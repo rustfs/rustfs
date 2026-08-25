@@ -55,6 +55,7 @@ const DEVICE_UID: &str = "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92";
 const TOKEN_UID: &str = "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5";
 const FRESH_TOKEN_UID: &str = "0198f4b0-7f00-7c70-a381-8e9fa0b1c2d6";
 const SECOND_TOKEN_UID: &str = "0198f4b0-8f00-7d80-b491-9fa0b1c2d3e7";
+const UNRELATED_TOKEN_UID: &str = "0198f4b0-9f00-7e90-85a1-afb1c2d3e4f8";
 
 struct TestPki {
     root_params: CertificateParams,
@@ -952,6 +953,7 @@ async fn heartbeat_runtime_skips_only_valid_pending_reenrollment() {
         ("tokenUid", ""),
         ("tokenUid", "not-a-token-uid"),
         ("tokenUid", FRESH_TOKEN_UID),
+        ("tokenUid", UNRELATED_TOKEN_UID),
     ] {
         let mut corrupted_pending: Value = serde_json::from_slice(&pending).expect("pending reenrollment JSON");
         corrupted_pending[field] = json!(value);
@@ -1322,19 +1324,31 @@ async fn pending_reenrollment_blocks_rotation_and_resumes_original_exchange() {
 async fn reenrollment_commit_recovers_after_each_durable_step() {
     let temp = tempfile::tempdir().expect("temp dir");
     let (identity_store, credential_store) = stores(&temp);
-    let current = identity_store.load_or_create().expect("create identity");
+    let initial = identity_store.load_or_create().expect("create identity");
     let pki = TestPki::new();
-    let issued = pki.credential(&current, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 13);
+    let issued = pki.credential(&initial, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 13);
     let registration = server(&pki, vec![Reply::Json(StatusCode::CREATED, issued)]).await;
     client(&registration, &pki, Duration::from_secs(2))
         .register(&identity_store, &credential_store, &token())
         .await
         .expect("register");
 
+    let first_next = identity_store
+        .load_or_create_next()
+        .expect("create first reenrollment identity");
+    let first_enrolled = pki.credential(&first_next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 14);
+    let first_reenrollment = server(&pki, vec![Reply::Json(StatusCode::CREATED, first_enrolled)]).await;
+    client(&first_reenrollment, &pki, Duration::from_secs(2))
+        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .await
+        .expect("complete prior reenrollment");
+    let completed_path = temp.path().join("credential/registration.completed.json");
+    let previous_completed = fs::read(&completed_path).expect("read prior completed receipt");
+
     let failed = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
     assert!(matches!(
         client(&failed, &pki, Duration::from_secs(2))
-            .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+            .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
             .await,
         Err(ClientError::Unavailable { .. })
     ));
@@ -1343,16 +1357,41 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
     let pending = fs::read(&pending_path).expect("read pending reenrollment");
     let next_der = fs::read(temp.path().join("identity/device.key.next")).expect("read next key");
     let next = rustfs::connect::DeviceIdentity::from_pkcs8_der(&next_der).expect("parse next key");
-    let enrolled = pki.credential(&next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 14);
+    let enrolled = pki.credential(&next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 15);
     write_stored_credential(&temp.path().join("credential/device.crt.json"), &enrolled);
 
     let idle = server(&pki, vec![]).await;
     let idle_client = client(&idle, &pki, Duration::from_secs(2));
+    for token_uid in [UNRELATED_TOKEN_UID, FRESH_TOKEN_UID] {
+        let mut document: Value = serde_json::from_slice(&pending).expect("pending reenrollment JSON");
+        document["tokenUid"] = json!(token_uid);
+        let tampered_pending = serde_json::to_vec(&document).expect("tampered pending reenrollment JSON");
+        fs::write(&pending_path, &tampered_pending).expect("tamper pending after credential save");
+        set_owner_only(&pending_path);
+        assert!(matches!(
+            idle_client
+                .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
+                .await,
+            Err(ClientError::PendingRegistration)
+        ));
+        assert_eq!(fs::read(&pending_path).expect("preserved tampered pending"), tampered_pending);
+        assert_eq!(fs::read(&completed_path).expect("preserved prior completed receipt"), previous_completed);
+        assert_eq!(
+            identity_store
+                .load()
+                .expect("load current key")
+                .expect("current key")
+                .public_key_der(),
+            first_next.public_key_der()
+        );
+    }
+    fs::write(&pending_path, &pending).expect("restore bound pending after credential save");
+    set_owner_only(&pending_path);
     let recovered = idle_client
-        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
         .await
         .expect("recover after reenrollment credential save");
-    assert_eq!(recovered.certificate_serial, "0e".repeat(16));
+    assert_eq!(recovered.certificate_serial, "0f".repeat(16));
     assert_eq!(
         identity_store
             .load()
@@ -1362,26 +1401,50 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
         next.public_key_der()
     );
 
-    fs::remove_file(temp.path().join("credential/registration.completed.json")).expect("remove completed receipt");
-    fs::write(&pending_path, pending).expect("restore pending after key commit");
+    fs::write(&completed_path, &previous_completed).expect("restore prior completed receipt after key commit");
+    set_owner_only(&completed_path);
+    for token_uid in [UNRELATED_TOKEN_UID, FRESH_TOKEN_UID] {
+        let mut document: Value = serde_json::from_slice(&pending).expect("pending reenrollment JSON");
+        document["tokenUid"] = json!(token_uid);
+        let tampered_pending = serde_json::to_vec(&document).expect("tampered pending reenrollment JSON");
+        fs::write(&pending_path, &tampered_pending).expect("tamper pending after key commit");
+        set_owner_only(&pending_path);
+        assert!(matches!(
+            idle_client
+                .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
+                .await,
+            Err(ClientError::PendingRegistration)
+        ));
+        assert_eq!(fs::read(&pending_path).expect("preserved tampered pending"), tampered_pending);
+        assert_eq!(fs::read(&completed_path).expect("preserved prior completed receipt"), previous_completed);
+        assert_eq!(
+            identity_store
+                .load()
+                .expect("load current key")
+                .expect("current key")
+                .public_key_der(),
+            next.public_key_der()
+        );
+    }
+    fs::write(&pending_path, pending).expect("restore bound pending after key commit");
     set_owner_only(&pending_path);
     let recovered = idle_client
-        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
         .await
         .expect("recover after reenrollment key commit");
-    assert_eq!(recovered.certificate_serial, "0e".repeat(16));
+    assert_eq!(recovered.certificate_serial, "0f".repeat(16));
     assert!(!pending_path.exists());
     let recovered = idle_client
-        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
         .await
         .expect("completed reenrollment is idempotent after pending cleanup");
-    assert_eq!(recovered.certificate_serial, "0e".repeat(16));
+    assert_eq!(recovered.certificate_serial, "0f".repeat(16));
     assert!(idle.seen.lock().expect("seen lock").is_empty());
 
     let different = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
     assert!(matches!(
         client(&different, &pki, Duration::from_secs(2))
-            .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
+            .reenroll(&identity_store, &credential_store, &token_with_uid(TOKEN_UID))
             .await,
         Err(ClientError::Unavailable { .. })
     ));

@@ -37,6 +37,7 @@ use super::registration::{
 const MAX_ATTEMPTS: usize = 3;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const ROTATION_THRESHOLD_SECONDS: i64 = 8 * 60 * 60;
+const PENDING_REGISTRATION_STATE_DOMAIN: &[u8] = b"RUSTFS-CONNECT-PENDING-REGISTRATION-V1";
 
 pub struct ConnectConfig<'a> {
     pub endpoint: &'a str,
@@ -125,19 +126,22 @@ impl ConnectClient {
         }
 
         let identity = identity_store.load_or_create()?;
-        let candidate = PendingRegistration {
+        let mut candidate = PendingRegistration {
             token_uid: token.registration_token_uid.clone(),
             request_id: Uuid::new_v4().to_string(),
             certificate_request: identity.certificate_request_base64()?,
             previous_credential_fingerprint: None,
             next_public_key_sha256: None,
+            state_proof: String::new(),
         };
+        candidate.state_proof = identity.sign_pending_registration_state(&pending_registration_state(&candidate));
         let pending = credential_store.claim_pending_registration(&candidate)?;
         if pending.token_uid != token.registration_token_uid
             || pending.previous_credential_fingerprint.is_some()
             || pending.next_public_key_sha256.is_some()
             || !is_request_id(&pending.request_id)
             || !certificate_request_matches(&pending.certificate_request, &identity)?
+            || !pending_registration_is_bound(&pending, &identity)
         {
             return Err(ClientError::PendingRegistration);
         }
@@ -174,19 +178,22 @@ impl ConnectClient {
         credential_store.clear_pending_rotation()?;
         let next = identity_store.load_or_create_next()?;
         let next_fingerprint = public_key_fingerprint(&next);
-        let candidate = PendingRegistration {
+        let mut candidate = PendingRegistration {
             token_uid: token.registration_token_uid.clone(),
             request_id: Uuid::new_v4().to_string(),
             certificate_request: next.certificate_request_base64()?,
             previous_credential_fingerprint: Some(fingerprint.clone()),
             next_public_key_sha256: Some(next_fingerprint.clone()),
+            state_proof: String::new(),
         };
+        candidate.state_proof = next.sign_pending_registration_state(&pending_registration_state(&candidate));
         let pending = credential_store.claim_pending_registration(&candidate)?;
         if pending.token_uid != token.registration_token_uid
             || pending.previous_credential_fingerprint.as_deref() != Some(&fingerprint)
             || pending.next_public_key_sha256.as_deref() != Some(&next_fingerprint)
             || !is_request_id(&pending.request_id)
             || !certificate_request_matches(&pending.certificate_request, &next)?
+            || !pending_registration_is_bound(&pending, &next)
         {
             return Err(ClientError::PendingRegistration);
         }
@@ -357,6 +364,7 @@ impl ConnectClient {
                 if pending.next_public_key_sha256.is_some()
                     || !is_request_id(&pending.request_id)
                     || !certificate_request_matches(&pending.certificate_request, &current)?
+                    || !pending_registration_is_bound(&pending, &current)
                 {
                     return Err(ClientError::PendingRegistration);
                 }
@@ -377,6 +385,7 @@ impl ConnectClient {
                 let next = identity_store.load_next()?.ok_or(ClientError::PendingRegistration)?;
                 if public_key_fingerprint(&next) != next_fingerprint
                     || !certificate_request_matches(&pending.certificate_request, &next)?
+                    || !pending_registration_is_bound(&pending, &next)
                 {
                     return Err(ClientError::PendingRegistration);
                 }
@@ -389,7 +398,9 @@ impl ConnectClient {
                 return Ok(Some((credential, current, true)));
             }
             if public_key_fingerprint(&current) == next_fingerprint {
-                if !certificate_request_matches(&pending.certificate_request, &current)? {
+                if !certificate_request_matches(&pending.certificate_request, &current)?
+                    || !pending_registration_is_bound(&pending, &current)
+                {
                     return Err(ClientError::PendingRegistration);
                 }
                 validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
@@ -397,6 +408,7 @@ impl ConnectClient {
                 let next = identity_store.load_next()?.ok_or(ClientError::PendingRegistration)?;
                 if public_key_fingerprint(&next) != next_fingerprint
                     || !certificate_request_matches(&pending.certificate_request, &next)?
+                    || !pending_registration_is_bound(&pending, &next)
                 {
                     return Err(ClientError::PendingRegistration);
                 }
@@ -526,6 +538,32 @@ impl ConnectClient {
 
 fn is_request_id(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version() == Some(uuid::Version::Random) && uuid.to_string() == value)
+}
+
+fn pending_registration_is_bound(pending: &PendingRegistration, identity: &super::identity::DeviceIdentity) -> bool {
+    identity.verifies_pending_registration_state(&pending_registration_state(pending), &pending.state_proof)
+}
+
+fn pending_registration_state(pending: &PendingRegistration) -> Vec<u8> {
+    let mut state = Vec::with_capacity(PENDING_REGISTRATION_STATE_DOMAIN.len() + 512);
+    state.extend_from_slice(PENDING_REGISTRATION_STATE_DOMAIN);
+    for field in [
+        Some(pending.token_uid.as_str()),
+        Some(pending.request_id.as_str()),
+        Some(pending.certificate_request.as_str()),
+        pending.previous_credential_fingerprint.as_deref(),
+        pending.next_public_key_sha256.as_deref(),
+    ] {
+        match field {
+            Some(value) => {
+                state.push(1);
+                state.extend_from_slice(&(value.len() as u64).to_be_bytes());
+                state.extend_from_slice(value.as_bytes());
+            }
+            None => state.push(0),
+        }
+    }
+    state
 }
 
 fn unix_now() -> i64 {
