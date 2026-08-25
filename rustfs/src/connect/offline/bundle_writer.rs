@@ -575,7 +575,6 @@ impl Drop for CreatedFile<'_> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
 fn open_directory(path: &Path) -> Result<File, BundleError> {
     use std::os::fd::AsRawFd as _;
     use std::path::Component;
