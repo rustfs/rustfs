@@ -15,10 +15,6 @@ pub(crate) struct BufferPool {
 }
 
 impl BufferPool {
-    pub(crate) fn new() -> Self {
-        Self::with_limits(16)
-    }
-
     pub(crate) fn with_limits(max_per_bucket: usize) -> Self {
         let buckets = (0..32).map(|_| Vec::new()).collect();
         Self {
