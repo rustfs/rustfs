@@ -70,6 +70,7 @@ fn context() -> BundleContext {
 }
 
 fn entries() -> Vec<ManifestEntry> {
+    let cpu_summary = format!(r#"{{"cpuSummary":{{"architecture":"{}","cores":8}}}}"#, std::env::consts::ARCH);
     let values = [
         ("offline.rustfsVersion", DataClassification::L0, r#"{"rustfsVersion":"1.4.2"}"#),
         ("offline.nodeCount", DataClassification::L0, r#"{"nodeCount":2}"#),
@@ -83,11 +84,7 @@ fn entries() -> Vec<ManifestEntry> {
         ),
         ("offline.osSummary", DataClassification::L1, r#"{"osSummary":"Linux"}"#),
         ("offline.kernelSummary", DataClassification::L1, r#"{"kernelSummary":"6.8.0"}"#),
-        (
-            "offline.cpuSummary",
-            DataClassification::L1,
-            r#"{"cpuSummary":{"architecture":"x86_64","cores":8}}"#,
-        ),
+        ("offline.cpuSummary", DataClassification::L1, cpu_summary.as_str()),
         (
             "offline.memorySummary",
             DataClassification::L1,
@@ -264,8 +261,10 @@ fn connect_offline_bundle_rejects_schema_drift_and_removes_every_temporary_file(
     unknown_health_flag[5].canonical_json = r#"{"coarseHealthFlags":["customer.alpha"]}"#.to_owned();
     invalid.push(unknown_health_flag);
     let mut unknown_payload_field = entries();
-    unknown_payload_field[8].canonical_json =
-        r#"{"cpuSummary":{"architecture":"x86_64","cores":8,"customerName":"Acme"}}"#.to_owned();
+    unknown_payload_field[8].canonical_json = format!(
+        r#"{{"cpuSummary":{{"architecture":"{}","cores":8,"customerName":"Acme"}}}}"#,
+        std::env::consts::ARCH
+    );
     invalid.push(unknown_payload_field);
     let mut secret_canary = entries();
     secret_canary[6].canonical_json = r#"{"osSummary":"AKIAIOSFODNN7EXAMPLE"}"#.to_owned();
