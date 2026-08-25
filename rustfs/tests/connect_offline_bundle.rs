@@ -251,6 +251,22 @@ fn connect_offline_bundle_rejects_schema_drift_and_removes_every_temporary_file(
     let mut wrong_payload = entries();
     wrong_payload[0].canonical_json = r#"{"nodeCount":2}"#.to_owned();
     invalid.push(wrong_payload);
+    let mut wrong_payload_type = entries();
+    wrong_payload_type[1].canonical_json = r#"{"nodeCount":"customer-alpha"}"#.to_owned();
+    invalid.push(wrong_payload_type);
+    let mut out_of_range = entries();
+    out_of_range[1].canonical_json = r#"{"nodeCount":0}"#.to_owned();
+    invalid.push(out_of_range);
+    let mut impossible_capacity = entries();
+    impossible_capacity[3].canonical_json = r#"{"capacityUsedBytes":6001}"#.to_owned();
+    invalid.push(impossible_capacity);
+    let mut unknown_health_flag = entries();
+    unknown_health_flag[5].canonical_json = r#"{"coarseHealthFlags":["customer.alpha"]}"#.to_owned();
+    invalid.push(unknown_health_flag);
+    let mut unknown_payload_field = entries();
+    unknown_payload_field[8].canonical_json =
+        r#"{"cpuSummary":{"architecture":"x86_64","cores":8,"customerName":"Acme"}}"#.to_owned();
+    invalid.push(unknown_payload_field);
     let mut secret_canary = entries();
     secret_canary[6].canonical_json = r#"{"osSummary":"AKIAIOSFODNN7EXAMPLE"}"#.to_owned();
     invalid.push(secret_canary);

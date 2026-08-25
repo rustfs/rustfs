@@ -57,6 +57,8 @@ const ENTRY_TYPE: &str = "offline-diagnostic";
 #[cfg(target_os = "linux")]
 const ENTRY_LIMIT: usize = 16 * 1024;
 #[cfg(target_os = "linux")]
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+#[cfg(target_os = "linux")]
 const MANIFEST_LIMIT: usize = 1024 * 1024;
 #[cfg(target_os = "linux")]
 const SIGNATURE_LIMIT: usize = 4 * 1024;
@@ -271,21 +273,119 @@ fn validate_entries(entries: &[ManifestEntry]) -> Result<(), BundleError> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&entry.canonical_json) else {
             return Err(BundleError::InvalidEntries);
         };
+        let Some(object) = value.as_object() else {
+            return Err(BundleError::InvalidEntries);
+        };
+        let Some(payload) = object.get(collector.field_name()) else {
+            return Err(BundleError::InvalidEntries);
+        };
         let Ok(redacted) = redact_json(RedactionSource::OfflineDiagnostic, entry.canonical_json.as_bytes()) else {
             return Err(BundleError::InvalidEntries);
         };
         if redacted.canonical_json != entry.canonical_json
             || redacted.redaction_version != REDACTION_VERSION
             || redacted.ruleset_hash != RULESET_HASH
-            || !value
-                .as_object()
-                .is_some_and(|object| object.len() == 1 && object.contains_key(collector.field_name()))
+            || object.len() != 1
+            || !valid_payload(collector, payload)
             || serde_json::to_string(&value).ok().as_deref() != Some(entry.canonical_json.as_str())
         {
             return Err(BundleError::InvalidEntries);
         }
     }
+    let used = entry_u64(&entries[3], "capacityUsedBytes").ok_or(BundleError::InvalidEntries)?;
+    let total = entry_u64(&entries[4], "capacityTotalBytes").ok_or(BundleError::InvalidEntries)?;
+    if used > total {
+        return Err(BundleError::InvalidEntries);
+    }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn valid_payload(collector: OfflineCollector, value: &serde_json::Value) -> bool {
+    match collector {
+        OfflineCollector::RustfsVersion => value.as_str().is_some_and(valid_rustfs_version),
+        OfflineCollector::NodeCount => value.as_u64().is_some_and(|count| (1..=4096).contains(&count)),
+        OfflineCollector::DriveCount => value.as_u64().is_some_and(|count| count <= 1_048_576),
+        OfflineCollector::CapacityUsedBytes | OfflineCollector::CapacityTotalBytes => {
+            value.as_u64().is_some_and(|bytes| bytes <= MAX_SAFE_INTEGER)
+        }
+        OfflineCollector::CoarseHealthFlags => value.as_array().is_some_and(|flags| {
+            ordered_known_strings(
+                flags,
+                &[
+                    "capacity.critical",
+                    "capacity.warning",
+                    "clock.skew",
+                    "cluster.degraded",
+                    "cluster.healing",
+                    "cluster.readonly",
+                    "drive.offline",
+                    "node.offline",
+                ],
+            )
+        }),
+        OfflineCollector::OsSummary | OfflineCollector::KernelSummary => value.is_string(),
+        OfflineCollector::CpuSummary => value.as_object().is_some_and(|object| {
+            object.len() == 2
+                && object.get("architecture").and_then(serde_json::Value::as_str) == Some(std::env::consts::ARCH)
+                && object.get("cores").and_then(serde_json::Value::as_u64).is_some()
+        }),
+        OfflineCollector::MemorySummary => value.as_object().is_some_and(|object| {
+            object.len() == 2
+                && object.get("totalBytes").and_then(serde_json::Value::as_u64).is_some()
+                && object.get("underPressure").and_then(serde_json::Value::as_bool).is_some()
+        }),
+        OfflineCollector::FilesystemSummary => value.as_array().is_some_and(ordered_strings),
+        OfflineCollector::NetworkSummary => value.as_object().is_some_and(|object| {
+            object.len() == 2
+                && object.get("bondCount").and_then(serde_json::Value::as_u64).is_some()
+                && object.get("interfaceCount").and_then(serde_json::Value::as_u64).is_some()
+        }),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn valid_rustfs_version(version: &str) -> bool {
+    let mut components = version.split('.');
+    (0..3).all(|_| {
+        components.next().is_some_and(|component| {
+            !component.is_empty()
+                && component.len() <= 4
+                && (component == "0" || !component.starts_with('0'))
+                && component.parse::<u16>().is_ok_and(|value| value <= 9999)
+        })
+    }) && components.next().is_none()
+}
+
+#[cfg(target_os = "linux")]
+fn ordered_strings(values: &[serde_json::Value]) -> bool {
+    let mut previous = None;
+    for value in values {
+        let Some(value) = value.as_str() else {
+            return false;
+        };
+        if previous.is_some_and(|previous| previous >= value) {
+            return false;
+        }
+        previous = Some(value);
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn ordered_known_strings(values: &[serde_json::Value], allowed: &[&str]) -> bool {
+    ordered_strings(values)
+        && values
+            .iter()
+            .all(|value| value.as_str().is_some_and(|value| allowed.binary_search(&value).is_ok()))
+}
+
+#[cfg(target_os = "linux")]
+fn entry_u64(entry: &ManifestEntry, field: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(&entry.canonical_json)
+        .ok()?
+        .get(field)?
+        .as_u64()
 }
 
 #[cfg(target_os = "linux")]
@@ -477,17 +577,41 @@ impl Drop for CreatedFile<'_> {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn open_directory(path: &Path) -> Result<File, BundleError> {
-    use std::os::fd::FromRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::fd::AsRawFd as _;
+    use std::path::Component;
 
-    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    // SAFETY: the path is a live C string and a successful descriptor is transferred to File.
-    let descriptor =
-        unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY) };
-    if descriptor < 0 {
-        return Err(std::io::Error::last_os_error().into());
+    let root = if path.is_absolute() { c"/" } else { c"." };
+    let mut directory = open_directory_at(libc::AT_FDCWD, root)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                let name = c_name(name)?;
+                directory = open_directory_at(directory.as_raw_fd(), &name)?;
+            }
+            Component::ParentDir | Component::Prefix(_) => return Err(BundleError::UnsafeOutput),
+        }
     }
-    // SAFETY: open returned a new owned descriptor.
+    Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn open_directory_at(parent: std::os::fd::RawFd, name: &CStr) -> std::io::Result<File> {
+    use std::os::fd::FromRawFd as _;
+
+    // SAFETY: the parent descriptor and C string are live; a successful descriptor is transferred to File.
+    let descriptor = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a new owned descriptor.
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
@@ -686,7 +810,7 @@ mod test_support {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use serde_json::{Map, Value};
+    use serde_json::{Map, json};
 
     use super::test_support::{self, Action, Stage};
     use super::*;
@@ -705,7 +829,23 @@ mod tests {
             .iter()
             .map(|(collector, _)| {
                 let mut value = Map::new();
-                value.insert(collector.field_name().to_owned(), Value::Null);
+                value.insert(
+                    collector.field_name().to_owned(),
+                    match collector {
+                        OfflineCollector::RustfsVersion => json!("1.4.2"),
+                        OfflineCollector::NodeCount => json!(2),
+                        OfflineCollector::DriveCount => json!(3),
+                        OfflineCollector::CapacityUsedBytes => json!(1500),
+                        OfflineCollector::CapacityTotalBytes => json!(6000),
+                        OfflineCollector::CoarseHealthFlags => json!(["cluster.degraded", "drive.offline"]),
+                        OfflineCollector::OsSummary => json!("Linux"),
+                        OfflineCollector::KernelSummary => json!("6.8.0"),
+                        OfflineCollector::CpuSummary => json!({"architecture": std::env::consts::ARCH, "cores": 8}),
+                        OfflineCollector::MemorySummary => json!({"totalBytes": 17179869184_u64, "underPressure": false}),
+                        OfflineCollector::FilesystemSummary => json!(["ext4", "xfs"]),
+                        OfflineCollector::NetworkSummary => json!({"bondCount": 1, "interfaceCount": 4}),
+                    },
+                );
                 ManifestEntry {
                     field_id: collector.field_id(),
                     classification: collector.classification(),
@@ -778,6 +918,17 @@ mod tests {
         ));
         assert!(!swapped_output.exists());
         assert_eq!(temp_residue(&moved), 0);
+
+        use std::os::unix::fs::symlink;
+
+        let target = temp.path().join("ancestor-target");
+        let private = target.join("private");
+        fs::create_dir_all(&private).expect("symlink target directory");
+        let link = temp.path().join("ancestor-link");
+        symlink(&target, &link).expect("ancestor symlink");
+        let escaped_output = link.join("private/bundle.zip");
+        assert!(write_offline_bundle(&escaped_output, &context(), &entries(), &key, &CancellationToken::new()).is_err());
+        assert!(!private.join("bundle.zip").exists());
 
         let original = temp.path().join("publish-original");
         let moved = temp.path().join("publish-moved");
