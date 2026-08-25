@@ -190,6 +190,7 @@ const PUT_EAGER_STATUS_ZERO_COPY_INELIGIBLE: &str = "zero_copy_ineligible";
 const PUT_EAGER_STATUS_AWS_CHUNKED_MISSING_DECODED_LENGTH: &str = "aws_chunked_missing_decoded_length";
 static CACHED_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 use std::collections::HashMap;
+use std::io;
 use std::ops::Add;
 use std::path::Path;
 use std::pin::Pin;
@@ -232,6 +233,26 @@ use crate::app::object_data_cache::{ColdFillRole, ColdFillWaitOutcome, scope_col
 use crate::app::object_traffic_health::ObjectTrafficHealth;
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+fn s3s_body_error_to_io(err: StdError) -> io::Error {
+    match err.to_string().as_str() {
+        "UploadStreamError: Sha256Mismatch" => {
+            return io::Error::new(
+                io::ErrorKind::InvalidData,
+                rustfs_rio::ChecksumMismatch {
+                    want: AMZ_CONTENT_SHA256.to_string(),
+                    got: "payload sha256".to_string(),
+                },
+            );
+        }
+        "UploadStreamError: Incomplete" | "UploadStreamError: LengthMismatch" => {
+            return io::Error::new(io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining: 0 });
+        }
+        _ => {}
+    }
+
+    io::Error::other(err)
+}
 
 struct ColdFillDiskPermitMetric {
     owner: ColdFillDiskPermitOwner,
@@ -2821,7 +2842,7 @@ where
         let mut remaining = (&mut *buf).limit(size - filled);
         let read = tokio::io::AsyncReadExt::read_buf(&mut *body, &mut remaining)
             .await
-            .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+            .map_err(ApiError::from)?;
         if read == 0 {
             return Err(s3_error!(IncompleteBody));
         }
@@ -2831,7 +2852,7 @@ where
     let mut extra = [0u8; 1];
     let extra_read = tokio::io::AsyncReadExt::read(&mut *body, &mut extra)
         .await
-        .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        .map_err(ApiError::from)?;
     if extra_read != 0 {
         return Err(s3_error!(UnexpectedContent));
     }
@@ -2863,7 +2884,7 @@ where
 async fn read_zero_copy_put_body_exact<S, E>(mut body: S, size: usize) -> S3Result<ChunkedBytesReader>
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>> + Unpin,
-    E: std::fmt::Display,
+    E: Into<StdError>,
 {
     let mut chunks = Vec::new();
     let mut filled = 0usize;
@@ -2872,7 +2893,7 @@ where
         let Some(chunk) = body.next().await else {
             return Err(s3_error!(IncompleteBody));
         };
-        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        let chunk = chunk.map_err(|err| ApiError::from(s3s_body_error_to_io(err.into())))?;
         if chunk.is_empty() {
             continue;
         }
@@ -2886,7 +2907,7 @@ where
     }
 
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        let chunk = chunk.map_err(|err| ApiError::from(s3s_body_error_to_io(err.into())))?;
         if !chunk.is_empty() {
             return Err(s3_error!(UnexpectedContent));
         }
@@ -6172,7 +6193,7 @@ impl DefaultObjectUsecase {
         let mut reader = if should_compress {
             let body = tokio::io::BufReader::with_capacity(
                 buffer_size,
-                StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
             );
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
@@ -6205,7 +6226,7 @@ impl DefaultObjectUsecase {
                     // Mutex contention under high concurrency. Direct allocation
                     // for ≤4KiB is negligible cost.
                     let eager_body = read_small_put_body_exact_direct(
-                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         actual_size as usize,
                     )
                     .await?;
@@ -6213,7 +6234,7 @@ impl DefaultObjectUsecase {
                 } else {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_body = read_small_put_body_exact_pooled(
-                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         actual_size as usize,
                         pool.as_ref(),
                     )
@@ -6224,7 +6245,7 @@ impl DefaultObjectUsecase {
             } else {
                 let body = tokio::io::BufReader::with_capacity(
                     buffer_size,
-                    StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                    StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                 );
                 HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
             }
@@ -9784,10 +9805,8 @@ impl DefaultObjectUsecase {
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
-        let body = tokio::io::BufReader::with_capacity(
-            buffer_size,
-            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
-        );
+        let body =
+            tokio::io::BufReader::with_capacity(buffer_size, StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))));
 
         let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
             return Err(s3_error!(InvalidArgument, "key extension not found"));
