@@ -89,6 +89,144 @@ const EVENT_SCANNER_BACKGROUND_HEAL_STATE: &str = "scanner_background_heal_state
 const METRIC_SCANNER_LEADER_LOCK_TOTAL: &str = "rustfs_scanner_leader_lock_total";
 const CLEAN_IDLE_MAX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SCANNER_SCHEDULE_DELAY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+#[cfg(test)]
+static SCANNER_STARTUP_OBSERVED_PROBE: LazyLock<StdMutex<Option<Arc<ScannerStartupObservedProbeState>>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+struct ScannerStartupObservedProbeState {
+    observed: Notify,
+    resume: Notify,
+}
+
+#[cfg(test)]
+struct ScannerObservedProbeState {
+    store_key: usize,
+    paused: bool,
+    notify: Notify,
+}
+
+#[cfg(test)]
+pub(super) struct ScannerStartupObservedProbe {
+    state: Arc<ScannerStartupObservedProbeState>,
+}
+
+#[cfg(test)]
+static SCANNER_RUNTIME_OBSERVED_PROBE: LazyLock<StdMutex<Option<Arc<ScannerObservedProbeState>>>> =
+    LazyLock::new(|| StdMutex::new(None));
+
+#[cfg(test)]
+pub(super) struct ScannerRuntimeObservedProbe {
+    state: Arc<ScannerObservedProbeState>,
+}
+
+#[cfg(test)]
+impl ScannerStartupObservedProbe {
+    pub(super) fn install() -> Self {
+        let state = Arc::new(ScannerStartupObservedProbeState {
+            observed: Notify::new(),
+            resume: Notify::new(),
+        });
+        let mut probe = SCANNER_STARTUP_OBSERVED_PROBE
+            .lock()
+            .expect("scanner startup observed probe should not be poisoned");
+        assert!(probe.is_none(), "scanner startup observed probe must be unique");
+        *probe = Some(state.clone());
+        Self { state }
+    }
+
+    pub(super) async fn wait(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.state.observed.notified())
+            .await
+            .expect("scanner should complete startup pause-backlog observation");
+    }
+
+    pub(super) fn resume(&self) {
+        self.state.resume.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl ScannerRuntimeObservedProbe {
+    pub(super) fn install(storeapi: &Arc<ECStore>, paused: bool) -> Self {
+        let state = Arc::new(ScannerObservedProbeState {
+            store_key: scanner_observed_probe_store_key(storeapi),
+            paused,
+            notify: Notify::new(),
+        });
+        let mut probe = SCANNER_RUNTIME_OBSERVED_PROBE
+            .lock()
+            .expect("scanner runtime observed probe should not be poisoned");
+        assert!(probe.is_none(), "scanner runtime observed probe must be unique");
+        *probe = Some(state.clone());
+        Self { state }
+    }
+
+    pub(super) async fn wait(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.state.notify.notified())
+            .await
+            .expect("scanner should complete runtime pause-backlog observation");
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScannerStartupObservedProbe {
+    fn drop(&mut self) {
+        let mut probe = SCANNER_STARTUP_OBSERVED_PROBE
+            .lock()
+            .expect("scanner startup observed probe should not be poisoned");
+        if probe.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *probe = None;
+        }
+        self.state.resume.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScannerRuntimeObservedProbe {
+    fn drop(&mut self) {
+        let mut probe = SCANNER_RUNTIME_OBSERVED_PROBE
+            .lock()
+            .expect("scanner runtime observed probe should not be poisoned");
+        if probe.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *probe = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn notify_scanner_startup_observed_for_test() {
+    let probe = {
+        SCANNER_STARTUP_OBSERVED_PROBE
+            .lock()
+            .expect("scanner startup observed probe should not be poisoned")
+            .clone()
+    };
+    if let Some(probe) = probe {
+        probe.observed.notify_one();
+        probe.resume.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn scanner_observed_probe_store_key(storeapi: &Arc<ECStore>) -> usize {
+    Arc::as_ptr(storeapi).cast::<()>() as usize
+}
+
+#[cfg(test)]
+fn notify_scanner_runtime_observed_for_test(storeapi: &Arc<ECStore>, observation: ScannerPauseBacklogObservation) {
+    if let Some(probe) = SCANNER_RUNTIME_OBSERVED_PROBE
+        .lock()
+        .expect("scanner runtime observed probe should not be poisoned")
+        .clone()
+        && probe.store_key == scanner_observed_probe_store_key(storeapi)
+        && probe.paused == observation.paused
+    {
+        probe.notify.notify_one();
+    }
+}
+
 const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
 /// First-retry delay after a scanner cycle cannot publish authoritative usage.
 ///
@@ -2145,6 +2283,74 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     run_data_scanner_with_maintenance_state(ctx, storeapi, maintenance_features, maintenance_generation).await
 }
 
+async fn current_scanner_pause_backlog_observation(storeapi: &Arc<ECStore>) -> ScannerPauseBacklogObservation {
+    let now_unix_secs = scanner_pause_backlog_now();
+    let pause = storeapi.scanner_data_movement_pause_status().await;
+    let metrics = global_metrics().report().await;
+    ScannerPauseBacklogObservation {
+        now_unix_secs,
+        paused: pause.paused,
+        movement_generation: pause.movement_generation,
+        movement_work_items: pause.movement_backlog_work_items,
+        pause_started_at_unix_secs: pause.started_at_unix_secs,
+        dirty_usage_buckets: metrics.usage_freshness.dirty_pending_buckets,
+        discovered_expiry_items: metrics
+            .lifecycle_expiry
+            .current_queued
+            .saturating_add(metrics.lifecycle_expiry.current_active),
+        discovered_transition_items: metrics
+            .lifecycle_transition
+            .current_queued
+            .saturating_add(metrics.lifecycle_transition.current_active)
+            .saturating_add(metrics.lifecycle_transition.compensation_pending)
+            .saturating_add(metrics.lifecycle_transition.compensation_running),
+    }
+}
+
+async fn wait_for_scanner_data_movement_resume(
+    ctx: &CancellationToken,
+    storeapi: &Arc<ECStore>,
+    guard: &NamespaceLockGuard,
+    pause_backlog: &mut ScannerPauseBacklogController,
+) -> bool {
+    loop {
+        let observation = current_scanner_pause_backlog_observation(storeapi).await;
+        pause_backlog.observe(observation).await;
+        #[cfg(test)]
+        notify_scanner_runtime_observed_for_test(storeapi, observation);
+        if !observation.paused {
+            return !ctx.is_cancelled() && !guard.is_lock_lost();
+        }
+
+        let movement_changed = storeapi.scanner_data_movement_changed();
+        if storeapi.scanner_data_movement_generation() != observation.movement_generation {
+            continue;
+        }
+        tokio::select! {
+            _ = ctx.cancelled() => return false,
+            _ = guard.lock_lost_notified() => return false,
+            _ = movement_changed.notified() => {},
+            _ = tokio::time::sleep(SCANNER_CYCLE_RECOVERY_PAUSED_INTERVAL) => {},
+        }
+    }
+}
+
+async fn finish_scanner_pause_backlog_cycle(
+    pause_backlog: &mut ScannerPauseBacklogController,
+    storeapi: &Arc<ECStore>,
+    attempt: ScannerPauseBacklogAttemptDecision,
+    outcome: ScannerCycleOutcome,
+) {
+    let observation = current_scanner_pause_backlog_observation(storeapi).await;
+    if let ScannerPauseBacklogAttemptDecision::Tracked(serial) = attempt {
+        pause_backlog.finish_attempt(serial, outcome, observation).await;
+    } else {
+        pause_backlog.observe_cycle_outcome(outcome, observation).await;
+    }
+    #[cfg(test)]
+    notify_scanner_runtime_observed_for_test(storeapi, observation);
+}
+
 async fn run_data_scanner_with_maintenance_state(
     ctx: CancellationToken,
     storeapi: Arc<ECStore>,
@@ -2224,6 +2430,28 @@ async fn run_data_scanner_with_maintenance_state(
             return Ok(());
         }
     };
+    let pause_backlog_now = scanner_pause_backlog_now();
+    let mut pause_backlog = match ScannerPauseBacklogController::claim(storeapi.clone(), pause_backlog_now).await {
+        Ok(controller) => controller,
+        Err(err) => {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "pause_backlog_claim_failed",
+                error = %err,
+                "Scanner pause backlog persistence is unavailable"
+            );
+            ScannerPauseBacklogController::unavailable(storeapi.clone(), err, pause_backlog_now)
+        }
+    };
+    if !wait_for_scanner_data_movement_resume(&ctx, &storeapi, &guard, &mut pause_backlog).await {
+        global_metrics().set_cycle(None).await;
+        return Ok(());
+    }
+    #[cfg(test)]
+    notify_scanner_startup_observed_for_test().await;
     let single_disk = storeapi.setup_is_erasure_sd().await;
     let erasure = storeapi.setup_is_erasure().await;
     let distributed = storeapi.setup_is_dist_erasure().await;
@@ -2358,6 +2586,19 @@ async fn run_data_scanner_with_maintenance_state(
         return Ok(());
     }
     if !leadership_claimed {
+        let observation = current_scanner_pause_backlog_observation(&storeapi).await;
+        pause_backlog.observe(observation).await;
+        #[cfg(test)]
+        notify_scanner_runtime_observed_for_test(&storeapi, observation);
+        if observation.paused {
+            if wait_for_scanner_data_movement_resume(&ctx, &storeapi, &guard, &mut pause_backlog).await {
+                return Err(ScannerError::Other(
+                    "scanner startup was fenced by data movement; retrying from durable state".to_string(),
+                ));
+            }
+            global_metrics().set_cycle(None).await;
+            return Ok(());
+        }
         error!(
             target: "rustfs::scanner",
             event = EVENT_SCANNER_LOCK_STATE,
@@ -2374,7 +2615,13 @@ async fn run_data_scanner_with_maintenance_state(
         return Ok(());
     }
 
-    if !ctx.is_cancelled() {
+    let initial_pause_backlog_attempt = pause_backlog.begin_attempt(scanner_pause_backlog_now()).await;
+    if !ctx.is_cancelled()
+        && matches!(
+            initial_pause_backlog_attempt,
+            ScannerPauseBacklogAttemptDecision::Untracked | ScannerPauseBacklogAttemptDecision::Tracked(_)
+        )
+    {
         // Preserve previous behavior: run one cycle immediately after lock acquisition.
         let dirty_generation_before_cycle = dirty_usage_generation();
         let dirty_usage_pending_before_cycle = dirty_usage_buckets_pending();
@@ -2428,6 +2675,7 @@ async fn run_data_scanner_with_maintenance_state(
                 return Ok(());
             }
         };
+        finish_scanner_pause_backlog_cycle(&mut pause_backlog, &storeapi, initial_pause_backlog_attempt, initial_outcome).await;
         superseded_backoff.record_retryable_cycle(initial_outcome == ScannerCycleOutcome::Superseded);
         deferred_backoff.record_retryable_cycle(matches!(initial_outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
@@ -2479,6 +2727,10 @@ async fn run_data_scanner_with_maintenance_state(
             break;
         }
 
+        let pause_backlog_observation = current_scanner_pause_backlog_observation(&storeapi).await;
+        pause_backlog.observe(pause_backlog_observation).await;
+        #[cfg(test)]
+        notify_scanner_runtime_observed_for_test(&storeapi, pause_backlog_observation);
         let runtime_config = resolve_scanner_runtime_config();
         if clean_idle_topology_supported && scanner_clean_idle_backoff_configured(&runtime_config) {
             let current_generation = scanner_maintenance_generation();
@@ -2515,10 +2767,15 @@ async fn run_data_scanner_with_maintenance_state(
             scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
         let superseded_retry_interval = superseded_backoff.retry_interval(runtime_config.cycle_interval);
         let deferred_retry_interval = deferred_backoff.retry_interval(runtime_config.cycle_interval);
-        let convergence_retry_interval = superseded_retry_interval.or(deferred_retry_interval);
+        let mut convergence_retry_interval = superseded_retry_interval.or(deferred_retry_interval);
         if let Some(retry_interval) = convergence_retry_interval {
             wait_plan.effective_interval = retry_interval;
             wait_plan.delay = randomized_cycle_delay_for(retry_interval).min(retry_interval);
+        }
+        if let Some(pause_backlog_delay) = pause_backlog.scheduling_delay(scanner_pause_backlog_now()) {
+            wait_plan.effective_interval = pause_backlog_delay.max(Duration::from_secs(1));
+            wait_plan.delay = pause_backlog_delay;
+            convergence_retry_interval = Some(pause_backlog_delay.max(Duration::from_secs(1)));
         }
         let dirty_generation_before_wait = dirty_usage_generation();
         let dirty_usage_pending_before_wait = dirty_usage_buckets_pending();
@@ -2644,6 +2901,20 @@ async fn run_data_scanner_with_maintenance_state(
             record_scanner_leader_lock_lost("Scanner leader lock lost before starting the next cycle").await;
             break;
         }
+        let pause_backlog_observation = current_scanner_pause_backlog_observation(&storeapi).await;
+        pause_backlog.observe(pause_backlog_observation).await;
+        #[cfg(test)]
+        notify_scanner_runtime_observed_for_test(&storeapi, pause_backlog_observation);
+        if pause_backlog_observation.paused {
+            continue;
+        }
+        let pause_backlog_attempt = pause_backlog.begin_attempt(scanner_pause_backlog_now()).await;
+        if matches!(
+            pause_backlog_attempt,
+            ScannerPauseBacklogAttemptDecision::RateLimited | ScannerPauseBacklogAttemptDecision::PersistenceUnavailable
+        ) {
+            continue;
+        }
         let dirty_generation_before_cycle = dirty_usage_generation();
         let cycle_ctx = ctx.child_token();
         let cycle_budget = ScannerCycleBudget::new_with_runtime_progress_tracking(&cycle_ctx, scanner_cycle_budget_config());
@@ -2689,6 +2960,7 @@ async fn run_data_scanner_with_maintenance_state(
                 return Ok(());
             }
         };
+        finish_scanner_pause_backlog_cycle(&mut pause_backlog, &storeapi, pause_backlog_attempt, outcome).await;
         superseded_backoff.record_retryable_cycle(outcome == ScannerCycleOutcome::Superseded);
         deferred_backoff.record_retryable_cycle(matches!(outcome, ScannerCycleOutcome::Deferred(_)));
         dirty_usage_generation_seen = dirty_generation_before_cycle;
@@ -2989,12 +3261,14 @@ fn data_usage_reintroduces_missing_bucket(incoming: &DataUsageInfo, existing: Op
 
 /// Store data usage info in backend. Will store all objects sent on the receiver until closed.
 mod activity;
+mod backlog;
 mod cycle_state;
 mod heal_info;
 mod leadership;
 mod usage_store;
 
 use activity::*;
+use backlog::*;
 use cycle_state::*;
 use leadership::*;
 use usage_store::*;
@@ -3005,6 +3279,10 @@ pub(crate) use activity::{
     scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest, scanner_dirty_usage_acknowledgements,
 };
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
+pub use backlog::{
+    ScannerPauseBacklogAlertReason, ScannerPauseBacklogPhase, ScannerPauseBacklogStatus, ScannerPauseBacklogThresholds,
+    scanner_pause_backlog_status,
+};
 #[cfg(test)]
 pub(crate) use cycle_state::encode_scanner_cycle_fence_for_test;
 pub use cycle_state::{

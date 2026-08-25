@@ -44,7 +44,7 @@ use crate::error::{
 use crate::runtime::global::DISK_RESERVE_FRACTION;
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
-use crate::services::rebalance::{RebalanceMeta, is_rebalance_conflicting_with_decommission};
+use crate::services::rebalance::{RebalStatus, RebalanceMeta, is_rebalance_conflicting_with_decommission};
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -273,6 +273,215 @@ pub struct ECStore {
     pub(crate) bucket_fence_registry: Arc<bucket_fence::BucketFenceRegistry>,
 }
 
+const METRIC_SCANNER_DATA_MOVEMENT_PAUSED: &str = "rustfs_scanner_data_movement_paused";
+const METRIC_SCANNER_DATA_MOVEMENT_PAUSE_DURATION_SECONDS: &str = "rustfs_scanner_data_movement_pause_duration_seconds";
+const METRIC_SCANNER_DATA_MOVEMENT_BACKLOG_WORK_ITEMS: &str = "rustfs_scanner_data_movement_backlog_work_items";
+const SCANNER_DATA_MOVEMENT_PAUSE_POLICY: &str = "global_pause";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScannerDataMovementPauseReason {
+    OperationEpochExhausted,
+    MovementGenerationExhausted,
+    DecommissionActive,
+    DecommissionFailed,
+    DecommissionCanceled,
+    RebalanceActive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ScannerDataMovementPauseStatus {
+    pub paused: bool,
+    pub policy: &'static str,
+    pub reasons: Vec<ScannerDataMovementPauseReason>,
+    pub started_at_unix_secs: u64,
+    pub duration_seconds: u64,
+    pub operation_epoch: u64,
+    pub movement_generation: u64,
+    pub movement_backlog_work_items: u64,
+    pub movement_backlog_estimated: bool,
+}
+
+impl Default for ScannerDataMovementPauseStatus {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            policy: SCANNER_DATA_MOVEMENT_PAUSE_POLICY,
+            reasons: Vec::new(),
+            started_at_unix_secs: 0,
+            duration_seconds: 0,
+            operation_epoch: 0,
+            movement_generation: 0,
+            movement_backlog_work_items: 0,
+            movement_backlog_estimated: false,
+        }
+    }
+}
+
+fn offset_unix_seconds(value: OffsetDateTime) -> u64 {
+    u64::try_from(value.unix_timestamp()).unwrap_or(0)
+}
+
+fn earliest_timestamp(current: Option<OffsetDateTime>, candidate: Option<OffsetDateTime>) -> Option<OffsetDateTime> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.min(candidate)),
+        (Some(current), None) => Some(current),
+        (None, candidate) => candidate,
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn metric_u64(value: u64) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+pub(crate) fn scanner_data_movement_timestamp_generation(value: OffsetDateTime) -> u64 {
+    let timestamp = value.unix_timestamp_nanos();
+    if timestamp <= 0 {
+        0
+    } else {
+        u64::try_from(timestamp).unwrap_or(u64::MAX)
+    }
+}
+
+fn valid_scanner_data_movement_timestamp_generation(value: OffsetDateTime) -> Option<u64> {
+    let generation = scanner_data_movement_timestamp_generation(value);
+    (generation != 0 && generation != u64::MAX).then_some(generation)
+}
+
+fn durable_scanner_data_movement_generation(pool_meta: &PoolMeta, rebalance_meta: Option<&RebalanceMeta>) -> u64 {
+    let mut generation = 0;
+    for pool in pool_meta.pools.iter().filter(|pool| pool.decommission.is_some()) {
+        let Some(pool_generation) = valid_scanner_data_movement_timestamp_generation(pool.last_update) else {
+            return u64::MAX;
+        };
+        generation = generation.max(pool_generation);
+    }
+
+    for movement_timestamp in rebalance_meta.into_iter().flat_map(|meta| {
+        meta.stopped_at.into_iter().chain(
+            meta.pool_stats
+                .iter()
+                .flat_map(|pool| [pool.info.start_time, pool.info.end_time])
+                .flatten(),
+        )
+    }) {
+        let Some(rebalance_generation) = valid_scanner_data_movement_timestamp_generation(movement_timestamp) else {
+            return u64::MAX;
+        };
+        generation = generation.max(rebalance_generation);
+    }
+
+    if generation == 0
+        && rebalance_meta.is_some_and(|meta| !meta.id.is_empty() || !meta.pool_stats.is_empty() || meta.stopped_at.is_some())
+    {
+        u64::MAX
+    } else {
+        generation
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ScannerDataMovementSequenceState {
+    operation_epoch: u64,
+    operation_epoch_exhausted: bool,
+    movement_generation: u64,
+    movement_generation_exhausted: bool,
+}
+
+fn resolve_scanner_data_movement_pause_status(
+    pool_meta: &PoolMeta,
+    rebalance_meta: Option<&RebalanceMeta>,
+    decommission_worker_active: bool,
+    sequence: ScannerDataMovementSequenceState,
+    now: OffsetDateTime,
+) -> ScannerDataMovementPauseStatus {
+    let mut decommission_active = decommission_worker_active;
+    let mut decommission_failed = false;
+    let mut decommission_canceled = false;
+    let mut rebalance_active = false;
+    let mut started_at = None;
+    let mut movement_backlog_work_items = 0_u64;
+
+    for pool in &pool_meta.pools {
+        let Some(info) = pool.decommission.as_ref() else {
+            continue;
+        };
+        let active = info.has_decommission_state() && !info.complete && !info.failed && !info.canceled;
+        let failed = !info.queued && info.failed;
+        let canceled = !info.queued && info.canceled;
+        if !(active || failed || canceled) {
+            continue;
+        }
+
+        decommission_active |= active;
+        decommission_failed |= failed;
+        decommission_canceled |= canceled;
+        started_at = earliest_timestamp(started_at, info.start_time.or(Some(pool.last_update)));
+        let queued = usize_to_u64(info.queued_buckets.len());
+        let current_bucket = if info.bucket.is_empty() { 0 } else { 1 };
+        movement_backlog_work_items = movement_backlog_work_items.saturating_add(queued.max(current_bucket));
+    }
+
+    if let Some(rebalance_meta) = rebalance_meta {
+        for pool in &rebalance_meta.pool_stats {
+            let active = (pool.participating && pool.info.status == RebalStatus::Started) || pool.info.stopping;
+            if !active {
+                continue;
+            }
+            rebalance_active = true;
+            started_at = earliest_timestamp(started_at, pool.info.start_time);
+            movement_backlog_work_items = movement_backlog_work_items.saturating_add(usize_to_u64(pool.buckets.len()));
+        }
+    }
+
+    let mut reasons = Vec::with_capacity(6);
+    if sequence.operation_epoch_exhausted {
+        reasons.push(ScannerDataMovementPauseReason::OperationEpochExhausted);
+    }
+    if sequence.movement_generation_exhausted {
+        reasons.push(ScannerDataMovementPauseReason::MovementGenerationExhausted);
+    }
+    if decommission_active {
+        reasons.push(ScannerDataMovementPauseReason::DecommissionActive);
+    }
+    if decommission_failed {
+        reasons.push(ScannerDataMovementPauseReason::DecommissionFailed);
+    }
+    if decommission_canceled {
+        reasons.push(ScannerDataMovementPauseReason::DecommissionCanceled);
+    }
+    if rebalance_active {
+        reasons.push(ScannerDataMovementPauseReason::RebalanceActive);
+    }
+    let started_at_unix_secs = started_at.map(offset_unix_seconds).unwrap_or(0);
+    let duration_seconds = started_at
+        .and_then(|started_at| u64::try_from((now - started_at).whole_seconds()).ok())
+        .unwrap_or(0);
+    let paused = !reasons.is_empty();
+
+    ScannerDataMovementPauseStatus {
+        paused,
+        policy: SCANNER_DATA_MOVEMENT_PAUSE_POLICY,
+        reasons,
+        started_at_unix_secs,
+        duration_seconds,
+        operation_epoch: sequence.operation_epoch,
+        movement_generation: sequence.movement_generation,
+        movement_backlog_work_items,
+        movement_backlog_estimated: paused,
+    }
+}
+
+fn record_scanner_data_movement_pause_status(status: &ScannerDataMovementPauseStatus) {
+    metrics::gauge!(METRIC_SCANNER_DATA_MOVEMENT_PAUSED).set(if status.paused { 1.0 } else { 0.0 });
+    metrics::gauge!(METRIC_SCANNER_DATA_MOVEMENT_PAUSE_DURATION_SECONDS).set(metric_u64(status.duration_seconds));
+    metrics::gauge!(METRIC_SCANNER_DATA_MOVEMENT_BACKLOG_WORK_ITEMS).set(metric_u64(status.movement_backlog_work_items));
+}
+
 impl std::fmt::Debug for ECStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let disk_slot_count: usize = self.disk_map.values().map(Vec::len).sum();
@@ -298,6 +507,28 @@ impl ECStore {
     /// on one set (rustfs/backlog#1872).
     pub fn all_set_disks(&self) -> Vec<Arc<crate::set_disk::SetDisks>> {
         self.pools.iter().flat_map(|pool| pool.disk_set.iter().cloned()).collect()
+    }
+
+    /// Erasure sets that may receive scanner pause-backlog replicas.
+    ///
+    /// An actively decommissioning or already decommissioned source pool is
+    /// excluded so an operational record acknowledged during movement always
+    /// has a copy on storage that remains in the cluster. The record is kept
+    /// separate from pool and rebalance metadata.
+    pub async fn scanner_pause_backlog_writable_set_disks(&self) -> Vec<Arc<crate::set_disk::SetDisks>> {
+        let pool_meta = self.pool_meta.read().await;
+        self.pools
+            .iter()
+            .enumerate()
+            .filter(|(pool_index, _)| {
+                !pool_meta.pools.get(*pool_index).is_some_and(|pool| {
+                    pool.decommission
+                        .as_ref()
+                        .is_some_and(|info| info.has_decommission_state() && !info.failed && !info.canceled)
+                })
+            })
+            .flat_map(|(_, pool)| pool.disk_set.iter().cloned())
+            .collect()
     }
 
     /// Get server configuration (delegates to global)
@@ -454,14 +685,14 @@ impl ECStore {
         self.scanner_data_usage_publication_snapshot_blocked().await
     }
 
+    pub async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus {
+        let operation_gate = self.ctx.data_movement_operation_gate();
+        let _operation_guard = operation_gate.read_owned().await;
+        self.scanner_data_movement_pause_snapshot().await
+    }
+
     async fn scanner_data_usage_publication_snapshot_blocked(&self) -> bool {
-        if self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted() {
-            self.ctx.set_scanner_publication_state(true);
-            return true;
-        }
-        let (_, blocked) = self.scanner_data_movement_snapshot_locked().await;
-        self.ctx.set_scanner_publication_state(blocked);
-        blocked
+        self.scanner_data_movement_pause_snapshot().await.paused
     }
 
     async fn scanner_data_movement_snapshot_locked(&self) -> (bool, bool) {
@@ -481,17 +712,54 @@ impl ECStore {
                 .as_ref()
                 .is_some_and(|info| !info.queued && (info.failed || info.canceled))
         });
-        drop(pool_meta);
-
-        let rebalance_active = self
-            .rebalance_meta
-            .read()
-            .await
+        let rebalance_meta = self.rebalance_meta.read().await;
+        let rebalance_active = rebalance_meta
             .as_ref()
             .is_some_and(is_rebalance_conflicting_with_decommission);
+        self.ctx
+            .observe_durable_data_movement_generation(durable_scanner_data_movement_generation(
+                &pool_meta,
+                rebalance_meta.as_ref(),
+            ));
 
         let blocked = decommission_active || decommission_terminal || rebalance_active;
         (decommission_active || rebalance_active, blocked)
+    }
+
+    async fn scanner_data_movement_pause_snapshot(&self) -> ScannerDataMovementPauseStatus {
+        let decommission_active = {
+            let decommission_cancelers = self.decommission_cancelers.read().await;
+            decommission_cancelers
+                .iter()
+                .any(|canceler| canceler.as_ref().is_some_and(DecommissionCanceler::is_active))
+        };
+        let pool_meta = self.pool_meta.read().await.clone();
+        let rebalance_meta = self.rebalance_meta.read().await.clone();
+        self.ctx
+            .observe_durable_data_movement_generation(durable_scanner_data_movement_generation(
+                &pool_meta,
+                rebalance_meta.as_ref(),
+            ));
+        let status = resolve_scanner_data_movement_pause_status(
+            &pool_meta,
+            rebalance_meta.as_ref(),
+            decommission_active,
+            ScannerDataMovementSequenceState {
+                operation_epoch: self.ctx.data_movement_operation_epoch(),
+                operation_epoch_exhausted: self.ctx.data_movement_operation_epoch_exhausted(),
+                movement_generation: self.ctx.data_movement_generation(),
+                movement_generation_exhausted: self.ctx.data_movement_generation_exhausted(),
+            },
+            OffsetDateTime::now_utc(),
+        );
+        self.ctx.set_scanner_publication_state(status.paused);
+        record_scanner_data_movement_pause_status(&status);
+        status
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn scanner_data_movement_pause_snapshot_for_test(&self) -> ScannerDataMovementPauseStatus {
+        self.scanner_data_movement_pause_snapshot().await
     }
 
     /// Admit one short data-usage publication commit under the same
@@ -1196,7 +1464,7 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::pools::{PoolDecommissionInfo, PoolStatus};
+    use crate::core::pools::{PoolDecommissionInfo, PoolSpaceInfo, PoolStatus};
     use crate::layout::endpoints::{Endpoints, PoolEndpoints, SetupType};
     use crate::object_api::ObjectOptions;
     use crate::runtime::global::reset_local_disk_test_state;
@@ -1307,6 +1575,558 @@ mod tests {
             ctx,
             bucket_fence_registry: Arc::default(),
         })
+    }
+
+    fn scanner_sequence_state(operation_epoch: u64, movement_generation: u64) -> ScannerDataMovementSequenceState {
+        ScannerDataMovementSequenceState {
+            operation_epoch,
+            operation_epoch_exhausted: false,
+            movement_generation,
+            movement_generation_exhausted: false,
+        }
+    }
+
+    #[test]
+    fn scanner_pause_status_derives_restart_stable_decommission_fields() {
+        let started_at = OffsetDateTime::from_unix_timestamp(1_000).expect("fixed timestamp should be valid");
+        let now = OffsetDateTime::from_unix_timestamp(1_090).expect("fixed timestamp should be valid");
+        let pool_meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: started_at,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(started_at),
+                    queued_buckets: vec!["bucket-a".to_string(), "bucket-b".to_string()],
+                    bucket: "bucket-a".to_string(),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let status = resolve_scanner_data_movement_pause_status(&pool_meta, None, false, scanner_sequence_state(7, 11), now);
+
+        assert!(status.paused);
+        assert_eq!(status.policy, "global_pause");
+        assert_eq!(status.reasons, vec![ScannerDataMovementPauseReason::DecommissionActive]);
+        assert_eq!(status.started_at_unix_secs, 1_000);
+        assert_eq!(status.duration_seconds, 90);
+        assert_eq!(status.operation_epoch, 7);
+        assert_eq!(status.movement_generation, 11);
+        assert_eq!(status.movement_backlog_work_items, 2);
+        assert!(status.movement_backlog_estimated);
+    }
+
+    #[test]
+    fn completed_decommission_restores_durable_movement_generation() {
+        let completed_at = OffsetDateTime::from_unix_timestamp(1_100).expect("fixed timestamp should be valid");
+        let pool_meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: completed_at,
+                decommission: Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let durable_generation = durable_scanner_data_movement_generation(&pool_meta, None);
+        let ctx = InstanceContext::new();
+
+        ctx.observe_durable_data_movement_generation(durable_generation);
+
+        assert_eq!(durable_generation, 1_100_000_000_000);
+        assert_eq!(ctx.data_movement_generation(), durable_generation);
+    }
+
+    #[tokio::test]
+    async fn cleared_decommission_restores_durable_movement_generation_after_restart() {
+        let mut pool_meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        assert!(pool_meta.clear_decommission(0).expect("failed decommission should clear"));
+        assert!(
+            pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| !info.has_decommission_state())
+        );
+        let durable_generation = durable_scanner_data_movement_generation(&pool_meta, None);
+        let restarted = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        *restarted.pool_meta.write().await = pool_meta;
+
+        let status = restarted.scanner_data_movement_pause_status().await;
+
+        assert_ne!(durable_generation, 0);
+        assert!(!status.paused);
+        assert_eq!(status.movement_generation, durable_generation);
+        assert_eq!(restarted.scanner_data_movement_generation(), durable_generation);
+    }
+
+    #[tokio::test]
+    async fn same_tick_cleared_decommission_tombstones_advance_durable_movement_generation() {
+        let same_tick = OffsetDateTime::from_unix_timestamp(1_100).expect("fixed timestamp should be valid");
+        let mut pool_meta = PoolMeta {
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: same_tick,
+                    decommission: Some(PoolDecommissionInfo {
+                        failed: true,
+                        ..Default::default()
+                    }),
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: same_tick,
+                    decommission: Some(PoolDecommissionInfo {
+                        canceled: true,
+                        ..Default::default()
+                    }),
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(
+            pool_meta
+                .clear_decommission_at_for_test(0, same_tick, None)
+                .expect("first terminal decommission should clear")
+        );
+        let first_generation = durable_scanner_data_movement_generation(&pool_meta, None);
+        assert_eq!(
+            first_generation,
+            scanner_data_movement_timestamp_generation(same_tick + time::Duration::nanoseconds(1))
+        );
+
+        assert!(
+            pool_meta
+                .clear_decommission_at_for_test(1, same_tick, None)
+                .expect("second terminal decommission should clear")
+        );
+        let second_generation = durable_scanner_data_movement_generation(&pool_meta, None);
+        assert_eq!(
+            second_generation,
+            scanner_data_movement_timestamp_generation(same_tick + time::Duration::nanoseconds(2))
+        );
+        assert!(second_generation > first_generation);
+
+        let restarted = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        *restarted.pool_meta.write().await = pool_meta;
+        let status = restarted.scanner_data_movement_pause_status().await;
+
+        assert!(!status.paused);
+        assert_eq!(status.movement_generation, second_generation);
+        assert_eq!(restarted.scanner_data_movement_generation(), second_generation);
+    }
+
+    #[tokio::test]
+    async fn terminal_decommission_transitions_advance_durable_generation_across_same_or_earlier_clocks() {
+        let same_tick = OffsetDateTime::from_unix_timestamp(1_200).expect("fixed timestamp should be valid");
+        let earlier_tick = same_tick - time::Duration::nanoseconds(10);
+        let rebalance_floor = same_tick + time::Duration::nanoseconds(5);
+        let rebalance = RebalanceMeta {
+            stopped_at: Some(rebalance_floor),
+            id: "completed-rebalance".to_string(),
+            ..Default::default()
+        };
+        let active_decommission = |id| PoolStatus {
+            id,
+            cmd_line: format!("pool-{id}"),
+            last_update: same_tick,
+            decommission: Some(PoolDecommissionInfo {
+                start_time: Some(same_tick),
+                ..Default::default()
+            }),
+        };
+        let mut pool_meta = PoolMeta {
+            pools: vec![active_decommission(0), active_decommission(1), active_decommission(2)],
+            ..Default::default()
+        };
+
+        assert!(pool_meta.decommission_complete_at_for_test(0, same_tick, Some(&rebalance)));
+        assert_eq!(pool_meta.pools[0].last_update, rebalance_floor + time::Duration::nanoseconds(1));
+
+        assert!(pool_meta.decommission_cancel_at_for_test(1, same_tick, Some(&rebalance)));
+        assert_eq!(pool_meta.pools[1].last_update, rebalance_floor + time::Duration::nanoseconds(2));
+
+        assert!(pool_meta.decommission_failed_at_for_test(2, earlier_tick, Some(&rebalance)));
+        assert_eq!(pool_meta.pools[2].last_update, rebalance_floor + time::Duration::nanoseconds(3));
+        let durable_generation = durable_scanner_data_movement_generation(&pool_meta, Some(&rebalance));
+        assert_eq!(
+            durable_generation,
+            scanner_data_movement_timestamp_generation(rebalance_floor + time::Duration::nanoseconds(3))
+        );
+
+        let restarted = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        *restarted.pool_meta.write().await = pool_meta;
+        *restarted.rebalance_meta.write().await = Some(rebalance);
+        let status = restarted.scanner_data_movement_pause_status().await;
+
+        assert_eq!(status.movement_generation, durable_generation);
+        assert_eq!(restarted.scanner_data_movement_generation(), durable_generation);
+        assert_eq!(
+            status.reasons,
+            vec![
+                ScannerDataMovementPauseReason::DecommissionFailed,
+                ScannerDataMovementPauseReason::DecommissionCanceled
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn decommission_start_after_clear_advances_durable_generation_across_clock_rollback_after_restart() {
+        let same_tick = OffsetDateTime::from_unix_timestamp(1_250).expect("fixed timestamp should be valid");
+        let earlier_tick = same_tick - time::Duration::nanoseconds(10);
+        let rebalance_floor = same_tick + time::Duration::nanoseconds(5);
+        let rebalance = RebalanceMeta {
+            stopped_at: Some(rebalance_floor),
+            id: "completed-rebalance".to_string(),
+            ..Default::default()
+        };
+        let mut pool_meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: same_tick,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            pool_meta
+                .clear_decommission_at_for_test(0, same_tick, Some(&rebalance))
+                .expect("failed decommission should clear")
+        );
+        let cleared_at = rebalance_floor + time::Duration::nanoseconds(1);
+        assert_eq!(pool_meta.pools[0].last_update, cleared_at);
+
+        pool_meta
+            .decommission_at_for_test(
+                0,
+                PoolSpaceInfo {
+                    total: 200,
+                    free: 50,
+                    used: 150,
+                },
+                earlier_tick,
+                Some(&rebalance),
+            )
+            .expect("decommission restart after clear should be allowed");
+        let started_at = cleared_at + time::Duration::nanoseconds(1);
+        assert_eq!(pool_meta.pools[0].last_update, started_at);
+        assert_eq!(
+            pool_meta.pools[0].decommission.as_ref().and_then(|info| info.start_time),
+            Some(started_at)
+        );
+
+        assert!(pool_meta.decommission_complete_at_for_test(0, earlier_tick, Some(&rebalance)));
+        let completed_at = started_at + time::Duration::nanoseconds(1);
+        assert_eq!(pool_meta.pools[0].last_update, completed_at);
+        let durable_generation = durable_scanner_data_movement_generation(&pool_meta, Some(&rebalance));
+        assert_eq!(durable_generation, scanner_data_movement_timestamp_generation(completed_at));
+
+        let restarted = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        *restarted.pool_meta.write().await = pool_meta;
+        *restarted.rebalance_meta.write().await = Some(rebalance);
+        let status = restarted.scanner_data_movement_pause_status().await;
+
+        assert!(!status.paused);
+        assert_eq!(status.movement_generation, durable_generation);
+        assert_eq!(restarted.scanner_data_movement_generation(), durable_generation);
+    }
+
+    #[tokio::test]
+    async fn decommission_terminal_reload_failure_advances_durable_generation_across_clock_rollback_after_restart() {
+        let terminal_at = OffsetDateTime::from_unix_timestamp(1_280).expect("fixed timestamp should be valid");
+        let earlier_tick = terminal_at - time::Duration::nanoseconds(10);
+        let rebalance_floor = terminal_at + time::Duration::nanoseconds(5);
+        let rebalance = RebalanceMeta {
+            stopped_at: Some(rebalance_floor),
+            id: "completed-rebalance".to_string(),
+            ..Default::default()
+        };
+        let mut pool_meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: terminal_at,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(terminal_at),
+                    complete: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            pool_meta
+                .record_decommission_terminal_reload_failure_at_for_test(
+                    0,
+                    "complete_decommission",
+                    "peer reload failed".to_string(),
+                    earlier_tick,
+                    Some(&rebalance),
+                )
+                .expect("reload failure should be recorded")
+        );
+        let reload_failure_at = rebalance_floor + time::Duration::nanoseconds(1);
+        assert_eq!(pool_meta.pools[0].last_update, reload_failure_at);
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("decommission metadata should exist");
+        assert_eq!(info.terminal_reload_attempt_at, Some(reload_failure_at));
+        assert_eq!(
+            info.terminal_reload_failures,
+            vec!["complete_decommission: peer reload failed".to_string()]
+        );
+        let durable_generation = durable_scanner_data_movement_generation(&pool_meta, Some(&rebalance));
+        assert_eq!(durable_generation, scanner_data_movement_timestamp_generation(reload_failure_at));
+
+        let restarted = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        *restarted.pool_meta.write().await = pool_meta;
+        *restarted.rebalance_meta.write().await = Some(rebalance);
+        let status = restarted.scanner_data_movement_pause_status().await;
+
+        assert!(!status.paused);
+        assert_eq!(status.movement_generation, durable_generation);
+        assert_eq!(restarted.scanner_data_movement_generation(), durable_generation);
+    }
+
+    #[tokio::test]
+    async fn rebalance_transitions_advance_durable_generation_across_same_or_earlier_clocks_after_restart() {
+        let same_tick = OffsetDateTime::from_unix_timestamp(1_300).expect("fixed timestamp should be valid");
+        let earlier_tick = same_tick - time::Duration::nanoseconds(10);
+        let decommission_floor = same_tick + time::Duration::nanoseconds(5);
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        *store.pool_meta.write().await = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: decommission_floor,
+                decommission: Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let started_at = store.next_scanner_data_movement_update(same_tick).await;
+        assert_eq!(started_at, decommission_floor + time::Duration::nanoseconds(1));
+        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+            id: "rebalance-generation".to_string(),
+            pool_stats: vec![crate::services::rebalance::RebalanceStats {
+                participating: true,
+                info: crate::services::rebalance::RebalanceInfo {
+                    start_time: Some(started_at),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let completed_at = store.next_scanner_data_movement_update(same_tick).await;
+        assert_eq!(completed_at, decommission_floor + time::Duration::nanoseconds(2));
+        {
+            let mut rebalance_meta = store.rebalance_meta.write().await;
+            let meta = rebalance_meta.as_mut().expect("rebalance metadata should be present");
+            meta.pool_stats[0].info.status = RebalStatus::Completed;
+            meta.pool_stats[0].info.end_time = Some(completed_at);
+        }
+
+        let stopped_at = store.next_scanner_data_movement_update(earlier_tick).await;
+        assert_eq!(stopped_at, decommission_floor + time::Duration::nanoseconds(3));
+        {
+            let mut rebalance_meta = store.rebalance_meta.write().await;
+            let meta = rebalance_meta.as_mut().expect("rebalance metadata should be present");
+            meta.stopped_at = Some(stopped_at);
+        }
+        let pool_meta = store.pool_meta.read().await.clone();
+        let rebalance_meta = store.rebalance_meta.read().await.clone();
+        let durable_generation = durable_scanner_data_movement_generation(&pool_meta, rebalance_meta.as_ref());
+        assert_eq!(
+            durable_generation,
+            scanner_data_movement_timestamp_generation(decommission_floor + time::Duration::nanoseconds(3))
+        );
+
+        let restarted = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        *restarted.pool_meta.write().await = pool_meta;
+        *restarted.rebalance_meta.write().await = rebalance_meta;
+        let status = restarted.scanner_data_movement_pause_status().await;
+
+        assert!(!status.paused);
+        assert_eq!(status.movement_generation, durable_generation);
+        assert_eq!(restarted.scanner_data_movement_generation(), durable_generation);
+    }
+
+    #[test]
+    fn malformed_durable_movement_timestamp_exhausts_generation_fail_closed() {
+        let pool_meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(durable_scanner_data_movement_generation(&pool_meta, None), u64::MAX);
+        let exhausted_generation =
+            OffsetDateTime::from_unix_timestamp(253_402_300_799).expect("the largest RFC 3339 timestamp should be valid");
+        assert_eq!(scanner_data_movement_timestamp_generation(exhausted_generation), u64::MAX);
+    }
+
+    #[test]
+    fn malformed_durable_movement_timestamp_is_not_masked_by_valid_rebalance_generation() {
+        let valid_rebalance_at = OffsetDateTime::from_unix_timestamp(2_400).expect("fixed timestamp should be valid");
+        let pool_meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let rebalance_meta = RebalanceMeta {
+            id: "completed-rebalance".to_string(),
+            stopped_at: Some(valid_rebalance_at),
+            pool_stats: vec![crate::services::rebalance::RebalanceStats {
+                participating: true,
+                info: crate::services::rebalance::RebalanceInfo {
+                    start_time: Some(valid_rebalance_at - time::Duration::nanoseconds(1)),
+                    end_time: Some(valid_rebalance_at),
+                    status: RebalStatus::Completed,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(durable_scanner_data_movement_generation(&pool_meta, Some(&rebalance_meta)), u64::MAX);
+    }
+
+    #[test]
+    fn durable_movement_generation_without_records_is_zero() {
+        assert_eq!(durable_scanner_data_movement_generation(&PoolMeta::default(), None), 0);
+        assert_eq!(
+            durable_scanner_data_movement_generation(&PoolMeta::default(), Some(&RebalanceMeta::default())),
+            0
+        );
+    }
+
+    #[test]
+    fn scanner_pause_status_distinguishes_terminal_rebalance_epoch_and_idle() {
+        let last_update = OffsetDateTime::from_unix_timestamp(2_000).expect("fixed timestamp should be valid");
+        let now = OffsetDateTime::from_unix_timestamp(2_030).expect("fixed timestamp should be valid");
+        let failed = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let failed_status = resolve_scanner_data_movement_pause_status(&failed, None, false, scanner_sequence_state(3, 12), now);
+        assert_eq!(failed_status.reasons, vec![ScannerDataMovementPauseReason::DecommissionFailed]);
+        assert_eq!(failed_status.started_at_unix_secs, 2_000);
+        assert_eq!(failed_status.duration_seconds, 30);
+
+        let rebalance = RebalanceMeta {
+            pool_stats: vec![crate::services::rebalance::RebalanceStats {
+                buckets: vec!["bucket-a".to_string(), "bucket-b".to_string()],
+                participating: true,
+                info: crate::services::rebalance::RebalanceInfo {
+                    start_time: Some(last_update),
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let rebalance_status = resolve_scanner_data_movement_pause_status(
+            &PoolMeta::default(),
+            Some(&rebalance),
+            false,
+            scanner_sequence_state(4, 13),
+            now,
+        );
+        assert_eq!(rebalance_status.reasons, vec![ScannerDataMovementPauseReason::RebalanceActive]);
+        assert_eq!(rebalance_status.movement_backlog_work_items, 2);
+
+        let exhausted = resolve_scanner_data_movement_pause_status(
+            &PoolMeta::default(),
+            None,
+            false,
+            ScannerDataMovementSequenceState {
+                operation_epoch: u64::MAX,
+                operation_epoch_exhausted: true,
+                movement_generation: 14,
+                movement_generation_exhausted: false,
+            },
+            now,
+        );
+        assert_eq!(exhausted.reasons, vec![ScannerDataMovementPauseReason::OperationEpochExhausted]);
+        assert_eq!(exhausted.started_at_unix_secs, 0);
+
+        let generation_exhausted = resolve_scanner_data_movement_pause_status(
+            &PoolMeta::default(),
+            None,
+            false,
+            ScannerDataMovementSequenceState {
+                operation_epoch: 5,
+                operation_epoch_exhausted: false,
+                movement_generation: u64::MAX,
+                movement_generation_exhausted: true,
+            },
+            now,
+        );
+        assert_eq!(
+            generation_exhausted.reasons,
+            vec![ScannerDataMovementPauseReason::MovementGenerationExhausted]
+        );
+
+        let idle =
+            resolve_scanner_data_movement_pause_status(&PoolMeta::default(), None, false, scanner_sequence_state(5, 15), now);
+        assert!(!idle.paused);
+        assert!(idle.reasons.is_empty());
+        assert!(!idle.movement_backlog_estimated);
     }
 
     #[tokio::test]

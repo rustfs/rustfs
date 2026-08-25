@@ -952,6 +952,8 @@ fn record_decommission_unresolved_entry(
     idx: usize,
     generation: OffsetDateTime,
     entry: DecommissionUnresolvedEntry,
+    now: OffsetDateTime,
+    rebalance_meta: Option<&RebalanceMeta>,
 ) -> Result<bool> {
     ensure_decommission_generation(meta, idx, generation)?;
     if entry.pool_index != idx || entry.source_generation != generation {
@@ -959,34 +961,37 @@ fn record_decommission_unresolved_entry(
     }
 
     let pool_count = meta.pools.len();
-    let Some(pool) = meta.pools.get_mut(idx) else {
+    let Some(pool) = meta.pools.get(idx) else {
         return Err(invalid_decommission_pool_index_error(pool_count, idx));
     };
-    let Some(info) = pool.decommission.as_mut() else {
+    let Some(info) = pool.decommission.as_ref() else {
         return Err(decommission_metadata_not_initialized_error("record decommission unresolved entry"));
     };
-    let existing = info.unresolved_entries.iter_mut().find(|existing| {
+    let existing_index = info.unresolved_entries.iter().position(|existing| {
         existing.bucket == entry.bucket
             && existing.object == entry.object
             && existing.pool_index == entry.pool_index
             && existing.set_index == entry.set_index
             && existing.source_generation == entry.source_generation
     });
-    let changed = match existing {
-        Some(existing) if existing == &entry => false,
-        Some(existing) => {
-            *existing = entry;
-            true
-        }
-        None => {
-            info.unresolved_entries.push(entry);
-            true
-        }
-    };
-    if changed {
-        pool.last_update = OffsetDateTime::now_utc();
+    if existing_index.is_some_and(|index| info.unresolved_entries[index] == entry) {
+        return Ok(false);
     }
-    Ok(changed)
+
+    let last_update = meta.next_scanner_data_movement_update(now, rebalance_meta);
+    let Some(pool) = meta.pools.get_mut(idx) else {
+        return Err(invalid_decommission_pool_index_error(pool_count, idx));
+    };
+    let Some(info) = pool.decommission.as_mut() else {
+        return Err(decommission_metadata_not_initialized_error("record decommission unresolved entry"));
+    };
+    if let Some(index) = existing_index {
+        info.unresolved_entries[index] = entry;
+    } else {
+        info.unresolved_entries.push(entry);
+    }
+    pool.last_update = last_update;
+    Ok(true)
 }
 
 type DecommissionUnresolvedEntryIdentity = (usize, String, String);
@@ -1760,7 +1765,11 @@ fn merge_pool_meta_updates_for_save(
         if current_pool.id != idx || persisted_pool.id != idx || current_pool.cmd_line != persisted_pool.cmd_line {
             return Err(Error::other(format!("{operation}: pool metadata layout changed for pool {idx}")));
         }
-        if current_pool.decommission.is_none()
+        let current_clears_decommission = current_pool
+            .decommission
+            .as_ref()
+            .is_none_or(|info| !info.has_decommission_state());
+        if current_clears_decommission
             && persisted_pool.decommission.as_ref().is_some_and(|info| {
                 info.has_decommission_state() && is_decommission_active(info.complete, info.failed, info.canceled)
             })
@@ -1770,6 +1779,19 @@ fn merge_pool_meta_updates_for_save(
                 "{operation}: stale pool metadata update rejected for pool {idx}; persisted active or queued decommission cannot be cleared"
             )));
         }
+        if current_clears_decommission
+            && persisted_pool
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.complete || !info.unresolved_entries.is_empty())
+        {
+            record_pool_meta_stale_write_rejection("unsafe_terminal_decommission_clear");
+            return Err(Error::StalePoolMetadataUpdate {
+                operation: operation.to_string(),
+                pool_index: idx,
+                reason: "completed or unresolved decommission state cannot be cleared",
+            });
+        }
         if current_pool.last_update < persisted_pool.last_update {
             record_pool_meta_stale_write_rejection("older_pool_revision");
             return Err(Error::other(format!(
@@ -1778,6 +1800,7 @@ fn merge_pool_meta_updates_for_save(
         }
         if let (Some(persisted_info), Some(current_info)) =
             (persisted_pool.decommission.as_ref(), current_pool.decommission.as_ref())
+            && current_info.has_decommission_state()
         {
             let persisted_terminal = (persisted_info.complete, persisted_info.failed, persisted_info.canceled);
             let current_terminal = (current_info.complete, current_info.failed, current_info.canceled);
@@ -4594,6 +4617,45 @@ impl PoolMetaSaveOutcome {
 }
 
 impl PoolMeta {
+    fn current_decommission_movement_update(&self) -> Option<OffsetDateTime> {
+        self.pools
+            .iter()
+            .filter(|pool| pool.decommission.is_some())
+            .map(|pool| pool.last_update)
+            .max()
+    }
+
+    fn current_rebalance_movement_update(rebalance_meta: Option<&RebalanceMeta>) -> Option<OffsetDateTime> {
+        rebalance_meta
+            .into_iter()
+            .flat_map(|meta| {
+                meta.stopped_at.into_iter().chain(
+                    meta.pool_stats
+                        .iter()
+                        .flat_map(|pool| [pool.info.start_time, pool.info.end_time])
+                        .flatten(),
+                )
+            })
+            .max()
+    }
+
+    pub(crate) fn next_scanner_data_movement_update(
+        &self,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> OffsetDateTime {
+        let max_seen = self
+            .current_decommission_movement_update()
+            .max(Self::current_rebalance_movement_update(rebalance_meta));
+        match max_seen {
+            Some(max_seen) => max_seen
+                .checked_add(Duration::nanoseconds(1))
+                .map(|next| now.max(next))
+                .unwrap_or(max_seen),
+            None => now,
+        }
+    }
+
     fn decode_pool_meta_payload(version: u16, payload: &[u8]) -> Result<Self> {
         match version {
             POOL_META_VERSION => rmp_serde::from_slice::<PersistedPoolMeta>(payload)
@@ -4673,6 +4735,7 @@ impl PoolMeta {
         idx: usize,
         duration: Duration,
         now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
     ) -> Result<Option<DecommissionProgressCheckpoint>> {
         let pool_count = self.pools.len();
         ensure_valid_decommission_pool_index(pool_count, idx)?;
@@ -4698,7 +4761,7 @@ impl PoolMeta {
             start_time: info.start_time,
             queued: info.queued,
             counted_items: info.counted_items(),
-            checkpoint_at: now,
+            checkpoint_at: self.next_scanner_data_movement_update(now, rebalance_meta),
         }))
     }
 
@@ -5245,63 +5308,101 @@ impl PoolMeta {
     }
 
     pub fn decommission_cancel(&mut self, idx: usize) -> bool {
-        if let Some(stats) = self.pools.get_mut(idx) {
-            if let Some(d) = &stats.decommission {
-                if !d.canceled {
-                    stats.last_update = OffsetDateTime::now_utc();
+        self.decommission_cancel_at(idx, OffsetDateTime::now_utc(), None)
+    }
 
-                    let mut pd = d.clone();
-                    pd.canceled = true;
-                    pd.failed = false;
-                    pd.complete = false;
-                    pd.start_time = None;
-                    pd.terminal_reload_attempt_at = None;
-                    pd.terminal_reload_failures.clear();
+    #[cfg(test)]
+    pub(crate) fn decommission_cancel_at_for_test(
+        &mut self,
+        idx: usize,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> bool {
+        self.decommission_cancel_at(idx, now, rebalance_meta)
+    }
 
-                    stats.decommission = Some(pd);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+    fn decommission_cancel_at(&mut self, idx: usize, now: OffsetDateTime, rebalance_meta: Option<&RebalanceMeta>) -> bool {
+        let Some(d) = self.pools.get(idx).and_then(|stats| stats.decommission.as_ref()) else {
+            return false;
+        };
+        if d.canceled {
+            return false;
         }
+
+        let last_update = self.next_scanner_data_movement_update(now, rebalance_meta);
+        let mut pd = d.clone();
+        pd.canceled = true;
+        pd.failed = false;
+        pd.complete = false;
+        pd.start_time = None;
+        pd.terminal_reload_attempt_at = None;
+        pd.terminal_reload_failures.clear();
+
+        let Some(stats) = self.pools.get_mut(idx) else {
+            return false;
+        };
+        stats.last_update = last_update;
+        stats.decommission = Some(pd);
+        true
     }
     pub fn decommission_failed(&mut self, idx: usize) -> bool {
-        if let Some(stats) = self.pools.get_mut(idx) {
-            if let Some(d) = &stats.decommission {
-                if is_decommission_active(d.complete, d.failed, d.canceled) {
-                    stats.last_update = OffsetDateTime::now_utc();
+        self.decommission_failed_at(idx, OffsetDateTime::now_utc(), None)
+    }
 
-                    let mut pd = d.clone();
-                    pd.canceled = false;
-                    pd.failed = true;
-                    pd.complete = false;
-                    pd.start_time = None;
-                    pd.terminal_reload_attempt_at = None;
-                    pd.terminal_reload_failures.clear();
+    #[cfg(test)]
+    pub(crate) fn decommission_failed_at_for_test(
+        &mut self,
+        idx: usize,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> bool {
+        self.decommission_failed_at(idx, now, rebalance_meta)
+    }
 
-                    stats.decommission = Some(pd);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
+    fn decommission_failed_at(&mut self, idx: usize, now: OffsetDateTime, rebalance_meta: Option<&RebalanceMeta>) -> bool {
+        let Some(d) = self.pools.get(idx).and_then(|stats| stats.decommission.as_ref()) else {
+            return false;
+        };
+        if !is_decommission_active(d.complete, d.failed, d.canceled) {
+            return false;
         }
+
+        let last_update = self.next_scanner_data_movement_update(now, rebalance_meta);
+        let mut pd = d.clone();
+        pd.canceled = false;
+        pd.failed = true;
+        pd.complete = false;
+        pd.start_time = None;
+        pd.terminal_reload_attempt_at = None;
+        pd.terminal_reload_failures.clear();
+
+        let Some(stats) = self.pools.get_mut(idx) else {
+            return false;
+        };
+        stats.last_update = last_update;
+        stats.decommission = Some(pd);
+        true
     }
 
     pub fn clear_decommission(&mut self, idx: usize) -> Result<bool> {
+        self.clear_decommission_at(idx, OffsetDateTime::now_utc(), None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_decommission_at_for_test(
+        &mut self,
+        idx: usize,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> Result<bool> {
+        self.clear_decommission_at(idx, now, rebalance_meta)
+    }
+
+    fn clear_decommission_at(&mut self, idx: usize, now: OffsetDateTime, rebalance_meta: Option<&RebalanceMeta>) -> Result<bool> {
         let pool_count = self.pools.len();
         ensure_valid_decommission_pool_index(pool_count, idx)?;
 
-        let Some(pool) = self.pools.get_mut(idx) else {
+        let Some(pool) = self.pools.get(idx) else {
             return Err(invalid_decommission_pool_index_error(pool_count, idx));
         };
 
@@ -5321,52 +5422,95 @@ impl PoolMeta {
 
         ensure_decommission_clear_allowed(true, decommission_present, complete, failed, canceled, unresolved_entries)?;
 
-        pool.last_update = OffsetDateTime::now_utc();
-        pool.decommission = None;
+        let last_update = self.next_scanner_data_movement_update(now, rebalance_meta);
+        let Some(pool) = self.pools.get_mut(idx) else {
+            return Err(invalid_decommission_pool_index_error(pool_count, idx));
+        };
+        pool.last_update = last_update;
+        // Preserve a state-empty tombstone so scanner catch-up can recover the
+        // durable movement generation after a clear followed by a restart.
+        pool.decommission = Some(PoolDecommissionInfo::default());
         Ok(true)
     }
 
     pub fn decommission_complete(&mut self, idx: usize) -> bool {
-        if let Some(stats) = self.pools.get_mut(idx) {
-            if let Some(d) = &stats.decommission {
-                if is_decommission_active(d.complete, d.failed, d.canceled) {
-                    stats.last_update = OffsetDateTime::now_utc();
-
-                    let mut pd = d.clone();
-                    pd.canceled = false;
-                    pd.failed = false;
-                    pd.complete = true;
-                    pd.terminal_reload_attempt_at = None;
-                    pd.terminal_reload_failures.clear();
-
-                    stats.decommission = Some(pd);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        }
+        self.decommission_complete_at(idx, OffsetDateTime::now_utc(), None)
     }
-    fn set_decommission_state(&mut self, idx: usize, pi: PoolSpaceInfo, queued: bool) -> Result<()> {
+
+    #[cfg(test)]
+    pub(crate) fn decommission_complete_at_for_test(
+        &mut self,
+        idx: usize,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> bool {
+        self.decommission_complete_at(idx, now, rebalance_meta)
+    }
+
+    fn decommission_complete_at(&mut self, idx: usize, now: OffsetDateTime, rebalance_meta: Option<&RebalanceMeta>) -> bool {
+        let Some(d) = self.pools.get(idx).and_then(|stats| stats.decommission.as_ref()) else {
+            return false;
+        };
+        if !is_decommission_active(d.complete, d.failed, d.canceled) {
+            return false;
+        }
+
+        let last_update = self.next_scanner_data_movement_update(now, rebalance_meta);
+        let mut pd = d.clone();
+        pd.canceled = false;
+        pd.failed = false;
+        pd.complete = true;
+        pd.terminal_reload_attempt_at = None;
+        pd.terminal_reload_failures.clear();
+
+        let Some(stats) = self.pools.get_mut(idx) else {
+            return false;
+        };
+        stats.last_update = last_update;
+        stats.decommission = Some(pd);
+        true
+    }
+    fn set_decommission_state_at(
+        &mut self,
+        idx: usize,
+        pi: PoolSpaceInfo,
+        queued: bool,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> Result<()> {
         let pool_count = self.pools.len();
         ensure_valid_decommission_pool_index(pool_count, idx)?;
 
-        let Some(pool) = self.pools.get_mut(idx) else {
+        let Some(pool) = self.pools.get(idx) else {
             return Err(invalid_decommission_pool_index_error(pool_count, idx));
         };
 
         ensure_decommission_start_allowed(decommission_start_pool_state(Some(pool)))?;
 
+        let generation = self.next_scanner_data_movement_update(now, rebalance_meta);
+        let Some(pool) = self.pools.get_mut(idx) else {
+            return Err(invalid_decommission_pool_index_error(pool_count, idx));
+        };
         let previous = pool.decommission.as_ref();
-        let now = OffsetDateTime::now_utc();
-        pool.last_update = now;
-        pool.decommission = Some(build_decommission_start_state(pi, queued, now, previous));
+        pool.last_update = generation;
+        pool.decommission = Some(build_decommission_start_state(pi, queued, generation, previous));
 
         Ok(())
+    }
+
+    fn set_decommission_state(&mut self, idx: usize, pi: PoolSpaceInfo, queued: bool) -> Result<()> {
+        self.set_decommission_state_at(idx, pi, queued, OffsetDateTime::now_utc(), None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decommission_at_for_test(
+        &mut self,
+        idx: usize,
+        pi: PoolSpaceInfo,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> Result<()> {
+        self.set_decommission_state_at(idx, pi, false, now, rebalance_meta)
     }
 
     pub fn decommission(&mut self, idx: usize, pi: PoolSpaceInfo) -> Result<()> {
@@ -5378,13 +5522,36 @@ impl PoolMeta {
     }
 
     pub fn record_decommission_terminal_reload_failure(&mut self, idx: usize, stage: &str, message: String) -> Result<bool> {
+        self.record_decommission_terminal_reload_failure_at(idx, stage, message, OffsetDateTime::now_utc(), None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_decommission_terminal_reload_failure_at_for_test(
+        &mut self,
+        idx: usize,
+        stage: &str,
+        message: String,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> Result<bool> {
+        self.record_decommission_terminal_reload_failure_at(idx, stage, message, now, rebalance_meta)
+    }
+
+    fn record_decommission_terminal_reload_failure_at(
+        &mut self,
+        idx: usize,
+        stage: &str,
+        message: String,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> Result<bool> {
         let pool_count = self.pools.len();
         ensure_valid_decommission_pool_index(pool_count, idx)?;
 
-        let Some(pool) = self.pools.get_mut(idx) else {
+        let Some(pool) = self.pools.get(idx) else {
             return Err(invalid_decommission_pool_index_error(pool_count, idx));
         };
-        let Some(info) = pool.decommission.as_mut() else {
+        let Some(info) = pool.decommission.as_ref() else {
             return Err(decommission_metadata_not_initialized_error("record decommission terminal reload failure"));
         };
 
@@ -5393,29 +5560,60 @@ impl PoolMeta {
             return Ok(false);
         }
 
-        pool.last_update = OffsetDateTime::now_utc();
-        info.terminal_reload_attempt_at = Some(pool.last_update);
+        let last_update = self.next_scanner_data_movement_update(now, rebalance_meta);
+        let Some(pool) = self.pools.get_mut(idx) else {
+            return Err(invalid_decommission_pool_index_error(pool_count, idx));
+        };
+        let Some(info) = pool.decommission.as_mut() else {
+            return Err(decommission_metadata_not_initialized_error("record decommission terminal reload failure"));
+        };
+        pool.last_update = last_update;
+        info.terminal_reload_attempt_at = Some(last_update);
         info.terminal_reload_failures.push(failure);
         Ok(true)
     }
 
     pub fn promote_queued_decommission(&mut self, idx: usize) -> bool {
-        if let Some(pool) = self.pools.get_mut(idx)
-            && let Some(info) = pool.decommission.as_mut()
-            && info.queued
-            && is_decommission_active(info.complete, info.failed, info.canceled)
-        {
-            let now = OffsetDateTime::now_utc();
-            pool.last_update = now;
-            info.queued = false;
-            let generation = *info.start_time.get_or_insert(now);
-            for entry in &mut info.unresolved_entries {
-                entry.source_generation = generation;
-            }
-            return true;
+        self.promote_queued_decommission_at(idx, OffsetDateTime::now_utc(), None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn promote_queued_decommission_at_for_test(
+        &mut self,
+        idx: usize,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> bool {
+        self.promote_queued_decommission_at(idx, now, rebalance_meta)
+    }
+
+    fn promote_queued_decommission_at(
+        &mut self,
+        idx: usize,
+        now: OffsetDateTime,
+        rebalance_meta: Option<&RebalanceMeta>,
+    ) -> bool {
+        let Some(info) = self.pools.get(idx).and_then(|pool| pool.decommission.as_ref()) else {
+            return false;
+        };
+        if !info.queued || !is_decommission_active(info.complete, info.failed, info.canceled) {
+            return false;
         }
 
-        false
+        let generation = self.next_scanner_data_movement_update(now, rebalance_meta);
+        let Some(pool) = self.pools.get_mut(idx) else {
+            return false;
+        };
+        let Some(info) = pool.decommission.as_mut() else {
+            return false;
+        };
+        pool.last_update = generation;
+        info.queued = false;
+        info.start_time = Some(generation);
+        for entry in &mut info.unresolved_entries {
+            entry.source_generation = generation;
+        }
+        true
     }
     pub fn queue_buckets(&mut self, idx: usize, bks: Vec<DecomBucketInfo>) {
         if let Some(pool) = self.pools.get_mut(idx)
@@ -5494,7 +5692,7 @@ impl PoolMeta {
 
     pub fn update_after(&mut self, idx: usize, duration: Duration) -> Result<bool> {
         Ok(self
-            .decommission_progress_checkpoint(idx, duration, OffsetDateTime::now_utc())?
+            .decommission_progress_checkpoint(idx, duration, OffsetDateTime::now_utc(), None)?
             .is_some())
     }
 
@@ -6241,9 +6439,17 @@ impl ECStore {
         entry: DecommissionUnresolvedEntry,
     ) -> Result<()> {
         {
+            let rebalance_meta = self.rebalance_meta.read().await.clone();
             let mut pool_meta = self.pool_meta.write().await;
             ensure_decommission_ledger_persistence_supported(&pool_meta)?;
-            record_decommission_unresolved_entry(&mut pool_meta, idx, generation, entry)?;
+            record_decommission_unresolved_entry(
+                &mut pool_meta,
+                idx,
+                generation,
+                entry,
+                OffsetDateTime::now_utc(),
+                rebalance_meta.as_ref(),
+            )?;
         }
         self.save_current_pool_meta(&[idx])
             .await
@@ -6251,19 +6457,32 @@ impl ECStore {
     }
 
     async fn save_decommission_progress_checkpoint(&self, idx: usize, generation: OffsetDateTime) -> Result<bool> {
-        // Lock order: save gate, then the short pool metadata read/write sections. Peer
-        // reloads are intentionally performed by the caller after both locks are released.
+        self.save_decommission_progress_checkpoint_at(idx, generation, OffsetDateTime::now_utc())
+            .await
+    }
+
+    async fn save_decommission_progress_checkpoint_at(
+        &self,
+        idx: usize,
+        generation: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool> {
+        // Lock order: save gate, rebalance metadata, then the short pool
+        // metadata read/write sections. Peer reloads are intentionally
+        // performed by the caller after both locks are released.
         let mut save_guard = self.pool_meta_save_gate.lock().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission progress save failed")
             .await?;
         let (snapshot, checkpoint) = {
+            let rebalance_meta = self.rebalance_meta.read().await.clone();
             let pool_meta = self.pool_meta.read().await;
             ensure_decommission_generation(&pool_meta, idx, generation)?;
             let Some(checkpoint) = pool_meta.decommission_progress_checkpoint(
                 idx,
                 DECOMMISSION_PROGRESS_SAVE_INTERVAL,
-                OffsetDateTime::now_utc(),
+                now,
+                rebalance_meta.as_ref(),
             )?
             else {
                 return Ok(false);
@@ -6398,11 +6617,13 @@ impl ECStore {
         let previous_pool_meta = latest_pool_meta.clone();
         let first_idx = indices.first().copied();
         for (idx, pi) in space_infos {
-            if Some(idx) == first_idx {
-                latest_pool_meta.decommission(idx, pi)?;
-            } else {
-                latest_pool_meta.queue_decommission(idx, pi)?;
-            }
+            latest_pool_meta.set_decommission_state_at(
+                idx,
+                pi,
+                Some(idx) != first_idx,
+                OffsetDateTime::now_utc(),
+                Some(&rebalance_meta),
+            )?;
             latest_pool_meta.queue_buckets(idx, decom_buckets.clone());
         }
 
@@ -6517,6 +6738,12 @@ impl ECStore {
         Ok(space_infos)
     }
 
+    pub(crate) async fn next_scanner_data_movement_update(&self, now: OffsetDateTime) -> OffsetDateTime {
+        let pool_meta = self.pool_meta.read().await;
+        let rebalance_meta = self.rebalance_meta.read().await;
+        pool_meta.next_scanner_data_movement_update(now, rebalance_meta.as_ref())
+    }
+
     #[tracing::instrument(skip(self))]
     pub async fn decommission_cancel(self: &Arc<Self>, idx: usize) -> Result<()> {
         self.decommission_cancel_with_owner(idx, None).await
@@ -6575,12 +6802,14 @@ impl ECStore {
             .and_then(rustfs_lock::NamespaceLockGuard::lock_lost_signal);
 
         // Lock order: start gate, save gate, distributed pool metadata fence,
-        // decommission_cancelers, then pool_meta. The state guards stay held
-        // across persistence so the active generation cannot change before
-        // the cancel is published.
+        // rebalance_meta, decommission_cancelers, then pool_meta. The state
+        // guards stay held across persistence so the active generation cannot
+        // change before the cancel is published.
+        let rebalance_meta = self.rebalance_meta.read().await.clone();
+        let terminal_at = OffsetDateTime::now_utc();
         let mut cancelers = self.decommission_cancelers.write().await;
         let mut pool_meta = self.pool_meta.write().await;
-        let (pending, should_reload_pool_meta, already_canceled, terminal_canceler) = {
+        let (pending, should_reload_pool_meta, already_canceled, terminal_canceler, durable_movement_generation) = {
             let mut already_canceled = false;
             let (pool_present, decommission_present, terminal) = if let Some(pool) = pool_meta.pools.get(idx) {
                 if let Some(info) = pool.decommission.as_ref() {
@@ -6609,7 +6838,7 @@ impl ECStore {
                 .ok_or_else(|| decommission_metadata_not_initialized_error("cancel decommission"))?;
             let mut snapshot = pool_meta.clone();
             let Some(changed) = update_decommission_for_operation(cancelers.as_slice(), &mut snapshot, idx, owner, |pool_meta| {
-                pool_meta.decommission_cancel(idx)
+                pool_meta.decommission_cancel_at(idx, terminal_at, rebalance_meta.as_ref())
             }) else {
                 return Ok(());
             };
@@ -6640,11 +6869,16 @@ impl ECStore {
             } else {
                 cancelers.get(idx).and_then(Option::as_ref).cloned()
             };
+            let durable_movement_generation = pending
+                .as_ref()
+                .map(|(_, commit)| crate::store::scanner_data_movement_timestamp_generation(commit.canceled_pool.last_update))
+                .unwrap_or_default();
             (
                 pending,
                 should_retry_decommission_cancel_reload(changed, already_canceled),
                 already_canceled,
                 terminal_canceler,
+                durable_movement_generation,
             )
         };
         let active_worker = terminal_canceler.as_ref().is_some_and(DecommissionCanceler::is_active);
@@ -6698,7 +6932,8 @@ impl ECStore {
             // the shared gate without deadlocking the terminal transition.
             let movement_gate = self.ctx.data_movement_operation_gate();
             let _movement_guard = movement_gate.write().await;
-            self.ctx.advance_data_movement_operation_epoch();
+            self.ctx
+                .advance_data_movement_operation_epoch_to_durable_generation(durable_movement_generation);
         }
 
         if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
@@ -6897,9 +7132,11 @@ impl ECStore {
         let _movement_guard = movement_gate.write().await;
 
         let (should_reload_pool_meta, previous_pool_meta) = {
+            let rebalance_meta = self.rebalance_meta.read().await.clone();
+            let terminal_at = OffsetDateTime::now_utc();
             let mut pool_meta = self.pool_meta.write().await;
             let previous_pool_meta = pool_meta.clone();
-            let changed = pool_meta.clear_decommission(idx)?;
+            let changed = pool_meta.clear_decommission_at(idx, terminal_at, rebalance_meta.as_ref())?;
             (changed, changed.then_some(previous_pool_meta))
         };
 
@@ -6946,12 +7183,13 @@ impl ECStore {
             let (pool_meta_guard, mut snapshot) = self
                 .acquire_pool_meta_write_guard(&mut save_guard, "decommission promotion failed")
                 .await?;
+            let rebalance_meta = self.rebalance_meta.read().await.clone();
             let mut pool_meta = self.pool_meta.write().await;
             if pool_meta.pools.get(idx).is_none() {
                 return Err(Error::other("failed to start decommission: target pool was not found"));
             }
             let reconciled = reconcile_decommission_meta_buckets(&mut pool_meta, idx);
-            let promoted = pool_meta.promote_queued_decommission(idx);
+            let promoted = pool_meta.promote_queued_decommission_at(idx, OffsetDateTime::now_utc(), rebalance_meta.as_ref());
             let changed = reconciled || promoted;
             if changed {
                 merge_pool_meta_updates_for_save(&mut snapshot, &pool_meta, &[idx], "decommission promotion failed")?;
@@ -7019,8 +7257,15 @@ impl ECStore {
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.write().await;
         let changed = {
+            let rebalance_meta = self.rebalance_meta.read().await.clone();
             let mut pool_meta = self.pool_meta.write().await;
-            pool_meta.record_decommission_terminal_reload_failure(idx, stage, err.to_string())?
+            pool_meta.record_decommission_terminal_reload_failure_at(
+                idx,
+                stage,
+                err.to_string(),
+                OffsetDateTime::now_utc(),
+                rebalance_meta.as_ref(),
+            )?
         };
 
         if changed {
@@ -9025,16 +9270,18 @@ impl ECStore {
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.write().await;
 
-        // Lock order: movement gate, then decommission_cancelers, then pool_meta.
-        // Holding both state locks makes owner validation and the terminal
-        // transition one atomic operation.
+        // Lock order: movement gate, rebalance_meta, decommission_cancelers,
+        // then pool_meta. Holding both state locks makes owner validation and
+        // the terminal transition one atomic operation.
+        let rebalance_meta = self.rebalance_meta.read().await.clone();
+        let terminal_at = OffsetDateTime::now_utc();
         let (should_reload_pool_meta, previous_pool_meta, terminal_canceler) = {
             let cancelers = self.decommission_cancelers.read().await;
             let mut pool_meta = self.pool_meta.write().await;
             let previous_pool_meta = pool_meta.clone();
             let Some(changed) =
                 update_decommission_for_operation(cancelers.as_slice(), &mut pool_meta, idx, owner, |pool_meta| {
-                    pool_meta.decommission_failed(idx)
+                    pool_meta.decommission_failed_at(idx, terminal_at, rebalance_meta.as_ref())
                 })
             else {
                 return Ok(());
@@ -9142,9 +9389,11 @@ impl ECStore {
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.write().await;
 
-        // Lock order: movement gate, then decommission_cancelers, then pool_meta.
-        // Holding both state locks makes owner validation and the terminal
-        // transition one atomic operation.
+        // Lock order: movement gate, rebalance_meta, decommission_cancelers,
+        // then pool_meta. Holding both state locks makes owner validation and
+        // the terminal transition one atomic operation.
+        let rebalance_meta = self.rebalance_meta.read().await.clone();
+        let terminal_at = OffsetDateTime::now_utc();
         let (should_reload_pool_meta, completed, previous_pool_meta, terminal_canceler) = {
             let cancelers = self.decommission_cancelers.read().await;
             let mut pool_meta = self.pool_meta.write().await;
@@ -9157,7 +9406,7 @@ impl ECStore {
                         verified_generation,
                         verified_unresolved_entries.as_deref(),
                     )?;
-                    Ok::<bool, Error>(pool_meta.decommission_complete(idx))
+                    Ok::<bool, Error>(pool_meta.decommission_complete_at(idx, terminal_at, rebalance_meta.as_ref()))
                 })
             else {
                 return Ok(());
@@ -13662,8 +13911,10 @@ mod pools_tests {
         );
         let pool_meta = store.pool_meta.read().await;
         assert!(
-            pool_meta.pools[0].decommission.is_none(),
-            "the detached transaction should publish the persisted clear"
+            pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| !info.has_decommission_state())
         );
     }
 
@@ -14101,7 +14352,12 @@ mod pools_tests {
         merge_pool_meta_updates_for_save(&mut persisted, &current, &[0], "clear decommission")
             .expect("the target pool update should merge into the latest snapshot");
 
-        assert!(persisted.pools[0].decommission.is_none());
+        assert!(
+            persisted.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| !info.has_decommission_state())
+        );
         assert_eq!(persisted.pools[1].last_update, newer);
         assert!(persisted.pools[1].decommission.as_ref().is_some_and(|info| info.failed));
     }
@@ -14140,6 +14396,59 @@ mod pools_tests {
 
         assert!(err.to_string().contains("stale pool metadata update rejected"));
         assert!(persisted.pools[0].decommission.as_ref().is_some_and(|info| info.canceled));
+    }
+
+    #[test]
+    fn test_pool_meta_save_merge_rejects_clear_over_completed_or_unresolved_state() {
+        let timestamp = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
+        for persisted_info in [
+            PoolDecommissionInfo {
+                complete: true,
+                ..Default::default()
+            },
+            PoolDecommissionInfo {
+                failed: true,
+                unresolved_entries: vec![DecommissionUnresolvedEntry {
+                    bucket: "bucket-a".to_string(),
+                    object: "object-a".to_string(),
+                    pool_index: 0,
+                    set_index: 0,
+                    source_generation: timestamp,
+                    candidate_count: 1,
+                    disk_error_count: 1,
+                    observed_at: timestamp,
+                    reason: "test unresolved entry".to_string(),
+                }],
+                ..Default::default()
+            },
+        ] {
+            let mut persisted = PoolMeta {
+                pools: vec![PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: timestamp,
+                    decommission: Some(persisted_info),
+                }],
+                ..Default::default()
+            };
+            let cleared = PoolMeta {
+                pools: vec![PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::now_utc(),
+                    decommission: Some(PoolDecommissionInfo::default()),
+                }],
+                ..Default::default()
+            };
+
+            let err = merge_pool_meta_updates_for_save(&mut persisted, &cleared, &[0], "clear decommission")
+                .expect_err("a stale clear must not erase completed or unresolved state");
+
+            assert!(
+                err.to_string()
+                    .contains("completed or unresolved decommission state cannot be cleared")
+            );
+        }
     }
 
     #[test]
@@ -15533,8 +15842,15 @@ mod pools_tests {
         };
 
         assert!(
-            record_decommission_unresolved_entry(&mut pool_meta, 0, generation, unresolved_entry.clone())
-                .expect("active generation should accept unresolved entry")
+            record_decommission_unresolved_entry(
+                &mut pool_meta,
+                0,
+                generation,
+                unresolved_entry.clone(),
+                generation + Duration::nanoseconds(1),
+                None,
+            )
+            .expect("active generation should accept unresolved entry")
         );
         let err = reconcile_decommission_unresolved_entries_for_completion(&mut pool_meta, 0, None, None)
             .expect_err("unverified completion must retain unresolved entries");
@@ -15558,8 +15874,15 @@ mod pools_tests {
         replacement.disk_error_count = 2;
         replacement.observed_at = generation + Duration::seconds(1);
         assert!(
-            record_decommission_unresolved_entry(&mut pool_meta, 0, generation, replacement.clone())
-                .expect("a newer observation should replace the ledger entry")
+            record_decommission_unresolved_entry(
+                &mut pool_meta,
+                0,
+                generation,
+                replacement.clone(),
+                generation + Duration::nanoseconds(2),
+                None,
+            )
+            .expect("a newer observation should replace the ledger entry")
         );
         let err =
             reconcile_decommission_unresolved_entries_for_completion(&mut pool_meta, 0, Some(generation), Some(&stale_verified))
@@ -15653,6 +15976,100 @@ mod pools_tests {
                 .unresolved_entries,
             in_memory_entries
         );
+    }
+
+    #[tokio::test]
+    async fn decommission_metadata_saves_stay_monotonic_across_clock_rollback_before_terminal_restart() {
+        let (_dirs, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        let persisted_floor = store.pool_meta.read().await.pools[0].last_update;
+        let generation = persisted_floor
+            .checked_add(Duration::seconds(1))
+            .expect("test generation should advance the initialized pool metadata");
+        let earlier_tick = generation - Duration::nanoseconds(10);
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.dont_save = false;
+            pool_meta.pools[0].last_update = generation;
+            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
+                start_time: Some(generation),
+                ..Default::default()
+            });
+        }
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("active decommission metadata should persist before rollback checkpoints");
+
+        let unresolved_entry = DecommissionUnresolvedEntry {
+            bucket: "bucket-a".to_string(),
+            object: "object-a".to_string(),
+            pool_index: 0,
+            set_index: 0,
+            source_generation: generation,
+            candidate_count: 1,
+            disk_error_count: 1,
+            observed_at: earlier_tick,
+            reason: "metadata_resolution_failed".to_string(),
+        };
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            assert!(
+                record_decommission_unresolved_entry(&mut pool_meta, 0, generation, unresolved_entry, earlier_tick, None)
+                    .expect("unresolved entry should record under active generation")
+            );
+            assert_eq!(pool_meta.pools[0].last_update, generation + Duration::nanoseconds(1));
+        }
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("rollback unresolved-entry save should not stale-reject");
+        store.pool_meta.write().await.pools[0]
+            .decommission
+            .as_mut()
+            .expect("decommission metadata should exist")
+            .items_decommissioned = DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD;
+
+        assert!(
+            store
+                .save_decommission_progress_checkpoint_at(0, generation, earlier_tick)
+                .await
+                .expect("rollback progress checkpoint should use a monotonic durable identity")
+        );
+        let progress_at = generation + Duration::nanoseconds(2);
+        assert_eq!(store.pool_meta.read().await.pools[0].last_update, progress_at);
+
+        let terminal_at = generation + Duration::nanoseconds(3);
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            assert!(pool_meta.decommission_failed_at_for_test(0, earlier_tick, None));
+            assert_eq!(pool_meta.pools[0].last_update, terminal_at);
+        }
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("terminal failure after rollback checkpoints should persist");
+
+        let mut restored = PoolMeta::default();
+        restored
+            .load_no_lock_from_replicas(vec![store.pools[0].clone()])
+            .await
+            .expect("terminal metadata should reload after restart");
+        assert_eq!(restored.pools[0].last_update, terminal_at);
+        assert!(
+            restored.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| info.failed && !info.complete && !info.canceled)
+        );
+
+        let restarted = decommission_worker_test_store(restored, Vec::new());
+        let status = restarted.scanner_data_movement_pause_status().await;
+        let expected_generation =
+            u64::try_from(terminal_at.unix_timestamp_nanos()).expect("fixed positive timestamp should fit generation");
+
+        assert_eq!(status.movement_generation, expected_generation);
+        assert_eq!(status.reasons, vec![crate::store::ScannerDataMovementPauseReason::DecommissionFailed]);
+        assert_eq!(restarted.scanner_data_movement_generation(), expected_generation);
     }
 
     #[tokio::test]
@@ -16127,7 +16544,7 @@ mod pools_tests {
         };
 
         let checkpoint = meta
-            .decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, checkpoint_at)
+            .decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, checkpoint_at, None)
             .expect("valid decommission state should produce a checkpoint")
             .expect("item threshold should produce a checkpoint");
         meta.count_item(0, 1, false);
@@ -16159,13 +16576,13 @@ mod pools_tests {
         };
 
         let checkpoint = meta
-            .decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, checkpoint_at)
+            .decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, checkpoint_at, None)
             .expect("valid decommission state should produce a checkpoint")
             .expect("item threshold should produce a checkpoint");
         meta.defer_decommission_progress_checkpoint(0, checkpoint, retry_after);
 
         assert!(
-            meta.decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, checkpoint_at)
+            meta.decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, checkpoint_at, None)
                 .expect("retry backoff check should succeed")
                 .is_none()
         );
@@ -16201,7 +16618,7 @@ mod pools_tests {
         for _ in 0..(DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD * 10) {
             meta.count_item(0, 1, false);
             if let Some(checkpoint) = meta
-                .decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, checkpoint_at)
+                .decommission_progress_checkpoint(0, DECOMMISSION_PROGRESS_SAVE_INTERVAL, checkpoint_at, None)
                 .expect("valid decommission state should produce a checkpoint")
             {
                 checkpoint_count += 1;
@@ -17082,7 +17499,12 @@ mod pools_tests {
 
             assert!(meta.is_suspended(0));
             assert!(meta.clear_decommission(0).expect("terminal decommission should clear"));
-            assert!(meta.pools[0].decommission.is_none());
+            assert!(
+                meta.pools[0]
+                    .decommission
+                    .as_ref()
+                    .is_some_and(|info| !info.has_decommission_state())
+            );
             assert!(!meta.is_suspended(0));
         }
     }
@@ -17301,6 +17723,40 @@ mod pools_tests {
     }
 
     #[test]
+    fn test_queued_decommission_promotion_advances_generation_after_clock_rollback() {
+        let queued_at = OffsetDateTime::from_unix_timestamp(1_260).expect("fixed timestamp should be valid");
+        let earlier_tick = queued_at - Duration::nanoseconds(10);
+        let rebalance_floor = queued_at + Duration::nanoseconds(5);
+        let rebalance = RebalanceMeta {
+            stopped_at: Some(rebalance_floor),
+            id: "completed-rebalance".to_string(),
+            ..Default::default()
+        };
+        let mut meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: queued_at,
+                decommission: Some(PoolDecommissionInfo {
+                    queued: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        assert!(meta.promote_queued_decommission_at_for_test(0, earlier_tick, Some(&rebalance)));
+        let expected_generation = rebalance_floor + Duration::nanoseconds(1);
+        let promoted = meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("promoted decommission metadata should exist");
+        assert_eq!(meta.pools[0].last_update, expected_generation);
+        assert_eq!(promoted.start_time, Some(expected_generation));
+        assert!(!promoted.queued);
+    }
+
+    #[test]
     fn test_pool_meta_queued_decommission_is_not_suspended_until_promoted() {
         let mut meta = PoolMeta {
             pools: vec![PoolStatus {
@@ -17410,7 +17866,12 @@ mod pools_tests {
         assert_eq!(blocked.bytes_done, 1024);
 
         assert!(meta.clear_decommission(0).expect("failed decommission should clear"));
-        assert!(meta.pools[0].decommission.is_none());
+        assert!(
+            meta.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| !info.has_decommission_state())
+        );
 
         meta.decommission(
             0,
@@ -17497,7 +17958,12 @@ mod pools_tests {
         assert_eq!(blocked.bytes_done, 512);
 
         assert!(meta.clear_decommission(0).expect("canceled decommission should clear"));
-        assert!(meta.pools[0].decommission.is_none());
+        assert!(
+            meta.pools[0]
+                .decommission
+                .as_ref()
+                .is_some_and(|info| !info.has_decommission_state())
+        );
 
         meta.queue_decommission(
             0,
@@ -18515,6 +18981,7 @@ mod pools_tests {
         let save_started = Arc::new(tokio::sync::Notify::new());
         let save_release = Arc::new(tokio::sync::Notify::new());
         let save_entered = Arc::new(AtomicBool::new(false));
+        let persisted = Arc::new(std::sync::Mutex::new(None));
 
         let mut cancel = tokio::spawn({
             let store = store.clone();
@@ -18522,9 +18989,12 @@ mod pools_tests {
             let save_started = save_started.clone();
             let save_release = save_release.clone();
             let save_entered = save_entered.clone();
+            let persisted = persisted.clone();
             async move {
                 store
-                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |_, _| async move {
+                    .decommission_cancel_with_owner_and_save(0, Some(&canceler), move |snapshot, _| async move {
+                        *persisted.lock().expect("persisted cancel lock should not be poisoned") =
+                            Some(snapshot.encode_config_data()?);
                         save_entered.store(true, Ordering::SeqCst);
                         save_started.notify_one();
                         save_release.notified().await;
@@ -18561,7 +19031,7 @@ mod pools_tests {
             .await
             .expect("the durable cancel must signal the active worker");
         assert!(!cancel.is_finished(), "cancel must wait for in-flight movement after the durable signal");
-        {
+        let canceled_at = {
             let pool_meta = store.pool_meta.read().await;
             let info = pool_meta.pools[0]
                 .decommission
@@ -18571,7 +19041,11 @@ mod pools_tests {
             assert!(!info.complete);
             assert!(!info.failed);
             assert!(info.start_time.is_none());
-        }
+            pool_meta.pools[0].last_update
+        };
+        let expected_generation = crate::store::scanner_data_movement_timestamp_generation(canceled_at);
+        let scanner_status = store.scanner_data_movement_pause_snapshot_for_test().await;
+        assert_eq!(scanner_status.movement_generation, expected_generation);
 
         drop(side_effect);
         tokio::time::timeout(StdDuration::from_secs(1), &mut cancel)
@@ -18598,6 +19072,27 @@ mod pools_tests {
         assert!(canceler.is_cancelled());
         assert!(!canceler.is_active());
         assert!(store.decommission_cancelers.read().await[0].is_none());
+        assert_eq!(store.scanner_data_movement_generation(), expected_generation);
+
+        let persisted = persisted
+            .lock()
+            .expect("persisted cancel lock should not be poisoned")
+            .take()
+            .expect("cancel should persist a durable snapshot");
+        let mut durable = PoolMeta::default();
+        durable
+            .load_from_config_data(persisted)
+            .expect("durable cancel snapshot should decode after restart");
+        let restarted = decommission_worker_test_store(durable.clone(), Vec::new());
+        let restarted_status = restarted.scanner_data_movement_pause_status().await;
+        assert_eq!(restarted_status.movement_generation, expected_generation);
+
+        assert!(
+            durable
+                .clear_decommission_at_for_test(0, canceled_at, None)
+                .expect("same-tick clear should succeed")
+        );
+        assert!(durable.pools[0].last_update > canceled_at);
     }
 
     #[test]

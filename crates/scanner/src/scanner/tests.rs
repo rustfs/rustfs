@@ -38,30 +38,46 @@ async fn setup_scanner_cycle_store() -> (tempfile::TempDir, Arc<ECStore>) {
 }
 
 async fn setup_scanner_cycle_store_with_usage_baseline(seed_usage_baseline: bool) -> (tempfile::TempDir, Arc<ECStore>) {
+    setup_scanner_cycle_store_with_pool_count(seed_usage_baseline, 1).await
+}
+
+async fn setup_scanner_cycle_store_with_pool_count(
+    seed_usage_baseline: bool,
+    pool_count: usize,
+) -> (tempfile::TempDir, Arc<ECStore>) {
     init_ecstore_config_for_scanner_tests();
     let temp_dir = tempfile::tempdir().expect("scanner cycle test directory should be created");
-    let mut endpoints = Vec::new();
-    for disk_index in 0..4 {
-        let disk_path = temp_dir.path().join(format!("disk{disk_index}"));
-        tokio::fs::create_dir_all(&disk_path)
-            .await
-            .expect("scanner cycle test disk should be created");
-        let mut endpoint =
-            Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
-        endpoint.set_pool_index(0);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(disk_index);
-        endpoints.push(endpoint);
+    let mut pools = Vec::with_capacity(pool_count);
+    for pool_index in 0..pool_count {
+        let mut endpoints = Vec::new();
+        for disk_index in 0..4 {
+            let disk_path = temp_dir.path().join(format!("pool{pool_index}/disk{disk_index}"));
+            tokio::fs::create_dir_all(&disk_path)
+                .await
+                .expect("scanner cycle test disk should be created");
+            let mut endpoint =
+                Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+            endpoint.set_pool_index(pool_index);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_index);
+            endpoints.push(endpoint);
+        }
+        pools.push(PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 4,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: if pool_count == 1 {
+                "scanner-cycle-metrics".to_string()
+            } else {
+                format!("scanner-cycle-metrics-pool-{pool_index}")
+            },
+            platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
+        });
     }
-    let endpoint_pools = EndpointServerPools::from(vec![PoolEndpoints {
-        legacy: false,
-        set_count: 1,
-        drives_per_set: 4,
-        endpoints: Endpoints::from(endpoints),
-        cmd_line: "scanner-cycle-metrics".to_string(),
-        platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
-    }]);
+    let endpoint_pools = EndpointServerPools::from(pools);
     let instance_ctx = Arc::new(InstanceContext::new());
+    instance_ctx.set_endpoints(endpoint_pools.clone());
     init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
         .await
         .expect("scanner cycle test disks should initialize");
@@ -88,6 +104,27 @@ async fn setup_scanner_cycle_store_with_usage_baseline(seed_usage_baseline: bool
     (temp_dir, store)
 }
 
+async fn restart_scanner_cycle_store_from(store: &Arc<ECStore>) -> Arc<ECStore> {
+    let endpoint_pools = store
+        .instance_endpoints()
+        .expect("scanner restart test store should retain its endpoint topology");
+    let instance_ctx = Arc::new(InstanceContext::new());
+    instance_ctx.set_endpoints(endpoint_pools.clone());
+    init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
+        .await
+        .expect("scanner restart test disks should reinitialize");
+    let restarted = ECStore::new_with_instance_ctx(
+        "127.0.0.1:0".parse().expect("test address should parse"),
+        endpoint_pools,
+        CancellationToken::new(),
+        instance_ctx,
+    )
+    .await
+    .expect("restarted scanner cycle test ECStore should initialize");
+    init_bucket_metadata_sys_for_scanner_tests(restarted.clone()).await;
+    restarted
+}
+
 fn assert_run_data_scanner_signature<F, Fut>(_run: F)
 where
     F: Fn(CancellationToken, Arc<ECStore>) -> Fut,
@@ -98,6 +135,190 @@ where
 #[test]
 fn run_data_scanner_keeps_its_two_argument_api() {
     assert_run_data_scanner_signature(run_data_scanner);
+}
+
+#[tokio::test]
+async fn restarted_main_loop_completes_durable_pause_backlog_catch_up() {
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    global_metrics().set_cycle(None).await;
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+
+    let paused_at = scanner_pause_backlog_now();
+    let mut seeded = ScannerPauseBacklogController::claim(store.clone(), paused_at)
+        .await
+        .expect("seed writer should claim the durable pause backlog");
+    seeded
+        .observe(ScannerPauseBacklogObservation {
+            now_unix_secs: paused_at.saturating_add(1),
+            paused: true,
+            movement_generation: store.scanner_data_movement_generation().saturating_add(1),
+            movement_work_items: 1,
+            pause_started_at_unix_secs: paused_at.saturating_add(1),
+            dirty_usage_buckets: 0,
+            discovered_expiry_items: 0,
+            discovered_transition_items: 0,
+        })
+        .await;
+    drop(seeded);
+
+    let seeded_status = scanner_pause_backlog_status(store.clone()).await;
+    assert!(seeded_status.durable, "seeded pause backlog must be set-backed");
+    assert_eq!(seeded_status.phase, ScannerPauseBacklogPhase::Paused);
+    assert!(seeded_status.pending_full_scan);
+    assert_eq!(seeded_status.catch_up_attempts, 0);
+
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    assert!(
+        restarted.instance_endpoints().is_some(),
+        "restarted scanner store must retain instance endpoints"
+    );
+    let restarted_status = scanner_pause_backlog_status(restarted.clone()).await;
+    assert_eq!(restarted_status.phase, ScannerPauseBacklogPhase::Paused);
+    assert_eq!(restarted_status.generation, seeded_status.generation);
+
+    let ctx = CancellationToken::new();
+    let scanner_ctx = ctx.clone();
+    let scanner_store = restarted.clone();
+    let scanner_task = tokio::spawn(async move { run_data_scanner(scanner_ctx, scanner_store).await });
+
+    let final_status = match tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let status = scanner_pause_backlog_status(restarted.clone()).await;
+            if status.phase == ScannerPauseBacklogPhase::Idle
+                && status.writer_epoch > seeded_status.writer_epoch
+                && status.catch_up_attempts > seeded_status.catch_up_attempts
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            ctx.cancel();
+            scanner_task.abort();
+            panic!("restarted scanner did not complete durable catch-up through the main loop: {err}");
+        }
+    };
+
+    ctx.cancel();
+    tokio::time::timeout(Duration::from_secs(5), scanner_task)
+        .await
+        .expect("scanner loop should stop after cancellation")
+        .expect("scanner task should not panic")
+        .expect("scanner loop should exit cleanly");
+
+    assert!(final_status.durable);
+    assert_eq!(final_status.phase, ScannerPauseBacklogPhase::Idle);
+    assert!(!final_status.pending_full_scan);
+    assert_eq!(final_status.pending_work_items, 0);
+    assert_eq!(final_status.consecutive_failures, 0);
+    assert!(final_status.pause_ended_at_unix_secs >= final_status.pause_started_at_unix_secs);
+
+    let usage = read_config(restarted.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("the catch-up scanner cycle should leave an authoritative usage snapshot readable");
+    let usage = serde_json::from_slice::<DataUsageInfo>(&usage).expect("authoritative usage snapshot should decode");
+    assert!(
+        usage.is_complete_bucket_usage_snapshot(),
+        "durable catch-up must run a complete scanner cycle before clearing the backlog"
+    );
+
+    global_metrics().set_cycle(None).await;
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial_test::serial(scanner_runtime_env)]
+async fn running_main_loop_catches_up_pause_cleared_after_startup_observe() {
+    temp_env::async_with_vars([(ENV_SCANNER_CYCLE, Some("1")), (ENV_SCANNER_START_DELAY_SECS, Some("0"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        global_metrics().set_cycle(None).await;
+        let (_temp_dir, store) = setup_scanner_cycle_store_with_pool_count(true, 2).await;
+
+        let ctx = CancellationToken::new();
+        let scanner_ctx = ctx.clone();
+        let scanner_store = store.clone();
+        let startup_probe = ScannerStartupObservedProbe::install();
+        let scanner_task = tokio::spawn(async move { run_data_scanner(scanner_ctx, scanner_store).await });
+        startup_probe.wait().await;
+        let ready_probe = ScannerRuntimeObservedProbe::install(&store, false);
+        startup_probe.resume();
+        drop(startup_probe);
+        ready_probe.wait().await;
+        drop(ready_probe);
+
+        let paused_probe = ScannerRuntimeObservedProbe::install(&store, true);
+        let paused_at = time::OffsetDateTime::now_utc();
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].last_update = paused_at;
+            pool_meta.pools[0].decommission = Some(crate::storage_api::owner::EcstorePoolDecommissionInfo {
+                failed: true,
+                ..Default::default()
+            });
+        }
+        let pause_status = store.scanner_data_movement_pause_status().await;
+        assert!(pause_status.paused);
+        paused_probe.wait().await;
+        drop(paused_probe);
+
+        let paused_backlog = scanner_pause_backlog_status(store.clone()).await;
+        assert_eq!(paused_backlog.phase, ScannerPauseBacklogPhase::Paused);
+        assert!(paused_backlog.pending_full_scan);
+
+        let resumed_probe = ScannerRuntimeObservedProbe::install(&store, false);
+        store
+            .clear_decommission(0)
+            .await
+            .expect("terminal decommission clear should publish a movement generation");
+        resumed_probe.wait().await;
+        drop(resumed_probe);
+
+        let final_status = match tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let status = scanner_pause_backlog_status(store.clone()).await;
+                if status.phase == ScannerPauseBacklogPhase::Idle
+                    && status.writer_epoch == paused_backlog.writer_epoch
+                    && status.catch_up_attempts > paused_backlog.catch_up_attempts
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        {
+            Ok(status) => status,
+            Err(err) => {
+                ctx.cancel();
+                scanner_task.abort();
+                panic!("running scanner did not complete durable catch-up after a runtime movement clear: {err}");
+            }
+        };
+
+        ctx.cancel();
+        tokio::time::timeout(Duration::from_secs(5), scanner_task)
+            .await
+            .expect("scanner loop should stop after cancellation")
+            .expect("scanner task should not panic")
+            .expect("scanner loop should exit cleanly");
+
+        assert!(final_status.durable);
+        assert_eq!(final_status.phase, ScannerPauseBacklogPhase::Idle);
+        assert_eq!(final_status.writer_epoch, paused_backlog.writer_epoch);
+        assert!(!final_status.pending_full_scan);
+        assert_eq!(final_status.pending_work_items, 0);
+        assert_eq!(final_status.consecutive_failures, 0);
+
+        global_metrics().set_cycle(None).await;
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    })
+    .await;
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
 
 #[tokio::test]
