@@ -779,16 +779,11 @@ impl SetDisks {
                                 .await
                             {
                                 Ok(m) => {
-                                    let derr = if !version_id.is_empty() {
-                                        DiskError::FileVersionNotFound
-                                    } else {
-                                        DiskError::FileNotFound
-                                    };
                                     let mut t_errs = Vec::with_capacity(errs.len());
                                     for _ in 0..errs.len() {
                                         t_errs.push(None);
                                     }
-                                    Ok((self.default_heal_result(m, &t_errs, bucket, object, version_id).await, Some(derr)))
+                                    Ok((self.default_heal_result(m, &t_errs, bucket, object, version_id).await, None))
                                 }
                                 Err(err) => {
                                     error!(
@@ -798,10 +793,9 @@ impl SetDisks {
                                         object,
                                         version_id,
                                         error = %err,
-                                        returned_error = %cannot_heal_err,
                                         "Heal object dangling cleanup could not prove object deletion"
                                     );
-                                    Ok((result, Some(cannot_heal_err)))
+                                    Ok((result, Some(err)))
                                 }
                             };
                         }
@@ -1273,6 +1267,14 @@ impl SetDisks {
                     return Box::pin(self.heal_object_with_explicit_version_regen(bucket, object, version_id, opts, false)).await;
                 }
 
+                if opts.dry_run {
+                    return Ok((
+                        self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
+                            .await,
+                        Some(err),
+                    ));
+                }
+
                 if self
                     .dangling_delete_safety(bucket, object, &parts_metadata, &errs, &disks)
                     .await?
@@ -1300,18 +1302,11 @@ impl SetDisks {
                     )
                     .await
                 {
-                    Ok(m) => {
-                        let err = if !version_id.is_empty() {
-                            DiskError::FileVersionNotFound
-                        } else {
-                            DiskError::FileNotFound
-                        };
-                        Ok((self.default_heal_result(m, &errs, bucket, object, version_id).await, Some(err)))
-                    }
-                    Err(_) => Ok((
+                    Ok(m) => Ok((self.default_heal_result(m, &errs, bucket, object, version_id).await, None)),
+                    Err(cleanup_err) => Ok((
                         self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
                             .await,
-                        Some(err),
+                        Some(cleanup_err),
                     )),
                 }
             }
@@ -2123,7 +2118,7 @@ mod heal_result_report_tests {
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::format::FormatV3;
-    use crate::disk::{DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, new_disk};
+    use crate::disk::{DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, STORAGE_FORMAT_FILE, new_disk};
     use crate::error::Error;
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
@@ -2134,6 +2129,7 @@ mod heal_result_report_tests {
         config::storageclass,
         store::init_format::{load_format_erasure, save_format_file},
     };
+    use bytes::Bytes;
     use rustfs_common::heal_channel::{DriveState, HealOpts, HealScanMode};
     use rustfs_filemeta::{BLOCK_SIZE_V2, FileInfo, ObjectPartInfo, TRANSITION_COMPLETE};
     use std::sync::{Arc, Mutex};
@@ -2392,6 +2388,20 @@ mod heal_result_report_tests {
             .write_metadata("", bucket, object, file_info.clone())
             .await
             .expect("test metadata should be written");
+    }
+
+    async fn dangling_inline_test_fixture(
+        bucket: &str,
+        object: &str,
+        mod_time: OffsetDateTime,
+    ) -> (Vec<TempDir>, Arc<SetDisks>, Vec<Option<DiskStore>>) {
+        let (temp_dirs, set, disks) = meta_regen_test_set(bucket, object, &[]).await;
+        let mut metadata = meta_regen_test_fileinfo(object, Uuid::nil(), mod_time.unix_timestamp(), 0);
+        metadata.data_dir = None;
+        metadata.set_inline_data();
+        metadata.data = Some(Bytes::from_static(b"stale-inline-shard"));
+        seed_meta_regen_test_metadata(&disks, 0, bucket, object, &metadata).await;
+        (temp_dirs, set, disks)
     }
 
     async fn formatted_single_disk_no_parity_set() -> (TempDir, Arc<SetDisks>) {
@@ -3066,6 +3076,109 @@ mod heal_result_report_tests {
             ),
             "the delete guard must not propagate metadata"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_reports_success_after_dangling_inline_cleanup() {
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("0"))], async {
+            let bucket = "bucket-dangling-inline-cleanup";
+            let object = "stale.txt";
+            let (temp_dirs, set, _disks) =
+                dangling_inline_test_fixture(bucket, object, OffsetDateTime::now_utc() - time::Duration::hours(2)).await;
+
+            let (_, error) = set
+                .heal_object(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("dangling cleanup should complete");
+
+            assert!(error.is_none(), "successful dangling cleanup must not be reported as FileNotFound");
+            assert!(
+                temp_dirs.iter().all(|dir| !dir.path().join(bucket).join(object).exists()),
+                "successful dangling cleanup must remove the stale object from every disk"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_preserves_recent_dangling_inline_metadata_as_retryable() {
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("3600"))], async {
+            let bucket = "bucket-dangling-inline-grace";
+            let object = "recent.txt";
+            let (temp_dirs, set, _disks) = dangling_inline_test_fixture(bucket, object, OffsetDateTime::now_utc()).await;
+
+            let (_, error) = set
+                .heal_object(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("grace-protected dangling metadata should return a typed heal result");
+
+            assert_eq!(error, Some(DiskError::ErasureReadQuorum));
+            assert!(
+                temp_dirs[0]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(STORAGE_FORMAT_FILE)
+                    .is_file(),
+                "grace-protected metadata must remain for a later heal pass"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dry_run_never_deletes_dangling_inline_metadata() {
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("0"))], async {
+            let bucket = "bucket-dangling-inline-dry-run";
+            let object = "stale.txt";
+            let (temp_dirs, set, _disks) =
+                dangling_inline_test_fixture(bucket, object, OffsetDateTime::now_utc() - time::Duration::hours(2)).await;
+
+            let (_, error) = set
+                .heal_object(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        dry_run: true,
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("dry-run should report the dangling candidate without mutation");
+
+            assert_eq!(error, Some(DiskError::FileNotFound));
+            assert!(
+                temp_dirs[0]
+                    .path()
+                    .join(bucket)
+                    .join(object)
+                    .join(STORAGE_FORMAT_FILE)
+                    .is_file(),
+                "dry-run must preserve dangling metadata even when grace is disabled"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]

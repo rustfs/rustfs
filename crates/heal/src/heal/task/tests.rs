@@ -564,6 +564,8 @@ struct MockStorage {
     replacement_resume_disk: Mutex<Option<DiskStore>>,
     usage_baseline: Mutex<Option<HealBucketUsageBaseline>>,
     usage_baseline_error: Mutex<bool>,
+    erasure_set_scopes: Mutex<Vec<(usize, usize)>>,
+    disk_walk_calls: Mutex<Vec<String>>,
 }
 
 #[test]
@@ -946,6 +948,26 @@ impl HealStorageAPI for MockStorage {
         }
     }
 
+    async fn heal_erasure_set_scopes(&self, _opts: &HealOpts) -> Result<Option<Vec<(usize, usize)>>> {
+        let scopes = self.erasure_set_scopes.lock().unwrap().clone();
+        Ok((!scopes.is_empty()).then_some(scopes))
+    }
+
+    async fn list_versions_for_heal_page_disk_walk(
+        &self,
+        set_disk_id: &str,
+        _bucket: &str,
+        _prefix: &str,
+        continuation_token: Option<&str>,
+        _include_lifecycle_object_info: bool,
+    ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
+        self.disk_walk_calls.lock().unwrap().push(set_disk_id.to_string());
+        if continuation_token.is_some() {
+            return Ok((Vec::new(), None, false));
+        }
+        Ok((vec![heal_item(&format!("{set_disk_id}-object"))], None, false))
+    }
+
     async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore> {
         self.resume_disk
             .lock()
@@ -1079,6 +1101,47 @@ async fn test_recursive_bucket_heal_visits_objects() {
     let result_items = task.get_result_items().await;
     assert_eq!(result_items.len(), 3);
     assert_eq!(result_items.iter().filter(|item| item.object_size == 1).count(), 2);
+}
+
+#[tokio::test]
+async fn recursive_bucket_heal_uses_each_erasure_set_union_scope() {
+    let storage = Arc::new(MockStorage {
+        erasure_set_scopes: Mutex::new(vec![(0, 0), (1, 2)]),
+        ..Default::default()
+    });
+    let request = HealRequest::new(
+        HealType::Bucket {
+            bucket: "bucket-a".to_string(),
+        },
+        HealOptions {
+            recursive: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.heal_bucket("bucket-a")
+        .await
+        .expect("recursive bucket heal should consume every selected set union");
+
+    assert_eq!(
+        storage.disk_walk_calls.lock().unwrap().as_slice(),
+        ["pool_0_set_0".to_string(), "pool_1_set_2".to_string()]
+    );
+    assert_eq!(
+        storage.healed_objects.lock().unwrap().as_slice(),
+        ["pool_0_set_0-object".to_string(), "pool_1_set_2-object".to_string()]
+    );
+    assert!(
+        !*storage.listed.lock().unwrap(),
+        "read-quorum listing must not hide returning-disk candidates"
+    );
+    let object_opts = storage.object_heal_opts.lock().unwrap();
+    assert_eq!(object_opts.len(), 2);
+    assert_eq!((object_opts[0].pool, object_opts[0].set), (Some(0), Some(0)));
+    assert_eq!((object_opts[1].pool, object_opts[1].set), (Some(1), Some(2)));
 }
 
 #[tokio::test]

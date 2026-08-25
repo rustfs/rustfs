@@ -9,4 +9,4 @@
 # if the selected count drops below this number, so a rename or removal that
 # thins the security smoke gate must update this file in the same PR.
 # Adding tests does not require a bump, but bumping keeps the guard tight.
-16
+18

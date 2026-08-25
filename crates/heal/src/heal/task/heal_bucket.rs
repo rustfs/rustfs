@@ -14,6 +14,7 @@
 /// bucket/cluster/prefix heal: the recursive bucket-objects sweep and the erasure-set usage baseline
 use super::*;
 use crate::heal::progress::{add_bytes, increment_counter, stable_generation};
+use crate::heal::utils::format_set_disk_id;
 
 impl HealTask {
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
@@ -242,7 +243,6 @@ impl HealTask {
 
     #[hotpath::measure]
     async fn heal_bucket_objects(&self, bucket: &str, prefix: &str) -> Result<()> {
-        let mut continuation_token: Option<String> = None;
         let mut scanned = 0u64;
         let mut healed = 0u64;
         let mut failed = 0u64;
@@ -266,108 +266,101 @@ impl HealTask {
             set: self.options.set_index,
         };
 
-        loop {
-            self.check_control_flags().await?;
-            let (objects, next_token, is_truncated) = self
-                .await_with_control(
-                    self.storage
-                        .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref(), false),
-                )
-                .await?;
+        let erasure_set_scopes = self
+            .await_with_control(self.storage.heal_erasure_set_scopes(&heal_opts))
+            .await?;
+        let listing_scopes = match erasure_set_scopes {
+            None => vec![(None, heal_opts)],
+            Some(erasure_set_scopes) => erasure_set_scopes
+                .into_iter()
+                .map(|(pool_idx, set_idx)| {
+                    let mut scoped_opts = heal_opts;
+                    scoped_opts.pool = Some(pool_idx);
+                    scoped_opts.set = Some(set_idx);
+                    (Some(format_set_disk_id(pool_idx, set_idx)), scoped_opts)
+                })
+                .collect(),
+        };
 
-            let mut pending = objects;
-            let mut retry_attempt = 0_u32;
-            while !pending.is_empty() {
-                if retry_attempt > 0 {
-                    self.await_with_control(async {
-                        tokio::time::sleep(self.bucket_object_retry_delay(retry_attempt)).await;
-                        Ok(())
-                    })
-                    .await?;
-                }
-                let mut retry = Vec::with_capacity(pending.len());
-                for item in pending {
-                    self.check_control_flags().await?;
-                    let mut telemetry_unknown = false;
-                    let object = item.name.as_str();
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.set_current_object(Some(format!("{bucket}/{object}")));
+        for (set_disk_id, heal_opts) in listing_scopes {
+            let mut continuation_token: Option<String> = None;
+            loop {
+                self.check_control_flags().await?;
+                let (objects, next_token, is_truncated) = if let Some(set_disk_id) = set_disk_id.as_deref() {
+                    self.await_with_control(self.storage.list_versions_for_heal_page_disk_walk(
+                        set_disk_id,
+                        bucket,
+                        prefix,
+                        continuation_token.as_deref(),
+                        false,
+                    ))
+                    .await?
+                } else {
+                    self.await_with_control(self.storage.list_objects_for_heal_page(
+                        bucket,
+                        prefix,
+                        continuation_token.as_deref(),
+                        false,
+                    ))
+                    .await?
+                };
+
+                let mut pending = objects;
+                let mut retry_attempt = 0_u32;
+                while !pending.is_empty() {
+                    if retry_attempt > 0 {
+                        self.await_with_control(async {
+                            tokio::time::sleep(self.bucket_object_retry_delay(retry_attempt)).await;
+                            Ok(())
+                        })
+                        .await?;
                     }
-
-                    let mut terminal_outcome = true;
-                    let error = match self
-                        .await_with_control(
-                            self.storage
-                                .heal_object(bucket, object, item.version_id.as_deref(), &heal_opts),
-                        )
-                        .await
-                    {
-                        Ok((result, None)) => {
-                            telemetry_unknown |= !increment_counter(&mut healed);
-                            telemetry_unknown |= !add_bytes(&mut bytes, u64::try_from(result.object_size).unwrap_or(u64::MAX));
-                            self.record_result_item(result).await;
-                            None
+                    let mut retry = Vec::with_capacity(pending.len());
+                    for item in pending {
+                        self.check_control_flags().await?;
+                        let mut telemetry_unknown = false;
+                        let object = item.name.as_str();
+                        {
+                            let mut progress = self.progress.write().await;
+                            progress.set_current_object(Some(format!("{bucket}/{object}")));
                         }
-                        Ok((_, Some(err))) if is_missing_object_dir_heal_result(object, &err) => {
-                            telemetry_unknown |= !increment_counter(&mut healed);
-                            debug!(
-                                target: "rustfs::heal::task",
-                                event = EVENT_HEAL_BUCKET_RESULT,
-                                component = LOG_COMPONENT_HEAL,
-                                subsystem = LOG_SUBSYSTEM_TASK,
-                                task_id = %self.id,
-                                bucket,
-                                object,
-                                result = "object_dir_not_found_skipped",
-                                "Heal bucket object-dir candidate skipped after not-found result"
-                            );
-                            None
-                        }
-                        Ok((_, Some(err))) | Err(err) => Some(err),
-                    };
 
-                    if let Some(err) = error {
-                        if Self::should_skip_data_usage_cache_heal_error(bucket, object, &err) {
-                            telemetry_unknown |= !increment_counter(&mut skipped);
-                            warn!(
-                                target: "rustfs::heal::task",
-                                event = EVENT_HEAL_BUCKET_RESULT,
-                                component = LOG_COMPONENT_HEAL,
-                                subsystem = LOG_SUBSYSTEM_TASK,
-                                task_id = %self.id,
-                                bucket,
-                                object,
-                                result = "transient_skip",
-                                error = %err,
-                                "Heal bucket object repair skipped due to transient metadata error"
-                            );
-                        } else if err.is_recoverable_heal() && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
-                            terminal_outcome = false;
-                            debug!(
-                                target: "rustfs::heal::task",
-                                event = EVENT_HEAL_BUCKET_RESULT,
-                                component = LOG_COMPONENT_HEAL,
-                                subsystem = LOG_SUBSYSTEM_TASK,
-                                task_id = %self.id,
-                                bucket,
-                                object,
-                                retry_attempt = retry_attempt.saturating_add(1),
-                                error = %err,
-                                result = "object_retry_scheduled",
-                                "Heal bucket object retry scheduled"
-                            );
-                            retry.push(item);
-                        } else {
-                            telemetry_unknown |= !increment_counter(&mut failed);
-                            if err.is_recoverable_heal() {
-                                retryable_failed = retryable_failed.saturating_add(1);
-                            } else {
-                                permanent_failed = permanent_failed.saturating_add(1);
+                        let mut terminal_outcome = true;
+                        let error = match self
+                            .await_with_control(
+                                self.storage
+                                    .heal_object(bucket, object, item.version_id.as_deref(), &heal_opts),
+                            )
+                            .await
+                        {
+                            Ok((result, None)) => {
+                                telemetry_unknown |= !increment_counter(&mut healed);
+                                telemetry_unknown |=
+                                    !add_bytes(&mut bytes, u64::try_from(result.object_size).unwrap_or(u64::MAX));
+                                self.record_result_item(result).await;
+                                None
                             }
-                            first_failed_object.get_or_insert_with(|| object.to_string());
-                            first_error.get_or_insert_with(|| err.to_string());
-                            if take_failure_log_sample(&mut failure_samples_logged) {
+                            Ok((_, Some(err))) if is_missing_object_dir_heal_result(object, &err) => {
+                                telemetry_unknown |= !increment_counter(&mut healed);
+                                debug!(
+                                    target: "rustfs::heal::task",
+                                    event = EVENT_HEAL_BUCKET_RESULT,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_TASK,
+                                    task_id = %self.id,
+                                    bucket,
+                                    object,
+                                    result = "object_dir_not_found_skipped",
+                                    "Heal bucket object-dir candidate skipped after not-found result"
+                                );
+                                None
+                            }
+                            Ok((_, Some(err))) | Err(err) => Some(err),
+                        };
+
+                        if let Some(err) = error {
+                            if Self::should_skip_data_usage_cache_heal_error(bucket, object, &err) {
+                                telemetry_unknown |= !increment_counter(&mut skipped);
                                 warn!(
                                     target: "rustfs::heal::task",
                                     event = EVENT_HEAL_BUCKET_RESULT,
@@ -376,41 +369,80 @@ impl HealTask {
                                     task_id = %self.id,
                                     bucket,
                                     object,
-                                    retry_attempt,
+                                    result = "transient_skip",
                                     error = %err,
-                                    result = "object_failed",
-                                    "Heal bucket object repair failed"
+                                    "Heal bucket object repair skipped due to transient metadata error"
                                 );
+                            } else if err.is_recoverable_heal() && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES {
+                                terminal_outcome = false;
+                                debug!(
+                                    target: "rustfs::heal::task",
+                                    event = EVENT_HEAL_BUCKET_RESULT,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_TASK,
+                                    task_id = %self.id,
+                                    bucket,
+                                    object,
+                                    retry_attempt = retry_attempt.saturating_add(1),
+                                    error = %err,
+                                    result = "object_retry_scheduled",
+                                    "Heal bucket object retry scheduled"
+                                );
+                                retry.push(item);
+                            } else {
+                                telemetry_unknown |= !increment_counter(&mut failed);
+                                if err.is_recoverable_heal() {
+                                    retryable_failed = retryable_failed.saturating_add(1);
+                                } else {
+                                    permanent_failed = permanent_failed.saturating_add(1);
+                                }
+                                first_failed_object.get_or_insert_with(|| object.to_string());
+                                first_error.get_or_insert_with(|| err.to_string());
+                                if take_failure_log_sample(&mut failure_samples_logged) {
+                                    warn!(
+                                        target: "rustfs::heal::task",
+                                        event = EVENT_HEAL_BUCKET_RESULT,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_TASK,
+                                        task_id = %self.id,
+                                        bucket,
+                                        object,
+                                        retry_attempt,
+                                        error = %err,
+                                        result = "object_failed",
+                                        "Heal bucket object repair failed"
+                                    );
+                                }
                             }
                         }
-                    }
 
-                    if terminal_outcome {
-                        telemetry_unknown |= !increment_counter(&mut scanned);
-                    }
+                        if terminal_outcome {
+                            telemetry_unknown |= !increment_counter(&mut scanned);
+                        }
 
-                    if !terminal_outcome {
-                        continue;
-                    }
+                        if !terminal_outcome {
+                            continue;
+                        }
 
-                    let mut progress = self.progress.write().await;
-                    progress.update_object_progress(scanned, healed, failed, skipped, bytes);
-                    if telemetry_unknown {
-                        progress.mark_unknown();
+                        let mut progress = self.progress.write().await;
+                        progress.update_object_progress(scanned, healed, failed, skipped, bytes);
+                        if telemetry_unknown {
+                            progress.mark_unknown();
+                        }
                     }
+                    pending = retry;
+                    retry_attempt = retry_attempt.saturating_add(1);
                 }
-                pending = retry;
-                retry_attempt = retry_attempt.saturating_add(1);
-            }
 
-            if !is_truncated {
-                break;
-            }
+                if !is_truncated {
+                    break;
+                }
 
-            continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
-            if continuation_token.is_none() {
-                // Truncated but no continuation token: end of listing.
-                break;
+                continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
+                if continuation_token.is_none() {
+                    // Truncated but no continuation token: end of listing.
+                    break;
+                }
             }
         }
 
