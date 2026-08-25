@@ -6370,8 +6370,15 @@ mod tests {
         .await
         .expect("second waiter should enqueue during the configured wait budget");
         tokio::time::advance(wait_budget).await;
-        tokio::task::yield_now().await;
-        file_sync_probe::wait_for_active(1).await;
+        let batch_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while file_sync_probe::group_batches().is_empty() {
+            assert!(
+                std::time::Instant::now() < batch_deadline,
+                "timed out waiting for the wait-budget group batch; counts={:?}",
+                file_fdatasync_group_commit_counts_for_test()
+            );
+            tokio::task::yield_now().await;
+        }
 
         assert_eq!(
             file_sync_probe::group_batches(),

@@ -14,7 +14,7 @@
 
 //! Hybrid Capacity Manager for efficient capacity statistics
 
-use super::scan::refresh_capacity_with_scope;
+use super::scan::{ScheduledCapacityRefresh, refresh_capacity_with_scope, select_scheduled_capacity_refresh};
 use super::types::CapacityDiskRef;
 use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty_scopes, take_capacity_scope};
 use futures::FutureExt;
@@ -1021,6 +1021,7 @@ impl HybridCapacityManager {
     /// remote or removed disks would otherwise stay marked forever and keep
     /// the dirty-disk gauge permanently non-zero (backlog#1020 S30).
     pub async fn retain_dirty_disks_within(&self, local: &HashSet<CapacityScopeDisk>) {
+        self.sync_global_dirty_scopes().await;
         let mut dirty_disks = self.dirty_disks.write().await;
         let before = dirty_disks.len();
         dirty_disks.retain(|disk, _| local.contains(disk));
@@ -1378,6 +1379,44 @@ where
     }
 }
 
+async fn run_scheduled_capacity_refresh(manager: Arc<HybridCapacityManager>, disks: Vec<CapacityDiskRef>) -> bool {
+    let start = Instant::now();
+    match select_scheduled_capacity_refresh(manager.as_ref(), &disks).await {
+        ScheduledCapacityRefresh::Idle => {
+            debug!(
+                event = EVENT_CAPACITY_REFRESH_SCHEDULED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "skipped",
+                source = DataSource::Scheduled.as_metric_label(),
+                reason = "no_dirty_disks",
+                disk_count = disks.len(),
+                "capacity refresh scheduled"
+            );
+            true
+        }
+        ScheduledCapacityRefresh::Scan { disks, dirty_subset } => {
+            debug!(
+                event = EVENT_CAPACITY_REFRESH_SCHEDULED,
+                component = LOG_COMPONENT_CAPACITY,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "started",
+                source = DataSource::Scheduled.as_metric_label(),
+                refresh_scope = if dirty_subset { "dirty_subset" } else { "full" },
+                disk_count = disks.len(),
+                enqueue_latency_ms = start.elapsed().as_millis() as u64,
+                "capacity refresh scheduled"
+            );
+            let result = manager
+                .refresh_or_join(DataSource::Scheduled, move || async move {
+                    refresh_capacity_with_scope(disks, dirty_subset).await
+                })
+                .await;
+            scheduled_refresh_was_clean(&result)
+        }
+    }
+}
+
 /// Owned capacity scheduler tasks for one server runtime.
 #[must_use = "capacity background tasks stop when their lifecycle handle is dropped"]
 pub struct CapacityBackgroundTasks {
@@ -1429,29 +1468,7 @@ pub async fn start_background_tasks(disks: Vec<CapacityDiskRef>) -> CapacityBack
 
     tasks.spawn(async move {
         run_scheduled_refresh_loop(refresh_interval, refresh_shutdown, move || {
-            let start = Instant::now();
-            let manager = manager_for_refresh.clone();
-            let disks = disks.clone();
-            let disk_count = disks.len();
-            async move {
-                debug!(
-                    event = EVENT_CAPACITY_REFRESH_SCHEDULED,
-                    component = LOG_COMPONENT_CAPACITY,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    state = "started",
-                    source = DataSource::Scheduled.as_metric_label(),
-                    disk_count,
-                    enqueue_latency_ms = start.elapsed().as_millis() as u64,
-                    "capacity refresh scheduled"
-                );
-                let result = manager
-                    .refresh_or_join(
-                        DataSource::Scheduled,
-                        move || async move { refresh_capacity_with_scope(disks, false).await },
-                    )
-                    .await;
-                scheduled_refresh_was_clean(&result)
-            }
+            run_scheduled_capacity_refresh(manager_for_refresh.clone(), disks.clone())
         })
         .await;
     });
@@ -1524,6 +1541,39 @@ mod tests {
         assert!(!scheduled_refresh_was_clean(&Ok(timed_out)));
         assert!(!scheduled_refresh_was_clean(&Ok(degraded)));
         assert!(!scheduled_refresh_was_clean(&Err("scan failed".to_string())));
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_capacity_refresh_skips_clean_cache_then_scans_dirty_disk() {
+        let temp_dir = tempfile::TempDir::new().expect("capacity test directory should be created");
+        std::fs::write(temp_dir.path().join("object.bin"), b"capacity-bytes").expect("capacity fixture should be written");
+        let disk = CapacityDiskRef {
+            endpoint: "node-a".to_string(),
+            drive_path: temp_dir.path().display().to_string(),
+        };
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        manager
+            .update_capacity(CapacityUpdate::estimated(123, 1), DataSource::RealTime)
+            .await;
+
+        assert!(run_scheduled_capacity_refresh(manager.clone(), vec![disk.clone()]).await);
+        let cached = manager.get_capacity().await.expect("cached capacity should remain available");
+        assert_eq!(cached.total_used, 123);
+        assert_eq!(cached.source, DataSource::RealTime);
+
+        manager
+            .mark_dirty_scope(&CapacityScope {
+                disks: vec![CapacityScopeDisk {
+                    endpoint: disk.endpoint.clone(),
+                    drive_path: disk.drive_path.clone(),
+                }],
+            })
+            .await;
+
+        assert!(run_scheduled_capacity_refresh(manager.clone(), vec![disk]).await);
+        let cached = manager.get_capacity().await.expect("dirty refresh should update the cache");
+        assert_eq!(cached.source, DataSource::Scheduled);
+        assert!(manager.get_dirty_disks().await.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

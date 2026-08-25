@@ -62,6 +62,8 @@ pub struct ContainerResources {
     pub cgroup_detected: bool,
     /// Whether values were overridden by environment variables.
     pub overridden: bool,
+    /// Pre-computed basis string for metrics ("cgroup" or "host").
+    pub basis: &'static str,
 }
 
 impl Default for ContainerResources {
@@ -71,6 +73,7 @@ impl Default for ContainerResources {
             memory_bytes: 0,
             cgroup_detected: false,
             overridden: false,
+            basis: "host",
         }
     }
 }
@@ -205,7 +208,7 @@ mod cgroup {
 /// Detection priority:
 /// 1. Environment variable overrides
 /// 2. cgroup v1/v2 limits (Linux only)
-/// 3. Host values from sysinfo
+/// 3. Host values from sysinfo (single System instance for both CPU and memory)
 fn detect_container_resources() -> ContainerResources {
     // Check if cgroup detection is disabled
     let cgroup_disabled = std::env::var(ENV_DISABLE_CGROUP_DETECTION)
@@ -234,30 +237,25 @@ fn detect_container_resources() -> ContainerResources {
 
     let overridden = override_cores.is_some() || override_memory.is_some();
 
-    // Get host values for fallback
-    let host_cores = {
-        let mut sys =
-            sysinfo::System::new_with_specifics(sysinfo::RefreshKind::everything().without_memory().without_processes());
+    // Get host values from a single sysinfo::System instance (avoids double init)
+    let (host_cores, host_memory) = {
+        let mut sys = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::everything().without_processes());
         sys.refresh_cpu_all();
-        sys.cpus().len().max(1)
-    };
-
-    let host_memory = {
-        let mut sys = sysinfo::System::new();
         sys.refresh_memory();
-        sys.total_memory()
+        (sys.cpus().len().max(1), sys.total_memory())
     };
 
     // Determine effective values: override > cgroup > host
     let cpu_cores = override_cores.or(cgroup_cpus).unwrap_or(host_cores).max(1);
-
     let memory_bytes = override_memory.or(cgroup_memory).unwrap_or(host_memory);
+    let basis = if cgroup_detected { "cgroup" } else { "host" };
 
     ContainerResources {
         cpu_cores,
         memory_bytes,
         cgroup_detected,
         overridden,
+        basis,
     }
 }
 
@@ -273,12 +271,13 @@ pub fn container_resources() -> &'static ContainerResources {
 /// Should be called once during startup to help operators verify detection.
 pub fn log_container_resources() {
     let res = container_resources();
+    let memory_mib = res.memory_bytes / (1024 * 1024);
 
     if res.overridden {
         tracing::info!(
             cpu_cores = res.cpu_cores,
             memory_bytes = res.memory_bytes,
-            memory_mib = res.memory_bytes / (1024 * 1024),
+            memory_mib,
             cgroup_detected = res.cgroup_detected,
             "container resources (overridden by environment variables)"
         );
@@ -286,7 +285,7 @@ pub fn log_container_resources() {
         tracing::info!(
             cpu_cores = res.cpu_cores,
             memory_bytes = res.memory_bytes,
-            memory_mib = res.memory_bytes / (1024 * 1024),
+            memory_mib,
             "container resources (detected from cgroup)"
         );
     } else {
@@ -296,12 +295,6 @@ pub fn log_container_resources() {
             "container resources (using host values)"
         );
     }
-}
-
-/// Get the memory basis string for metrics.
-pub fn memory_basis() -> &'static str {
-    let res = container_resources();
-    if res.cgroup_detected { "cgroup" } else { "host" }
 }
 
 // ============================================================================
@@ -319,6 +312,7 @@ mod tests {
         assert_eq!(resources.memory_bytes, 0);
         assert!(!resources.cgroup_detected);
         assert!(!resources.overridden);
+        assert_eq!(resources.basis, "host");
     }
 
     #[test]

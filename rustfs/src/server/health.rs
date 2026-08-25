@@ -39,12 +39,6 @@ pub(crate) enum HealthProbe {
     ClusterRead,
 }
 
-impl HealthProbe {
-    const fn requires_lock_quorum(self) -> bool {
-        matches!(self, Self::ClusterWrite | Self::ClusterRead)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HealthReadinessSource {
     Node,
@@ -116,7 +110,7 @@ pub(crate) fn health_check_state(
     peer_health_ready: bool,
     probe: HealthProbe,
 ) -> HealthCheckState {
-    let ready = storage_ready && iam_ready && peer_health_ready && (!probe.requires_lock_quorum() || lock_quorum_ready);
+    let ready = storage_ready && iam_ready && lock_quorum_ready && peer_health_ready;
 
     if probe == HealthProbe::Liveness {
         // Liveness always returns HTTP 200 (process is alive), but the `ready`
@@ -493,6 +487,32 @@ mod tests {
 
         assert_eq!(parts.status_code, StatusCode::OK);
         assert!(parts.payload.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn liveness_and_readiness_payloads_share_lock_quorum_readiness() {
+        with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
+            let mut report = ready_report();
+            report.readiness.lock_quorum_ready = false;
+            report.degraded_reasons.push(ReadinessDegradedReason::LockQuorumUnavailable);
+
+            let liveness =
+                build_health_response_parts(Method::GET, HealthProbe::Liveness, Some(&report), "rustfs-endpoint", None, None);
+            let readiness =
+                build_health_response_parts(Method::GET, HealthProbe::Readiness, Some(&report), "rustfs-endpoint", None, None);
+
+            assert_eq!(liveness.status_code, StatusCode::OK);
+            assert_eq!(readiness.status_code, StatusCode::SERVICE_UNAVAILABLE);
+            let liveness_payload = liveness.payload.expect("liveness GET should include payload");
+            let readiness_payload = readiness.payload.expect("readiness GET should include payload");
+            assert_eq!(liveness_payload["ready"], false);
+            assert_eq!(readiness_payload["ready"], false);
+            assert_eq!(liveness_payload["details"]["lock"]["ready"], false);
+            assert_eq!(readiness_payload["details"]["lock"]["ready"], false);
+            assert_eq!(liveness_payload["degradedReasons"], json!(["lock_quorum_unavailable"]));
+            assert_eq!(readiness_payload["degradedReasons"], json!(["lock_quorum_unavailable"]));
+        });
     }
 
     #[test]

@@ -6,8 +6,8 @@
 # where it stays for the rest of the job. On this repository that matters more
 # than usual: pull_request jobs run on self-hosted runners and execute the PR's
 # own build.rs, proc-macros and tests, any of which can read that file. The
-# Test and Lint job additionally holds actions: write, so its token can cancel
-# runs and delete the Actions caches the whole pipeline depends on.
+# post-failure cancellation job holds actions: write but never checks out
+# repository code, so untrusted build scripts cannot read that token from Git.
 #
 # A checkout is exempt only when the token IS the credential the job needs —
 # helm-package pushes to rustfs/helm with it. Mark those with a comment

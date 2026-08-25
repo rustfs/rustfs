@@ -18,8 +18,8 @@
 //! GET, scanner, and heal workloads, mimalloc can retain freed pages in process
 //! heaps for later reuse instead of immediately returning them to the OS. That
 //! behavior is usually good for latency, but it can make process RSS look high
-//! after a workload has gone idle. This module provides an opt-in background
-//! loop that waits for a configurable idle window and then asks the allocator to
+//! after a workload has gone idle. This module provides a configurable
+//! background loop that waits for an idle window and then asks the allocator to
 //! collect retained memory.
 //!
 //! The loop is intentionally conservative:
@@ -41,7 +41,7 @@ use metrics::{counter, gauge, histogram};
 use serde::Serialize;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const ALLOCATOR_RECLAIM_SERVICE_NAME: &str = "allocator_reclaim";
 
@@ -238,8 +238,9 @@ fn reclaimable_work_snapshot() -> ReclaimableWorkSnapshot {
 
 /// Read the startup enablement switch.
 ///
-/// The code default is disabled. Local developer scripts may choose to export
-/// the variable as enabled for their own launch profile.
+/// The code default is enabled so direct binary, container, Helm, and local
+/// script launches share the same reclaim contract. Operators can still set
+/// `RUSTFS_ALLOCATOR_RECLAIM_ENABLED=false` for latency-sensitive deployments.
 fn configured_allocator_reclaim_enabled() -> bool {
     rustfs_utils::get_env_bool(
         rustfs_config::ENV_ALLOCATOR_RECLAIM_ENABLED,
@@ -421,15 +422,27 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
     gauge!("rustfs_memory_allocator_reclaim_enabled").set(if enabled { 1.0 } else { 0.0 });
     counter!("rustfs_memory_allocator_backend_info", "backend" => backend.to_string()).increment(1);
 
-    if !enabled {
-        debug!("allocator reclaim loop disabled");
-        return;
-    }
-
     let configured_force = configured_allocator_reclaim_force();
     let force = effective_allocator_reclaim_force(backend, configured_force);
     let idle_intervals = configured_allocator_reclaim_idle_intervals();
     let interval = Duration::from_secs(configured_allocator_reclaim_interval_secs());
+    info!(
+        event = "allocator_reclaim_configured",
+        component = "runtime",
+        subsystem = "memory",
+        state = if enabled { "enabled" } else { "disabled" },
+        backend,
+        configured_force,
+        effective_force = force,
+        idle_intervals,
+        interval_secs = interval.as_secs(),
+        "allocator reclaim configured"
+    );
+
+    if !enabled {
+        debug!("allocator reclaim loop disabled");
+        return;
+    }
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);

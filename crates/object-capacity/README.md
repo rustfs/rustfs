@@ -171,7 +171,9 @@ Refreshing only dirty disks is safe only when:
 - which means the system has already completed at least one full refresh without partial errors
 - and the per-disk cache is fully populated
 
-If the per-disk cache is incomplete, or there are no dirty disks, the system falls back to a full refresh.
+If no aggregate cache exists yet, the system performs a full refresh to establish an initial value. Once an aggregate cache exists, a scheduled refresh with no dirty disks stays idle instead of repeatedly walking unchanged disks. If disks are dirty while the per-disk cache is incomplete, the system performs a full refresh because a subset cannot be merged safely.
+
+A full refresh that reaches its time budget may publish an estimated aggregate without establishing a complete per-disk baseline. That bounded estimate acknowledges dirty marks that predate the scan, while marks recorded during the scan remain pending. This prevents one old dirty mark from causing an endless timeout loop without treating the estimate as exact.
 
 ### Merge Rules After a Subset Refresh
 

@@ -73,6 +73,15 @@ struct CapacityScanReport {
     per_disk: Vec<DiskCapacityScanResult>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ScheduledCapacityRefresh {
+    Idle,
+    Scan {
+        disks: Vec<CapacityDiskRef>,
+        dirty_subset: bool,
+    },
+}
+
 impl CapacityScanReport {
     fn into_capacity_update(self, expected_disk_count: usize, replaces_disk_cache: bool) -> CapacityUpdate {
         let mut update = if self.summary.is_estimated {
@@ -94,7 +103,13 @@ impl CapacityScanReport {
                 .collect();
             // Skipped metadata or timeout fallback estimates can update an
             // existing complete cache, but must not establish a new baseline.
-            if !self.summary.timed_out && !self.summary.metadata_incomplete {
+            if self.summary.timed_out {
+                // A timeout estimate is still the best bounded refresh for a
+                // disk too large to enumerate. Acknowledge dirty marks that
+                // predate this attempt so an idle disk does not loop forever;
+                // update_capacity preserves marks recorded during the scan.
+                update.clear_dirty_disks = update.per_disk.iter().map(|entry| entry.disk.clone()).collect();
+            } else if !self.summary.metadata_incomplete {
                 update.expected_disk_count = Some(expected_disk_count);
                 update.replaces_disk_cache = replaces_disk_cache;
                 update.clear_dirty_disks = update.per_disk.iter().map(|entry| entry.disk.clone()).collect();
@@ -329,23 +344,33 @@ pub(crate) async fn calculate_data_dir_used_capacity(
     Ok(calculate_data_dir_used_capacity_report(disks).await?.summary)
 }
 
-pub async fn select_capacity_refresh_disks(
+pub(crate) async fn select_scheduled_capacity_refresh(
     capacity_manager: &HybridCapacityManager,
     disks: &[CapacityDiskRef],
-) -> (Vec<CapacityDiskRef>, bool) {
+) -> ScheduledCapacityRefresh {
     // The write side marks every disk of an EC set dirty, including remote
     // peers, but only local disks are ever scanned and cleared — drop ghost
     // entries so the dirty gauge reflects local pending work (backlog#1020).
     let local_set: HashSet<CapacityScopeDisk> = disks.iter().map(disk_scope_key).collect();
     capacity_manager.retain_dirty_disks_within(&local_set).await;
 
-    if !capacity_manager.can_refresh_dirty_subset().await {
-        return (disks.to_vec(), false);
-    }
-
     let dirty_disks = capacity_manager.get_dirty_disks().await;
     if dirty_disks.is_empty() {
-        return (disks.to_vec(), false);
+        return if disks.is_empty() || capacity_manager.get_capacity().await.is_some() {
+            ScheduledCapacityRefresh::Idle
+        } else {
+            ScheduledCapacityRefresh::Scan {
+                disks: disks.to_vec(),
+                dirty_subset: false,
+            }
+        };
+    }
+
+    if !capacity_manager.can_refresh_dirty_subset().await {
+        return ScheduledCapacityRefresh::Scan {
+            disks: disks.to_vec(),
+            dirty_subset: false,
+        };
     }
 
     let dirty_set: HashSet<CapacityScopeDisk> = dirty_disks.into_iter().collect();
@@ -356,9 +381,27 @@ pub async fn select_capacity_refresh_disks(
         .collect();
 
     if selected.is_empty() || selected.len() >= disks.len() {
-        (disks.to_vec(), false)
+        ScheduledCapacityRefresh::Scan {
+            disks: disks.to_vec(),
+            dirty_subset: false,
+        }
     } else {
-        (selected, true)
+        ScheduledCapacityRefresh::Scan {
+            disks: selected,
+            dirty_subset: true,
+        }
+    }
+}
+
+pub async fn select_capacity_refresh_disks(
+    capacity_manager: &HybridCapacityManager,
+    disks: &[CapacityDiskRef],
+) -> (Vec<CapacityDiskRef>, bool) {
+    match select_scheduled_capacity_refresh(capacity_manager, disks).await {
+        // Preserve the public selector's historical contract. The background
+        // scheduler consumes the richer internal plan and can remain idle.
+        ScheduledCapacityRefresh::Idle => (disks.to_vec(), false),
+        ScheduledCapacityRefresh::Scan { disks, dirty_subset } => (disks, dirty_subset),
     }
 }
 
@@ -1606,21 +1649,27 @@ mod tests {
 
     #[test]
     fn test_into_capacity_update_incomplete_results_do_not_replace_disk_cache() {
-        for scan in [
-            CapacityScanResult {
-                used_bytes: 100,
-                file_count: 10,
-                is_estimated: true,
-                metadata_incomplete: true,
-                ..Default::default()
-            },
-            CapacityScanResult {
-                used_bytes: 100,
-                file_count: 10,
-                is_estimated: true,
-                timed_out: true,
-                ..Default::default()
-            },
+        for (scan, clears_dirty) in [
+            (
+                CapacityScanResult {
+                    used_bytes: 100,
+                    file_count: 10,
+                    is_estimated: true,
+                    metadata_incomplete: true,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                CapacityScanResult {
+                    used_bytes: 100,
+                    file_count: 10,
+                    is_estimated: true,
+                    timed_out: true,
+                    ..Default::default()
+                },
+                true,
+            ),
         ] {
             let disk = CapacityScopeDisk {
                 endpoint: "node-a".to_string(),
@@ -1641,7 +1690,11 @@ mod tests {
             assert_eq!(update.per_disk[0].disk, disk);
             assert_eq!(update.expected_disk_count, None);
             assert!(!update.replaces_disk_cache);
-            assert!(update.clear_dirty_disks.is_empty());
+            if clears_dirty {
+                assert_eq!(update.clear_dirty_disks, vec![disk]);
+            } else {
+                assert!(update.clear_dirty_disks.is_empty());
+            }
         }
     }
 
@@ -1710,6 +1763,29 @@ mod tests {
         let (selected, dirty_subset) = select_capacity_refresh_disks(manager.as_ref(), &disks).await;
         assert!(!dirty_subset);
         assert_eq!(selected.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_scheduled_capacity_refresh_returns_idle_with_cached_incomplete_baseline() {
+        let manager = create_isolated_manager(HybridStrategyConfig::default());
+        manager
+            .update_capacity(CapacityUpdate::estimated(100, 10), DataSource::Scheduled)
+            .await;
+
+        let disks = vec![CapacityDiskRef {
+            endpoint: "disk-1".to_string(),
+            drive_path: "/tmp/disk-1".to_string(),
+        }];
+
+        assert_eq!(
+            select_scheduled_capacity_refresh(manager.as_ref(), &disks).await,
+            ScheduledCapacityRefresh::Idle
+        );
+
+        let (selected, dirty_subset) = select_capacity_refresh_disks(manager.as_ref(), &disks).await;
+        assert_eq!(selected, disks);
+        assert!(!dirty_subset);
+        assert!(!manager.can_refresh_dirty_subset().await);
     }
 
     #[tokio::test]

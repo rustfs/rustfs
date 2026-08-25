@@ -34,6 +34,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_exact_1mib_handoff_abba.sh
 	./scripts/test_pinned_paired_abba_bench.sh
 	./scripts/test_manual_transition_runbooks.sh
+	./scripts/test_fuzz_runner.sh
 	./scripts/check_embedded_secrets.sh --self-test
 	python3 ./scripts/check_test_wiring.py --self-test
 	python3 ./scripts/check_security_coverage.py --self-test

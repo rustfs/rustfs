@@ -16,8 +16,10 @@
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Borrow;
+
     use crate::common::{RustFSTestEnvironment, init_logging, signed_s3_request};
-    use aws_sdk_s3::error::ProvideErrorMetadata;
+    use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
     use aws_sdk_s3::types::{
         AccelerateConfiguration, BucketAccelerateStatus, BucketLoggingStatus, IndexDocument, LoggingEnabled, Payer,
         RequestPaymentConfiguration, WebsiteConfiguration,
@@ -25,6 +27,26 @@ mod tests {
     use http::Method;
     use http::header::CONTENT_TYPE;
     use tracing::info;
+
+    fn assert_s3_error<T, E, R>(result: Result<T, R>, expected_status: u16, expected_code: &str, context: &str)
+    where
+        T: std::fmt::Debug,
+        E: ProvideErrorMetadata + std::fmt::Debug,
+        R: Borrow<SdkError<E>> + std::fmt::Debug,
+    {
+        let error = result.expect_err(context);
+        let sdk_error = error.borrow();
+        assert_eq!(
+            sdk_error.raw_response().map(|response| response.status().as_u16()),
+            Some(expected_status),
+            "{context}: expected HTTP {expected_status}, got: {error:?}"
+        );
+        assert_eq!(
+            sdk_error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some(expected_code),
+            "{context}: expected {expected_code}, got: {error:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_dummy_bucket_compatibility_endpoints() {
@@ -217,17 +239,11 @@ mod tests {
             .expect("DeleteBucketWebsite should return success");
 
         let website_after_delete = client.get_bucket_website().bucket(bucket).send().await;
-        assert!(
-            website_after_delete.is_err(),
-            "GetBucketWebsite should return NoSuchWebsiteConfiguration after deletion"
-        );
-        let website_err = website_after_delete.err().unwrap();
-        let website_code = website_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(website_code, Some("NoSuchWebsiteConfiguration")),
-            "Unexpected GetBucketWebsite error code: {:?}, err: {:?}",
-            website_code,
-            website_err
+        assert_s3_error(
+            website_after_delete,
+            404,
+            "NoSuchWebsiteConfiguration",
+            "GetBucketWebsite after deleting the website configuration",
         );
 
         env.stop_server();
@@ -245,15 +261,7 @@ mod tests {
         let missing_bucket = "test-dummy-bucket-missing";
 
         let get_logging = client.get_bucket_logging().bucket(missing_bucket).send().await;
-        assert!(get_logging.is_err(), "GetBucketLogging should fail for missing bucket");
-        let get_logging_err = get_logging.err().unwrap();
-        let get_logging_code = get_logging_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(get_logging_code, Some("NoSuchBucket")),
-            "Unexpected GetBucketLogging error code: {:?}, err: {:?}",
-            get_logging_code,
-            get_logging_err
-        );
+        assert_s3_error(get_logging, 404, "NoSuchBucket", "GetBucketLogging for a missing bucket");
 
         let put_logging = client
             .put_bucket_logging()
@@ -261,41 +269,22 @@ mod tests {
             .bucket_logging_status(BucketLoggingStatus::builder().build())
             .send()
             .await;
-        assert!(put_logging.is_err(), "PutBucketLogging should fail for missing bucket");
-        let put_logging_err = put_logging.err().unwrap();
-        let put_logging_code = put_logging_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(put_logging_code, Some("NoSuchBucket")),
-            "Unexpected PutBucketLogging error code: {:?}, err: {:?}",
-            put_logging_code,
-            put_logging_err
-        );
+        assert_s3_error(put_logging, 404, "NoSuchBucket", "PutBucketLogging for a missing bucket");
 
         let get_accelerate = client
             .get_bucket_accelerate_configuration()
             .bucket(missing_bucket)
             .send()
             .await;
-        assert!(get_accelerate.is_err(), "GetBucketAccelerateConfiguration should fail for missing bucket");
-        let get_accelerate_err = get_accelerate.err().unwrap();
-        let get_accelerate_code = get_accelerate_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(get_accelerate_code, Some("NoSuchBucket")),
-            "Unexpected GetBucketAccelerateConfiguration error code: {:?}, err: {:?}",
-            get_accelerate_code,
-            get_accelerate_err
+        assert_s3_error(
+            get_accelerate,
+            404,
+            "NoSuchBucket",
+            "GetBucketAccelerateConfiguration for a missing bucket",
         );
 
         let get_request_payment = client.get_bucket_request_payment().bucket(missing_bucket).send().await;
-        assert!(get_request_payment.is_err(), "GetBucketRequestPayment should fail for missing bucket");
-        let get_request_payment_err = get_request_payment.err().unwrap();
-        let get_request_payment_code = get_request_payment_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(get_request_payment_code, Some("NoSuchBucket")),
-            "Unexpected GetBucketRequestPayment error code: {:?}, err: {:?}",
-            get_request_payment_code,
-            get_request_payment_err
-        );
+        assert_s3_error(get_request_payment, 404, "NoSuchBucket", "GetBucketRequestPayment for a missing bucket");
 
         let put_accelerate = client
             .put_bucket_accelerate_configuration()
@@ -307,14 +296,11 @@ mod tests {
             )
             .send()
             .await;
-        assert!(put_accelerate.is_err(), "PutBucketAccelerateConfiguration should fail for missing bucket");
-        let put_accelerate_err = put_accelerate.err().unwrap();
-        let put_accelerate_code = put_accelerate_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(put_accelerate_code, Some("NoSuchBucket")),
-            "Unexpected PutBucketAccelerateConfiguration error code: {:?}, err: {:?}",
-            put_accelerate_code,
-            put_accelerate_err
+        assert_s3_error(
+            put_accelerate,
+            404,
+            "NoSuchBucket",
+            "PutBucketAccelerateConfiguration for a missing bucket",
         );
 
         let put_request_payment = client
@@ -328,15 +314,7 @@ mod tests {
             )
             .send()
             .await;
-        assert!(put_request_payment.is_err(), "PutBucketRequestPayment should fail for missing bucket");
-        let put_request_payment_err = put_request_payment.err().unwrap();
-        let put_request_payment_code = put_request_payment_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(put_request_payment_code, Some("NoSuchBucket")),
-            "Unexpected PutBucketRequestPayment error code: {:?}, err: {:?}",
-            put_request_payment_code,
-            put_request_payment_err
-        );
+        assert_s3_error(put_request_payment, 404, "NoSuchBucket", "PutBucketRequestPayment for a missing bucket");
 
         let put_website = client
             .put_bucket_website()
@@ -353,37 +331,13 @@ mod tests {
             )
             .send()
             .await;
-        assert!(put_website.is_err(), "PutBucketWebsite should fail for missing bucket");
-        let put_website_err = put_website.err().unwrap();
-        let put_website_code = put_website_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(put_website_code, Some("NoSuchBucket")),
-            "Unexpected PutBucketWebsite error code: {:?}, err: {:?}",
-            put_website_code,
-            put_website_err
-        );
+        assert_s3_error(put_website, 404, "NoSuchBucket", "PutBucketWebsite for a missing bucket");
 
         let get_website = client.get_bucket_website().bucket(missing_bucket).send().await;
-        assert!(get_website.is_err(), "GetBucketWebsite should fail for missing bucket");
-        let get_website_err = get_website.err().unwrap();
-        let get_website_code = get_website_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(get_website_code, Some("NoSuchBucket")),
-            "Unexpected GetBucketWebsite error code: {:?}, err: {:?}",
-            get_website_code,
-            get_website_err
-        );
+        assert_s3_error(get_website, 404, "NoSuchBucket", "GetBucketWebsite for a missing bucket");
 
         let delete_website = client.delete_bucket_website().bucket(missing_bucket).send().await;
-        assert!(delete_website.is_err(), "DeleteBucketWebsite should fail for missing bucket");
-        let delete_website_err = delete_website.err().unwrap();
-        let delete_website_code = delete_website_err.as_service_error().and_then(|e| e.code());
-        assert!(
-            matches!(delete_website_code, Some("NoSuchBucket")),
-            "Unexpected DeleteBucketWebsite error code: {:?}, err: {:?}",
-            delete_website_code,
-            delete_website_err
-        );
+        assert_s3_error(delete_website, 404, "NoSuchBucket", "DeleteBucketWebsite for a missing bucket");
 
         env.stop_server();
     }

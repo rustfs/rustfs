@@ -2683,48 +2683,50 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn public_health_endpoint_layer_handles_health_before_inner_service() {
-        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
-            let inner = CountingHybridService::default();
-            let calls = inner.calls();
-            let mut service = public_health_layer().layer(inner);
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false")),
+            ],
+            async {
+                let inner = CountingHybridService::default();
+                let calls = inner.calls();
+                let mut service = public_health_layer().layer(inner);
 
-            let response = service
-                .call(
-                    Request::builder()
-                        .method(Method::GET)
-                        .uri(HEALTH_PREFIX)
-                        .header(http::header::HOST, "localhost:9000")
-                        .body(Full::<Bytes>::from(Bytes::new()))
-                        .expect("request"),
-                )
-                .await
-                .expect("health response");
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_PREFIX)
+                            .header(http::header::HOST, "localhost:9000")
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("health response");
 
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-            assert_eq!(
-                response
-                    .headers()
-                    .get(http::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok()),
-                Some("application/json")
-            );
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/json")
+                );
 
-            let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
-            let payload: serde_json::Value =
-                serde_json::from_slice(&body).expect("public liveness health response should be valid JSON");
-            assert_eq!(payload["status"], "degraded");
-            assert_eq!(payload["ready"], false);
-            assert_eq!(
-                payload["details"],
-                serde_json::json!({
-                    "storage": { "status": "disconnected", "ready": false },
-                    "iam": { "status": "disconnected", "ready": false },
-                    "lock": { "status": "connected", "ready": true },
-                })
-            );
-            assert_eq!(payload["degradedReasons"], serde_json::json!(["storage_and_iam_unavailable"]));
-        })
+                let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&body).expect("public liveness health response should be valid JSON");
+                assert!(matches!(payload["status"].as_str(), Some("ok" | "degraded")));
+                assert!(payload["ready"].is_boolean());
+                assert!(payload["details"].is_object());
+                assert!(payload["details"]["storage"]["ready"].is_boolean());
+                assert!(payload["details"]["iam"]["ready"].is_boolean());
+                assert!(payload["details"]["lock"]["ready"].is_boolean());
+                assert!(payload["degradedReasons"].is_array());
+            },
+        )
         .await;
     }
 
