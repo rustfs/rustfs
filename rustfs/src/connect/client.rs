@@ -30,7 +30,7 @@ use super::identity::{IdentityError, RegistrationTranscript};
 use super::identity_store::{IdentityStore, StoreError};
 use super::registration::{
     CredentialResponse, CredentialValidationError, ExpectedDevice, RegistrationRequest, RegistrationToken, RotationRequest,
-    certificate_fingerprint, certificate_request_matches, public_key_fingerprint, validate_credential,
+    certificate_fingerprint, certificate_request_matches, is_uuid_v7, public_key_fingerprint, validate_credential,
     validate_stored_credential,
 };
 
@@ -350,6 +350,9 @@ impl ConnectClient {
         };
         let current = identity_store.load()?.ok_or(ClientError::IdentityMissing)?;
         if let Some(pending) = credential_store.load_pending_registration()? {
+            if !is_uuid_v7(&pending.token_uid) {
+                return Err(ClientError::PendingRegistration);
+            }
             let Some(previous) = pending.previous_credential_fingerprint.as_deref() else {
                 if pending.next_public_key_sha256.is_some()
                     || !is_request_id(&pending.request_id)
@@ -375,6 +378,12 @@ impl ConnectClient {
                 if public_key_fingerprint(&next) != next_fingerprint
                     || !certificate_request_matches(&pending.certificate_request, &next)?
                 {
+                    return Err(ClientError::PendingRegistration);
+                }
+                if credential_store.load_completed_registration()?.is_some_and(|completed| {
+                    completed.credential_fingerprint == fingerprint
+                        && (!is_uuid_v7(&completed.token_uid) || completed.token_uid == pending.token_uid)
+                }) {
                     return Err(ClientError::PendingRegistration);
                 }
                 return Ok(Some((credential, current, true)));

@@ -496,7 +496,7 @@ fn canonical_serial(raw: &[u8]) -> Result<String, CredentialValidationError> {
     Ok(hex_lower(&padded))
 }
 
-fn is_uuid_v7(value: &str) -> bool {
+pub(crate) fn is_uuid_v7(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|uuid| uuid.get_version() == Some(Version::SortRand) && uuid.to_string() == value)
 }
 
