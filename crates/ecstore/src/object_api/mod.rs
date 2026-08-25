@@ -52,6 +52,13 @@ pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 pub(crate) const ENCRYPTED_PART_LAYOUT_CANDIDATE_SUFFIX: &str = "encrypted-part-layout-quorum-candidate-v1";
 pub(crate) const ENCRYPTED_PART_LAYOUT_QUORUM_SUFFIX: &str = "encrypted-part-layout-quorum-v1";
+/// Marker naming the fixed-8-KiB v2 frame layout of a single-part encrypted
+/// object. The value is the object's `data_dir` token, exactly like the part
+/// layout markers above: any path that re-homes this metadata onto other
+/// ciphertext or a new object identity (copy, replication re-encryption, data
+/// movement) mints a new `data_dir`, invalidating the marker so the read falls
+/// back to the conservative full path instead of trusting a stale layout.
+pub(crate) const ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX: &str = "encrypted-frame-layout-fixed8k-v1";
 pub(crate) const ENV_RUSTFS_ENCRYPTED_RANGE_SEEK: &str = "RUSTFS_ENCRYPTED_RANGE_SEEK";
 pub(crate) const DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK: bool = true;
 

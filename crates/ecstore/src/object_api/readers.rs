@@ -142,6 +142,87 @@ fn get_encrypted_offsets(oi: &ObjectInfo, offset: i64) -> Result<(i64, usize, us
 const ENCRYPTED_RANGE_READ_PATH_FULL: &str = "full";
 /// Metric path label for a Legacy encrypted Range GET served by the part-boundary seek.
 const ENCRYPTED_RANGE_READ_PATH_PART_SEEK: &str = "part_seek";
+/// Metric path label for a single-part v2 fixed-frame seek.
+const ENCRYPTED_RANGE_READ_PATH_FRAME_SEEK: &str = "frame_seek";
+
+/// Plaintext bytes per non-final v2 frame (the rio v2 writer's fixed block).
+const V2_FRAME_PLAINTEXT_LEN: i64 = 8 * 1024;
+/// Ciphertext cost of one full v2 frame: 8-byte header, 2-byte uvarint(8192),
+/// the plaintext block, and the 16-byte GCM tag.
+const V2_FRAME_CIPHERTEXT_LEN: i64 = 8 + 2 + V2_FRAME_PLAINTEXT_LEN + 16;
+
+/// True when a single-part v2 fixed-frame object may seek to a frame boundary.
+///
+/// The marker's value is the object's `data_dir` token (see
+/// [`ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX`]), so metadata re-homed onto other
+/// ciphertext or another object identity disqualifies itself. Correctness never
+/// rests on the marker: the v2 decrypt path authenticates every frame against
+/// its absolute index, so a lying marker surfaces as a read error, never as
+/// plaintext from the wrong offset.
+fn v2_frame_seek_eligible(
+    oi: &ObjectInfo,
+    is_multipart: bool,
+    is_compressed: bool,
+    requested_length: i64,
+    recorded_plaintext_size: Option<i64>,
+) -> bool {
+    if is_multipart || is_compressed || requested_length <= 0 || recorded_plaintext_size.is_none() {
+        return false;
+    }
+    let Some(data_dir) = oi.data_dir.filter(|data_dir| !data_dir.is_nil()) else {
+        return false;
+    };
+    let mut layout_token_buf = [0_u8; 36];
+    let layout_token = data_dir.hyphenated().encode_lower(&mut layout_token_buf);
+    has_encrypted_part_layout_marker(&oi.user_defined, ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX, layout_token)
+}
+
+/// Closed-form frame-boundary offsets for a single-part v2 object.
+///
+/// Returns `(storage_offset, storage_length, plaintext_skip_in_frame,
+/// starting_frame_index, remaining_plaintext)`. `None` on any bound the stored
+/// layout cannot satisfy — the caller then keeps the conservative full read.
+fn get_v2_frame_offsets(oi: &ObjectInfo, offset: i64, length: i64, plaintext_size: i64) -> Option<(i64, i64, usize, u32, i64)> {
+    if offset < 0 || length <= 0 || plaintext_size < 0 {
+        return None;
+    }
+    let end = offset.checked_add(length)?.checked_sub(1)?;
+    if end >= plaintext_size {
+        return None;
+    }
+    let frame_index = offset / V2_FRAME_PLAINTEXT_LEN;
+    let storage_offset = frame_index.checked_mul(V2_FRAME_CIPHERTEXT_LEN)?;
+    if storage_offset >= oi.size {
+        return None;
+    }
+    let end_frame = end / V2_FRAME_PLAINTEXT_LEN;
+    let total_full_frames = plaintext_size / V2_FRAME_PLAINTEXT_LEN;
+    // Frames below `total_full_frames` are full-size by construction. A range
+    // reaching into the last plaintext-bearing frame extends the window to the
+    // ciphertext end: a range that touches the plaintext end drains the
+    // decrypt stream, and the stream only ends cleanly at its authenticated
+    // final frame (which on a block-aligned object is the empty frame after
+    // the last full one). Interior ranges stop before their window ends and
+    // never observe the cut.
+    let storage_end = if end_frame.checked_add(1)? < total_full_frames {
+        end_frame.checked_add(1)?.checked_mul(V2_FRAME_CIPHERTEXT_LEN)?.min(oi.size)
+    } else {
+        oi.size
+    };
+    if storage_end <= storage_offset {
+        return None;
+    }
+    let plaintext_skip = usize::try_from(offset % V2_FRAME_PLAINTEXT_LEN).ok()?;
+    let remaining_plaintext = plaintext_size.checked_sub(frame_index.checked_mul(V2_FRAME_PLAINTEXT_LEN)?)?;
+    let starting_frame = u32::try_from(frame_index).ok()?;
+    Some((
+        storage_offset,
+        storage_end - storage_offset,
+        plaintext_skip,
+        starting_frame,
+        remaining_plaintext,
+    ))
+}
 
 /// True when a Legacy (rio v1) encrypted Range GET may seek to the covering part
 /// boundary instead of streaming the whole ciphertext.
@@ -294,6 +375,29 @@ fn legacy_encrypted_range_plan(
     full_plaintext_size: usize,
     recorded_plaintext_size: Option<i64>,
 ) -> Result<EncryptedRangePlan> {
+    if v2_frame_seek_eligible(oi, is_multipart, is_compressed, requested_length, recorded_plaintext_size)
+        && let Some(recorded_plaintext) = recorded_plaintext_size
+        && let Ok(requested_offset_i64) = i64::try_from(requested_offset)
+        && let Some((physical_offset, physical_length, plaintext_skip_in_frame, starting_frame, remaining_plaintext)) =
+            get_v2_frame_offsets(oi, requested_offset_i64, requested_length, recorded_plaintext)
+    {
+        let storage_offset = usize::try_from(physical_offset)
+            .map_err(|_| Error::other(format!("invalid v2 encrypted offset {physical_offset}")))?;
+        let total_plaintext_size = usize::try_from(remaining_plaintext)
+            .map_err(|_| Error::other(format!("invalid v2 remaining decrypted size {remaining_plaintext}")))?;
+        record_encrypted_range_read_amplification(ENCRYPTED_RANGE_READ_PATH_FRAME_SEEK, physical_length, requested_length);
+        return Ok((
+            storage_offset,
+            physical_length,
+            0,
+            plaintext_skip_in_frame,
+            requested_length,
+            total_plaintext_size,
+            starting_frame,
+            Vec::new(),
+        ));
+    }
+
     if legacy_encrypted_seek_eligible(oi, is_multipart, is_compressed, requested_length, recorded_plaintext_size)
         && let Ok(requested_offset) = i64::try_from(requested_offset)
         && let Some((physical_offset, physical_length, plaintext_skip_in_part, part_start_index, remaining_plaintext)) =
@@ -2926,6 +3030,45 @@ mod tests {
         .await
     }
 
+    /// Single-part object encrypted with the v2 fixed-frame writer, carrying
+    /// the frame-layout marker bound to its `data_dir`.
+    async fn build_v2_singlepart_fixture(key_bytes: [u8; 32], plain_size: usize) -> LegacyMultipartFixture {
+        let plaintext = legacy_fixture_part_plaintext(1, plain_size);
+        let mut ciphertext = Vec::new();
+        rustfs_rio::EncryptReader::new_v2(Cursor::new(plaintext.clone()), key_bytes, LEGACY_FIXTURE_BASE_NONCE)
+            .read_to_end(&mut ciphertext)
+            .await
+            .expect("encrypt v2 single-part fixture");
+
+        let data_dir = Uuid::from_u128(2);
+        let mut user_defined = legacy_ssec_multipart_metadata(key_bytes, plain_size);
+        rustfs_utils::http::insert_str(&mut user_defined, ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX, data_dir.to_string());
+
+        let parts = vec![ObjectPartInfo {
+            number: 1,
+            size: ciphertext.len(),
+            actual_size: plaintext.len() as i64,
+            ..Default::default()
+        }];
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "v2-single-part".to_string(),
+            size: ciphertext.len() as i64,
+            data_dir: Some(data_dir),
+            etag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            parts: Arc::new(parts),
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        LegacyMultipartFixture {
+            plaintext,
+            ciphertext,
+            object_info,
+            part_physical_sizes: Vec::new(),
+        }
+    }
+
     /// Serves exactly the ciphertext window the plan schedules — the contract the
     /// erasure layer honors for `(storage_offset, storage_length)` — then decodes
     /// the body end to end. Returns the body, the plan offsets, and the reported
@@ -3887,5 +4030,244 @@ mod tests {
         assert_eq!(length, encrypted.len() as i64 - expected_storage_offset as i64);
         assert_eq!(reader.object_info.size, 64);
         assert_eq!(actual, plaintext[range.start as usize..range.start as usize + 64]);
+    }
+
+    // =============== v2 fixed-frame single-part seek ===============
+
+    #[test]
+    fn test_get_v2_frame_offsets_math() {
+        let frame = V2_FRAME_CIPHERTEXT_LEN;
+        let block = V2_FRAME_PLAINTEXT_LEN;
+        // 3 full frames + a 500-byte final frame (2-byte uvarint) + end marker.
+        let plaintext_size = 3 * block + 500;
+        let final_frame = 8 + 2 + 500 + 16;
+        let oi = ObjectInfo {
+            size: 3 * frame + final_frame + 8,
+            ..Default::default()
+        };
+
+        // Head range stays inside frame 0.
+        let (off, len, skip, seq, remaining) = get_v2_frame_offsets(&oi, 0, 100, plaintext_size).expect("head range plans");
+        assert_eq!((off, len, skip, seq), (0, frame, 0, 0));
+        assert_eq!(remaining, plaintext_size);
+
+        // A range crossing the first frame boundary covers frames 0..=1.
+        let (off, len, skip, seq, _) = get_v2_frame_offsets(&oi, block - 1, 2, plaintext_size).expect("boundary range plans");
+        assert_eq!((off, len, skip, seq), (0, 2 * frame, (block - 1) as usize, 0));
+
+        // A range starting exactly on frame 1 seeks past frame 0.
+        let (off, len, skip, seq, remaining) = get_v2_frame_offsets(&oi, block, 10, plaintext_size).expect("aligned range plans");
+        assert_eq!((off, len, skip, seq), (frame, frame, 0, 1));
+        assert_eq!(remaining, plaintext_size - block);
+
+        // A tail range inside the final frame reads through the ciphertext end.
+        let (off, len, skip, seq, remaining) =
+            get_v2_frame_offsets(&oi, 3 * block + 100, 200, plaintext_size).expect("tail range plans");
+        assert_eq!((off, len, skip, seq), (3 * frame, final_frame + 8, 100, 3));
+        assert_eq!(remaining, 500);
+
+        // A range ending inside the LAST full frame also extends to the
+        // ciphertext end, so a drain-to-plaintext-end read still observes the
+        // authenticated final frame.
+        let (off, len, skip, seq, _) =
+            get_v2_frame_offsets(&oi, 2 * block + 1, block - 1, plaintext_size).expect("last-full-frame range plans");
+        assert_eq!((off, len, skip, seq), (2 * frame, oi.size - 2 * frame, 1, 2));
+
+        // Out-of-bounds and degenerate requests fall back.
+        assert!(get_v2_frame_offsets(&oi, plaintext_size - 10, 20, plaintext_size).is_none());
+        assert!(get_v2_frame_offsets(&oi, -1, 10, plaintext_size).is_none());
+        assert!(get_v2_frame_offsets(&oi, 0, 0, plaintext_size).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_v2_singlepart_range_seek_byte_exact_matrix() {
+        let key_bytes = [0x6B; 32];
+        let block = V2_FRAME_PLAINTEXT_LEN as usize;
+        let fixture = build_v2_singlepart_fixture(key_bytes, 3 * block + 500).await;
+
+        let cases = [
+            (0_i64, 99_i64),
+            ((block - 1) as i64, block as i64),
+            (block as i64, (block + 9) as i64),
+            ((2 * block + 5) as i64, (3 * block + 480) as i64),
+        ];
+        for (start, end) in cases {
+            let (body, offset, length, _) = read_via_seek_window(
+                &fixture,
+                Some(range(start, end)),
+                &ObjectOptions::default(),
+                &ssec_headers_from_key(key_bytes),
+            )
+            .await;
+            let expected = &fixture.plaintext[start as usize..=end as usize];
+            assert_eq!(body, expected, "range {start}-{end} must be byte-exact");
+            let expected_offset = (start / V2_FRAME_PLAINTEXT_LEN) * V2_FRAME_CIPHERTEXT_LEN;
+            assert_eq!(offset, usize::try_from(expected_offset).expect("offset fits"), "range {start}-{end}");
+            assert!(
+                length < fixture.ciphertext.len() as i64 || start < V2_FRAME_PLAINTEXT_LEN,
+                "a mid-object range must not span the whole ciphertext"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v2_singlepart_block_aligned_object_serves_tail_ranges() {
+        // A block-aligned object ends in an EMPTY authenticated final frame.
+        // Ranges ending on the last plaintext byte plan a window that excludes
+        // that final frame; the ranged reader must not misread the window end
+        // as truncation.
+        let key_bytes = [0x6E; 32];
+        let block = V2_FRAME_PLAINTEXT_LEN as usize;
+        let fixture = build_v2_singlepart_fixture(key_bytes, 3 * block).await;
+
+        for (start, end) in [
+            (2 * block as i64 + 10, 3 * block as i64 - 1),
+            (3 * block as i64 - 1, 3 * block as i64 - 1),
+            (0, 3 * block as i64 - 1),
+        ] {
+            let (body, _, _, _) = read_via_seek_window(
+                &fixture,
+                Some(range(start, end)),
+                &ObjectOptions::default(),
+                &ssec_headers_from_key(key_bytes),
+            )
+            .await;
+            assert_eq!(
+                body,
+                &fixture.plaintext[start as usize..=end as usize],
+                "aligned-object range {start}-{end} must be byte-exact"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v2_singlepart_seek_requires_a_matching_marker() {
+        let key_bytes = [0x6C; 32];
+        let block = V2_FRAME_PLAINTEXT_LEN as usize;
+        let fixture = build_v2_singlepart_fixture(key_bytes, 2 * block + 40).await;
+
+        // Marker bound to another data_dir (a copied/re-homed object): full read.
+        let mut foreign = (*fixture.object_info.user_defined).clone();
+        rustfs_utils::http::insert_str(&mut foreign, ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX, Uuid::from_u128(9).to_string());
+        let mut object_info = fixture.object_info.clone();
+        object_info.user_defined = Arc::new(foreign);
+        let plan = ReadPlan::build(
+            Some(range(block as i64, (block + 5) as i64)),
+            &object_info,
+            &ObjectOptions::default(),
+            &ssec_headers_from_key(key_bytes),
+        )
+        .await
+        .expect("mismatched marker still plans a conservative read");
+        assert_eq!(plan.storage_offset, 0);
+        assert_eq!(plan.storage_length, fixture.ciphertext.len() as i64);
+
+        // No marker at all: full read.
+        let mut unmarked = (*fixture.object_info.user_defined).clone();
+        unmarked.retain(|key, _| !rustfs_utils::http::has_internal_suffix(key, ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX));
+        let mut object_info = fixture.object_info.clone();
+        object_info.user_defined = Arc::new(unmarked);
+        let plan = ReadPlan::build(
+            Some(range(block as i64, (block + 5) as i64)),
+            &object_info,
+            &ObjectOptions::default(),
+            &ssec_headers_from_key(key_bytes),
+        )
+        .await
+        .expect("markerless object plans a conservative read");
+        assert_eq!(plan.storage_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn test_v2_singlepart_lying_marker_fails_closed() {
+        // v1 ciphertext with a v2 marker planted on it: the seek positions the
+        // read at a fake frame boundary, and decryption must fail — never
+        // serve bytes from the wrong offset. The v1 writer frames per upstream
+        // read, so a small-buffered source yields short (non-8-KiB) frames and
+        // the fixed-frame math lands mid-frame.
+        struct ShortReads<R> {
+            inner: R,
+            cap: usize,
+        }
+        impl<R: AsyncRead + Unpin> AsyncRead for ShortReads<R> {
+            fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                let cap = self.cap.min(buf.remaining());
+                let mut tmp = vec![0u8; cap];
+                let mut limited = ReadBuf::new(&mut tmp);
+                match Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
+                    Poll::Ready(Ok(())) => {
+                        buf.put_slice(limited.filled());
+                        Poll::Ready(Ok(()))
+                    }
+                    other => other,
+                }
+            }
+        }
+
+        let key_bytes = [0x6D; 32];
+        let block = V2_FRAME_PLAINTEXT_LEN as usize;
+        let plaintext = legacy_fixture_part_plaintext(1, 3 * block);
+        let mut ciphertext = Vec::new();
+        rustfs_rio::EncryptReader::new(
+            ShortReads {
+                inner: Cursor::new(plaintext.clone()),
+                cap: 5_000,
+            },
+            key_bytes,
+            LEGACY_FIXTURE_BASE_NONCE,
+        )
+        .read_to_end(&mut ciphertext)
+        .await
+        .expect("encrypt v1 fixture");
+        // The fixture premise: short frames mean the fixed-frame boundary is
+        // not a real frame boundary in this ciphertext.
+        assert_ne!(ciphertext[0..8][1], ((V2_FRAME_CIPHERTEXT_LEN - 8) & 0xFF) as u8, "frames must be short");
+
+        let data_dir = Uuid::from_u128(3);
+        let mut user_defined = legacy_ssec_multipart_metadata(key_bytes, 3 * block);
+        rustfs_utils::http::insert_str(&mut user_defined, ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX, data_dir.to_string());
+        let object_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "lying-marker".to_string(),
+            size: ciphertext.len() as i64,
+            data_dir: Some(data_dir),
+            etag: Some("d41d8cd98f00b204e9800998ecf8427e".to_string()),
+            parts: Arc::new(vec![ObjectPartInfo {
+                number: 1,
+                size: ciphertext.len(),
+                actual_size: (3 * block) as i64,
+                ..Default::default()
+            }]),
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        let rs = range(block as i64, (block + 50) as i64);
+        let plan = ReadPlan::build(
+            Some(rs.clone()),
+            &object_info,
+            &ObjectOptions::default(),
+            &ssec_headers_from_key(key_bytes),
+        )
+        .await
+        .expect("plan still builds; failure must come from authentication");
+        let start = plan.storage_offset;
+        let window_len = usize::try_from(plan.storage_length).expect("window fits");
+        let window = ciphertext[start.min(ciphertext.len())..(start + window_len).min(ciphertext.len())].to_vec();
+
+        let (mut reader, _, _) = GetObjectReader::new(
+            Box::new(Cursor::new(window)),
+            Some(rs),
+            &object_info,
+            &ObjectOptions::default(),
+            &ssec_headers_from_key(key_bytes),
+        )
+        .await
+        .expect("reader construction succeeds; decryption fails at read time");
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .await
+            .expect_err("a lying frame-layout marker must fail closed, not serve plaintext");
     }
 }

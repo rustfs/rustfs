@@ -608,6 +608,72 @@ mod lifecycle_delete_all_plan_tests {
         ));
     }
 
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn put_object_stamps_the_v2_frame_layout_marker_only_when_enabled() {
+        use rustfs_utils::http::headers::SSEC_ALGORITHM_HEADER;
+
+        async fn put_encrypted_and_reread(marker_expected: bool) {
+            let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+            let bucket = "frame-layout-marker-bucket";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+
+            let opts = ObjectOptions {
+                user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]),
+                ..Default::default()
+            };
+            let mut reader = PutObjReader::from_vec(vec![0x42; 4096]);
+            set.put_object(bucket, "encrypted", &mut reader, &opts)
+                .await
+                .expect("encrypted object should be stored");
+
+            let info = set
+                .get_object_info(bucket, "encrypted", &ObjectOptions::default())
+                .await
+                .expect("stored object should be readable");
+            let marker = rustfs_utils::http::get_consistent_str(
+                &info.user_defined,
+                crate::object_api::ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX,
+            )
+            .map(str::to_string);
+            if marker_expected {
+                let data_dir = info.data_dir.expect("stored object should have a data dir").to_string();
+                assert_eq!(marker.as_deref(), Some(data_dir.as_str()), "marker must bind the object's data_dir");
+            } else {
+                assert_eq!(marker, None, "marker must not be stamped");
+            }
+
+            // A plaintext object never carries the marker, whatever the switch.
+            let mut reader = PutObjReader::from_vec(vec![0x43; 128]);
+            set.put_object(bucket, "plaintext", &mut reader, &ObjectOptions::default())
+                .await
+                .expect("plaintext object should be stored");
+            let info = set
+                .get_object_info(bucket, "plaintext", &ObjectOptions::default())
+                .await
+                .expect("plaintext object should be readable");
+            assert_eq!(
+                rustfs_utils::http::get_consistent_str(
+                    &info.user_defined,
+                    crate::object_api::ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX
+                ),
+                None,
+                "plaintext objects never carry a frame-layout marker"
+            );
+        }
+
+        temp_env::async_with_vars([(crate::io_support::rio::ENV_RUSTFS_ENCRYPTION_FRAME_V2, Some("true"))], async {
+            put_encrypted_and_reread(true).await;
+        })
+        .await;
+        temp_env::async_with_vars([(crate::io_support::rio::ENV_RUSTFS_ENCRYPTION_FRAME_V2, None::<&str>)], async {
+            put_encrypted_and_reread(false).await;
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn staged_delete_removes_history_before_the_trigger() {
         let (temp_dirs, disks, set) = hermetic_set_disks(4).await;
@@ -2325,6 +2391,29 @@ impl SetDisks {
         }
 
         fi.data_dir = Some(Uuid::new_v4());
+
+        // Never inherit a frame-layout marker: an incoming one (replication
+        // passthrough, data movement) describes some other object identity and
+        // this write mints a fresh data_dir. Stamp only when this put actually
+        // encrypts its stream locally, which is when the v2 write switch is on.
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut user_defined,
+            crate::object_api::ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX,
+        );
+        #[cfg(not(feature = "rio-v2"))]
+        if crate::io_support::rio::encryption_frame_v2_enabled()
+            && !opts.preserve_ciphertext
+            && !opts.data_movement
+            && should_persist_encryption_original_size(&user_defined)
+            && let Some(data_dir) = fi.data_dir.filter(|data_dir| !data_dir.is_nil())
+        {
+            insert_str(
+                &mut user_defined,
+                crate::object_api::ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX,
+                data_dir.to_string(),
+            );
+        }
+
         let mut shuffle_disks = Self::shuffle_disks_owned(disks, &fi.erasure.distribution);
 
         let tmp_dir = Uuid::new_v4().to_string();

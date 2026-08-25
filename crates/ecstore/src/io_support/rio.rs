@@ -180,6 +180,12 @@ where
     #[cfg(feature = "rio-v2")]
     {
         match backend {
+            // The legacy family includes v2 fixed-frame objects, whose plans
+            // seek by frame; honor the starting index here too so a rio-v2
+            // build can range-read objects a default-build node wrote.
+            ReadEncryptionBackend::Legacy if sequence_number > 0 => {
+                Box::new(rustfs_rio::DecryptReader::new_at_block(reader, key, base_nonce, sequence_number as usize))
+            }
             ReadEncryptionBackend::Legacy => Box::new(rustfs_rio::DecryptReader::new(reader, key, base_nonce)),
             ReadEncryptionBackend::V2 => {
                 Box::new(rustfs_rio_v2::DecryptReader::new_with_sequence(reader, key, base_nonce, sequence_number))
@@ -189,8 +195,14 @@ where
 
     #[cfg(not(feature = "rio-v2"))]
     {
-        let _ = (backend, sequence_number);
-        Box::new(rustfs_rio::DecryptReader::new(reader, key, base_nonce))
+        let _ = backend;
+        if sequence_number > 0 {
+            // Single-part v2 frame seek: the plan positioned the storage read
+            // at frame `sequence_number`; nonce and AAD bind absolute indices.
+            Box::new(rustfs_rio::DecryptReader::new_at_block(reader, key, base_nonce, sequence_number as usize))
+        } else {
+            Box::new(rustfs_rio::DecryptReader::new(reader, key, base_nonce))
+        }
     }
 }
 
