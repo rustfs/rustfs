@@ -817,6 +817,7 @@ pub(crate) static ERR_TIER_MISSING_CREDENTIALS: AdminErrorRef =
 pub(crate) static ERR_TIER_ALREADY_EXISTS: AdminErrorRef =
     AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_ALREADY_EXISTS);
 pub(crate) static ERR_TIER_CONNECT_ERR: AdminErrorRef = AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_CONNECT_ERR);
+pub(crate) static ERR_TIER_INVALID_CONFIG: AdminErrorRef = AdminErrorRef(|| &ecstore_tier::tier::ERR_TIER_INVALID_CONFIG);
 pub(crate) static ERR_TIER_INVALID_CREDENTIALS: AdminErrorRef =
     AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_INVALID_CREDENTIALS);
 pub(crate) static ERR_TIER_NAME_NOT_UPPERCASE: AdminErrorRef =
@@ -963,7 +964,8 @@ pub(crate) mod s3 {
 pub(crate) mod tier {
     pub(crate) use super::{
         AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
-        ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
-        ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig, TierConfigUpdateError, TierCreds, TierType,
+        ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CONFIG, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS,
+        ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig, TierConfigUpdateError, TierCreds,
+        TierType,
     };
 }
