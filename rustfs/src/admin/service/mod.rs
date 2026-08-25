@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) mod caller_identity;
 pub mod config;
 pub(crate) mod federated_identity;
 pub(crate) mod session_policy;

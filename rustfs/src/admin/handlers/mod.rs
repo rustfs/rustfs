@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod account;
+pub(crate) mod account_audit;
 pub mod account_info;
 pub mod audit;
 mod audit_runtime_config;
@@ -40,6 +42,7 @@ pub mod kms_key_metadata;
 pub mod kms_keys;
 pub mod kms_management;
 pub mod metrics;
+pub mod mfa;
 pub mod module_switch;
 mod notify_runtime_access;
 pub mod object_data_cache;
@@ -69,6 +72,27 @@ pub mod user;
 pub mod user_iam;
 pub mod user_lifecycle;
 pub mod user_policy_binding;
+
+/// Serialize `payload` as the body of an admin JSON response.
+///
+/// Routes reached through the `/minio/admin` compat prefix carry an encrypted
+/// body; `encode_compatible_admin_payload` decides that from the path, so every
+/// handler must go through here rather than serializing directly, or a
+/// MinIO client gets plaintext where it expects ciphertext.
+pub(crate) fn admin_json_response<T: serde::Serialize>(
+    path: &str,
+    secret_key: &str,
+    status: http::StatusCode,
+    payload: &T,
+) -> s3s::S3Result<s3s::S3Response<(http::StatusCode, s3s::Body)>> {
+    let body = serde_json::to_vec(payload)
+        .map_err(|e| s3s::S3Error::with_message(s3s::S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
+    let (body, content_type) = crate::admin::utils::encode_compatible_admin_payload(path, secret_key, body)?;
+
+    let mut header = hyper::HeaderMap::new();
+    header.insert(s3s::header::CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    Ok(s3s::S3Response::with_headers((status, s3s::Body::from(body)), header))
+}
 
 pub(crate) async fn supervise_admin_mutation<T>(
     operation: &'static str,

@@ -24,6 +24,7 @@ const CONFIG_UPDATE: AdminActionRef = AdminActionRef::new("ConfigUpdateAdminActi
 const CONSOLE_LOG: AdminActionRef = AdminActionRef::new("ConsoleLogAdminAction");
 const COMMIT_TABLE: AdminActionRef = AdminActionRef::new("CommitTableAction");
 const CREATE_POLICY: AdminActionRef = AdminActionRef::new("CreatePolicyAdminAction");
+const CREATE_USER: AdminActionRef = AdminActionRef::new("CreateUserAdminAction");
 const CREATE_SERVICE_ACCOUNT: AdminActionRef = AdminActionRef::new("CreateServiceAccountAdminAction");
 const CREATE_TABLE: AdminActionRef = AdminActionRef::new("CreateTableAction");
 const DECOMMISSION: AdminActionRef = AdminActionRef::new("DecommissionAdminAction");
@@ -38,6 +39,7 @@ const EXPORT_IAM: AdminActionRef = AdminActionRef::new("ExportIAMAction");
 const FORCE_UNLOCK: AdminActionRef = AdminActionRef::new("ForceUnlockAdminAction");
 const GET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("GetBucketTargetAction");
 const GET_GROUP: AdminActionRef = AdminActionRef::new("GetGroupAdminAction");
+const GET_USER: AdminActionRef = AdminActionRef::new("GetUserAdminAction");
 const GET_METRICS: AdminActionRef = AdminActionRef::new("GetMetricsAction");
 const GET_POLICY: AdminActionRef = AdminActionRef::new("GetPolicyAdminAction");
 const GET_REPLICATION_METRICS: AdminActionRef = AdminActionRef::new("GetReplicationMetricsAction");
@@ -153,6 +155,14 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/list-users", LIST_USERS, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Delete, "/rustfs/admin/v3/remove-user", DELETE_USER, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/set-user-status", ENABLE_USER, RouteRiskLevel::High),
+    // Resetting somebody else's secret key is the same capability as creating
+    // them, so it carries the same action.
+    admin(HttpMethod::Put, "/rustfs/admin/v3/set-user-secret-key", CREATE_USER, RouteRiskLevel::High),
+    admin(HttpMethod::Get, "/rustfs/admin/v3/user/mfa", GET_USER, RouteRiskLevel::Sensitive),
+    // Clearing another identity's second factor is break-glass: whoever can
+    // re-enable a disabled account can already take the identity over, so this
+    // shares that action rather than inventing a weaker one.
+    admin(HttpMethod::Delete, "/rustfs/admin/v3/user/mfa", ENABLE_USER, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/v3/groups", LIST_GROUPS, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/group", GET_GROUP, RouteRiskLevel::Sensitive),
     admin(
@@ -1478,6 +1488,53 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
 
 pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
     deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action),
+    // The self-service account routes act on the caller, never on a target
+    // named in the request, so they gate on possession of the credential (plus,
+    // for the mutation, knowledge of the current secret) rather than on an
+    // admin action. Giving them one would be wrong in both directions: it would
+    // stop an ordinary user from managing their own password, and it would let
+    // any holder of that action manage somebody else's.
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/account/info",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/password",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    // The MFA self-service family gates the same way, plus a proof of the
+    // second factor (and, for disable, of the account password) inside the
+    // handler.
+    deferred(HttpMethod::Get, "/rustfs/admin/v3/account/mfa", DeferredRoutePolicyReason::CredentialOnly),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/enroll",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/activate",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/disable",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    deferred(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/account/mfa/recovery-codes",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
+    // The login challenge is signed with the identity's own credentials, so
+    // possession of them is the whole authorization.
+    deferred(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/mfa/challenge",
+        DeferredRoutePolicyReason::CredentialOnly,
+    ),
     deferred(
         HttpMethod::Get,
         "/rustfs/admin/v3/user-info",
