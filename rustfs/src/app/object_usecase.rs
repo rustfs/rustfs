@@ -234,7 +234,7 @@ use crate::app::object_traffic_health::ObjectTrafficHealth;
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-fn s3s_body_error_to_io(err: StdError) -> io::Error {
+pub(crate) fn s3s_body_error_to_io(err: StdError) -> io::Error {
     io::Error::other(err)
 }
 
