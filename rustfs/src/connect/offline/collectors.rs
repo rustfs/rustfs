@@ -15,24 +15,23 @@
 //! Fixed Q07 L0/L1 collectors for an operator-triggered offline diagnostic.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use rustfs_madmin::{ITEM_OFFLINE, StorageInfo};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sysinfo::{Disks, Networks, RefreshKind, System};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
-use url::Url;
 
+use super::super::inventory::{InventoryError, InventorySnapshot, InventoryStateStore};
 use super::manifest_entry::ManifestEntry;
 use super::redaction::RedactionError;
 
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ENTRY_BYTES: usize = 16 * 1024;
-const MAX_DRIVES: usize = 4_096;
 static SYSTEM_SCAN_PERMIT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -119,19 +118,14 @@ impl OfflineCollector {
         self.field_id().split_once('.').expect("collector field ids are frozen").1
     }
 
-    fn value(self, storage: &StorageSnapshot, system: &SystemSnapshot) -> Value {
+    fn value(self, inventory: &InventorySnapshot, system: &SystemSnapshot) -> Value {
         match self {
-            Self::RustfsVersion => json!(env!("CARGO_PKG_VERSION")),
-            Self::NodeCount => json!(storage.node_count),
-            Self::DriveCount => json!(storage.drive_count),
-            Self::CapacityUsedBytes => json!(storage.capacity_used_bytes),
-            Self::CapacityTotalBytes => json!(storage.capacity_total_bytes),
-            Self::CoarseHealthFlags => json!({
-                "degraded": storage.degraded,
-                "healing": storage.healing,
-                "offlineDrives": storage.offline_drives,
-                "scanning": storage.scanning,
-            }),
+            Self::RustfsVersion => json!(inventory.rustfs_version()),
+            Self::NodeCount => json!(inventory.node_count()),
+            Self::DriveCount => json!(inventory.drive_count()),
+            Self::CapacityUsedBytes => json!(inventory.capacity_used_bytes()),
+            Self::CapacityTotalBytes => json!(inventory.capacity_total_bytes()),
+            Self::CoarseHealthFlags => json!(inventory.coarse_flags()),
             Self::OsSummary => json!(system.os_summary),
             Self::KernelSummary => json!(system.kernel_summary),
             Self::CpuSummary => json!({ "architecture": system.architecture, "cores": system.cores }),
@@ -156,68 +150,22 @@ pub enum CollectorError {
     TimedOut,
     #[error("offline diagnostic collector task failed")]
     TaskFailed,
-    #[error("offline diagnostic storage topology exceeds its 4096 drive budget")]
-    StorageTopologyTooLarge,
-    #[error("offline diagnostic storage topology contains an invalid endpoint")]
-    InvalidStorageEndpoint,
     #[error("offline diagnostic field {field_id} exceeds its {limit} byte entry budget")]
     EntryTooLarge { field_id: &'static str, limit: usize },
     #[error("offline diagnostic entry is not representable as JSON")]
     NotRepresentable,
     #[error(transparent)]
+    Inventory(#[from] InventoryError),
+    #[error(transparent)]
     Redaction(#[from] RedactionError),
 }
 
-#[derive(Debug)]
-struct StorageSnapshot {
-    node_count: usize,
-    drive_count: usize,
-    capacity_used_bytes: u64,
-    capacity_total_bytes: u64,
-    offline_drives: usize,
-    degraded: bool,
-    healing: bool,
-    scanning: bool,
-}
-
-impl TryFrom<&StorageInfo> for StorageSnapshot {
-    type Error = CollectorError;
-
-    fn try_from(info: &StorageInfo) -> Result<Self, Self::Error> {
-        if info.disks.len() > MAX_DRIVES {
-            return Err(CollectorError::StorageTopologyTooLarge);
-        }
-        let node_count = info
-            .disks
-            .iter()
-            .map(|disk| {
-                let endpoint = Url::parse(&disk.endpoint).map_err(|_| CollectorError::InvalidStorageEndpoint)?;
-                let host = endpoint.host_str().ok_or(CollectorError::InvalidStorageEndpoint)?;
-                Ok((host.to_owned(), endpoint.port_or_known_default()))
-            })
-            .collect::<Result<BTreeSet<_>, CollectorError>>()?
-            .len();
-        let offline_drives = info.disks.iter().filter(|disk| disk.state == ITEM_OFFLINE).count();
-        Ok(Self {
-            node_count,
-            drive_count: info.disks.len(),
-            capacity_used_bytes: info
-                .disks
-                .iter()
-                .fold(0_u64, |total, disk| total.saturating_add(disk.used_space)),
-            capacity_total_bytes: info
-                .disks
-                .iter()
-                .fold(0_u64, |total, disk| total.saturating_add(disk.total_space)),
-            offline_drives,
-            degraded: info
-                .disks
-                .iter()
-                .any(|disk| !matches!(disk.state.as_str(), "ok" | "unformatted" | rustfs_madmin::ITEM_ONLINE)),
-            healing: info.disks.iter().any(|disk| disk.healing),
-            scanning: info.disks.iter().any(|disk| disk.scanning),
-        })
-    }
+/// The bounded entries plus the capture time of their persisted L0 source.
+#[derive(Debug, PartialEq)]
+pub struct OfflineDiagnostics {
+    pub entries: Vec<ManifestEntry>,
+    pub inventory_captured_at: String,
+    pub inventory_age: Duration,
 }
 
 #[derive(Debug)]
@@ -293,23 +241,33 @@ async fn collect_system_snapshot(cancel: &CancellationToken) -> Result<SystemSna
     }
 }
 
-/// Collect all and only the Q07 offline L0/L1 fields, with one independently
-/// bounded and redacted manifest entry per field.
+/// Collect all and only the Q07 offline L0/L1 fields after acquiring the
+/// stopped-runtime inventory lock.
 pub async fn collect_offline_diagnostics(
-    storage_info: &StorageInfo,
+    state_root: &Path,
     cancel: &CancellationToken,
-) -> Result<Vec<ManifestEntry>, CollectorError> {
+) -> Result<OfflineDiagnostics, CollectorError> {
     if cancel.is_cancelled() {
         return Err(CollectorError::Cancelled);
     }
-    let storage = StorageSnapshot::try_from(storage_info)?;
+    let store = InventoryStateStore::from_state_root(state_root)?;
+    let _lock = store.try_runtime_lock()?;
+    let persisted = store.read_latest(chrono::Utc::now())?;
     let system = collect_system_snapshot(cancel).await?;
 
     let mut entries = Vec::with_capacity(COLLECTORS.len());
     for collector in COLLECTORS {
-        entries.push(ManifestEntry::from_value(collector, collector.value(&storage, &system), cancel)?);
+        entries.push(ManifestEntry::from_value(
+            collector,
+            collector.value(&persisted.snapshot, &system),
+            cancel,
+        )?);
     }
-    Ok(entries)
+    Ok(OfflineDiagnostics {
+        entries,
+        inventory_captured_at: persisted.captured_at,
+        inventory_age: persisted.age,
+    })
 }
 
 #[cfg(test)]
@@ -346,8 +304,6 @@ mod test_support {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use rustfs_madmin::StorageInfo;
-
     use super::*;
 
     async fn wait_for_active(expected: usize) {
@@ -366,16 +322,13 @@ mod tests {
         test_support::DELAY_MILLIS.store((COLLECT_TIMEOUT + Duration::from_millis(200)).as_millis() as u64, Ordering::SeqCst);
 
         let first_cancel = CancellationToken::new();
-        assert!(matches!(
-            collect_offline_diagnostics(&StorageInfo::default(), &first_cancel).await,
-            Err(CollectorError::TimedOut)
-        ));
+        assert!(matches!(collect_system_snapshot(&first_cancel).await, Err(CollectorError::TimedOut)));
         assert_eq!(test_support::ACTIVE.load(Ordering::SeqCst), 1, "timed-out blocking scan remains active");
 
         let second_cancel = CancellationToken::new();
         let second = tokio::spawn({
             let second_cancel = second_cancel.clone();
-            async move { collect_offline_diagnostics(&StorageInfo::default(), &second_cancel).await }
+            async move { collect_system_snapshot(&second_cancel).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
@@ -392,7 +345,7 @@ mod tests {
         let third_cancel = CancellationToken::new();
         let third = tokio::spawn({
             let third_cancel = third_cancel.clone();
-            async move { collect_offline_diagnostics(&StorageInfo::default(), &third_cancel).await }
+            async move { collect_system_snapshot(&third_cancel).await }
         });
         wait_for_active(1).await;
         third_cancel.cancel();
@@ -401,7 +354,7 @@ mod tests {
         let fourth_cancel = CancellationToken::new();
         let fourth = tokio::spawn({
             let fourth_cancel = fourth_cancel.clone();
-            async move { collect_offline_diagnostics(&StorageInfo::default(), &fourth_cancel).await }
+            async move { collect_system_snapshot(&fourth_cancel).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(

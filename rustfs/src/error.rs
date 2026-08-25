@@ -225,6 +225,28 @@ where
     false
 }
 
+fn error_chain_has_upload_stream_sha256_mismatch(err: &(dyn std::error::Error + 'static)) -> bool {
+    if matches!(err.downcast_ref::<s3s::UploadStreamError>(), Some(s3s::UploadStreamError::Sha256Mismatch)) {
+        return true;
+    }
+
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>()
+        && let Some(inner) = io_err.get_ref()
+        && error_chain_has_upload_stream_sha256_mismatch(inner)
+    {
+        return true;
+    }
+
+    let mut current = err.source();
+    while let Some(err) = current {
+        if matches!(err.downcast_ref::<s3s::UploadStreamError>(), Some(s3s::UploadStreamError::Sha256Mismatch)) {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 impl From<ApiError> for S3Error {
     fn from(err: ApiError) -> Self {
         let mut s3e = S3Error::with_message(err.code, err.message);
@@ -237,11 +259,13 @@ impl From<ApiError> for S3Error {
 
 impl From<StorageError> for ApiError {
     fn from(err: StorageError) -> Self {
-        // Special handling for Io errors that may contain ChecksumMismatch
+        // Preserve typed client-provided digest failures across I/O boundaries.
         if let StorageError::Io(ref io_err) = err
             && let Some(inner) = io_err.get_ref()
             && (inner.downcast_ref::<rustfs_rio::ChecksumMismatch>().is_some()
-                || inner.downcast_ref::<rustfs_rio::BadDigest>().is_some())
+                || inner.downcast_ref::<rustfs_rio::BadDigest>().is_some()
+                || inner.downcast_ref::<rustfs_rio::Sha256Mismatch>().is_some()
+                || error_chain_has_upload_stream_sha256_mismatch(inner))
         {
             return ApiError {
                 code: S3ErrorCode::BadDigest,
@@ -362,9 +386,12 @@ impl From<HTTPRangeError> for ApiError {
 
 impl From<std::io::Error> for ApiError {
     fn from(err: std::io::Error) -> Self {
-        // Check if the error is a ChecksumMismatch (BadDigest)
+        // Map client-provided digest mismatches to BadDigest.
         if let Some(inner) = err.get_ref() {
-            if error_chain_has_type::<rustfs_rio::ChecksumMismatch>(inner) || error_chain_has_type::<rustfs_rio::BadDigest>(inner)
+            if error_chain_has_type::<rustfs_rio::ChecksumMismatch>(inner)
+                || error_chain_has_type::<rustfs_rio::BadDigest>(inner)
+                || error_chain_has_type::<rustfs_rio::Sha256Mismatch>(inner)
+                || error_chain_has_upload_stream_sha256_mismatch(inner)
             {
                 return ApiError {
                     code: S3ErrorCode::BadDigest,
@@ -458,6 +485,67 @@ mod tests {
             let downcast_io_error = source.downcast_ref::<IoError>();
             assert!(downcast_io_error.is_some());
             assert_eq!(downcast_io_error.unwrap().kind(), kind);
+        }
+    }
+
+    #[test]
+    fn sha256_mismatch_io_errors_map_to_bad_digest() {
+        let io_error = IoError::new(
+            ErrorKind::InvalidData,
+            rustfs_rio::Sha256Mismatch {
+                expected_sha256: "expected".to_string(),
+                calculated_sha256: "calculated".to_string(),
+            },
+        );
+        let api_error = ApiError::from(io_error);
+        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+
+        let storage_error = StorageError::Io(IoError::new(
+            ErrorKind::InvalidData,
+            rustfs_rio::Sha256Mismatch {
+                expected_sha256: "expected".to_string(),
+                calculated_sha256: "calculated".to_string(),
+            },
+        ));
+        let api_error = ApiError::from(storage_error);
+        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+    }
+
+    #[test]
+    fn upload_stream_sha256_mismatch_maps_to_bad_digest() {
+        let api_error = ApiError::from(IoError::other(s3s::UploadStreamError::Sha256Mismatch));
+        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+
+        let api_error = ApiError::from(StorageError::Io(IoError::other(s3s::UploadStreamError::Sha256Mismatch)));
+        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+    }
+
+    #[test]
+    fn other_upload_stream_errors_do_not_map_to_bad_digest() {
+        let errors = [
+            s3s::UploadStreamError::Underlying(Box::new(IoError::other("underlying body error"))),
+            s3s::UploadStreamError::LengthMismatch,
+            s3s::UploadStreamError::Incomplete,
+        ];
+
+        for error in errors {
+            let api_error = ApiError::from(IoError::other(error));
+            assert_eq!(api_error.code, S3ErrorCode::InternalError);
+        }
+
+        let errors = [
+            s3s::UploadStreamError::Underlying(Box::new(IoError::other("underlying body error"))),
+            s3s::UploadStreamError::LengthMismatch,
+            s3s::UploadStreamError::Incomplete,
+        ];
+
+        for error in errors {
+            let api_error = ApiError::from(StorageError::Io(IoError::other(error)));
+            assert_eq!(api_error.code, S3ErrorCode::InternalError);
         }
     }
 

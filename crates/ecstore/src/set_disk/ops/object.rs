@@ -149,6 +149,23 @@ impl Drop for PutObjectCommitCancellation {
     }
 }
 
+async fn wait_for_put_object_commit_cancellation(
+    owner_cancellation: Option<&CancellationToken>,
+    request_cancellation: Option<&CancellationToken>,
+) {
+    match (owner_cancellation, request_cancellation) {
+        (Some(owner), Some(request)) => {
+            tokio::select! {
+                _ = owner.cancelled() => {}
+                _ = request.cancelled() => {}
+            }
+        }
+        (Some(owner), None) => owner.cancelled().await,
+        (None, Some(request)) => request.cancelled().await,
+        (None, None) => std::future::pending().await,
+    }
+}
+
 #[inline]
 fn duration_millis_f64(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
@@ -2314,8 +2331,15 @@ impl SetDisks {
 
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
+        let (operation_cancellation, mut commit_cancellation_handoff_tx, cancellation_wait) =
+            if let Some(cancellation) = opts.put_object_cancellation.clone() {
+                let (handoff_tx, handoff_rx) = tokio::sync::oneshot::channel();
+                (Some(cancellation.clone()), Some(handoff_tx), Some((cancellation, handoff_rx)))
+            } else {
+                (None, None, None)
+            };
         let mut tmp_cleanup_owned = false;
-        let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = async {
+        let operation = async {
             let erasure = Arc::new(erasure_from_file_info(&fi, false)?);
 
             let put_object_size = known_put_object_storage_size(data.size());
@@ -2981,6 +3005,7 @@ impl SetDisks {
             let commit_capacity_scope_token = opts.capacity_scope_token;
             let commit_replication_state = replication_state_to_filemeta(&opts.put_replication_state());
             let commit_scanner_publication_lease_tokens = scanner_publication_lease_tokens;
+            let request_cancellation = operation_cancellation.clone();
             tmp_cleanup_owned = true;
 
             let commit = move |cancellation: Option<CancellationToken>| async move {
@@ -3065,10 +3090,12 @@ impl SetDisks {
                     }
                     Ok(())
                 };
-                let pre_rename_result = if let Some(cancellation) = cancellation {
+                let pre_rename_result = if cancellation.is_some() || request_cancellation.is_some() {
                     tokio::select! {
                         biased;
-                        _ = cancellation.cancelled() => Err(StorageError::OperationCanceled),
+                        _ = wait_for_put_object_commit_cancellation(cancellation.as_ref(), request_cancellation.as_ref()) => {
+                            Err(StorageError::OperationCanceled)
+                        },
                         result = pre_rename => result,
                     }
                 } else {
@@ -3422,6 +3449,9 @@ impl SetDisks {
                 ))
             };
 
+            if let Some(handoff) = commit_cancellation_handoff_tx.take() {
+                let _ = handoff.send(());
+            }
             if detach_commit_owner {
                 let mut cancellation = PutObjectCommitCancellation::new();
                 let child_token = cancellation.child_token();
@@ -3433,8 +3463,19 @@ impl SetDisks {
             } else {
                 Box::pin(commit(None)).await
             }
-        }
-        .await;
+        };
+        let result: Result<(ObjectInfo, Option<OldCurrentSize>)> = if let Some((cancellation, mut handoff_rx)) = cancellation_wait
+        {
+            tokio::pin!(operation);
+            tokio::select! {
+                biased;
+                _ = &mut handoff_rx => operation.await,
+                result = &mut operation => result,
+                _ = cancellation.cancelled() => Err(StorageError::OperationCanceled),
+            }
+        } else {
+            operation.await
+        };
 
         if issue3031_diag_enabled()
             && let Err(err) = &result
@@ -14266,6 +14307,71 @@ mod put_object_tmp_cleanup_tests {
         wait_for_tmp_workspace_to_drain(&temp_dirs, "cancelling before rename should drain the tmp workspace").await;
 
         drop(barrier);
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn cooperative_cancellation_while_waiting_for_namespace_lock_cleans_tmp_workspace() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "tmp-clean-namespace-cancel-bucket";
+        let object = "contended-object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let first_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::AfterNamespace);
+        let first_set = set_disks.clone();
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+            first_set
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        first_barrier.wait_until_paused().await;
+        let first_workspace = non_trash_tmp_entries(&temp_dirs).await.into_iter().collect::<HashSet<_>>();
+        assert!(!first_workspace.is_empty(), "the lock holder should own a staged tmp workspace");
+
+        let second_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+        let cancellation = CancellationToken::new();
+        let second_cancellation = cancellation.clone();
+        let second_set = set_disks.clone();
+        let second = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]);
+            let opts = ObjectOptions {
+                put_object_cancellation: Some(second_cancellation),
+                ..Default::default()
+            };
+            second_set.put_object(bucket, object, &mut reader, &opts).await
+        });
+        second_barrier.release_and_wait_until_namespace_pending().await;
+        let both_workspaces = non_trash_tmp_entries(&temp_dirs).await.into_iter().collect::<HashSet<_>>();
+        assert!(
+            both_workspaces.len() > first_workspace.len() && first_workspace.is_subset(&both_workspaces),
+            "the contending PUT should stage its own tmp workspace before cancellation"
+        );
+
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("cooperative cancellation should finish storage cleanup")
+            .expect("the cancelled PUT task should join")
+            .expect_err("the cancelled PUT must not commit");
+        assert!(matches!(error, StorageError::OperationCanceled));
+        let remaining = non_trash_tmp_entries(&temp_dirs).await.into_iter().collect::<HashSet<_>>();
+        assert_eq!(
+            remaining, first_workspace,
+            "the cancelled contender must clean only its own tmp workspace"
+        );
+
+        drop(second_barrier);
+        first_barrier.release();
+        first
+            .await
+            .expect("the lock-holding PUT task should join")
+            .expect("the lock-holding PUT should commit");
+        wait_for_tmp_workspace_to_drain(&temp_dirs, "the committed lock holder should eventually drain its tmp workspace").await;
+
+        drop(first_barrier);
         drop(temp_dirs);
     }
 

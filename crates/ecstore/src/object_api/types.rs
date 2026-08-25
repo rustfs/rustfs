@@ -379,6 +379,11 @@ pub struct ObjectOptions {
     pub skip_rebalancing: bool,
     pub skip_free_version: bool,
 
+    /// Cooperative cancellation for an owned PutObject before authoritative
+    /// rename begins. Storage ignores it after entering the durable commit.
+    #[doc(hidden)]
+    pub put_object_cancellation: Option<tokio_util::sync::CancellationToken>,
+
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
     /// Materialize the data-movement per-part checksum sidecar for APIs that

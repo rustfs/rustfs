@@ -325,6 +325,57 @@ async fn tampered_payload_is_rejected() -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 
+/// A signed UploadPart body must pass the same payload-hash gate as PutObject.
+/// Rejection must happen before the part is published into the multipart upload.
+#[tokio::test]
+async fn tampered_upload_part_payload_is_rejected() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let key = "tampered-upload-part.bin";
+    let client = env.create_s3_client();
+    let upload = client.create_multipart_upload().bucket(BUCKET).key(key).send().await?;
+    let upload_id = upload.upload_id().ok_or("create multipart upload omitted upload_id")?;
+
+    let path = format!("/{BUCKET}/{key}");
+    let canonical_query = format!("partNumber=1&uploadId={}", urlencoding::encode(upload_id));
+    let request_target = format!("{path}?{canonical_query}");
+    let claimed_body = b"the-part-i-claim-to-send";
+    let actual_body = b"the-part-i-really-send!!";
+    assert_eq!(claimed_body.len(), actual_body.len(), "keep content-length stable for the mismatch");
+
+    let signer = SigV4::new(&env);
+    let headers = signer.sign("PUT", &path, &canonical_query, &sha256_hex(claimed_body));
+    let resp = send_signed(&env, reqwest::Method::PUT, &request_target, &headers, Some(actual_body.to_vec())).await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "multipart payload mismatch must be rejected as BadDigest, body:\n{body}"
+    );
+    assert_error_code(&body, "BadDigest");
+
+    let parts = client
+        .list_parts()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await?;
+    assert!(parts.parts().is_empty(), "a tampered UploadPart must not publish a part");
+
+    client
+        .abort_multipart_upload()
+        .bucket(BUCKET)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await?;
+    Ok(())
+}
+
 /// (e) A request whose `x-amz-date` is skewed beyond the server's tolerance
 /// (s3s default 900s / 15 min) must be rejected with RequestTimeTooSkewed /
 /// 403. The signature is otherwise valid: the credential-scope date and

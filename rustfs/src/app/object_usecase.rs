@@ -190,6 +190,7 @@ const PUT_EAGER_STATUS_ZERO_COPY_INELIGIBLE: &str = "zero_copy_ineligible";
 const PUT_EAGER_STATUS_AWS_CHUNKED_MISSING_DECODED_LENGTH: &str = "aws_chunked_missing_decoded_length";
 static CACHED_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 use std::collections::HashMap;
+use std::io;
 use std::ops::Add;
 use std::path::Path;
 use std::pin::Pin;
@@ -232,6 +233,10 @@ use crate::app::object_data_cache::{ColdFillRole, ColdFillWaitOutcome, scope_col
 use crate::app::object_traffic_health::ObjectTrafficHealth;
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+pub(crate) fn s3s_body_error_to_io(err: StdError) -> io::Error {
+    io::Error::other(err)
+}
 
 struct ColdFillDiskPermitMetric {
     owner: ColdFillDiskPermitOwner,
@@ -391,6 +396,7 @@ const LOG_COMPONENT_APP: &str = "app";
 const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
 const EVENT_PUT_OBJECT_STORE_RETURNED: &str = "put_object_store_returned";
+const EVENT_PUT_OBJECT_COMMIT_OWNER_DEADLINE: &str = "put_object_commit_owner_deadline";
 const EVENT_GET_OBJECT_STREAM_BODY: &str = "get_object_stream_body";
 const EVENT_PUT_OBJECT_BODY_READ_STALLED: &str = "put_object_body_read_stalled";
 const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
@@ -406,6 +412,12 @@ const GET_OBJECT_STAGE_CHECKSUM_HEADERS: &str = "checksum_headers";
 const GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION: &str = "lifecycle_expiration";
 const GET_OBJECT_STAGE_METADATA_FILTER: &str = "metadata_filter";
 const PUT_OBJECT_STORE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+// Eager PUT bodies are fully materialized before the storage owner starts. On
+// request cancellation, keep the commit/publication tail alive briefly, then
+// request pre-commit rollback and await cleanup so its write-health guard is
+// reaped without abandoning staged shards.
+const EAGER_PUT_COMMIT_CANCELLATION_GRACE: Duration =
+    Duration::from_secs(rustfs_config::DEFAULT_DRIVE_MAX_TIMEOUT_DURATION_SECS * 4);
 const GET_OBJECT_STREAM_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -2821,7 +2833,7 @@ where
         let mut remaining = (&mut *buf).limit(size - filled);
         let read = tokio::io::AsyncReadExt::read_buf(&mut *body, &mut remaining)
             .await
-            .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+            .map_err(ApiError::from)?;
         if read == 0 {
             return Err(s3_error!(IncompleteBody));
         }
@@ -2831,7 +2843,7 @@ where
     let mut extra = [0u8; 1];
     let extra_read = tokio::io::AsyncReadExt::read(&mut *body, &mut extra)
         .await
-        .map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        .map_err(ApiError::from)?;
     if extra_read != 0 {
         return Err(s3_error!(UnexpectedContent));
     }
@@ -2863,7 +2875,7 @@ where
 async fn read_zero_copy_put_body_exact<S, E>(mut body: S, size: usize) -> S3Result<ChunkedBytesReader>
 where
     S: futures::Stream<Item = std::result::Result<Bytes, E>> + Unpin,
-    E: std::fmt::Display,
+    E: Into<StdError>,
 {
     let mut chunks = Vec::new();
     let mut filled = 0usize;
@@ -2872,7 +2884,7 @@ where
         let Some(chunk) = body.next().await else {
             return Err(s3_error!(IncompleteBody));
         };
-        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        let chunk = chunk.map_err(|err| ApiError::from(s3s_body_error_to_io(err.into())))?;
         if chunk.is_empty() {
             continue;
         }
@@ -2886,7 +2898,7 @@ where
     }
 
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        let chunk = chunk.map_err(|err| ApiError::from(s3s_body_error_to_io(err.into())))?;
         if !chunk.is_empty() {
             return Err(s3_error!(UnexpectedContent));
         }
@@ -3196,6 +3208,62 @@ struct PutObjectChecksums {
 struct PutObjectCommitResult {
     obj_info: ObjectInfo,
     put_versioned: bool,
+}
+
+struct EagerPutCommitOwner<T: Send + 'static> {
+    task: Option<tokio::task::JoinHandle<T>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    cancellation_grace: Duration,
+}
+
+impl<T: Send + 'static> EagerPutCommitOwner<T> {
+    fn new(
+        task: tokio::task::JoinHandle<T>,
+        cancellation: tokio_util::sync::CancellationToken,
+        cancellation_grace: Duration,
+    ) -> Self {
+        Self {
+            task: Some(task),
+            cancellation,
+            cancellation_grace,
+        }
+    }
+
+    async fn join(mut self) -> Result<T, tokio::task::JoinError> {
+        let result = self.task.as_mut().expect("eager PUT commit owner task must be present").await;
+        self.task = None;
+        result
+    }
+}
+
+impl<T: Send + 'static> Drop for EagerPutCommitOwner<T> {
+    fn drop(&mut self) {
+        let Some(mut task) = self.task.take() else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            task.abort();
+            return;
+        }
+        let cancellation = self.cancellation.clone();
+        let cancellation_grace = self.cancellation_grace;
+        spawn_traced(async move {
+            if tokio::time::timeout(cancellation_grace, &mut task).await.is_err() {
+                cancellation.cancel();
+                metrics::counter!("rustfs_put_commit_owner_deadline_total", "put_path" => "eager").increment(1);
+                warn!(
+                    target: "rustfs::app::object_usecase",
+                    event = EVENT_PUT_OBJECT_COMMIT_OWNER_DEADLINE,
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    state = "cancellation_requested",
+                    cancellation_grace_ms = cancellation_grace.as_millis() as u64,
+                    "cancelled eager PutObject commit owner exceeded its grace period and requested storage cleanup"
+                );
+                let _ = task.await;
+            }
+        });
+    }
 }
 
 fn normalize_delete_objects_version_id(
@@ -6101,6 +6169,9 @@ impl DefaultObjectUsecase {
             object_lock_retain_until_date,
             &mut opts,
         )?;
+        let eager_put_commit_cancellation =
+            (use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path).then(tokio_util::sync::CancellationToken::new);
+        opts.put_object_cancellation = eager_put_commit_cancellation.clone();
 
         // rustfs/backlog#1009: the pre-PUT lookup has exactly two consumers —
         // the existing-object WORM validation and usage accounting's
@@ -6172,7 +6243,7 @@ impl DefaultObjectUsecase {
         let mut reader = if should_compress {
             let body = tokio::io::BufReader::with_capacity(
                 buffer_size,
-                StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
             );
             let algorithm = CompressionAlgorithm::default();
             insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
@@ -6205,7 +6276,7 @@ impl DefaultObjectUsecase {
                     // Mutex contention under high concurrency. Direct allocation
                     // for ≤4KiB is negligible cost.
                     let eager_body = read_small_put_body_exact_direct(
-                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         actual_size as usize,
                     )
                     .await?;
@@ -6213,7 +6284,7 @@ impl DefaultObjectUsecase {
                 } else {
                     let pool = get_concurrency_manager().bytes_pool();
                     let eager_body = read_small_put_body_exact_pooled(
-                        StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                        StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                         actual_size as usize,
                         pool.as_ref(),
                     )
@@ -6224,7 +6295,7 @@ impl DefaultObjectUsecase {
             } else {
                 let body = tokio::io::BufReader::with_capacity(
                     buffer_size,
-                    StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+                    StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))),
                 );
                 HashReader::from_stream(body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
             }
@@ -6483,7 +6554,14 @@ impl DefaultObjectUsecase {
                 Ok::<_, S3Error>(PutObjectCommitResult { obj_info, put_versioned })
             }
         });
-        let PutObjectCommitResult { obj_info, put_versioned } = match put_commit.await {
+        let put_commit_result = if let Some(cancellation) = eager_put_commit_cancellation {
+            EagerPutCommitOwner::new(put_commit, cancellation, EAGER_PUT_COMMIT_CANCELLATION_GRACE)
+                .join()
+                .await
+        } else {
+            put_commit.await
+        };
+        let PutObjectCommitResult { obj_info, put_versioned } = match put_commit_result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
                 let result: S3Result<S3Response<PutObjectOutput>> = Err(err);
@@ -9784,10 +9862,8 @@ impl DefaultObjectUsecase {
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         let buffer_size = get_buffer_size_opt_in(size);
-        let body = tokio::io::BufReader::with_capacity(
-            buffer_size,
-            StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
-        );
+        let body =
+            tokio::io::BufReader::with_capacity(buffer_size, StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))));
 
         let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
             return Err(s3_error!(InvalidArgument, "key extension not found"));
@@ -10270,6 +10346,38 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio_tar::{Builder, EntryType, Header};
+
+    #[tokio::test]
+    async fn cancelled_eager_put_commit_owner_reaps_stalled_storage_task() {
+        let health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+        let task_health = Arc::clone(&health);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = spawn_traced_join(async move {
+            let _progress = task_health.track_write_storage().expect("write tracking must be enabled");
+            task_cancellation.cancelled().await;
+        });
+        let owner = EagerPutCommitOwner::new(task, cancellation, Duration::from_millis(10));
+        let request = spawn_traced_join(owner.join());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stalled owner must publish write-storage progress");
+
+        request.abort();
+        let _ = request.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while health.snapshot().write_stalled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled owner must abort and reap the stalled storage task");
+    }
 
     #[test]
     fn delete_response_version_id_preserves_null_and_synthetic_semantics() {
@@ -16229,6 +16337,43 @@ mod tests {
             zero_copy_eager_put_path_status(2 * 1024 * 1024, &headers, false, false, true),
             PUT_EAGER_STATUS_EXTRACT
         );
+    }
+
+    #[test]
+    fn s3s_body_error_to_io_preserves_upload_stream_error_source() {
+        let error = s3s_body_error_to_io(Box::new(s3s::UploadStreamError::Sha256Mismatch));
+
+        assert!(matches!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<s3s::UploadStreamError>()),
+            Some(s3s::UploadStreamError::Sha256Mismatch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_small_put_body_maps_upload_stream_sha256_mismatch_to_bad_digest() {
+        let body = StreamReader::new(futures::stream::iter(vec![Err::<Bytes, std::io::Error>(s3s_body_error_to_io(Box::new(
+            s3s::UploadStreamError::Sha256Mismatch,
+        )))]));
+
+        let error = read_small_put_body_exact_direct(body, 1)
+            .await
+            .expect_err("SHA256 mismatch should reject the small PUT body");
+
+        assert_eq!(error.code(), &S3ErrorCode::BadDigest);
+    }
+
+    #[tokio::test]
+    async fn read_zero_copy_put_body_maps_upload_stream_sha256_mismatch_to_bad_digest() {
+        let body = futures::stream::iter(vec![Err::<Bytes, s3s::UploadStreamError>(s3s::UploadStreamError::Sha256Mismatch)]);
+
+        let error = match read_zero_copy_put_body_exact(body, 1).await {
+            Ok(_) => panic!("SHA256 mismatch should reject the zero-copy PUT body"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code(), &S3ErrorCode::BadDigest);
     }
 
     struct FragmentedBody {

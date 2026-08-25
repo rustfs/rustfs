@@ -17,8 +17,9 @@ use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::runtime_sources::TierConfigMgr;
 use crate::admin::storage_api::tier::{
     AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
-    ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
-    ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig, TierConfigUpdateError, TierCreds, TierType,
+    ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CONFIG, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS,
+    ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND, ERR_TIER_RESERVED_NAME, TierConfig, TierConfigUpdateError, TierCreds,
+    TierType,
 };
 use crate::{
     admin::runtime_sources::{current_daily_tier_stats, current_notification_system, current_tier_config_handle},
@@ -391,6 +392,8 @@ impl Operation for AddTier {
                     S3ErrorCode::Custom("TierConnectError".into()),
                     "tier connectivity check failed",
                 ))
+            } else if err.code == ERR_TIER_INVALID_CONFIG.code {
+                Err(S3Error::with_message(S3ErrorCode::InvalidArgument, err.message))
             } else if err.code == ERR_TIER_INVALID_CREDENTIALS.code {
                 Err(S3Error::with_message(S3ErrorCode::Custom(err.code.clone().into()), err.message))
             } else {

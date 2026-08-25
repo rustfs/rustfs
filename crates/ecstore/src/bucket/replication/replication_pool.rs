@@ -1862,6 +1862,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         Ok(status)
     }
 
+    /// Read `resync.bin` directly without consulting or replacing this node's
+    /// progress cache when the persisted cross-node intent is authoritative.
+    pub async fn read_durable_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError> {
+        load_bucket_resync_metadata(bucket, self.storage.clone()).await
+    }
+
     pub async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError> {
         self.resyncer.cancel(&opts).await;
         self.resyncer
@@ -2803,6 +2809,7 @@ pub trait ReplicationPoolTrait: std::fmt::Debug {
     async fn persist_mrf_entry(&self, entry: MrfReplicateEntry) -> ReplicationQueueAdmission;
     async fn resize(&self, priority: ReplicationPriority, max_workers: usize, max_l_workers: usize);
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
+    async fn read_durable_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError>;
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError>;
     async fn cancel_bucket_resync_for_removed_target(
         self: Arc<Self>,
@@ -2856,6 +2863,10 @@ impl<S: ReplicationStorage> ReplicationPoolTrait for ReplicationPool<S> {
 
     async fn get_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError> {
         self.get_bucket_resync_status(bucket).await
+    }
+
+    async fn read_durable_bucket_resync_status(&self, bucket: &str) -> Result<BucketReplicationResyncStatus, EcstoreError> {
+        self.read_durable_bucket_resync_status(bucket).await
     }
 
     async fn cancel_bucket_resync(&self, opts: ResyncOpts) -> Result<(), EcstoreError> {
@@ -3858,12 +3869,16 @@ mod tests {
     }
 
     fn load_resync_test_metadata() -> Vec<u8> {
+        resync_test_metadata_with_status("load-resync-lock", ResyncStatusType::ResyncCompleted)
+    }
+
+    fn resync_test_metadata_with_status(bucket: &str, resync_status: ResyncStatusType) -> Vec<u8> {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:test".to_string(),
             TargetReplicationResyncStatus {
-                bucket: "load-resync-lock".to_string(),
-                resync_status: ResyncStatusType::ResyncCompleted,
+                bucket: bucket.to_string(),
+                resync_status,
                 ..Default::default()
             },
         );
@@ -3895,6 +3910,36 @@ mod tests {
             write_started: Notify::new(),
             allow_write: Notify::new(),
         })
+    }
+
+    #[tokio::test]
+    async fn durable_resync_read_observes_cancellation_after_cached_pending_intent() {
+        let bucket = "startup-cancel-race";
+        let shared = empty_resync_shared_state();
+        *shared.data.lock().expect("test data lock should not be poisoned") =
+            resync_test_metadata_with_status(bucket, ResyncStatusType::ResyncPending);
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", shared.clone()))).await;
+
+        let cached = pool
+            .get_bucket_resync_status(bucket)
+            .await
+            .expect("the pending intent should populate the node cache");
+        assert_eq!(cached.targets_map["arn:test"].resync_status, ResyncStatusType::ResyncPending);
+
+        *shared.data.lock().expect("test data lock should not be poisoned") =
+            resync_test_metadata_with_status(bucket, ResyncStatusType::ResyncCanceled);
+        let stale = pool
+            .get_bucket_resync_status(bucket)
+            .await
+            .expect("the ordinary status read should expose the stale-cache precondition");
+        assert_eq!(stale.targets_map["arn:test"].resync_status, ResyncStatusType::ResyncPending);
+
+        let durable = pool
+            .read_durable_bucket_resync_status(bucket)
+            .await
+            .expect("the lock-protected status read should bypass the stale cache");
+        assert_eq!(durable.targets_map["arn:test"].resync_status, ResyncStatusType::ResyncCanceled);
+        assert_eq!(shared.read_count.load(Ordering::SeqCst), 2);
     }
 
     async fn hold_resync_runtime_lock(
