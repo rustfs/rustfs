@@ -3840,10 +3840,12 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "data-encoding",
  "flatbuffers",
  "flate2",
  "futures",
  "hex",
+ "hmac 0.13.0",
  "hotpath",
  "http 1.5.0",
  "http-body-util",
@@ -3874,6 +3876,8 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "sha1 0.11.0",
  "sha2 0.11.0",
  "suppaftp",
  "time",
@@ -8278,6 +8282,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quad-rand"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9637,13 +9647,17 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "base64-simd",
+ "data-encoding",
  "futures",
+ "hmac 0.13.0",
  "hotpath",
  "http 1.5.0",
  "jsonwebtoken 11.0.0",
  "moka",
  "openidconnect",
  "pollster",
+ "qrcode",
+ "rand 0.10.2",
  "rcgen",
  "reqwest",
  "rustfs-config",
@@ -9661,6 +9675,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
+ "subtle",
  "temp-env",
  "tempfile",
  "thiserror 2.0.20",

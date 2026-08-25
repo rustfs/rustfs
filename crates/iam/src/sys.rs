@@ -58,6 +58,15 @@ const STS_INVALIDATION_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duratio
 #[cfg(test)]
 const STS_INVALIDATION_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Concurrent STS deletions inside a single revocation batch.
+const STS_REVOCATION_BATCH_CONCURRENCY: usize = 16;
+/// Process-wide ceiling on in-flight STS deletions across all batches, so
+/// concurrent revocations cannot exhaust the runtime the peer notifications
+/// each deletion waits on.
+const STS_REVOCATION_GLOBAL_LIMIT: usize = 64;
+static STS_REVOCATION_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(STS_REVOCATION_GLOBAL_LIMIT));
+
 pub const MAX_SVCSESSION_POLICY_SIZE: usize = 4096;
 pub const SITE_REPLICATOR_SERVICE_ACCOUNT: &str = "site-replicator-0";
 
@@ -474,6 +483,67 @@ impl<T: Store> IamSys<T> {
         let task = runtime.spawn(operation);
 
         task.await.map_err(Error::other)?
+    }
+
+    /// Revoke a set of STS access keys, returning how many were deleted.
+    ///
+    /// An STS credential *is* the session in RustFS, so deleting it invalidates
+    /// the session token immediately. Deletions run concurrently under both a
+    /// per-batch and a process-wide cap, so a large fan-out cannot starve the
+    /// peer-notification path that each individual deletion depends on.
+    ///
+    /// Every key is attempted even when one fails; the first error is returned
+    /// afterwards so a single unreachable peer cannot silently skip the
+    /// remaining revocations.
+    ///
+    /// The MinIO-compatible `revoke-tokens` endpoint keeps its own
+    /// provider-filtered variant (`admin/handlers/idp_compat.rs`) because it
+    /// injects the revoke closure for testing; both funnel into
+    /// [`Self::delete_temp_account`].
+    pub async fn revoke_sts_accounts(&self, access_keys: Vec<String>) -> Result<usize> {
+        use futures::StreamExt as _;
+
+        let results = futures::stream::iter(access_keys)
+            .map(|access_key| async move {
+                let _permit = STS_REVOCATION_PERMITS.acquire().await.map_err(Error::other)?;
+                self.delete_temp_account(&access_key, true).await
+            })
+            .buffer_unordered(STS_REVOCATION_BATCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        let mut revoked = 0usize;
+        let mut first_error = None;
+        for result in results {
+            match result {
+                Ok(()) => revoked += 1,
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(revoked),
+        }
+    }
+
+    /// Revoke every STS session minted from `parent_access_key`.
+    ///
+    /// Called after that identity's secret key changes: a session issued under
+    /// the old secret must not outlive it. Returns the number of sessions
+    /// revoked; zero is a normal result for an identity with no live sessions.
+    pub async fn revoke_sts_sessions_for_parent(&self, parent_access_key: &str) -> Result<usize> {
+        let sessions = self.list_sts_accounts(parent_access_key).await?;
+        if sessions.is_empty() {
+            return Ok(0);
+        }
+
+        let access_keys = sessions.into_iter().map(|cred| cred.access_key).collect();
+        self.revoke_sts_accounts(access_keys).await
     }
 
     #[cfg(test)]

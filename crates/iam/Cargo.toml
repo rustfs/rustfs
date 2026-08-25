@@ -105,6 +105,15 @@ openidconnect = { workspace = true, default-features = false, features = ["accep
 http = { workspace = true }
 url = { workspace = true }
 
+# Two-factor authentication (crates/iam/src/mfa)
+data-encoding = { workspace = true }
+hmac = { workspace = true }
+qrcode = { workspace = true }
+rand = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+
 [dev-dependencies]
 pollster.workspace = true
 rcgen.workspace = true

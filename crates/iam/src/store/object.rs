@@ -199,6 +199,21 @@ pub fn try_decrypt_iam_blob(data: &[u8]) -> Option<Vec<u8>> {
     ObjectStore::decrypt_data_with_source(data).ok().map(|outcome| outcome.plain)
 }
 
+/// Encrypt a blob for at-rest storage using the IAM master key.
+///
+/// Shared with [`crate::mfa`], which stores TOTP secrets under the same key so
+/// there is one at-rest scheme for every credential-equivalent secret the IAM
+/// domain owns, and one key to rotate.
+pub(crate) fn encrypt_iam_blob(plain: &[u8]) -> Result<Vec<u8>> {
+    ObjectStore::encrypt_data_with_master_key(plain)
+}
+
+/// Decrypt a blob written by [`encrypt_iam_blob`], or read a legacy plaintext
+/// one, using the same key sources as the IAM load path.
+pub(crate) fn decrypt_iam_blob(data: &[u8]) -> Result<Vec<u8>> {
+    ObjectStore::decrypt_data_with_source(data).map(|outcome| outcome.plain)
+}
+
 #[derive(Clone)]
 pub struct ObjectStore {
     object_api: Arc<IamStore>,
