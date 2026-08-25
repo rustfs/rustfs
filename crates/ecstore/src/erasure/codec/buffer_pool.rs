@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_basic() {
-        let pool = BufferPool::new();
+        let pool = BufferPool::with_limits(16);
         let buf = pool.get(1024);
         assert!(buf.capacity() >= 1024);
         pool.put(buf);
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_buffer_pool_different_sizes() {
-        let pool = BufferPool::new();
+        let pool = BufferPool::with_limits(16);
         let buf1 = pool.get(100);
         let buf2 = pool.get(1000);
         let buf3 = pool.get(10000);
