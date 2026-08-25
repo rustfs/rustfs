@@ -391,8 +391,8 @@ pub fn memory_observability_controller_snapshot(ctx: &CancellationToken) -> Memo
 
 /// Record the effective memory total and its basis (host or cgroup).
 fn record_effective_memory(total_bytes: u64) {
-    let basis = crate::cgroup_resources::memory_basis();
-    metrics::gauge!("rustfs_memory_effective_total_bytes", "basis" => basis.to_string()).set(total_bytes as f64);
+    let basis = crate::cgroup_resources::container_resources().basis;
+    metrics::gauge!("rustfs_memory_effective_total_bytes", "basis" => basis).set(total_bytes as f64);
 }
 
 /// Record container resource detection results.

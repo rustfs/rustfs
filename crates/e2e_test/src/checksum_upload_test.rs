@@ -20,6 +20,7 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
     use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
+    use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
@@ -186,16 +187,16 @@ mod tests {
             .send()
             .await;
 
-        assert!(
-            result.is_err(),
-            "PutObject with a mismatched SHA256 must be rejected, but it succeeded (issue #4341)"
+        let error = result.expect_err("PutObject with a mismatched SHA256 must be rejected (issue #4341)");
+        assert_eq!(
+            error.raw_response().map(|response| response.status().as_u16()),
+            Some(400),
+            "Mismatched SHA256 must return HTTP 400, got {error:?}"
         );
-        let err = result.err().unwrap();
-        let msg = format!("{err:?}");
-        info!("PutObject correctly rejected mismatched checksum: {msg}");
-        assert!(
-            msg.contains("BadDigest") || msg.to_lowercase().contains("digest") || msg.to_lowercase().contains("checksum"),
-            "Expected a BadDigest/checksum error, got: {msg}"
+        assert_eq!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("BadDigest"),
+            "Mismatched SHA256 must return BadDigest, got {error:?}"
         );
 
         // And the object must not have been stored.
@@ -556,11 +557,16 @@ mod tests {
                 })
                 .send()
                 .await;
-            assert!(put_bad.is_err(), "{header}: a mismatched checksum must be rejected");
-            let msg = format!("{:?}", put_bad.err().unwrap());
-            assert!(
-                msg.contains("BadDigest") || msg.to_lowercase().contains("digest") || msg.to_lowercase().contains("checksum"),
-                "{header}: expected a BadDigest/checksum error, got: {msg}"
+            let error = put_bad.expect_err("a mismatched checksum must be rejected");
+            assert_eq!(
+                error.raw_response().map(|response| response.status().as_u16()),
+                Some(400),
+                "{header}: mismatched checksum must return HTTP 400, got {error:?}"
+            );
+            assert_eq!(
+                error.as_service_error().and_then(ProvideErrorMetadata::code),
+                Some("BadDigest"),
+                "{header}: mismatched checksum must return BadDigest, got {error:?}"
             );
             let error = client
                 .head_object()
