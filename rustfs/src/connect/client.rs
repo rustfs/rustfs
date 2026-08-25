@@ -15,7 +15,8 @@
 use std::time::Duration;
 
 use base64::Engine as _;
-use reqwest::{Client, StatusCode, Url};
+use chrono::{DateTime, Utc};
+use reqwest::{Client, StatusCode, Url, header};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, pem::PemObject as _};
 use serde::Deserialize;
@@ -277,7 +278,7 @@ impl ConnectClient {
         let client = build_client(&self.root_certificates, self.timeout, Some(tls_identity))?;
         let path = format!("clusterDevices/{}:rotateCredential", credential.uid);
         let url = self.url(&path)?;
-        let response = self.send(StatusCode::OK, || client.post(url.clone()).json(&body)).await?;
+        let response = self.send_once(StatusCode::OK, client.post(url).json(&body)).await?;
         let rotated = validate_credential(
             response,
             &next,
@@ -432,7 +433,39 @@ impl ConnectClient {
                 tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
             }
         }
-        Err(ClientError::Unavailable { status: last_status })
+        Err(ClientError::Unavailable {
+            status: last_status,
+            retry_after: None,
+        })
+    }
+
+    async fn send_once(&self, success: StatusCode, request: reqwest::RequestBuilder) -> Result<CredentialResponse, ClientError> {
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) if error.is_timeout() || error.is_connect() || error.is_request() => {
+                return Err(ClientError::Unavailable {
+                    status: None,
+                    retry_after: None,
+                });
+            }
+            Err(error) => return Err(ClientError::Transport(error)),
+        };
+        let status = response.status();
+        if status == success {
+            return decode_response(response).await;
+        }
+        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            let reason = decode_reason(response).await;
+            return Err(ClientError::AccessRevoked { status, reason });
+        }
+        if matches!(status, StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS) || status.is_server_error() {
+            return Err(ClientError::Unavailable {
+                status: Some(status),
+                retry_after: retry_after(response.headers(), Utc::now()),
+            });
+        }
+        let reason = decode_reason(response).await;
+        Err(ClientError::Rejected { status, reason })
     }
 
     fn url(&self, path: &str) -> Result<Url, ClientError> {
@@ -458,6 +491,15 @@ fn ensure_credential_time(credential: &DeviceCredential, now_unix: i64) -> Resul
         return Err(ClientError::CredentialExpired);
     }
     Ok(())
+}
+
+fn retry_after(headers: &header::HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?;
+    value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| {
+        DateTime::parse_from_rfc2822(value)
+            .ok()
+            .and_then(|at| (at.with_timezone(&Utc) - now).to_std().ok())
+    })
 }
 
 fn build_client(
@@ -547,8 +589,11 @@ pub enum ClientError {
     AccessRevoked { status: StatusCode, reason: Option<String> },
     #[error("Connect rejected the request with HTTP {status}; reason={reason:?}")]
     Rejected { status: StatusCode, reason: Option<String> },
-    #[error("Connect remained unavailable after bounded retries; last_status={status:?}")]
-    Unavailable { status: Option<StatusCode> },
+    #[error("Connect is unavailable; last_status={status:?}; retry_after={retry_after:?}")]
+    Unavailable {
+        status: Option<StatusCode>,
+        retry_after: Option<Duration>,
+    },
     #[error("Connect response exceeded the 1 MiB credential-response limit")]
     ResponseTooLarge,
     #[error("Connect returned an invalid credential response")]

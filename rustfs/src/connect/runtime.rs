@@ -20,6 +20,7 @@ use chrono::Utc;
 use rand::RngExt as _;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::client::{ClientError, ConnectClient, ConnectConfig};
@@ -127,26 +128,44 @@ where
     let task = tokio::spawn(async move {
         let _lock = lock;
         let mut backoff = schedule.initial_backoff;
+        let mut rotation_backoff = schedule.initial_backoff;
+        let mut rotation_retry_at = None;
         loop {
             if task_shutdown.is_cancelled() {
                 break;
             }
-            match cancellable(
-                &task_shutdown,
-                rotation.rotate_if_due(&identity_store, &credential_store, Utc::now().timestamp()),
-            )
-            .await
-            {
-                Some(Ok(_)) | Some(Err(ClientError::Unavailable { .. })) | Some(Err(ClientError::Transport(_))) => {}
-                Some(Err(ClientError::AccessRevoked { status, reason })) => {
-                    let _ = status_tx.send(HeartbeatStatus::AuthenticationStopped {
-                        status: status.as_u16(),
-                        reason,
-                    });
-                    return;
+            if rotation_retry_at.is_none_or(|retry_at| Instant::now() >= retry_at) {
+                match cancellable(
+                    &task_shutdown,
+                    rotation.rotate_if_due(&identity_store, &credential_store, Utc::now().timestamp()),
+                )
+                .await
+                {
+                    Some(Ok(_)) => {
+                        rotation_backoff = schedule.initial_backoff;
+                        rotation_retry_at = None;
+                    }
+                    Some(Err(ClientError::Unavailable { retry_after, .. })) => {
+                        let delay = retry_after
+                            .unwrap_or(rotation_backoff)
+                            .clamp(schedule.initial_backoff, schedule.max_backoff);
+                        rotation_backoff = rotation_backoff.saturating_mul(2).min(schedule.max_backoff);
+                        rotation_retry_at = Some(Instant::now() + delay);
+                    }
+                    Some(Err(ClientError::Transport(_))) => {
+                        rotation_retry_at = Some(Instant::now() + rotation_backoff);
+                        rotation_backoff = rotation_backoff.saturating_mul(2).min(schedule.max_backoff);
+                    }
+                    Some(Err(ClientError::AccessRevoked { status, reason })) => {
+                        let _ = status_tx.send(HeartbeatStatus::AuthenticationStopped {
+                            status: status.as_u16(),
+                            reason,
+                        });
+                        return;
+                    }
+                    Some(Err(error)) => return failed(&status_tx, rotation_failure(error)),
+                    None => break,
                 }
-                Some(Err(error)) => return failed(&status_tx, rotation_failure(error)),
-                None => break,
             }
             let pending = match store.prepare(sample(), Utc::now()).await {
                 Ok(pending) => pending,

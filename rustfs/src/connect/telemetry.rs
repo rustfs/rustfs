@@ -25,7 +25,7 @@ use super::config::HeartbeatConfig;
 use super::credential_store::{CredentialStoreError, DeviceCredential};
 use super::identity::IdentityError;
 use super::identity_store::StoreError;
-use super::registration::{CredentialValidationError, validate_stored_credential};
+use super::registration::{CredentialValidationError, certificate_fingerprint, validate_stored_credential};
 
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
@@ -41,6 +41,13 @@ pub(crate) struct TelemetryTransport {
     root_store: RootCertStore,
     roots: Vec<CertificateDer<'static>>,
     config: HeartbeatConfig,
+}
+
+struct AuthenticatedClient {
+    cluster_name: String,
+    cluster_uid: String,
+    credential_fingerprint: String,
+    client: Client,
 }
 
 impl TelemetryTransport {
@@ -87,43 +94,56 @@ impl TelemetryTransport {
     }
 
     pub(crate) async fn post<T: Serialize>(&self, collection: &str, value: &T) -> Result<TelemetryDelivery, TelemetryError> {
-        let (cluster_name, cluster_uid, client) = self.authenticated_client().await?;
-        let url = self.endpoint.join(&format!("clusters/{cluster_uid}/{collection}"))?;
-        let response = match client.post(url).json(value).send().await {
-            Ok(response) => response,
-            Err(error) if error.is_timeout() || error.is_connect() || error.is_request() => {
+        let mut authenticated = self.authenticated_client().await?;
+        let mut refreshed = false;
+        loop {
+            let url = self
+                .endpoint
+                .join(&format!("clusters/{}/{collection}", authenticated.cluster_uid))?;
+            let response = match authenticated.client.post(url).json(value).send().await {
+                Ok(response) => response,
+                Err(error) if error.is_timeout() || error.is_connect() || error.is_request() => {
+                    return Ok(TelemetryDelivery::Retry { retry_after: None });
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let status = response.status();
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) && !refreshed {
+                let current = self.authenticated_client().await?;
+                if current.credential_fingerprint != authenticated.credential_fingerprint {
+                    authenticated = current;
+                    refreshed = true;
+                    continue;
+                }
+            }
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                return Ok(TelemetryDelivery::Retry {
+                    retry_after: retry_after(response.headers(), Utc::now(), self.config.schedule.max_backoff),
+                });
+            }
+            if status == StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
                 return Ok(TelemetryDelivery::Retry { retry_after: None });
             }
-            Err(error) => return Err(error.into()),
-        };
-        let status = response.status();
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            return Ok(TelemetryDelivery::Retry {
-                retry_after: retry_after(response.headers(), Utc::now(), self.config.schedule.max_backoff),
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                return Ok(TelemetryDelivery::AuthenticationStopped {
+                    status: status.as_u16(),
+                    reason: response_reason(response).await,
+                });
+            }
+            if status != StatusCode::OK {
+                return Ok(TelemetryDelivery::Rejected {
+                    status: status.as_u16(),
+                    reason: response_reason(response).await,
+                });
+            }
+            return Ok(TelemetryDelivery::Accepted {
+                cluster_name: authenticated.cluster_name,
+                body: bounded_body(response).await?,
             });
         }
-        if status == StatusCode::REQUEST_TIMEOUT || status.is_server_error() {
-            return Ok(TelemetryDelivery::Retry { retry_after: None });
-        }
-        if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
-            return Ok(TelemetryDelivery::AuthenticationStopped {
-                status: status.as_u16(),
-                reason: response_reason(response).await,
-            });
-        }
-        if status != StatusCode::OK {
-            return Ok(TelemetryDelivery::Rejected {
-                status: status.as_u16(),
-                reason: response_reason(response).await,
-            });
-        }
-        Ok(TelemetryDelivery::Accepted {
-            cluster_name,
-            body: bounded_body(response).await?,
-        })
     }
 
-    async fn authenticated_client(&self) -> Result<(String, String, Client), TelemetryError> {
+    async fn authenticated_client(&self) -> Result<AuthenticatedClient, TelemetryError> {
         let _lock = self.config.credential_store.lock().await?;
         let credential = self.config.credential_store.load()?.ok_or(TelemetryError::NotRegistered)?;
         let identity = self.config.identity_store.load()?.ok_or(TelemetryError::IdentityMissing)?;
@@ -134,8 +154,14 @@ impl TelemetryTransport {
         }
         let (organization_uid, cluster_uid) = credential_parent(&credential)?;
         let cluster_name = format!("organizations/{organization_uid}/clusters/{cluster_uid}");
+        let credential_fingerprint = certificate_fingerprint(&credential.certificate)?;
         let client = self.client(&credential, &identity.to_pkcs8_pem()?)?;
-        Ok((cluster_name, cluster_uid.to_owned(), client))
+        Ok(AuthenticatedClient {
+            cluster_name,
+            cluster_uid: cluster_uid.to_owned(),
+            credential_fingerprint,
+            client,
+        })
     }
 
     fn client(&self, credential: &DeviceCredential, key: &Zeroizing<String>) -> Result<Client, TelemetryError> {
