@@ -1825,11 +1825,24 @@ impl SetDisks {
 }
 
 impl SetDisks {
+    #[cfg(test)]
     pub(crate) async fn heal_replacement_format(
         &self,
         dry_run: bool,
         targets: &[String],
     ) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_replacement_format_with_fence(dry_run, targets, || false).await
+    }
+
+    pub(crate) async fn heal_replacement_format_with_fence<F>(
+        &self,
+        dry_run: bool,
+        targets: &[String],
+        fence_lost: F,
+    ) -> Result<(HealResultItem, Option<Error>)>
+    where
+        F: FnMut() -> bool + Send,
+    {
         if targets.is_empty() {
             return Err(Error::other("replacement format requires at least one target"));
         }
@@ -1845,14 +1858,18 @@ impl SetDisks {
             target_slots.push(slot);
         }
 
-        self.heal_format_for_slots(dry_run, Some(&target_slots)).await
+        self.heal_format_for_slots(dry_run, Some(&target_slots), fence_lost).await
     }
 
-    async fn heal_format_for_slots(
+    async fn heal_format_for_slots<F>(
         &self,
         dry_run: bool,
         target_slots: Option<&[usize]>,
-    ) -> Result<(HealResultItem, Option<Error>)> {
+        mut fence_lost: F,
+    ) -> Result<(HealResultItem, Option<Error>)>
+    where
+        F: FnMut() -> bool + Send,
+    {
         let disks = self.disks.read().await.clone();
         let (formats, errs) = load_format_erasure_all(&disks, true).await;
         if errs.iter().any(|err| {
@@ -1922,8 +1939,14 @@ impl SetDisks {
 
                 let mut new_format = ref_format.clone();
                 new_format.erasure.this = ref_format.erasure.sets[self.set_index][disk_idx];
+                if fence_lost() {
+                    return Ok((result, Some(StorageError::SlowDown)));
+                }
                 match save_format_file(&disks[disk_idx], &Some(new_format.clone())).await {
                     Ok(()) => {
+                        if fence_lost() {
+                            return Ok((result, Some(StorageError::SlowDown)));
+                        }
                         result.after.drives[disk_idx].uuid = new_format.erasure.this.to_string();
                         result.after.drives[disk_idx].state = DriveState::Ok.to_string();
                     }
@@ -1949,7 +1972,7 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-        self.heal_format_for_slots(dry_run, None).await
+        self.heal_format_for_slots(dry_run, None, || false).await
     }
 
     #[tracing::instrument(skip(self))]

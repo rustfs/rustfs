@@ -77,7 +77,14 @@ pub async fn connect_load_init_formats(
     deployment_id: Option<Uuid>,
 ) -> Result<FormatV3> {
     let instance_ctx = crate::runtime::global::current_ctx();
-    connect_load_init_formats_with_instance_ctx(&instance_ctx, first_disk, disks, set_count, set_drive_count, deployment_id).await
+    connect_load_init_formats_with_instance_ctx(&instance_ctx, first_disk, disks, set_count, set_drive_count, deployment_id)
+        .await
+        .map(|loaded| loaded.format)
+}
+
+pub(crate) struct LoadedFormat {
+    pub(crate) format: FormatV3,
+    pub(crate) fresh_bootstrap_proven: bool,
 }
 
 pub(crate) async fn connect_load_init_formats_with_instance_ctx(
@@ -87,17 +94,18 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
     set_count: usize,
     set_drive_count: usize,
     deployment_id: Option<Uuid>,
-) -> Result<FormatV3> {
+) -> Result<LoadedFormat> {
     let (formats, errs) = load_format_erasure_all(disks, false).await;
 
     check_disk_fatal_errs(&errs)?;
 
-    // Treat transient network errors (connection refused, timeout, etc.) as
-    // equivalent to UnformattedDisk for the bootstrap decision. During
-    // fresh-cluster startup a remote peer that cannot be reached is
-    // indistinguishable from an unformatted disk — the peer may simply not
-    // have started its gRPC server yet.
+    // Transient network errors still follow the first-node wait path so peers
+    // can come online, but they are never fresh-cluster authority below.
     let all_unformatted = errs.iter().all(is_unformatted_or_transient_network);
+    // Fresh-cluster authority requires a response from every configured disk.
+    // A transiently unreachable peer may belong to an existing cluster and
+    // must never be treated as proof that the topology is new.
+    let fresh_bootstrap_proven = should_init_erasure_disks(&errs);
     let formats_present = formats.iter().flatten().count();
     let mut format_quorum = (formats_present > 0).then(|| select_format_erasure_in_quorum(&formats, 0));
     if format_quorum.as_ref().is_none_or(Result::is_err)
@@ -123,7 +131,10 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
             Ok(LegacyFormatOutcome::Migrated { format, quorum_members }) => {
                 info!("Migrated format from MinIO config");
                 retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count).await?;
-                return Ok(*format);
+                return Ok(LoadedFormat {
+                    format: *format,
+                    fresh_bootstrap_proven: false,
+                });
             }
             Ok(LegacyFormatOutcome::Incompatible) => {
                 error!(
@@ -138,9 +149,12 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
             Ok(LegacyFormatOutcome::None) => {}
             Err(e) => return Err(e),
         }
-        if all_unformatted {
+        if fresh_bootstrap_proven {
             let fm = init_format_erasure(instance_ctx, disks, set_count, set_drive_count, deployment_id).await?;
-            return Ok(fm);
+            return Ok(LoadedFormat {
+                format: fm,
+                fresh_bootstrap_proven: true,
+            });
         }
     }
 
@@ -166,7 +180,10 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
     check_format_erasure_value_for_topology(&fm, formats.len(), set_drive_count)?;
     retain_format_quorum_members(instance_ctx, disks, &fm, &quorum_members, set_drive_count).await?;
 
-    Ok(fm)
+    Ok(LoadedFormat {
+        format: fm,
+        fresh_bootstrap_proven: false,
+    })
 }
 
 async fn retain_format_quorum_members(
@@ -258,11 +275,8 @@ pub fn should_init_erasure_disks(errs: &[Option<DiskError>]) -> bool {
     count_errs(errs, &DiskError::UnformattedDisk) == errs.len()
 }
 
-/// Returns `true` if the error represents a disk that is either unformatted
-/// or unreachable due to a transient network failure. During fresh-cluster
-/// bootstrap a remote peer that cannot be reached is indistinguishable from
-/// an unformatted disk — the peer may simply not have started its gRPC
-/// server yet.
+/// Returns `true` for errors that stay on the first-node wait path. This is not
+/// fresh-cluster proof; only [`should_init_erasure_disks`] grants that.
 fn is_unformatted_or_transient_network(err: &Option<DiskError>) -> bool {
     matches!(err, Some(DiskError::UnformattedDisk)) || err.as_ref().is_some_and(is_network_like_disk_error)
 }
@@ -1294,9 +1308,14 @@ mod tests {
     async fn fresh_format_load_initializes_all_disks() {
         let (_temp_dir, mut disks) = local_disks(3).await;
 
-        let format = connect_load_init_formats(true, &mut disks, 1, 3, None)
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 3, None)
             .await
             .expect("fresh disks should receive a storage format");
+        assert!(
+            loaded.fresh_bootstrap_proven,
+            "every configured disk explicitly reporting unformatted should establish fresh topology proof"
+        );
+        let format = loaded.format;
 
         let (formats, errors) = load_format_erasure_all(&disks, false).await;
         assert!(errors.iter().all(Option::is_none), "every disk should load its fresh format: {errors:?}");
@@ -1640,6 +1659,14 @@ mod tests {
         assert!(!is_unformatted_or_transient_network(&Some(DiskError::FileNotFound)));
         assert!(!is_unformatted_or_transient_network(&Some(DiskError::CorruptedFormat)));
         assert!(!is_unformatted_or_transient_network(&Some(DiskError::DiskFull)));
+        assert!(should_init_erasure_disks(&[
+            Some(DiskError::UnformattedDisk),
+            Some(DiskError::UnformattedDisk),
+        ]));
+        assert!(
+            !should_init_erasure_disks(&[Some(DiskError::UnformattedDisk), Some(DiskError::Timeout)]),
+            "an unreachable peer is not fresh-topology proof"
+        );
     }
 }
 
