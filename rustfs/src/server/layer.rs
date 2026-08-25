@@ -2718,13 +2718,10 @@ mod tests {
                 let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
                 let payload: serde_json::Value =
                     serde_json::from_slice(&body).expect("public liveness health response should be valid JSON");
-                assert!(matches!(payload["status"].as_str(), Some("ok" | "degraded")));
-                assert!(payload["ready"].is_boolean());
-                assert!(payload["details"].is_object());
-                assert!(payload["details"]["storage"]["ready"].is_boolean());
-                assert!(payload["details"]["iam"]["ready"].is_boolean());
-                assert!(payload["details"]["lock"]["ready"].is_boolean());
-                assert!(payload["degradedReasons"].is_array());
+                assert_eq!(payload["status"], "ok");
+                assert!(payload.get("ready").is_none());
+                assert!(payload.get("details").is_none());
+                assert!(payload.get("degradedReasons").is_none());
             },
         )
         .await;
@@ -3058,6 +3055,14 @@ mod tests {
                     .await
                     .expect("liveness response");
                 assert_eq!(response.status(), StatusCode::OK);
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .expect("liveness body")
+                    .to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(&body).expect("liveness JSON");
+                assert_eq!(payload["status"], "ok");
+                assert!(payload.get("ready").is_none());
+                assert!(payload.get("degradedReasons").is_none());
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
 
                 drop(stalled);

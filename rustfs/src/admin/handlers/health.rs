@@ -113,8 +113,8 @@ mod tests {
     fn test_liveness_state_iam_not_ready() {
         let state = health_check_state(true, false, true, true, HealthProbe::Liveness);
         assert_eq!(state.status_code, StatusCode::OK);
-        assert_eq!(state.status, "degraded");
-        assert!(!state.ready);
+        assert_eq!(state.status, "ok");
+        assert!(state.ready);
     }
 
     #[test]
@@ -137,8 +137,8 @@ mod tests {
     fn test_liveness_state_lock_not_ready() {
         let state = health_check_state(true, true, false, true, HealthProbe::Liveness);
         assert_eq!(state.status_code, StatusCode::OK);
-        assert_eq!(state.status, "degraded");
-        assert!(!state.ready);
+        assert_eq!(state.status, "ok");
+        assert!(state.ready);
     }
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn test_readiness_probe_uses_node_collector_only() {
         assert_eq!(readiness_source_for_probe(HealthProbe::Readiness), Some(HealthReadinessSource::Node));
-        assert_eq!(readiness_source_for_probe(HealthProbe::Liveness), Some(HealthReadinessSource::Node));
+        assert_eq!(readiness_source_for_probe(HealthProbe::Liveness), None);
     }
 
     #[test]
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_health_response_liveness_returns_200_when_deps_not_ready() {
+    fn test_build_health_response_liveness_omits_readiness_state_when_deps_not_ready() {
         let readiness_report = crate::shared_types::DependencyReadinessReport {
             readiness: crate::shared_types::DependencyReadiness {
                 storage_ready: false,
@@ -264,20 +264,17 @@ mod tests {
             None,
             None,
         );
-        // Liveness HTTP status remains 200 (process is alive).
         assert_eq!(parts.status_code, StatusCode::OK);
         let payload = parts.payload.expect("GET should include payload");
-        // But `ready` now reflects actual readiness state.
-        assert_eq!(payload["status"], "degraded");
-        assert_eq!(payload["ready"], false);
-        // Dependency details are included when readiness report is present.
-        assert!(payload.get("details").is_some());
-        assert!(payload.get("degradedReasons").is_some());
+        assert_eq!(payload["status"], "ok");
+        assert!(payload.get("ready").is_none());
+        assert!(payload.get("details").is_none());
+        assert!(payload.get("degradedReasons").is_none());
     }
 
     #[test]
     #[serial]
-    fn test_health_and_readiness_body_agree_when_only_lock_quorum_is_unavailable() {
+    fn test_liveness_body_stays_peer_independent_when_only_lock_quorum_is_unavailable() {
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
             let readiness_report = crate::shared_types::DependencyReadinessReport {
                 readiness: crate::shared_types::DependencyReadiness {
@@ -310,13 +307,13 @@ mod tests {
             assert_eq!(readiness.status_code, StatusCode::SERVICE_UNAVAILABLE);
             let liveness_payload = liveness.payload.expect("GET should include liveness payload");
             let readiness_payload = readiness.payload.expect("GET should include readiness payload");
-            assert_eq!(liveness_payload["status"], "degraded");
+            assert_eq!(liveness_payload["status"], "ok");
             assert_eq!(readiness_payload["status"], "degraded");
-            assert_eq!(liveness_payload["ready"], false);
+            assert!(liveness_payload.get("ready").is_none());
             assert_eq!(readiness_payload["ready"], false);
-            assert_eq!(liveness_payload["details"]["lock"]["ready"], false);
+            assert!(liveness_payload.get("details").is_none());
             assert_eq!(readiness_payload["details"]["lock"]["ready"], false);
-            assert_eq!(liveness_payload["degradedReasons"][0], "lock_quorum_unavailable");
+            assert!(liveness_payload.get("degradedReasons").is_none());
             assert_eq!(readiness_payload["degradedReasons"][0], "lock_quorum_unavailable");
         });
     }
@@ -350,6 +347,7 @@ mod tests {
         let health = health_check_state(true, false, true, true, HealthProbe::Readiness);
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("true"), || {
             let payload = build_health_payload(HealthPayloadContext {
+                probe: HealthProbe::Readiness,
                 health,
                 storage_ready: true,
                 iam_ready: false,
@@ -375,6 +373,7 @@ mod tests {
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false"), || {
             let health = health_check_state(false, false, false, true, HealthProbe::Readiness);
             let payload = build_health_payload(HealthPayloadContext {
+                probe: HealthProbe::Readiness,
                 health,
                 storage_ready: false,
                 iam_ready: false,
