@@ -430,7 +430,8 @@ const GET_OBJECT_STAGE_METADATA_FILTER: &str = "metadata_filter";
 const PUT_OBJECT_STORE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 // Eager PUT bodies are fully materialized before the storage owner starts. On
 // request cancellation, keep the commit/publication tail alive briefly, then
-// reap it so its write-health guard cannot remain detached indefinitely.
+// request pre-commit rollback and await cleanup so its write-health guard is
+// reaped without abandoning staged shards.
 const EAGER_PUT_COMMIT_CANCELLATION_GRACE: Duration =
     Duration::from_secs(rustfs_config::DEFAULT_DRIVE_MAX_TIMEOUT_DURATION_SECS * 4);
 const GET_OBJECT_STREAM_WARN_THRESHOLD: Duration = Duration::from_secs(5);
@@ -3227,13 +3228,19 @@ struct PutObjectCommitResult {
 
 struct EagerPutCommitOwner<T: Send + 'static> {
     task: Option<tokio::task::JoinHandle<T>>,
+    cancellation: tokio_util::sync::CancellationToken,
     cancellation_grace: Duration,
 }
 
 impl<T: Send + 'static> EagerPutCommitOwner<T> {
-    fn new(task: tokio::task::JoinHandle<T>, cancellation_grace: Duration) -> Self {
+    fn new(
+        task: tokio::task::JoinHandle<T>,
+        cancellation: tokio_util::sync::CancellationToken,
+        cancellation_grace: Duration,
+    ) -> Self {
         Self {
             task: Some(task),
+            cancellation,
             cancellation_grace,
         }
     }
@@ -3254,21 +3261,22 @@ impl<T: Send + 'static> Drop for EagerPutCommitOwner<T> {
             task.abort();
             return;
         }
+        let cancellation = self.cancellation.clone();
         let cancellation_grace = self.cancellation_grace;
         spawn_traced(async move {
             if tokio::time::timeout(cancellation_grace, &mut task).await.is_err() {
-                task.abort();
-                let _ = task.await;
+                cancellation.cancel();
                 metrics::counter!("rustfs_put_commit_owner_deadline_total", "put_path" => "eager").increment(1);
                 warn!(
                     target: "rustfs::app::object_usecase",
                     event = EVENT_PUT_OBJECT_COMMIT_OWNER_DEADLINE,
                     component = LOG_COMPONENT_APP,
                     subsystem = LOG_SUBSYSTEM_OBJECT,
-                    state = "aborted",
+                    state = "cancellation_requested",
                     cancellation_grace_ms = cancellation_grace.as_millis() as u64,
-                    "cancelled eager PutObject commit owner exceeded its grace period and was reaped"
+                    "cancelled eager PutObject commit owner exceeded its grace period and requested storage cleanup"
                 );
+                let _ = task.await;
             }
         });
     }
@@ -6177,6 +6185,9 @@ impl DefaultObjectUsecase {
             object_lock_retain_until_date,
             &mut opts,
         )?;
+        let eager_put_commit_cancellation =
+            (use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path).then(tokio_util::sync::CancellationToken::new);
+        opts.put_object_cancellation = eager_put_commit_cancellation.clone();
 
         // rustfs/backlog#1009: the pre-PUT lookup has exactly two consumers —
         // the existing-object WORM validation and usage accounting's
@@ -6559,8 +6570,8 @@ impl DefaultObjectUsecase {
                 Ok::<_, S3Error>(PutObjectCommitResult { obj_info, put_versioned })
             }
         });
-        let put_commit_result = if use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path {
-            EagerPutCommitOwner::new(put_commit, EAGER_PUT_COMMIT_CANCELLATION_GRACE)
+        let put_commit_result = if let Some(cancellation) = eager_put_commit_cancellation {
+            EagerPutCommitOwner::new(put_commit, cancellation, EAGER_PUT_COMMIT_CANCELLATION_GRACE)
                 .join()
                 .await
         } else {
@@ -10356,11 +10367,13 @@ mod tests {
     async fn cancelled_eager_put_commit_owner_reaps_stalled_storage_task() {
         let health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
         let task_health = Arc::clone(&health);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let task_cancellation = cancellation.clone();
         let task = spawn_traced_join(async move {
             let _progress = task_health.track_write_storage().expect("write tracking must be enabled");
-            std::future::pending::<()>().await;
+            task_cancellation.cancelled().await;
         });
-        let owner = EagerPutCommitOwner::new(task, Duration::from_millis(10));
+        let owner = EagerPutCommitOwner::new(task, cancellation, Duration::from_millis(10));
         let request = spawn_traced_join(owner.join());
 
         tokio::time::timeout(Duration::from_secs(2), async {
