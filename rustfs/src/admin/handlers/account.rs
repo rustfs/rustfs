@@ -38,6 +38,7 @@ use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_action_credentials, current_ready_iam_handle, object_store_from_req};
 use crate::admin::service::caller_identity::CallerIdentity;
+use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Response, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::constant_time_eq;
 use crate::server::RemoteAddr;
@@ -50,7 +51,6 @@ use rustfs_madmin::account::{AccountMfaSummary, ChangePasswordRequest, IdentityT
 use rustfs_policy::auth::is_secret_key_valid;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::MaskedAccessKey;
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use time::OffsetDateTime;
 use tracing::{info, warn};
 
@@ -75,7 +75,8 @@ pub struct SelfAccountInfoHandler {}
 impl Operation for SelfAccountInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let caller = CallerIdentity::resolve(&req).await?;
-        let iam_store = current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam is not initialized"))?;
+        let iam_store =
+            current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
         // Root has no IAM record at all — `check_key` special-cases it — so its
         // status and memberships are synthesized rather than looked up.
@@ -101,7 +102,7 @@ impl Operation for SelfAccountInfoHandler {
             Some(store) => {
                 let status = mfa_service::status(store, &caller.access_key, OffsetDateTime::now_utc())
                     .await
-                    .map_err(|err| s3_error!(InternalError, "{}", err))?;
+                    .map_err(|err| s3::error(S3ErrorCode::InternalError, format!("{err}")))?;
                 AccountMfaSummary {
                     enabled: status.enabled,
                     pending: status.pending,
@@ -118,7 +119,7 @@ impl Operation for SelfAccountInfoHandler {
                     },
                 }
             }
-            None => return Err(s3_error!(ServiceUnavailable, "the object store is not ready")),
+            None => return Err(s3::error(S3ErrorCode::ServiceUnavailable, "the object store is not ready")),
         };
 
         let info = SelfAccountInfo {
@@ -164,10 +165,11 @@ impl Operation for ChangeOwnPasswordHandler {
         let path = req.uri.path().to_string();
         let body =
             read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
-        let request: ChangePasswordRequest =
-            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid change-password request: {e}"))?;
+        let request: ChangePasswordRequest = serde_json::from_slice(&body)
+            .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid change-password request: {e}")))?;
 
-        let iam_store = current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam is not initialized"))?;
+        let iam_store =
+            current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
         let Some(stored) = iam_store.get_user(&caller.access_key).await else {
             // Reached only if the identity was deleted between authentication
@@ -181,7 +183,7 @@ impl Operation for ChangeOwnPasswordHandler {
                     AccountAuditFailure::Internal,
                 ),
             );
-            return Err(s3_error!(InvalidRequest, "the calling identity no longer exists"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "the calling identity no longer exists"));
         };
 
         if !constant_time_eq(&request.current_secret_key, &stored.credentials.secret_key) {
@@ -207,7 +209,7 @@ impl Operation for ChangeOwnPasswordHandler {
             // Deliberately the same message the validation failures below use,
             // so a caller cannot distinguish "wrong current password" from
             // "new password rejected" by probing.
-            return Err(s3_error!(InvalidRequest, "the current secret key is incorrect"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "the current secret key is incorrect"));
         }
 
         if let Err(err) = validate_new_secret_key(&request) {
@@ -234,7 +236,8 @@ impl Operation for ChangeOwnPasswordHandler {
         // the secret write and the session revocation must not leave the old
         // sessions alive against a rotated secret.
         let sessions_revoked = supervise_admin_mutation("change own password", async move {
-            let iam_store = current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam is not initialized"))?;
+            let iam_store =
+                current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
             iam_store
                 .set_user_secret_key(&access_key, &new_secret_key)
@@ -315,12 +318,13 @@ struct SetUserSecretKeyQuery {
 impl Operation for SetUserSecretKeyHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let query: SetUserSecretKeyQuery = match req.uri.query() {
-            Some(query) => serde_urlencoded::from_str(query).map_err(|_| s3_error!(InvalidArgument, "failed to decode query"))?,
+            Some(query) => serde_urlencoded::from_str(query)
+                .map_err(|_| s3::error(S3ErrorCode::InvalidArgument, "failed to decode query"))?,
             None => SetUserSecretKeyQuery::default(),
         };
         let target = query.access_key.unwrap_or_default();
         if target.is_empty() {
-            return Err(s3_error!(InvalidArgument, "access key is empty"));
+            return Err(s3::error(S3ErrorCode::InvalidArgument, "access key is empty"));
         }
 
         let caller = CallerIdentity::resolve(&req).await?;
@@ -330,9 +334,9 @@ impl Operation for SetUserSecretKeyHandler {
         // process-wide `OnceLock` that also derives the internode RPC secret, so
         // there is nothing here that could change it.
         if current_action_credentials().is_some_and(|root| constant_time_eq(&root.access_key, &target)) {
-            return Err(s3_error!(
-                InvalidRequest,
-                "the root identity is provisioned from the server environment and cannot be changed at runtime"
+            return Err(s3::error(
+                S3ErrorCode::InvalidRequest,
+                "the root identity is provisioned from the server environment and cannot be changed at runtime",
             ));
         }
 
@@ -340,9 +344,9 @@ impl Operation for SetUserSecretKeyHandler {
         // was minted from: the session would otherwise be able to promote
         // itself into permanent control of that account.
         if caller.session_access_key.is_some() && caller.access_key == target {
-            return Err(s3_error!(
-                InvalidRequest,
-                "cannot change the credentials of the parent identity of this session"
+            return Err(s3::error(
+                S3ErrorCode::InvalidRequest,
+                "cannot change the credentials of the parent identity of this session",
             ));
         }
 
@@ -371,11 +375,11 @@ impl Operation for SetUserSecretKeyHandler {
         let path = req.uri.path().to_string();
         let body =
             read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
-        let request: SetUserSecretKeyRequest =
-            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid set-user-secret-key request: {e}"))?;
+        let request: SetUserSecretKeyRequest = serde_json::from_slice(&body)
+            .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid set-user-secret-key request: {e}")))?;
 
         if !is_secret_key_valid(&request.secret_key) {
-            return Err(s3_error!(InvalidArgument, "the new secret key is too short"));
+            return Err(s3::error(S3ErrorCode::InvalidArgument, "the new secret key is too short"));
         }
 
         let actor = caller.access_key.clone();
@@ -383,7 +387,8 @@ impl Operation for SetUserSecretKeyHandler {
         let audit_for_task = audit.clone();
 
         let sessions_revoked = supervise_admin_mutation("set user secret key", async move {
-            let iam_store = current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam is not initialized"))?;
+            let iam_store =
+                current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
             iam_store
                 .set_user_secret_key(&target, &request.secret_key)
@@ -450,11 +455,14 @@ struct ChangePasswordResult {
 /// Reject a new secret that would be useless or a no-op.
 fn validate_new_secret_key(request: &ChangePasswordRequest) -> S3Result<()> {
     if !is_secret_key_valid(&request.new_secret_key) {
-        return Err(s3_error!(InvalidArgument, "the new secret key is too short"));
+        return Err(s3::error(S3ErrorCode::InvalidArgument, "the new secret key is too short"));
     }
 
     if constant_time_eq(&request.current_secret_key, &request.new_secret_key) {
-        return Err(s3_error!(InvalidArgument, "the new secret key must differ from the current one"));
+        return Err(s3::error(
+            S3ErrorCode::InvalidArgument,
+            "the new secret key must differ from the current one",
+        ));
     }
 
     Ok(())

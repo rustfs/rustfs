@@ -958,7 +958,18 @@ pub(crate) mod runtime {
 }
 
 pub(crate) mod s3 {
-    pub(crate) use s3s::{S3Error, S3ErrorCode, S3Result};
+    pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header};
+
+    /// Build an `S3Error` without reaching for the `s3s` error macro.
+    ///
+    /// The macro expands to the very constructor this calls, but it puts an
+    /// `s3s` dependency in every file that reports an error. Routing the
+    /// construction through here keeps that dependency in this facade, which is
+    /// the boundary the s3gate migration replaces
+    /// (`scripts/check_s3s_footprint.sh`, rustfs/backlog#1677 F1).
+    pub(crate) fn error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'static, str>>) -> S3Error {
+        S3Error::with_message(code, message)
+    }
 }
 
 pub(crate) mod tier {

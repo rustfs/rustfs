@@ -27,12 +27,12 @@
 
 use crate::admin::auth::authenticate_request;
 use crate::admin::runtime_sources::current_action_credentials;
+use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Result};
 use crate::auth::constant_time_eq;
 use rustfs_credentials::Credentials;
 use rustfs_iam::federation::OIDC_VIRTUAL_PARENT_CLAIM;
 use rustfs_iam::sys::is_rustfs_oidc_claims;
 use rustfs_madmin::account::{AccountMutability, CredentialsSource, IdentityType};
-use s3s::{Body, S3Request, S3Result, s3_error};
 
 /// Claim written by the Keystone middleware onto its synthesized credentials.
 const KEYSTONE_ROLES_CLAIM: &str = "keystone_roles";
@@ -117,7 +117,7 @@ impl CallerIdentity {
     /// not, because every authenticated identity may inspect and manage itself.
     pub(crate) async fn resolve(req: &S3Request<Body>) -> S3Result<Self> {
         let Some(input_cred) = req.credentials.as_ref() else {
-            return Err(s3_error!(InvalidRequest, "authentication required"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "authentication required"));
         };
 
         let (credentials, is_owner) = authenticate_request(&req.headers, &req.uri, input_cred).await?;
@@ -231,7 +231,7 @@ impl CallerIdentity {
     pub(crate) fn ensure_credential_mutation_allowed(&self) -> S3Result<()> {
         match self.mutation_denial {
             None => Ok(()),
-            Some(denial) => Err(s3_error!(InvalidRequest, "{}", denial.message())),
+            Some(denial) => Err(s3::error(S3ErrorCode::InvalidRequest, denial.message())),
         }
     }
 
@@ -242,7 +242,7 @@ impl CallerIdentity {
     pub(crate) fn ensure_mfa_management_allowed(&self) -> S3Result<()> {
         match self.mfa_denial {
             None => Ok(()),
-            Some(denial) => Err(s3_error!(InvalidRequest, "{}", denial.message())),
+            Some(denial) => Err(s3::error(S3ErrorCode::InvalidRequest, denial.message())),
         }
     }
 }

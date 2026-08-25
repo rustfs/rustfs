@@ -47,7 +47,8 @@ use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_token_signing_key, object_store_from_req};
 use crate::admin::service::caller_identity::CallerIdentity;
-use crate::admin::storage_api::ECStore;
+use crate::admin::storage_api::runtime::ECStore;
+use crate::admin::storage_api::s3::{self, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::constant_time_eq;
 use crate::server::RemoteAddr;
@@ -59,7 +60,6 @@ use rustfs_iam::mfa::{MfaServiceError, MfaVerification, service as mfa_service};
 use rustfs_madmin::account::{MfaChallengeResponse, MfaCodeRequest, MfaDisableRequest, UserMfaStatus};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::MaskedAccessKey;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -142,7 +142,7 @@ fn audit_failure_for(error: &MfaServiceError) -> AccountAuditFailure {
 }
 
 fn store_from_req(req: &S3Request<Body>) -> S3Result<Arc<ECStore>> {
-    object_store_from_req(req).ok_or_else(|| s3_error!(ServiceUnavailable, "the object store is not ready"))
+    object_store_from_req(req).ok_or_else(|| s3::error(S3ErrorCode::ServiceUnavailable, "the object store is not ready"))
 }
 
 /// Resolve the caller and confirm this credential kind may manage a second
@@ -235,8 +235,8 @@ impl Operation for AccountMfaActivateHandler {
 
         let body =
             read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
-        let request: MfaCodeRequest =
-            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid activation request: {e}"))?;
+        let request: MfaCodeRequest = serde_json::from_slice(&body)
+            .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid activation request: {e}")))?;
 
         let response = match mfa_service::activate(store, &caller.access_key, &request.code, OffsetDateTime::now_utc()).await {
             Ok(response) => response,
@@ -288,17 +288,17 @@ impl Operation for AccountMfaDisableHandler {
 
         let body =
             read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
-        let request: MfaDisableRequest =
-            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid disable request: {e}"))?;
+        let request: MfaDisableRequest = serde_json::from_slice(&body)
+            .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid disable request: {e}")))?;
 
         // Step-up: the second factor alone is not enough to remove the second
         // factor. The console signs with a short-lived STS session, so a
         // hijacked tab would otherwise be able to strip the protection using
         // only a code shoulder-surfed once.
         let iam_store = crate::admin::runtime_sources::current_ready_iam_handle()
-            .map_err(|_| s3_error!(InternalError, "iam is not initialized"))?;
+            .map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
         let Some(stored) = iam_store.get_user(&caller.access_key).await else {
-            return Err(s3_error!(InvalidRequest, "the calling identity no longer exists"));
+            return Err(s3::error(S3ErrorCode::InvalidRequest, "the calling identity no longer exists"));
         };
         if !constant_time_eq(&request.current_secret_key, &stored.credentials.secret_key) {
             emit_audit(
@@ -311,7 +311,7 @@ impl Operation for AccountMfaDisableHandler {
                 )
                 .with_session_access_key(caller.session_access_key.as_deref()),
             );
-            return Err(s3_error!(AccessDenied, "the current secret key is incorrect"));
+            return Err(s3::error(S3ErrorCode::AccessDenied, "the current secret key is incorrect"));
         }
 
         if let Err(err) = mfa_service::disable(store, &caller.access_key, &request.code, OffsetDateTime::now_utc()).await {
@@ -360,8 +360,8 @@ impl Operation for AccountMfaRecoveryCodesHandler {
 
         let body =
             read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &caller.credentials.secret_key).await?;
-        let request: MfaCodeRequest =
-            serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid recovery-code request: {e}"))?;
+        let request: MfaCodeRequest = serde_json::from_slice(&body)
+            .map_err(|e| s3::error(S3ErrorCode::InvalidRequest, format!("invalid recovery-code request: {e}")))?;
 
         let response =
             match mfa_service::regenerate_recovery_codes(store, &caller.access_key, &request.code, OffsetDateTime::now_utc())
@@ -421,7 +421,7 @@ impl Operation for MfaChallengeHandler {
 
         let response = if required {
             let Some(signing_key) = current_token_signing_key() else {
-                return Err(s3_error!(InternalError, "the session signing key is not initialized"));
+                return Err(s3::error(S3ErrorCode::InternalError, "the session signing key is not initialized"));
             };
             let challenge = mfa_service::issue_challenge(&caller.access_key, now, signing_key.as_bytes());
 
@@ -456,13 +456,15 @@ struct UserMfaQuery {
 
 fn parse_user_mfa_query(req: &S3Request<Body>) -> S3Result<String> {
     let query: UserMfaQuery = match req.uri.query() {
-        Some(query) => serde_urlencoded::from_str(query).map_err(|_| s3_error!(InvalidArgument, "failed to decode query"))?,
+        Some(query) => {
+            serde_urlencoded::from_str(query).map_err(|_| s3::error(S3ErrorCode::InvalidArgument, "failed to decode query"))?
+        }
         None => UserMfaQuery::default(),
     };
 
     let access_key = query.access_key.unwrap_or_default();
     if access_key.is_empty() {
-        return Err(s3_error!(InvalidArgument, "access key is empty"));
+        return Err(s3::error(S3ErrorCode::InvalidArgument, "access key is empty"));
     }
     Ok(access_key)
 }
@@ -578,7 +580,7 @@ pub(crate) async fn verify_for_session(
     // consume an attempt against the rate limiter.
     if let Some(challenge) = challenge.filter(|value| !value.is_empty()) {
         let Some(signing_key) = current_token_signing_key() else {
-            return Err(s3_error!(InternalError, "the session signing key is not initialized"));
+            return Err(s3::error(S3ErrorCode::InternalError, "the session signing key is not initialized"));
         };
         if let Err(err) = mfa_service::validate_challenge(challenge, access_key, now, signing_key.as_bytes()) {
             emit_audit(
@@ -630,7 +632,7 @@ pub(crate) async fn verify_for_session(
 
 fn empty_ok() -> S3Response<(StatusCode, Body)> {
     let mut header = hyper::HeaderMap::new();
-    header.insert(s3s::header::CONTENT_LENGTH, "0".parse().expect("valid header value"));
+    header.insert(s3::header::CONTENT_LENGTH, "0".parse().expect("valid header value"));
     S3Response::with_headers((StatusCode::OK, Body::empty()), header)
 }
 

@@ -202,7 +202,7 @@ async fn handle_assume_role(
     headers: http::HeaderMap,
     remote_addr: Option<std::net::SocketAddr>,
     body: AssumeRoleRequest,
-    store: Option<std::sync::Arc<crate::admin::storage_api::ECStore>>,
+    store: Option<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>>,
     audit: &AccountAuditContext,
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
     let Some(user) = credentials else {
@@ -354,7 +354,7 @@ pub(crate) const MFA_VERIFIED_CLAIM: &str = "x-rustfs-mfa-verified";
 async fn enforce_second_factor(
     access_key: &str,
     body: &AssumeRoleRequest,
-    store: Option<std::sync::Arc<crate::admin::storage_api::ECStore>>,
+    store: Option<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>>,
     audit: &AccountAuditContext,
 ) -> S3Result<bool> {
     let Some(store) = store else {
@@ -362,7 +362,10 @@ async fn enforce_second_factor(
         // reachable, but failing *open* would let a store outage disable the
         // second factor. The store is required for the lookup, so an
         // unavailable one is reported as unavailable.
-        return Err(s3_error!(ServiceUnavailable, "the object store is not ready"));
+        return Err(crate::admin::storage_api::s3::error(
+            S3ErrorCode::ServiceUnavailable,
+            "the object store is not ready",
+        ));
     };
 
     let now = OffsetDateTime::now_utc();

@@ -28,6 +28,7 @@
 //! of static strings, so no caller-supplied bytes can reach a log target
 //! through this module.
 
+use crate::admin::storage_api::s3::{Body, S3Request};
 use crate::server::RemoteAddr;
 use crate::storage::access::request_context_from_extensions;
 use crate::storage::helper::spawn_background_with_context;
@@ -38,7 +39,6 @@ use rustfs_audit::global::AuditLogger;
 use rustfs_madmin::account::IdentityType;
 use rustfs_s3_types::EventName;
 use rustfs_targets::get_request_user_agent;
-use s3s::{Body, S3Request};
 use serde_json::Value;
 
 /// Audit entry schema version, shared with the S3 and KMS paths so a consumer
