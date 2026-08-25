@@ -1,0 +1,105 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Upgrade Compatibility
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/e2e-upgrade.yml"
+      - "crates/e2e_test/src/common.rs"
+      - "crates/e2e_test/src/lib.rs"
+      - "crates/e2e_test/src/upgrade_compatibility_test.rs"
+      - "crates/ecstore/**"
+      - "crates/filemeta/**"
+      - "crates/kms/**"
+      - "crates/storage-api/**"
+      - "rustfs/**"
+      - "Cargo.lock"
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  UPGRADE_SOURCE_VERSION: 1.0.0-rc.2
+  UPGRADE_SOURCE_ASSET: rustfs-linux-x86_64-gnu-v1.0.0-rc.2.zip
+  UPGRADE_SOURCE_SHA256: 7c789386bf85278f865b8e0d359bf4edb84d5aa408cc3fa54a18c25ca74cd6e7
+
+jobs:
+  direct-upgrade:
+    name: Direct upgrade from rc.2
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: e2e-direct-upgrade
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          install-build-packaging-tools: "false"
+
+      - name: Download pinned previous release
+        env:
+          SOURCE_DIR: ${{ runner.temp }}/rustfs-upgrade-source
+        run: |
+          set -euo pipefail
+          mkdir -p "$SOURCE_DIR"
+          archive="$SOURCE_DIR/$UPGRADE_SOURCE_ASSET"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${UPGRADE_SOURCE_VERSION}/${UPGRADE_SOURCE_ASSET}"
+          echo "$UPGRADE_SOURCE_SHA256  $archive" | sha256sum --check --strict
+          unzip -q "$archive" -d "$SOURCE_DIR"
+          chmod +x "$SOURCE_DIR/rustfs"
+          test -x "$SOURCE_DIR/rustfs"
+          echo "RUSTFS_UPGRADE_SOURCE_BINARY=$SOURCE_DIR/rustfs" >> "$GITHUB_ENV"
+          echo "RUSTFS_E2E_LOG_DIR=$RUNNER_TEMP/rustfs-upgrade-logs" >> "$GITHUB_ENV"
+
+      - name: Build current RustFS binary
+        run: |
+          cargo build --locked -p rustfs --bin rustfs
+          : > target/debug/rustfs.features
+
+      - name: Run direct-upgrade compatibility test
+        run: |
+          cargo test --locked -p e2e_test \
+            upgrade_compatibility_test::direct_upgrade_from_rc2_preserves_object_contracts \
+            -- --ignored --exact --nocapture
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: direct-upgrade-server-logs-${{ github.run_number }}
+          path: ${{ runner.temp }}/rustfs-upgrade-logs
+          if-no-files-found: warn
+          retention-days: 14

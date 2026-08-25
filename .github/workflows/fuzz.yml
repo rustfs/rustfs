@@ -173,7 +173,7 @@ jobs:
           path: |
             fuzz/artifacts/**
             fuzz/corpus/${{ matrix.target }}/**
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 7
 
   # ──────────────────────────────────────────────────────────────
@@ -227,7 +227,7 @@ jobs:
           path: |
             fuzz/artifacts/**
             fuzz/corpus/${{ matrix.target }}/**
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 30
 
   # ──────────────────────────────────────────────────────────────

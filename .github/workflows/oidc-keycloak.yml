@@ -1,0 +1,110 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: OIDC Keycloak Live
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/oidc-keycloak.yml"
+      - "crates/config/src/constants/oidc.rs"
+      - "crates/iam/src/federation/**"
+      - "crates/iam/src/oidc.rs"
+      - "rustfs/src/admin/handlers/oidc.rs"
+      - "rustfs/src/admin/handlers/sts.rs"
+      - "scripts/test/oidc_keycloak_live.sh"
+      - "scripts/test/fixtures/keycloak-rustfs-ci-realm.json"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/oidc-keycloak.yml"
+      - "crates/config/src/constants/oidc.rs"
+      - "crates/iam/src/federation/**"
+      - "crates/iam/src/oidc.rs"
+      - "rustfs/src/admin/handlers/oidc.rs"
+      - "rustfs/src/admin/handlers/sts.rs"
+      - "scripts/test/oidc_keycloak_live.sh"
+      - "scripts/test/fixtures/keycloak-rustfs-ci-realm.json"
+  schedule:
+    - cron: "23 2 * * 1"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oidc-keycloak-live-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  oidc-keycloak-live:
+    name: OIDC Keycloak live gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: oidc-keycloak-live
+          cache-save-if: "true"
+          install-build-packaging-tools: "false"
+          install-test-tools: "false"
+
+      - name: Build RustFS
+        run: cargo build --locked -p rustfs --bin rustfs
+
+      - name: Install pinned request signer
+        run: |
+          python3 -m pip install --user --upgrade pip "awscurl==0.44"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Run live Keycloak discovery, JWT and STS checks
+        run: bash scripts/test/oidc_keycloak_live.sh ./target/debug/rustfs
+
+      - name: Upload service logs
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: oidc-keycloak-live-${{ github.run_number }}
+          path: ${{ runner.temp }}/rustfs-keycloak-live-*/**/*.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: oidc-keycloak-live
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (needs.oidc-keycloak-live.result == 'failure' || needs.oidc-keycloak-live.result == 'cancelled')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

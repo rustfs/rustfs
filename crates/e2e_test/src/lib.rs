@@ -61,6 +61,10 @@ mod get_codec_streaming_compat_test;
 #[cfg(test)]
 mod version_id_regression_test;
 
+// Pinned previous-release -> current-build on-disk compatibility.
+#[cfg(test)]
+mod upgrade_compatibility_test;
+
 // Receiver-side replication LWW (rustfs/backlog#1953): stale inbound
 // replication metadata must not overwrite a newer local category state.
 #[cfg(test)]
