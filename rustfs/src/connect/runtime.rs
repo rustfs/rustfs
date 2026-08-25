@@ -116,7 +116,7 @@ where
         root_ca_pem: &config.root_ca_pem,
         timeout: config.schedule.timeout,
     })
-    .map_err(HeartbeatError::CredentialRotation)?;
+    .map_err(rotation_failure)?;
     let identity_store = config.identity_store.clone();
     let credential_store = config.credential_store.clone();
     let store = HeartbeatStateStore::new(config.state_path.clone());
@@ -401,7 +401,13 @@ fn rotation_failure(error: ClientError) -> HeartbeatError {
         ClientError::IdentityStore(error) => HeartbeatError::IdentityStore(error),
         ClientError::CredentialStore(error) => HeartbeatError::CredentialStore(error),
         ClientError::Credential(error) => HeartbeatError::CredentialValidation(error),
-        error => HeartbeatError::CredentialRotation(error),
+        ClientError::Transport(error) => HeartbeatError::Transport(error),
+        ClientError::ResponseTooLarge => HeartbeatError::ResponseTooLarge,
+        ClientError::PendingRegistration | ClientError::PendingRotation => HeartbeatError::StateConflict,
+        ClientError::AccessRevoked { .. }
+        | ClientError::Rejected { .. }
+        | ClientError::Unavailable { .. }
+        | ClientError::Response => HeartbeatError::Response,
     }
 }
 
@@ -428,7 +434,6 @@ pub(crate) fn heartbeat_failure_reason(error: &HeartbeatError) -> &'static str {
         HeartbeatError::StatePermissions { .. } => "connect_heartbeat_state_permissions",
         HeartbeatError::ResponseTooLarge => "connect_heartbeat_response_too_large",
         HeartbeatError::Response => "connect_heartbeat_response",
-        HeartbeatError::CredentialRotation(_) => "connect_heartbeat_credential_rotation",
         HeartbeatError::Url(_) => "connect_heartbeat_url",
         HeartbeatError::Transport(_) => "connect_heartbeat_transport",
         HeartbeatError::Identity(_) => "connect_heartbeat_identity",
@@ -510,9 +515,14 @@ mod tests {
             heartbeat_failure_reason(&HeartbeatError::CredentialExpired),
             "connect_heartbeat_credential_expired"
         );
+        let pending_rotation = rotation_failure(ClientError::PendingRotation);
+        assert!(matches!(pending_rotation, HeartbeatError::StateConflict));
+        assert_eq!(heartbeat_failure_reason(&pending_rotation), "connect_heartbeat_state_conflict");
+        let oversized_rotation_response = rotation_failure(ClientError::ResponseTooLarge);
+        assert!(matches!(oversized_rotation_response, HeartbeatError::ResponseTooLarge));
         assert_eq!(
-            heartbeat_failure_reason(&HeartbeatError::CredentialRotation(ClientError::PendingRotation)),
-            "connect_heartbeat_credential_rotation"
+            heartbeat_failure_reason(&oversized_rotation_response),
+            "connect_heartbeat_response_too_large"
         );
         assert_eq!(
             heartbeat_failure_reason(&HeartbeatError::CredentialValidation(

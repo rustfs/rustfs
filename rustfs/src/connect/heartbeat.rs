@@ -22,7 +22,6 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::client::ClientError;
 use super::config::HeartbeatConfig;
 use super::credential_store::CredentialStoreError;
 use super::identity::IdentityError;
@@ -406,8 +405,6 @@ pub enum HeartbeatError {
     ResponseTooLarge,
     #[error("Connect returned an invalid heartbeat response")]
     Response,
-    #[error("Connect credential rotation failed: {0}")]
-    CredentialRotation(#[source] ClientError),
     #[error(transparent)]
     Url(#[from] url::ParseError),
     #[error(transparent)]
