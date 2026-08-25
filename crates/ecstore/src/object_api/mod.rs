@@ -53,7 +53,7 @@ pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 pub(crate) const ENCRYPTED_PART_LAYOUT_CANDIDATE_SUFFIX: &str = "encrypted-part-layout-quorum-candidate-v1";
 pub(crate) const ENCRYPTED_PART_LAYOUT_QUORUM_SUFFIX: &str = "encrypted-part-layout-quorum-v1";
 pub(crate) const ENV_RUSTFS_ENCRYPTED_RANGE_SEEK: &str = "RUSTFS_ENCRYPTED_RANGE_SEEK";
-pub(crate) const DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK: bool = false;
+pub(crate) const DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK: bool = true;
 
 pub(crate) fn has_encrypted_part_layout_marker(metadata: &HashMap<String, String>, suffix: &str, expected: &str) -> bool {
     let mut value = None;
@@ -70,7 +70,11 @@ pub(crate) fn has_encrypted_part_layout_marker(metadata: &HashMap<String, String
 }
 
 pub(crate) fn legacy_encrypted_range_seek_enabled() -> bool {
-    // RUSTFS_COMPAT_TODO(backlog-1316): mixed-version MPUs need opt-in. Remove after all servers use candidate markers and uploadId locks.
+    // On by default (backlog-1316 Phase A): every misfit direction falls back to the
+    // conservative full read — MPUs created without a candidate marker, completions
+    // that cannot revalidate the candidate against the data_dir under the uploadId
+    // lock, and reads whose quorum marker disagrees with the current data_dir all
+    // serve the full-object path. RUSTFS_ENCRYPTED_RANGE_SEEK=false is the kill switch.
     #[cfg(test)]
     {
         rustfs_utils::get_env_bool(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK)
