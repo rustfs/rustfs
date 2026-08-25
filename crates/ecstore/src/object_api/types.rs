@@ -452,6 +452,29 @@ pub struct ObjectOptions {
 pub const SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY: &str = "x-rustfs-internal-scanner-publication-lease-fence-v1";
 
 impl ObjectOptions {
+    /// Create a new ObjectOptions with modified no_lock field.
+    pub fn with_no_lock(&self, no_lock: bool) -> Self {
+        let mut opts = self.clone();
+        opts.no_lock = no_lock;
+        opts
+    }
+
+    /// Create commit options from base options (optimized clone).
+    pub fn as_commit_opts(&self) -> Self {
+        let mut opts = self.clone();
+        opts.no_lock = true;
+        opts.metadata_cache_safe = false;
+        opts.include_part_checksums = true;
+        opts
+    }
+
+    /// Create read options with include_part_checksums enabled.
+    pub fn as_read_opts(&self) -> Self {
+        let mut opts = self.clone();
+        opts.include_part_checksums = true;
+        opts
+    }
+
     pub fn set_quota_admission(&mut self, current_usage: u64, quota_limit: u64) -> bool {
         self.quota_admission = (current_usage <= quota_limit).then_some(QuotaAdmission {
             current_usage,

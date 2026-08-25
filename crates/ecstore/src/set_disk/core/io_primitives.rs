@@ -3911,14 +3911,11 @@ impl SetDisks {
                             };
 
                             let is_delete_marker = file_info.is_canonical_delete_marker();
-                            let mut local_file_info;
-                            let file_info = if file_info.erasure.index == 0 {
-                                local_file_info = file_info.clone();
-                                local_file_info.erasure.index = i + 1;
-                                &local_file_info
-                            } else {
-                                &file_info
-                            };
+                            // Clone FileInfo and set erasure.index for this disk
+                            let mut file_info = file_info.clone();
+                            if file_info.erasure.index == 0 {
+                                file_info.erasure.index = i + 1;
+                            }
                             if file_info.erasure.index == 0 || (!is_delete_marker && !file_info.has_valid_erasure_geometry()) {
                                 return Err(DiskError::FileCorrupt);
                             }
@@ -3934,7 +3931,7 @@ impl SetDisks {
                                 .rename_data_borrowed_with_fence(
                                     &src_bucket,
                                     &src_object,
-                                    file_info,
+                                    &file_info,
                                     &dst_bucket,
                                     &dst_object,
                                     scanner_publication_lease_token,

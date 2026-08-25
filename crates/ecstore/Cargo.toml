@@ -129,6 +129,7 @@ hotpath-cpu = [
 test-util = []
 
 [dependencies]
+starshard = { workspace = true }
 hotpath.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }

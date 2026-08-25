@@ -9520,6 +9520,7 @@ dependencies = [
  "sha2 0.11.0",
  "shadow-rs",
  "smallvec",
+ "starshard",
  "temp-env",
  "tempfile",
  "thiserror 2.0.20",
@@ -11613,9 +11614,9 @@ dependencies = [
 
 [[package]]
 name = "starshard"
-version = "2.2.2"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d298eb1bb81d6e5ddf447f3d26698d6ac5e5b9502b03004dbc2a2e2f8b572b6"
+checksum = "4155f6127729fef4a7b2aff334e9f05e697f52b67a8512e789b640e036195544"
 dependencies = [
  "async-trait",
  "hashbrown 0.17.1",

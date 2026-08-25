@@ -300,7 +300,7 @@ siphasher = "1.0.3"
 smallvec = { version = "1.15.2" }
 compact_str = "0.10.0"
 snap = "1.1.2"
-starshard = { version = "2.2.2" }
+starshard = { version = "2.3.0" }
 strum = { version = "0.28.0" }
 sysinfo = "0.39.6"
 temp-env = "0.3.6"
@@ -371,10 +371,10 @@ debug = "line-tables-only"
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
-debug = 0
-split-debuginfo = "off"
+codegen-units = 16
+debug = 2
 strip = "symbols"
+split-debuginfo = "off"
 
 [profile.production]
 inherits = "release"
