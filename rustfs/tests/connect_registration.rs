@@ -56,6 +56,7 @@ const TOKEN_UID: &str = "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5";
 const FRESH_TOKEN_UID: &str = "0198f4b0-7f00-7c70-a381-8e9fa0b1c2d6";
 const SECOND_TOKEN_UID: &str = "0198f4b0-8f00-7d80-b491-9fa0b1c2d3e7";
 const UNRELATED_TOKEN_UID: &str = "0198f4b0-9f00-7e90-85a1-afb1c2d3e4f8";
+const INVENTORY_UID: &str = "0198f4b0-af00-7fa0-96b1-bfc1d2e3f509";
 
 struct TestPki {
     root_params: CertificateParams,
@@ -1150,6 +1151,130 @@ async fn inventory_retries_with_the_new_credential_after_concurrent_rotation() {
     let certificates = server.client_certificates.lock().expect("client certificates lock");
     assert_eq!(certificates[0].as_deref(), Some(current_fingerprint.as_str()));
     assert_eq!(certificates[2].as_deref(), Some(rotated_fingerprint.as_str()));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn inventory_first_recovers_a_saved_reenrollment_before_telemetry() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let failed = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
+    let (mut config, _, next) = runtime_config(&temp, &pki, &failed.endpoint, 1);
+    assert!(matches!(
+        client(&failed, &pki, Duration::from_millis(250))
+            .reenroll(&config.identity_store, &config.credential_store, &token_with_uid(SECOND_TOKEN_UID))
+            .await,
+        Err(ClientError::Unavailable { .. })
+    ));
+    let enrolled = pki.credential(&next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 0x25);
+    write_stored_credential(&temp.path().join("credential/device.crt.json"), &enrolled);
+    assert!(temp.path().join("credential/registration.pending.json").exists());
+    assert!(temp.path().join("identity/device.key.next").exists());
+    assert_ne!(
+        config
+            .identity_store
+            .load()
+            .expect("load pre-recovery identity")
+            .expect("pre-recovery identity")
+            .public_key_der(),
+        next.public_key_der()
+    );
+
+    let snapshot = InventorySnapshot::current(1, 1, 100, 50, []).expect("inventory snapshot");
+    let content_hash = snapshot.content_hash().expect("inventory content hash");
+    let telemetry = server_with_client_auth(
+        &pki,
+        vec![
+            Reply::Json(
+                StatusCode::OK,
+                json!({
+                    "name": format!("organizations/{ORGANIZATION_UID}/clusters/{CLUSTER_UID}/inventorySnapshots/{INVENTORY_UID}"),
+                    "uid": INVENTORY_UID,
+                    "contentHash": content_hash,
+                    "receivedAt": "2026-08-25T01:02:03Z",
+                }),
+            ),
+            Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:04Z")),
+        ],
+        true,
+    )
+    .await;
+    config.endpoint = telemetry.endpoint.clone();
+    config.schedule.cadence = Duration::from_secs(60);
+    let heartbeat_config = config.clone();
+    let shutdown = CancellationToken::new();
+    let inventory_snapshot = snapshot.clone();
+    let inventory = spawn_inventory_runtime(
+        Some(config),
+        InventorySchedule {
+            cadence: Duration::from_secs(60),
+            jitter: Duration::ZERO,
+        },
+        &shutdown,
+        move || std::future::ready(Ok(inventory_snapshot.clone())),
+    )
+    .expect("start inventory runtime")
+    .expect("configured inventory runtime");
+    let mut inventory_status = inventory.status();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let current = inventory_status.borrow_and_update().clone();
+                if matches!(current, InventoryStatus::Online { .. }) {
+                    break current;
+                }
+                inventory_status.changed().await.expect("inventory status channel");
+            }
+        })
+        .await
+        .expect("inventory online status"),
+        InventoryStatus::Online { .. }
+    ));
+
+    let pending_path = temp.path().join("credential/registration.pending.json");
+    assert!(!pending_path.exists());
+    assert!(!temp.path().join("identity/device.key.next").exists());
+    assert_eq!(
+        heartbeat_config
+            .identity_store
+            .load()
+            .expect("load recovered identity")
+            .expect("recovered identity")
+            .public_key_der(),
+        next.public_key_der()
+    );
+    let completed: Value = serde_json::from_slice(
+        &fs::read(temp.path().join("credential/registration.completed.json")).expect("completed reenrollment receipt"),
+    )
+    .expect("completed reenrollment JSON");
+    assert_eq!(completed["tokenUid"], SECOND_TOKEN_UID);
+
+    let heartbeat = spawn_heartbeat_runtime(Some(heartbeat_config), &shutdown, || {
+        CoarseNodeSummary::new(1, 1, 0).expect("node summary")
+    })
+    .expect("start heartbeat runtime")
+    .expect("configured heartbeat runtime");
+    let mut heartbeat_status = heartbeat.status();
+    assert!(matches!(
+        wait_for_heartbeat_status(&mut heartbeat_status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        HeartbeatStatus::Online { .. }
+    ));
+    heartbeat.shutdown().await;
+    inventory.shutdown().await;
+
+    assert_eq!(failed.paths.lock().expect("registration paths").len(), 3);
+    assert_eq!(
+        telemetry.paths.lock().expect("telemetry paths").as_slice(),
+        [
+            format!("/agent/clusters/{CLUSTER_UID}/inventorySnapshots"),
+            format!("/agent/clusters/{CLUSTER_UID}/heartbeats"),
+        ]
+    );
+    let enrolled_fingerprint = certificate_fingerprint(enrolled["certificate"].as_str().expect("enrolled certificate"));
+    assert_eq!(
+        telemetry.client_certificates.lock().expect("client certificates").as_slice(),
+        [Some(enrolled_fingerprint.clone()), Some(enrolled_fingerprint)]
+    );
 }
 
 #[tokio::test]

@@ -430,6 +430,7 @@ impl From<TelemetryError> for HeartbeatError {
             TelemetryError::IdentityCertificate => Self::IdentityCertificate,
             TelemetryError::CredentialName => Self::CredentialName,
             TelemetryError::CredentialExpired => Self::CredentialExpired,
+            TelemetryError::StateConflict => Self::StateConflict,
             TelemetryError::ResponseTooLarge => Self::ResponseTooLarge,
             TelemetryError::Url(error) => Self::Url(error),
             TelemetryError::Transport(error) => Self::Transport(error),

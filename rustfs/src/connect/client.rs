@@ -24,7 +24,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::credential_store::{
-    CompletedRegistration, CredentialStore, CredentialStoreError, DeviceCredential, PendingRegistration, PendingRotation,
+    CompletedRegistration, CredentialLock, CredentialStore, CredentialStoreError, DeviceCredential, PendingRegistration,
+    PendingRotation,
 };
 use super::identity::{IdentityError, RegistrationTranscript};
 use super::identity_store::{IdentityStore, StoreError};
@@ -119,8 +120,10 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
-        let _lock = credential_store.lock().await?;
-        if let Some((credential, _, _)) = self.load_valid_credential(identity_store, credential_store)? {
+        let lock = credential_store.lock().await?;
+        if let Some((credential, _, _)) =
+            Self::recover_valid_credential_locked(&lock, identity_store, credential_store, &self.roots, &self.root_certificates)?
+        {
             ensure_credential_time(&credential, unix_now())?;
             return Ok(credential);
         }
@@ -165,10 +168,10 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         token: &RegistrationToken,
     ) -> Result<DeviceCredential, ClientError> {
-        let _lock = credential_store.lock().await?;
-        let (credential, _, _) = self
-            .load_valid_credential(identity_store, credential_store)?
-            .ok_or(ClientError::NotRegistered)?;
+        let lock = credential_store.lock().await?;
+        let (credential, _, _) =
+            Self::recover_valid_credential_locked(&lock, identity_store, credential_store, &self.roots, &self.root_certificates)?
+                .ok_or(ClientError::NotRegistered)?;
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
         if credential_store.load_completed_registration()?.is_some_and(|completed| {
             completed.token_uid == token.registration_token_uid && completed.credential_fingerprint == fingerprint
@@ -280,10 +283,10 @@ impl ConnectClient {
         credential_store: &CredentialStore,
         now_unix: i64,
     ) -> Result<RotationAttempt, ClientError> {
-        let _lock = credential_store.lock().await?;
-        let (credential, identity, reenrollment_pending) = self
-            .load_valid_credential(identity_store, credential_store)?
-            .ok_or(ClientError::NotRegistered)?;
+        let lock = credential_store.lock().await?;
+        let (credential, identity, reenrollment_pending) =
+            Self::recover_valid_credential_locked(&lock, identity_store, credential_store, &self.roots, &self.root_certificates)?
+                .ok_or(ClientError::NotRegistered)?;
         if reenrollment_pending {
             return Ok(RotationAttempt::ReenrollmentPending);
         }
@@ -347,10 +350,12 @@ impl ConnectClient {
         Ok(RotationAttempt::Completed(Some(rotated)))
     }
 
-    fn load_valid_credential(
-        &self,
+    pub(crate) fn recover_valid_credential_locked(
+        _lock: &CredentialLock,
         identity_store: &IdentityStore,
         credential_store: &CredentialStore,
+        roots: &RootCertStore,
+        root_certificates: &[CertificateDer<'static>],
     ) -> Result<Option<(DeviceCredential, super::identity::DeviceIdentity, bool)>, ClientError> {
         let Some(credential) = credential_store.load()? else {
             return Ok(None);
@@ -368,7 +373,7 @@ impl ConnectClient {
                 {
                     return Err(ClientError::PendingRegistration);
                 }
-                validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+                validate_stored_credential(&credential, &current, roots, root_certificates)?;
                 credential_store.clear_pending_registration()?;
                 return Ok(Some((credential, current, false)));
             };
@@ -381,7 +386,7 @@ impl ConnectClient {
             }
             let fingerprint = certificate_fingerprint(&credential.certificate)?;
             if fingerprint == previous {
-                validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+                validate_stored_credential(&credential, &current, roots, root_certificates)?;
                 let next = identity_store.load_next()?.ok_or(ClientError::PendingRegistration)?;
                 if public_key_fingerprint(&next) != next_fingerprint
                     || !certificate_request_matches(&pending.certificate_request, &next)?
@@ -403,7 +408,7 @@ impl ConnectClient {
                 {
                     return Err(ClientError::PendingRegistration);
                 }
-                validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+                validate_stored_credential(&credential, &current, roots, root_certificates)?;
             } else {
                 let next = identity_store.load_next()?.ok_or(ClientError::PendingRegistration)?;
                 if public_key_fingerprint(&next) != next_fingerprint
@@ -412,7 +417,7 @@ impl ConnectClient {
                 {
                     return Err(ClientError::PendingRegistration);
                 }
-                validate_stored_credential(&credential, &next, &self.roots, &self.root_certificates)?;
+                validate_stored_credential(&credential, &next, roots, root_certificates)?;
                 identity_store.commit_next(&next)?;
             }
             credential_store.save_completed_registration(&CompletedRegistration {
@@ -424,7 +429,7 @@ impl ConnectClient {
             return Ok(Some((credential, current, false)));
         }
         let Some(pending) = credential_store.load_pending_rotation()? else {
-            validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+            validate_stored_credential(&credential, &current, roots, root_certificates)?;
             return Ok(Some((credential, current, false)));
         };
         let fingerprint = certificate_fingerprint(&credential.certificate)?;
@@ -432,7 +437,7 @@ impl ConnectClient {
             return Err(ClientError::PendingRotation);
         }
         if fingerprint == pending.credential_fingerprint {
-            validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+            validate_stored_credential(&credential, &current, roots, root_certificates)?;
             let next = identity_store.load_next()?.ok_or(ClientError::PendingRotation)?;
             if pending.next_public_key_sha256 != public_key_fingerprint(&next)
                 || !certificate_request_matches(&pending.certificate_request, &next)?
@@ -446,7 +451,7 @@ impl ConnectClient {
             if !certificate_request_matches(&pending.certificate_request, &current)? {
                 return Err(ClientError::PendingRotation);
             }
-            validate_stored_credential(&credential, &current, &self.roots, &self.root_certificates)?;
+            validate_stored_credential(&credential, &current, roots, root_certificates)?;
         } else {
             let next = identity_store.load_next()?.ok_or(ClientError::PendingRotation)?;
             if public_key_fingerprint(&next) != pending.next_public_key_sha256
@@ -454,7 +459,7 @@ impl ConnectClient {
             {
                 return Err(ClientError::PendingRotation);
             }
-            validate_stored_credential(&credential, &next, &self.roots, &self.root_certificates)?;
+            validate_stored_credential(&credential, &next, roots, root_certificates)?;
             identity_store.commit_next(&next)?;
         }
         credential_store.clear_pending_rotation()?;
