@@ -23,6 +23,7 @@
 
 use super::common::LocalKMSTestEnvironment;
 use crate::common::{TEST_BUCKET, init_logging};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::ServerSideEncryption;
 use std::fs;
 use std::time::Duration;
@@ -77,12 +78,25 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
         .send()
         .await;
 
-    // This should fail, but the server should still be responsive
-    if put_result2.is_err() {
-        info!("✅ Upload correctly failed when key directory unavailable");
-    } else {
-        warn!("⚠️ Upload succeeded despite unavailable key directory (may be using cached keys)");
-    }
+    let unavailable_error = put_result2.expect_err("a missing Local KMS key directory must reject encrypted writes");
+    assert_eq!(unavailable_error.raw_response().map(|response| response.status().as_u16()), Some(500));
+    assert_eq!(
+        unavailable_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("InternalError")
+    );
+    let unavailable_absence = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key2)
+        .send()
+        .await
+        .expect_err("a write rejected by unavailable KMS must not publish an object");
+    assert_eq!(unavailable_absence.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(
+        unavailable_absence.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchKey")
+    );
+    info!("✅ Upload correctly failed when key directory unavailable");
 
     // Restore the key directory
     info!("🔧 Restoring key directory");
@@ -106,6 +120,11 @@ async fn test_kms_key_directory_unavailable() -> Result<(), Box<dyn std::error::
         .await?;
 
     assert_eq!(put_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+
+    let get_response3 = s3_client.get_object().bucket(TEST_BUCKET).key(object_key3).send().await?;
+    assert_eq!(get_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let downloaded_data3 = get_response3.body.collect().await?.into_bytes();
+    assert_eq!(downloaded_data3.as_ref(), test_data3);
 
     // Verify we can still access the original file
     info!("📥 Verifying access to original encrypted file");
@@ -174,12 +193,22 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
         .send()
         .await;
 
-    // This might succeed if KMS uses cached keys, but should eventually fail
-    if put_result2.is_err() {
-        info!("✅ Upload correctly failed with corrupted key");
-    } else {
-        warn!("⚠️ Upload succeeded despite corrupted key (likely using cached key)");
-    }
+    let corrupt_error = put_result2.expect_err("corrupt Local KMS key material must reject encrypted writes");
+    assert_eq!(corrupt_error.raw_response().map(|response| response.status().as_u16()), Some(500));
+    assert_eq!(
+        corrupt_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("InternalError")
+    );
+    let corrupt_absence = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key2)
+        .send()
+        .await
+        .expect_err("a write rejected by corrupt KMS material must not publish an object");
+    assert_eq!(corrupt_absence.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(corrupt_absence.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    info!("✅ Upload correctly failed with corrupted key");
 
     // Restore the original key file
     info!("🔧 Restoring original key file");
@@ -204,6 +233,11 @@ async fn test_kms_corrupted_key_files() -> Result<(), Box<dyn std::error::Error 
         .await?;
 
     assert_eq!(put_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+
+    let get_response3 = s3_client.get_object().bucket(TEST_BUCKET).key(object_key3).send().await?;
+    assert_eq!(get_response3.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let downloaded_data3 = get_response3.body.collect().await?.into_bytes();
+    assert_eq!(downloaded_data3.as_ref(), test_data3);
 
     kms_env.base_env.delete_test_bucket(TEST_BUCKET).await?;
     info!("✅ Corrupted key files test completed successfully");
@@ -280,18 +314,14 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
     info!("🔧 Simulating upload interruption");
 
     // Abort the multipart upload
-    let abort_result = s3_client
+    s3_client
         .abort_multipart_upload()
         .bucket(TEST_BUCKET)
         .key(object_key)
         .upload_id(upload_id)
         .send()
-        .await;
-
-    match abort_result {
-        Ok(_) => info!("✅ Multipart upload aborted successfully"),
-        Err(e) => warn!("⚠️ Failed to abort multipart upload: {}", e),
-    }
+        .await?;
+    info!("✅ Multipart upload aborted successfully");
 
     // Try to complete the aborted upload - this should fail
     info!("🔍 Attempting to complete aborted upload");
@@ -310,17 +340,37 @@ async fn test_kms_multipart_upload_interruption() -> Result<(), Box<dyn std::err
         .set_parts(Some(completed_parts))
         .build();
 
-    let complete_result = s3_client
+    let complete_error = s3_client
         .complete_multipart_upload()
         .bucket(TEST_BUCKET)
         .key(object_key)
         .upload_id(upload_id)
         .multipart_upload(completed_multipart_upload)
         .send()
-        .await;
-
-    assert!(complete_result.is_err(), "Should not be able to complete aborted upload");
+        .await
+        .expect_err("an aborted multipart upload must not be completable");
+    assert_eq!(complete_error.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(
+        complete_error.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("NoSuchUpload")
+    );
+    assert_eq!(
+        complete_error.as_service_error().and_then(ProvideErrorMetadata::message),
+        Some(
+            "The specified multipart upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed."
+        )
+    );
     info!("✅ Correctly failed to complete aborted upload");
+
+    let missing_object = s3_client
+        .get_object()
+        .bucket(TEST_BUCKET)
+        .key(object_key)
+        .send()
+        .await
+        .expect_err("aborting a multipart upload must not publish an object");
+    assert_eq!(missing_object.raw_response().map(|response| response.status().as_u16()), Some(404));
+    assert_eq!(missing_object.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
 
     // Start a new multipart upload and complete it successfully
     info!("📤 Starting new multipart upload");

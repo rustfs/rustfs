@@ -20,7 +20,8 @@
 //! - Complete encryption/decryption lifecycle
 
 use super::common::{
-    LocalKMSTestEnvironment, get_kms_status, sse_customer_key_md5_base64, test_kms_key_management, test_sse_c_encryption,
+    LocalKMSTestEnvironment, SSE_C_KEY_MISMATCH_MESSAGE, assert_s3_error, get_kms_status, sse_customer_key_md5_base64,
+    test_kms_key_management, test_sse_c_encryption,
 };
 use crate::common::{TEST_BUCKET, init_logging};
 use tracing::{error, info};
@@ -196,7 +197,13 @@ async fn test_local_kms_key_isolation() {
         .send()
         .await;
 
-    assert!(wrong_key_result.is_err(), "Should not be able to decrypt object1 with key2");
+    assert_s3_error(
+        wrong_key_result,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "local SSE-C object GET with a wrong key must be rejected",
+    );
 
     kms_env
         .base_env

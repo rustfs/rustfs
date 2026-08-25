@@ -17,8 +17,9 @@ use crate::storage_api::startup::services::{ECStore, EndpointServerPools, Server
 use crate::{
     config::Config,
     connect::{
-        CoarseNodeSummary, HeartbeatConfig, HeartbeatRuntime, InventoryError, InventoryFlag, InventoryRuntime, InventorySchedule,
-        InventorySnapshot, spawn_heartbeat_runtime, spawn_inventory_runtime,
+        CoarseNodeSummary, HeartbeatConfig, HeartbeatError, HeartbeatRuntime, InventoryError, InventoryFlag, InventoryRuntime,
+        InventorySchedule, InventorySnapshot, runtime::heartbeat_failure_reason, spawn_heartbeat_runtime,
+        spawn_inventory_runtime,
     },
     init::{init_buffer_profile_system, init_kms_system},
     server::ServiceStateManager,
@@ -40,6 +41,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct StartupServiceRuntime {
     pub(crate) optional_runtimes: OptionalRuntimeServices,
     pub(crate) heartbeat: Option<HeartbeatRuntime>,
+    pub(crate) inventory: Option<InventoryRuntime>,
     pub(crate) iam_bootstrap: IamBootstrapDisposition,
     pub(crate) enable_scanner: bool,
 }
@@ -104,11 +106,11 @@ pub(crate) async fn init_startup_runtime_services(
     init_observability_runtime(store.clone(), ctx.clone()).await;
     let heartbeat = start_heartbeat_runtime(heartbeat_config.clone(), heartbeat_nodes, &ctx)?;
     let inventory = start_inventory_runtime(heartbeat_config, heartbeat_nodes, inventory_drives, store, &ctx)?;
-    let heartbeat = heartbeat.map(|heartbeat| heartbeat.with_inventory(inventory));
 
     Ok(StartupServiceRuntime {
         optional_runtimes,
         heartbeat,
+        inventory,
         iam_bootstrap,
         enable_scanner,
     })
@@ -122,11 +124,18 @@ fn start_heartbeat_runtime(
     let Some(config) = config else {
         return Ok(None);
     };
+    if !config.transport_enabled() {
+        return Ok(None);
+    }
     let summary = u16::try_from(node_count.unwrap_or_default())
         .ok()
         .and_then(|total| CoarseNodeSummary::new(total, 0, 0).ok())
         .ok_or_else(|| std::io::Error::other("Connect heartbeat node count is outside protocol bounds"))?;
-    spawn_heartbeat_runtime(Some(config), shutdown, move || summary).map_err(std::io::Error::other)
+    spawn_heartbeat_runtime(Some(config), shutdown, move || summary).map_err(startup_heartbeat_error)
+}
+
+fn startup_heartbeat_error(error: HeartbeatError) -> std::io::Error {
+    std::io::Error::other(heartbeat_failure_reason(&error))
 }
 
 fn start_inventory_runtime(
@@ -317,6 +326,16 @@ fn aggregate_inventory_capacity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeat_startup_errors_expose_only_stable_codes() {
+        let error = startup_heartbeat_error(HeartbeatError::StateIo {
+            path: std::path::PathBuf::from("/private/connect/canary/state.json"),
+            source: std::io::Error::other("private-source-canary"),
+        });
+
+        assert_eq!(error.to_string(), "connect_heartbeat_state_io");
+    }
 
     fn disk(state: &str, runtime_state: Option<&str>, disk_index: i32) -> rustfs_madmin::Disk {
         rustfs_madmin::Disk {

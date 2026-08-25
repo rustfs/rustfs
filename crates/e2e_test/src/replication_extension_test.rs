@@ -20,7 +20,10 @@ use crate::fake_s3_target::{
     FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
     RequestRecord,
 };
-use crate::kms::common::{create_key_with_specific_id, sse_customer_key_md5_base64};
+use crate::kms::common::{
+    SSE_C_KEY_MISMATCH_MESSAGE, SSE_C_MISSING_PARAMETERS_MESSAGE, assert_s3_error, create_key_with_specific_id,
+    sse_customer_key_md5_base64,
+};
 use crate::storage_api::replication_extension::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -4375,7 +4378,13 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
     // Without the customer key the replica must not be readable — the direct
     // detection point for a silent-plaintext replica (backlog#1291).
     let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
-    assert!(plain_read.is_err(), "SSE-C replica must not be readable without the customer key");
+    assert_s3_error(
+        plain_read,
+        400,
+        "InvalidRequest",
+        SSE_C_MISSING_PARAMETERS_MESSAGE,
+        "SSE-C replica must not be readable without the customer key",
+    );
 
     // A wrong customer key must fail too.
     let wrong_key = BASE64_STANDARD.encode("99999999999999999999999999999999");
@@ -4389,7 +4398,13 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
         .sse_customer_key_md5(&wrong_key_md5)
         .send()
         .await;
-    assert!(wrong_read.is_err(), "SSE-C replica must reject a wrong customer key");
+    assert_s3_error(
+        wrong_read,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "SSE-C replica must reject a wrong customer key",
+    );
 
     Ok(())
 }
@@ -4486,9 +4501,12 @@ async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
     assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), payload.as_slice());
 
     let plain_read = target_client.get_object().bucket(&target_bucket).key(key).send().await;
-    assert!(
-        plain_read.is_err(),
-        "SSE-C multipart replica must not be readable without the customer key"
+    assert_s3_error(
+        plain_read,
+        400,
+        "InvalidRequest",
+        SSE_C_MISSING_PARAMETERS_MESSAGE,
+        "SSE-C multipart replica must not be readable without the customer key",
     );
 
     // Stability across scanner cycles: convergence must hold for passthrough.
@@ -4892,15 +4910,12 @@ async fn test_bucket_replication_sse_c_existing_object_resync() -> TestResult {
     assert_eq!(replica.body.collect().await?.into_bytes().as_ref(), body.as_slice());
 
     // No plaintext leak: the replica stays unreadable without the key.
-    assert!(
-        target_client
-            .get_object()
-            .bucket(target_bucket)
-            .key(key)
-            .send()
-            .await
-            .is_err(),
-        "SSE-C replica must not be readable without the customer key"
+    assert_s3_error(
+        target_client.get_object().bucket(target_bucket).key(key).send().await,
+        400,
+        "InvalidRequest",
+        SSE_C_MISSING_PARAMETERS_MESSAGE,
+        "SSE-C resynced replica must not be readable without the customer key",
     );
 
     Ok(())

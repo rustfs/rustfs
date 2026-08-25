@@ -22,9 +22,9 @@ use crate::common::{TEST_BUCKET, init_logging};
 use tracing::{error, info};
 
 use super::common::{
-    VAULT_KEY_NAME, VaultTestEnvironment, get_kms_status, sse_customer_key_md5_base64, start_kms,
-    test_all_multipart_encryption_types, test_error_scenarios, test_kms_key_management, test_sse_c_encryption,
-    test_sse_kms_encryption, test_sse_s3_encryption,
+    SSE_C_KEY_MISMATCH_MESSAGE, VAULT_KEY_NAME, VaultTestEnvironment, assert_s3_error, get_kms_status,
+    sse_customer_key_md5_base64, start_kms, test_all_multipart_encryption_types, test_error_scenarios, test_kms_key_management,
+    test_sse_c_encryption, test_sse_kms_encryption, test_sse_s3_encryption,
 };
 
 /// Helper that brings up Vault, configures RustFS, and starts the KMS service.
@@ -182,7 +182,13 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
         .sse_customer_key_md5(&key2_md5)
         .send()
         .await;
-    assert!(wrong_key.is_err(), "Object1 should not decrypt with key2");
+    assert_s3_error(
+        wrong_key,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "Vault-backed SSE-C object GET with a wrong key must be rejected",
+    );
 
     context
         .base_env()

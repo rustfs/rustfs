@@ -23,6 +23,7 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::delete_object::DeleteObjectError;
+use aws_sdk_s3::operation::put_object_retention::PutObjectRetentionError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode,
@@ -182,11 +183,8 @@ pub async fn put_object_retention(
     mode: ObjectLockRetentionMode,
     retain_until: DateTime<Utc>,
     bypass_governance: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // AWS SDK requires UTC time without timezone offset (e.g., "2026-01-24T11:20:14Z")
-    let retain_until_str = retain_until.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    let retain_until_datetime =
-        aws_sdk_s3::primitives::DateTime::from_str(&retain_until_str, aws_sdk_s3::primitives::DateTimeFormat::DateTime)?;
+) -> Result<(), Box<SdkError<PutObjectRetentionError>>> {
+    let retain_until_datetime = aws_sdk_s3::primitives::DateTime::from_secs(retain_until.timestamp());
 
     let retention = ObjectLockRetention::builder()
         .mode(mode.clone())
@@ -204,7 +202,7 @@ pub async fn put_object_retention(
         request = request.version_id(vid);
     }
 
-    request.send().await?;
+    request.send().await.map_err(Box::new)?;
     info!("Put object retention on {} with mode {:?}", key, mode);
     Ok(())
 }
