@@ -902,7 +902,7 @@ mod tests {
         let moved = temp.path().join("moved");
         fs::create_dir(&original).expect("original output directory");
         let swapped_output = original.join("bundle.zip");
-        let swap_original = original.clone();
+        let swap_original = original;
         let swap_moved = moved.clone();
         test_support::set(
             Stage::BeforePublish,
@@ -933,7 +933,7 @@ mod tests {
         let moved = temp.path().join("publish-moved");
         fs::create_dir(&original).expect("original publish directory");
         let swapped_output = original.join("bundle.zip");
-        let swap_original = original.clone();
+        let swap_original = original;
         let swap_moved = moved.clone();
         test_support::set(
             Stage::Rename,
