@@ -71,7 +71,7 @@ use crate::app::object_data_cache::{
 };
 use crate::app::object_usecase::{
     acquire_copy_bucket_lifecycle_locks, apply_quota_admission, build_put_like_object_lock_metadata, map_quota_check_outcome,
-    validate_existing_object_lock_for_write,
+    s3s_body_error_to_io, validate_existing_object_lock_for_write,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
@@ -988,7 +988,7 @@ impl DefaultMultipartUsecase {
             let mut total = 0i64;
             let mut buffer = bytes::BytesMut::new();
             while let Some(chunk) = body_stream.next().await {
-                let chunk = chunk.map_err(|e| ApiError::from(StorageError::other(e.to_string())))?;
+                let chunk = chunk.map_err(|e| ApiError::from(s3s_body_error_to_io(e)))?;
                 total += chunk.len() as i64;
                 buffer.extend_from_slice(&chunk);
             }
@@ -1022,7 +1022,7 @@ impl DefaultMultipartUsecase {
         let buffer_size = get_buffer_size_opt_in(size);
         let body = tokio::io::BufReader::with_capacity(
             buffer_size,
-            StreamReader::new(body_stream.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
+            StreamReader::new(body_stream.map(|f| f.map_err(s3s_body_error_to_io))),
         );
 
         let is_disk_compressed = rustfs_utils::http::contains_key_str(&fi.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
