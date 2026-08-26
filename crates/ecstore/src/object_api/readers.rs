@@ -3329,11 +3329,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_range_seek_defaults_disabled() {
-        async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, None::<&str>)], async {
-            let key_bytes = [0x7D; 32];
-            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+    async fn test_legacy_range_seek_defaults_enabled() {
+        let key_bytes = [0x7D; 32];
 
+        // The unset-env default must behave exactly like the explicit opt-in:
+        // an eligible multipart object seeks to the covering part boundary
+        // instead of reading the whole ciphertext.
+        let default_plan = async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, None::<&str>)], async {
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
             let plan = ReadPlan::build(
                 Some(range(33_900, 33_999)),
                 &fixture.object_info,
@@ -3341,12 +3344,31 @@ mod tests {
                 &ssec_headers_from_key(key_bytes),
             )
             .await
-            .expect("default-disabled read plan should build");
-
-            assert_eq!(plan.storage_offset, 0);
-            assert_eq!(plan.storage_length, fixture.ciphertext.len() as i64);
+            .expect("default read plan should build");
+            (plan.storage_offset, plan.storage_length, fixture.ciphertext.len())
         })
         .await;
+
+        let opt_in_plan = async_with_vars([(ENV_RUSTFS_ENCRYPTED_RANGE_SEEK, Some("true"))], async {
+            let fixture = build_legacy_ssec_multipart_fixture(key_bytes, &[20_000, 9_000, 5_000]).await;
+            let plan = ReadPlan::build(
+                Some(range(33_900, 33_999)),
+                &fixture.object_info,
+                &ObjectOptions::default(),
+                &ssec_headers_from_key(key_bytes),
+            )
+            .await
+            .expect("opt-in read plan should build");
+            (plan.storage_offset, plan.storage_length)
+        })
+        .await;
+
+        assert_eq!((default_plan.0, default_plan.1), opt_in_plan, "unset env must match explicit opt-in");
+        assert_ne!(default_plan.0, 0, "an eligible range read must seek past the leading parts");
+        assert!(
+            (default_plan.1 as usize) < default_plan.2,
+            "an eligible range read must not span the whole ciphertext"
+        );
     }
 
     #[tokio::test]
