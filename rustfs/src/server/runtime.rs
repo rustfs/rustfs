@@ -30,6 +30,12 @@ fn compute_default_thread_stack_size() -> usize {
     }
 }
 
+#[inline]
+fn mark_allocator_threadpool_thread() {
+    #[cfg(not(target_os = "windows"))]
+    rustfs_mimalloc::set_current_thread_in_threadpool();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,15 +166,19 @@ pub fn tokio_runtime_builder() -> tokio::runtime::Builder {
         rustfs_utils::get_env_usize(rustfs_config::ENV_MAX_IO_EVENTS_PER_TICK, rustfs_config::DEFAULT_MAX_IO_EVENTS_PER_TICK);
     builder.enable_all().max_io_events_per_tick(max_io_events_per_tick);
 
-    // Optional: Simple log of thread start/stop
-    if print_tokio_thread_enable() {
-        builder
-            .on_thread_start(|| {
-                tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread started");
-            })
-            .on_thread_stop(|| {
-                tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread stopped");
-            });
+    let print_tokio_threads = print_tokio_thread_enable();
+    builder.on_thread_start(move || {
+        mark_allocator_threadpool_thread();
+        if print_tokio_threads {
+            tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread started");
+        }
+    });
+
+    // Optional: Simple log of thread stop
+    if print_tokio_threads {
+        builder.on_thread_stop(|| {
+            tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread stopped");
+        });
     }
     if !rustfs_obs::is_production_environment() {
         println!(
