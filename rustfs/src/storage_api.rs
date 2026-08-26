@@ -227,6 +227,8 @@ pub(crate) mod site_replication {
         BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata,
     };
 
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::replication::merge_incoming_replication_config;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::replication::{
         OperatorRuleContract, assign_site_replication_rule_priorities, is_site_replication_role,
         replication_target_arn_deployment_id, site_replication_rule_deployment_id,
@@ -238,6 +240,8 @@ pub(crate) mod site_replication {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi;
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::ecstore_config::com::save_config;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};
 
     pub(crate) use crate::storage::storage_api::{
         ECStore, EndpointServerPools, StorageError, delete_config_no_lock, lock_bucket_targets_metadata, read_config,
@@ -261,6 +265,8 @@ pub(crate) mod site_replication {
             ReplicationRuleStatus, SourceSelectionCriteria, VersioningConfiguration,
         };
         pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
+        #[cfg(test)]
+        pub(crate) use s3s::dto::{ExpirationStatus, LifecycleExpiration, Timestamp, Transition, TransitionStorageClass};
     }
 }
 
