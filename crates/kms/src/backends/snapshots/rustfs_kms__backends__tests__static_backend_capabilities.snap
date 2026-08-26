@@ -8,6 +8,7 @@ expression: capabilities_snapshot(backend.capabilities())
   "encrypt": true,
   "generate_data_key": true,
   "physical_delete": false,
+  "production_supported": false,
   "rewrap": false,
   "rotate": false,
   "schedule_deletion": false,

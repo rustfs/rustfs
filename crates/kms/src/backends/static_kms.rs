@@ -413,7 +413,9 @@ impl KmsBackend for StaticKmsBackend {
 
     fn capabilities(&self) -> BackendCapabilities {
         // Static KMS is a read-only single-key backend: it only performs
-        // cryptographic operations and rejects every lifecycle mutation.
+        // cryptographic operations and rejects every lifecycle mutation. Its
+        // key material comes straight from configuration, so like Local it is
+        // a development/testing backend and never production_supported.
         BackendCapabilities::minimal()
     }
 }

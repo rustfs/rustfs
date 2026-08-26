@@ -633,6 +633,20 @@ impl KmsServiceManager {
             }
         };
 
+        // Every path that can activate a backend (startup, persisted-config
+        // replay, dynamic configure, peer reload) converges here, so this is
+        // the one place a non-production backend is guaranteed to announce
+        // itself each time it starts serving.
+        if !backend.capabilities().production_supported {
+            warn!(
+                event = "kms_backend_positioning",
+                backend = config.backend.as_str(),
+                version,
+                "KMS backend is intended for development, testing and demos only; \
+                 use Vault Transit, Vault KV2 or AWS KMS for production deployments"
+            );
+        }
+
         // Create KMS manager
         //
         // The deletion reference checker is handed to the manager as well as to

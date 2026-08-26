@@ -8,8 +8,8 @@ For how the Vault backends authenticate (static token, AppRole, Kubernetes, Vaul
 
 | Backend | Config tag | Master key material location | At-rest protection of key material | Durability | Rotation | Intended use |
 | --- | --- | --- | --- | --- | --- | --- |
-| Local | `Local` | Files under `key_dir`, encrypted with the configured local master key | Local master key (AES-GCM) + file permissions | Crash-durable commits on local filesystems only; see [Local backend durability and deployment support matrix](#local-backend-durability-and-deployment-support-matrix) | Rejected by design (single material, development backend) | Development; single-node setups that accept host-level trust |
-| Static | `Static` | Provided out-of-band via environment/file; never persisted by RustFS | Operator-managed secret distribution | No state persisted by RustFS | Rejected (read-only backend) | Simple deployments with an external secret manager |
+| Local | `Local` | Files under `key_dir`, encrypted with the configured local master key | Local master key (AES-GCM) + file permissions | Crash-durable commits on local filesystems only; see [Local backend durability and deployment support matrix](#local-backend-durability-and-deployment-support-matrix) | Rejected by design (single material, development backend) | Development, testing and demos only; not supported for production |
+| Static | `Static` | Provided out-of-band via environment/file; never persisted by RustFS | Operator-managed secret distribution | No state persisted by RustFS | Rejected (read-only backend) | Development and testing with an externally supplied key; not supported for production |
 | Vault KV2 | `VaultKV2` (legacy alias `Vault`) | Stored **directly** in Vault KV v2 (Base64-encoded plaintext) | Vault ACLs + KV v2 at-rest encryption + TLS only | Delegated to Vault storage | Versioned retention (immutable per-version records + current pointer) | Deployments that accept Vault KV ACLs as the sole confidentiality boundary |
 | Vault Transit | `VaultTransit` | Key-encryption keys never leave Vault; only Transit ciphertext is visible outside | Vault Transit engine (cryptographic isolation) | Delegated to Vault storage | Via Vault Transit key versioning | Deployments that need key material to be unreadable through storage APIs |
 | AWS KMS | `AWS` (alias `AwsKms`) | Key material never leaves AWS KMS; RustFS mirrors no key state | AWS KMS (cryptographic isolation) + IAM | Delegated to AWS | On-demand `RotateKeyOnDemand`; prior backing keys stay usable for decryption | Deployments already rooted in AWS IAM that want AWS as the cryptographic root — read [AWS KMS: deviations from the shared backend contract](#aws-kms-deviations-from-the-shared-backend-contract) first |
@@ -274,7 +274,7 @@ The facts today:
 - The in-code documentation labels the backend "for development and testing only", and configuration validation enforces stricter rules outside explicit development mode: a master key is required and `key_dir` must not live under the process temp directory.
 - Production multi-node deployments should use the Vault Transit backend.
 
-The backend's final support level is positioning under review (internal tracking); this section describes what the implementation guarantees, not a commitment to a support tier.
+The backend's positioning is settled (owner decision, 2026-08): `Local` is a development, testing and demo backend and is not supported for production. The runtime now states this itself — activating a backend whose capabilities report `production_supported: false` logs a `kms_backend_positioning` warning on every start, restart and reconfigure, and the `kms/status` capability matrix carries the same flag for consoles and tooling. Existing deployments are not blocked: the positioning is a warning, not a gate. This section describes what the implementation guarantees for those who accept that positioning.
 
 ### Deployment support matrix
 

@@ -2279,7 +2279,10 @@ impl KmsBackend for LocalKmsBackend {
     fn capabilities(&self) -> BackendCapabilities {
         // Rotation stays unadvertised until historical key versions can be
         // retained (see LocalKmsClient::rotate_key); without version history
-        // there is also no versioning capability.
+        // there is also no versioning capability. `production_supported` stays
+        // false by positioning decision: the Local backend keeps its
+        // cryptographic root on the host filesystem and exists for
+        // development, testing and demos only.
         BackendCapabilities::minimal()
             .with_enable_disable(true)
             .with_schedule_deletion(true)

@@ -397,7 +397,7 @@ pub struct ServerOpts {
     #[arg(long, default_value_t = false, env = "RUSTFS_KMS_ENABLE")]
     pub kms_enable: bool,
 
-    /// KMS backend type: local, vault or vault-kv2 (plain Vault KV v2 storage), vault-transit, static, aws
+    /// KMS backend type: local (development/testing only), vault or vault-kv2 (plain Vault KV v2 storage), vault-transit, static (development/testing only), aws
     #[arg(long, default_value_t = rustfs_config::DEFAULT_KMS_BACKEND.to_string(), env = "RUSTFS_KMS_BACKEND")]
     pub kms_backend: String,
 
