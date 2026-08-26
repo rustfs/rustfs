@@ -228,17 +228,20 @@ impl NodeService {
                 success: false,
                 storage_info: Bytes::new(),
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
         let info = StorageAdminApi::local_storage_info(store.as_ref()).await;
         match encode_msgpack_map(&info) {
             Ok(buf) => Ok(Response::new(LocalStorageInfoResponse {
+                error_code: None,
                 success: true,
                 storage_info: buf.into(),
                 error_info: None,
             })),
             Err(err) => Ok(Response::new(LocalStorageInfoResponse {
+                error_code: None,
                 success: false,
                 storage_info: Bytes::new(),
                 error_info: Some(err.to_string()),

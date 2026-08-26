@@ -228,6 +228,14 @@ pub enum StorageError {
     /// during quorum aggregation (backlog#1845).
     #[error("remote rpc client unavailable: {0}")]
     RemoteClientUnavailable(String),
+
+    /// A peer answered a control-plane RPC but its storage/IAM layer is not
+    /// initialized yet. Typed form of the legacy "errServerNotInitialized"
+    /// error_info string (backlog#1845); the wire carries it as
+    /// `ControlPlaneErrorCode::ControlPlaneErrorNotInitialized` alongside the
+    /// legacy string for rolling-upgrade compatibility.
+    #[error("remote peer not initialized")]
+    RemoteNotInitialized,
 }
 
 impl From<crate::erasure::coding::ErasureConstructionError> for StorageError {
@@ -581,6 +589,7 @@ impl Clone for StorageError {
                 limit: *limit,
             },
             StorageError::RemoteClientUnavailable(detail) => StorageError::RemoteClientUnavailable(detail.clone()),
+            StorageError::RemoteNotInitialized => StorageError::RemoteNotInitialized,
         }
     }
 }
@@ -670,6 +679,7 @@ impl StorageError {
             StorageError::NamespaceLockQuorumUnavailable { .. } => StorageErrorCode::NamespaceLockQuorumUnavailable,
             StorageError::QuotaExceeded { .. } => StorageErrorCode::QuotaExceeded,
             StorageError::RemoteClientUnavailable(_) => StorageErrorCode::RemoteClientUnavailable,
+            StorageError::RemoteNotInitialized => StorageErrorCode::RemoteNotInitialized,
         }
     }
 
@@ -800,6 +810,7 @@ impl StorageError {
                 limit: Default::default(),
             }),
             StorageErrorCode::RemoteClientUnavailable => Some(StorageError::RemoteClientUnavailable(Default::default())),
+            StorageErrorCode::RemoteNotInitialized => Some(StorageError::RemoteNotInitialized),
         }
     }
 }
@@ -943,7 +954,13 @@ pub fn is_err_operation_canceled(err: &Error) -> bool {
 
 #[allow(dead_code, reason = "predicate asserted by this file's tests (backlog#1823)")]
 pub fn is_err_not_initialized(err: &Error) -> bool {
-    err.to_string().contains("errServerNotInitialized") || err.to_string().contains("ServerNotInitialized")
+    // Typed-first: peers at or above the ControlPlaneErrorCode change decode to
+    // the typed variant. The substring form only matches legacy peers' string
+    // responses.
+    // RUSTFS_COMPAT_TODO(not-initialized-error-code-v1): substring fallback for peers that predate the typed wire code. Remove after the minimum supported RustFS peer version always sends error_code.
+    matches!(err, StorageError::RemoteNotInitialized)
+        || err.to_string().contains("errServerNotInitialized")
+        || err.to_string().contains("ServerNotInitialized")
 }
 
 /// Strict "not found" predicate that only matches genuine object/version/volume

@@ -60,6 +60,7 @@ impl NodeService {
         let bucket = request.bucket;
         if bucket.is_empty() {
             return Ok(Response::new(LoadBucketMetadataResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("bucket name is missing".to_string()),
             }));
@@ -69,6 +70,7 @@ impl NodeService {
             return Ok(Response::new(LoadBucketMetadataResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
@@ -78,11 +80,13 @@ impl NodeService {
                     rustfs_scanner::record_scanner_maintenance_change(&bucket);
                 }
                 Ok(Response::new(LoadBucketMetadataResponse {
+                    error_code: None,
                     success: true,
                     error_info: None,
                 }))
             }
             Err(err) => Ok(Response::new(LoadBucketMetadataResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             })),
