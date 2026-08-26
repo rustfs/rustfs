@@ -585,8 +585,7 @@ pub(crate) fn site_replication_peer_url(connection: &PeerConnection, wire_path: 
 /// derivation, payload wire-encoding, SigV4 signing, transport-error
 /// classification, and the response read live here once. The option axes are
 /// the method, an optional pre-resolved client, the service-account secret
-/// candidates, and the retry-event bookkeeping; the `send_peer_admin_*`
-/// names below remain as thin compatibility wrappers.
+/// candidates, and the retry-event bookkeeping.
 pub(crate) struct PeerAdminRequest<'a> {
     connection: &'a PeerConnection,
     path: &'a str,
@@ -706,8 +705,8 @@ impl<'a> PeerAdminRequest<'a> {
         Ok((status, body.to_vec()))
     }
 
-    /// `PUT` with the success check and error shape of
-    /// [`send_peer_admin_request`].
+    /// `PUT` with a success check; a non-success status becomes an error
+    /// naming the peer endpoint and the caller's path.
     pub(crate) async fn send<T: Serialize>(&self, secret_key: &str, body: &T) -> S3Result<Vec<u8>> {
         let (status, body) = self.send_raw(secret_key, Some(body)).await?;
         if status.is_success() {
@@ -725,8 +724,8 @@ impl<'a> PeerAdminRequest<'a> {
         ))
     }
 
-    /// Bodiless `GET` with the success check and error shape of
-    /// [`send_peer_admin_get_request`].
+    /// Bodiless `GET` with a success check; a non-success status becomes an
+    /// error naming the resolved wire URL.
     pub(crate) async fn send_get(&self, secret_key: &str) -> S3Result<Vec<u8>> {
         let (status, body) = self.send_raw::<()>(secret_key, None).await?;
         if !status.is_success() {
@@ -809,71 +808,6 @@ impl<'a> PeerAdminRequest<'a> {
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn send_peer_admin_request_raw<T: Serialize>(
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<(StatusCode, Vec<u8>)> {
-    PeerAdminRequest::put(connection, path, access_key)
-        .send_raw(secret_key, Some(body))
-        .await
-}
-
-pub(crate) async fn send_peer_admin_request_raw_with_client<T: Serialize>(
-    client: &reqwest::Client,
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<(StatusCode, Vec<u8>)> {
-    PeerAdminRequest::put(connection, path, access_key)
-        .with_client(client)
-        .send_raw(secret_key, Some(body))
-        .await
-}
-
-pub(crate) async fn send_peer_admin_request<T: Serialize>(
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    PeerAdminRequest::put(connection, path, access_key)
-        .send(secret_key, body)
-        .await
-}
-
-pub(crate) async fn send_peer_admin_request_with_client<T: Serialize>(
-    client: &reqwest::Client,
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    PeerAdminRequest::put(connection, path, access_key)
-        .with_client(client)
-        .send(secret_key, body)
-        .await
-}
-
-pub(crate) async fn send_peer_admin_request_with_secret_candidates<T: Serialize>(
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_candidates: &[String],
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    PeerAdminRequest::put(connection, path, access_key)
-        .send_with_secret_candidates(secret_candidates, body)
-        .await
-}
-
 pub(crate) fn peer_error_may_be_secret_mismatch(detail: &str) -> bool {
     let detail = detail.to_ascii_lowercase();
     detail.contains("signaturedoesnotmatch")
@@ -881,28 +815,6 @@ pub(crate) fn peer_error_may_be_secret_mismatch(detail: &str) -> bool {
         || detail.contains("forbidden")
         || detail.contains("401")
         || detail.contains("403")
-}
-
-pub(crate) async fn send_peer_admin_get_request(
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-) -> S3Result<Vec<u8>> {
-    PeerAdminRequest::get(connection, path, access_key).send_get(secret_key).await
-}
-
-pub(crate) async fn send_peer_admin_get_request_with_client(
-    client: &reqwest::Client,
-    connection: &PeerConnection,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-) -> S3Result<Vec<u8>> {
-    PeerAdminRequest::get(connection, path, access_key)
-        .with_client(client)
-        .send_get(secret_key)
-        .await
 }
 
 pub(crate) async fn runtime_site_replication_targets() -> S3Result<Option<SiteReplicationRuntime>> {
@@ -956,42 +868,14 @@ pub(crate) async fn broadcast_site_replication_json_with_runtime<T: Serialize>(
             continue;
         }
 
-        send_peer_admin_request_with_retry_event(
-            peer,
-            path,
-            &state.service_account_access_key,
-            &runtime.service_account_secret_key,
-            body,
-        )
-        .await?;
+        let transport = PeerTransport::for_runtime_peer(peer).await?;
+        PeerAdminRequest::put(&transport.connection, path, &state.service_account_access_key)
+            .with_client(&transport.client)
+            .send_with_retry_event(peer, &runtime.service_account_secret_key, body)
+            .await?;
     }
 
     Ok(())
-}
-
-pub(crate) async fn send_peer_admin_request_with_retry_event<T: Serialize>(
-    peer: &PeerInfo,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    let transport = PeerTransport::for_runtime_peer(peer).await?;
-    send_peer_admin_request_with_retry_event_transport(peer, &transport, path, access_key, secret_key, body).await
-}
-
-pub(crate) async fn send_peer_admin_request_with_retry_event_transport<T: Serialize>(
-    peer: &PeerInfo,
-    transport: &PeerTransport,
-    path: &str,
-    access_key: &str,
-    secret_key: &str,
-    body: &T,
-) -> S3Result<Vec<u8>> {
-    PeerAdminRequest::put(&transport.connection, path, access_key)
-        .with_client(&transport.client)
-        .send_with_retry_event(peer, secret_key, body)
-        .await
 }
 
 pub(crate) fn parse_endpoint_refresh_status(peer: &PeerInfo, body: &[u8]) -> S3Result<()> {

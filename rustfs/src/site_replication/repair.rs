@@ -251,37 +251,22 @@ impl SiteReplicationRepairTask<'_> {
     pub(crate) async fn send(&self, transport: &PeerTransport, access_key: &str, secret_key: &str) -> S3Result<Vec<u8>> {
         match self {
             Self::Iam(item) => {
-                send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    self.path(),
-                    access_key,
-                    secret_key,
-                    item,
-                )
-                .await
+                PeerAdminRequest::put(&transport.connection, self.path(), access_key)
+                    .with_client(&transport.client)
+                    .send(secret_key, item)
+                    .await
             }
             Self::BucketMetadata(item) => {
-                send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    self.path(),
-                    access_key,
-                    secret_key,
-                    item,
-                )
-                .await
+                PeerAdminRequest::put(&transport.connection, self.path(), access_key)
+                    .with_client(&transport.client)
+                    .send(secret_key, item)
+                    .await
             }
             Self::BucketMake(_) | Self::Replication(_) => {
-                send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    self.path(),
-                    access_key,
-                    secret_key,
-                    &serde_json::json!({}),
-                )
-                .await
+                PeerAdminRequest::put(&transport.connection, self.path(), access_key)
+                    .with_client(&transport.client)
+                    .send(secret_key, &serde_json::json!({}))
+                    .await
             }
         }
     }
