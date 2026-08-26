@@ -546,11 +546,14 @@ impl VaultKmsClient {
     /// request issued through this client, plus the retry and fail-closed
     /// budgets for credential refresh.
     pub async fn new(config: VaultConfig, kms_config: &KmsConfig) -> Result<Self> {
+        let (ca_cert_paths, client_identity) = crate::backends::vault_credentials::vault_tls_materials(config.tls.as_ref())?;
         let settings = VaultConnectionSettings {
             address: config.address.clone(),
             namespace: config.namespace.clone(),
             attempt_timeout: kms_config.effective_timeout(),
             skip_tls_verify: config.tls.as_ref().is_some_and(|tls| tls.skip_verify),
+            ca_cert_paths,
+            client_identity,
         };
         let source = token_source_for(&config.auth_method, &settings)?;
         let policy = VaultCredentialPolicy::from_kms_config(

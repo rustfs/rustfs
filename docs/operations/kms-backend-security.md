@@ -261,6 +261,21 @@ The KMS admin API accepts the AWS backend as `"backend_type": "AWS"` (aliases `a
 
 `region` is mandatory on this path even though `RUSTFS_KMS_AWS_REGION` is optional at startup: the admin configuration is persisted once and replayed on every node, so a request that left the region to each node's ambient chain would let nodes address different regions, and therefore different keys, while reporting an identical configuration. `default_key_id` must be an AWS key id or ARN that already exists — this backend never creates keys by name.
 
+## Vault TLS: custom CA and mutual TLS
+
+Both Vault backends (KV2 and Transit) support a private certificate authority and client-certificate (mTLS) authentication at the connection layer:
+
+| Setting | Environment variable | Admin configure field | Meaning |
+| --- | --- | --- | --- |
+| CA bundle | `RUSTFS_KMS_VAULT_CA_CERT` | `ca_cert_path` | Path to a PEM CA bundle trusted for the Vault connection, in addition to nothing else: when set, only this bundle is trusted |
+| Client certificate | `RUSTFS_KMS_VAULT_CLIENT_CERT` | `client_cert_path` | Path to a PEM client certificate presented to Vault; requires the client key |
+| Client key | `RUSTFS_KMS_VAULT_CLIENT_KEY` | `client_key_path` | Path to the PEM private key matching the client certificate |
+| Skip verification | `RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY` | `skip_tls_verify` | Disables server certificate verification; gated on the insecure development defaults opt-in |
+
+Paths are read on the node applying the configuration, so the files must exist at the same path on every node. The certificate and key must be configured together; configuration validation rejects one without the other, and the files are read and parsed when the backend starts, so a bad path or malformed PEM fails the configuration instead of a later request. The `kms/status` backend summary reports `has_custom_ca` and `has_client_identity` booleans (never the file contents).
+
+The Vault client library would otherwise fall back to the `VAULT_CACERT`, `VAULT_CAPATH`, `VAULT_CLIENT_CERT` and `VAULT_CLIENT_KEY` process environment variables; RustFS always sets the trust roots and identity explicitly - to the configured values or to empty - so stray Vault environment variables cannot splice TLS material into the connection behind the KMS configuration.
+
 ## Local backend durability and deployment support matrix
 
 The Local backend stores one JSON record per key (`<key_id>.key`) plus an Argon2id salt file (`.master-key.salt`) inside the configured `key_dir`. This section documents which deployments that layout supports and how the backend recovers from a crash or power loss. For where the key material lives and who can read it, see the [backend comparison](#backend-comparison) above.

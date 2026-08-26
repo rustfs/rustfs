@@ -583,6 +583,68 @@ pub(crate) struct VaultConnectionSettings {
     /// Whether to accept an unverified Vault server certificate. Gated on
     /// `allow_insecure_dev_defaults` by `KmsConfig::validate`.
     pub(crate) skip_tls_verify: bool,
+    /// Additional CA bundle paths trusted for the Vault connection. vaultrs
+    /// reads and parses the files itself; [`vault_tls_materials`] has already
+    /// validated them so a bad path fails at configuration time.
+    pub(crate) ca_cert_paths: Vec<String>,
+    /// Client certificate + key presented to Vault for mTLS, already loaded
+    /// from disk. Built once at configuration time so every generation reuses
+    /// the same identity and a bad file fails fast instead of on refresh.
+    pub(crate) client_identity: Option<reqwest::Identity>,
+}
+
+/// Resolve TLS trust and identity material from the configured [`TlsConfig`].
+///
+/// Reads the files eagerly and fails on the first problem: vaultrs and reqwest
+/// would otherwise surface an unreadable bundle only when a client generation
+/// is built, or - worse - silently fall back to the `VAULT_CACERT` /
+/// `VAULT_CLIENT_CERT` environment variables.
+pub(crate) fn vault_tls_materials(tls: Option<&crate::config::TlsConfig>) -> Result<(Vec<String>, Option<reqwest::Identity>)> {
+    let Some(tls) = tls else {
+        return Ok((Vec::new(), None));
+    };
+
+    let mut ca_cert_paths = Vec::new();
+    if let Some(path) = &tls.ca_cert_path {
+        let content = std::fs::read(path)
+            .map_err(|e| KmsError::configuration_error(format!("failed to read Vault CA certificate {}: {e}", path.display())))?;
+        reqwest::Certificate::from_pem_bundle(&content).map_err(|e| {
+            KmsError::configuration_error(format!("Vault CA certificate {} is not a PEM bundle: {e}", path.display()))
+        })?;
+        let path = path.to_str().ok_or_else(|| {
+            KmsError::configuration_error(format!("Vault CA certificate path {} is not valid UTF-8", path.display()))
+        })?;
+        ca_cert_paths.push(path.to_string());
+    }
+
+    let client_identity = match (&tls.client_cert_path, &tls.client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let mut pem = std::fs::read(cert_path).map_err(|e| {
+                KmsError::configuration_error(format!("failed to read Vault client certificate {}: {e}", cert_path.display()))
+            })?;
+            pem.extend_from_slice(b"\n");
+            pem.extend_from_slice(&std::fs::read(key_path).map_err(|e| {
+                KmsError::configuration_error(format!("failed to read Vault client key {}: {e}", key_path.display()))
+            })?);
+            Some(reqwest::Identity::from_pem(&pem).map_err(|e| {
+                KmsError::configuration_error(format!(
+                    "Vault client certificate {} / key {} do not form a usable identity: {e}",
+                    cert_path.display(),
+                    key_path.display()
+                ))
+            })?)
+        }
+        (None, None) => None,
+        // `KmsConfig::validate` rejects unpaired cert/key configuration; this
+        // guard keeps the invariant for callers that skip validation.
+        _ => {
+            return Err(KmsError::configuration_error(
+                "Vault client certificate and key must be configured together for mTLS",
+            ));
+        }
+    };
+
+    Ok((ca_cert_paths, client_identity))
 }
 
 impl VaultConnectionSettings {
@@ -601,6 +663,12 @@ impl VaultConnectionSettings {
         // disable certificate verification behind the KMS configuration and its
         // insecure-defaults gate.
         settings_builder.verify(!self.skip_tls_verify);
+        // Same reasoning for trust roots and the client identity: unset, they
+        // default to VAULT_CACERT / VAULT_CAPATH and VAULT_CLIENT_CERT /
+        // VAULT_CLIENT_KEY, splicing TLS material into the connection behind
+        // the KMS configuration. An empty list / None neutralizes them.
+        settings_builder.ca_certs(self.ca_cert_paths.clone());
+        settings_builder.identity(self.client_identity.clone());
 
         if let Some(namespace) = &self.namespace {
             settings_builder.namespace(Some(namespace.clone()));
@@ -1000,6 +1068,8 @@ mod tests {
             namespace: Some("team-namespace".to_string()),
             attempt_timeout: Duration::from_secs(30),
             skip_tls_verify: false,
+            ca_cert_paths: Vec::new(),
+            client_identity: None,
         }
     }
 
@@ -1248,6 +1318,8 @@ mod tests {
                 namespace: None,
                 attempt_timeout: Duration::from_secs(30),
                 skip_tls_verify,
+                ca_cert_paths: Vec::new(),
+                client_identity: None,
             };
 
             let authenticated = settings.build_client(TEST_TOKEN).expect("authenticated client must build");
@@ -1270,6 +1342,139 @@ mod tests {
                 "a stray VAULT_SKIP_VERIFY must not disable verification behind the KMS configuration"
             );
         });
+    }
+
+    /// Write a self-signed certificate + key pair usable both as a CA bundle
+    /// and as an mTLS client identity for TLS material tests.
+    fn write_test_cert_pair(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["vault.example.com".to_string()]).expect("cert should generate");
+        let cert_path = dir.join("client_cert.pem");
+        let key_path = dir.join("client_key.pem");
+        std::fs::write(&cert_path, cert.pem()).expect("cert should write");
+        std::fs::write(&key_path, signing_key.serialize_pem()).expect("key should write");
+        (cert_path, key_path)
+    }
+
+    /// Like `verify`, the configured trust roots and client identity have to
+    /// reach the HTTP client on every generation, or an mTLS Vault rejects the
+    /// handshake for whichever generation missed them.
+    #[test]
+    fn test_tls_materials_reach_every_vault_client_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path) = write_test_cert_pair(dir.path());
+
+        let tls = crate::config::TlsConfig {
+            ca_cert_path: Some(cert_path.clone()),
+            client_cert_path: Some(cert_path.clone()),
+            client_key_path: Some(key_path),
+            skip_verify: false,
+        };
+        let (ca_cert_paths, client_identity) =
+            vault_tls_materials(Some(&tls)).expect("valid certificate files must produce TLS materials");
+        assert_eq!(ca_cert_paths, vec![cert_path.to_str().expect("utf-8 path").to_string()]);
+        assert!(client_identity.is_some(), "cert + key must produce a client identity");
+
+        let settings = VaultConnectionSettings {
+            address: "https://vault.example.com:8200".to_string(),
+            namespace: None,
+            attempt_timeout: Duration::from_secs(30),
+            skip_tls_verify: false,
+            ca_cert_paths: ca_cert_paths.clone(),
+            client_identity,
+        };
+
+        let authenticated = settings.build_client(TEST_TOKEN).expect("authenticated client must build");
+        assert_eq!(authenticated.settings.ca_certs, ca_cert_paths);
+        assert!(authenticated.settings.identity.is_some());
+
+        let login = settings.build_login_client().expect("login client must build");
+        assert_eq!(login.settings.ca_certs, ca_cert_paths);
+        assert!(login.settings.identity.is_some());
+    }
+
+    /// vaultrs defaults `ca_certs` from VAULT_CACERT / VAULT_CAPATH and
+    /// `identity` from VAULT_CLIENT_CERT / VAULT_CLIENT_KEY when the builder
+    /// leaves them unset, which would splice TLS material into the connection
+    /// behind the KMS configuration.
+    #[test]
+    fn test_vaultrs_tls_env_material_cannot_reach_the_client() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_path, key_path) = write_test_cert_pair(dir.path());
+        let cert = cert_path.to_str().expect("utf-8 path");
+        let key = key_path.to_str().expect("utf-8 path");
+        let ca_dir = dir.path().to_str().expect("utf-8 path");
+
+        temp_env::with_vars(
+            [
+                ("VAULT_CACERT", Some(cert)),
+                ("VAULT_CAPATH", Some(ca_dir)),
+                ("VAULT_CLIENT_CERT", Some(cert)),
+                ("VAULT_CLIENT_KEY", Some(key)),
+            ],
+            || {
+                let client = test_settings().build_client(TEST_TOKEN).expect("client must build");
+                assert!(
+                    client.settings.ca_certs.is_empty(),
+                    "stray VAULT_CACERT / VAULT_CAPATH must not add trust roots behind the KMS configuration"
+                );
+                assert!(
+                    client.settings.identity.is_none(),
+                    "stray VAULT_CLIENT_CERT / VAULT_CLIENT_KEY must not attach an mTLS identity behind the KMS configuration"
+                );
+            },
+        );
+    }
+
+    /// Misconfigured TLS material has to fail at configuration time, not on a
+    /// later credential refresh, and never by silently ignoring the files.
+    #[test]
+    fn test_tls_materials_fail_closed_on_bad_configuration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_path, _key_path) = write_test_cert_pair(dir.path());
+
+        let missing_ca = crate::config::TlsConfig {
+            ca_cert_path: Some(dir.path().join("absent.pem")),
+            client_cert_path: None,
+            client_key_path: None,
+            skip_verify: false,
+        };
+        assert!(
+            vault_tls_materials(Some(&missing_ca)).is_err(),
+            "an unreadable CA bundle must fail configuration"
+        );
+
+        let garbage_path = dir.path().join("garbage.pem");
+        std::fs::write(
+            &garbage_path,
+            b"-----BEGIN CERTIFICATE-----\nnot base64 at all!!\n-----END CERTIFICATE-----\n",
+        )
+        .expect("garbage should write");
+        let garbage_ca = crate::config::TlsConfig {
+            ca_cert_path: Some(garbage_path),
+            client_cert_path: None,
+            client_key_path: None,
+            skip_verify: false,
+        };
+        assert!(
+            vault_tls_materials(Some(&garbage_ca)).is_err(),
+            "a CA file that is not a PEM bundle must fail configuration"
+        );
+
+        let unpaired = crate::config::TlsConfig {
+            ca_cert_path: None,
+            client_cert_path: Some(cert_path),
+            client_key_path: None,
+            skip_verify: false,
+        };
+        assert!(
+            vault_tls_materials(Some(&unpaired)).is_err(),
+            "a client certificate without its key must fail configuration"
+        );
+
+        let (ca_cert_paths, client_identity) = vault_tls_materials(None).expect("absent TLS config is valid");
+        assert!(ca_cert_paths.is_empty());
+        assert!(client_identity.is_none());
     }
 
     /// The projected token is read fresh per login attempt and trimmed, so a
