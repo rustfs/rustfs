@@ -403,7 +403,7 @@ pub(super) fn data_usage_info_has_persisted_baseline_identity(info: &DataUsageIn
         && u64::try_from(info.buckets_usage.len()).ok() == Some(info.buckets_count)
 }
 
-pub(super) fn data_usage_info_is_pristine_bootstrap_pending(info: &DataUsageInfo) -> bool {
+pub(super) fn data_usage_info_is_bootstrap_pending(info: &DataUsageInfo) -> bool {
     if info.last_update.is_none() || info.scanner_cycle.is_some() {
         return false;
     }
@@ -681,27 +681,30 @@ async fn initial_scanner_startup_usage_state(storeapi: &Arc<ECStore>) -> (bool, 
     (persisted_usage_cache_is_cold_for_startup(storeapi).await, has_buckets)
 }
 
-fn scanner_cycle_state_is_pristine(
-    cycle_info: &CurrentCycle,
-    leader_epoch: u64,
-    cycle_revision: &DataUsageCacheRevision,
+fn prepare_cycle_for_usage_floor_bootstrap(
+    cycle_info: &mut CurrentCycle,
+    usage_floor: PersistedUsageFloor,
+    startup: PersistedUsageFloorStartup,
 ) -> bool {
-    cycle_info.next == 0 && leader_epoch == 0 && matches!(cycle_revision, DataUsageCacheRevision::Missing)
-}
-
-fn scanner_may_bootstrap_missing_usage_floor(
-    cycle_info: &CurrentCycle,
-    leader_epoch: u64,
-    cycle_revision: &DataUsageCacheRevision,
-) -> bool {
-    // The server becomes ready before the scanner starts, so a first bucket may
-    // already exist. The bootstrap marker is non-authoritative; only prior
-    // durable scanner progress must block its creation.
-    scanner_cycle_state_is_pristine(cycle_info, leader_epoch, cycle_revision)
-}
-
-fn scanner_may_resume_pristine_usage_bootstrap(cycle_info: &CurrentCycle) -> bool {
-    cycle_info.next == 0
+    match startup {
+        PersistedUsageFloorStartup::Authoritative => false,
+        PersistedUsageFloorStartup::Missing => {
+            // Cycle progress without its corresponding usage floor cannot
+            // prove namespace coverage. Restart from cycle zero while keeping
+            // the separately fenced leader epoch monotonic.
+            *cycle_info = CurrentCycle::default();
+            true
+        }
+        PersistedUsageFloorStartup::BootstrapPending => {
+            // An unfenced marker may have been written before an upgrade's old
+            // cycle state was replaced. A fenced marker belongs to the current
+            // scanner generation and may retain partial-cycle progress.
+            if usage_floor.leader_epoch == 0 {
+                *cycle_info = CurrentCycle::default();
+            }
+            true
+        }
+    }
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
@@ -2186,47 +2189,30 @@ async fn run_data_scanner_with_maintenance_state(
                 return Err(err);
             }
         };
-    let may_bootstrap_missing_usage_floor = scanner_may_bootstrap_missing_usage_floor(&cycle_info, leader_epoch, &cycle_revision);
-    let (usage_floor, usage_floor_startup) =
-        match persisted_usage_floor_for_startup(storeapi.clone(), may_bootstrap_missing_usage_floor).await {
-            Ok(result) => result,
-            Err(err) => {
-                error!(
-                    target: "rustfs::scanner",
-                    event = EVENT_SCANNER_PERSIST_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
-                    state = "usage_floor_load_failed",
-                    error = %err,
-                    "Scanner stopped because the persisted usage floor could not be loaded"
-                );
-                global_metrics().set_cycle(None).await;
-                return Ok(());
-            }
-        };
-    if usage_floor_startup == PersistedUsageFloorStartup::BootstrapPending
-        && !scanner_may_resume_pristine_usage_bootstrap(&cycle_info)
-    {
-        error!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
-            state = "usage_floor_bootstrap_conflict",
-            next_cycle = cycle_info.next,
-            "Scanner stopped because a pristine usage bootstrap conflicts with persisted cycle progress"
-        );
-        global_metrics().set_cycle(None).await;
-        return Ok(());
-    }
+    let (usage_floor, usage_floor_startup) = match persisted_usage_floor_for_startup(storeapi.clone(), true).await {
+        Ok(result) => result,
+        Err(err) => {
+            error!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                state = "usage_floor_load_failed",
+                error = %err,
+                "Scanner stopped because the persisted usage floor could not be loaded"
+            );
+            global_metrics().set_cycle(None).await;
+            return Ok(());
+        }
+    };
+    let allow_usage_floor_bootstrap_pending =
+        prepare_cycle_for_usage_floor_bootstrap(&mut cycle_info, usage_floor, usage_floor_startup);
     apply_persisted_usage_floor(&mut cycle_info, &mut leader_epoch, usage_floor);
-    let allow_pristine_bootstrap_pending = match usage_floor_startup {
-        PersistedUsageFloorStartup::Authoritative => false,
-        PersistedUsageFloorStartup::BootstrapPending => true,
+    match usage_floor_startup {
+        PersistedUsageFloorStartup::Authoritative | PersistedUsageFloorStartup::BootstrapPending => {}
         PersistedUsageFloorStartup::Missing => {
-            if !may_bootstrap_missing_usage_floor || ctx.is_cancelled() || guard.is_lock_lost() {
+            if ctx.is_cancelled() || guard.is_lock_lost() {
                 global_metrics().set_cycle(None).await;
                 return Ok(());
             }
@@ -2234,12 +2220,12 @@ async fn run_data_scanner_with_maintenance_state(
             let bootstrap_ctx = ctx.child_token();
             match await_scanner_cycle_with_lock_fence(
                 &bootstrap_ctx,
-                initialize_pristine_usage_baseline(storeapi.clone()),
+                initialize_usage_baseline_bootstrap(storeapi.clone()),
                 guard.lock_lost_notified(),
             )
             .await
             {
-                Some(Ok(())) => true,
+                Some(Ok(())) => {}
                 Some(Err(err)) => {
                     error!(
                         target: "rustfs::scanner",
@@ -2249,7 +2235,7 @@ async fn run_data_scanner_with_maintenance_state(
                         path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
                         state = "usage_floor_bootstrap_failed",
                         error = %err,
-                        "Scanner stopped because the pristine usage bootstrap could not be initialized"
+                        "Scanner stopped because the usage baseline bootstrap could not be initialized"
                     );
                     global_metrics().set_cycle(None).await;
                     return Ok(());
@@ -2260,7 +2246,7 @@ async fn run_data_scanner_with_maintenance_state(
                 }
             }
         }
-    };
+    }
 
     if ctx.is_cancelled() || guard.is_lock_lost() {
         global_metrics().set_cycle(None).await;
@@ -2275,7 +2261,7 @@ async fn run_data_scanner_with_maintenance_state(
             &mut cycle_info,
             &mut cycle_revision,
             &mut leader_epoch,
-            allow_pristine_bootstrap_pending,
+            allow_usage_floor_bootstrap_pending,
         ),
         guard.lock_lost_notified(),
     )

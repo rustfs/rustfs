@@ -1319,7 +1319,7 @@ pub(super) async fn persisted_usage_floor(
 
 pub(super) async fn persisted_usage_floor_for_startup(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
-    allow_missing_for_pristine_startup: bool,
+    allow_missing_for_bootstrap: bool,
 ) -> Result<(PersistedUsageFloor, PersistedUsageFloorStartup), ScannerError> {
     let Some(read_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
         return Err(ScannerError::Other("scanner usage floor read is blocked by data movement".to_string()));
@@ -1345,11 +1345,9 @@ pub(super) async fn persisted_usage_floor_for_startup(
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {primary_path}: {err}"))
                 })?;
-                if data_usage_info_is_pristine_bootstrap_pending(&usage) && primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str() {
+                if data_usage_info_is_bootstrap_pending(&usage) && primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str() {
                     if bootstrap_pending {
-                        return Err(ScannerError::Other(
-                            "multiple pristine scanner usage bootstrap markers were found".to_string(),
-                        ));
+                        return Err(ScannerError::Other("multiple scanner usage bootstrap markers were found".to_string()));
                     }
                     bootstrap_pending = true;
                     update_floor(&mut floor, &usage, primary_path)?;
@@ -1376,7 +1374,7 @@ pub(super) async fn persisted_usage_floor_for_startup(
             Ok((Some(data), _)) => {
                 if bootstrap_pending {
                     return Err(ScannerError::Other(
-                        "pristine scanner usage bootstrap conflicts with a persisted backup".to_string(),
+                        "scanner usage bootstrap conflicts with a persisted backup".to_string(),
                     ));
                 }
                 any_found = true;
@@ -1406,7 +1404,7 @@ pub(super) async fn persisted_usage_floor_for_startup(
         if any_found {
             if bootstrap_pending {
                 return Err(ScannerError::Other(
-                    "pristine scanner usage bootstrap conflicts with an authoritative usage floor".to_string(),
+                    "scanner usage bootstrap conflicts with an authoritative usage floor".to_string(),
                 ));
             }
             found_any = true;
@@ -1415,14 +1413,14 @@ pub(super) async fn persisted_usage_floor_for_startup(
     }
 
     if !found_any && !bootstrap_pending {
-        if !allow_missing_for_pristine_startup {
+        if !allow_missing_for_bootstrap {
             return Err(ScannerError::Other(
                 "persisted scanner usage floor has no authoritative baseline".to_string(),
             ));
         }
         let Some(publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
             return Err(ScannerError::Other(
-                "scanner usage floor changed before pristine state confirmation".to_string(),
+                "scanner usage floor changed before missing-state confirmation".to_string(),
             ));
         };
         for path in [
@@ -1435,12 +1433,12 @@ pub(super) async fn persisted_usage_floor_for_startup(
                 Ok((None, _)) => {}
                 Ok((Some(_), _)) => {
                     return Err(ScannerError::Other(format!(
-                        "scanner usage floor changed while confirming pristine state: {path} appeared"
+                        "scanner usage floor changed while confirming missing state: {path} appeared"
                     )));
                 }
                 Err(err) => {
                     return Err(ScannerError::Other(format!(
-                        "failed to confirm pristine scanner usage floor at {path}: {err}"
+                        "failed to confirm missing scanner usage floor at {path}: {err}"
                     )));
                 }
             }
