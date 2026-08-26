@@ -6,6 +6,7 @@ cd "$repo_root"
 
 checked_files=(
   "rustfs/src/main.rs"
+  "rustfs/src/startup_entrypoint.rs"
   "rustfs/src/init.rs"
   "rustfs/src/profiling.rs"
   "rustfs/src/startup_iam.rs"
@@ -113,6 +114,8 @@ checked_files=(
   "crates/obs/src/telemetry/dial9/config.rs"
   "crates/obs/src/telemetry/dial9/enabled.rs"
   "crates/obs/src/telemetry/local.rs"
+  "crates/obs/src/telemetry/guard.rs"
+  "crates/obs/src/telemetry/rolling.rs"
   "crates/obs/src/metrics/scheduler.rs"
   "crates/obs/src/cleaner/core.rs"
   "crates/obs/src/cleaner/compress.rs"
@@ -144,17 +147,17 @@ forbidden_patterns=(
   'debug!("http_client headers: {:?}"'
   'warn!("err_body: {}"'
   'debug!("config: {:?}"'
-  'warn!("No audit targets configured for dispatch"'
-  'warn!("No audit targets configured for batch dispatch"'
-  'info!("Event stream processing for target {} is started successfully"'
-  'info!("Target {} has no replay worker to start"'
-  'info!("Sending event to targets: {:?}"'
-  'info!("Event processing initiated for {} targets for bucket: {}"'
+  '"No audit targets configured for dispatch"'
+  '"No audit targets configured for batch dispatch"'
+  '"Event stream processing for target {} is started successfully"'
+  '"Target {} has no replay worker to start"'
+  '"Sending event to targets: {:?}"'
+  '"Event processing initiated for {} targets for bucket: {}"'
   'warn!("{}", notify_configuration_hint())'
-  'info!("Available ARNs: {:?}"'
-  'info!("Loaded notification config for bucket: {}"'
-  'info!("Updated notification rules for bucket: {}"'
-  'info!("Removed all notification rules for bucket: {}"'
+  '"Available ARNs: {:?}"'
+  '"Loaded notification config for bucket: {}"'
+  '"Updated notification rules for bucket: {}"'
+  '"Removed all notification rules for bucket: {}"'
   'info!(event = EVENT_NOTIFY_RUNTIME_LIFECYCLE,'
   'info!("Notification system instance is being dropped"'
   'info!("Notification shutdown metric snapshot"'
@@ -174,9 +177,9 @@ forbidden_patterns=(
   'info!(target_id = %self.id, "MQTT target close method finished.")'
   'debug!("Wrote event to store: {}"'
   'debug!("Deleted event from store: {}"'
-  'info!("Audit configuration reloaded"'
-  'info!("Audit system started"'
-  'info!("Audit metrics reset"'
+  '"Audit configuration reloaded"'
+  '"Audit system started"'
+  '"Audit metrics reset"'
   'error!("Failed to set global observability guard: {}"'
   'error!("Failed to initialize TLS from {}: {}"'
   'error!("Server encountered an error and is shutting down: {}"'
@@ -661,6 +664,21 @@ forbidden_patterns=(
   'error!("{} cache write lock poisoned: {}"'
   'error!("metrics_metadata lock poisoned: {}"'
   'warn!("Could not get GPU stats, recording 0 for GPU memory usage"'
+  # Migrated from the retired source-text tests in crates/obs/src/logging.rs
+  # (rustfs/backlog#1884): unmasked access-key interpolation, retired startup
+  # noise, and stderr prints that were converted to tracing events.
+  'access_key: {access_key}'
+  '"Successfully sent audit entry, target: {}, key: {}"'
+  '"Target {} not connected, retrying..."'
+  '"Timeout sending to target {}, retrying..."'
+  '"[WARN] Failed to initialize file observability logging'
+  '"Falling back to stdout logging.'
+  'eprintln!("Tracer shutdown error: {err:?}")'
+  'eprintln!("Meter shutdown error: {err:?}")'
+  'eprintln!("Logger shutdown error: {err:?}")'
+  'eprintln!("Log cleanup task stopped")'
+  'eprintln!("Tracing guard dropped, flushing logs.")'
+  'eprintln!("Stdout guard dropped, flushing logs.")'
 )
 
 for pattern in "${forbidden_patterns[@]}"; do
@@ -670,6 +688,50 @@ for pattern in "${forbidden_patterns[@]}"; do
     exit 1
   fi
 done
+
+# Positive structure guards migrated from the retired source-text tests in
+# crates/obs/src/logging.rs (rustfs/backlog#1884). Each pattern below must keep
+# existing: the single fatal-stderr formatter used before observability is up,
+# the structured tracing fields that replaced eprintln! in telemetry
+# fallback/shutdown paths, and the explicit stderr exceptions in the low-level
+# rolling appender (which cannot log through the sink it implements).
+require_patterns() {
+  local file="$1"
+  shift
+  for pattern in "$@"; do
+    if ! rg -n -F -- "$pattern" "$file" >/dev/null; then
+      echo "❌ logging guardrail violation: required pattern '$pattern' is missing from $file" >&2
+      exit 1
+    fi
+  done
+}
+
+require_patterns "rustfs/src/startup_entrypoint.rs" \
+  'fn format_fatal_stderr_message(context: &str, error: impl std::fmt::Display) -> String' \
+  'fn emit_fatal_stderr(context: &str, error: impl std::fmt::Display)' \
+  'emit_fatal_stderr("Server runtime failed", e)' \
+  'emit_fatal_stderr("Command parse failed", e)' \
+  'emit_fatal_stderr("Observability initialization failed", err)'
+
+require_patterns "crates/obs/src/telemetry/local.rs" \
+  'warn!(' \
+  'state = "fallback_to_stdout"' \
+  'failed_sink = "file"' \
+  'sink = "stdout"'
+
+require_patterns "crates/obs/src/telemetry/guard.rs" \
+  'EVENT_OBS_GUARD_SHUTDOWN' \
+  'resource = "tracer_provider"' \
+  'resource = "meter_provider"' \
+  'resource = "logger_provider"' \
+  'resource = "log_cleaner"' \
+  'resource = "tracing_guard"' \
+  'resource = "stdout_guard"'
+
+require_patterns "crates/obs/src/telemetry/rolling.rs" \
+  'Failed to flush log file before rotation' \
+  'RollingAppender: Failed to rotate log file after' \
+  'RollingAppender: failed to rotate log file'
 
 if rg -n -F -- 'warn!(name = %MaskedAccessKey(name), user_type = ?user_type, "IAM user identity missing")' crates/iam/src/store/object.rs >/dev/null; then
   echo "❌ logging guardrail violation: missing IAM identity is an expected debug event, not a warning" >&2
