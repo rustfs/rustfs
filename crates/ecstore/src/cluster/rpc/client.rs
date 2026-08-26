@@ -198,6 +198,7 @@ pub(crate) fn message_has_network_needle(message: &str) -> bool {
 pub(crate) fn is_network_like_disk_error(err: &DiskErrorType) -> bool {
     match err {
         DiskError::Timeout => true,
+        DiskError::RemoteClientUnavailable(detail) => message_has_network_needle(detail),
         DiskError::Io(io_err) => {
             if let Some(status) = embedded_tonic_status(io_err) {
                 return is_network_like_status(status);
@@ -717,6 +718,16 @@ mod tests {
         )));
         assert!(is_network_like_disk_error(&DiskError::other("connection refused")));
         assert!(!is_network_like_disk_error(&DiskError::FileNotFound));
+    }
+
+    #[test]
+    fn network_like_disk_error_keeps_typed_client_failures_classified() {
+        assert!(is_network_like_disk_error(&DiskError::RemoteClientUnavailable(
+            "transport error: connection refused".to_string()
+        )));
+        assert!(!is_network_like_disk_error(&DiskError::RemoteClientUnavailable(
+            "invalid client credentials".to_string()
+        )));
     }
 
     #[test]
