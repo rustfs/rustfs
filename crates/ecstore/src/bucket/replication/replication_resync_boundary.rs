@@ -53,10 +53,13 @@ pub(crate) const MRF_META_FORMAT: u16 = rustfs_replication::mrf::MRF_META_FORMAT
 )]
 pub(crate) const MRF_META_VERSION: u16 = rustfs_replication::mrf::MRF_META_VERSION;
 
-fn map_replication_error(err: rustfs_replication::Error) -> Error {
+fn map_replication_error(err: rustfs_replication::ResyncStateError) -> Error {
     match err {
-        rustfs_replication::Error::CorruptedFormat => Error::CorruptedFormat,
-        rustfs_replication::Error::Other(err) => Error::other(err),
+        rustfs_replication::ResyncStateError::CorruptedFormat => Error::CorruptedFormat,
+        // Keep the io error typed so its kind survives into StorageError::Io
+        // instead of degrading to a stringified other() (backlog#1845).
+        rustfs_replication::ResyncStateError::Io(err) => Error::Io(err),
+        rustfs_replication::ResyncStateError::Other(err) => Error::other(err),
     }
 }
 
