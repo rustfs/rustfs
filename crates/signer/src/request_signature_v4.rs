@@ -28,6 +28,13 @@ use super::utils::{HostAddrError, sign_v4_trim_all, try_get_host_addr};
 use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
 use s3s::Body;
 
+const SIGNING_KEY_CACHE_CAPACITY: usize = 1024;
+type SigningKeyCacheKey = ([u8; 32], String, String, String);
+
+// Keep the cache bounded and avoid retaining raw secret access keys.
+static SIGNING_KEY_CACHE: LazyLock<std::sync::Mutex<HashMap<SigningKeyCacheKey, [u8; 32]>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SERVICE_TYPE_S3: &str = "s3";
 pub const SERVICE_TYPE_STS: &str = "sts";
@@ -88,14 +95,40 @@ fn format_amz_datetime(t: OffsetDateTime) -> SignResult<String> {
 }
 
 pub fn get_signing_key(secret: &str, loc: &str, t: OffsetDateTime, service_type: &str) -> [u8; 32] {
+    let date_value = format_yyyymmdd(t);
+    let cache_key = (
+        hmac_sha256(b"rustfs-signing-key-cache", secret),
+        loc.to_string(),
+        date_value.clone(),
+        service_type.to_string(),
+    );
+
+    // Check cache first
+    if let Ok(cache) = SIGNING_KEY_CACHE.lock()
+        && let Some(&key) = cache.get(&cache_key)
+    {
+        return key;
+    }
+
+    // Cache miss: compute signing key
     let mut s = "AWS4".to_string();
     s.push_str(secret);
-    let date_value = format_yyyymmdd(t);
     let date = hmac_sha256(s.into_bytes(), date_value.into_bytes());
     let location = hmac_sha256(date, loc);
     let service = hmac_sha256(location, service_type);
+    let signing_key = hmac_sha256(service, "aws4_request");
 
-    hmac_sha256(service, "aws4_request")
+    if let Ok(mut cache) = SIGNING_KEY_CACHE.lock() {
+        if cache.len() >= SIGNING_KEY_CACHE_CAPACITY
+            && !cache.contains_key(&cache_key)
+            && let Some(evicted_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&evicted_key);
+        }
+        cache.insert(cache_key, signing_key);
+    }
+
+    signing_key
 }
 
 pub fn get_signature(signing_key: [u8; 32], string_to_sign: &str) -> String {
