@@ -1805,7 +1805,20 @@ mod tests {
                     second_writer.clone()
                 };
                 let bytes = encode_envelope(snapshot, captured_at.to_owned()).expect("envelope");
-                writer.replace_file("latest.json", &bytes, || false).expect("atomic replace");
+                let mut committed = false;
+                for _ in 0..100 {
+                    match writer.replace_file("latest.json", &bytes, || false) {
+                        Ok(()) => {
+                            committed = true;
+                            break;
+                        }
+                        Err(InventoryError::StateIo | InventoryError::PersistenceSecurity) => {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("atomic replace: {error}"),
+                    }
+                }
+                assert!(committed, "atomic replace did not recover from transient fail-closed errors");
             }
         });
         let now = chrono::DateTime::parse_from_rfc3339(captured_at)
