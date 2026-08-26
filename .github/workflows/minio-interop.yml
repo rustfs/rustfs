@@ -37,6 +37,11 @@
 # banner. Re-enabling is a UI action; anyone doing so should first check that the
 # workflow still matches the current CI layout. See rustfs/backlog#1603.
 #
+# While disabled, this workflow is deliberately absent from
+# .github/scheduled-validations.json — a disabled workflow can never satisfy the
+# freshness check. Whoever re-enables it must re-add the entry in the same
+# change so the freshness gate covers it again.
+#
 name: minio-interop
 
 on:
