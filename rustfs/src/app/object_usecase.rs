@@ -14707,8 +14707,10 @@ mod tests {
             .expect("multipart object must be placed in one source pool");
         if upload_pool != 0 {
             for (source_disk, target_disk) in pool_disk_paths[upload_pool].iter().zip(&pool_disk_paths[0]) {
-                std::fs::rename(source_disk.join(&bucket).join(object), target_disk.join(&bucket).join(object))
-                    .expect("normalize the test object into the old pool");
+                let source_object = source_disk.join(&bucket).join(object);
+                let target_bucket = target_disk.join(&bucket);
+                std::fs::create_dir_all(&target_bucket).expect("create normalized target bucket directory");
+                std::fs::rename(source_object, target_bucket.join(object)).expect("normalize the test object into the old pool");
             }
         }
         let source_pool = 0;

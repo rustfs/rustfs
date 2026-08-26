@@ -937,6 +937,7 @@ mod tests {
         POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_VERSION, PoolDecommissionInfo, PoolStatus,
         initialized_pool_meta_identity_for_test, pool_meta_v3_commit_state_for_test,
     };
+    use crate::core::sets::Sets;
     use crate::disk::error::DiskError;
     use crate::layout::endpoint::Endpoint;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
@@ -2320,9 +2321,61 @@ mod tests {
 
     async fn persist_reload_snapshot(store: &ECStore, snapshot: &PoolMeta) {
         snapshot
-            .save(store.pools.clone())
+            .save_for_startup(store.pools.clone())
             .await
             .expect("pool meta snapshot should persist to every pool");
+    }
+
+    #[derive(Debug)]
+    struct PoolMetaCommitPauseStorage {
+        inner: Arc<Sets>,
+        pause_committed_pool_meta: bool,
+        paused: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for PoolMetaCommitPauseStorage {
+        type Error = Error;
+        type RangeSpec = crate::storage_api_contracts::range::HTTPRangeSpec;
+        type HeaderMap = http::HeaderMap;
+        type ObjectOptions = crate::object_api::ObjectOptions;
+        type ObjectInfo = crate::object_api::ObjectInfo;
+        type GetObjectReader = crate::object_api::GetObjectReader;
+        type PutObjectReader = crate::object_api::PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            bucket: &str,
+            object: &str,
+            range: Option<Self::RangeSpec>,
+            h: Self::HeaderMap,
+            opts: &Self::ObjectOptions,
+        ) -> std::result::Result<Self::GetObjectReader, Error> {
+            self.inner.get_object_reader(bucket, object, range, h, opts).await
+        }
+
+        async fn put_object(
+            &self,
+            bucket: &str,
+            object: &str,
+            data: &mut Self::PutObjectReader,
+            opts: &Self::ObjectOptions,
+        ) -> std::result::Result<Self::ObjectInfo, Error> {
+            let result = self.inner.put_object(bucket, object, data, opts).await;
+            if result.is_ok() && object == POOL_META_NAME && self.pause_committed_pool_meta {
+                let committed = read_config_no_lock_preserve_empty_with_metadata(self.inner.clone(), POOL_META_NAME)
+                    .await
+                    .ok()
+                    .and_then(|(payload, _)| pool_meta_v3_commit_state_for_test(payload).ok())
+                    .is_some_and(|(_, committed)| committed);
+                if committed {
+                    self.paused.notify_one();
+                    self.release.notified().await;
+                }
+            }
+            result
+        }
     }
 
     #[tokio::test]
@@ -2330,7 +2383,16 @@ mod tests {
     async fn pool_meta_runtime_load_waits_for_multi_pool_commit_fence() {
         let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-load-fence", &[2, 2]).await;
         let old = PoolMeta::new(&store.pools, &PoolMeta::default());
-        old.save(store.pools.clone()).await.expect("old pool metadata should persist");
+        old.save_for_startup(store.pools.clone())
+            .await
+            .expect("old V3 pool metadata should persist");
+        let (old_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), POOL_META_NAME)
+            .await
+            .expect("old V3 pool metadata should be readable");
+        let (old_generation, old_committed) =
+            pool_meta_v3_commit_state_for_test(old_payload).expect("old replica should be a V3 envelope");
+        assert!(old_committed, "old generation should be committed before the mixed-state save");
+        let next_generation = old_generation.checked_add(1).expect("test generation should not exhaust");
         let mut newer = old.clone();
         newer.pools[0].last_update += TimeDuration::seconds(1);
 
@@ -2342,11 +2404,6 @@ mod tests {
             .get_write_lock(get_lock_acquire_timeout())
             .await
             .expect("pool metadata write fence should be acquired");
-        newer
-            .save_for_startup(vec![store.pools[0].clone()])
-            .await
-            .expect("first replica should enter the new generation");
-
         let started = Arc::new(tokio::sync::Notify::new());
         let mut load_task = tokio::spawn({
             let store = store.clone();
@@ -2357,17 +2414,57 @@ mod tests {
             }
         });
         started.notified().await;
+        let save_paused = Arc::new(tokio::sync::Notify::new());
+        let save_release = Arc::new(tokio::sync::Notify::new());
+        let save_task = tokio::spawn({
+            let newer = newer.clone();
+            let pools = vec![
+                Arc::new(PoolMetaCommitPauseStorage {
+                    inner: store.pools[0].clone(),
+                    pause_committed_pool_meta: true,
+                    paused: save_paused.clone(),
+                    release: save_release.clone(),
+                }),
+                Arc::new(PoolMetaCommitPauseStorage {
+                    inner: store.pools[1].clone(),
+                    pause_committed_pool_meta: false,
+                    paused: save_paused.clone(),
+                    release: save_release.clone(),
+                }),
+            ];
+            async move { newer.save_for_startup(pools).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), save_paused.notified())
+            .await
+            .expect("the newer V3 generation should pause after the first replica commit");
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), &mut load_task)
                 .await
                 .is_err(),
-            "runtime load must not observe a valid-old/valid-new intermediate state"
+            "runtime load must not observe a partially committed V3 generation while fenced"
+        );
+        let (committed_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), POOL_META_NAME)
+            .await
+            .expect("first replica should be readable while the runtime read is fenced");
+        let (pending_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[1].clone(), POOL_META_NAME)
+            .await
+            .expect("second replica should be readable while the runtime read is fenced");
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(committed_payload).expect("first replica should be a V3 envelope"),
+            (next_generation, true),
+            "first replica should hold the committed new generation before the fence releases"
+        );
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(pending_payload).expect("second replica should be a V3 envelope"),
+            (next_generation, false),
+            "second replica should still hold the pending new generation before the fence releases"
         );
 
-        newer
-            .save_for_startup(vec![store.pools[1].clone()])
+        save_release.notify_one();
+        save_task
             .await
-            .expect("second replica should enter the new generation");
+            .expect("newer V3 save task should not panic")
+            .expect("the newer generation should finish while the runtime read is fenced");
         drop(pool_meta_guard);
 
         let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), load_task)

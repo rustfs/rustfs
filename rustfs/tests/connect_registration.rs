@@ -419,6 +419,20 @@ fn stores(temp: &tempfile::TempDir) -> (IdentityStore, CredentialStore) {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn secure_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = fs::canonicalize(std::env::var_os("HOME").expect("test requires a protected home directory"))
+        .expect("test home directory must resolve without symlink components");
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
+        .expect("test home directory permissions must be restricted to the process owner");
+    tempfile::Builder::new()
+        .prefix(".connect-registration-")
+        .tempdir_in(home)
+        .expect("temporary directory inside the protected home directory")
+}
+
 fn stage_next_identity(temp: &tempfile::TempDir) -> DeviceIdentity {
     let directory = temp.path().join("identity");
     fs::create_dir_all(&directory).expect("identity directory");
@@ -902,7 +916,7 @@ async fn heartbeat_runtime_respects_rotation_retry_after_without_blocking_heartb
     let mut status = runtime.status();
 
     wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await;
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    wait_for_requests(&server, 4).await;
     runtime.shutdown().await;
 
     let paths = server.paths.lock().expect("paths lock");
@@ -925,7 +939,7 @@ async fn heartbeat_runtime_skips_only_valid_pending_reenrollment() {
             Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
             Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:03Z")),
         ],
-        true,
+        false,
     )
     .await;
     config.endpoint = server.endpoint.clone();
@@ -1086,7 +1100,7 @@ async fn heartbeat_retries_with_the_new_credential_after_concurrent_rotation() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn inventory_retries_with_the_new_credential_after_concurrent_rotation() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = secure_tempdir();
     let pki = TestPki::new();
     let (mut config, current, next) = runtime_config(&temp, &pki, "https://localhost/agent/", 1);
     let (rotated, rotated_stored) = rotation_response(&pki, &next, 0x23);
@@ -1181,7 +1195,7 @@ async fn inventory_retries_with_the_new_credential_after_concurrent_rotation() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn inventory_first_recovers_a_saved_reenrollment_before_telemetry() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = secure_tempdir();
     let pki = TestPki::new();
     let failed = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
     let (mut config, _, next) = runtime_config(&temp, &pki, &failed.endpoint, 1);
