@@ -67,9 +67,9 @@ crates/s3-client/src/constants.rs|unused_variables
 crates/s3-client/src/credentials.rs|clippy::all
 crates/s3-client/src/credentials.rs|unused_must_use
 crates/s3-client/src/credentials.rs|unused_variables
-crates/ecstore/src/client/object_api_utils.rs|clippy::all
-crates/ecstore/src/client/object_api_utils.rs|unused_must_use
-crates/ecstore/src/client/object_api_utils.rs|unused_variables
+crates/ecstore/src/object_api/object_api_utils.rs|clippy::all
+crates/ecstore/src/object_api/object_api_utils.rs|unused_must_use
+crates/ecstore/src/object_api/object_api_utils.rs|unused_variables
 crates/s3-client/src/transition_api.rs|clippy::all
 crates/s3-client/src/transition_api.rs|unused_must_use
 crates/s3-client/src/transition_api.rs|unused_variables

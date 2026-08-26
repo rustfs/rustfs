@@ -9388,6 +9388,7 @@ dependencies = [
  "rustfs-protocols",
  "rustfs-protos",
  "rustfs-rio",
+ "rustfs-s3-client",
  "rustfs-s3-ops",
  "rustfs-s3-types",
  "rustfs-s3select-api",

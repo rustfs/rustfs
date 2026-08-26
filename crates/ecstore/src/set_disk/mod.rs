@@ -55,7 +55,6 @@ use crate::bucket::replication::{
 };
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::client::{object_api_utils::get_raw_etag, transition_api::ObjectReader, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
@@ -88,6 +87,7 @@ use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_reader_from_bytes, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
 use crate::object_api::get_object_body_cache_hook;
+use crate::object_api::object_api_utils::get_raw_etag;
 use crate::runtime::instance::{InstanceContext, bootstrap_ctx};
 use crate::runtime::sources as runtime_sources;
 use crate::services::batch_processor::AsyncBatchProcessor;
@@ -151,6 +151,7 @@ use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
 use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, current_dirty_generation, record_capacity_scope, record_global_dirty_scope,
 };
+use rustfs_s3_client::transition_api::{ObjectReader, ReaderImpl};
 use rustfs_s3_types::EventName;
 #[cfg(test)]
 use rustfs_utils::http::SSEC_ALGORITHM_HEADER;

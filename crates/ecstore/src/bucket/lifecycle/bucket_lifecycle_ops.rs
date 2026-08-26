@@ -939,7 +939,7 @@ impl ExpiryState {
                         let version_count = u64::try_from(v.versions.len()).unwrap_or(u64::MAX);
                         let trace = LifecycleExpiryTrace::for_batch(&v.bucket, &v.event, &v.src, version_count);
                         trace.emit(EVENT_LIFECYCLE_DELETE_DISPATCHED, "delete_dispatched", None);
-                        crate::client::object_handlers_common::delete_object_versions(
+                        crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
                             &api,
                             &v.bucket,
                             &v.versions,
@@ -5431,8 +5431,6 @@ mod tests {
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG};
     use crate::bucket::metadata_sys;
-    #[cfg(feature = "test-util")]
-    use crate::client::transition_api::ReaderImpl;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::{RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
     use crate::error::{Error, is_err_invalid_upload_id};
@@ -5465,6 +5463,8 @@ mod tests {
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_data_usage::TierStats;
     use rustfs_filemeta::{FileInfo, FileMeta};
+    #[cfg(feature = "test-util")]
+    use rustfs_s3_client::transition_api::ReaderImpl;
     use s3s::dto::{
         BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, OutputLocation, RestoreRequest,
@@ -6352,7 +6352,7 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         let admin_err = err
             .get_ref()
-            .and_then(|source| source.downcast_ref::<crate::client::admin_handler_utils::AdminError>())
+            .and_then(|source| source.downcast_ref::<rustfs_s3_client::admin_handler_utils::AdminError>())
             .expect("identity mismatch should retain the typed tier error");
         assert_eq!(admin_err.code, crate::services::tier::tier::ERR_TIER_INVALID_CONFIG.code);
         assert_eq!(new_backend.get_count().await, 0);
@@ -11563,7 +11563,7 @@ mod tests {
         lease
             .put(
                 "remote/object",
-                crate::client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"candidate")),
+                rustfs_s3_client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"candidate")),
                 9,
             )
             .await

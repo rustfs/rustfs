@@ -21,7 +21,7 @@ const EVENT_LIFECYCLE_CLEANUP_SKIPPED: &str = "lifecycle_cleanup_skipped";
 const EVENT_LIFECYCLE_CLEANUP_FAILED: &str = "lifecycle_cleanup_failed";
 
 use crate::bucket::lifecycle::lifecycle;
-use crate::bucket::replication::{ReplicationLifecycleBridge, ReplicationObjectBridge};
+use crate::bucket::lifecycle::replication_sink::{self, ReplicationObjectBridge};
 use crate::object_api::ObjectOptions;
 use crate::storage_api_contracts::object::{ObjectOperations as _, ObjectToDelete};
 use crate::store::ECStore;
@@ -84,7 +84,7 @@ pub async fn delete_object_versions(
             if deleted_obj.replication_state.is_none() {
                 continue;
             }
-            ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_obj.clone()).await;
+            replication_sink::schedule_delete(bucket.to_string(), deleted_obj.clone()).await;
         }
 
         for (i, err) in errors.iter().enumerate() {
