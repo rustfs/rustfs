@@ -925,9 +925,19 @@ impl ECStore {
             }
 
             if let Some(idx) = pe.index {
+                let pool = self.pools[idx].clone();
                 results.push(RebalanceDeletePoolResult {
                     pool_idx: idx,
-                    result: self.pools[idx].delete_object(bucket, object, opts.clone()).await,
+                    result: self
+                        .run_external_decommission_capacity_object_mutation(
+                            idx,
+                            bucket,
+                            object,
+                            object,
+                            opts.clone(),
+                            |opts| async move { pool.delete_object(bucket, object, opts).await },
+                        )
+                        .await,
                 });
             }
         }

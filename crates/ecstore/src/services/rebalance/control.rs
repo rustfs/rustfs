@@ -1336,7 +1336,11 @@ mod tests {
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
 
     async fn persist_initialized_identity_then_remove_pool_meta(store: &Arc<ECStore>) {
-        let mut write_state = PoolMetaWriteState::for_startup(store.id, false);
+        let deployment_id = store
+            .ctx
+            .deployment_id()
+            .expect("test store should have a deployment identity");
+        let mut write_state = PoolMetaWriteState::for_startup(deployment_id, false);
         persist_pool_meta_identity_for_startup(store.pools.clone(), &mut write_state, true)
             .await
             .expect("initialized pool metadata identity should persist");

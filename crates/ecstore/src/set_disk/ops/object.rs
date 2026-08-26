@@ -2660,6 +2660,9 @@ impl SetDisks {
         let disks = self.get_disks_internal().await;
 
         let mut object_lock_guard = None;
+        let mut decommission_object_lock_guard = None;
+        let mut decommission_target_lock_covered = false;
+        let mut decommission_capacity_guard = None;
         let mut bucket_lifecycle_guard = None;
 
         // This pre-body check is advisory fast-fail only: the authoritative
@@ -3112,7 +3115,25 @@ impl SetDisks {
                 .await?;
             }
 
-            if !opts.no_lock && object_lock_guard.is_none() {
+            if let Some(store) = opts.decommission_capacity_admission.as_ref() {
+                #[cfg(test)]
+                {
+                    crate::core::pools::notify_decommission_external_object_commit_phase_started(store.id);
+                    crate::core::pools::wait_for_decommission_external_object_commit_phase_release(store.id).await;
+                }
+                let (object_guard, target_lock_covered, capacity_guard) = store
+                    .acquire_external_decommission_commit_guards(
+                        self.pool_index,
+                        bucket,
+                        object,
+                        opts.no_lock || object_lock_guard.is_some(),
+                    )
+                    .await?;
+                decommission_object_lock_guard = object_guard;
+                decommission_target_lock_covered = target_lock_covered;
+                decommission_capacity_guard = capacity_guard;
+            }
+            if !opts.no_lock && object_lock_guard.is_none() && !decommission_target_lock_covered {
                 #[cfg(any(test, feature = "test-util"))]
                 pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
                 if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
@@ -3289,6 +3310,33 @@ impl SetDisks {
                 });
             }
 
+            if decommission_capacity_guard.is_none()
+                && let Some(store) = opts.decommission_capacity_admission.as_ref()
+            {
+                decommission_capacity_guard = Some(
+                    store
+                        .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                        .await?,
+                );
+            }
+
+            // The object namespace is acquired above, after the input stream
+            // has been fully staged. Only then admit the local publication
+            // against the decommission capacity ledger; holding this guard
+            // through rename_data keeps the namespace -> capacity order.
+            if decommission_object_lock_guard
+                .as_ref()
+                .is_some_and(|guard| guard.is_lock_lost())
+            {
+                return Err(StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "put_object_external_namespace",
+                    bucket: bucket.to_string(),
+                    object: object.to_string(),
+                    required: 1,
+                    achieved: 0,
+                });
+            }
+
             let transaction_fencing_proof = object_transaction_fencing_fleet_proof();
             if object_transaction_fencing_requested() && transaction_fencing_proof.is_none() {
                 return Err(Error::other("object transaction fencing requires a live fleet capability proof"));
@@ -3423,13 +3471,17 @@ impl SetDisks {
             let commit_object = object.to_owned();
             let commit_tmp_dir = tmp_dir.clone();
             let commit_object_lock_guard = object_lock_guard.take();
+            let commit_decommission_object_lock_guard = decommission_object_lock_guard.take();
             let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
+            let commit_decommission_capacity_guard = decommission_capacity_guard.take();
             let commit_scanner_publication_scope = opts.scanner_publication_commit_scope.clone();
             // A scanner publication scope owns the movement permit until the
             // complete rename fan-out drains. Keep this path synchronous so
             // its terminal state is known before the coordinator releases
             // remote leases.
-            let commit_allows_early_ack = commit_object_lock_guard.is_some() && commit_scanner_publication_scope.is_none();
+            let commit_allows_early_ack = !(opts.data_movement && opts.has_decommission_capacity_reservation())
+                && (commit_object_lock_guard.is_some() || commit_decommission_object_lock_guard.is_some())
+                && commit_scanner_publication_scope.is_none();
             let detach_commit_owner = commit_scanner_publication_scope.is_some()
                 || commit_allows_early_ack
                 || commit_bucket_lifecycle_guard.is_some()
@@ -3449,7 +3501,9 @@ impl SetDisks {
 
             let commit = move |cancellation: Option<CancellationToken>| async move {
                 let mut _object_lock_guard = commit_object_lock_guard;
+                let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
                 let mut _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
+                let mut _decommission_capacity_guard = commit_decommission_capacity_guard;
                 let mut quota_reservation = quota_reservation;
                 let rename_stage_start = Instant::now();
                 let pre_rename = async {
@@ -3461,6 +3515,9 @@ impl SetDisks {
                     if quota_reservation.is_lock_lost()
                         || !quota_reservation.capability_proof_matches()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                        || _decommission_object_lock_guard
+                            .as_ref()
+                            .is_some_and(|guard| guard.is_lock_lost())
                         || commit_namespace_lock_fence
                             .as_ref()
                             .is_some_and(NamespaceLockFence::is_lock_lost)
@@ -3468,6 +3525,9 @@ impl SetDisks {
                             .as_ref()
                             .is_some_and(NamespaceLockFence::is_lock_lost)
                         || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                        || _decommission_capacity_guard
+                            .as_ref()
+                            .is_some_and(|guard| guard.is_lock_lost())
                     {
                         return Err(StorageError::NamespaceLockQuorumUnavailable {
                             mode: "quota_reservation",
@@ -3511,6 +3571,9 @@ impl SetDisks {
                     if quota_reservation.is_lock_lost()
                         || !quota_reservation.capability_proof_matches()
                         || _object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                        || _decommission_object_lock_guard
+                            .as_ref()
+                            .is_some_and(|guard| guard.is_lock_lost())
                         || commit_namespace_lock_fence
                             .as_ref()
                             .is_some_and(NamespaceLockFence::is_lock_lost)
@@ -3518,6 +3581,9 @@ impl SetDisks {
                             .as_ref()
                             .is_some_and(NamespaceLockFence::is_lock_lost)
                         || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                        || _decommission_capacity_guard
+                            .as_ref()
+                            .is_some_and(|guard| guard.is_lock_lost())
                     {
                         return Err(StorageError::NamespaceLockQuorumUnavailable {
                             mode: "quota_reservation",
@@ -3627,6 +3693,8 @@ impl SetDisks {
                             .map(|version_id| version_id.to_string());
                         let object_lock_guard = _object_lock_guard.take();
                         let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
+                        let decommission_object_lock_guard = _decommission_object_lock_guard.take();
+                        let decommission_capacity_guard = _decommission_capacity_guard.take();
                         let cleanup_bucket = commit_bucket.clone();
                         let cleanup_object = commit_object.clone();
                         let heal_set = commit_set.clone();
@@ -3641,7 +3709,12 @@ impl SetDisks {
                         tokio::spawn(finish_rename_tail_heal(
                             rename_tail_drain,
                             guard_release_rx,
-                            (object_lock_guard, bucket_lifecycle_guard),
+                            (
+                                object_lock_guard,
+                                bucket_lifecycle_guard,
+                                decommission_object_lock_guard,
+                                decommission_capacity_guard,
+                            ),
                             request,
                             move || async move {
                                 if quota_mutation_fence {
@@ -3655,7 +3728,13 @@ impl SetDisks {
                                     .await;
                                 }
                             },
-                            move |(object_lock_guard, bucket_lifecycle_guard), targets| async move {
+                            move |(
+                                object_lock_guard,
+                                bucket_lifecycle_guard,
+                                decommission_object_lock_guard,
+                                decommission_capacity_guard,
+                            ),
+                                  targets| async move {
                                 drop(object_lock_guard);
                                 drop(bucket_lifecycle_guard);
                                 cleanup_set
@@ -3676,10 +3755,15 @@ impl SetDisks {
                                         "issue3031_put_object_tmp_cleanup_done"
                                     );
                                 }
+                                drop(decommission_object_lock_guard);
+                                drop(decommission_capacity_guard);
                             },
                             |request| async move { heal_set.submit_rename_tail_heal(request).await },
                         ));
                     }
+                }
+                if !tail_owns_tmp_cleanup {
+                    drop(_decommission_capacity_guard.take());
                 }
                 #[cfg(any(test, feature = "test-util"))]
                 if rename_result.is_ok() {
@@ -5587,6 +5671,7 @@ fn notify_put_object_commit_namespace_acquired(bucket: &str, object: &str) {
 struct DeleteObjectCommitBarrierState {
     bucket: String,
     object: String,
+    pause_after_publish: bool,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -5603,9 +5688,18 @@ static DELETE_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option
 #[cfg(test)]
 impl DeleteObjectCommitBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        Self::install_with_mode(bucket, object, false)
+    }
+
+    pub(crate) fn install_after_publish(bucket: &str, object: &str) -> Self {
+        Self::install_with_mode(bucket, object, true)
+    }
+
+    fn install_with_mode(bucket: &str, object: &str, pause_after_publish: bool) -> Self {
         let state = Arc::new(DeleteObjectCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
+            pause_after_publish,
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
         });
@@ -5650,7 +5744,22 @@ async fn pause_delete_object_commit(bucket: &str, object: &str) {
         .lock()
         .expect("delete object commit barrier mutex should not poison")
         .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && !barrier.pause_after_publish)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+async fn pause_delete_object_commit_after_publish(bucket: &str, object: &str) {
+    let barrier = DELETE_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete object commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause_after_publish)
         .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -7427,6 +7536,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             self.delete_object_version(bucket, object, &fi, should_force_delete_marker_for_missing_version(&opts))
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+            #[cfg(test)]
+            pause_delete_object_commit_after_publish(bucket, object).await;
 
             let disks = self.disk_inventory().await;
             self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
@@ -7467,6 +7578,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
+        #[cfg(test)]
+        pause_delete_object_commit_after_publish(bucket, object).await;
 
         let disks = self.disk_inventory().await;
         self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
@@ -8218,19 +8331,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 part_checksums.to_string(),
             );
         }
-        // The restore copy-back re-writes this same object via put_object /
-        // new_multipart_upload / complete_multipart_upload, each of which takes
-        // the object write lock in its commit phase. The caller
-        // (handle_restore_transitioned_object, #4877) already holds that write
-        // lock for the whole restore and forwards no_lock=true, so the inner
-        // writes must inherit it or they self-deadlock on the lock we already
-        // hold and time out. put_restore_opts builds fresh options that default
-        // no_lock=false, so propagate it explicitly here.
+        // Keep the public ECStore capacity admission attached to each local
+        // commit. The tier reads below must remain outside the object write
+        // lock so HEAD/GET do not wait for a slow remote copy-back.
         ropts.no_lock = opts.no_lock;
         ropts.expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
         ropts.bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.clone();
         ropts.namespace_lock_fence = opts.namespace_lock_fence.clone();
         ropts.object_lock_config_snapshot = opts.object_lock_config_snapshot.clone();
+        ropts.decommission_capacity_admission = opts.decommission_capacity_admission.clone();
         if oi.parts.len() == 1 {
             let mut opts = opts.clone();
             opts.part_number = Some(1);
@@ -8361,25 +8470,19 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     .expect("multipart restore must contain at least one uploaded part")
                     .etag = Some("injected-invalid-complete-etag".to_string());
             }
+            let complete_opts = ObjectOptions {
+                mod_time: oi.mod_time,
+                version_id: oi.version_id.map(|version| version.to_string()),
+                expected_bucket_incarnation_id: opts.expected_bucket_incarnation_id,
+                bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
+                user_defined: restore_commit_metadata,
+                no_lock: opts.no_lock,
+                decommission_capacity_admission: opts.decommission_capacity_admission.clone(),
+                ..Default::default()
+            };
             self_
                 .clone()
-                .complete_multipart_upload(
-                    bucket,
-                    object,
-                    &res.upload_id,
-                    uploaded_parts,
-                    &ObjectOptions {
-                        mod_time: oi.mod_time,
-                        version_id: oi.version_id.map(|version| version.to_string()),
-                        expected_bucket_incarnation_id: opts.expected_bucket_incarnation_id,
-                        bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
-                        user_defined: restore_commit_metadata,
-                        // Inherit the restore write lock (see ropts.no_lock above):
-                        // the commit phase re-acquires this object's write lock.
-                        no_lock: opts.no_lock,
-                        ..Default::default()
-                    },
-                )
+                .complete_multipart_upload(bucket, object, &res.upload_id, uploaded_parts, &complete_opts)
                 .await
         }
         .await;

@@ -262,7 +262,9 @@ fn every_rule_has_a_positive_sample() {
         ),
         (
             "decom-capacity-insufficient",
-            msg("failed to start decommission: insufficient target pool capacity: required 100 bytes available 50 bytes"),
+            msg(
+                "failed to start decommission: insufficient reserved physical target capacity: required 100 bytes available 50 bytes",
+            ),
         ),
         // ops
         ("decom-object-failed", msg("Decommission object migration failed")),

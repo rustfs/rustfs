@@ -97,7 +97,7 @@ pub(crate) async fn test_two_pool_stores(
     std::sync::Arc<crate::store::ECStore>,
     std::sync::Arc<crate::store::ECStore>,
 ) {
-    test_two_pool_stores_with_contexts(rebalance_meta, false).await
+    test_pool_stores_with_contexts(rebalance_meta, false, 2, 2).await
 }
 
 #[cfg(test)]
@@ -108,7 +108,7 @@ pub(crate) async fn test_two_pool_stores_with_isolated_node_contexts(
     std::sync::Arc<crate::store::ECStore>,
     std::sync::Arc<crate::store::ECStore>,
 ) {
-    test_two_pool_stores_with_contexts(rebalance_meta, true).await
+    test_pool_stores_with_contexts(rebalance_meta, true, 2, 2).await
 }
 
 #[cfg(test)]
@@ -123,26 +123,58 @@ pub(crate) async fn promote_test_pool_meta_to_v2(store: &std::sync::Arc<crate::s
 }
 
 #[cfg(test)]
-async fn test_two_pool_stores_with_contexts(
+pub(crate) async fn test_three_pool_stores_with_isolated_node_contexts(
+    rebalance_meta: Option<RebalanceMeta>,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_pool_stores_with_contexts(rebalance_meta, true, 3, 2).await
+}
+
+#[cfg(test)]
+pub(crate) async fn test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(
+    rebalance_meta: Option<RebalanceMeta>,
+) -> (
+    Vec<tempfile::TempDir>,
+    std::sync::Arc<crate::store::ECStore>,
+    std::sync::Arc<crate::store::ECStore>,
+) {
+    test_pool_stores_with_contexts(rebalance_meta, true, 3, 3).await
+}
+
+#[cfg(test)]
+async fn test_pool_stores_with_contexts(
     rebalance_meta: Option<RebalanceMeta>,
     isolate_node_contexts: bool,
+    pool_count: usize,
+    set_drive_count: usize,
 ) -> (
     Vec<tempfile::TempDir>,
     std::sync::Arc<crate::store::ECStore>,
     std::sync::Arc<crate::store::ECStore>,
 ) {
     crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
-    use crate::core::pools::PoolMeta;
+    use crate::core::pools::{POOL_META_VERSION, PoolMeta, PoolMetaWriteState, persist_pool_meta_identity_for_startup};
     use crate::layout::endpoints::{EndpointServerPools, SetupType};
 
     let ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
     ctx.update_erasure_type(SetupType::DistErasure).await;
-    let (mut temp_dirs, first_pool) =
-        crate::core::sets::make_local_two_set_sets_for_pool_with_ctx(std::sync::Arc::clone(&ctx), 0).await;
-    let (second_temp_dirs, second_pool) =
-        crate::core::sets::make_local_two_set_sets_for_pool_with_ctx(std::sync::Arc::clone(&ctx), 1).await;
-    temp_dirs.extend(second_temp_dirs);
-    let pools = vec![first_pool, second_pool];
+    let deployment_id = uuid::Uuid::new_v4();
+    ctx.set_deployment_id(deployment_id);
+    let mut temp_dirs = Vec::new();
+    let mut pools = Vec::with_capacity(pool_count);
+    for pool_index in 0..pool_count {
+        let (pool_temp_dirs, pool) = crate::core::sets::make_local_two_set_sets_for_pool_with_drive_count_and_ctx(
+            std::sync::Arc::clone(&ctx),
+            pool_index,
+            set_drive_count,
+        )
+        .await;
+        temp_dirs.extend(pool_temp_dirs);
+        pools.push(pool);
+    }
     {
         let local_disk_map = ctx.local_disk_map();
         let mut local_disk_map = local_disk_map.write().await;
@@ -154,11 +186,24 @@ async fn test_two_pool_stores_with_contexts(
             }
         }
     }
-    let pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
+    let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
+    pool_meta.version = POOL_META_VERSION;
     pool_meta
         .save_for_startup(pools.clone())
         .await
         .expect("baseline pool metadata should be persisted");
+    let mut pool_meta_write_state = PoolMetaWriteState::for_startup(deployment_id, true);
+    persist_pool_meta_identity_for_startup(pools.clone(), &mut pool_meta_write_state, false)
+        .await
+        .expect("pending pool metadata identity should be persisted");
+    let replica_state = pool_meta
+        .load_no_lock_from_replicas_observing(pools.clone(), &mut pool_meta_write_state)
+        .await
+        .expect("baseline pool metadata should remain readable");
+    pool_meta_write_state.observe_replicas(replica_state);
+    persist_pool_meta_identity_for_startup(pools.clone(), &mut pool_meta_write_state, true)
+        .await
+        .expect("initialized pool metadata identity should be persisted");
     if let Some(meta) = rebalance_meta.as_ref() {
         meta.save(pools[0].clone())
             .await
@@ -169,6 +214,7 @@ async fn test_two_pool_stores_with_contexts(
     let other_ctx = if isolate_node_contexts {
         let other_ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
         other_ctx.update_erasure_type(SetupType::DistErasure).await;
+        other_ctx.set_deployment_id(deployment_id);
         *other_ctx.local_disk_map().write().await = ctx.local_disk_map().read().await.clone();
         other_ctx.set_endpoints(endpoint_pools.clone());
         other_ctx
@@ -183,9 +229,9 @@ async fn test_two_pool_stores_with_contexts(
             peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, std::sync::Arc::clone(&store_ctx)),
             pool_meta: tokio::sync::RwLock::new(pool_meta.clone()),
             rebalance_meta: tokio::sync::RwLock::new(rebalance_meta.clone()),
-            decommission_cancelers: tokio::sync::RwLock::new(vec![None, None]),
+            decommission_cancelers: tokio::sync::RwLock::new(vec![None; pool_count]),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::default(),
+            pool_meta_save_gate: tokio::sync::Mutex::new(pool_meta_write_state.independent_clone_for_test()),
             ctx: store_ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         })
@@ -195,6 +241,8 @@ async fn test_two_pool_stores_with_contexts(
     if isolate_node_contexts {
         crate::bucket::metadata_sys::init_bucket_metadata_sys(std::sync::Arc::clone(&store), Vec::new()).await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(std::sync::Arc::clone(&other_store), Vec::new()).await;
+    } else {
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(std::sync::Arc::clone(&store), Vec::new()).await;
     }
     (temp_dirs, store, other_store)
 }

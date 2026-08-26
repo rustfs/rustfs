@@ -412,8 +412,14 @@ pub(crate) fn require_bucket_metadata_sys_in(
 }
 
 pub(crate) async fn object_store_in(ctx: &crate::runtime::instance::InstanceContext) -> Result<Arc<ECStore>> {
-    let sys = bucket_metadata_sys_of(ctx)?;
-    Ok(sys.read().await.api.clone())
+    object_store_if_initialized_in(ctx)
+        .await
+        .ok_or_else(|| Error::other("bucket metadata sys not initialized for this instance"))
+}
+
+pub(crate) async fn object_store_if_initialized_in(ctx: &crate::runtime::instance::InstanceContext) -> Option<Arc<ECStore>> {
+    let sys = ctx.bucket_metadata_sys().or_else(get_global_bucket_metadata_sys)?;
+    Some(sys.read().await.api.clone())
 }
 
 pub(crate) async fn get_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<Arc<BucketMetadata>> {

@@ -681,6 +681,16 @@ impl Drop for ScannerPublicationCommitScopeInner {
     }
 }
 
+#[derive(Clone, Default)]
+#[doc(hidden)]
+pub struct DecommissionCapacityOptions {
+    pub(crate) expected_data_bytes: Option<usize>,
+    pub(crate) operation_id: Option<Uuid>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) owner_nonce: Option<Uuid>,
+    pub(crate) mutation_id: Option<Uuid>,
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -725,6 +735,12 @@ pub struct ObjectOptions {
 
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Durable reservation identity carried only by decommission writes. Other
+    /// data-movement users, including rebalance, leave it unset. Keep this
+    /// context boxed because `ObjectOptions` is passed by value through deep
+    /// storage futures.
+    #[doc(hidden)]
+    pub decommission_capacity: Option<Box<DecommissionCapacityOptions>>,
     /// Materialize the data-movement per-part checksum sidecar for APIs that
     /// return part checksums. Ordinary object reads leave it encoded.
     pub include_part_checksums: bool,
@@ -788,6 +804,36 @@ pub struct ObjectOptions {
     /// Storage-owned journal writer used by the atomic delete path. This is
     /// populated only by the `ECStore` wrapper that holds the namespace locks.
     pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
+    /// Internal staged-mutation admission supplied by `ECStore`; each local
+    /// publish is fenced namespace-first and then by decommission capacity.
+    #[doc(hidden)]
+    pub decommission_capacity_admission: Option<Arc<crate::store::ECStore>>,
+}
+
+impl ObjectOptions {
+    pub(crate) fn with_capacity_expected_data_bytes(expected_data_bytes: Option<usize>) -> Self {
+        Self {
+            decommission_capacity: expected_data_bytes.map(|expected_data_bytes| {
+                Box::new(DecommissionCapacityOptions {
+                    expected_data_bytes: Some(expected_data_bytes),
+                    ..Default::default()
+                })
+            }),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn capacity_expected_data_bytes(&self) -> Option<usize> {
+        self.decommission_capacity
+            .as_deref()
+            .and_then(|capacity| capacity.expected_data_bytes)
+    }
+
+    pub(crate) fn has_decommission_capacity_reservation(&self) -> bool {
+        self.decommission_capacity
+            .as_deref()
+            .is_some_and(|capacity| capacity.operation_id.is_some())
+    }
 }
 
 impl std::fmt::Debug for ObjectOptions {
