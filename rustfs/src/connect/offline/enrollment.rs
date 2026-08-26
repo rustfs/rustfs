@@ -32,8 +32,7 @@
 //! are frozen beside it. Reordering the checks changes which reason a given
 //! artifact produces, which is itself part of the contract.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
+use base64_simd::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::DecodePrivateKey as _;
@@ -367,7 +366,7 @@ impl OfflineEnrollment {
         // The octets that were transmitted. They are never re-serialised: every
         // later step signs and parses this same buffer.
         let bytes = BASE64_STANDARD
-            .decode(envelope.bytes.as_bytes())
+            .decode_to_vec(envelope.bytes.as_bytes())
             .map_err(|_| EnrollmentError::MalformedDocument)?;
 
         // Step 2: routing only.
@@ -440,8 +439,8 @@ impl OfflineEnrollment {
             challenge_nonce: &challenge.nonce,
             challenge_proof: &challenge.challenge_proof,
             device_key_id: key_id(&point),
-            device_public_key: BASE64_URL_NO_PAD.encode(point),
-            device_nonce: BASE64_URL_NO_PAD.encode(device_nonce),
+            device_public_key: BASE64_URL_NO_PAD.encode_to_string(point),
+            device_nonce: BASE64_URL_NO_PAD.encode_to_string(device_nonce),
             produced_at,
         };
 
@@ -451,7 +450,7 @@ impl OfflineEnrollment {
         let signature = sign(key, TAG_RESPONSE, &bytes)?;
 
         let envelope = SignedDocument {
-            bytes: BASE64_STANDARD.encode(&bytes),
+            bytes: BASE64_STANDARD.encode_to_string(&bytes),
             signature: DocumentSignature {
                 algorithm: SIGNATURE_ALGORITHM.to_owned(),
                 key_id: document.device_key_id,
@@ -537,7 +536,7 @@ fn verify_trust_chain(
 /// checked against these, never against a re-encoding of the parsed link.
 fn decode_trust_link(entry: &SignedDocument) -> Result<(TrustLink, Vec<u8>), EnrollmentError> {
     let bytes = BASE64_STANDARD
-        .decode(entry.bytes.as_bytes())
+        .decode_to_vec(entry.bytes.as_bytes())
         .map_err(|_| EnrollmentError::MalformedDocument)?;
     let link = serde_json::from_slice(&bytes).map_err(|_| EnrollmentError::TrustChainInvalid)?;
     Ok((link, bytes))
@@ -559,7 +558,7 @@ fn decode_signature(signature: &DocumentSignature) -> Result<Signature, Enrollme
     }
 
     let decoded = BASE64_URL_NO_PAD
-        .decode(value)
+        .decode_to_vec(value)
         .map_err(|_| EnrollmentError::SignatureMalformed)?;
     let octets: [u8; SIGNATURE_OCTETS] = decoded
         .as_slice()
@@ -602,7 +601,7 @@ fn sign(key: &DeviceIdentity, tag: &[u8], bytes: &[u8]) -> Result<String, Enroll
     let signature: Signature = signing_key.sign(&signature_input(tag, bytes));
     let canonical = signature.normalize_s();
 
-    Ok(BASE64_URL_NO_PAD.encode(canonical.to_bytes()))
+    Ok(BASE64_URL_NO_PAD.encode_to_string(canonical.to_bytes()))
 }
 
 /// The device's public point, recovered from the DER encoding the identity
@@ -627,7 +626,7 @@ fn decode_public_key(value: &str) -> Option<(VerifyingKey, [u8; PUBLIC_KEY_OCTET
         return None;
     }
 
-    let point: [u8; PUBLIC_KEY_OCTETS] = BASE64_URL_NO_PAD.decode(value).ok()?.try_into().ok()?;
+    let point: [u8; PUBLIC_KEY_OCTETS] = BASE64_URL_NO_PAD.decode_to_vec(value).ok()?.try_into().ok()?;
     if point[0] != UNCOMPRESSED_POINT {
         return None;
     }

@@ -23,7 +23,6 @@ use crate::encryption::context_aad;
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
-use base64::Engine;
 use jiff::Zoned;
 use md5::{Digest as Md5Digest, Md5};
 use rand::random;
@@ -40,7 +39,7 @@ use zeroize::Zeroize;
 fn md5_hex(input: impl AsRef<[u8]>) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_ref());
-    hex::encode(hasher.finalize())
+    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
 }
 
 /// Data key for object encryption
@@ -836,19 +835,16 @@ impl ObjectEncryptionService {
         // Internal headers for decryption
         headers.insert(
             INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
-            base64::engine::general_purpose::STANDARD.encode(&metadata.iv),
+            base64_simd::STANDARD.encode_to_string(&metadata.iv),
         );
 
         if let Some(ref tag) = metadata.tag {
-            headers.insert(
-                INTERNAL_ENCRYPTION_TAG_HEADER.to_string(),
-                base64::engine::general_purpose::STANDARD.encode(tag),
-            );
+            headers.insert(INTERNAL_ENCRYPTION_TAG_HEADER.to_string(), base64_simd::STANDARD.encode_to_string(tag));
         }
 
         headers.insert(
             INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
-            base64::engine::general_purpose::STANDARD.encode(&metadata.encrypted_data_key),
+            base64_simd::STANDARD.encode_to_string(&metadata.encrypted_data_key),
         );
 
         // Whatever the object was sealed under is what gets stored: for a
@@ -906,14 +902,14 @@ impl ObjectEncryptionService {
         let iv = headers
             .get(INTERNAL_ENCRYPTION_IV_HEADER)
             .ok_or_else(|| KmsError::validation_error("Missing IV header"))?;
-        let iv = base64::engine::general_purpose::STANDARD
-            .decode(iv)
+        let iv = base64_simd::STANDARD
+            .decode_to_vec(iv)
             .map_err(|e| KmsError::validation_error(format!("Invalid IV: {e}")))?;
 
         let tag = if let Some(tag_str) = headers.get(INTERNAL_ENCRYPTION_TAG_HEADER) {
             Some(
-                base64::engine::general_purpose::STANDARD
-                    .decode(tag_str)
+                base64_simd::STANDARD
+                    .decode_to_vec(tag_str)
                     .map_err(|e| KmsError::validation_error(format!("Invalid tag: {e}")))?,
             )
         } else {
@@ -921,8 +917,8 @@ impl ObjectEncryptionService {
         };
 
         let encrypted_data_key = if let Some(key_str) = headers.get(INTERNAL_ENCRYPTION_KEY_HEADER) {
-            base64::engine::general_purpose::STANDARD
-                .decode(key_str)
+            base64_simd::STANDARD
+                .decode_to_vec(key_str)
                 .map_err(|e| KmsError::validation_error(format!("Invalid encrypted key: {e}")))?
         } else {
             Vec::new() // Empty for SSE-C

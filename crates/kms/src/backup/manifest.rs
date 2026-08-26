@@ -69,7 +69,7 @@ impl ContentDigest {
     pub fn sha256_of(bytes: &[u8]) -> Self {
         Self {
             algorithm: DigestAlgorithm::Sha256,
-            hex: hex::encode(Sha256::digest(bytes)),
+            hex: hex_simd::encode_to_string(Sha256::digest(bytes), hex_simd::AsciiCase::Lower),
         }
     }
 

@@ -199,7 +199,7 @@ serde_urlencoded = "0.7.1"
 # releases.
 aes-gcm = { version = "=0.11.1" }
 argon2 = { version = "=0.6.0-rc.8" }
-blake2 = "=0.11.0-rc.6"
+blake2 = "=0.11.0"
 chacha20poly1305 = { version = "=0.11.0" }
 crc-fast = "1.10.0"
 hmac = { version = "0.13.0" }
@@ -243,7 +243,6 @@ aws-sdk-sts = { default-features = false, version = "1.113.0" }
 aws-smithy-http-client = { default-features = false, version = "1.4.0" }
 aws-smithy-runtime-api = { version = "1.15.0" }
 aws-smithy-types = { version = "1.6.2" }
-base64 = "0.23.1"
 base64-simd = "0.8.0"
 brotli = "8.0.4"
 clap = { version = "4.6.6" }
@@ -266,7 +265,6 @@ hashbrown = { version = "0.17.1" }
 # Base32 for RFC 6238 TOTP shared secrets (RFC 4648 unpadded, the alphabet
 # every authenticator app expects). Already in the graph transitively.
 data-encoding = "2.11.1"
-hex = "0.4.3"
 hex-simd = "0.8.0"
 highway = { version = "1.3.0" }
 hostname = "0.4.2"
@@ -366,7 +364,6 @@ dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.5.1" }
-rustfs-mimalloc-sys = { version = "0.5.1" }
 hotpath = { version = "0.24.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }

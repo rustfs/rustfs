@@ -22,7 +22,6 @@ use crate::admin::utils::extract_query_params;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::kms_deletion_gate::current_key_impact;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use base64::Engine;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -1520,8 +1519,8 @@ impl Operation for GenerateDataKeyHandler {
             Ok(response) => {
                 let api_response = GenerateDataKeyApiResponse {
                     key_id: response.key_id,
-                    plaintext_key: base64::prelude::BASE64_STANDARD.encode(&response.plaintext_key),
-                    ciphertext_blob: base64::prelude::BASE64_STANDARD.encode(&response.ciphertext_blob),
+                    plaintext_key: base64_simd::STANDARD.encode_to_string(&response.plaintext_key),
+                    ciphertext_blob: base64_simd::STANDARD.encode_to_string(&response.ciphertext_blob),
                 };
 
                 let data = serde_json::to_vec(&api_response)

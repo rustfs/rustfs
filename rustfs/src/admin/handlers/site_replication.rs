@@ -56,9 +56,8 @@ use crate::storage::storage_api::{
     delete_config_no_lock, lock_bucket_targets_metadata, read_config_no_lock, save_config_no_lock, with_config_object_read_lock,
     with_config_object_write_lock,
 };
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64_simd::STANDARD as BASE64_STANDARD;
+use base64_simd::URL_SAFE_NO_PAD;
 use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use http::header::{CONTENT_TYPE, HOST};
@@ -1633,7 +1632,7 @@ fn hash_client_secret(secret: Option<&str>) -> String {
 
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
-    URL_SAFE_NO_PAD.encode(hasher.finalize())
+    URL_SAFE_NO_PAD.encode_to_string(hasher.finalize())
 }
 
 fn config_enabled(value: Option<String>) -> bool {
@@ -3763,7 +3762,7 @@ impl SiteReplicationRepairTask<'_> {
         digest.update(self.path().as_bytes());
         digest.update([0]);
         digest.update(payload);
-        Ok(URL_SAFE_NO_PAD.encode(digest.finalize()))
+        Ok(URL_SAFE_NO_PAD.encode_to_string(digest.finalize()))
     }
 
     async fn send(&self, transport: &PeerTransport, access_key: &str, secret_key: &str) -> S3Result<Vec<u8>> {
@@ -3850,7 +3849,7 @@ fn site_replication_repair_plan_token(state: &SiteReplicationState, plan: &SiteR
     for (_, task) in site_replication_repair_tasks(plan) {
         digest.update(task.id()?.as_bytes());
     }
-    Ok(URL_SAFE_NO_PAD.encode(digest.finalize()))
+    Ok(URL_SAFE_NO_PAD.encode_to_string(digest.finalize()))
 }
 
 fn site_replication_repair_preflight_token(
@@ -3880,7 +3879,7 @@ fn site_replication_repair_preflight_token(
         digest.update(event.path.as_bytes());
         digest.update(&[0]);
     }
-    Ok(URL_SAFE_NO_PAD.encode(digest.finalize().into_bytes()))
+    Ok(URL_SAFE_NO_PAD.encode_to_string(digest.finalize().into_bytes()))
 }
 
 fn site_replication_repair_task_checkpoint_id(
@@ -3894,7 +3893,7 @@ fn site_replication_repair_task_checkpoint_id(
     digest.update(peer_deployment_id.as_bytes());
     digest.update(&[0]);
     digest.update(task.id()?.as_bytes());
-    Ok(URL_SAFE_NO_PAD.encode(digest.finalize().into_bytes()))
+    Ok(URL_SAFE_NO_PAD.encode_to_string(digest.finalize().into_bytes()))
 }
 
 fn site_replication_repair_sites(
@@ -4476,11 +4475,11 @@ fn raw_config_to_string(raw: &[u8]) -> Option<String> {
 }
 
 fn raw_config_to_base64(raw: &[u8]) -> Option<String> {
-    (!raw.is_empty()).then(|| BASE64_STANDARD.encode(raw))
+    (!raw.is_empty()).then(|| BASE64_STANDARD.encode_to_string(raw))
 }
 
 fn encode_bucket_meta_wire_value(value: Option<String>) -> Option<String> {
-    value.map(|raw| BASE64_STANDARD.encode(raw.as_bytes()))
+    value.map(|raw| BASE64_STANDARD.encode_to_string(raw.as_bytes()))
 }
 
 fn encode_bucket_meta_wire_item(mut item: SRBucketMeta) -> SRBucketMeta {
@@ -4496,7 +4495,7 @@ fn encode_bucket_meta_wire_item(mut item: SRBucketMeta) -> SRBucketMeta {
 
 fn decode_bucket_meta_wire_value(raw: &str) -> Vec<u8> {
     BASE64_STANDARD
-        .decode(raw.as_bytes())
+        .decode_to_vec(raw.as_bytes())
         .ok()
         .filter(|decoded| std::str::from_utf8(decoded).is_ok())
         .unwrap_or_else(|| raw.as_bytes().to_vec())
@@ -7705,7 +7704,7 @@ fn site_resync_page(status: &SRResyncOpStatus, limit: usize, offset: usize) -> S
         };
         let encoded = serde_json::to_vec(&token)
             .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("encode resync cursor failed: {err}")))?;
-        URL_SAFE_NO_PAD.encode(encoded)
+        URL_SAFE_NO_PAD.encode_to_string(encoded)
     } else {
         String::new()
     };
@@ -7724,7 +7723,7 @@ fn parse_site_resync_page(query: &HashMap<String, String>, status: &SRResyncOpSt
     }
     let offset = if let Some(value) = query.get("continuationToken") {
         let decoded = URL_SAFE_NO_PAD
-            .decode(value)
+            .decode_to_vec(value)
             .map_err(|_| s3_error!(InvalidRequest, "invalid resync continuation token"))?;
         let token: SiteResyncContinuationToken =
             serde_json::from_slice(&decoded).map_err(|_| s3_error!(InvalidRequest, "invalid resync continuation token"))?;
@@ -14119,7 +14118,7 @@ mod tests {
         let bucket = SRBucketInfo {
             bucket: "photos".to_string(),
             created_at: Some(OffsetDateTime::UNIX_EPOCH),
-            object_lock_config: Some(BASE64_STANDARD.encode("<ObjectLockConfiguration/>")),
+            object_lock_config: Some(BASE64_STANDARD.encode_to_string("<ObjectLockConfiguration/>")),
             ..Default::default()
         };
         let bootstrap = bootstrap_bucket_make_op_path(&bucket);
@@ -14646,10 +14645,10 @@ mod tests {
             SRBucketInfo {
                 bucket: "photos".to_string(),
                 policy: Some(serde_json::json!({"Statement": []})),
-                versioning: Some(BASE64_STANDARD.encode("<VersioningConfiguration/>")),
-                quota_config: Some(BASE64_STANDARD.encode(r#"{"quota":1024}"#)),
-                expiry_lc_config: Some(BASE64_STANDARD.encode("<LifecycleConfiguration/>")),
-                object_lock_config: Some(BASE64_STANDARD.encode("<ObjectLockConfiguration/>")),
+                versioning: Some(BASE64_STANDARD.encode_to_string("<VersioningConfiguration/>")),
+                quota_config: Some(BASE64_STANDARD.encode_to_string(r#"{"quota":1024}"#)),
+                expiry_lc_config: Some(BASE64_STANDARD.encode_to_string("<LifecycleConfiguration/>")),
+                object_lock_config: Some(BASE64_STANDARD.encode_to_string("<ObjectLockConfiguration/>")),
                 created_at: Some(OffsetDateTime::UNIX_EPOCH),
                 api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 ..Default::default()
@@ -14688,7 +14687,7 @@ mod tests {
             "photos".to_string(),
             SRBucketInfo {
                 bucket: "photos".to_string(),
-                expiry_lc_config: Some(BASE64_STANDARD.encode("<LifecycleConfiguration/>")),
+                expiry_lc_config: Some(BASE64_STANDARD.encode_to_string("<LifecycleConfiguration/>")),
                 api_version: Some(SITE_REPL_API_VERSION.to_string()),
                 ..Default::default()
             },
@@ -17658,7 +17657,7 @@ mod tests {
     fn test_metainfo_bucket_config_values_are_base64_encoded() {
         let raw = br#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>"#;
 
-        assert_eq!(raw_config_to_base64(raw), Some(BASE64_STANDARD.encode(raw)));
+        assert_eq!(raw_config_to_base64(raw), Some(BASE64_STANDARD.encode_to_string(raw)));
         assert_ne!(raw_config_to_base64(raw), raw_config_to_string(raw));
         assert_eq!(raw_config_to_base64(&[]), None);
     }
@@ -18203,8 +18202,8 @@ mod tests {
         };
         let dep_a_xml = site_config_xml("dep-b");
         let dep_b_xml = site_config_xml("dep-a");
-        let dep_a_b64 = BASE64_STANDARD.encode(dep_a_xml.as_bytes());
-        let dep_b_b64 = BASE64_STANDARD.encode(dep_b_xml.as_bytes());
+        let dep_a_b64 = BASE64_STANDARD.encode_to_string(dep_a_xml.as_bytes());
+        let dep_b_b64 = BASE64_STANDARD.encode_to_string(dep_b_xml.as_bytes());
 
         // Both sites present the complete config in base64 wire form → NOT a mismatch.
         assert_eq!(

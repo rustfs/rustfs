@@ -652,11 +652,10 @@ const MPU_SSE_COMPRESSION_BUCKET: &str = "compression-mpu-sse-bucket";
 async fn start_rustfs_with_compression_and_sse(
     env: &mut RustFSTestEnvironment,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use base64::Engine;
     env.cleanup_existing_processes().await?;
 
     let binary_path = rustfs_binary_path();
-    let master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     // Server output goes to a file inside the per-test temp dir so a failing
     // run can be diagnosed from the child's logs.
     let server_log = std::fs::File::create(format!("{}/server.log", env.temp_dir))?;

@@ -641,6 +641,12 @@ for ecstore_private_module in \
     "mod ${ecstore_private_module};" \
     "ECStore legacy ${ecstore_private_module} root module crate-private visibility"
 done
+ECSTORE_CLIENT_SHIM_IMPORT_HITS_FILE="${TMP_DIR}/ecstore_client_shim_import_hits.txt"
+if rg -n --no-heading --glob '*.rs' 'crate::client::|^[[:space:]]+client::' \
+  "${ROOT_DIR}/crates/ecstore/src" >"${ECSTORE_CLIENT_SHIM_IMPORT_HITS_FILE}"; then
+  report_failure "ECStore client shim imports must use rustfs_s3_client directly"
+  cat "${ECSTORE_CLIENT_SHIM_IMPORT_HITS_FILE}" >&2
+fi
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
@@ -5448,9 +5454,11 @@ require_source_contains \
 # --- Leaf crates must stay free of internal dependencies (backlog#1834) ---
 # ARCHITECTURE.md invariant 2 names config, credentials, crypto, io-metrics,
 # and madmin as leaf crates that depend only on external crates. Allowlist:
-# io-metrics -> rustfs-s3-ops (contract crate; leaf-allowance adjudication is
-# tracked as backlog#1834 PR2). Adding any other rustfs-* dependency to a leaf
-# crate needs a maintainer decision, not a quiet Cargo.toml edit.
+# io-metrics -> rustfs-s3-ops. That edge is DECIDED in backlog#1834: allowed as a
+# pure-contract-crate exception (types/enums only, no I/O, no globals, no
+# non-contract internal deps), narrowed to exactly this edge. Adding any other
+# rustfs-* dependency to a leaf crate needs its own adjudication, not a quiet
+# Cargo.toml edit.
 LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
 : >"$LEAF_CRATE_DEP_HITS_FILE"
 (
@@ -5472,7 +5480,7 @@ LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
 )
 
 if [[ -s "$LEAF_CRATE_DEP_HITS_FILE" ]]; then
-  report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (allowlist: io-metrics -> rustfs-s3-ops, backlog#1834): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
+  report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (sole adjudicated exception, decided in backlog#1834: io-metrics -> rustfs-s3-ops, a pure contract crate; any new edge needs its own adjudication): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
 fi
 
 # --- ecstore module-level lint blankets (backlog#1823 step 9) ---

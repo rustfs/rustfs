@@ -127,8 +127,8 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
 
     let key1 = "01234567890123456789012345678901";
     let key2 = "98765432109876543210987654321098";
-    let key1_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key1);
-    let key2_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key2);
+    let key1_b64 = base64_simd::STANDARD.encode_to_string(key1);
+    let key2_b64 = base64_simd::STANDARD.encode_to_string(key2);
     let key1_md5 = sse_customer_key_md5_base64(key1);
     let key2_md5 = sse_customer_key_md5_base64(key2);
 

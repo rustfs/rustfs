@@ -568,7 +568,10 @@ pub(crate) fn compute_master_key_verifier(master_key: &str, salt: Option<&[u8]>,
     let mut hasher = Sha256::new();
     hasher.update(&framing);
     hasher.update(derived.as_slice());
-    Ok(format!("{prefix}{}", hex::encode(hasher.finalize())))
+    Ok(format!(
+        "{prefix}{}",
+        hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
+    ))
 }
 
 /// The bundle-level protection label is the weakest state observed across

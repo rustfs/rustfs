@@ -91,8 +91,7 @@ use crate::Sha256Hasher;
 use crate::compress_index::{Index, TryGetIndex};
 use crate::get_content_checksum;
 use crate::{DynReader, EtagReader, EtagResolvable, HardLimitReader, HashReaderDetector, WarpReader, boxed_reader, wrap_reader};
-use base64::Engine;
-use base64::engine::general_purpose;
+
 use http::HeaderMap;
 use pin_project_lite::pin_project;
 use s3s::TrailingHeaders;
@@ -582,8 +581,8 @@ impl AsyncRead for HashReader {
                             })
                         {
                             expected_content_hash.encoded = checksum_str;
-                            expected_content_hash.raw = general_purpose::STANDARD
-                                .decode(&expected_content_hash.encoded)
+                            expected_content_hash.raw = base64_simd::STANDARD
+                                .decode_to_vec(&expected_content_hash.encoded)
                                 .map_err(|_| std::io::Error::other("Invalid base64 checksum"))?;
 
                             if expected_content_hash.raw.is_empty() {
@@ -598,7 +597,7 @@ impl AsyncRead for HashReader {
                             && !expected_content_hash.checksum_type.trailing()
                         {
                             expected_content_hash.raw = content_hash;
-                            expected_content_hash.encoded = general_purpose::STANDARD.encode(&expected_content_hash.raw);
+                            expected_content_hash.encoded = base64_simd::STANDARD.encode_to_string(&expected_content_hash.raw);
                         } else if content_hash != expected_content_hash.raw {
                             let expected_hex = hex_simd::encode_to_string(&expected_content_hash.raw, hex_simd::AsciiCase::Lower);
                             let actual_hex = hex_simd::encode_to_string(content_hash, hex_simd::AsciiCase::Lower);

@@ -15,8 +15,7 @@
 use std::io::Read;
 use std::sync::Arc;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
+use base64_simd::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use p256::ecdsa::signature::Signer as _;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey as _;
@@ -89,10 +88,10 @@ impl RegistrationToken {
         }
         let document: RegistrationTokenDocument = serde_json::from_slice(&bytes).map_err(TokenError::Invalid)?;
         let decoded = BASE64_URL_NO_PAD
-            .decode(&document.registration_token_secret)
+            .decode_to_vec(&document.registration_token_secret)
             .map(Zeroizing::new)
             .map_err(|_| TokenError::SecretShape)?;
-        if decoded.len() != 32 || BASE64_URL_NO_PAD.encode(&decoded) != document.registration_token_secret {
+        if decoded.len() != 32 || BASE64_URL_NO_PAD.encode_to_string(&decoded) != document.registration_token_secret {
             return Err(TokenError::SecretShape);
         }
         if !is_uuid_v7(&document.registration_token_uid)
@@ -198,10 +197,10 @@ impl<'a> RotationRequest<'a> {
         request_id: &'a str,
         certificate_request: &'a str,
     ) -> Result<Self, CredentialValidationError> {
-        let csr_der = base64::engine::general_purpose::STANDARD
-            .decode(certificate_request)
+        let csr_der = base64_simd::STANDARD
+            .decode_to_vec(certificate_request)
             .map_err(|_| CredentialValidationError::CertificateRequest)?;
-        let csr_digest = BASE64_URL_NO_PAD.encode(Sha256::digest(&csr_der));
+        let csr_digest = BASE64_URL_NO_PAD.encode_to_string(Sha256::digest(&csr_der));
         let transcript = rotation_transcript(credential_fingerprint, device_name, request_id, &csr_digest)?;
         let key = identity
             .to_pkcs8_der()
@@ -216,7 +215,7 @@ impl<'a> RotationRequest<'a> {
             certificate_request,
             proof: ProofOwned {
                 algorithm: "ES256".to_string(),
-                value: BASE64_URL_NO_PAD.encode(canonical.to_bytes()),
+                value: BASE64_URL_NO_PAD.encode_to_string(canonical.to_bytes()),
             },
         })
     }
@@ -475,8 +474,8 @@ pub(crate) fn public_key_fingerprint(identity: &DeviceIdentity) -> String {
 }
 
 pub(crate) fn certificate_request_matches(encoded: &str, identity: &DeviceIdentity) -> Result<bool, CredentialValidationError> {
-    let der = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
+    let der = base64_simd::STANDARD
+        .decode_to_vec(encoded)
         .map_err(|_| CredentialValidationError::CertificateRequest)?;
     let (remaining, request) =
         X509CertificationRequest::from_der(&der).map_err(|_| CredentialValidationError::CertificateRequest)?;

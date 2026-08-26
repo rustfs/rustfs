@@ -722,8 +722,7 @@ impl Default for BackendCapabilities {
 mod tests {
     use super::*;
     use crate::config::KmsConfig;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64_simd::STANDARD as BASE64;
 
     /// Backend that implements only the trait-mandated operations and relies
     /// on the default `capabilities` implementation.
@@ -958,7 +957,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_backend_capabilities_golden() {
-        let config = KmsConfig::static_kms("static-key".to_string(), BASE64.encode([0u8; 32]));
+        let config = KmsConfig::static_kms("static-key".to_string(), BASE64.encode_to_string([0u8; 32]));
         let backend = static_kms::StaticKmsBackend::new(config)
             .await
             .expect("static backend should build");

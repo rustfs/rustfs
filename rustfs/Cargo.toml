@@ -310,7 +310,6 @@ astral-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 async_zip = { workspace = true, default-features = false, features = ["tokio", "deflate"] }
-base64 = { workspace = true }
 zeroize = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
@@ -352,9 +351,6 @@ rustfs-mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
-
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-rustfs-mimalloc-sys = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }

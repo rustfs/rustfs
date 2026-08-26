@@ -39,10 +39,6 @@ tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 metrics = { workspace = true }
-# Transitional shim deps (backlog#1843): dropped with the re-export shims once
-# every consumer imports the contracts crates directly.
-rustfs-heal-contracts = { workspace = true }
-rustfs-scanner-contracts = { workspace = true }
 smallvec = { workspace = true }
 tracing = { workspace = true }
 

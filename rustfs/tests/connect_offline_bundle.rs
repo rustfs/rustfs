@@ -22,7 +22,7 @@ use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64_simd::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier as _};
 use p256::pkcs8::DecodePublicKey as _;
 use rustfs::connect::DeviceIdentity;
@@ -169,7 +169,7 @@ fn connect_offline_bundle_is_deterministic_bounded_and_signed_over_exact_manifes
     assert_eq!(signature_document["signedFile"], "manifest.json");
     assert_eq!(signature_document["domainSeparationTag"], "rustfs-support-bundle-v1");
     let signature_bytes: [u8; 64] = URL_SAFE_NO_PAD
-        .decode(signature_document["value"].as_str().expect("signature value"))
+        .decode_to_vec(signature_document["value"].as_str().expect("signature value"))
         .expect("signature base64url")
         .try_into()
         .expect("fixed-width signature");
@@ -197,7 +197,7 @@ fn connect_offline_bundle_is_deterministic_bounded_and_signed_over_exact_manifes
         "organizations/0198f3a1-4c00-7a10-8b21-0c1d2e3f4a50/clusters/0198f3a1-5d00-7b20-9c31-1d2e3f4a5b61"
     );
     assert_eq!(manifest["deviceName"], DEVICE_NAME);
-    assert_eq!(manifest["nonce"], URL_SAFE_NO_PAD.encode([0x2a; 32]));
+    assert_eq!(manifest["nonce"], URL_SAFE_NO_PAD.encode_to_string([0x2a; 32]));
     assert_eq!(manifest["producedAt"], "2026-05-04T02:00:00Z");
     assert_eq!(manifest["redactionVersion"], REDACTION_VERSION);
     assert_eq!(manifest["rulesetHash"], RULESET_HASH);

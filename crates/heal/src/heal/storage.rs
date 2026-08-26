@@ -14,8 +14,7 @@
 
 use crate::{Error, Result};
 use async_trait::async_trait;
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64_simd::URL_SAFE_NO_PAD;
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
@@ -147,7 +146,7 @@ pub(crate) fn encode_heal_token(marker: Option<&str>, version_marker: Option<&st
     // serde_json of a simple two-Option struct cannot fail; fall back to an
     // empty object rather than panicking if it somehow does.
     let json = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
-    format!("{HEAL_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(json))
+    format!("{HEAL_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode_to_string(json))
 }
 
 /// Decode an opaque heal continuation token back into `(marker, version_marker)`.
@@ -174,7 +173,7 @@ pub(crate) fn decode_heal_token(token: &str) -> (Option<String>, Option<String>)
         return (None, None);
     };
 
-    let bytes = match URL_SAFE_NO_PAD.decode(encoded) {
+    let bytes = match URL_SAFE_NO_PAD.decode_to_vec(encoded) {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
@@ -234,7 +233,7 @@ const DISK_WALK_TOKEN_PREFIX: &str = "dw1:";
 /// enumerators can never misread each other's cursor: a `dw1:` token decodes to
 /// `(None, None)` under the B5 decoder, and a `v1:` token decodes to `None` here.
 pub(crate) fn encode_disk_walk_token(next_forward: &str) -> String {
-    format!("{DISK_WALK_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(next_forward.as_bytes()))
+    format!("{DISK_WALK_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode_to_string(next_forward.as_bytes()))
 }
 
 /// Decode a disk-walk continuation token back into the `next_forward` object key.
@@ -261,7 +260,7 @@ pub(crate) fn decode_disk_walk_token(token: &str) -> Option<String> {
         return None;
     };
 
-    let bytes = match URL_SAFE_NO_PAD.decode(encoded) {
+    let bytes = match URL_SAFE_NO_PAD.decode_to_vec(encoded) {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
@@ -1513,7 +1512,6 @@ mod tests {
         decode_disk_walk_token, decode_heal_token, encode_disk_walk_token, encode_heal_token, is_transient_object_exists_error,
         is_transient_object_exists_message, next_heal_listing_token,
     };
-    use base64::Engine as _;
 
     #[test]
     fn next_heal_listing_token_returns_none_for_complete_page() {
@@ -1564,7 +1562,7 @@ mod tests {
         assert_eq!(decode_heal_token("no-prefix-here"), (None, None));
         assert_eq!(decode_heal_token("v1:!!!not-base64!!!"), (None, None));
         // valid base64 of non-JSON bytes.
-        let bad_json = format!("v1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"not json"));
+        let bad_json = format!("v1:{}", base64_simd::URL_SAFE_NO_PAD.encode_to_string(b"not json"));
         assert_eq!(decode_heal_token(&bad_json), (None, None));
         // a raw v2-style list_objects_v2 token (no "v1:" prefix) resets cleanly.
         assert_eq!(decode_heal_token("some-opaque-legacy-token"), (None, None));
@@ -1576,7 +1574,7 @@ mod tests {
         // list_object_versions returns NotImplemented for that pairing.
         // Craft a token whose JSON encodes (None, Some) directly and confirm coercion.
         let json = br#"{"m":null,"v":"orphan-version"}"#;
-        let token = format!("v1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json));
+        let token = format!("v1:{}", base64_simd::URL_SAFE_NO_PAD.encode_to_string(json));
         assert_eq!(decode_heal_token(&token), (None, None), "version-only marker must coerce to (None, None)");
     }
 

@@ -34,7 +34,7 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use aws_sdk_s3::{Client, Config};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use futures::{Stream, StreamExt};
@@ -1244,7 +1244,7 @@ async fn wait_for_source_replication_pending_or_failed(
 }
 
 async fn wait_for_source_replication_status(client: &Client, bucket: &str, key: &str, expected: &str, ssec: bool) -> TestResult {
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
     let wait = async {
         loop {
@@ -1339,7 +1339,7 @@ async fn assert_failed_replication_stays_absent_for(
     ssec: bool,
     duration: Duration,
 ) -> TestResult {
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
     let wait = async {
         let deadline = tokio::time::Instant::now() + duration;
@@ -4332,7 +4332,7 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
     let target_client = target_env.create_s3_client();
     let key = "ssec-contract.txt";
     let body = b"repl-17 SSE-C payload";
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
 
     source_client
@@ -4387,7 +4387,7 @@ async fn test_bucket_replication_sse_c_contract() -> TestResult {
     );
 
     // A wrong customer key must fail too.
-    let wrong_key = BASE64_STANDARD.encode("99999999999999999999999999999999");
+    let wrong_key = BASE64_STANDARD.encode_to_string("99999999999999999999999999999999");
     let wrong_key_md5 = sse_customer_key_md5_base64("99999999999999999999999999999999");
     let wrong_read = target_client
         .get_object()
@@ -4423,7 +4423,7 @@ async fn test_bucket_replication_sse_c_multipart_passthrough() -> TestResult {
     let source_client = source_env.create_s3_client();
     let target_client = target_env.create_s3_client();
     let key = "ssec-mp-contract.bin";
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
 
     let created = source_client
@@ -4568,7 +4568,7 @@ async fn test_ssec_replication_fails_closed_when_target_drops_passthrough_header
     .await?;
     put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
 
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
     let put_ssec = |key: &'static str| {
         source_client
@@ -4741,7 +4741,7 @@ async fn test_bucket_replication_sse_c_heals_after_target_outage() -> TestResult
     let source_client = source_env.create_s3_client();
     let key = "ssec-heal-contract.txt";
     let body = b"repl-22 ssec heal payload".to_vec();
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
 
     // Target outage: the SSE-C write cannot replicate.
@@ -4856,7 +4856,7 @@ async fn test_bucket_replication_sse_c_existing_object_resync() -> TestResult {
     // The SSE-C object exists before any replication wiring.
     let key = "ssec-existing-contract.txt";
     let body = b"repl-22 ssec existing-object payload".to_vec();
-    let customer_key = BASE64_STANDARD.encode(REPL17_SSEC_KEY);
+    let customer_key = BASE64_STANDARD.encode_to_string(REPL17_SSEC_KEY);
     let customer_key_md5 = sse_customer_key_md5_base64(REPL17_SSEC_KEY);
     source_client
         .put_object()
@@ -9152,7 +9152,7 @@ async fn test_get_and_head_proxy_unreplicated_object_to_replication_target() -> 
     // the real SSE-C decryption; the plaintext fake simply ignores them).
     target.take_requests();
     let ssec_key = "01234567890123456789012345678901";
-    let ssec_key_b64 = BASE64_STANDARD.encode(ssec_key);
+    let ssec_key_b64 = BASE64_STANDARD.encode_to_string(ssec_key);
     let ssec_key_md5 = sse_customer_key_md5_base64(ssec_key);
     let _ = source_client
         .get_object()

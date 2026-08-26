@@ -21,6 +21,17 @@ message Error {
   string error_info = 2;
 }
 
+// Typed control-plane error discriminants carried alongside the legacy
+// error_info string on control-plane responses. Rolling-upgrade compat:
+// old peers ignore the field and keep reading error_info.
+// RUSTFS_COMPAT_TODO(not-initialized-error-code-v1): legacy string dual-write. Remove after the minimum supported RustFS peer version always sends error_code.
+enum ControlPlaneErrorCode {
+  CONTROL_PLANE_ERROR_UNSPECIFIED = 0;
+  // The peer answered but its storage/IAM layer is not initialized yet
+  // (legacy string form: "errServerNotInitialized").
+  CONTROL_PLANE_ERROR_NOT_INITIALIZED = 1;
+}
+
 message PingRequest {
   uint64 version = 1;
   bytes body = 2;
@@ -580,6 +591,7 @@ message LocalStorageInfoResponse {
   bool success = 1;
   bytes storage_info = 2;
   optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
 }
 
 message ServerInfoRequest {
@@ -726,6 +738,7 @@ message LoadBucketMetadataRequest {
 message LoadBucketMetadataResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message DeleteBucketMetadataRequest {
@@ -744,6 +757,7 @@ message DeletePolicyRequest {
 message DeletePolicyResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadPolicyRequest {
@@ -753,6 +767,7 @@ message LoadPolicyRequest {
 message LoadPolicyResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadPolicyMappingRequest {
@@ -764,6 +779,7 @@ message LoadPolicyMappingRequest {
 message LoadPolicyMappingResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message DeleteUserRequest {
@@ -773,6 +789,7 @@ message DeleteUserRequest {
 message DeleteUserResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message DeleteServiceAccountRequest {
@@ -782,6 +799,7 @@ message DeleteServiceAccountRequest {
 message DeleteServiceAccountResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadUserRequest {
@@ -792,6 +810,7 @@ message LoadUserRequest {
 message LoadUserResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadServiceAccountRequest {
@@ -801,6 +820,7 @@ message LoadServiceAccountRequest {
 message LoadServiceAccountResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadGroupRequest {
@@ -810,6 +830,7 @@ message LoadGroupRequest {
 message LoadGroupResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message ReloadSiteReplicationConfigRequest {}
@@ -817,6 +838,7 @@ message ReloadSiteReplicationConfigRequest {}
 message ReloadSiteReplicationConfigResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message SignalServiceRequest {
@@ -907,6 +929,7 @@ message BackgroundHealStatusResponse {
   bool success = 1;
   bytes bg_heal_state = 2;
   optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
 }
 
 message ReplacementRecoveryStatusRequest {}
@@ -915,6 +938,7 @@ message ReplacementRecoveryStatusResponse {
   bool success = 1;
   bytes recovery_status = 2;
   optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
 }
 
 message HealControlRequest {
@@ -955,6 +979,7 @@ message ReloadPoolMetaRequest {}
 message ReloadPoolMetaResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message StopRebalanceRequest {
@@ -964,6 +989,7 @@ message StopRebalanceRequest {
 message StopRebalanceResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadRebalanceMetaRequest {
@@ -973,6 +999,7 @@ message LoadRebalanceMetaRequest {
 message LoadRebalanceMetaResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message StartDecommissionRequest {
@@ -982,6 +1009,7 @@ message StartDecommissionRequest {
 message StartDecommissionResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message CancelDecommissionRequest {
@@ -991,6 +1019,7 @@ message CancelDecommissionRequest {
 message CancelDecommissionResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message ClearDecommissionRequest {
@@ -1000,6 +1029,7 @@ message ClearDecommissionRequest {
 message ClearDecommissionResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadTransitionTierConfigRequest {}
@@ -1007,6 +1037,7 @@ message LoadTransitionTierConfigRequest {}
 message LoadTransitionTierConfigResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message TierMutationPrepareRequest {

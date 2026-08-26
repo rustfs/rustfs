@@ -305,7 +305,7 @@ pub fn redact_encryption_context(encryption_context: &HashMap<String, String>) -
 }
 
 fn digest_value(value: &str) -> String {
-    let digest = hex::encode(Sha256::digest(value.as_bytes()));
+    let digest = hex_simd::encode_to_string(Sha256::digest(value.as_bytes()), hex_simd::AsciiCase::Lower);
     format!("{DIGEST_PREFIX}{}", &digest[..DIGEST_LEN])
 }
 

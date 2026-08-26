@@ -30,7 +30,6 @@ default = []
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
-    "rustfs-common/hotpath",
     "rustfs-config/hotpath",
     "rustfs-replication/hotpath",
     "rustfs-storage-api/hotpath",
@@ -38,7 +37,6 @@ hotpath = [
 hotpath-alloc = [
     "hotpath",
     "hotpath/hotpath-alloc",
-    "rustfs-common/hotpath-alloc",
     "rustfs-config/hotpath-alloc",
     "rustfs-replication/hotpath-alloc",
     "rustfs-storage-api/hotpath-alloc",
@@ -46,7 +44,6 @@ hotpath-alloc = [
 hotpath-cpu = [
     "hotpath",
     "hotpath/hotpath-cpu",
-    "rustfs-common/hotpath-cpu",
     "rustfs-config/hotpath-cpu",
     "rustfs-replication/hotpath-cpu",
     "rustfs-storage-api/hotpath-cpu",
@@ -56,7 +53,6 @@ hotpath-cpu = [
 hotpath.workspace = true
 async-trait.workspace = true
 metrics.workspace = true
-rustfs-common.workspace = true
 rustfs-scanner-contracts.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-replication.workspace = true

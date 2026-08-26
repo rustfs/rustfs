@@ -57,7 +57,7 @@ hotpath.workspace = true
 aes-gcm = { workspace = true, features = ["rand_core"] }
 bytes = { workspace = true, features = ["serde"] }
 chacha20poly1305.workspace = true
-hex.workspace = true
+hex-simd.workspace = true
 hmac.workspace = true
 minlz.workspace = true
 pin-project-lite.workspace = true

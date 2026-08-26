@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::errors::ChecksumMismatch;
-use base64::{Engine as _, engine::general_purpose};
+use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use http::HeaderMap;
 use sha1::Sha1;
@@ -330,7 +330,7 @@ impl Checksum {
         let mut hasher = checksum_type.hasher()?;
         hasher.write_all(data).ok()?;
         let raw = hasher.finalize();
-        let encoded = general_purpose::STANDARD.encode(&raw);
+        let encoded = BASE64_STANDARD.encode_to_string(&raw);
 
         let checksum = Checksum {
             checksum_type,
@@ -369,7 +369,7 @@ impl Checksum {
             value_string = value.to_string();
         }
         // let raw = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(&value_string).ok()?;
-        let raw = general_purpose::STANDARD.decode(&value_string).ok()?;
+        let raw = BASE64_STANDARD.decode_to_vec(&value_string).ok()?;
 
         let checksum = Checksum {
             checksum_type,
@@ -413,14 +413,14 @@ impl Checksum {
         if self.want_parts > 0 && self.want_parts != parts {
             return Err(ChecksumMismatch {
                 want: format!("{}-{}", self.encoded, self.want_parts),
-                got: format!("{}-{}", general_purpose::STANDARD.encode(&sum), parts),
+                got: format!("{}-{}", base64_simd::STANDARD.encode_to_string(&sum), parts),
             });
         }
 
         if sum != self.raw {
             return Err(ChecksumMismatch {
                 want: self.encoded.clone(),
-                got: general_purpose::STANDARD.encode(&sum),
+                got: base64_simd::STANDARD.encode_to_string(&sum),
             });
         }
 
@@ -569,7 +569,7 @@ impl Checksum {
             }
         }
 
-        self.encoded = general_purpose::STANDARD.encode(&self.raw);
+        self.encoded = base64_simd::STANDARD.encode_to_string(&self.raw);
         Ok(())
     }
 }
@@ -1160,7 +1160,7 @@ pub fn read_checksums(mut buf: &[u8], part: i32) -> (HashMap<String, String>, bo
 
         let checksum_bytes = &buf[..length];
         buf = &buf[length..];
-        let mut checksum_str = general_purpose::STANDARD.encode(checksum_bytes);
+        let mut checksum_str = base64_simd::STANDARD.encode_to_string(checksum_bytes);
 
         if checksum_type.is(ChecksumType::MULTIPART) {
             is_multipart = true;
@@ -1190,7 +1190,7 @@ pub fn read_checksums(mut buf: &[u8], part: i32) -> (HashMap<String, String>, bo
                 if part > 0 && (part as u64) <= parts_count {
                     let offset = ((part - 1) as usize) * length;
                     let part_checksum = &buf[offset..offset + length];
-                    checksum_str = general_purpose::STANDARD.encode(part_checksum);
+                    checksum_str = base64_simd::STANDARD.encode_to_string(part_checksum);
                 }
                 buf = &buf[want_len..];
             }
@@ -1249,7 +1249,7 @@ pub fn read_part_checksums(mut buf: &[u8]) -> Vec<HashMap<String, String>> {
 
             let checksum_bytes = &buf[..length];
             buf = &buf[length..];
-            let checksum_str = general_purpose::STANDARD.encode(checksum_bytes);
+            let checksum_str = base64_simd::STANDARD.encode_to_string(checksum_bytes);
 
             part_checksum.insert(checksum_type.to_string(), checksum_str);
         }
@@ -1553,7 +1553,6 @@ mod tests {
     // asserted alongside the raw hex so both the digest and its encoding are pinned.
     #[test]
     fn xxhash_sha512_regression_lock_non_empty() {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
         let data = b"The quick brown fox jumps over the lazy dog";
 
         // XXH3-64(fox) = 0xce7d19a5418fb365 is the official upstream vector.
@@ -1565,7 +1564,11 @@ mod tests {
             let got_hex: String = c.raw.iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(got_hex, want_hex, "{t:?} raw hex drifted");
             // encoded field must be the standard-base64 of raw (S3 wire form)
-            assert_eq!(c.encoded, STANDARD.encode(&c.raw), "{t:?} encoded field != base64(raw)");
+            assert_eq!(
+                c.encoded,
+                base64_simd::STANDARD.encode_to_string(&c.raw),
+                "{t:?} encoded field != base64(raw)"
+            );
         }
     }
 

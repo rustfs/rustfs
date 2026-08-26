@@ -28,7 +28,6 @@ use aws_sdk_s3::types::{
     BucketLifecycleConfiguration, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, ExpirationStatus,
     LifecycleRule, LifecycleRuleFilter, ServerSideEncryption, Transition, TransitionStorageClass, VersioningConfiguration,
 };
-use base64::Engine;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use http::header::{CONTENT_ENCODING, HOST};
@@ -1808,7 +1807,7 @@ async fn four_node_inline_fallback_controls() -> TestResult {
     let collector = OtlpMetricCollector::start().await?;
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
     configure_reader_metric_cluster(&mut cluster, &collector);
-    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let sse_master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     cluster.set_env("RUSTFS_SSE_S3_MASTER_KEY", &sse_master_key);
     cluster.start().await?;
 
@@ -2017,7 +2016,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls() -> Te
 
     let collector = OtlpMetricCollector::start().await?;
     let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
-    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let sse_master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     cluster.set_env("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key);
     cluster.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
     cluster.set_env("RUSTFS_COMPRESSION_MULTIPART_ENABLED", "true");
@@ -2489,7 +2488,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
     hot.set_env("RUSTFS_SCANNER_CYCLE", "1");
     hot.set_env("RUSTFS_ILM_PROCESS_TIME", "1");
 
-    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let sse_master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     hot.set_env("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key);
     hot.set_env("RUSTFS_COMPRESSION_ENABLED", "true");
     hot.start().await?;

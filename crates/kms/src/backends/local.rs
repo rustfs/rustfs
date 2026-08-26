@@ -33,7 +33,7 @@ use aes_gcm::{
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64_simd::STANDARD as BASE64;
 use jiff::Zoned;
 use rand::RngExt;
 use serde::de::{self, IgnoredAny, MapAccess, Visitor};
@@ -1268,7 +1268,7 @@ impl LocalKmsClient {
         }
 
         let encrypted_bytes = BASE64
-            .decode(&stored_key.encrypted_key_material)
+            .decode_to_vec(&stored_key.encrypted_key_material)
             .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key material is not valid base64: {e}")))?;
 
         let effective_protection = if stored_key.at_rest_protection == StoredKeyProtection::LegacyUnspecified {
@@ -1406,13 +1406,17 @@ impl LocalKmsClient {
                 .encrypt(&nonce, key_material)
                 .map_err(|e| KmsError::cryptographic_error("encrypt", e.to_string()))?;
             // Encode encrypted bytes to base64 string
-            (BASE64.encode(&encrypted), nonce.to_vec(), StoredKeyProtection::EncryptedMasterKey)
+            (
+                BASE64.encode_to_string(&encrypted),
+                nonce.to_vec(),
+                StoredKeyProtection::EncryptedMasterKey,
+            )
         } else {
             warn!(
                 key_id = %master_key.key_id,
                 "Local KMS is storing key material as plaintext-dev-only because no master key is configured"
             );
-            (BASE64.encode(key_material), Vec::new(), StoredKeyProtection::PlaintextDevOnly)
+            (BASE64.encode_to_string(key_material), Vec::new(), StoredKeyProtection::PlaintextDevOnly)
         };
 
         let stored_key = StoredMasterKey {
@@ -2648,10 +2652,10 @@ mod tests {
 
         let tampered_material = {
             let mut material = BASE64
-                .decode(pristine["encrypted_key_material"].as_str().expect("material is a string"))
+                .decode_to_vec(pristine["encrypted_key_material"].as_str().expect("material is a string"))
                 .expect("decode pristine material");
             *material.last_mut().expect("material is not empty") ^= 0x01;
-            BASE64.encode(&material)
+            BASE64.encode_to_string(&material)
         };
 
         type PoisonCase = (&'static str, Vec<u8>, fn(&KmsError) -> bool);
@@ -2976,7 +2980,7 @@ mod tests {
             "created_at": "2024-01-01T00:00:00+00:00",
             "rotated_at": serde_json::Value::Null,
             "created_by": "legacy-test",
-            "encrypted_key_material": BASE64.encode([7u8; 32]),
+            "encrypted_key_material": BASE64.encode_to_string([7u8; 32]),
             "nonce": Vec::<u8>::new()
         });
 

@@ -27,11 +27,10 @@
 //! digest does not match. Raw `xl.meta`, object contents, drive paths,
 //! endpoints, user metadata, and encryption keys are never archive entries.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::DiskError;
 use crate::storage::{StorageDiskRpcExt, all_local_disk};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -576,16 +575,10 @@ fn inspect_archive_gate_actions() -> Vec<Action> {
 #[async_trait::async_trait]
 impl Operation for InspectArchiveHandler {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials.as_ref() else {
+        if req.credentials.is_none() {
             return Err(s3_error!(AccessDenied, "Signature is required"));
-        };
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-        let remote_addr = req
-            .extensions
-            .get::<Option<RemoteAddr>>()
-            .and_then(|opt| opt.map(|addr| addr.0));
-        validate_admin_request(&req.headers, &cred, owner, false, inspect_archive_gate_actions(), remote_addr).await?;
+        }
+        authorize_admin_request(&req, inspect_archive_gate_actions()).await?;
 
         let body = req
             .input
@@ -1003,5 +996,42 @@ mod tests {
             .await
             .expect_err("unsigned request should fail");
         assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+        // The shared gate reports InvalidRequest / "get cred failed"; the pre-check
+        // keeps this endpoint's own signature-required response (rustfs/backlog#1829).
+        assert_eq!(error.message(), Some("Signature is required"));
+    }
+
+    /// The handler authorizes through the shared admin gate and still derives its
+    /// action vector from `inspect_archive_gate_actions()` (rustfs/backlog#1829).
+    #[test]
+    fn inspect_archive_handler_uses_the_shared_admin_gate_with_its_gate_actions() {
+        let production = include_str!("inspect_archive.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let block = production
+            .split_once("impl Operation for InspectArchiveHandler")
+            .expect("the inspect archive handler must exist")
+            .1;
+
+        assert_eq!(
+            block.matches("authorize_admin_request(").count(),
+            1,
+            "InspectArchiveHandler must use exactly one shared gate"
+        );
+        assert!(
+            block.contains("authorize_admin_request(&req, inspect_archive_gate_actions())"),
+            "InspectArchiveHandler must keep deriving its actions from inspect_archive_gate_actions()"
+        );
+        assert_eq!(
+            block.matches("Action::AdminAction(").count(),
+            0,
+            "InspectArchiveHandler must not inline an action vector"
+        );
+        assert!(
+            !block.contains("let cred = authorize_admin_request("),
+            "InspectArchiveHandler does not need the authenticated credentials"
+        );
+        assert!(!production.contains("check_key_valid(get_session_token"));
     }
 }

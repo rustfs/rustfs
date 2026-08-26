@@ -50,8 +50,8 @@ aes-gcm = { workspace = true, features = ["rand_core"] }
 argon2 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
-base64 = { workspace = true }
-hex = { workspace = true }
+base64-simd = { workspace = true }
+hex-simd = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 zeroize = { workspace = true, features = ["derive"] }

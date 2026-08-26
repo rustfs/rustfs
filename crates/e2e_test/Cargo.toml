@@ -121,10 +121,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 urlencoding.workspace = true
 walkdir.workspace = true
-base64 = { workspace = true }
+base64-simd = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
-hex = { workspace = true }
+hex-simd = { workspace = true }
 md-5 = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost.workspace = true

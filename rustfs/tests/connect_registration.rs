@@ -18,8 +18,7 @@ use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
+use base64_simd::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper::service::service_fn;
@@ -359,9 +358,9 @@ fn verify_rotation_request(request: &Value, current_public_key: &[u8], fingerpri
     assert_eq!(request["protocolVersion"], "v1");
     assert_eq!(request["proof"]["algorithm"], "ES256");
     let csr = BASE64_STANDARD
-        .decode(request["certificateRequest"].as_str().expect("certificateRequest"))
+        .decode_to_vec(request["certificateRequest"].as_str().expect("certificateRequest"))
         .expect("CSR base64");
-    let csr_digest = BASE64_URL_NO_PAD.encode(Sha256::digest(&csr));
+    let csr_digest = BASE64_URL_NO_PAD.encode_to_string(Sha256::digest(&csr));
     let request_id = request["requestId"].as_str().expect("requestId");
     let transcript = rebuilt_rotation_transcript(
         b"RUSTFS-CONNECT-CREDENTIAL-ROTATION-V1",
@@ -369,7 +368,7 @@ fn verify_rotation_request(request: &Value, current_public_key: &[u8], fingerpri
     );
     let encoded = request["proof"]["value"].as_str().expect("proof value");
     assert_eq!(encoded.len(), 86);
-    let raw = BASE64_URL_NO_PAD.decode(encoded).expect("proof base64url");
+    let raw = BASE64_URL_NO_PAD.decode_to_vec(encoded).expect("proof base64url");
     let signature = Signature::from_slice(&raw).expect("fixed-width signature");
     assert_eq!(signature.normalize_s(), signature, "rotation proof must be low-S");
     let verifying = VerifyingKey::from_public_key_der(current_public_key).expect("current public key");
