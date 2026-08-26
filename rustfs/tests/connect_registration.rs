@@ -427,10 +427,13 @@ fn secure_tempdir() -> tempfile::TempDir {
         .expect("test home directory must resolve without symlink components");
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
         .expect("test home directory permissions must be restricted to the process owner");
-    tempfile::Builder::new()
+    let temp = tempfile::Builder::new()
         .prefix(".connect-registration-")
         .tempdir_in(home)
-        .expect("temporary directory inside the protected home directory")
+        .expect("temporary directory inside the protected home directory");
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+        .expect("temporary state root permissions must be restricted to the process owner");
+    temp
 }
 
 fn stage_next_identity(temp: &tempfile::TempDir) -> DeviceIdentity {
