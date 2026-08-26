@@ -18,8 +18,9 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use crate::client::bucket_cache::BucketLocationCache;
-use crate::client::{
+use crate::bucket_cache::BucketLocationCache;
+use crate::checksum::ChecksumMode;
+use crate::{
     api_error_response::ErrorResponse,
     api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
     api_get_options::GetObjectOptions,
@@ -34,7 +35,6 @@ use crate::client::{
     provider_versions::{BucketVersioningState, ProviderVersionCapabilities, RemoteVersion},
     signer_error,
 };
-use crate::{client::checksum::ChecksumMode, object_api::GetObjectReader};
 use futures::{Future, StreamExt};
 use http::{HeaderMap, HeaderName};
 use http::{
@@ -79,16 +79,17 @@ use std::{
 use time::Duration;
 use time::OffsetDateTime;
 use tokio::io::BufReader;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, error, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 const C_USER_AGENT: &str = "RustFS (linux; x86)";
-pub(crate) const MAX_S3_ERROR_RESPONSE_SIZE: usize = 64 * 1024;
+pub const MAX_S3_ERROR_RESPONSE_SIZE: usize = 64 * 1024;
 
 const SUCCESS_STATUS: [StatusCode; 3] = [StatusCode::OK, StatusCode::NO_CONTENT, StatusCode::PARTIAL_CONTENT];
 
-pub(crate) async fn collect_response_body<B>(body: B, limit: usize) -> Result<Vec<u8>, std::io::Error>
+pub async fn collect_response_body<B>(body: B, limit: usize) -> Result<Vec<u8>, std::io::Error>
 where
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -135,10 +136,42 @@ fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> s
     signer_error::signer_error_to_io_error(scope, error)
 }
 
-//pub type ReaderImpl = Box<dyn Reader + Send + Sync + 'static>;
+/// Streaming object body handed to the client by the storage engine. The
+/// client only ever reads it to completion, so the engine-side reader type
+/// (e.g. ecstore's `GetObjectReader`) stays behind this boxed `AsyncRead`.
+pub struct ObjectReader(Box<dyn AsyncRead + Send + Sync + Unpin>);
+
+impl ObjectReader {
+    pub fn new(reader: impl AsyncRead + Send + Sync + Unpin + 'static) -> Self {
+        Self(Box::new(reader))
+    }
+
+    pub async fn read_all(&mut self) -> Result<Vec<u8>, std::io::Error> {
+        let mut data = Vec::new();
+        self.0.read_to_end(&mut data).await?;
+        Ok(data)
+    }
+}
+
+impl std::fmt::Debug for ObjectReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ObjectReader")
+    }
+}
+
+impl AsyncRead for ObjectReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
 pub enum ReaderImpl {
     Body(Bytes),
-    ObjectBody(GetObjectReader),
+    ObjectBody(ObjectReader),
 }
 
 pub type ReadCloser = BufReader<Cursor<Vec<u8>>>;
@@ -223,8 +256,8 @@ where
 async fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
     with_rustls_init_guard(|| Ok(()))?;
 
-    let outbound_tls = crate::client::runtime_sources::transition_client_outbound_tls_state().await;
-    crate::client::runtime_sources::record_transition_client_tls_generation(outbound_tls.generation.0);
+    let outbound_tls = crate::runtime_sources::transition_client_outbound_tls_state().await;
+    crate::runtime_sources::record_transition_client_tls_generation(outbound_tls.generation.0);
     let builder = if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
         let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
         let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)
@@ -336,15 +369,15 @@ impl TransitionClient {
         self.endpoint_url.clone()
     }
 
-    pub(crate) fn provider_version_capabilities(&self) -> ProviderVersionCapabilities {
+    pub fn provider_version_capabilities(&self) -> ProviderVersionCapabilities {
         ProviderVersionCapabilities::for_tier_type(&self.tier_type)
     }
 
-    pub(crate) fn raw_version_id<'a>(&self, headers: &'a HeaderMap) -> Result<Option<&'a str>, std::io::Error> {
+    pub fn raw_version_id<'a>(&self, headers: &'a HeaderMap) -> Result<Option<&'a str>, std::io::Error> {
         self.provider_version_capabilities().raw_version_id(headers)
     }
 
-    pub(crate) fn remote_version(
+    pub fn remote_version(
         &self,
         headers: &HeaderMap,
         versioning: BucketVersioningState,
@@ -352,7 +385,7 @@ impl TransitionClient {
         self.provider_version_capabilities().remote_version(headers, versioning)
     }
 
-    pub(crate) fn legacy_remote_version_id(&self, headers: &HeaderMap) -> Result<String, std::io::Error> {
+    pub fn legacy_remote_version_id(&self, headers: &HeaderMap) -> Result<String, std::io::Error> {
         Ok(self
             .remote_version(headers, BucketVersioningState::Unknown)?
             .exact_id()
@@ -934,8 +967,8 @@ impl TransitionCore {
         //    part_id, start_offset, length, metadata)
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            crate::client::credentials::ErrorResponse {
-                sts_error: crate::client::credentials::STSError {
+            crate::credentials::ErrorResponse {
+                sts_error: crate::credentials::STSError {
                     r#type: "".to_string(),
                     code: "NotImplemented".to_string(),
                     message: format!(
@@ -1147,7 +1180,7 @@ impl Default for ObjectInfo {
 
 impl ObjectInfo {
     #[allow(dead_code, reason = "MinIO-parity accessor with no caller in this port (backlog#1823)")]
-    pub(crate) fn remote_version(
+    pub fn remote_version(
         &self,
         capabilities: ProviderVersionCapabilities,
         versioning: BucketVersioningState,
@@ -1229,7 +1262,7 @@ pub fn to_object_info(bucket_name: &str, object_name: &str, h: &HeaderMap) -> Re
     to_object_info_for_provider(bucket_name, object_name, h, ProviderVersionCapabilities::for_tier_type("s3"))
 }
 
-pub(crate) fn to_object_info_for_provider(
+pub fn to_object_info_for_provider(
     bucket_name: &str,
     object_name: &str,
     h: &HeaderMap,
@@ -1475,7 +1508,7 @@ mod tests {
         MAX_S3_CLIENT_RESPONSE_SIZE, MAX_S3_ERROR_RESPONSE_SIZE, SignatureType, build_tls_config, collect_response_body,
         signer_error_to_io_error, to_object_info_for_provider, validate_header_values, with_rustls_init_guard,
     };
-    use crate::client::provider_versions::{BucketVersioningState, ProviderVersionCapabilities, RemoteVersion};
+    use crate::provider_versions::{BucketVersioningState, ProviderVersionCapabilities, RemoteVersion};
     use http::{HeaderMap, HeaderValue};
     use http_body_util::Full;
     use hyper::body::Bytes;

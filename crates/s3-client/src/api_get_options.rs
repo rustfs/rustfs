@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 use tracing::warn;
 
-use crate::client::api_error_response::err_invalid_argument;
+use crate::api_error_response::err_invalid_argument;
 
 #[derive(Default)]
 pub struct AdvancedGetOptions {

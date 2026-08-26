@@ -2205,7 +2205,7 @@ impl SetDisks {
         }
         let current = read_object_transaction_epoch_fence(self, bucket, object)
             .await
-            .map_err(DiskError::from)?;
+            .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
         let disks = self.get_disks_internal().await;
         let mut removed = 0usize;
 
@@ -7332,12 +7332,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let expected_size = u64::try_from(fi.size).map_err(|_| StorageError::FileCorrupt)?;
         let (pr, pw) = tokio::io::duplex(fi.erasure.block_size);
         let consumed = Arc::new(AtomicU64::new(0));
-        let reader = ReaderImpl::ObjectBody(GetObjectReader {
-            stream: Box::new(TransitionUploadReader::new(pr, Arc::clone(&consumed))),
-            object_info: oi,
-            buffered_body: None,
-            body_source: GetObjectBodySource::Unprobed,
-        });
+        let reader = ReaderImpl::ObjectBody(ObjectReader::new(TransitionUploadReader::new(pr, Arc::clone(&consumed))));
 
         let cloned_bucket = bucket.to_string();
         let cloned_object = object.to_string();

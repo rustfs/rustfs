@@ -27,7 +27,7 @@ use std::task::{Context, Poll};
 use tokio::io::BufReader;
 use tokio_util::io::StreamReader;
 
-use crate::client::{
+use crate::{
     api_error_response::err_invalid_argument,
     api_get_options::GetObjectOptions,
     transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info_for_provider},

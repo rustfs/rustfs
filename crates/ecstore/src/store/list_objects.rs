@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Narrow a store error into the filemeta vocabulary for `MetaCacheEntriesSortedResult.err`.
+/// Faithful port of the retired blanket `From<StorageError> for rustfs_filemeta::Error`:
+/// unmatched variants fold into the io-backed `other()`, whose boxed identity the io bridge
+/// recovers on the way back (see conversion_roundtrip_tests).
+fn to_filemeta_err(err: Error) -> rustfs_filemeta::Error {
+    err.narrow_to_filemeta().unwrap_or_else(rustfs_filemeta::Error::other)
+}
+
 use crate::bucket::metadata_sys::{get_versioning_config, has_authoritative_never_versioned_state};
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
@@ -3162,7 +3170,7 @@ impl ECStore {
                 .list_path(&page_opts)
                 .await
                 .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                    err: Some(err.into()),
+                    err: Some(to_filemeta_err(err)),
                     ..Default::default()
                 });
             let reached_end = match list_result.err.take() {
@@ -3525,7 +3533,7 @@ impl ECStore {
                         .list_path(&provider_opts)
                         .await
                         .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                            err: Some(err.into()),
+                            err: Some(to_filemeta_err(err)),
                             ..Default::default()
                         });
 
@@ -3788,7 +3796,7 @@ impl ECStore {
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -3928,7 +3936,7 @@ impl ECStore {
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -4109,7 +4117,7 @@ impl ECStore {
                 match res{
                     Ok(err) => {
                         log_list_path_worker_error("store", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(err.as_ref().clone().into()) }
+                        MetaCacheEntriesSortedResult{ entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
                     },
                     Err(err) => {
                         log_list_path_worker_error("store", "error_channel_closed", &log_context, &err);
@@ -4129,7 +4137,7 @@ impl ECStore {
 
         if let Ok(err) = err_rx.try_recv() {
             log_list_path_worker_error("store", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(err.as_ref().clone().into());
+            result.err = Some(to_filemeta_err(err.as_ref().clone()));
         }
 
         if result.err.is_some() {
@@ -4150,7 +4158,7 @@ impl ECStore {
             }
 
             if !truncated {
-                result.err = Some(Error::Unexpected.into());
+                result.err = Some(rustfs_filemeta::Error::Unexpected);
             }
         }
 
@@ -4350,7 +4358,7 @@ impl ECStore {
                     let reader_disks = disks.len();
 
                     let path = base_dir_from_prefix(prefix);
-                    ensure_non_empty_listing_disks(bucket, &path, &disks)?;
+                    ensure_non_empty_listing_disks(bucket, &path, &disks).map_err(to_filemeta_err)?;
 
                     let mut filter_prefix = {
                         prefix
@@ -4816,7 +4824,7 @@ async fn gather_results(
                 o: MetaCacheEntries(entries),
                 ..Default::default()
             }),
-            err: Some(Error::Unexpected.into()),
+            err: Some(rustfs_filemeta::Error::Unexpected),
         })
         .await
         .is_err()
@@ -5133,7 +5141,7 @@ impl Sets {
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -5222,7 +5230,7 @@ impl Sets {
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -5383,7 +5391,7 @@ impl Sets {
                 match res {
                     Ok(err) => {
                         log_list_path_worker_error("sets", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(err.as_ref().clone().into()) }
+                        MetaCacheEntriesSortedResult { entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
                     },
                     Err(err) => {
                         log_list_path_worker_error("sets", "error_channel_closed", &log_context, &err);
@@ -5398,7 +5406,7 @@ impl Sets {
 
         if let Ok(err) = err_rx.try_recv() {
             log_list_path_worker_error("sets", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(err.as_ref().clone().into());
+            result.err = Some(to_filemeta_err(err.as_ref().clone()));
         }
 
         if result.err.is_some() {
@@ -5419,7 +5427,7 @@ impl Sets {
             }
 
             if !truncated {
-                result.err = Some(Error::Unexpected.into());
+                result.err = Some(rustfs_filemeta::Error::Unexpected);
             }
         }
 
@@ -5584,7 +5592,7 @@ impl Sets {
                 let reader_disks = disks.len();
 
                 let path = base_dir_from_prefix(prefix);
-                ensure_non_empty_listing_disks(bucket, &path, &disks)?;
+                ensure_non_empty_listing_disks(bucket, &path, &disks).map_err(to_filemeta_err)?;
 
                 let mut filter_prefix = prefix
                     .trim_start_matches(&path)
@@ -5911,7 +5919,7 @@ impl SetDisks {
             .list_path_result(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -6040,7 +6048,7 @@ impl SetDisks {
             .list_path_result(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -6128,7 +6136,7 @@ impl SetDisks {
             .list_path_result(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
-                err: Some(err.into()),
+                err: Some(to_filemeta_err(err)),
                 ..Default::default()
             });
         let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
@@ -6436,7 +6444,7 @@ impl SetDisks {
                 match res {
                     Ok(err) => {
                         log_list_path_worker_error("set_disks", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(err.as_ref().clone().into()) }
+                        MetaCacheEntriesSortedResult { entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
                     },
                     Err(err) => {
                         log_list_path_worker_error("set_disks", "error_channel_closed", &log_context, &err);
@@ -6451,7 +6459,7 @@ impl SetDisks {
 
         if let Ok(err) = err_rx.try_recv() {
             log_list_path_worker_error("set_disks", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(err.as_ref().clone().into());
+            result.err = Some(to_filemeta_err(err.as_ref().clone()));
         }
 
         if result.err.is_some() {
@@ -6472,7 +6480,7 @@ impl SetDisks {
             }
 
             if !truncated {
-                result.err = Some(Error::Unexpected.into());
+                result.err = Some(rustfs_filemeta::Error::Unexpected);
             }
         }
 

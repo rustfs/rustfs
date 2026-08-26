@@ -23,10 +23,9 @@ use lazy_static::lazy_static;
 use rustfs_checksums::ChecksumAlgorithm;
 use std::collections::HashMap;
 
-use crate::client::utils::base64_decode;
-use crate::client::utils::base64_encode;
-use crate::client::{api_put_object::PutObjectOptions, api_s3_datatypes::ObjectPart};
-use crate::{disk::DiskAPI, object_api::GetObjectReader};
+use crate::utils::base64_decode;
+use crate::utils::base64_encode;
+use crate::{api_put_object::PutObjectOptions, api_s3_datatypes::ObjectPart};
 // s3s::header has no CRC64NVME constant yet; the canonical RustFS copy lives
 // in rustfs-utils' headers module.
 use rustfs_utils::http::headers::AMZ_CHECKSUM_CRC64NVME;

@@ -55,7 +55,7 @@ use crate::bucket::replication::{
 };
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
+use crate::client::{object_api_utils::get_raw_etag, transition_api::ObjectReader, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
