@@ -906,13 +906,14 @@ async fn heartbeat_runtime_respects_rotation_retry_after_without_blocking_heartb
     let pki = TestPki::new();
     let server = server_with_client_auth(
         &pki,
-        std::iter::once(Reply::RateLimited("1"))
+        std::iter::once(Reply::RateLimited("5"))
             .chain((0..8).map(|_| Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:03Z"))))
             .collect(),
         true,
     )
     .await;
-    let (config, _, _) = due_runtime_config(&temp, &pki, &server.endpoint);
+    let (mut config, _, _) = due_runtime_config(&temp, &pki, &server.endpoint);
+    config.schedule.max_backoff = Duration::from_secs(5);
     let shutdown = CancellationToken::new();
     let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, || CoarseNodeSummary::new(1, 1, 0).expect("node summary"))
         .expect("start heartbeat runtime")

@@ -14696,7 +14696,7 @@ mod tests {
     async fn execute_get_object_resumes_from_relocated_pool_without_splicing_body() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 
-        let (_temp_dir, pool_disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let (temp_dir, pool_disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
         if current_app_context().is_none() {
             crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
         }
@@ -14745,35 +14745,37 @@ mod tests {
             .take()
             .expect("multi-pool GET response must include a body");
 
-        // Open the source reader before exposing a metadata-less target object.
-        // Keeping that partial target across the async GET lets background
-        // storage maintenance reclaim it as residue and makes publication race
-        // with ENOENT instead of exercising resume.
+        // Open the source reader before publishing the relocated object. Build
+        // each replica outside the bucket and rename it into place atomically so
+        // background maintenance never observes a metadata-less target object.
+        let mut staged_targets = Vec::with_capacity(pool_disk_paths[target_pool].len());
         for (source_disk, target_disk) in pool_disk_paths[source_pool].iter().zip(&pool_disk_paths[target_pool]) {
             let source_dir = source_disk.join(&bucket).join(object);
             let target_dir = target_disk.join(&bucket).join(object);
-            std::fs::create_dir_all(&target_dir).expect("create relocated target object directory");
+            let staging_dir = temp_dir.path().join(format!("resume-relocate-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&staging_dir).expect("create relocated target staging directory");
             for entry in std::fs::read_dir(&source_dir).expect("read source object directory") {
                 let entry = entry.expect("read source object entry");
                 if !entry.file_type().expect("read source object entry type").is_dir() {
                     continue;
                 }
-                let target_entry = target_dir.join(entry.file_name());
+                let target_entry = staging_dir.join(entry.file_name());
                 std::fs::create_dir_all(&target_entry).expect("create relocated target data directory");
                 for child in std::fs::read_dir(entry.path()).expect("read source object data directory") {
                     let child = child.expect("read source object data entry");
                     std::fs::copy(child.path(), target_entry.join(child.file_name())).expect("copy relocated object data entry");
                 }
             }
+            std::fs::copy(source_dir.join("xl.meta"), staging_dir.join("xl.meta")).expect("stage relocated object metadata");
+            staged_targets.push((staging_dir, target_dir));
         }
         let (version_dirs, deleted) = delete_object_part_shards(&pool_disk_paths[source_pool], &bucket, object, &[2, 3]);
         assert!(version_dirs > 0, "the source pool must have at least one version data directory");
         assert_eq!(deleted, version_dirs * 2);
 
-        for (source_disk, target_disk) in pool_disk_paths[source_pool].iter().zip(&pool_disk_paths[target_pool]) {
+        for ((staging_dir, target_dir), source_disk) in staged_targets.into_iter().zip(&pool_disk_paths[source_pool]) {
+            std::fs::rename(staging_dir, target_dir).expect("publish relocated target object");
             let source_meta = source_disk.join(&bucket).join(object).join("xl.meta");
-            std::fs::copy(&source_meta, target_disk.join(&bucket).join(object).join("xl.meta"))
-                .expect("publish relocated object metadata");
             std::fs::remove_file(source_meta).expect("remove relocated source object metadata");
         }
         store
