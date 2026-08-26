@@ -961,17 +961,18 @@ async fn heartbeat_runtime_skips_only_valid_pending_reenrollment() {
     assert_eq!(fs::read(&pending_path).expect("preserved pending reenrollment"), pending);
     assert_eq!(fs::read(&next_path).expect("preserved pending reenrollment key"), next);
     assert_eq!(fs::read(&credential_path).expect("preserved current credential"), credential);
-    let paths = server.paths.lock().expect("paths lock");
-    assert_eq!(
-        paths
-            .iter()
-            .filter(|path| path.ends_with("registrationTokens:exchange"))
-            .count(),
-        4
-    );
-    assert_eq!(paths.iter().filter(|path| path.ends_with(":rotateCredential")).count(), 0);
-    assert_eq!(paths.iter().filter(|path| path.ends_with("/heartbeats")).count(), 1);
-    drop(paths);
+    {
+        let paths = server.paths.lock().expect("paths lock");
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| path.ends_with("registrationTokens:exchange"))
+                .count(),
+            4
+        );
+        assert_eq!(paths.iter().filter(|path| path.ends_with(":rotateCredential")).count(), 0);
+        assert_eq!(paths.iter().filter(|path| path.ends_with("/heartbeats")).count(), 1);
+    }
 
     for (field, value) in [
         ("requestId", "not-a-request-id"),
@@ -1377,13 +1378,14 @@ async fn rotation_commit_recovers_after_each_durable_step() {
             .await,
         Err(ClientError::Unavailable { .. })
     ));
-    let failed_seen = failed.seen.lock().expect("seen lock");
-    assert_eq!(failed_seen.len(), 3, "public rotation keeps its bounded retry contract");
-    for request in &failed_seen[1..] {
-        assert_eq!(request["requestId"], failed_seen[0]["requestId"]);
-        assert_eq!(request["certificateRequest"], failed_seen[0]["certificateRequest"]);
+    {
+        let failed_seen = failed.seen.lock().expect("seen lock");
+        assert_eq!(failed_seen.len(), 3, "public rotation keeps its bounded retry contract");
+        for request in &failed_seen[1..] {
+            assert_eq!(request["requestId"], failed_seen[0]["requestId"]);
+            assert_eq!(request["certificateRequest"], failed_seen[0]["certificateRequest"]);
+        }
     }
-    drop(failed_seen);
 
     let pending_path = temp.path().join("credential/rotation.pending.json");
     let pending = fs::read(&pending_path).expect("read pending state");
