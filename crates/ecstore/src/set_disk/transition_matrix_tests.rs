@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::{
+    Arc, Duration, GetObjectMetadataCacheKey, HeaderMap, MakeBucketOptions, ObjectOptions, OffsetDateTime, PutObjReader,
+    SetDisks, Uuid,
+};
 use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions, expected_expiry_time};
 use crate::ecstore_validation_blackbox::make_local_set_disks;
 use crate::services::tier::test_util::register_mock_tier;
+use crate::storage_api_contracts::bucket::BucketOperations;
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
 use tokio::io::AsyncReadExt;

@@ -23,7 +23,7 @@
 //! This module only establishes the borrow handle. It moves no trait impl and
 //! changes no runtime behavior.
 
-use super::*;
+use super::{Arc, DiskStore, Endpoint, FormatV3, LockClient, RwLock, SetDisks};
 
 /// Lightweight, `Copy` handle borrowing the shared [`SetDisks`] core state.
 ///
