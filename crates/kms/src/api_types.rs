@@ -94,6 +94,12 @@ pub struct ConfigureVaultKmsRequest {
     pub key_path_prefix: Option<String>,
     /// Skip TLS verification (insecure, for development only)
     pub skip_tls_verify: Option<bool>,
+    /// Path to a PEM CA bundle trusted for the Vault connection (server-local path)
+    pub ca_cert_path: Option<String>,
+    /// Path to a PEM client certificate presented to Vault for mTLS (requires client_key_path)
+    pub client_cert_path: Option<String>,
+    /// Path to the PEM private key matching client_cert_path
+    pub client_key_path: Option<String>,
     /// Default master key ID for auto-encryption
     pub default_key_id: Option<String>,
     /// Operation timeout in seconds
@@ -125,6 +131,12 @@ pub struct ConfigureVaultTransitKmsRequest {
     pub mount_path: Option<String>,
     /// Skip TLS verification (insecure, for development only)
     pub skip_tls_verify: Option<bool>,
+    /// Path to a PEM CA bundle trusted for the Vault connection (server-local path)
+    pub ca_cert_path: Option<String>,
+    /// Path to a PEM client certificate presented to Vault for mTLS (requires client_key_path)
+    pub client_cert_path: Option<String>,
+    /// Path to the PEM private key matching client_cert_path
+    pub client_key_path: Option<String>,
     /// Default master key ID for auto-encryption
     pub default_key_id: Option<String>,
     /// Operation timeout in seconds
@@ -461,6 +473,12 @@ pub enum BackendSummary {
         key_path_prefix: String,
         /// Skip TLS verification
         skip_tls_verify: bool,
+        /// Whether a custom CA bundle is configured for the connection
+        #[serde(default)]
+        has_custom_ca: bool,
+        /// Whether an mTLS client certificate/key pair is configured
+        #[serde(default)]
+        has_client_identity: bool,
     },
     /// Vault Transit backend summary
     VaultTransit {
@@ -476,6 +494,12 @@ pub enum BackendSummary {
         mount_path: String,
         /// Skip TLS verification
         skip_tls_verify: bool,
+        /// Whether a custom CA bundle is configured for the connection
+        #[serde(default)]
+        has_custom_ca: bool,
+        /// Whether an mTLS client certificate/key pair is configured
+        #[serde(default)]
+        has_client_identity: bool,
     },
     /// Static single-key backend summary
     Static {
@@ -528,6 +552,8 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 kv_mount: vault_config.kv_mount.clone(),
                 key_path_prefix: vault_config.key_path_prefix.clone(),
                 skip_tls_verify: vault_config.tls.as_ref().is_some_and(|tls| tls.skip_verify),
+                has_custom_ca: vault_config.tls.as_ref().is_some_and(|tls| tls.ca_cert_path.is_some()),
+                has_client_identity: vault_config.tls.as_ref().is_some_and(|tls| tls.client_cert_path.is_some()),
             },
             BackendConfig::VaultTransit(vault_config) => BackendSummary::VaultTransit {
                 address: vault_config.address.clone(),
@@ -541,6 +567,8 @@ impl From<&KmsConfig> for KmsConfigSummary {
                 namespace: vault_config.namespace.clone(),
                 mount_path: vault_config.mount_path.clone(),
                 skip_tls_verify: vault_config.tls.as_ref().is_some_and(|tls| tls.skip_verify),
+                has_custom_ca: vault_config.tls.as_ref().is_some_and(|tls| tls.ca_cert_path.is_some()),
+                has_client_identity: vault_config.tls.as_ref().is_some_and(|tls| tls.client_cert_path.is_some()),
             },
             BackendConfig::Static(static_config) => BackendSummary::Static {
                 key_id: static_config.key_id.clone(),
@@ -593,6 +621,25 @@ impl ConfigureLocalKmsRequest {
     }
 }
 
+/// Assemble the Vault TLS settings named by a configure request.
+///
+/// Mirrors the env-side assembly: `None` when nothing TLS-related was
+/// requested, so the persisted config keeps its historical shape.
+fn vault_tls_from_request(
+    skip_tls_verify: Option<bool>,
+    ca_cert_path: Option<&String>,
+    client_cert_path: Option<&String>,
+    client_key_path: Option<&String>,
+) -> Option<TlsConfig> {
+    let skip_verify = skip_tls_verify.unwrap_or(false);
+    (skip_verify || ca_cert_path.is_some() || client_cert_path.is_some() || client_key_path.is_some()).then(|| TlsConfig {
+        ca_cert_path: ca_cert_path.map(PathBuf::from),
+        client_cert_path: client_cert_path.map(PathBuf::from),
+        client_key_path: client_key_path.map(PathBuf::from),
+        skip_verify,
+    })
+}
+
 impl ConfigureVaultKmsRequest {
     /// Convert to KmsConfig
     pub fn to_kms_config(&self) -> KmsConfig {
@@ -606,16 +653,12 @@ impl ConfigureVaultKmsRequest {
                 mount_path: self.mount_path.clone().unwrap_or_else(|| "transit".to_string()),
                 kv_mount: self.kv_mount.clone().unwrap_or_else(|| "secret".to_string()),
                 key_path_prefix: self.key_path_prefix.clone().unwrap_or_else(|| "rustfs/kms/keys".to_string()),
-                tls: if self.skip_tls_verify.unwrap_or(false) {
-                    Some(TlsConfig {
-                        ca_cert_path: None,
-                        client_cert_path: None,
-                        client_key_path: None,
-                        skip_verify: true,
-                    })
-                } else {
-                    None
-                },
+                tls: vault_tls_from_request(
+                    self.skip_tls_verify,
+                    self.ca_cert_path.as_ref(),
+                    self.client_cert_path.as_ref(),
+                    self.client_key_path.as_ref(),
+                ),
             })),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
             // Read from server configuration, never from the request body: the
@@ -647,16 +690,12 @@ impl ConfigureVaultTransitKmsRequest {
                 mount_path: self.mount_path.clone().unwrap_or_else(|| "transit".to_string()),
                 metadata_kv_mount: DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string(),
                 metadata_key_prefix: DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string(),
-                tls: if self.skip_tls_verify.unwrap_or(false) {
-                    Some(TlsConfig {
-                        ca_cert_path: None,
-                        client_cert_path: None,
-                        client_key_path: None,
-                        skip_verify: true,
-                    })
-                } else {
-                    None
-                },
+                tls: vault_tls_from_request(
+                    self.skip_tls_verify,
+                    self.ca_cert_path.as_ref(),
+                    self.client_cert_path.as_ref(),
+                    self.client_key_path.as_ref(),
+                ),
             })),
             allow_insecure_dev_defaults: self.allow_insecure_dev_defaults.unwrap_or(false),
             // Read from server configuration, never from the request body: the
@@ -1016,6 +1055,67 @@ mod tests {
         assert!(request.to_kms_config().validate().is_ok());
     }
 
+    /// TLS certificate paths named by a configure request must reach the
+    /// backend configuration, the summary must report them only as booleans,
+    /// and a request without TLS settings must keep the historical `tls: None`
+    /// shape in the persisted configuration.
+    #[test]
+    fn test_configure_request_tls_paths_reach_the_config_and_summary() {
+        let mut request = ConfigureVaultTransitKmsRequest {
+            address: "https://vault.example.com:8200".to_string(),
+            auth_method: VaultAuthMethod::Token {
+                token: "vault-token".to_string(),
+            },
+            namespace: None,
+            mount_path: None,
+            skip_tls_verify: None,
+            ca_cert_path: Some("/certs/vault-ca.pem".to_string()),
+            client_cert_path: Some("/certs/client.pem".to_string()),
+            client_key_path: Some("/certs/client.key".to_string()),
+            default_key_id: None,
+            timeout_seconds: None,
+            retry_attempts: None,
+            enable_cache: None,
+            max_cached_keys: None,
+            cache_ttl_seconds: None,
+            allow_insecure_dev_defaults: None,
+        };
+
+        let config = request.to_kms_config();
+        let tls = config
+            .vault_transit_config()
+            .and_then(|transit| transit.tls.as_ref())
+            .expect("certificate paths in the request must produce TLS settings");
+        assert_eq!(tls.ca_cert_path.as_deref(), Some(std::path::Path::new("/certs/vault-ca.pem")));
+        assert_eq!(tls.client_cert_path.as_deref(), Some(std::path::Path::new("/certs/client.pem")));
+        assert_eq!(tls.client_key_path.as_deref(), Some(std::path::Path::new("/certs/client.key")));
+        assert!(!tls.skip_verify);
+
+        match &KmsConfigSummary::from(&config).backend_summary {
+            BackendSummary::VaultTransit {
+                has_custom_ca,
+                has_client_identity,
+                ..
+            } => {
+                assert!(*has_custom_ca);
+                assert!(*has_client_identity);
+            }
+            other => panic!("expected vault transit summary, got {other:?}"),
+        }
+
+        request.ca_cert_path = None;
+        request.client_cert_path = None;
+        request.client_key_path = None;
+        assert!(
+            request
+                .to_kms_config()
+                .vault_transit_config()
+                .and_then(|t| t.tls.as_ref())
+                .is_none(),
+            "a request without TLS settings must keep tls: None"
+        );
+    }
+
     /// The AWS summary carries only non-credential settings, because the
     /// backend never holds AWS credential material to begin with.
     #[test]
@@ -1180,6 +1280,9 @@ mod tests {
             namespace: None,
             mount_path: Some("transit".to_string()),
             skip_tls_verify: Some(false),
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
             default_key_id: None,
             timeout_seconds: None,
             retry_attempts: None,
@@ -1196,6 +1299,9 @@ mod tests {
             kv_mount: Some("secret".to_string()),
             key_path_prefix: Some("rustfs/kms/keys".to_string()),
             skip_tls_verify: Some(false),
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
             default_key_id: None,
             timeout_seconds: None,
             retry_attempts: None,

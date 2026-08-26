@@ -452,8 +452,12 @@ impl VaultRestoreClient {
             attempt_timeout: kms_config.effective_timeout(),
             // A restore target carries no TLS settings, so certificates are
             // always verified: recovery is the last path that should accept an
-            // unauthenticated Vault.
+            // unauthenticated Vault. The empty trust list and absent identity
+            // also neutralize the VAULT_CACERT / VAULT_CLIENT_CERT environment
+            // fallbacks, exactly as on the primary connection.
             skip_tls_verify: false,
+            ca_cert_paths: Vec::new(),
+            client_identity: None,
         };
         let source = token_source_for(&target.auth_method, &settings)?;
         let policy = VaultCredentialPolicy::from_kms_config(

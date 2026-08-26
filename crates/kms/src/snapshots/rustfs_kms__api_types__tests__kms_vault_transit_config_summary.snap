@@ -1,12 +1,14 @@
 ---
 source: crates/kms/src/api_types.rs
-expression: "serde_json::to_value(&summary).expect(\"KMS config summary should serialize\")"
+expression: stable_json_value(&summary)
 ---
 {
   "backend_summary": {
     "address": "http://127.0.0.1:8200",
     "auth_method_type": "token",
     "backend_type": "vault-transit",
+    "has_client_identity": false,
+    "has_custom_ca": false,
     "has_stored_credentials": true,
     "mount_path": "transit",
     "namespace": "tenant-a",

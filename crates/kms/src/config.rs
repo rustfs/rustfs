@@ -30,6 +30,9 @@ pub const ENV_KMS_VAULT_TOKEN: &str = "RUSTFS_KMS_VAULT_TOKEN";
 pub const ENV_KMS_VAULT_NAMESPACE: &str = "RUSTFS_KMS_VAULT_NAMESPACE";
 pub const ENV_KMS_VAULT_MOUNT_PATH: &str = "RUSTFS_KMS_VAULT_MOUNT_PATH";
 pub const ENV_KMS_VAULT_SKIP_TLS_VERIFY: &str = "RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY";
+pub const ENV_KMS_VAULT_CA_CERT: &str = "RUSTFS_KMS_VAULT_CA_CERT";
+pub const ENV_KMS_VAULT_CLIENT_CERT: &str = "RUSTFS_KMS_VAULT_CLIENT_CERT";
+pub const ENV_KMS_VAULT_CLIENT_KEY: &str = "RUSTFS_KMS_VAULT_CLIENT_KEY";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT";
 pub const ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX: &str = "RUSTFS_KMS_VAULT_TRANSIT_METADATA_PREFIX";
 pub const ENV_KMS_STATIC_SECRET_KEY: &str = "RUSTFS_KMS_STATIC_SECRET_KEY";
@@ -936,22 +939,18 @@ impl KmsConfig {
                     return Err(KmsError::configuration_error("Vault KV2 mount cannot be empty"));
                 }
 
+                if let Some(ref tls) = config.tls {
+                    validate_vault_tls_pairing(tls)?;
+                }
+
                 // Validate TLS configuration if using HTTPS
                 if config.address.starts_with("https://")
                     && let Some(ref tls) = config.tls
                     && !tls.skip_verify
+                    && tls.ca_cert_path.is_none()
+                    && tls.client_cert_path.is_none()
                 {
-                    if tls.ca_cert_path.is_some() || tls.client_cert_path.is_some() || tls.client_key_path.is_some() {
-                        // No configuration surface sets these paths today and the
-                        // Vault client does not consume them; warn loudly instead
-                        // of implying the certificates take effect.
-                        tracing::warn!(
-                            "Vault TLS certificate paths are configured but not applied to the Vault client; \
-                             the connection still relies on the system CA store without a client identity"
-                        );
-                    } else {
-                        tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
-                    }
+                    tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
                 }
             }
             BackendConfig::VaultTransit(config) => {
@@ -982,20 +981,17 @@ impl KmsConfig {
                     return Err(KmsError::configuration_error("Vault Transit metadata key prefix cannot be empty"));
                 }
 
+                if let Some(ref tls) = config.tls {
+                    validate_vault_tls_pairing(tls)?;
+                }
+
                 if config.address.starts_with("https://")
                     && let Some(ref tls) = config.tls
                     && !tls.skip_verify
+                    && tls.ca_cert_path.is_none()
+                    && tls.client_cert_path.is_none()
                 {
-                    if tls.ca_cert_path.is_some() || tls.client_cert_path.is_some() || tls.client_key_path.is_some() {
-                        // Same as the KV2 branch: these paths are dead
-                        // configuration until the client consumes them.
-                        tracing::warn!(
-                            "Vault TLS certificate paths are configured but not applied to the Vault client; \
-                             the connection still relies on the system CA store without a client identity"
-                        );
-                    } else {
-                        tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
-                    }
+                    tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
                 }
             }
             BackendConfig::Static(config) => {
@@ -1220,13 +1216,34 @@ pub fn kms_config_from_persisted_json(data: &[u8]) -> serde_json::Result<KmsConf
     Ok(config)
 }
 
-fn vault_tls_config(skip_tls_verify: bool) -> Option<TlsConfig> {
-    skip_tls_verify.then_some(TlsConfig {
-        ca_cert_path: None,
-        client_cert_path: None,
-        client_key_path: None,
-        skip_verify: true,
+/// Assemble the Vault TLS settings from the environment.
+///
+/// Returns `None` when nothing TLS-related is configured so the config
+/// serializes without an empty `tls` block, matching the previous behavior.
+fn vault_tls_config_from_env() -> Option<TlsConfig> {
+    let skip_verify = get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false);
+    let ca_cert_path = get_env_opt_str(ENV_KMS_VAULT_CA_CERT).map(PathBuf::from);
+    let client_cert_path = get_env_opt_str(ENV_KMS_VAULT_CLIENT_CERT).map(PathBuf::from);
+    let client_key_path = get_env_opt_str(ENV_KMS_VAULT_CLIENT_KEY).map(PathBuf::from);
+
+    (skip_verify || ca_cert_path.is_some() || client_cert_path.is_some() || client_key_path.is_some()).then_some(TlsConfig {
+        ca_cert_path,
+        client_cert_path,
+        client_key_path,
+        skip_verify,
     })
+}
+
+/// A client certificate without its key (or the reverse) cannot form an mTLS
+/// identity; rejecting it at validation names the missing setting instead of
+/// failing when the backend loads the files.
+fn validate_vault_tls_pairing(tls: &TlsConfig) -> Result<()> {
+    if tls.client_cert_path.is_some() != tls.client_key_path.is_some() {
+        return Err(KmsError::configuration_error(
+            "Vault client_cert_path and client_key_path must be configured together for mTLS",
+        ));
+    }
+    Ok(())
 }
 
 fn development_default_error(reason: &str) -> KmsError {
@@ -1280,7 +1297,7 @@ pub fn vault_kv2_config_from_env(overrides: VaultCliOverrides<'_>) -> Result<Vau
         mount_path,
         kv_mount: get_env_str("RUSTFS_KMS_VAULT_KV_MOUNT", "secret"),
         key_path_prefix: get_env_str("RUSTFS_KMS_VAULT_KEY_PREFIX", "rustfs/kms/keys"),
-        tls: vault_tls_config(get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false)),
+        tls: vault_tls_config_from_env(),
     })
 }
 
@@ -1299,7 +1316,7 @@ pub fn vault_transit_config_from_env(overrides: VaultCliOverrides<'_>) -> Result
             .unwrap_or_else(|| get_env_str(ENV_KMS_VAULT_MOUNT_PATH, "transit")),
         metadata_kv_mount: get_env_str(ENV_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT, DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT),
         metadata_key_prefix: get_env_str(ENV_KMS_VAULT_TRANSIT_METADATA_PREFIX, DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX),
-        tls: vault_tls_config(get_env_bool(ENV_KMS_VAULT_SKIP_TLS_VERIFY, false)),
+        tls: vault_tls_config_from_env(),
     })
 }
 
@@ -1661,6 +1678,111 @@ mod tests {
 
         assert!(skip_tls_config.validate().is_err());
         assert!(skip_tls_config.with_insecure_development_defaults().validate().is_ok());
+    }
+
+    #[test]
+    fn test_vault_tls_client_cert_and_key_must_be_paired() {
+        fn kv2_with_tls(tls: TlsConfig) -> KmsConfig {
+            KmsConfig {
+                backend: KmsBackend::VaultKv2,
+                backend_config: BackendConfig::VaultKv2(Box::new(VaultConfig {
+                    address: "https://vault.example.com:8200".to_string(),
+                    auth_method: VaultAuthMethod::Token {
+                        token: "vault-token".to_string(),
+                    },
+                    namespace: None,
+                    mount_path: "transit".to_string(),
+                    kv_mount: "secret".to_string(),
+                    key_path_prefix: "rustfs/kms/keys".to_string(),
+                    tls: Some(tls),
+                })),
+                ..Default::default()
+            }
+        }
+
+        let cert_only = kv2_with_tls(TlsConfig {
+            ca_cert_path: None,
+            client_cert_path: Some(PathBuf::from("/certs/client.pem")),
+            client_key_path: None,
+            skip_verify: false,
+        });
+        let error = cert_only
+            .with_insecure_development_defaults()
+            .validate()
+            .expect_err("a client certificate without its key cannot form an mTLS identity");
+        assert!(error.to_string().contains("must be configured together"), "{error}");
+
+        let key_only = kv2_with_tls(TlsConfig {
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: Some(PathBuf::from("/certs/client.key")),
+            skip_verify: false,
+        });
+        assert!(key_only.with_insecure_development_defaults().validate().is_err());
+
+        let paired = kv2_with_tls(TlsConfig {
+            ca_cert_path: Some(PathBuf::from("/certs/vault-ca.pem")),
+            client_cert_path: Some(PathBuf::from("/certs/client.pem")),
+            client_key_path: Some(PathBuf::from("/certs/client.key")),
+            skip_verify: false,
+        });
+        assert!(paired.with_insecure_development_defaults().validate().is_ok());
+
+        // The Transit branch shares the pairing guard.
+        let transit_cert_only = KmsConfig {
+            backend: KmsBackend::VaultTransit,
+            backend_config: BackendConfig::VaultTransit(Box::new(VaultTransitConfig {
+                address: "https://vault.example.com:8200".to_string(),
+                auth_method: VaultAuthMethod::Token {
+                    token: "vault-token".to_string(),
+                },
+                namespace: None,
+                mount_path: "transit".to_string(),
+                metadata_kv_mount: DEFAULT_VAULT_TRANSIT_METADATA_KV_MOUNT.to_string(),
+                metadata_key_prefix: DEFAULT_VAULT_TRANSIT_METADATA_KEY_PREFIX.to_string(),
+                tls: Some(TlsConfig {
+                    ca_cert_path: None,
+                    client_cert_path: Some(PathBuf::from("/certs/client.pem")),
+                    client_key_path: None,
+                    skip_verify: false,
+                }),
+            })),
+            ..Default::default()
+        };
+        assert!(transit_cert_only.with_insecure_development_defaults().validate().is_err());
+    }
+
+    #[test]
+    fn test_vault_tls_config_from_env_reads_certificate_paths() {
+        temp_env::with_vars(
+            [
+                (ENV_KMS_VAULT_CA_CERT, Some("/certs/vault-ca.pem")),
+                (ENV_KMS_VAULT_CLIENT_CERT, Some("/certs/client.pem")),
+                (ENV_KMS_VAULT_CLIENT_KEY, Some("/certs/client.key")),
+            ],
+            || {
+                let tls = vault_tls_config_from_env().expect("certificate paths in the environment must produce TLS settings");
+                assert_eq!(tls.ca_cert_path.as_deref(), Some(Path::new("/certs/vault-ca.pem")));
+                assert_eq!(tls.client_cert_path.as_deref(), Some(Path::new("/certs/client.pem")));
+                assert_eq!(tls.client_key_path.as_deref(), Some(Path::new("/certs/client.key")));
+                assert!(!tls.skip_verify);
+            },
+        );
+
+        temp_env::with_vars_unset(
+            [
+                ENV_KMS_VAULT_CA_CERT,
+                ENV_KMS_VAULT_CLIENT_CERT,
+                ENV_KMS_VAULT_CLIENT_KEY,
+                ENV_KMS_VAULT_SKIP_TLS_VERIFY,
+            ],
+            || {
+                assert!(
+                    vault_tls_config_from_env().is_none(),
+                    "no TLS-related environment must keep the config free of a TLS block"
+                );
+            },
+        );
     }
 
     #[test]

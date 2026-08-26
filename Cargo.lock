@@ -9869,6 +9869,7 @@ dependencies = [
  "metrics-util",
  "moka",
  "rand 0.10.2",
+ "rcgen",
  "reqwest",
  "rustfs-s3-types",
  "rustfs-security-governance",
