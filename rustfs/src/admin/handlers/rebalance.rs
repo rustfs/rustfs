@@ -24,10 +24,9 @@ use crate::admin::storage_api::runtime::{ECStore, NotificationSys};
 use crate::{
     admin::runtime_sources::current_notification_system,
     admin::{
-        auth::validate_admin_request,
+        auth::authorize_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
 use http::{HeaderMap, HeaderValue, StatusCode, Uri};
@@ -497,23 +496,12 @@ impl Operation for RebalanceStart {
             "admin rebalance state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
         let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
 
         if rebalance_query_present(&req.uri) {
             log_rebalance_request_rejected("start", "invalid_query_parameters", &request_id, &actor, &remote_addr);
@@ -792,23 +780,12 @@ impl Operation for RebalanceStatus {
             "admin rebalance state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
         let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
 
         let Some(store) = object_store_from_extensions(&req.extensions) else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
@@ -924,23 +901,12 @@ impl Operation for RebalanceStop {
             "admin rebalance state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
         let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::RebalanceAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::RebalanceAdminAction)]).await?;
 
         if rebalance_query_present(&req.uri) {
             log_rebalance_request_rejected("stop", "invalid_query_parameters", &request_id, &actor, &remote_addr);
@@ -1092,7 +1058,8 @@ mod rebalance_handler_tests {
     use super::build_rebalance_pool_progress;
     use super::calculate_rebalance_progress;
     use super::{
-        RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStartStep, RebalanceStopPropagationStatus,
+        Body, HeaderMap, Method, Operation, Params, RebalPoolProgress, RebalanceAdminStatus, RebalancePoolStatus, RebalanceStart,
+        RebalanceStartStep, RebalanceStatus, RebalanceStop, RebalanceStopPropagationStatus, S3ErrorCode, S3Request, Uri,
         build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
         rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
         rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_start_steps, rebalance_stop_target_id,
@@ -1103,6 +1070,29 @@ mod rebalance_handler_tests {
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };
     use time::OffsetDateTime;
+
+    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a rebalance admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
 
     fn started_rebalance_meta(id: &str) -> RebalanceMeta {
         RebalanceMeta {
@@ -1927,5 +1917,75 @@ mod rebalance_handler_tests {
             status.terminal_reload_failed_peers,
             vec!["peer node-b load_rebalance_meta(start=false) failed: timeout"]
         );
+    }
+
+    /// The rebalance handlers pre-check credentials before delegating to the
+    /// shared admin gate, so a credential-less request keeps returning
+    /// `InvalidRequest: authentication required` rather than the gate's own
+    /// "get cred failed" wording (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn rebalance_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(&RebalanceStart {}, Method::POST, "/rustfs/admin/v3/rebalance/start").await;
+        assert_missing_credentials(&RebalanceStatus {}, Method::GET, "/rustfs/admin/v3/rebalance/status").await;
+        assert_missing_credentials(&RebalanceStop {}, Method::POST, "/rustfs/admin/v3/rebalance/stop").await;
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = [
+            "\npub struct ",
+            "\nasync fn ",
+            "\npub(crate) async fn ",
+            "\nmod ",
+            "\n#[cfg(test)]",
+        ]
+        .into_iter()
+        .filter_map(|boundary| block.find(boundary))
+        .min()
+        .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    /// All three rebalance handlers authorize through the single shared gate with
+    /// the same `RebalanceAdminAction` vector they used before the deduplication,
+    /// and none of them binds the returned credentials (rustfs/backlog#1829).
+    #[test]
+    fn rebalance_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("rebalance.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production source must precede the test module");
+
+        for handler in ["RebalanceStart", "RebalanceStatus", "RebalanceStop"] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_eq!(
+                block.matches("authorize_admin_request(").count(),
+                1,
+                "{handler} must use exactly one shared gate"
+            );
+            assert_eq!(
+                block.matches("Action::AdminAction(").count(),
+                1,
+                "{handler} must preserve its exact action-vector length"
+            );
+            assert!(
+                block.contains("AdminAction::RebalanceAdminAction"),
+                "{handler} must authorize with RebalanceAdminAction"
+            );
+            assert!(
+                !block.contains("let cred = authorize_admin_request("),
+                "{handler} does not consume the authenticated credentials"
+            );
+            assert!(
+                block.contains("let actor = MaskedAccessKey(&input_cred.access_key).to_string();"),
+                "{handler} must keep masking the caller access key for its audit trail"
+            );
+        }
+
+        assert!(!production.contains("check_key_valid(get_session_token"));
+        assert!(!production.contains("validate_admin_request("));
     }
 }
