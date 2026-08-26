@@ -351,7 +351,7 @@ impl From<std::io::Error> for DiskError {
             // classification instead of degrading to `DiskError::Io`, which
             // quorum aggregation (`reduce_errs`) would count as a distinct error.
             Err(io_error) => match io_error.downcast::<crate::error::StorageError>() {
-                Ok(storage_error) => storage_error.into(),
+                Ok(storage_error) => storage_error.narrow_to_disk().unwrap_or_else(DiskError::other),
                 Err(io_error) => DiskError::Io(io_error),
             },
         }
@@ -1189,7 +1189,7 @@ mod tests {
             &storage,
             crate::error::StorageError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
         ));
-        let narrowed: DiskError = storage.into();
+        let narrowed: DiskError = storage.narrow_to_disk().expect("typed variant must narrow");
         assert_eq!(narrowed, original);
         assert!(matches!(
             &narrowed,

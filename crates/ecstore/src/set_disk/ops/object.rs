@@ -2205,7 +2205,7 @@ impl SetDisks {
         }
         let current = read_object_transaction_epoch_fence(self, bucket, object)
             .await
-            .map_err(DiskError::from)?;
+            .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
         let disks = self.get_disks_internal().await;
         let mut removed = 0usize;
 

@@ -775,9 +775,10 @@ fn try_acquire_bucket_heal_movement_guard<'a>(
     };
     // Do not queue a receiver behind a movement writer while its coordinator
     // holds another node's read guard; failing fast breaks that cross-node cycle.
-    gate.try_read()
-        .map(Some)
-        .map_err(|_| crate::error::StorageError::SlowDown.into())
+    // `StorageError::SlowDown` has no disk-layer identity of its own: it
+    // collapses to `TooManyOpenFiles` at this boundary (see `narrow_to_disk`).
+    // Constructed directly so the loss stays explicit at the site.
+    gate.try_read().map(Some).map_err(|_| Error::TooManyOpenFiles)
 }
 
 async fn acquire_bucket_heal_write_guard<'a>(
@@ -787,7 +788,9 @@ async fn acquire_bucket_heal_write_guard<'a>(
         return Ok(None);
     };
     let guard = gate.lock().await;
-    guard.ensure_write_safe("bucket heal cannot run while pool metadata requires recovery")?;
+    guard
+        .ensure_write_safe("bucket heal cannot run while pool metadata requires recovery")
+        .map_err(|e| e.narrow_to_disk().unwrap_or_else(Error::other))?;
     Ok(Some(guard))
 }
 
@@ -2366,7 +2369,11 @@ mod tests {
 
         let err = try_acquire_bucket_heal_movement_guard(Some(&gate), false)
             .expect_err("receiver must not wait behind a queued movement writer");
-        assert_eq!(err, crate::error::StorageError::SlowDown.into());
+        assert_eq!(
+            err,
+            Error::TooManyOpenFiles,
+            "SlowDown collapses to TooManyOpenFiles at the disk boundary"
+        );
         assert!(
             try_acquire_bucket_heal_movement_guard(Some(&gate), true)
                 .expect("coordinator-owned movement guard should be reused")

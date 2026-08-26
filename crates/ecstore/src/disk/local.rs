@@ -5096,7 +5096,7 @@ impl LocalDisk {
 
         ensure_data_usage_layout(&io_root)
             .await
-            .map_err(DiskError::from)
+            .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))
             .inspect_err(|err| {
                 log_startup_disk_error("ensure_data_usage_layout", &root, err);
             })?;

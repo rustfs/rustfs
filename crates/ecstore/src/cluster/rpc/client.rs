@@ -678,7 +678,9 @@ mod tests {
     fn embedded_tonic_status_is_recovered_across_error_conversions() {
         // DiskError and StorageError share one wrapper, so a status keeps its
         // typed classification whichever error it was converted into first.
-        let from_storage: DiskErrorType = crate::error::Error::from(tonic::Status::unavailable("peer gone")).into();
+        let from_storage: DiskErrorType = crate::error::Error::from(tonic::Status::unavailable("peer gone"))
+            .narrow_to_disk()
+            .expect("status-derived Io errors narrow through the bridge");
         let DiskError::Io(io_err) = &from_storage else {
             panic!("status-derived disk error should stay an Io error");
         };
