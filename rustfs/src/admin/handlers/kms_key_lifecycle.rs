@@ -15,13 +15,14 @@
 //! KMS key lifecycle admin API handlers: enable, disable and rotate.
 
 use super::kms_audit::KmsAdminAudit;
-use super::kms_keys::{extract_query_params, scoped_key_id};
+use super::kms_keys::scoped_key_id;
 use crate::admin::auth::validate_admin_request_with_kms_key;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_kms_runtime_service_manager;
+use crate::admin::utils::{extract_query_params, json_response};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use hyper::{HeaderMap, Method, StatusCode};
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{
@@ -29,7 +30,6 @@ use rustfs_kms::{
     types::{DescribeKeyRequest, KeyMetadata, OperationContext},
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
-use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -231,13 +231,6 @@ async fn execute_lifecycle(
             )
         }
     }
-}
-
-fn json_response(status: StatusCode, response: &KmsKeyLifecycleResponse) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, "application/json".parse().expect("static content type should parse"));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
 }
 
 fn unavailable_response(message: &str, key_id: String) -> S3Result<S3Response<(StatusCode, Body)>> {

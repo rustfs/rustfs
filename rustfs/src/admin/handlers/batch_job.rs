@@ -37,18 +37,16 @@
 
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::utils::read_compatible_admin_body;
+use crate::admin::utils::{extract_query_params, json_response, read_compatible_admin_body};
 use crate::server::ADMIN_PREFIX;
-use http::{HeaderMap, HeaderValue, Uri};
+use http::Uri;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
-use std::collections::HashMap;
 use tracing::warn;
 
 /// Job types recognised by the MinIO batch-job admin API.
@@ -58,25 +56,8 @@ use tracing::warn;
 /// (`NotImplemented`) from "unknown job type" (`InvalidRequest`).
 const KNOWN_JOB_TYPES: &[&str] = &["replicate", "keyrotate", "expire"];
 
-fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    if let Some(query) = uri.query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            params.insert(key.into_owned(), value.into_owned());
-        }
-    }
-    params
-}
-
 async fn validate_batch_job_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<Credentials> {
     authorize_admin_request(req, vec![Action::AdminAction(action)]).await
-}
-
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(value).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
 }
 
 /// Best-effort detection of the declared job type from a MinIO batch-job
@@ -269,7 +250,7 @@ fn no_such_job(job_id: &str) -> S3Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_job_type, extract_query_params, require_job_id};
+    use super::{detect_job_type, require_job_id};
     use http::Uri;
 
     #[test]
@@ -302,17 +283,16 @@ mod tests {
         assert_eq!(detect_job_type(b"transmogrify:\n  foo: bar\n"), None);
     }
 
+    /// `jobId` reaches the handler percent-decoded — the shared query parser
+    /// is covered in `crate::admin::utils`; this pins the endpoint's own use
+    /// of it, including the rejection of a missing or empty id.
     #[test]
-    fn extract_query_params_decodes_job_id() {
-        let uri: Uri = "/rustfs/admin/v3/status-job?jobId=abc%2F123"
+    fn require_job_id_decodes_and_rejects_missing_and_empty() {
+        let encoded: Uri = "/rustfs/admin/v3/status-job?jobId=abc%2F123"
             .parse()
             .expect("uri should parse");
-        let params = extract_query_params(&uri);
-        assert_eq!(params.get("jobId"), Some(&"abc/123".to_string()));
-    }
+        assert_eq!(require_job_id(&encoded).expect("job id"), "abc/123");
 
-    #[test]
-    fn require_job_id_rejects_missing_and_empty() {
         let missing: Uri = "/rustfs/admin/v3/status-job".parse().expect("uri should parse");
         assert!(require_job_id(&missing).is_err());
 

@@ -44,10 +44,11 @@ use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_deployment_id, current_kms_runtime_service_manager};
+use crate::admin::utils::json_response;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use base64_simd::STANDARD as BASE64;
-use hyper::{HeaderMap, Method, StatusCode};
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::backup::{
@@ -58,7 +59,6 @@ use rustfs_kms::backup::{
 use rustfs_kms::config::{BackendConfig, KmsConfig, LocalConfig, VaultAuthMethod};
 use rustfs_kms::{KmsBackend, KmsManager, KmsServiceManager, KmsServiceStatus};
 use rustfs_policy::policy::action::{Action, KmsAction};
-use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -889,13 +889,6 @@ async fn backup_status() -> KmsBackupStatusResponse {
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
-
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(value).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, "application/json".parse().expect("static content type should parse"));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
-}
 
 #[derive(Debug, Serialize)]
 struct ErrorResponse {

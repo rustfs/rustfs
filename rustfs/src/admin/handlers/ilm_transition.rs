@@ -30,8 +30,9 @@ use crate::admin::storage_api::lifecycle::{
     request_manual_transition_job_cancel, save_manual_transition_job_record, update_manual_transition_job_record,
 };
 use crate::admin::storage_api::runtime::ECStore;
+use crate::admin::utils::json_response;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use http::{HeaderMap, HeaderValue};
+use http::HeaderMap;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -40,7 +41,6 @@ use rustfs_utils::{
     MaskedAccessKey,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
 };
-use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -51,7 +51,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-const JSON_CONTENT_TYPE: &str = "application/json";
 const DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS: u64 = 10_000;
 const MAX_MANUAL_TRANSITION_OBJECTS: u64 = 100_000;
 const MAX_MANUAL_TRANSITION_DURATION_SECONDS: u64 = 3600;
@@ -629,17 +628,6 @@ fn map_manual_transition_job_load_error(err: StorageError, job_id: Uuid) -> S3Er
     }
 }
 
-fn json_response<T: Serialize>(response: &T, status: StatusCode) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let body = serde_json::to_vec(response).map_err(|err| {
-        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode manual transition response: {err}"))
-    })?;
-    let content_type = HeaderValue::from_str(JSON_CONTENT_TYPE)
-        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid content type: {err}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, content_type);
-    Ok(S3Response::with_headers((status, Body::from(body)), headers))
-}
-
 async fn update_manual_transition_job_record_if_owned(
     store: Arc<ECStore>,
     job_id: Uuid,
@@ -921,10 +909,10 @@ impl Operation for ManualTransitionRunHandler {
                         cancel_endpoint: Some(status_endpoint),
                         report: record.report,
                     };
-                    return json_response(&response, StatusCode::ACCEPTED);
+                    return json_response(StatusCode::ACCEPTED, &response);
                 }
                 StartManualTransitionJobResult::Conflict(response) => {
-                    return json_response(&response, StatusCode::CONFLICT);
+                    return json_response(StatusCode::CONFLICT, &response);
                 }
             }
         }
@@ -960,7 +948,7 @@ impl Operation for ManualTransitionRunHandler {
             report,
         };
 
-        json_response(&response, StatusCode::OK)
+        json_response(StatusCode::OK, &response)
     }
 }
 
@@ -1000,7 +988,7 @@ impl Operation for ManualTransitionJobStatusHandler {
                 release_manual_transition_admission(store, &record);
             }
         }
-        json_response(&manual_transition_job_response(record), StatusCode::OK)
+        json_response(StatusCode::OK, &manual_transition_job_response(record))
     }
 }
 
@@ -1022,7 +1010,7 @@ impl Operation for ManualTransitionJobCancelHandler {
         {
             cancel_token.cancel();
         }
-        json_response(&manual_transition_job_response(record), StatusCode::OK)
+        json_response(StatusCode::OK, &manual_transition_job_response(record))
     }
 }
 
@@ -1039,7 +1027,7 @@ impl Operation for TransitionReconcileInspectHandler {
         let status = inspect_transition_transaction_for_operator(store, transaction_id)
             .await
             .map_err(map_transition_operator_error)?;
-        json_response(&status, StatusCode::OK)
+        json_response(StatusCode::OK, &status)
     }
 }
 
@@ -1074,7 +1062,7 @@ impl Operation for TransitionReconcileApplyHandler {
                     "exact_delete_completed_journal_already_finalized"
                 };
                 log_transition_reconcile_applied(transaction_id, "delete_candidate", outcome, &request_id, &actor, &remote_addr);
-                json_response(&TransitionCandidateDeleteResponse { outcome, result }, StatusCode::OK)
+                json_response(StatusCode::OK, &TransitionCandidateDeleteResponse { outcome, result })
             }
             ValidatedTransitionReconcileAction::FinalizeMissing => {
                 finalize_missing_transition_transaction_for_operator(store, transaction_id)
@@ -1089,12 +1077,12 @@ impl Operation for TransitionReconcileApplyHandler {
                     &remote_addr,
                 );
                 json_response(
+                    StatusCode::OK,
                     &TransitionFinalizeMissingResponse {
                         outcome: "journal_finalized",
                         journal_retained: false,
                         transaction_id,
                     },
-                    StatusCode::OK,
                 )
             }
         }

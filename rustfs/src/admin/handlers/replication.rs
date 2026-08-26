@@ -34,11 +34,11 @@ use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOption
 use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::runtime::PeerRestClient;
-use crate::admin::utils::read_compatible_admin_body;
+use crate::admin::utils::{extract_query_params, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::lock_bucket_targets_metadata;
-use http::{HeaderMap, HeaderValue, Uri};
+use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use jiff::Timestamp;
 use matchit::Params;
@@ -114,18 +114,6 @@ fn site_endpoint_for(endpoint: &str, secure: bool) -> String {
     } else {
         format!("http://{endpoint}")
     }
-}
-
-fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-
-    if let Some(query) = uri.query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            params.insert(key.into_owned(), value.into_owned());
-        }
-    }
-
-    params
 }
 
 fn map_bucket_target_error(err: BucketTargetError) -> S3Error {
