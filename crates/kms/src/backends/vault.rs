@@ -33,7 +33,7 @@ use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummar
 use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose};
+use base64_simd::STANDARD as BASE64;
 use jiff::Zoned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -527,8 +527,8 @@ fn decode_stored_key_material(key_id: &str, encrypted_material: &str) -> Result<
 
     // Mirrors `decrypt_key_material`: stored material is currently base64 without an
     // additional encryption layer.
-    let key_material = general_purpose::STANDARD
-        .decode(encrypted_material)
+    let key_material = BASE64
+        .decode_to_vec(encrypted_material)
         .map_err(|e| KmsError::material_corrupt(key_id, format!("stored key material is not valid base64: {e}")))?;
 
     // Key material must be exactly 32 bytes for AES-256.
@@ -693,7 +693,7 @@ impl VaultKmsClient {
     /// confidentiality. Any identity with KV read access to the key path can recover the
     /// plaintext master key.
     async fn encrypt_key_material(&self, key_material: &[u8]) -> Result<String> {
-        Ok(general_purpose::STANDARD.encode(key_material))
+        Ok(base64_simd::STANDARD.encode_to_string(key_material))
     }
 
     /// Read the immutable material record of one key version.
@@ -2405,7 +2405,7 @@ mod tests {
             tags: HashMap::new(),
             deletion_date: None,
             rotated_at: None,
-            encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
+            encrypted_key_material: base64_simd::STANDARD.encode_to_string([0x42u8; 32]),
             baseline_version: None,
             wrap_budget_reserved: 0,
         }
@@ -2869,21 +2869,21 @@ mod tests {
         ));
 
         // Truncated material: valid base64 of fewer than 32 bytes.
-        let truncated = general_purpose::STANDARD.encode([0x42u8; 16]);
+        let truncated = base64_simd::STANDARD.encode_to_string([0x42u8; 16]);
         assert!(matches!(
             decode_stored_key_material("poisoned", &truncated),
             Err(KmsError::MaterialCorrupt { key_id, .. }) if key_id == "poisoned"
         ));
 
         // Oversized material: valid base64 of more than 32 bytes.
-        let oversized = general_purpose::STANDARD.encode([0x42u8; 33]);
+        let oversized = base64_simd::STANDARD.encode_to_string([0x42u8; 33]);
         assert!(matches!(
             decode_stored_key_material("poisoned", &oversized),
             Err(KmsError::MaterialCorrupt { key_id, .. }) if key_id == "poisoned"
         ));
 
         // Well-formed material still decodes.
-        let valid = general_purpose::STANDARD.encode([0x42u8; 32]);
+        let valid = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
         assert_eq!(
             decode_stored_key_material("healthy", &valid).expect("valid material must decode"),
             vec![0x42u8; 32]
@@ -3046,7 +3046,7 @@ mod tests {
             description: None,
             metadata: HashMap::new(),
             tags: HashMap::new(),
-            encrypted_key_material: general_purpose::STANDARD.encode([0x42u8; 32]),
+            encrypted_key_material: base64_simd::STANDARD.encode_to_string([0x42u8; 32]),
             baseline_version: Some(1),
             deletion_date: None,
             rotated_at: None,
@@ -3760,7 +3760,7 @@ mod tests {
     /// Base64 material distinct from `healthy_key_data`'s, standing in for the
     /// material a concurrent rotation committed.
     fn rotated_material() -> String {
-        general_purpose::STANDARD.encode([0x43u8; 32])
+        base64_simd::STANDARD.encode_to_string([0x43u8; 32])
     }
 
     /// The issue's lost-update scenario: node A disables a key while node B's
@@ -4358,7 +4358,7 @@ mod tests {
         let material_v2 = [0x43u8; 32];
         let record_v2 = VaultKeyVersionRecord {
             version: 2,
-            encrypted_key_material: general_purpose::STANDARD.encode(material_v2),
+            encrypted_key_material: base64_simd::STANDARD.encode_to_string(material_v2),
             created_at: Zoned::now(),
         };
         // A well-formed envelope wrapped under version 2 — under a reverted
@@ -4900,8 +4900,8 @@ mod tests {
     #[tokio::test]
     async fn wired_decrypt_of_pre_versioning_envelope_adds_no_request() {
         let key_data = healthy_key_data();
-        let key_material = general_purpose::STANDARD
-            .decode(&key_data.encrypted_key_material)
+        let key_material = BASE64
+            .decode_to_vec(&key_data.encrypted_key_material)
             .expect("decode fixture material");
         let (encrypted_key, nonce) = AesDekCrypto::new()
             .encrypt(&key_material, b"dek-plaintext", &[])

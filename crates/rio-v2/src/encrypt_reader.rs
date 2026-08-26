@@ -731,11 +731,14 @@ fn random_stream_nonce() -> [u8; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hex::encode as hex_encode;
     use std::io::Cursor;
     use tokio::io::AsyncReadExt;
 
     const DARE_PACKAGE_SIZE: usize = DARE_HEADER_SIZE + DARE_PAYLOAD_SIZE + DARE_TAG_SIZE;
+
+    fn hex_encode(data: impl AsRef<[u8]>) -> String {
+        hex_simd::encode_to_string(data, hex_simd::AsciiCase::Lower)
+    }
 
     #[tokio::test]
     async fn decrypt_reader_can_start_from_non_zero_sequence_number() {

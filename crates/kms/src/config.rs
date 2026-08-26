@@ -367,9 +367,8 @@ impl StaticConfig {
     /// Decode the base64-encoded secret key into raw bytes.
     /// Returns an error if the key is not valid base64 or is not exactly 32 bytes.
     pub fn decode_key(&self) -> Result<[u8; 32]> {
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&self.secret_key)
+        let bytes = base64_simd::STANDARD
+            .decode_to_vec(&self.secret_key)
             .map_err(|e| KmsError::configuration_error(format!("Static KMS secret key is not valid base64: {e}")))?;
         if bytes.len() != 32 {
             return Err(KmsError::configuration_error(format!(
@@ -1963,9 +1962,7 @@ mod tests {
 
     #[test]
     fn static_kms_config_serialization_does_not_expose_key_material() {
-        use base64::Engine as _;
-
-        let encoded_key = base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]);
+        let encoded_key = base64_simd::STANDARD.encode_to_string([0x5au8; 32]);
         let config = KmsConfig::static_kms("static-key".to_string(), encoded_key.clone());
 
         let serialized = serde_json::to_string(&config).expect("static KMS config should serialize");
@@ -2569,14 +2566,12 @@ mod tests {
 
     #[test]
     fn test_from_env_reads_static_secret_file_and_sets_default_key() {
-        use base64::Engine as _;
-
         let temp_dir = TempDir::new().expect("create temp dir for static KMS secret");
         let secret_path = temp_dir.path().join("static-kms-secret");
         // Named `*_key_b64` (not `*_secret`) so the logging-guardrails check does not
         // flag these fixture interpolations as secrets leaking into log strings.
-        let file_key_b64 = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
-        let env_key_b64 = base64::engine::general_purpose::STANDARD.encode([9u8; 32]);
+        let file_key_b64 = base64_simd::STANDARD.encode_to_string([7u8; 32]);
+        let env_key_b64 = base64_simd::STANDARD.encode_to_string([9u8; 32]);
         std::fs::write(&secret_path, format!("file-key:{file_key_b64}\n")).expect("write static KMS secret file");
 
         with_vars(

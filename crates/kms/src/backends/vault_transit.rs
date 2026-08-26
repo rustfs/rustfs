@@ -31,7 +31,7 @@ use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummar
 use crate::policy::{self, AttemptError, OpClass, RetryPolicy};
 use crate::types::*;
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64_simd::STANDARD as BASE64;
 use jiff::Zoned;
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
@@ -479,7 +479,7 @@ impl VaultTransitKmsClient {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         let serialized = serde_json::to_vec(&ordered)?;
-        Ok(Some(BASE64.encode(serialized)))
+        Ok(Some(BASE64.encode_to_string(serialized)))
     }
 
     fn map_vault_error(key_id: &str, error: vaultrs::error::ClientError, operation: &str) -> KmsError {
@@ -524,7 +524,7 @@ impl VaultTransitKmsClient {
         plaintext: &[u8],
         encryption_context: &HashMap<String, String>,
     ) -> Result<String> {
-        let plaintext_b64 = BASE64.encode(plaintext);
+        let plaintext_b64 = BASE64.encode_to_string(plaintext);
         let plaintext_b64 = plaintext_b64.as_str();
         let aad = Self::canonicalize_context(encryption_context)?;
         let aad = aad.as_deref();
@@ -568,7 +568,7 @@ impl VaultTransitKmsClient {
             .await?;
 
         BASE64
-            .decode(response.plaintext)
+            .decode_to_vec(response.plaintext)
             .map_err(|e| KmsError::cryptographic_error("base64_decode", e.to_string()))
     }
 
@@ -3031,7 +3031,7 @@ mod tests {
             ScriptedResponse::ok(kv2_write_ack()),
             // decrypt of the pre-rotation envelope; Vault owns the transit
             // crypto, so the recovered material is the responder's to hand back.
-            ScriptedResponse::ok(serde_json::json!({ "plaintext": BASE64.encode(RECOVERED_DEK) })),
+            ScriptedResponse::ok(serde_json::json!({ "plaintext": BASE64.encode_to_string(RECOVERED_DEK) })),
         ])
         .await;
 
@@ -3243,7 +3243,7 @@ mod tests {
             // rewrap, context-bound route: latest-version read, then decrypt,
             // then re-encrypt under the newest version.
             ScriptedResponse::ok(transit_key_read_data_up_to("wired-key", 2)),
-            ScriptedResponse::ok(serde_json::json!({ "plaintext": BASE64.encode(RECOVERED_DEK) })),
+            ScriptedResponse::ok(serde_json::json!({ "plaintext": BASE64.encode_to_string(RECOVERED_DEK) })),
             ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v2:rewrapped" })),
         ])
         .await;

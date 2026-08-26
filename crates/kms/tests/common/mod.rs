@@ -34,8 +34,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64_simd::STANDARD as BASE64;
 use rustfs_kms::backends::BackendCapabilities;
 use rustfs_kms::{
     CreateKeyRequest, DeleteKeyRequest, KeyUsage, KmsConfig, KmsError, KmsManager, KmsServiceManager, KmsServiceStatus,
@@ -51,7 +50,7 @@ pub const STATIC_KEY_ID: &str = "behavior-static-key";
 /// Fixed rather than random so a failure is reproducible; it is test-only
 /// material and never leaves this crate's test binaries.
 pub fn static_secret_key() -> String {
-    BASE64.encode([0x5au8; 32])
+    BASE64.encode_to_string([0x5au8; 32])
 }
 
 /// Which backend a harness instance is running.

@@ -29,9 +29,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
+use base64_simd::STANDARD as BASE64_STANDARD;
+use base64_simd::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use rustfs::connect::identity::DeviceIdentity;
 use rustfs::connect::offline::{EnrollmentError, OfflineEnrollment, VerifiedChallenge};
 use serde_json::Value;
@@ -133,7 +132,7 @@ fn envelope(document: &Value) -> Vec<u8> {
 /// The raw octets the signature covers, exactly as transmitted.
 fn signed_octets(document: &Value) -> Vec<u8> {
     BASE64_STANDARD
-        .decode(field(document, "bytes"))
+        .decode_to_vec(field(document, "bytes"))
         .expect("document bytes are padded base64")
 }
 
@@ -158,7 +157,9 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 
 /// Turn a fixture's unpadded-base64url SEC1 point into a usable verifying key.
 fn verifying_key(sec1_base64url: &str) -> p256::ecdsa::VerifyingKey {
-    let point = BASE64_URL_NO_PAD.decode(sec1_base64url).expect("public key is base64url");
+    let point = BASE64_URL_NO_PAD
+        .decode_to_vec(sec1_base64url)
+        .expect("public key is base64url");
     assert_eq!(point.len(), 65, "the protocol freezes a 65 octet uncompressed SEC1 point");
 
     let mut der = hex_to_bytes(SPKI_PREFIX_HEX);
@@ -215,7 +216,7 @@ fn answered_challenge(response_vector: &Value) -> (Value, VerifiedChallenge) {
 
 fn device_nonce_of(document: &Value) -> [u8; 32] {
     let raw = BASE64_URL_NO_PAD
-        .decode(field(&signed_document(document), "deviceNonce"))
+        .decode_to_vec(field(&signed_document(document), "deviceNonce"))
         .expect("deviceNonce is base64url");
     raw.try_into().expect("replay.nonceLengthBytes freezes a 32 octet nonce")
 }
@@ -330,7 +331,7 @@ fn e2e_public_chain_matches_the_challenge_and_every_signature_verifies() {
     for link in chain.as_array().expect("E2E chain is a list") {
         assert_eq!(field(&link["signature"], "keyId"), issuer_id.as_str());
         let signature = BASE64_URL_NO_PAD
-            .decode(field(&link["signature"], "value"))
+            .decode_to_vec(field(&link["signature"], "value"))
             .expect("trust-link signature is base64url");
         issuer
             .verify(
@@ -345,7 +346,7 @@ fn e2e_public_chain_matches_the_challenge_and_every_signature_verifies() {
 
     assert_eq!(field(&challenge, "connectKeyId"), issuer_id.as_str());
     let signature = BASE64_URL_NO_PAD
-        .decode(field(&challenge_envelope["signature"], "value"))
+        .decode_to_vec(field(&challenge_envelope["signature"], "value"))
         .expect("challenge signature is base64url");
     issuer
         .verify(
@@ -571,7 +572,7 @@ fn response_reject_vectors_are_artifacts_build_response_cannot_emit() {
 
                         let presented = verifying_key(field(&refused, "devicePublicKey"));
                         let raw = BASE64_URL_NO_PAD
-                            .decode(field(&vector["document"]["signature"], "value"))
+                            .decode_to_vec(field(&vector["document"]["signature"], "value"))
                             .expect("signature is base64url");
                         let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
                         assert!(
@@ -685,8 +686,12 @@ fn malleated_high_s_signature_is_refused_although_it_verifies_mathematically() {
     let malleated_value = field(&malleated, "value").to_string();
     assert_ne!(genuine_value, malleated_value, "the malleation must be a different encoding");
 
-    let genuine = BASE64_URL_NO_PAD.decode(&genuine_value).expect("signature is base64url");
-    let raw = BASE64_URL_NO_PAD.decode(&malleated_value).expect("signature is base64url");
+    let genuine = BASE64_URL_NO_PAD
+        .decode_to_vec(&genuine_value)
+        .expect("signature is base64url");
+    let raw = BASE64_URL_NO_PAD
+        .decode_to_vec(&malleated_value)
+        .expect("signature is base64url");
     assert_eq!(raw.len(), 64, "the malleation is well formed at 64 octets");
     assert_eq!(raw[..32], genuine[..32], "the malleation shares r with the genuine signature");
     assert_ne!(raw[32..], genuine[32..], "the malleation replaces s with n - s");
@@ -797,7 +802,7 @@ fn assert_response_proves_possession(built_envelope: &Value, label: &str) {
         "{label}: the signature must use the base64url alphabet with no padding"
     );
 
-    let bytes = BASE64_URL_NO_PAD.decode(value).expect("signature is base64url");
+    let bytes = BASE64_URL_NO_PAD.decode_to_vec(value).expect("signature is base64url");
     assert_eq!(bytes.len(), 64, "{label}: the signature is a fixed-width r || s");
     let signature = p256::ecdsa::Signature::from_slice(&bytes).expect("signature parses");
     assert_eq!(
@@ -815,7 +820,7 @@ fn assert_response_proves_possession(built_envelope: &Value, label: &str) {
     // SubjectPublicKeyInfo, not of the bare point and not of the transfer
     // encoding.
     let mut spki = hex_to_bytes(SPKI_PREFIX_HEX);
-    spki.extend_from_slice(&BASE64_URL_NO_PAD.decode(presented).expect("public key is base64url"));
+    spki.extend_from_slice(&BASE64_URL_NO_PAD.decode_to_vec(presented).expect("public key is base64url"));
     let fingerprint = sha256_hex(&spki);
     assert_eq!(
         field(&built, "deviceKeyId"),
@@ -859,12 +864,12 @@ fn built_response_binds_the_challenge_proof_and_proves_possession_of_the_device_
 
     assert_eq!(
         field(&built, "devicePublicKey"),
-        BASE64_URL_NO_PAD.encode(&key.public_key_der()[hex_to_bytes(SPKI_PREFIX_HEX).len()..]),
+        BASE64_URL_NO_PAD.encode_to_string(&key.public_key_der()[hex_to_bytes(SPKI_PREFIX_HEX).len()..]),
         "the presented key must be the key that was passed in"
     );
     assert_eq!(
         field(&built, "deviceNonce"),
-        BASE64_URL_NO_PAD.encode([0x11; 32]),
+        BASE64_URL_NO_PAD.encode_to_string([0x11; 32]),
         "the device nonce must be the one that was passed in"
     );
     assert!(field(&built, "producedAt").ends_with('Z'), "producedAt is a UTC RFC 3339 instant");
@@ -901,8 +906,8 @@ fn built_response_carries_no_private_key_material() {
     for (description, needle) in [
         ("the PKCS#8 encoding", pkcs8.to_vec()),
         ("the raw private scalar", scalar.to_vec()),
-        ("the scalar in base64url", BASE64_URL_NO_PAD.encode(scalar).into_bytes()),
-        ("the scalar in standard base64", BASE64_STANDARD.encode(scalar).into_bytes()),
+        ("the scalar in base64url", BASE64_URL_NO_PAD.encode_to_string(scalar).into_bytes()),
+        ("the scalar in standard base64", BASE64_STANDARD.encode_to_string(scalar).into_bytes()),
         ("the scalar in hex", scalar_hex.into_bytes()),
     ] {
         assert!(
@@ -914,7 +919,7 @@ fn built_response_carries_no_private_key_material() {
     // The public half must be there, so the absence above is a statement about
     // what was excluded rather than about a haystack that would not have found
     // the private half either.
-    let point = BASE64_URL_NO_PAD.encode(&key.public_key_der()[hex_to_bytes(SPKI_PREFIX_HEX).len()..]);
+    let point = BASE64_URL_NO_PAD.encode_to_string(&key.public_key_der()[hex_to_bytes(SPKI_PREFIX_HEX).len()..]);
     assert!(
         haystack.windows(point.len()).any(|window| window == point.as_bytes()),
         "the response must still present the public key"

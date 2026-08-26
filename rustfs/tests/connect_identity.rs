@@ -20,8 +20,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
+use base64_simd::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use rustfs::connect::identity::{DeviceIdentity, IdentityError, RegistrationTranscript};
 use rustfs::connect::identity_store::{IdentityStore, StoreError};
 
@@ -66,8 +65,8 @@ fn transcript_reproduces_every_accept_vector() {
         let token = &vector["tokenRecord"];
         let request = &vector["request"];
 
-        let csr = base64::engine::general_purpose::STANDARD
-            .decode(
+        let csr = base64_simd::STANDARD
+            .decode_to_vec(
                 request["certificateRequest"]
                     .as_str()
                     .expect("vector carries a certificate request"),
@@ -118,8 +117,8 @@ fn published_proofs_verify_over_locally_rebuilt_transcripts() {
 
         let token = &vector["tokenRecord"];
         let request = &vector["request"];
-        let csr = base64::engine::general_purpose::STANDARD
-            .decode(request["certificateRequest"].as_str().unwrap())
+        let csr = base64_simd::STANDARD
+            .decode_to_vec(request["certificateRequest"].as_str().unwrap())
             .expect("certificate request is base64");
 
         let transcript = RegistrationTranscript::build(
@@ -134,7 +133,7 @@ fn published_proofs_verify_over_locally_rebuilt_transcripts() {
         .expect("transcript builds");
 
         let raw = BASE64_URL_NO_PAD
-            .decode(request["proof"]["value"].as_str().expect("vector carries a proof"))
+            .decode_to_vec(request["proof"]["value"].as_str().expect("vector carries a proof"))
             .expect("proof decodes");
         let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
         assert_eq!(
@@ -183,10 +182,10 @@ fn csr_octets_matching_golden_digest() -> Vec<u8> {
         let Some(encoded) = vector["request"]["certificateRequest"].as_str() else {
             continue;
         };
-        let der = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
+        let der = base64_simd::STANDARD
+            .decode_to_vec(encoded)
             .expect("certificate request is base64");
-        let digest = BASE64_URL_NO_PAD.encode(<sha2::Sha256 as sha2::Digest>::digest(&der));
+        let digest = BASE64_URL_NO_PAD.encode_to_string(<sha2::Sha256 as sha2::Digest>::digest(&der));
         if digest == want {
             return der;
         }
@@ -302,7 +301,7 @@ fn proof_is_a_canonical_low_s_signature_that_verifies() {
         "the proof must use the base64url alphabet with no padding"
     );
 
-    let raw = BASE64_URL_NO_PAD.decode(&proof.value).expect("proof decodes");
+    let raw = BASE64_URL_NO_PAD.decode_to_vec(&proof.value).expect("proof decodes");
     assert_eq!(raw.len(), 64, "the signature is a fixed-width r || s");
 
     let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
@@ -334,7 +333,7 @@ fn proof_does_not_verify_over_a_different_transcript() {
     let other = transcript_from_fixture_inputs(b"a different certificate request").expect("transcript builds");
     assert_ne!(transcript.as_bytes(), other.as_bytes());
 
-    let raw = BASE64_URL_NO_PAD.decode(&proof.value).expect("proof decodes");
+    let raw = BASE64_URL_NO_PAD.decode_to_vec(&proof.value).expect("proof decodes");
     let signature = p256::ecdsa::Signature::from_slice(&raw).expect("signature parses");
     let verifying = <p256::ecdsa::VerifyingKey as p256::pkcs8::DecodePublicKey>::from_public_key_der(&identity.public_key_der())
         .expect("public key decodes");

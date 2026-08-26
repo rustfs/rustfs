@@ -451,6 +451,5 @@ async fn harness_restart_brings_the_service_back_over_the_same_state() {
 }
 
 fn base64_of(bytes: &[u8]) -> String {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD.encode(bytes)
+    base64_simd::STANDARD.encode_to_string(bytes)
 }

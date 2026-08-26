@@ -195,7 +195,6 @@ rmp.workspace = true
 rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 tokio-stream = { workspace = true, features = ["sync"] }
-base64 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 hex-simd = { workspace = true }

@@ -24,7 +24,6 @@ mod tests {
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
-    use base64::Engine;
     use md5::{Digest as Md5Digest, Md5};
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
     use sha2::Sha256;
@@ -74,12 +73,12 @@ mod tests {
         let mut hasher = Md5::new();
         hasher.update(body);
         let digest = hasher.finalize();
-        base64::engine::general_purpose::STANDARD.encode(digest.as_slice())
+        base64_simd::STANDARD.encode_to_string(digest.as_slice())
     }
 
     fn checksum_sha256_base64(body: &[u8]) -> String {
         let digest = Sha256::digest(body);
-        base64::engine::general_purpose::STANDARD.encode(digest.as_slice())
+        base64_simd::STANDARD.encode_to_string(digest.as_slice())
     }
 
     fn checksum_crc64nvme_base64(body: &[u8]) -> String {

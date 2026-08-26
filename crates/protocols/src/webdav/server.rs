@@ -675,8 +675,7 @@ fn fixed_body(message: impl Into<Bytes>) -> WebDavBody {
 
 /// Decode base64 string
 fn base64_decode(encoded: &str) -> Result<Vec<u8>, ()> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|_| ())
+    base64_simd::STANDARD.decode_to_vec(encoded).map_err(|_| ())
 }
 
 #[cfg(test)]

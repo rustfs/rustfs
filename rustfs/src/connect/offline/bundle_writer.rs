@@ -25,7 +25,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64_simd::URL_SAFE_NO_PAD;
 #[cfg(target_os = "linux")]
 use p256::ecdsa::{Signature, SigningKey, signature::Signer as _};
 #[cfg(target_os = "linux")]
@@ -163,7 +163,7 @@ fn write_offline_bundle_unix(
 
     let produced_at = OffsetDateTime::from_unix_timestamp(context.produced_at_unix).map_err(|_| BundleError::InvalidMetadata)?;
     let produced_at = produced_at.format(&Rfc3339).map_err(|_| BundleError::InvalidMetadata)?;
-    let nonce = URL_SAFE_NO_PAD.encode(context.nonce);
+    let nonce = URL_SAFE_NO_PAD.encode_to_string(context.nonce);
     let device_key_id = hex_lower(&Sha256::digest(key.public_key_der()));
     let manifest_entries = entries
         .iter()
@@ -397,7 +397,7 @@ fn sign(key: &DeviceIdentity, manifest: &[u8]) -> Result<String, BundleError> {
     input.push(0);
     input.extend_from_slice(manifest);
     let signature: Signature = signing_key.sign(&input);
-    Ok(URL_SAFE_NO_PAD.encode(signature.normalize_s().to_bytes()))
+    Ok(URL_SAFE_NO_PAD.encode_to_string(signature.normalize_s().to_bytes()))
 }
 
 #[cfg(target_os = "linux")]

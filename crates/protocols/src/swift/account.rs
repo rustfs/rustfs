@@ -97,7 +97,7 @@ fn get_account_metadata_bucket_name(account: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(account.as_bytes());
     let hash_bytes = hasher.finalize();
-    let hash = hex::encode(hash_bytes);
+    let hash = hex_simd::encode_to_string(hash_bytes, hex_simd::AsciiCase::Lower);
     format!("swift-account-{}", &hash[0..16])
 }
 

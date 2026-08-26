@@ -14,7 +14,6 @@
 
 use std::time::Duration;
 
-use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode, Url, header};
 use rustls::RootCertStore;
@@ -228,8 +227,8 @@ impl ConnectClient {
         pending: &PendingRegistration,
         identity: &super::identity::DeviceIdentity,
     ) -> Result<DeviceCredential, ClientError> {
-        let csr_der = base64::engine::general_purpose::STANDARD
-            .decode(&pending.certificate_request)
+        let csr_der = base64_simd::STANDARD
+            .decode_to_vec(&pending.certificate_request)
             .map_err(|_| ClientError::PendingRegistration)?;
         let transcript = RegistrationTranscript::build(
             &token.registration_token_uid,

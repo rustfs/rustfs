@@ -1113,7 +1113,7 @@ fn md5_bytes(input: impl AsRef<[u8]>) -> [u8; 16] {
 fn md5_hex(input: impl AsRef<[u8]>) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_ref());
-    hex::encode(hasher.finalize())
+    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
 }
 
 fn ensure_store_budget(state: &StoreState, removed_bytes: usize, added_bytes: usize, adds_version: bool) -> S3Result {
@@ -1375,7 +1375,7 @@ impl S3 for FakeBackend {
             Some(value) => value,
             None => {
                 let (digest, _body_permit) = md5_digest(body.clone(), _body_permit).await?;
-                hex::encode(digest)
+                hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower)
             }
         };
         let version = ObjectVersion {
@@ -1660,7 +1660,7 @@ impl S3 for FakeBackend {
         }
         let body = collect_stream(input.body, input.content_length, fault.as_ref(), &self.control).await?;
         let (digest, _body_permit) = md5_digest(body.clone(), _body_permit).await?;
-        let e_tag = hex::encode(digest);
+        let e_tag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
         let mut state = lock(&self.store);
         let existing_bytes = state
             .uploads

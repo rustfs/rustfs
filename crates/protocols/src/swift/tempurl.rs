@@ -125,7 +125,7 @@ impl TempURL {
 
         // Hex-encode result
         let result = mac.finalize();
-        let signature = hex::encode(result.into_bytes());
+        let signature = hex_simd::encode_to_string(result.into_bytes(), hex_simd::AsciiCase::Lower);
 
         Ok(signature)
     }

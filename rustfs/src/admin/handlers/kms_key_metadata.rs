@@ -408,7 +408,6 @@ impl Operation for UntagKmsKeyHandler {
 mod tests {
     use super::*;
     use crate::admin::handlers::kms_keys::stable_json_value;
-    use base64::Engine as _;
     use rustfs_kms::KmsManager;
     use rustfs_kms::backends::local::LocalKmsBackend;
     use rustfs_kms::backends::static_kms::StaticKmsBackend;
@@ -431,8 +430,7 @@ mod tests {
     /// is the backend that must answer every metadata update with a capability
     /// gap rather than a failure of the request.
     async fn static_service() -> ObjectEncryptionService {
-        let config =
-            KmsConfig::static_kms("static-key".to_string(), base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]));
+        let config = KmsConfig::static_kms("static-key".to_string(), base64_simd::STANDARD.encode_to_string([0x42u8; 32]));
         let backend = Arc::new(
             StaticKmsBackend::new(config.clone())
                 .await

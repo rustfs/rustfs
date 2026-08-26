@@ -945,7 +945,7 @@ async fn tree_digest(root: &Path) -> Result<ContentDigest> {
             lines.push(format!(
                 "{relative}\u{1f}{}\u{1f}{modified}\u{1f}{}",
                 metadata.len(),
-                hex::encode(Sha256::digest(&content))
+                hex_simd::encode_to_string(Sha256::digest(&content), hex_simd::AsciiCase::Lower)
             ));
         }
         lines.sort();
@@ -1199,7 +1199,7 @@ mod tests {
         let text = String::from_utf8(encoded.clone()).expect("evidence is utf-8");
         assert!(!text.contains(DRILL_MASTER_KEY), "the evidence must not carry the master key");
         assert!(
-            !text.contains(&hex::encode([0x37u8; 32])),
+            !text.contains(&hex_simd::encode_to_string([0x37u8; 32], hex_simd::AsciiCase::Lower)),
             "the evidence must not carry backup KEK material"
         );
 

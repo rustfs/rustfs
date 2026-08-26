@@ -56,7 +56,7 @@ fn keystone_credentials(project_id: &str) -> Credentials {
 fn account_metadata_bucket_name(account: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(account.as_bytes());
-    let hash = hex::encode(hasher.finalize());
+    let hash = hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower);
     format!("swift-account-{}", &hash[0..16])
 }
 

@@ -434,8 +434,7 @@ mod tests {
     use crate::backends::KmsBackend as KmsBackendTrait;
     use crate::config::{BackendConfig, KmsBackend, StaticConfig};
     use crate::encryption::is_data_key_envelope;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64_simd::STANDARD as BASE64;
 
     /// Generate a random 32-byte key and return (key_id, raw_key).
     fn random_static_key(key_id: &str) -> (String, [u8; 32]) {
@@ -447,7 +446,7 @@ mod tests {
     fn static_config(key_id: &str, raw_key: &[u8; 32]) -> StaticConfig {
         StaticConfig {
             key_id: key_id.to_string(),
-            secret_key: BASE64.encode(raw_key),
+            secret_key: BASE64.encode_to_string(raw_key),
         }
     }
 

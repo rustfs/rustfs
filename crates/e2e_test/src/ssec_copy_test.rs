@@ -21,7 +21,6 @@ use aws_sdk_s3::error::BoxError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
 use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
-use base64::Engine;
 use md5::{Digest as Md5Digest, Md5};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,8 +106,8 @@ fn customer_key(byte: u8) -> CustomerKey {
     hasher.update(raw);
     CustomerKey {
         raw: String::from_utf8_lossy(&raw).into_owned(),
-        encoded: base64::engine::general_purpose::STANDARD.encode(raw),
-        md5: base64::engine::general_purpose::STANDARD.encode(hasher.finalize()),
+        encoded: base64_simd::STANDARD.encode_to_string(raw),
+        md5: base64_simd::STANDARD.encode_to_string(hasher.finalize()),
     }
 }
 

@@ -551,7 +551,6 @@ mod tests {
         ListKeysRequest, ListKeysResponse,
     };
     use async_trait::async_trait;
-    use base64::Engine as _;
     use metrics_util::MetricKind;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::future::Future;
@@ -562,8 +561,7 @@ mod tests {
     }
 
     async fn static_backend() -> Arc<dyn KmsBackend> {
-        let config =
-            KmsConfig::static_kms("static-key".to_string(), base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]));
+        let config = KmsConfig::static_kms("static-key".to_string(), base64_simd::STANDARD.encode_to_string([0x42u8; 32]));
         Arc::new(StaticKmsBackend::new(config).await.expect("static backend should build"))
     }
 

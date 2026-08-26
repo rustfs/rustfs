@@ -1407,8 +1407,7 @@ fn multipart_part_numbers(parts: &[ObjectPartInfo]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64_simd::STANDARD as BASE64_STANDARD;
     use md5::{Digest, Md5};
     use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_MD5_HEADER};
     use std::collections::HashMap;
@@ -1468,7 +1467,7 @@ mod tests {
             request: ReadEncryptionRequest<'_>,
         ) -> std::result::Result<Option<ReadEncryptionMaterial>, EncryptionResolutionError> {
             if let Some(encoded) = request.metadata.get(TEST_OBJECT_KEY_HEADER) {
-                let decoded = BASE64_STANDARD.decode(encoded).map_err(|_| {
+                let decoded = BASE64_STANDARD.decode_to_vec(encoded).map_err(|_| {
                     EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidMetadata, "invalid test object key")
                 })?;
                 let key_bytes = decoded.try_into().map_err(|_| {
@@ -1493,7 +1492,7 @@ mod tests {
                 .map_err(|_| {
                     EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidRequest, "invalid test encryption key")
                 })?;
-            let decoded = BASE64_STANDARD.decode(encoded).map_err(|_| {
+            let decoded = BASE64_STANDARD.decode_to_vec(encoded).map_err(|_| {
                 EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidRequest, "invalid test encryption key")
             })?;
             let key_bytes = decoded.try_into().map_err(|_| {
@@ -1505,7 +1504,7 @@ mod tests {
             let base_nonce = request
                 .metadata
                 .get(TEST_NONCE_HEADER)
-                .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+                .and_then(|encoded| BASE64_STANDARD.decode_to_vec(encoded).ok())
                 .and_then(|bytes| bytes.try_into().ok())
                 .unwrap_or_else(|| fixture_nonce(request.bucket, request.object));
             Ok(Some(ReadEncryptionMaterial {
@@ -1533,7 +1532,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             TEST_DIRECT_KEY_HEADER,
-            HeaderValue::from_str(&BASE64_STANDARD.encode(key_bytes)).expect("test key header is valid"),
+            HeaderValue::from_str(&BASE64_STANDARD.encode_to_string(key_bytes)).expect("test key header is valid"),
         );
         headers
     }
@@ -2439,7 +2438,10 @@ mod tests {
             user_defined: Arc::new(HashMap::from([
                 ("X-Amz-Server-Side-Encryption".to_string(), "aws:kms".to_string()),
                 ("X-Amz-Server-Side-Encryption-Iv".to_string(), "AAAAAAAAAAAAAAAA".to_string()),
-                ("X-Amz-Server-Side-Encryption-Key".to_string(), BASE64_STANDARD.encode([7_u8; 32])),
+                (
+                    "X-Amz-Server-Side-Encryption-Key".to_string(),
+                    BASE64_STANDARD.encode_to_string([7_u8; 32]),
+                ),
                 ("x-rustfs-encryption-original-size".to_string(), "64".to_string()),
             ])),
             ..Default::default()
@@ -2748,7 +2750,7 @@ mod tests {
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                    BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+                    BASE64_STANDARD.encode_to_string(md5_bytes(key_bytes)),
                 ),
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
@@ -2796,11 +2798,11 @@ mod tests {
             name: object.to_string(),
             size: encrypted.len() as i64,
             user_defined: Arc::new(HashMap::from([
-                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode(object_key)),
+                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string(object_key)),
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                    BASE64_STANDARD.encode(md5_bytes(customer_key)),
+                    BASE64_STANDARD.encode_to_string(md5_bytes(customer_key)),
                 ),
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
@@ -2856,7 +2858,7 @@ mod tests {
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                    BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+                    BASE64_STANDARD.encode_to_string(md5_bytes(key_bytes)),
                 ),
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
@@ -3008,13 +3010,13 @@ mod tests {
             ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
             (
                 "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+                BASE64_STANDARD.encode_to_string(md5_bytes(key_bytes)),
             ),
             (
                 "x-amz-server-side-encryption-customer-original-size".to_string(),
                 total_plaintext.to_string(),
             ),
-            (TEST_NONCE_HEADER.to_string(), BASE64_STANDARD.encode(LEGACY_FIXTURE_BASE_NONCE)),
+            (TEST_NONCE_HEADER.to_string(), BASE64_STANDARD.encode_to_string(LEGACY_FIXTURE_BASE_NONCE)),
         ])
     }
 
@@ -3751,11 +3753,11 @@ mod tests {
             name: object.to_string(),
             size: encrypted.len() as i64,
             user_defined: Arc::new(HashMap::from([
-                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode(object_key)),
+                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string(object_key)),
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                    BASE64_STANDARD.encode(md5_bytes(customer_key)),
+                    BASE64_STANDARD.encode_to_string(md5_bytes(customer_key)),
                 ),
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
@@ -3821,7 +3823,7 @@ mod tests {
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                    BASE64_STANDARD.encode(md5_bytes(key_bytes)),
+                    BASE64_STANDARD.encode_to_string(md5_bytes(key_bytes)),
                 ),
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),
@@ -3964,11 +3966,11 @@ mod tests {
                 ..Default::default()
             }]),
             user_defined: Arc::new(HashMap::from([
-                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode(object_key)),
+                (TEST_OBJECT_KEY_HEADER.to_string(), BASE64_STANDARD.encode_to_string(object_key)),
                 ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
                 (
                     "x-amz-server-side-encryption-customer-key-md5".to_string(),
-                    BASE64_STANDARD.encode(md5_bytes(customer_key)),
+                    BASE64_STANDARD.encode_to_string(md5_bytes(customer_key)),
                 ),
                 (
                     "x-amz-server-side-encryption-customer-original-size".to_string(),

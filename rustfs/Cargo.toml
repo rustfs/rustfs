@@ -310,7 +310,6 @@ astral-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 async_zip = { workspace = true, default-features = false, features = ["tokio", "deflate"] }
-base64 = { workspace = true }
 zeroize = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

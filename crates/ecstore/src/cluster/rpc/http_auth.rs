@@ -31,8 +31,7 @@ use crate::storage_api_contracts::internode::{
     NS_SCANNER_PROTOCOL_VERSION, PUT_FILE_AUTH_TRAILER_DIGEST_LEN, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_TRAILER_MAC_LEN,
     PUT_FILE_AUTH_TRAILER_MAGIC, PUT_FILE_CAPABILITY_VERSION,
 };
-use base64::Engine as _;
-use base64::engine::general_purpose;
+
 use hmac::{Hmac, KeyInit, Mac};
 use http::uri::Authority;
 use http::{HeaderMap, HeaderValue, Method, Uri};
@@ -523,11 +522,11 @@ fn generate_signature(secret: &str, url: &str, method: &Method, timestamp: i64) 
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(data.as_bytes());
     let result = mac.finalize();
-    general_purpose::STANDARD.encode(result.into_bytes())
+    base64_simd::STANDARD.encode_to_string(result.into_bytes())
 }
 
 fn verify_signature(secret: &str, url: &str, method: &Method, timestamp: i64, signature: &str) -> bool {
-    let Ok(signature) = general_purpose::STANDARD.decode(signature) else {
+    let Ok(signature) = base64_simd::STANDARD.decode_to_vec(signature) else {
         return false;
     };
 
@@ -745,11 +744,11 @@ fn generate_signature_v2(secret: &str, scope: SignatureV2Scope<'_>) -> std::io::
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
     update_signature_v2(&mut mac, scope);
-    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
 }
 
 fn verify_signature_v2(secret: &str, scope: SignatureV2Scope<'_>, signature: &str) -> bool {
-    let Ok(signature) = general_purpose::STANDARD.decode(signature) else {
+    let Ok(signature) = base64_simd::STANDARD.decode_to_vec(signature) else {
         return false;
     };
     let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
@@ -792,11 +791,11 @@ fn generate_replay_scope_signature(secret: &str, scope: ReplayScope<'_>) -> std:
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
     update_replay_scope(&mut mac, scope);
-    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
 }
 
 fn verify_replay_scope_signature(secret: &str, scope: ReplayScope<'_>, signature: &str) -> bool {
-    let Ok(signature) = general_purpose::STANDARD.decode(signature) else {
+    let Ok(signature) = base64_simd::STANDARD.decode_to_vec(signature) else {
         return false;
     };
     let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()) else {
@@ -821,15 +820,15 @@ fn generate_boot_epoch_proof(secret: &str, audience: &str, challenge: Uuid, boot
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
     update_boot_epoch_proof(&mut mac, audience, challenge, boot_epoch);
-    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
 }
 
 fn verify_boot_epoch_proof(secret: &str, audience: &str, challenge: Uuid, boot_epoch: Uuid, proof: &str) -> std::io::Result<()> {
     if audience.is_empty() || challenge.is_nil() || boot_epoch.is_nil() {
         return Err(std::io::Error::other("Invalid RPC boot epoch proof scope"));
     }
-    let proof = general_purpose::STANDARD
-        .decode(proof)
+    let proof = base64_simd::STANDARD
+        .decode_to_vec(proof)
         .map_err(|_| std::io::Error::other("Invalid RPC boot epoch proof"))?;
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
@@ -862,7 +861,7 @@ fn generate_replay_cache_capability_proof(
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
     update_replay_cache_capability_proof(&mut mac, audience, challenge, boot_epoch);
-    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
+    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
 }
 
 fn verify_replay_cache_capability_proof(
@@ -872,8 +871,8 @@ fn verify_replay_cache_capability_proof(
     boot_epoch: Uuid,
     proof: &str,
 ) -> std::io::Result<()> {
-    let proof = general_purpose::STANDARD
-        .decode(proof)
+    let proof = base64_simd::STANDARD
+        .decode_to_vec(proof)
         .map_err(|_| std::io::Error::other("Invalid RPC replay cache capability proof"))?;
     let mut mac =
         <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(|_| std::io::Error::other("Invalid RPC HMAC key"))?;
@@ -1988,9 +1987,9 @@ mod tests {
         let method = Method::GET;
         let timestamp = 1640995200;
         let signature = generate_signature(secret, url, &method, timestamp);
-        let mut tampered = general_purpose::STANDARD.decode(&signature).unwrap();
+        let mut tampered = base64_simd::STANDARD.decode_to_vec(&signature).unwrap();
         tampered[0] ^= 1;
-        let tampered_signature = general_purpose::STANDARD.encode(tampered);
+        let tampered_signature = base64_simd::STANDARD.encode_to_string(tampered);
 
         assert!(verify_signature(secret, url, &method, timestamp, &signature));
         assert!(!verify_signature(secret, url, &method, timestamp, &tampered_signature));
