@@ -20,7 +20,7 @@
 //! Unicode block art (for a terminal), and the console needs no new npm
 //! dependency to show a code.
 
-use qrcode::{EcLevel, QrCode, render::svg, render::unicode};
+use qrcode_rs::{EcLevel, QrCode, render::svg, render::unicode};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum QrError {
