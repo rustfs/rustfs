@@ -1,0 +1,142 @@
+name: RustFS Pool Expansion / Decommission Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      rustfs_version:
+        description: 'RustFS release tag to test (e.g. 1.0.0-rc.3)'
+        required: false
+        default: '1.0.0-rc.3'
+      package_url:
+        description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
+        required: false
+        type: string
+      pools:
+        description: 'Number of pools to expand to (2 = first rebalance only)'
+        type: choice
+        options:
+          - '2'
+          - '3'
+        default: '3'
+      storage_threshold:
+        description: 'Stop writing when storage usage reaches N%'
+        required: false
+        default: '50'
+      warp_duration:
+        description: 'warp write duration (e.g. 5m, 10m)'
+        required: false
+        default: '10m'
+      run_decommission:
+        description: 'Run the pool decommission step (3-pool topology only)'
+        type: boolean
+        default: true
+      cleanup_before:
+        description: 'Reset the nodes before the test (DESTROYS existing data/config)'
+        type: boolean
+        default: true
+      cleanup_after:
+        description: 'Reset the nodes after the test (DESTROYS test data/config)'
+        type: boolean
+        default: true
+  schedule:
+    # Nightly regression run; remove if you do not want a schedule.
+    - cron: '0 21 * * *'
+
+permissions:
+  contents: read
+
+# Only one pool-expansion test at a time: the workflow mutates a shared
+# test environment, so concurrent runs must not clobber each other.
+concurrency:
+  group: rustfs-pool-expansion-test
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_API_ENDPOINT: ${{ vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
+  RUSTFS_NODES: ${{ vars.RUSTFS_NODES }}
+  RUSTFS_SSH_USER: ${{ vars.RUSTFS_SSH_USER }}
+
+jobs:
+  pool-expansion-test:
+    runs-on: [self-hosted, linux, x64, rustfs-test]
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          openssl version
+          warp --version || true
+          df -h /data | tail -1
+
+      - name: Reset test environment (before)
+        if: ${{ inputs.cleanup_before }}
+        run: |
+          chmod +x scripts/test/rustfs_pool_expand.sh
+          ./scripts/test/rustfs_pool_expand.sh --reset -y
+
+      - name: Preflight checks
+        run: |
+          ARGS=(--preflight --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--version "${{ inputs.rustfs_version }}")
+          fi
+          ./scripts/test/rustfs_pool_expand.sh "${ARGS[@]}"
+
+      - name: Run pool expansion & decommission test
+        id: pool_test
+        run: |
+          set -o pipefail
+          STEPS="1,2,3,4,5,6"
+          if [ "${{ inputs.pools }}" = "3" ]; then
+            STEPS="$STEPS,7,8"
+            if [ "${{ inputs.run_decommission }}" = "true" ]; then
+              STEPS="$STEPS,9"
+            fi
+          fi
+          ARGS=(--steps "$STEPS" --with-warp -y \
+            --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
+            --storage-threshold "${{ inputs.storage_threshold }}" \
+            --warp-duration "${{ inputs.warp_duration }}" \
+            --log-file /tmp/rustfs-pool-test.log)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--version "${{ inputs.rustfs_version }}")
+          fi
+          ./scripts/test/rustfs_pool_expand.sh "${ARGS[@]}"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-pool-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-pool-test.log
+            /tmp/rustfs-warp.log
+          if-no-files-found: warn
+
+      - name: Reset test environment (after)
+        if: ${{ always() && inputs.cleanup_after }}
+        run: |
+          ./scripts/test/rustfs_pool_expand.sh --reset -y
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS pool expansion test failed"
+          echo "Package source: ${{ inputs.package_url || format('release {0}', inputs.rustfs_version) }}"
+          echo "See the uploaded log artifact for details."
