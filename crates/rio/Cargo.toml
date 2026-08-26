@@ -91,4 +91,6 @@ hex-simd.workspace = true
 [dev-dependencies]
 tokio-test = { workspace = true }
 axum = { workspace = true }
+hyper = { workspace = true, features = ["http2", "server"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }

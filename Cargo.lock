@@ -10271,6 +10271,8 @@ dependencies = [
  "hotpath",
  "http 1.5.0",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "md-5 0.11.0",
  "pin-project-lite",
  "rand 0.10.2",
