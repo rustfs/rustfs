@@ -13,38 +13,27 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-common"
+name = "rustfs-heal-contracts"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Common utilities and data structures for RustFS, providing shared functionality across the project."
-keywords = ["common", "utilities", "data-structures", "rustfs", "Minio"]
+description = "Heal request/response channel contracts shared by heal producers and the heal executor."
+keywords = ["heal", "contracts", "channel", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "data-structures"]
 
 [lints]
 workspace = true
 
-[features]
-default = []
-hotpath = ["hotpath/hotpath", "hotpath/tokio"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
-
 [dependencies]
-hotpath.workspace = true
-tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
-tonic = { workspace = true, features = ["gzip", "deflate"] }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["sync"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
-metrics = { workspace = true }
-# Transitional shim deps (backlog#1843): dropped with the re-export shims once
-# every consumer imports the contracts crates directly.
-rustfs-heal-contracts = { workspace = true }
-rustfs-scanner-contracts = { workspace = true }
-smallvec = { workspace = true }
-tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lib]
 doctest = false

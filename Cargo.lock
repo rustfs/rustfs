@@ -9390,13 +9390,10 @@ dependencies = [
 name = "rustfs-common"
 version = "1.0.0-rc.3"
 dependencies = [
- "chrono",
  "hotpath",
- "jiff",
  "metrics",
- "rmp-serde",
- "serde",
- "serde_json",
+ "rustfs-heal-contracts",
+ "rustfs-scanner-contracts",
  "smallvec",
  "tokio",
  "tonic",
@@ -9682,6 +9679,15 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "rustfs-heal-contracts"
+version = "1.0.0-rc.3"
+dependencies = [
+ "serde",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -10413,6 +10419,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "rustfs-scanner-contracts"
+version = "1.0.0-rc.3"
+dependencies = [
+ "chrono",
+ "jiff",
+ "metrics",
+ "rmp-serde",
+ "rustfs-heal-contracts",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 

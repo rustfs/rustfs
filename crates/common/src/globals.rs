@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,8 +26,10 @@ pub static GLOBAL_CONN_MAP: LazyLock<RwLock<HashMap<String, Channel>>> = LazyLoc
 pub static GLOBAL_ROOT_CERT: LazyLock<RwLock<Option<Vec<u8>>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_MTLS_IDENTITY: LazyLock<RwLock<Option<MtlsIdentityPem>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_OUTBOUND_TLS_GENERATION: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
-/// Global initialization time of the RustFS node.
-pub static GLOBAL_INIT_TIME: LazyLock<RwLock<Option<DateTime<Utc>>>> = LazyLock::new(|| RwLock::new(None));
+
+// Transitional re-export shim (backlog#1843): the node init-time global moved
+// to rustfs-scanner-contracts, whose metrics report reads it directly.
+pub use rustfs_scanner_contracts::{GLOBAL_INIT_TIME, get_global_init_time, set_global_init_time_now};
 
 /// Log level to use when reporting cached gRPC connection eviction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,20 +62,6 @@ pub fn try_get_global_local_node_name() -> Option<String> {
         .ok()
         .map(|name| name.clone())
         .filter(|name| !name.is_empty())
-}
-
-/// Set the global RustFS initialization time to the current UTC time.
-pub async fn set_global_init_time_now() {
-    let now = Utc::now();
-    *GLOBAL_INIT_TIME.write().await = Some(now);
-}
-
-/// Get the global RustFS initialization time.
-///
-/// # Returns
-/// * `Option<DateTime<Utc>>` - The initialization time if set.
-pub async fn get_global_init_time() -> Option<DateTime<Utc>> {
-    *GLOBAL_INIT_TIME.read().await
 }
 
 /// Set the global RustFS address used for gRPC connections.
