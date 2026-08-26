@@ -36,10 +36,8 @@ pub(crate) use crate::runtime_sources::{
 };
 use rustfs_config::server_config::Config;
 use rustfs_kms::KmsServiceManager;
-use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
+use rustfs_tls_runtime::GlobalPublishedOutboundTlsState;
 use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 pub(crate) fn default_admin_usecase() -> DefaultAdminUsecase {
@@ -114,29 +112,6 @@ pub(crate) fn current_server_config() -> Option<Config> {
 pub(crate) fn current_or_init_kms_runtime_service_manager() -> Arc<KmsServiceManager> {
     root_runtime_sources::current_or_init_kms_runtime_service_manager()
         .unwrap_or_else(rustfs_kms::init_global_kms_service_manager)
-}
-
-#[cfg(test)]
-static TEST_OUTBOUND_TLS_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
-pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
-    root_runtime_sources::set_test_outbound_tls_generation(generation);
-    TEST_OUTBOUND_TLS_GENERATION.store(generation, Ordering::Relaxed);
-}
-
-pub(crate) fn current_outbound_tls_generation() -> TlsGeneration {
-    root_runtime_sources::current_outbound_tls_generation().unwrap_or_else(empty_outbound_tls_generation)
-}
-
-#[cfg(test)]
-fn empty_outbound_tls_generation() -> TlsGeneration {
-    TlsGeneration(TEST_OUTBOUND_TLS_GENERATION.load(Ordering::Relaxed))
-}
-
-#[cfg(not(test))]
-fn empty_outbound_tls_generation() -> TlsGeneration {
-    TlsGeneration(0)
 }
 
 pub(crate) async fn current_outbound_tls_state() -> GlobalPublishedOutboundTlsState {

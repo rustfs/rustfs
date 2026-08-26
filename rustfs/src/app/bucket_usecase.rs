@@ -64,9 +64,6 @@ use super::storage_api::bucket_usecase::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     request_context, validate_list_object_unordered_with_delimiter,
 };
-use crate::admin::handlers::site_replication::{
-    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
-};
 use crate::app::object_data_cache::invalidate_object_data_cache_bucket_after_delete;
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_encryption_service, current_notification_system,
@@ -75,6 +72,9 @@ use crate::app::runtime_sources::{
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
+use crate::site_replication::{
+    site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
+};
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use http::StatusCode;
 use metrics::counter;

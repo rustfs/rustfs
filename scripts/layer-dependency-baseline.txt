@@ -18,9 +18,6 @@ cycle|app<->infra
 cycle|app<->interface
 cycle|infra<->interface
 dep|rustfs/src/app/admin_usecase.rs|app->interface|crate::server::collect_dependency_readiness_report
-dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_bucket_meta_hook
-dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_delete_bucket_hook
-dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_make_bucket_hook
 dep|rustfs/src/cluster_snapshot.rs|infra->interface|crate::server::snapshot_dependency_readiness_report
 dep|rustfs/src/runtime_sources.rs|infra->app|crate::app::context
 dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::server::cors

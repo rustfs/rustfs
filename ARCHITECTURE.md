@@ -332,6 +332,8 @@ The binary (`main.rs`) boots in this order:
 
 - **"Where is replication configured?"**
   `admin/handlers/replication.rs` and `admin/handlers/site_replication.rs` for API,
+  `rustfs/src/site_replication/` for the site-replication service subsystem
+  (state, peer transport, retry queue, repair, hooks),
   `ecstore/src/bucket/replication/` for engine
 
 - **"Where do I add a new admin endpoint?"**

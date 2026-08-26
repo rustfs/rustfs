@@ -216,6 +216,54 @@ pub(crate) mod server {
     }
 }
 
+/// Storage surface of the site-replication service module
+/// (`crate::site_replication`, backlog#1840): bucket metadata, bucket
+/// targets, replication-config primitives, and the config-object lock
+/// helpers its state transaction runs on.
+pub(crate) mod site_replication {
+    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions};
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::bucket_target_sys::BucketTargetSys;
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata::{
+        BUCKET_REPLICATION_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BucketMetadata,
+    };
+
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::replication::{
+        OperatorRuleContract, assign_site_replication_rule_priorities, is_site_replication_role,
+        replication_target_arn_deployment_id, site_replication_rule_deployment_id,
+    };
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::target::{
+        ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials,
+    };
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::{deserialize, serialize};
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi;
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::ecstore_config::com::save_config;
+
+    pub(crate) use crate::storage::storage_api::{
+        ECStore, EndpointServerPools, StorageError, delete_config_no_lock, lock_bucket_targets_metadata, read_config,
+        read_config_no_lock, save_config_no_lock, with_config_object_read_lock, with_config_object_write_lock,
+    };
+
+    pub(crate) mod metadata_sys {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::{
+            capture_bucket_metadata_incarnation, get, get_replication_config, get_versioning_config, list_bucket_targets,
+            update_if_incarnation,
+        };
+    }
+
+    /// S3 wire types for the service module, funneled here so the module
+    /// itself stays off the direct s3s surface (s3s footprint ratchet).
+    pub(crate) mod s3 {
+        pub(crate) use s3s::dto::{
+            BucketLifecycleConfiguration, BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus,
+            DeleteReplication, DeleteReplicationStatus, Destination, ExistingObjectReplication, ExistingObjectReplicationStatus,
+            LifecycleRule, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
+            ReplicationRuleStatus, SourceSelectionCriteria, VersioningConfiguration,
+        };
+        pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
+    }
+}
+
 pub(crate) mod startup {
     pub(crate) mod heal_control {
         #[cfg(test)]
