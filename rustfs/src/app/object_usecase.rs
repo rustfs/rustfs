@@ -40,6 +40,7 @@ use super::storage_api::object_usecase::bucket::{
     object_lock::{
         objectlock::{get_object_legalhold_meta, get_object_retention_meta},
         objectlock_sys::{check_object_lock_for_deletion, is_retention_active, replication_write_may_pass_worm_gate},
+        types::RetentionMode,
     },
     predict_lifecycle_expiration,
     quota::{QuotaCheckResult, QuotaError, QuotaOperation},
@@ -4045,11 +4046,7 @@ pub(crate) fn validate_existing_object_lock_for_write(
     }
 
     let legal_hold = get_object_legalhold_meta(&existing_obj_info.user_defined);
-    if legal_hold
-        .status
-        .as_ref()
-        .is_some_and(|status| status.as_str() == ObjectLockLegalHoldStatus::ON)
-    {
+    if legal_hold.is_on() {
         return Err(S3Error::with_message(
             S3ErrorCode::AccessDenied,
             "Object has a legal hold and cannot be overwritten. Remove the legal hold first.".to_string(),
@@ -4057,9 +4054,9 @@ pub(crate) fn validate_existing_object_lock_for_write(
     }
 
     let retention = get_object_retention_meta(&existing_obj_info.user_defined);
-    if let Some(mode) = retention.mode.as_ref()
-        && mode.as_str() == ObjectLockRetentionMode::COMPLIANCE
-        && is_retention_active(mode.as_str(), retention.retain_until_date.as_ref())
+    if let Some(mode) = retention.mode
+        && mode == RetentionMode::Compliance
+        && is_retention_active(mode, retention.retain_until_date)
     {
         return Err(S3Error::with_message(
             S3ErrorCode::AccessDenied,

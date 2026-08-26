@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use s3s::dto::{Date, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockRetention, ObjectLockRetentionMode};
-use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE};
+use super::types::{LegalHoldStatus, ObjectLegalHold, ObjectRetention, RetentionMode};
+use rustfs_utils::http::headers::{
+    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+};
 use std::collections::HashMap;
 use time::{OffsetDateTime, format_description};
 
@@ -31,65 +33,48 @@ pub fn utc_now_ntp() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 
-pub fn get_object_retention_meta(meta: &HashMap<String, String>) -> ObjectLockRetention {
-    // Note: X_AMZ_OBJECT_LOCK_MODE.as_str() is already lowercase ("x-amz-object-lock-mode")
-    let mode_str = meta.get(X_AMZ_OBJECT_LOCK_MODE.as_str());
+pub fn get_object_retention_meta(meta: &HashMap<String, String>) -> ObjectRetention {
+    // The persisted metadata keys are the lowercase wire header names.
+    let mode_str = meta.get(AMZ_OBJECT_LOCK_MODE_LOWER);
 
     let Some(mode_str) = mode_str else {
-        return ObjectLockRetention {
-            mode: None,
-            retain_until_date: None,
-        };
+        return ObjectRetention::default();
     };
 
     // If mode is invalid, return empty retention (don't panic)
     let Some(mode) = parse_ret_mode(mode_str.as_str()) else {
-        return ObjectLockRetention {
-            mode: None,
-            retain_until_date: None,
-        };
+        return ObjectRetention::default();
     };
 
-    let till_str = meta.get(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str());
+    let till_str = meta.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER);
 
-    let retain_until_date = till_str
-        .and_then(|s| OffsetDateTime::parse(s, &format_description::well_known::Iso8601::DEFAULT).ok())
-        .map(Date::from);
+    let retain_until_date =
+        till_str.and_then(|s| OffsetDateTime::parse(s, &format_description::well_known::Iso8601::DEFAULT).ok());
 
-    ObjectLockRetention {
+    ObjectRetention {
         mode: Some(mode),
         retain_until_date,
     }
 }
 
-pub fn get_object_legalhold_meta(meta: &HashMap<String, String>) -> ObjectLockLegalHold {
-    // Note: X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str() is already lowercase
-    let hold_str = meta.get(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str());
+pub fn get_object_legalhold_meta(meta: &HashMap<String, String>) -> ObjectLegalHold {
+    let hold_str = meta.get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER);
 
-    match hold_str.and_then(|s| parse_legalhold_status(s)) {
-        Some(status) => ObjectLockLegalHold { status: Some(status) },
-        None => ObjectLockLegalHold { status: None },
+    ObjectLegalHold {
+        status: hold_str.and_then(|s| parse_legalhold_status(s)),
     }
 }
 
-/// Parse retention mode string into ObjectLockRetentionMode.
+/// Parse retention mode string into [`RetentionMode`].
 /// Returns None for invalid/unknown mode strings instead of panicking.
-pub fn parse_ret_mode(mode_str: &str) -> Option<ObjectLockRetentionMode> {
-    match mode_str.to_uppercase().as_str() {
-        "GOVERNANCE" => Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::GOVERNANCE)),
-        "COMPLIANCE" => Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
-        _ => None,
-    }
+pub fn parse_ret_mode(mode_str: &str) -> Option<RetentionMode> {
+    RetentionMode::parse(mode_str)
 }
 
-/// Parse legal hold status string into ObjectLockLegalHoldStatus.
+/// Parse legal hold status string into [`LegalHoldStatus`].
 /// Returns None for invalid/unknown status strings instead of panicking.
-pub fn parse_legalhold_status(hold_str: &str) -> Option<ObjectLockLegalHoldStatus> {
-    match hold_str.to_uppercase().as_str() {
-        "ON" => Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
-        "OFF" => Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
-        _ => None,
-    }
+pub fn parse_legalhold_status(hold_str: &str) -> Option<LegalHoldStatus> {
+    LegalHoldStatus::parse(hold_str)
 }
 
 #[cfg(test)]
@@ -101,25 +86,25 @@ mod tests {
         // Test uppercase
         let mode = parse_ret_mode("GOVERNANCE");
         assert!(mode.is_some());
-        assert_eq!(mode.unwrap().as_str(), ObjectLockRetentionMode::GOVERNANCE);
+        assert_eq!(mode.unwrap().as_str(), RetentionMode::GOVERNANCE);
 
         let mode = parse_ret_mode("COMPLIANCE");
         assert!(mode.is_some());
-        assert_eq!(mode.unwrap().as_str(), ObjectLockRetentionMode::COMPLIANCE);
+        assert_eq!(mode.unwrap().as_str(), RetentionMode::COMPLIANCE);
 
         // Test lowercase
         let mode = parse_ret_mode("governance");
         assert!(mode.is_some());
-        assert_eq!(mode.unwrap().as_str(), ObjectLockRetentionMode::GOVERNANCE);
+        assert_eq!(mode.unwrap().as_str(), RetentionMode::GOVERNANCE);
 
         let mode = parse_ret_mode("compliance");
         assert!(mode.is_some());
-        assert_eq!(mode.unwrap().as_str(), ObjectLockRetentionMode::COMPLIANCE);
+        assert_eq!(mode.unwrap().as_str(), RetentionMode::COMPLIANCE);
 
         // Test mixed case
         let mode = parse_ret_mode("Governance");
         assert!(mode.is_some());
-        assert_eq!(mode.unwrap().as_str(), ObjectLockRetentionMode::GOVERNANCE);
+        assert_eq!(mode.unwrap().as_str(), RetentionMode::GOVERNANCE);
     }
 
     #[test]
@@ -136,20 +121,20 @@ mod tests {
         // Test uppercase
         let status = parse_legalhold_status("ON");
         assert!(status.is_some());
-        assert_eq!(status.unwrap().as_str(), ObjectLockLegalHoldStatus::ON);
+        assert_eq!(status.unwrap().as_str(), LegalHoldStatus::ON);
 
         let status = parse_legalhold_status("OFF");
         assert!(status.is_some());
-        assert_eq!(status.unwrap().as_str(), ObjectLockLegalHoldStatus::OFF);
+        assert_eq!(status.unwrap().as_str(), LegalHoldStatus::OFF);
 
         // Test lowercase
         let status = parse_legalhold_status("on");
         assert!(status.is_some());
-        assert_eq!(status.unwrap().as_str(), ObjectLockLegalHoldStatus::ON);
+        assert_eq!(status.unwrap().as_str(), LegalHoldStatus::ON);
 
         let status = parse_legalhold_status("off");
         assert!(status.is_some());
-        assert_eq!(status.unwrap().as_str(), ObjectLockLegalHoldStatus::OFF);
+        assert_eq!(status.unwrap().as_str(), LegalHoldStatus::OFF);
     }
 
     #[test]
@@ -175,7 +160,7 @@ mod tests {
         meta.insert("x-amz-object-lock-mode".to_string(), "GOVERNANCE".to_string());
         let retention = get_object_retention_meta(&meta);
         assert!(retention.mode.is_some());
-        assert_eq!(retention.mode.unwrap().as_str(), ObjectLockRetentionMode::GOVERNANCE);
+        assert_eq!(retention.mode.unwrap().as_str(), RetentionMode::GOVERNANCE);
         assert!(retention.retain_until_date.is_none());
     }
 
@@ -196,7 +181,7 @@ mod tests {
         meta.insert("x-amz-object-lock-retain-until-date".to_string(), "2030-01-01T00:00:00Z".to_string());
         let retention = get_object_retention_meta(&meta);
         assert!(retention.mode.is_some());
-        assert_eq!(retention.mode.unwrap().as_str(), ObjectLockRetentionMode::COMPLIANCE);
+        assert_eq!(retention.mode.unwrap().as_str(), RetentionMode::COMPLIANCE);
         assert!(retention.retain_until_date.is_some());
     }
 
@@ -210,17 +195,11 @@ mod tests {
         meta.insert("x-amz-object-lock-legal-hold".to_string(), "ON".to_string());
 
         let retention = get_object_retention_meta(&meta);
-        assert_eq!(
-            retention.mode.as_ref().map(|mode| mode.as_str()),
-            Some(ObjectLockRetentionMode::COMPLIANCE)
-        );
+        assert_eq!(retention.mode.as_ref().map(|mode| mode.as_str()), Some(RetentionMode::COMPLIANCE));
         assert!(retention.retain_until_date.is_some(), "persisted retention date must remain readable");
 
         let legal_hold = get_object_legalhold_meta(&meta);
-        assert_eq!(
-            legal_hold.status.as_ref().map(|status| status.as_str()),
-            Some(ObjectLockLegalHoldStatus::ON)
-        );
+        assert_eq!(legal_hold.status.as_ref().map(|status| status.as_str()), Some(LegalHoldStatus::ON));
     }
 
     #[test]
@@ -236,7 +215,7 @@ mod tests {
         meta.insert("x-amz-object-lock-legal-hold".to_string(), "ON".to_string());
         let legalhold = get_object_legalhold_meta(&meta);
         assert!(legalhold.status.is_some());
-        assert_eq!(legalhold.status.unwrap().as_str(), ObjectLockLegalHoldStatus::ON);
+        assert_eq!(legalhold.status.unwrap().as_str(), LegalHoldStatus::ON);
     }
 
     #[test]
@@ -245,7 +224,7 @@ mod tests {
         meta.insert("x-amz-object-lock-legal-hold".to_string(), "OFF".to_string());
         let legalhold = get_object_legalhold_meta(&meta);
         assert!(legalhold.status.is_some());
-        assert_eq!(legalhold.status.unwrap().as_str(), ObjectLockLegalHoldStatus::OFF);
+        assert_eq!(legalhold.status.unwrap().as_str(), LegalHoldStatus::OFF);
     }
 
     #[test]

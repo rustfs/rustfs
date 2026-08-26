@@ -25,14 +25,14 @@ cd "$(dirname "$0")/.."
 # Baselines verified on 2026-08-11. Lower-only; see header.
 # Excludes crates/e2e_test/ — test infrastructure legitimately uses s3s
 # to verify S3 behavior and does not widen the production s3s surface.
-S3S_IMPORT_FILES_BASELINE=211
+S3S_IMPORT_FILES_BASELINE=208
 S3_ERROR_LINES_BASELINE=1620
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;
 # this counter ratchets the remaining serving-side s3s references out of
 # crates/ecstore. Baseline verified on 2026-08-26.
-S3S_ECSTORE_FILES_BASELINE=42
+S3S_ECSTORE_FILES_BASELINE=39
 S3S_PATH_PATTERN='(^|[^"[:alnum:]_])s3s::'
 E2E_TEST_GLOB='--glob=!crates/e2e_test/**'
 

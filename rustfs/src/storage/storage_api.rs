@@ -1745,6 +1745,10 @@ pub(crate) fn check_retention_for_modification(
     new_retain_until: Option<time::OffsetDateTime>,
     bypass_governance: bool,
 ) -> Option<ObjectLockBlockReason> {
+    // The gate compares the requested mode literally against the canonical
+    // persisted mode, so only the exact canonical spelling maps to a typed
+    // mode; anything else stays `None` and is judged as a mode change.
+    let new_mode = new_mode.and_then(ecstore_bucket::object_lock::types::RetentionMode::parse_exact);
     ecstore_bucket::object_lock::objectlock_sys::check_retention_for_modification(
         user_defined,
         new_mode,

@@ -154,6 +154,12 @@ pub mod bucket {
     pub mod object_lock {
         pub use crate::bucket::object_lock::{ObjectLockApi, ObjectLockStatusExt};
 
+        pub mod types {
+            pub use crate::bucket::object_lock::types::{
+                DefaultRetention, LegalHoldStatus, ObjectLegalHold, ObjectRetention, RetentionMode,
+            };
+        }
+
         pub mod objectlock {
             pub use crate::bucket::object_lock::objectlock::{get_object_legalhold_meta, get_object_retention_meta};
         }

@@ -46,8 +46,8 @@ use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::object_lock::objectlock_sys::{
-    check_object_lock_for_deletion_with_config, check_object_lock_for_deletion_with_state, check_retention_for_modification,
-    replication_write_may_pass_worm_gate,
+    check_object_lock_for_deletion_with_default_retention, check_object_lock_for_deletion_with_state,
+    check_retention_for_modification, replication_write_may_pass_worm_gate,
 };
 use crate::bucket::replication::{
     ReplicateDecision, ReplicationObjectBridge, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
@@ -4688,7 +4688,10 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
     if let Some(retention) = &opts.object_lock_retention
         && check_retention_for_modification(
             &obj_info.user_defined,
-            retention.mode.as_deref(),
+            retention
+                .mode
+                .as_deref()
+                .and_then(crate::bucket::object_lock::types::RetentionMode::parse_exact),
             retention.retain_until,
             retention.bypass_governance,
         )
