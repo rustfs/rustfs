@@ -24,19 +24,16 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_object_data_cache;
+use crate::admin::utils::json_response;
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::server::ADMIN_PREFIX;
-use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_object_data_cache::{ObjectDataCacheIdentity, ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::header::CONTENT_TYPE;
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
 use std::sync::Arc;
-
-const JSON_CONTENT_TYPE: &str = "application/json";
 
 #[derive(Debug, Serialize)]
 struct ObjectDataCacheStatsResponse {
@@ -83,14 +80,6 @@ async fn authorize(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
     }
     authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
     Ok(())
-}
-
-fn json_response<T: Serialize>(body: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(body)
-        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode response: {err}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
-    Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
 }
 
 fn query_value(req: &S3Request<Body>, key: &str) -> Option<String> {
@@ -146,7 +135,7 @@ impl Operation for ObjectDataCacheStatsHandler {
             },
         };
 
-        json_response(&response)
+        json_response(StatusCode::OK, &response)
     }
 }
 
@@ -181,19 +170,24 @@ impl Operation for ObjectDataCacheFlushHandler {
         };
 
         let (outcome, removed_keys) = invalidation_outcome(&result);
-        json_response(&ObjectDataCacheFlushResponse {
-            scope,
-            bucket,
-            object,
-            outcome,
-            removed_keys,
-        })
+        json_response(
+            StatusCode::OK,
+            &ObjectDataCacheFlushResponse {
+                scope,
+                bucket,
+                object,
+                outcome,
+                removed_keys,
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::HeaderMap;
+    use s3s::S3ErrorCode;
 
     #[test]
     fn flush_outcome_maps_removed_and_noop() {

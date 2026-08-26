@@ -47,7 +47,7 @@ use crate::admin::storage_api::contract::bucket::{
 };
 use crate::admin::storage_api::error::{Error as StorageError, is_err_bucket_not_found};
 use crate::admin::storage_api::runtime::ECStore;
-use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
+use crate::admin::utils::{empty_response, encode_compatible_admin_payload, json_response, read_compatible_admin_body};
 use crate::auth::constant_time_eq;
 use crate::config::get_config_snapshot;
 use crate::error::ApiError;
@@ -62,7 +62,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use http::header::{CONTENT_TYPE, HOST};
-use http::{HeaderMap, HeaderValue, Uri};
+use http::{HeaderMap, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::{
@@ -970,14 +970,6 @@ fn reject_site_replicator_on_public_admin(cred: &rustfs_credentials::Credentials
     Ok(())
 }
 
-fn json_response<T: Serialize>(value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(s3s::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
-}
-
 fn go_gob_site_netperf_response(value: &SiteNetPerfNodeResult) -> S3Response<(StatusCode, Body)> {
     let data = encode_go_gob_site_netperf_node_result(value);
     S3Response::new((StatusCode::OK, Body::from(data)))
@@ -1057,10 +1049,6 @@ fn write_go_gob_uint(out: &mut Vec<u8>, value: u64) {
     let used = &bytes[first_non_zero..];
     out.push((0u8).wrapping_sub(used.len() as u8));
     out.extend_from_slice(used);
-}
-
-fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
-    S3Response::new((status, Body::empty()))
 }
 
 async fn read_plain_admin_body(mut input: Body) -> S3Result<Vec<u8>> {
@@ -4273,7 +4261,7 @@ async fn execute_site_replication_repair_locked(
             ));
         }
         if existing.status == "success" {
-            return json_response(&site_replication_repair_operation_response(existing));
+            return json_response(StatusCode::OK, &site_replication_repair_operation_response(existing));
         }
         if !constant_time_eq(&existing.plan_token, &plan_token) {
             return Err(S3Error::with_message(
@@ -4306,7 +4294,7 @@ async fn execute_site_replication_repair_locked(
     })
     .await?;
     if operation.status == "success" {
-        return json_response(&site_replication_repair_operation_response(&operation));
+        return json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation));
     }
 
     let service_account_secret_key = site_replicator_service_account_secret(&state.service_account_access_key).await?;
@@ -4368,7 +4356,7 @@ async fn execute_site_replication_repair_locked(
 
     summarize_site_replication_repair_operation(&mut operation);
     persist_site_replication_repair_operation(&operation).await?;
-    json_response(&site_replication_repair_operation_response(&operation))
+    json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation))
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
@@ -10183,13 +10171,16 @@ impl Operation for SiteReplicationAddHandler {
         // response below (BUG2) rather than swallowed; they do not abort the overall add.
         initial_sync_errors.extend(backfill_existing_buckets_after_add(&state, &local_peer, None).await);
 
-        json_response(&ReplicateAddStatus {
-            success: true,
-            status: SITE_REPL_ADD_SUCCESS.to_string(),
-            initial_sync_error_message: initial_sync_errors.render(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
+        json_response(
+            StatusCode::OK,
+            &ReplicateAddStatus {
+                success: true,
+                status: SITE_REPL_ADD_SUCCESS.to_string(),
+                initial_sync_error_message: initial_sync_errors.render(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -10256,7 +10247,7 @@ impl Operation for SiteReplicationRemoveHandler {
             site_replication_remove_status(&peer_errors)
         };
 
-        json_response(&status)
+        json_response(StatusCode::OK, &status)
     }
 }
 
@@ -10287,7 +10278,7 @@ impl Operation for SiteReplicationInfoHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
-        json_response(&site_replication_info_for(&state, &local_peer))
+        json_response(StatusCode::OK, &site_replication_info_for(&state, &local_peer))
     }
 }
 
@@ -10301,7 +10292,7 @@ impl Operation for SiteReplicationMetaInfoHandler {
         let local_peer = current_local_peer(&req, &state);
         let opts = sr_status_options(&req.uri);
         let info = filter_sr_info(build_sr_info(&state, &local_peer).await?, &opts);
-        json_response(&info)
+        json_response(StatusCode::OK, &info)
     }
 }
 
@@ -10314,7 +10305,7 @@ impl Operation for SiteReplicationStatusHandler {
         let state = load_site_replication_state().await?;
         let local_peer = current_local_peer(&req, &state);
         let status = build_status_info(&state, &local_peer, &req.uri).await?;
-        json_response(&status)
+        json_response(StatusCode::OK, &status)
     }
 }
 
@@ -10569,7 +10560,7 @@ impl Operation for SRPeerJoinHandler {
                     result = "join_superseded",
                     "admin site replication state"
                 );
-                return json_response(&superseded_join_response(peer));
+                return json_response(StatusCode::OK, &superseded_join_response(peer));
             }
         };
         // Fix 1 (receiving side): ensure the joining peer also sets up replication for any
@@ -10588,10 +10579,13 @@ impl Operation for SRPeerJoinHandler {
                 "admin site replication state"
             );
         }
-        json_response(&applied_join_response(
-            state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
-            backfill_errors.render(),
-        ))
+        json_response(
+            StatusCode::OK,
+            &applied_join_response(
+                state.peers.get(&local_peer.deployment_id).cloned().unwrap_or(local_peer),
+                backfill_errors.render(),
+            ),
+        )
     }
 }
 
@@ -10758,7 +10752,7 @@ impl Operation for SRPeerGetIDPSettingsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
 
-        json_response(&local_idp_settings())
+        json_response(StatusCode::OK, &local_idp_settings())
     }
 }
 
@@ -11037,12 +11031,15 @@ impl Operation for SiteReplicationEditHandler {
             }
         }
 
-        json_response(&ReplicateEditStatus {
-            success: true,
-            status: SITE_REPL_EDIT_SUCCESS.to_string(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
+        json_response(
+            StatusCode::OK,
+            &ReplicateEditStatus {
+                success: true,
+                status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -11052,14 +11049,17 @@ pub struct SRPeerEditCapabilitiesHandler {}
 impl Operation for SRPeerEditCapabilitiesHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
-        json_response(&ReplicateEditStatus {
-            success: query_pairs(&req.uri)
-                .get("capability")
-                .is_some_and(|value| peer_edit_capability_supported(value)),
-            status: SITE_REPL_EDIT_SUCCESS.to_string(),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
-        })
+        json_response(
+            StatusCode::OK,
+            &ReplicateEditStatus {
+                success: query_pairs(&req.uri)
+                    .get("capability")
+                    .is_some_and(|value| peer_edit_capability_supported(value)),
+                status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        )
     }
 }
 
@@ -11174,30 +11174,39 @@ impl Operation for SRPeerEditHandler {
         let service_account_access_key = match outcome {
             PeerEditOutcome::Applied(service_account_access_key) => service_account_access_key,
             PeerEditOutcome::Acked => {
-                return json_response(&ReplicateEditStatus {
-                    success: true,
-                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                    ..Default::default()
-                });
+                return json_response(
+                    StatusCode::OK,
+                    &ReplicateEditStatus {
+                        success: true,
+                        status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                        ..Default::default()
+                    },
+                );
             }
             PeerEditOutcome::Rejected(err_detail) => {
-                return json_response(&ReplicateEditStatus {
-                    success: false,
-                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                    err_detail: err_detail.to_string(),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                });
+                return json_response(
+                    StatusCode::OK,
+                    &ReplicateEditStatus {
+                        success: false,
+                        status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                        err_detail: err_detail.to_string(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    },
+                );
             }
         };
         if endpoint_refresh_requested {
             if service_account_access_key.is_empty() {
-                return json_response(&ReplicateEditStatus {
-                    success: false,
-                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                    err_detail: "site replicator service account is not configured".to_string(),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                });
+                return json_response(
+                    StatusCode::OK,
+                    &ReplicateEditStatus {
+                        success: false,
+                        status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                        err_detail: "site replicator service account is not configured".to_string(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    },
+                );
             }
             let service_account_secret_key = site_replicator_service_account_secret(&service_account_access_key).await?;
             let pending_id = refresh_id.unwrap_or_default();
@@ -11215,19 +11224,25 @@ impl Operation for SRPeerEditHandler {
             })
             .await?;
             if !committed {
-                return json_response(&ReplicateEditStatus {
-                    success: false,
-                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                    err_detail: "endpoint target refresh state changed during update".to_string(),
-                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                });
+                return json_response(
+                    StatusCode::OK,
+                    &ReplicateEditStatus {
+                        success: false,
+                        status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                        err_detail: "endpoint target refresh state changed during update".to_string(),
+                        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    },
+                );
             }
-            return json_response(&ReplicateEditStatus {
-                success: true,
-                status: SITE_REPL_EDIT_SUCCESS.to_string(),
-                api_version: Some(SITE_REPL_API_VERSION.to_string()),
-                ..Default::default()
-            });
+            return json_response(
+                StatusCode::OK,
+                &ReplicateEditStatus {
+                    success: true,
+                    status: SITE_REPL_EDIT_SUCCESS.to_string(),
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                    ..Default::default()
+                },
+            );
         }
         Ok(empty_response(StatusCode::OK))
     }
@@ -11434,7 +11449,7 @@ impl Operation for SiteReplicationResyncOpHandler {
             .buckets
             .sort_by(|left, right| left.bucket.cmp(&right.bucket).then(left.target_arn.cmp(&right.target_arn)));
         let (limit, offset) = parse_site_resync_page(&query, &status)?;
-        json_response(&site_resync_page(&status, limit, offset)?)
+        json_response(StatusCode::OK, &site_resync_page(&status, limit, offset)?)
     }
 }
 
@@ -11480,17 +11495,20 @@ impl Operation for SiteReplicationRepairHandler {
             if body.preflight_token.is_some() || body.operation_id.is_some() {
                 return Err(s3_error!(InvalidRequest, "dry-run does not accept preflightToken or operationId"));
             }
-            return json_response(&SiteReplicationRepairPreflight {
-                mode: "dry-run",
-                status: "planned",
-                preflight_token,
-                retry_events: state
-                    .retry_queue
-                    .iter()
-                    .filter(|event| retry_event_replayed_by_bootstrap(event))
-                    .count(),
-                sites,
-            });
+            return json_response(
+                StatusCode::OK,
+                &SiteReplicationRepairPreflight {
+                    mode: "dry-run",
+                    status: "planned",
+                    preflight_token,
+                    retry_events: state
+                        .retry_queue
+                        .iter()
+                        .filter(|event| retry_event_replayed_by_bootstrap(event))
+                        .count(),
+                    sites,
+                },
+            );
         }
 
         let supplied_token = body
@@ -11543,7 +11561,7 @@ impl Operation for SiteReplicationRepairStatusHandler {
             .get(&operation_id)
             .cloned()
             .ok_or_else(|| s3_error!(InvalidRequest, "repair operation was not found"))?;
-        json_response(&site_replication_repair_operation_response(&operation))
+        json_response(StatusCode::OK, &site_replication_repair_operation_response(&operation))
     }
 }
 
@@ -11697,17 +11715,20 @@ impl Operation for SRRotateServiceAccountHandler {
             peer_errors.push("service account rotation is still pending".to_string());
         }
 
-        json_response(&ReplicateEditStatus {
-            success: complete && peer_errors.is_empty(),
-            status: if complete && peer_errors.is_empty() {
-                "Success"
-            } else {
-                "Partial"
-            }
-            .to_string(),
-            err_detail: peer_errors.join("; "),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-        })
+        json_response(
+            StatusCode::OK,
+            &ReplicateEditStatus {
+                success: complete && peer_errors.is_empty(),
+                status: if complete && peer_errors.is_empty() {
+                    "Success"
+                } else {
+                    "Partial"
+                }
+                .to_string(),
+                err_detail: peer_errors.join("; "),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            },
+        )
     }
 }
 

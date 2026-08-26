@@ -30,10 +30,12 @@ use crate::admin::storage_api::config::{
     save_admin_server_config_snapshot,
 };
 use crate::admin::storage_api::contract::list::ListOperations as _;
-use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
+use crate::admin::utils::{
+    encode_compatible_admin_payload, extract_query_params, is_compat_admin_request, read_compatible_admin_body,
+};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
-use http::{HeaderMap, HeaderValue, Uri};
+use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::audit::{
@@ -81,7 +83,7 @@ use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::env;
 use std::mem::size_of;
 use time::OffsetDateTime;
@@ -662,18 +664,6 @@ pub fn register_config_route(r: &mut S3Router<AdminOperation>) -> std::io::Resul
     )?;
 
     Ok(())
-}
-
-fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-
-    if let Some(query) = uri.query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            params.insert(key.into_owned(), value.into_owned());
-        }
-    }
-
-    params
 }
 
 async fn validate_config_admin_request(req: &S3Request<Body>) -> S3Result<Credentials> {
@@ -2282,6 +2272,7 @@ impl Operation for SetConfigHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::Uri;
     use serial_test::serial;
     use temp_env::with_vars;
 

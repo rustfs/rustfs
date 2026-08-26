@@ -23,6 +23,7 @@ use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::storage_api::config::{
     read_admin_config_without_migrate, read_admin_server_config_snapshot, save_admin_server_config_snapshot,
 };
+use crate::admin::utils::json_response;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
 use http::StatusCode;
@@ -888,16 +889,6 @@ async fn parse_json_body<T: DeserializeOwned>(req: &mut S3Request<Body>) -> S3Re
     }
 
     serde_json::from_slice(&body).map_err(|e| s3_error!(InvalidRequest, "invalid JSON: {}", e))
-}
-
-fn json_response<T: Serialize>(status: StatusCode, payload: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let body = serde_json::to_vec(payload)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
-
-    let mut resp = S3Response::new((status, Body::from(body)));
-    resp.headers
-        .insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
-    Ok(resp)
 }
 
 async fn load_server_config_from_store() -> S3Result<ServerConfig> {

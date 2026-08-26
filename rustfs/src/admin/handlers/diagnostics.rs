@@ -26,6 +26,7 @@
 use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::storage_api::access::spawn_traced;
+use crate::admin::utils::json_response;
 use crate::server::ADMIN_PREFIX;
 use crate::storage::storage_api::get_global_lock_clients;
 use bytes::Bytes;
@@ -37,7 +38,7 @@ use rustfs_lock::{LockLeaseInfo, LockMode, LockType, ObjectKey, get_global_lock_
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::stream::{ByteStream, DynByteStream};
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, StdError, s3_error};
+use s3s::{Body, S3Error, S3Request, S3Response, S3Result, StdError, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -48,7 +49,6 @@ use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 
-const CONTENT_TYPE_JSON: &str = "application/json";
 const CONTENT_TYPE_NDJSON: &str = "application/x-ndjson";
 pub(crate) const CLIENT_DEVNULL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const CLIENT_DEVNULL_MAX_DURATION: Duration = Duration::from_secs(30);
@@ -141,14 +141,6 @@ async fn authorize(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
 
     authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
     Ok(())
-}
-
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize response: {e}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE_JSON));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
 }
 
 async fn read_body(input: Body) -> S3Result<Vec<u8>> {
@@ -1061,6 +1053,7 @@ fn query_values(uri: &Uri, key: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use http::{Extensions, Uri};
+    use s3s::S3ErrorCode;
 
     fn build_request(method: Method, uri: &'static str) -> S3Request<Body> {
         S3Request {

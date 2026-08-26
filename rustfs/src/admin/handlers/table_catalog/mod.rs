@@ -17,6 +17,7 @@ use crate::admin::runtime_sources::default_admin_usecase;
 use crate::admin::storage_api::access::{ReqInfo, authorize_internal_object_request};
 use crate::admin::storage_api::bucket::metadata::table_catalog_path_hash;
 use crate::admin::storage_api::runtime::ECStore;
+use crate::admin::utils::empty_response;
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_action_with_bucket_object_for_iam},
     router::{AdminOperation, Operation, S3Router},
@@ -967,10 +968,6 @@ fn build_sensitive_json_response<T: Serialize>(status: StatusCode, body: &T) -> 
         .insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
     response.headers.insert(http::header::EXPIRES, HeaderValue::from_static("0"));
     Ok(response)
-}
-
-fn empty_response(status: StatusCode) -> S3Response<(StatusCode, Body)> {
-    S3Response::new((status, Body::default()))
 }
 
 fn duration_millis_u64(duration: StdDuration) -> u64 {
