@@ -1177,6 +1177,7 @@ async fn inventory_retries_with_the_new_credential_after_concurrent_rotation() {
         .expect("inventory retry status"),
         InventoryStatus::BackingOff { .. }
     ));
+    wait_for_requests(&server, 3).await;
     runtime.shutdown().await;
 
     let inventory_path = format!("/agent/clusters/{CLUSTER_UID}/inventorySnapshots");
