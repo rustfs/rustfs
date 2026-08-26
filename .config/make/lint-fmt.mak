@@ -45,6 +45,11 @@ logging-guardrails-check: ## Check logging guardrails for redaction and noise re
 	@echo "🪵 Checking logging guardrails..."
 	./scripts/check_logging_guardrails.sh
 
+.PHONY: error-other-ratchet-check
+error-other-ratchet-check: ## Check the ecstore ::other(format!) quorum-bucketing ratchet stays shrink-only
+	@echo "🪣 Checking error other(format!) ratchet..."
+	./scripts/check_error_other_format_ratchet.sh
+
 .PHONY: tokio-io-uring-check
 tokio-io-uring-check: ## Check tokio io-uring runtime feature stays removed
 	@echo "🚫 Checking tokio io-uring feature guard..."
