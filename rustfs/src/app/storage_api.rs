@@ -1185,7 +1185,9 @@ pub(crate) mod multipart_usecase {
         }
 
         pub(crate) mod object {
-            pub(crate) use super::super::super::storage_contracts::{ObjectIO, ObjectOperations};
+            #[cfg(test)]
+            pub(crate) use super::super::super::storage_contracts::ObjectIO;
+            pub(crate) use super::super::super::storage_contracts::ObjectOperations;
         }
 
         pub(crate) mod range {

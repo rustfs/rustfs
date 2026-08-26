@@ -7948,10 +7948,17 @@ impl DefaultObjectUsecase {
             .into());
         }
 
-        let gr = store
-            .get_object_reader(&src_bucket, &src_key, None, h, &src_get_opts)
+        let (gr, source_cancellation) = store
+            .get_object_reader_for_copy(&src_bucket, &src_key, None, h, &src_get_opts)
             .await
             .map_err(map_get_object_reader_error)?;
+
+        // The commit owner is intentionally detached so SetDisk can finish
+        // its rename/cleanup and post-commit publication if the HTTP caller
+        // goes away.  Keep a request-owned guard for the source producer:
+        // cancellation drops the source read promptly, while the detached
+        // commit task retains the guards it needs to complete safely.
+        let _source_cancellation_guard = source_cancellation.clone().drop_guard();
 
         let mut src_info = gr.object_info.clone();
 

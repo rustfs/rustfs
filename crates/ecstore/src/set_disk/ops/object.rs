@@ -61,6 +61,8 @@ use http::HeaderValue;
 use rustfs_utils::path::decode_dir_object;
 use std::future::Future;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
 const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
@@ -1120,6 +1122,37 @@ where
     Ok((reader, offset, length))
 }
 
+/// Cancels a detached legacy GET producer when its consumer is dropped.
+///
+/// The producer owns the shard readers and the object read lock, while the
+/// consumer owns only the duplex read half. Closing that half eventually
+/// unblocks a writer, but can leave a producer stuck in reader setup or remote
+/// recovery until a lower-level timeout fires. This small boundary wrapper
+/// provides an explicit cancellation signal without changing the public
+/// `GetObjectReader` shape.
+struct ProducerCancellationReader<R> {
+    inner: R,
+    cancellation: CancellationToken,
+}
+
+impl<R> ProducerCancellationReader<R> {
+    fn new(inner: R, cancellation: CancellationToken) -> Self {
+        Self { inner, cancellation }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ProducerCancellationReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<R> Drop for ProducerCancellationReader<R> {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
 fn data_read_metadata_early_stop_request_shape_allowed(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions) -> bool {
     range.is_none()
         && opts.part_number.is_none()
@@ -1907,12 +1940,25 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // lookup on the streaming miss path (ODC-16).
         reader.body_source = body_source;
 
+        // The producer is otherwise detached from the returned reader. Tie its
+        // lifetime to the source stream so a cancelled copy (or an abandoned
+        // GET) releases in-flight shard opens, response bodies, and the read
+        // lock immediately instead of waiting for a disk timeout.
+        let producer_cancellation = crate::set_disk::get_object_read_cancellation();
+        if let Some(cancellation) = producer_cancellation.as_ref() {
+            reader.stream = Box::new(ProducerCancellationReader::new(reader.stream, cancellation.clone()));
+        }
+
         // let disks = disks.clone();
         let bucket = bucket.to_owned();
         let object = object.to_owned();
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
+        // The producer runs in a separate Tokio task, so carry the caller's
+        // read policy across the task boundary explicitly. Tokio task-local
+        // values are not inherited by spawned tasks.
+        let read_policy = crate::set_disk::get_object_read_policy();
         let erasure_cache = Arc::clone(&self.erasure_cache);
         let (fi, files, disks) = snapshot.into_owned();
         tokio::spawn(async move {
@@ -1922,26 +1968,40 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
             // would incorrectly treat downstream backpressure as disk-read latency.
             // Disk read timeouts must be enforced at the actual disk I/O operations.
-            let producer_result = Self::get_object_with_fileinfo(
-                &bucket,
-                &object,
-                erasure_cache,
-                offset,
-                length,
-                &mut writer,
-                fi,
-                files,
-                &disks,
-                set_index,
-                pool_index,
-                skip_verify,
-                false,
-                GET_OBJECT_PATH_LEGACY_DUPLEX,
-                object_class.as_str(),
-                size_bucket,
-            )
-            .await;
-            if let Err(e) = &producer_result {
+            let producer_result = tokio::select! {
+                biased;
+                result = crate::set_disk::with_get_object_read_policy(
+                    read_policy,
+                    Self::get_object_with_fileinfo(
+                        &bucket,
+                        &object,
+                        erasure_cache,
+                        offset,
+                        length,
+                        &mut writer,
+                        fi,
+                        files,
+                        &disks,
+                        set_index,
+                        pool_index,
+                        skip_verify,
+                        false,
+                        GET_OBJECT_PATH_LEGACY_DUPLEX,
+                        object_class.as_str(),
+                        size_bucket,
+                    ),
+                ) => result,
+                _ = async {
+                    if let Some(cancellation) = producer_cancellation.as_ref() {
+                        cancellation.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => Err(Error::OperationCanceled),
+            };
+            if let Err(e) = &producer_result
+                && !matches!(e, Error::OperationCanceled)
+            {
                 let reason = classify_storage_error(e);
                 if reason == GetObjectFailureReason::DownstreamClosed {
                     debug!(
@@ -3792,6 +3852,28 @@ mod legacy_duplex_producer_reader_tests {
             .expect("clean producer completion should surface clean EOF");
 
         assert_eq!(out, b"complete");
+    }
+
+    #[tokio::test]
+    async fn producer_cancellation_reader_cancels_pending_producer_on_drop() {
+        let cancellation = CancellationToken::new();
+        let producer_cancellation = cancellation.clone();
+        let producer = tokio::spawn(async move {
+            tokio::select! {
+                _ = producer_cancellation.cancelled() => true,
+                _ = std::future::pending::<()>() => false,
+            }
+        });
+
+        let reader = ProducerCancellationReader::new(tokio::io::empty(), cancellation);
+        drop(reader);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), producer)
+                .await
+                .expect("dropping the consumer should cancel the producer promptly")
+                .expect("producer task should not panic")
+        );
     }
 
     #[tokio::test]

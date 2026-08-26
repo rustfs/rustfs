@@ -710,6 +710,7 @@ Static gate reasons:
 - multipart_part_limit
 - invalid_min_size
 - read_quorum_not_safe
+- copy_source_demand_bound
 
 Relevant focused proof points:
 - set_disk::read::tests::codec_streaming_reader_gate_defaults_to_disabled

@@ -35,7 +35,11 @@ use crate::disk::{
     health_state::{RuntimeDriveHealthState, get_drive_returning_probe_interval, record_drive_runtime_state},
     validate_batch_read_version_item_count,
 };
-use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
+use crate::disk::{
+    disk_store::DiskHealthTracker,
+    error::{DiskError, is_terminal_read_error, terminal_read_error_to_io},
+    local::ScanGuard,
+};
 use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use bytes::Bytes;
 use futures::lock::Mutex;
@@ -324,6 +328,39 @@ where
     }
 }
 
+/// Mark a terminal fresh-shard recovery failure for adaptive retirement while
+/// retaining its typed `DiskError` and original I/O kind. The decoder checks
+/// the marker independently of the kind because not-found and transport
+/// failures are terminal too, but must not be reported as timeouts.
+fn remote_read_error_to_io(error: DiskError) -> io::Error {
+    terminal_read_error_to_io(error)
+}
+
+/// Retire a remote shard after its stream can no longer be trusted.  A body
+/// error that arrives after the one permitted resume is terminal: retaining
+/// the reader would let the next stripe poll an already misaligned stream.
+fn remote_terminal_io_error(error: io::Error) -> io::Error {
+    if is_terminal_read_error(&error) {
+        return error;
+    }
+    terminal_read_error_to_io(DiskError::from(error))
+}
+
+fn remote_terminal_message_to_io(message: &'static str) -> io::Error {
+    terminal_read_error_to_io(DiskError::Io(io::Error::other(message)))
+}
+
+fn remote_terminal_eof_to_io() -> io::Error {
+    terminal_read_error_to_io(DiskError::Io(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "remote read ended before requested length",
+    )))
+}
+
+fn remote_terminal_task_error_to_io(error: JoinError) -> io::Error {
+    terminal_read_error_to_io(DiskError::other(error))
+}
+
 struct AbortOnDropTask<T>(JoinHandle<T>);
 
 impl<T> AbortOnDropTask<T> {
@@ -418,6 +455,9 @@ impl RetryingRemoteReader {
 
 impl AsyncRead for RetryingRemoteReader {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         loop {
             // After the absolute cutoff, let initial progress win over a stale fresh-open.
             let resume_pending = if let Some(resume) = self.resume.as_mut() {
@@ -431,14 +471,14 @@ impl AsyncRead for RetryingRemoteReader {
                     Poll::Ready(Ok(Err(error))) => {
                         self.resume = None;
                         if self.reader.is_none() {
-                            return Poll::Ready(Err(io::Error::other(error)));
+                            return Poll::Ready(Err(remote_read_error_to_io(error)));
                         }
                         continue;
                     }
                     Poll::Ready(Err(error)) => {
                         self.resume = None;
                         if self.reader.is_none() {
-                            return Poll::Ready(Err(io::Error::other(error)));
+                            return Poll::Ready(Err(remote_terminal_task_error_to_io(error)));
                         }
                         continue;
                     }
@@ -479,6 +519,9 @@ impl AsyncRead for RetryingRemoteReader {
                         } else {
                             self.resume = None;
                         }
+                    } else if produced == 0 && self.request.length != 0 && self.emitted < self.request.length {
+                        self.reader = None;
+                        return Poll::Ready(Err(remote_terminal_eof_to_io()));
                     }
                     return Poll::Ready(Ok(()));
                 }
@@ -494,7 +537,10 @@ impl AsyncRead for RetryingRemoteReader {
                     self.reader = None;
                     continue;
                 }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Err(error)) => {
+                    self.reader = None;
+                    return Poll::Ready(Err(remote_terminal_io_error(error)));
+                }
             }
         }
     }
@@ -585,21 +631,23 @@ impl rustfs_rio::ChunkReader for RetryingRemoteChunkReader {
                     Poll::Ready(Ok(Ok(None))) => {
                         self.resume = None;
                         if self.reader.is_none() {
-                            return Poll::Ready(Err(io::Error::other("remote resume transport did not provide a chunk reader")));
+                            return Poll::Ready(Err(remote_terminal_message_to_io(
+                                "remote resume transport did not provide a chunk reader",
+                            )));
                         }
                         continue;
                     }
                     Poll::Ready(Ok(Err(error))) => {
                         self.resume = None;
                         if self.reader.is_none() {
-                            return Poll::Ready(Err(io::Error::other(error)));
+                            return Poll::Ready(Err(remote_read_error_to_io(error)));
                         }
                         continue;
                     }
                     Poll::Ready(Err(error)) => {
                         self.resume = None;
                         if self.reader.is_none() {
-                            return Poll::Ready(Err(io::Error::other(error)));
+                            return Poll::Ready(Err(remote_terminal_task_error_to_io(error)));
                         }
                         continue;
                     }
@@ -635,10 +683,26 @@ impl rustfs_rio::ChunkReader for RetryingRemoteChunkReader {
                     return Poll::Ready(Ok(Some(chunk)));
                 }
                 Poll::Ready(Ok(None)) if resume_pending => {
+                    // A clean EOF from the original stream wins when the
+                    // request is unbounded (or has already emitted its full
+                    // bounded length).  Waiting for a speculative fresh open
+                    // in that case can turn a successful read into a recovery
+                    // timeout, especially on the read_file/unbounded path.
+                    if self.request.length == 0 || self.emitted >= self.request.length {
+                        self.reader = None;
+                        self.resume = None;
+                        return Poll::Ready(Ok(None));
+                    }
                     self.reader = None;
                     continue;
                 }
-                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(None)),
+                Poll::Ready(Ok(None)) => {
+                    if self.request.length != 0 && self.emitted < self.request.length {
+                        self.reader = None;
+                        return Poll::Ready(Err(remote_terminal_eof_to_io()));
+                    }
+                    return Poll::Ready(Ok(None));
+                }
                 Poll::Ready(Err(error)) if !self.retried && is_retryable_remote_body_error(&error) => {
                     self.retried = true;
                     self.reader = None;
@@ -651,7 +715,10 @@ impl rustfs_rio::ChunkReader for RetryingRemoteChunkReader {
                     self.reader = None;
                     continue;
                 }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Err(error)) => {
+                    self.reader = None;
+                    return Poll::Ready(Err(remote_terminal_io_error(error)));
+                }
             }
         }
     }
@@ -5154,6 +5221,7 @@ mod tests {
     enum ResumeReadStep {
         PartialThenReset(Vec<u8>),
         Data(Vec<u8>),
+        Eof,
     }
 
     #[derive(Debug, Default)]
@@ -5412,6 +5480,7 @@ mod tests {
     struct PendingFreshOpenTransport {
         fresh_read_drops: Arc<AtomicUsize>,
         fresh_chunk_drops: Arc<AtomicUsize>,
+        initial_chunk_eof: bool,
     }
 
     #[async_trait::async_trait]
@@ -5429,6 +5498,9 @@ mod tests {
         }
 
         async fn open_read_chunks(&self, _request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            if self.initial_chunk_eof {
+                return Ok(Some(resume_step_chunk_reader(ResumeReadStep::Eof)));
+            }
             Ok(Some(Box::new(ChunkPartialThenErrorReader {
                 data: None,
                 error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
@@ -5457,6 +5529,70 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TerminalFreshOpenTransport {
+        fresh_read_opens: Arc<AtomicUsize>,
+        fresh_chunk_opens: Arc<AtomicUsize>,
+        chunk_returns_none: bool,
+    }
+
+    impl TerminalFreshOpenTransport {
+        fn new(chunk_returns_none: bool) -> Self {
+            Self {
+                fresh_read_opens: Arc::new(AtomicUsize::new(0)),
+                fresh_chunk_opens: Arc::new(AtomicUsize::new(0)),
+                chunk_returns_none,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InternodeDataTransport for TerminalFreshOpenTransport {
+        async fn open_read(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            Ok(Box::new(PartialThenErrorReader {
+                cursor: Cursor::new(Vec::new()),
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            }))
+        }
+
+        async fn open_read_fresh(&self, _request: ReadStreamRequest) -> Result<FileReader> {
+            self.fresh_read_opens.fetch_add(1, Ordering::Relaxed);
+            Err(DiskError::FileNotFound)
+        }
+
+        async fn open_read_chunks(&self, _request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            Ok(Some(Box::new(ChunkPartialThenErrorReader {
+                data: Some(Bytes::from_static(b"x")),
+                error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
+            })))
+        }
+
+        async fn open_read_chunks_fresh(&self, _request: ReadStreamRequest) -> Result<Option<rustfs_rio::ChunkReaderBox>> {
+            self.fresh_chunk_opens.fetch_add(1, Ordering::Relaxed);
+            if self.chunk_returns_none {
+                Ok(None)
+            } else {
+                Err(DiskError::FileNotFound)
+            }
+        }
+
+        async fn open_write(&self, _request: WriteStreamRequest) -> Result<FileWriter> {
+            panic!("open_write should not be used in terminal fresh-open tests");
+        }
+
+        async fn open_walk_dir(&self, _request: WalkDirStreamRequest) -> Result<FileReader> {
+            panic!("open_walk_dir should not be used in terminal fresh-open tests");
+        }
+
+        fn name(&self) -> &'static str {
+            "terminal-fresh-open-test"
+        }
+
+        fn capabilities(&self) -> InternodeDataTransportCapabilities {
+            InternodeDataTransportCapabilities::tcp_http()
+        }
+    }
+
     fn resume_step_reader(step: ResumeReadStep) -> FileReader {
         match step {
             ResumeReadStep::PartialThenReset(data) => Box::new(PartialThenErrorReader {
@@ -5464,6 +5600,7 @@ mod tests {
                 error: Some(io::Error::new(std_io::ErrorKind::ConnectionReset, "stream reset")),
             }),
             ResumeReadStep::Data(data) => Box::new(Cursor::new(data)),
+            ResumeReadStep::Eof => Box::new(Cursor::new(Vec::new())),
         }
     }
 
@@ -5477,6 +5614,7 @@ mod tests {
                 data: Some(Bytes::from(data)),
                 error: None,
             }),
+            ResumeReadStep::Eof => Box::new(ChunkPartialThenErrorReader { data: None, error: None }),
         }
     }
 
@@ -5551,6 +5689,430 @@ mod tests {
             length,
             stall_timeout: None,
         }
+    }
+
+    fn partial_hashed_shard(shard_size: usize) -> (rustfs_utils::HashAlgorithm, Vec<u8>, usize) {
+        let checksum = rustfs_utils::HashAlgorithm::HighwayHash256S;
+        let data = vec![0x5a; shard_size];
+        let hash_bytes = {
+            let hash = checksum.hash_encode(&data);
+            hash.as_ref().to_vec()
+        };
+        let hash_len = hash_bytes.len();
+        let encoded_length = hash_len + data.len();
+        let mut prefix = Vec::with_capacity(hash_len + shard_size / 2);
+        prefix.extend_from_slice(&hash_bytes);
+        prefix.extend_from_slice(&data[..shard_size / 2]);
+        (checksum, prefix, encoded_length)
+    }
+
+    #[test]
+    fn remote_read_error_conversion_preserves_recovery_classification() {
+        for disk_error in [DiskError::Timeout, DiskError::SourceStalled] {
+            let error = remote_read_error_to_io(disk_error);
+            assert_eq!(error.kind(), std_io::ErrorKind::TimedOut);
+        }
+
+        let error = remote_read_error_to_io(DiskError::Timeout);
+        assert!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<crate::disk::error::TerminalReadError>())
+                .is_some()
+        );
+        assert!(matches!(DiskError::from(error), DiskError::Timeout));
+
+        let error = remote_read_error_to_io(DiskError::SourceStalled);
+        assert!(matches!(DiskError::from(error), DiskError::SourceStalled));
+
+        let error =
+            remote_read_error_to_io(DiskError::Io(io::Error::new(std_io::ErrorKind::ConnectionReset, "connection reset")));
+        assert_eq!(error.kind(), std_io::ErrorKind::ConnectionReset);
+        assert!(crate::disk::error::is_terminal_read_error(&error));
+        assert!(matches!(DiskError::from(error), DiskError::Io(inner) if inner.kind() == std_io::ErrorKind::ConnectionReset));
+    }
+
+    #[test]
+    fn remote_reader_zero_capacity_poll_is_a_noop() {
+        let transport: Arc<dyn InternodeDataTransport> = Arc::new(PendingFreshOpenTransport::default());
+        let mut reader = RetryingRemoteReader::new_with_timeouts(
+            Box::new(Cursor::new(b"x".to_vec())),
+            transport,
+            resume_request(1),
+            None,
+            None,
+        );
+        let mut empty = [];
+        let mut read_buf = ReadBuf::new(&mut empty);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(Pin::new(&mut reader).poll_read(&mut cx, &mut read_buf), Poll::Ready(Ok(()))));
+        assert!(reader.reader.is_some(), "zero-capacity polls must not retire the remote reader");
+
+        let mut output = Vec::new();
+        futures::executor::block_on(reader.read_to_end(&mut output)).expect("the reader should remain usable");
+        assert_eq!(output, b"x");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_reader_fresh_open_timeout_preserves_timed_out_kind() {
+        let transport = Arc::new(PendingFreshOpenTransport::default());
+        let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+        let mut reader = RetryingRemoteReader::new_with_timeouts(
+            resume_step_reader(ResumeReadStep::PartialThenReset(Vec::new())),
+            transport_for_reader,
+            resume_request(1),
+            None,
+            Some(Duration::from_secs(1)),
+        );
+
+        let error = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("a hung fresh open must surface its recovery timeout");
+
+        assert_eq!(error.kind(), std_io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<crate::disk::error::TerminalReadError>())
+                .is_some()
+        );
+        assert!(matches!(DiskError::from(error), DiskError::Timeout));
+        assert_eq!(transport.fresh_read_drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_chunk_reader_fresh_open_timeout_preserves_timed_out_kind() {
+        let transport = Arc::new(PendingFreshOpenTransport::default());
+        let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+        let mut reader = RetryingRemoteChunkReader::new_with_timeouts(
+            resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"x".to_vec())),
+            transport_for_reader,
+            resume_request(2),
+            None,
+            Some(Duration::from_secs(1)),
+        );
+
+        let error = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("a hung fresh chunk open must surface its recovery timeout");
+
+        assert_eq!(error.kind(), std_io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<crate::disk::error::TerminalReadError>())
+                .is_some()
+        );
+        assert!(matches!(DiskError::from(error), DiskError::Timeout));
+        assert_eq!(transport.fresh_chunk_drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_chunk_reader_unbounded_clean_eof_wins_over_speculative_resume() {
+        let transport = Arc::new(PendingFreshOpenTransport {
+            initial_chunk_eof: true,
+            ..PendingFreshOpenTransport::default()
+        });
+        let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+        let mut reader = RetryingRemoteChunkReader::new_with_timeouts(
+            resume_step_chunk_reader(ResumeReadStep::Eof),
+            transport_for_reader,
+            resume_request(0),
+            Some(Duration::ZERO),
+            Some(Duration::from_secs(1)),
+        );
+
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("clean EOF from an unbounded original stream should finish the read");
+        assert!(output.is_empty());
+        // The executor may abort the speculative task before it is first
+        // polled, in which case the pending-open future never constructs its
+        // drop probe.  The dedicated drop-cancellation tests cover the
+        // already-polled case; this regression only needs to establish that a
+        // clean unbounded EOF is not converted into a recovery timeout.
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_reader_fresh_open_non_timeout_error_is_retired_from_adaptive_decode() {
+        let transport = Arc::new(TerminalFreshOpenTransport::new(false));
+        let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+        let retry = RetryingRemoteReader::new_with_timeouts(
+            resume_step_reader(ResumeReadStep::PartialThenReset(Vec::new())),
+            transport_for_reader,
+            resume_request(8),
+            None,
+            Some(Duration::from_secs(1)),
+        );
+        let shard = BitrotReader::new(ShardReader::Stream(Box::new(retry)), 8, rustfs_utils::HashAlgorithm::None, false);
+        let mut parallel = ParallelReader::new(vec![Some(shard)], Erasure::new(1, 0, 8), 0, 16);
+
+        let (_, first_errors) = parallel.read().await;
+        assert!(matches!(first_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
+        assert_eq!(transport.fresh_read_opens.load(Ordering::Relaxed), 1);
+
+        let (_, second_errors) = parallel.read().await;
+        assert!(matches!(second_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
+        assert_eq!(transport.fresh_read_opens.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_chunk_reader_missing_fresh_reader_is_retired_from_adaptive_decode() {
+        let transport = Arc::new(TerminalFreshOpenTransport::new(true));
+        let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+        let retry = RetryingRemoteChunkReader::new_with_timeouts(
+            resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"x".to_vec())),
+            transport_for_reader,
+            resume_request(8),
+            None,
+            Some(Duration::from_secs(1)),
+        );
+        let shard = BitrotReader::new(ShardReader::Chunked(Box::new(retry)), 8, rustfs_utils::HashAlgorithm::None, false);
+        let mut parallel = ParallelReader::new(vec![Some(shard)], Erasure::new(1, 0, 8), 0, 16);
+
+        let (_, first_errors) = parallel.read().await;
+        assert!(
+            matches!(first_errors.first().and_then(Option::as_ref), Some(DiskError::Io(error)) if error.kind() == std_io::ErrorKind::Other),
+            "unexpected first errors: {first_errors:?}"
+        );
+        assert_eq!(transport.fresh_chunk_opens.load(Ordering::Relaxed), 1);
+
+        let (_, second_errors) = parallel.read().await;
+        assert!(matches!(second_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
+        assert_eq!(transport.fresh_chunk_opens.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn remote_reader_fresh_open_short_eof_is_retired_from_adaptive_decode() {
+        // A successful fresh open can still end before the bounded request.
+        // Treat that as terminal immediately so the next stripe does not poll
+        // an already exhausted reader and defer the failure to BitrotReader.
+        let transport = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::Eof]));
+        let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+        let retry = RetryingRemoteReader::new_with_timeouts(
+            resume_step_reader(ResumeReadStep::PartialThenReset(b"01".to_vec())),
+            transport_for_reader,
+            resume_request(7),
+            None,
+            None,
+        );
+        let shard = BitrotReader::new(ShardReader::Stream(Box::new(retry)), 7, rustfs_utils::HashAlgorithm::None, false);
+        let mut parallel = ParallelReader::new(vec![Some(shard)], Erasure::new(1, 0, 7), 0, 14);
+
+        let (_, first_errors) = parallel.read().await;
+        assert!(matches!(
+            first_errors.first().and_then(Option::as_ref),
+            Some(DiskError::Io(error)) if error.kind() == std_io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(
+            transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .len(),
+            1
+        );
+
+        let (_, second_errors) = parallel.read().await;
+        assert!(matches!(second_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
+        assert_eq!(
+            transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_reader_fresh_open_short_eof_is_retired_from_adaptive_decode() {
+        let transport = Arc::new(ResumeTransport::with_chunk_steps(vec![ResumeReadStep::Eof]));
+        let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+        let retry = RetryingRemoteChunkReader::new_with_timeouts(
+            resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"01".to_vec())),
+            transport_for_reader,
+            resume_request(7),
+            None,
+            None,
+        );
+        let shard = BitrotReader::new(ShardReader::Chunked(Box::new(retry)), 7, rustfs_utils::HashAlgorithm::None, false);
+        let mut parallel = ParallelReader::new(vec![Some(shard)], Erasure::new(1, 0, 7), 0, 14);
+
+        let (_, first_errors) = parallel.read().await;
+        assert!(matches!(
+            first_errors.first().and_then(Option::as_ref),
+            Some(DiskError::Io(error)) if error.kind() == std_io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(
+            transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .len(),
+            1
+        );
+
+        let (_, second_errors) = parallel.read().await;
+        assert!(matches!(second_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
+        assert_eq!(
+            transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_reader_second_body_reset_is_retired_from_adaptive_decode() {
+        // The first connection emits a prefix, the one permitted fresh
+        // connection emits another prefix, and then resets again.  The second
+        // reset must retire the reader so the next stripe cannot consume a
+        // misaligned stream.
+        let transport = Arc::new(ResumeTransport::with_read_steps(vec![ResumeReadStep::PartialThenReset(b"23".to_vec())]));
+        let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+        let retry = RetryingRemoteReader::new_with_timeouts(
+            resume_step_reader(ResumeReadStep::PartialThenReset(b"01".to_vec())),
+            transport_for_reader,
+            resume_request(7),
+            None,
+            None,
+        );
+        let shard = BitrotReader::new(ShardReader::Stream(Box::new(retry)), 7, rustfs_utils::HashAlgorithm::None, false);
+        let mut parallel = ParallelReader::new(vec![Some(shard)], Erasure::new(1, 0, 7), 0, 14);
+
+        let (_, first_errors) = parallel.read().await;
+        assert!(matches!(
+            first_errors.first().and_then(Option::as_ref),
+            Some(DiskError::Io(error)) if error.kind() == std_io::ErrorKind::ConnectionReset
+        ));
+        assert_eq!(
+            transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .len(),
+            1
+        );
+
+        let (_, second_errors) = parallel.read().await;
+        assert!(matches!(second_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
+        assert_eq!(
+            transport
+                .fresh_read_requests
+                .lock()
+                .expect("fresh read request lock should not be poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_chunk_reader_second_body_reset_is_retired_from_adaptive_decode() {
+        let transport = Arc::new(ResumeTransport::with_chunk_steps(vec![ResumeReadStep::PartialThenReset(b"23".to_vec())]));
+        let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+        let retry = RetryingRemoteChunkReader::new_with_timeouts(
+            resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"01".to_vec())),
+            transport_for_reader,
+            resume_request(7),
+            None,
+            None,
+        );
+        let shard = BitrotReader::new(ShardReader::Chunked(Box::new(retry)), 7, rustfs_utils::HashAlgorithm::None, false);
+        let mut parallel = ParallelReader::new(vec![Some(shard)], Erasure::new(1, 0, 7), 0, 14);
+
+        let (_, first_errors) = parallel.read().await;
+        assert!(matches!(
+            first_errors.first().and_then(Option::as_ref),
+            Some(DiskError::Io(error)) if error.kind() == std_io::ErrorKind::ConnectionReset
+        ));
+        assert_eq!(
+            transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .len(),
+            1
+        );
+
+        let (_, second_errors) = parallel.read().await;
+        assert!(matches!(second_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
+        assert_eq!(
+            transport
+                .fresh_chunk_requests
+                .lock()
+                .expect("fresh chunk request lock should not be poisoned")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remote_reader_hashed_timeout_is_retired_from_adaptive_decode() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("5"))], async {
+            const SHARD_SIZE: usize = 64;
+            let (checksum, encoded_prefix, encoded_length) = partial_hashed_shard(SHARD_SIZE);
+            let transport = Arc::new(PendingFreshOpenTransport::default());
+            let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+            let retry = RetryingRemoteReader::new_with_timeouts(
+                resume_step_reader(ResumeReadStep::PartialThenReset(encoded_prefix)),
+                transport_for_reader,
+                resume_request(encoded_length),
+                None,
+                Some(Duration::from_secs(1)),
+            );
+            let shard = BitrotReader::new(ShardReader::Stream(Box::new(retry)), SHARD_SIZE, checksum, false);
+            let mut parallel = ParallelReader::new(vec![Some(shard)], Erasure::new(1, 0, SHARD_SIZE), 0, SHARD_SIZE * 2);
+
+            let (first_buffers, first_errors) = parallel.read().await;
+            assert!(first_buffers.first().and_then(Option::as_ref).is_none());
+            assert!(matches!(first_errors.first().and_then(Option::as_ref), Some(DiskError::Timeout)));
+            assert_eq!(transport.fresh_read_drops.load(Ordering::Relaxed), 1);
+
+            // A TimedOut error retires the dead slot. The next stripe therefore
+            // reports the slot as unavailable instead of polling a reader whose
+            // fresh connection already timed out.
+            let (_, second_errors) = parallel.read().await;
+            assert!(matches!(second_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn remote_chunk_reader_hashed_timeout_is_retired_from_adaptive_decode() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("5"))], async {
+            const SHARD_SIZE: usize = 64;
+            let (checksum, encoded_prefix, encoded_length) = partial_hashed_shard(SHARD_SIZE);
+            let transport = Arc::new(PendingFreshOpenTransport::default());
+            let transport_for_reader: Arc<dyn InternodeDataTransport> = transport.clone();
+            let retry = RetryingRemoteChunkReader::new_with_timeouts(
+                resume_step_chunk_reader(ResumeReadStep::PartialThenReset(encoded_prefix)),
+                transport_for_reader,
+                resume_request(encoded_length),
+                None,
+                Some(Duration::from_secs(1)),
+            );
+            let shard = BitrotReader::new(ShardReader::Chunked(Box::new(retry)), SHARD_SIZE, checksum, false);
+            let mut parallel = ParallelReader::new(vec![Some(shard)], Erasure::new(1, 0, SHARD_SIZE), 0, SHARD_SIZE * 2);
+
+            let (first_buffers, first_errors) = parallel.read().await;
+            assert!(first_buffers.first().and_then(Option::as_ref).is_none());
+            assert!(matches!(first_errors.first().and_then(Option::as_ref), Some(DiskError::Timeout)));
+            assert_eq!(transport.fresh_chunk_drops.load(Ordering::Relaxed), 1);
+
+            let (_, second_errors) = parallel.read().await;
+            assert!(matches!(second_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
+        })
+        .await;
     }
 
     #[tokio::test]
