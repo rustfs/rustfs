@@ -125,6 +125,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::{Digest as Md5Digest, Md5};
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
+use rustfs_audit::ObjectVersion as AuditObjectVersion;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_config::MI_B;
 use rustfs_filemeta::{NULL_VERSION_ID, RestoreStatusOps, parse_restore_obj_status};
@@ -3264,6 +3265,20 @@ impl<T: Send + 'static> Drop for EagerPutCommitOwner<T> {
             }
         });
     }
+}
+
+fn successful_delete_audit_objects(
+    delete: &s3s::dto::Delete,
+    successful_results: impl IntoIterator<Item = bool>,
+) -> Vec<AuditObjectVersion> {
+    delete
+        .objects
+        .iter()
+        .zip(successful_results)
+        .filter_map(|(requested, successful)| {
+            successful.then(|| AuditObjectVersion::new(requested.key.clone(), requested.version_id.clone()))
+        })
+        .collect()
 }
 
 fn normalize_delete_objects_version_id(
@@ -8694,6 +8709,13 @@ impl DefaultObjectUsecase {
             deleted: Some(deleted),
             errors: Some(errors),
             ..Default::default()
+        };
+        let helper = if helper.wants_audit_object_info() {
+            let audit_objects =
+                successful_delete_audit_objects(&delete, delete_results.iter().map(|result| result.delete_object.is_some()));
+            helper.audit_objects(audit_objects)
+        } else {
+            helper
         };
 
         let replication_deletes = if replicate_deletes {
@@ -18008,6 +18030,63 @@ mod tests {
             .expect_err("an uninitialized store should be reported after non-force admission");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(err.message(), Some("Not init"));
+    }
+
+    #[test]
+    fn delete_objects_audit_details_include_only_successful_request_entries() {
+        let requested = vec![
+            ObjectIdentifier {
+                key: "first-key".to_string(),
+                version_id: None,
+                ..Default::default()
+            },
+            ObjectIdentifier {
+                key: "denied-key".to_string(),
+                version_id: Some(Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            ObjectIdentifier {
+                key: "versioned-key".to_string(),
+                version_id: Some("requested-version".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let objects = successful_delete_audit_objects(
+            &Delete {
+                objects: requested,
+                quiet: Some(true),
+            },
+            [true, false, true],
+        );
+
+        assert_eq!(
+            objects,
+            vec![
+                AuditObjectVersion::new("first-key".to_string(), None),
+                AuditObjectVersion::new("versioned-key".to_string(), Some("requested-version".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn delete_objects_audit_details_are_empty_when_every_entry_fails() {
+        let requested = vec![ObjectIdentifier {
+            key: "failed-key".to_string(),
+            version_id: None,
+            ..Default::default()
+        }];
+
+        assert!(
+            successful_delete_audit_objects(
+                &Delete {
+                    objects: requested,
+                    quiet: None,
+                },
+                [false]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
