@@ -1896,7 +1896,7 @@ fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOpti
 #[cfg(test)]
 mod metadata_cache_tests {
     use super::*;
-    use rustfs_common::heal_channel::HealAdmissionDropReason;
+    use rustfs_heal_contracts::heal_channel::HealAdmissionDropReason;
     use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -1974,7 +1974,9 @@ mod metadata_cache_tests {
         }
     }
 
-    fn slow_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn slow_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         SLOW_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
         Box::pin(async {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1982,14 +1984,18 @@ mod metadata_cache_tests {
         })
     }
 
-    fn dropped_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn dropped_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         DROPPED_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
         Box::pin(async {
             ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
         })
     }
 
-    fn capture_read_repair_submitter(request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn capture_read_repair_submitter(
+        request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         CAPTURED_READ_REPAIR_CALLS.fetch_add(1, Ordering::Relaxed);
         *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned") = Some(request.priority);
         Box::pin(async {

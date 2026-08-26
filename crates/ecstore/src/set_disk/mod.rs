@@ -130,14 +130,14 @@ use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
 use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
-use rustfs_common::heal_channel::{
-    DriveState, HealAdmissionResult, HealChannelPriority, HealItemType, HealOpts, HealRequestSource, HealScanMode,
-    send_heal_disk, send_heal_request_with_admission,
-};
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
     RawFileInfo, file_info_from_raw, merge_file_meta_versions,
+};
+use rustfs_heal_contracts::heal_channel::{
+    DriveState, HealAdmissionResult, HealChannelPriority, HealItemType, HealOpts, HealRequestSource, HealScanMode,
+    send_heal_disk, send_heal_request_with_admission,
 };
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_enabled, record_object_lock_diag_hold_duration,
@@ -3111,8 +3111,9 @@ pub struct SetDisks {
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
     #[cfg(test)]
-    rename_tail_heal_capture:
-        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<rustfs_common::heal_channel::HealChannelRequest>>>>,
+    rename_tail_heal_capture: Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<rustfs_heal_contracts::heal_channel::HealChannelRequest>>>,
+    >,
 }
 
 // DistributedLock sends the raw ObjectKey to its clients; LockRegistry clones
@@ -3388,7 +3389,10 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
-    pub(in crate::set_disk) async fn submit_rename_tail_heal(&self, request: rustfs_common::heal_channel::HealChannelRequest) {
+    pub(in crate::set_disk) async fn submit_rename_tail_heal(
+        &self,
+        request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) {
         #[cfg(test)]
         {
             let capture = self
@@ -3402,13 +3406,13 @@ impl SetDisks {
             }
         }
 
-        let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+        let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
     }
 
     #[cfg(test)]
     pub(in crate::set_disk) fn capture_test_rename_tail_heals(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<rustfs_common::heal_channel::HealChannelRequest> {
+    ) -> tokio::sync::mpsc::UnboundedReceiver<rustfs_heal_contracts::heal_channel::HealChannelRequest> {
         let (capture, requests) = tokio::sync::mpsc::unbounded_channel();
         let mut slot = self
             .rename_tail_heal_capture

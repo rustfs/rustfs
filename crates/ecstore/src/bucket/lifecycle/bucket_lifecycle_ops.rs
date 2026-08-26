@@ -72,9 +72,6 @@ use crate::store::ECStore;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use http::HeaderMap;
 use rand::RngExt as _;
-use rustfs_common::metrics::{
-    IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
-};
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
     DEFAULT_TRANSITION_WORKERS_CAP, ENV_MAX_EXPIRY_WORKERS, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS,
@@ -83,6 +80,9 @@ use rustfs_config::{
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info, is_restored_object_on_disk,
+};
+use rustfs_scanner_contracts::metrics::{
+    IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
 use rustfs_utils::{
     get_env_i64, get_env_usize,
@@ -5460,11 +5460,11 @@ mod tests {
     use futures::FutureExt;
     #[cfg(feature = "test-util")]
     use http::HeaderMap;
-    use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_MAX_EXPIRY_WORKERS;
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_data_usage::TierStats;
     use rustfs_filemeta::{FileInfo, FileMeta};
+    use rustfs_scanner_contracts::metrics::{IlmAction, global_metrics};
     use s3s::dto::{
         BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, OutputLocation, RestoreRequest,

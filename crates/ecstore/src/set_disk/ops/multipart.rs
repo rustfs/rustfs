@@ -2749,7 +2749,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 needs_immediate_heal = rename_commit.needs_immediate_heal();
                 if let Some(rename_tail_drain) = rename_commit.tail_drain.take() {
                     tail_owns_staging_cleanup = true;
-                    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                    let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                         commit_bucket.clone(),
                         Some(commit_object.clone()),
                         false,
@@ -2846,7 +2846,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let committed_file_info = rename_commit.committed_file_info;
 
             if needs_immediate_heal {
-                let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                     commit_bucket.clone(),
                     Some(commit_object.clone()),
                     false,
@@ -2859,7 +2859,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .or_else(|| commit_version_suspended.then(Uuid::nil))
                     .map(|version_id| version_id.to_string());
                 tokio::spawn(async move {
-                    let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+                    let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
                 });
             }
 

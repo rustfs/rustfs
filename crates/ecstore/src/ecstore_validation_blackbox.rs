@@ -208,7 +208,7 @@ async fn blackbox_get_restores_body_after_one_shard_file_is_removed() {
 // Serialized: forces the reader-setup strategy through a process-global env var.
 #[serial_test::serial]
 async fn blackbox_heal_requests_preserve_repair_scope() {
-    use rustfs_common::heal_channel::{
+    use rustfs_heal_contracts::heal_channel::{
         HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealRequestSource,
     };
 
@@ -238,7 +238,7 @@ async fn blackbox_heal_requests_preserve_repair_scope() {
     // (failing their submitter, which releases their dedup reservation), and
     // fail fast once the receiver drops at test end. Tests that must observe a
     // deterministic channel state serialize under the same serial key.
-    let mut heal_rx = rustfs_common::heal_channel::init_heal_channel()
+    let mut heal_rx = rustfs_heal_contracts::heal_channel::init_heal_channel()
         .expect("this must be the only ecstore test that owns the heal channel receiver");
 
     // Ordinary PUTs use the same admission channel as read repair. A single

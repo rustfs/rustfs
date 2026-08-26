@@ -352,7 +352,7 @@ mod lifecycle_delete_all_plan_tests {
         crate::object_api::LifecycleDeleteAllRequest {
             version_id: Some(version_id),
             delete_marker: true,
-            action: rustfs_common::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
+            action: rustfs_scanner_contracts::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
             rule_id: "rule".to_string(),
             phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
         }
@@ -545,7 +545,7 @@ mod lifecycle_delete_all_plan_tests {
         let request = crate::object_api::LifecycleDeleteAllRequest {
             version_id: None,
             delete_marker: false,
-            action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+            action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
             rule_id: "rule".to_string(),
             phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
         };
@@ -3242,7 +3242,7 @@ impl SetDisks {
                     needs_immediate_heal = rename_commit.needs_immediate_heal();
                     if let Some(rename_tail_drain) = rename_commit.tail_drain.take() {
                         tail_owns_tmp_cleanup = true;
-                        let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                             commit_bucket.clone(),
                             Some(commit_object.clone()),
                             false,
@@ -3350,7 +3350,7 @@ impl SetDisks {
                 let mut fi = rename_commit.committed_file_info;
 
                 if needs_immediate_heal {
-                    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                    let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                         commit_bucket.clone(),
                         Some(commit_object.clone()),
                         false,
@@ -3362,7 +3362,7 @@ impl SetDisks {
                         .or_else(|| commit_version_suspended.then(Uuid::nil))
                         .map(|version_id| version_id.to_string());
                     tokio::spawn(async move {
-                        let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+                        let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
                     });
                 }
 
@@ -7076,7 +7076,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 Some(scope),
             );
         }
-        let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
             bucket.to_string(),
             Some(object.to_string()),
             false,
@@ -7085,7 +7085,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Some(self.set_index),
         );
         request.object_version_id = (!version_id.is_empty()).then(|| version_id.to_string());
-        if let Err(e) = rustfs_common::heal_channel::send_heal_request(request).await {
+        if let Err(e) = rustfs_heal_contracts::heal_channel::send_heal_request(request).await {
             warn!(
                 bucket,
                 object,
@@ -16546,7 +16546,7 @@ mod delete_objects_lock_gating_tests {
             lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
                 version_id: Some(trigger_version_id),
                 delete_marker: false,
-                action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+                action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
                 rule_id: "rule".to_string(),
                 phase: crate::object_api::LifecycleDeleteAllPhase::History,
             }),

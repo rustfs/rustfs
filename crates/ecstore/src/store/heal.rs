@@ -608,7 +608,7 @@ mod tests {
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations};
     use crate::store::init_format::{load_format_erasure, save_format_file};
     use crate::store::init_local_disks_with_instance_ctx;
-    use rustfs_common::heal_channel::DriveState;
+    use rustfs_heal_contracts::heal_channel::DriveState;
     use tokio_util::sync::CancellationToken;
 
     #[derive(Debug)]

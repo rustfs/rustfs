@@ -14,7 +14,7 @@
 
 use crate::disk::{DiskInfo, error::DiskError};
 use crate::layout::{endpoints::Endpoints, format::FormatV3};
-use rustfs_common::heal_channel::DriveState;
+use rustfs_heal_contracts::heal_channel::DriveState;
 use rustfs_madmin::heal_commands::HealDriveInfo;
 
 pub(crate) fn formats_to_drives_info(

@@ -36,7 +36,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::future::join_all;
-use rustfs_common::heal_channel::{DriveState, HealItemType, HealOpts, RUSTFS_RESERVED_BUCKET};
+use rustfs_heal_contracts::heal_channel::{DriveState, HealItemType, HealOpts, RUSTFS_RESERVED_BUCKET};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_protos::proto_gen::node_service::{
