@@ -37,6 +37,9 @@ use super::registration::{
 
 const MAX_ATTEMPTS: usize = 3;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "connect-e2e-short-credentials")]
+const ROTATION_THRESHOLD_SECONDS: i64 = 120;
+#[cfg(not(feature = "connect-e2e-short-credentials"))]
 const ROTATION_THRESHOLD_SECONDS: i64 = 8 * 60 * 60;
 const PENDING_REGISTRATION_STATE_DOMAIN: &[u8] = b"RUSTFS-CONNECT-PENDING-REGISTRATION-V1";
 

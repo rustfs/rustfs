@@ -38,6 +38,12 @@ use super::identity::{DeviceIdentity, RegistrationProof};
 
 pub const PROTOCOL_VERSION: &str = "v1";
 
+#[cfg(all(feature = "connect-e2e-short-credentials", not(debug_assertions)))]
+compile_error!("connect-e2e-short-credentials is restricted to debug builds");
+
+#[cfg(feature = "connect-e2e-short-credentials")]
+const CERTIFICATE_LIFETIME_SECONDS: i64 = 300;
+#[cfg(not(feature = "connect-e2e-short-credentials"))]
 const CERTIFICATE_LIFETIME_SECONDS: i64 = 86_400;
 const ROTATION_DOMAIN: &[u8] = b"RUSTFS-CONNECT-CREDENTIAL-ROTATION-V1";
 const MAX_TOKEN_BYTES: u64 = 16 * 1024;

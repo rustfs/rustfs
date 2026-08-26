@@ -50,6 +50,14 @@ use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "connect-e2e-short-credentials")]
+const EXPECTED_CERTIFICATE_LIFETIME_SECONDS: i64 = 300;
+#[cfg(not(feature = "connect-e2e-short-credentials"))]
+const EXPECTED_CERTIFICATE_LIFETIME_SECONDS: i64 = 86_400;
+#[cfg(feature = "connect-e2e-short-credentials")]
+const EXPECTED_ROTATION_THRESHOLD_SECONDS: i64 = 120;
+#[cfg(not(feature = "connect-e2e-short-credentials"))]
+const EXPECTED_ROTATION_THRESHOLD_SECONDS: i64 = 8 * 60 * 60;
 const ORGANIZATION_UID: &str = "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70";
 const CLUSTER_UID: &str = "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81";
 const DEVICE_UID: &str = "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92";
@@ -106,7 +114,13 @@ impl TestPki {
 
     fn credential(&self, identity: &rustfs::connect::DeviceIdentity, uri: &str, serial_byte: u8) -> Value {
         let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("whole second");
-        self.credential_window(identity, uri, serial_byte, now, now + time::Duration::days(1))
+        self.credential_window(
+            identity,
+            uri,
+            serial_byte,
+            now,
+            now + time::Duration::seconds(EXPECTED_CERTIFICATE_LIFETIME_SECONDS),
+        )
     }
 
     fn credential_window(
@@ -474,14 +488,19 @@ fn due_runtime_config(
     pki: &TestPki,
     endpoint: &str,
 ) -> (HeartbeatConfig, Value, rustfs::connect::DeviceIdentity) {
-    runtime_config(temp, pki, endpoint, 17)
+    runtime_config(
+        temp,
+        pki,
+        endpoint,
+        EXPECTED_CERTIFICATE_LIFETIME_SECONDS - EXPECTED_ROTATION_THRESHOLD_SECONDS,
+    )
 }
 
 fn runtime_config(
     temp: &tempfile::TempDir,
     pki: &TestPki,
     endpoint: &str,
-    elapsed_hours: i64,
+    elapsed_seconds: i64,
 ) -> (HeartbeatConfig, Value, rustfs::connect::DeviceIdentity) {
     let (identity_store, credential_store) = stores(temp);
     let identity = identity_store.load_or_create().expect("create current identity");
@@ -490,13 +509,13 @@ fn runtime_config(
         &identity,
         &format!("urn:rustfs:connect:device:{DEVICE_UID}"),
         0x20,
-        now - time::Duration::hours(elapsed_hours),
-        now + time::Duration::hours(24 - elapsed_hours),
+        now - time::Duration::seconds(elapsed_seconds),
+        now + time::Duration::seconds(EXPECTED_CERTIFICATE_LIFETIME_SECONDS - elapsed_seconds),
     );
     let not_before =
         OffsetDateTime::parse(credential["notBefore"].as_str().expect("notBefore"), &Rfc3339).expect("parse notBefore");
     let not_after = OffsetDateTime::parse(credential["notAfter"].as_str().expect("notAfter"), &Rfc3339).expect("parse notAfter");
-    assert_eq!(not_after - not_before, time::Duration::hours(24));
+    assert_eq!(not_after - not_before, time::Duration::seconds(EXPECTED_CERTIFICATE_LIFETIME_SECONDS));
     fs::create_dir_all(temp.path().join("credential")).expect("credential directory");
     write_stored_credential(&temp.path().join("credential/device.crt.json"), &credential);
     let next = stage_next_identity(temp);
@@ -666,6 +685,49 @@ async fn registration_rejects_untrusted_or_misbound_credentials() {
 }
 
 #[tokio::test]
+async fn registration_enforces_build_profile_credential_lifetime() {
+    let pki = TestPki::new();
+    let accepted_temp = tempfile::tempdir().expect("temp dir");
+    let (accepted_identity_store, accepted_credential_store) = stores(&accepted_temp);
+    let accepted_identity = accepted_identity_store.load_or_create().expect("create identity");
+    let accepted = pki.credential(&accepted_identity, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 4);
+    let accepted_server = server(&pki, vec![Reply::Json(StatusCode::CREATED, accepted)]).await;
+    let credential = client(&accepted_server, &pki, Duration::from_secs(2))
+        .register(&accepted_identity_store, &accepted_credential_store, &token())
+        .await
+        .expect("configured lifetime must be accepted");
+    assert_eq!(
+        credential.not_after_unix - credential.not_before_unix,
+        EXPECTED_CERTIFICATE_LIFETIME_SECONDS
+    );
+
+    let rejected_temp = tempfile::tempdir().expect("temp dir");
+    let (rejected_identity_store, rejected_credential_store) = stores(&rejected_temp);
+    let rejected_identity = rejected_identity_store.load_or_create().expect("create identity");
+    let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("whole second");
+    let other_lifetime = if cfg!(feature = "connect-e2e-short-credentials") {
+        86_400
+    } else {
+        300
+    };
+    let rejected = pki.credential_window(
+        &rejected_identity,
+        &format!("urn:rustfs:connect:device:{DEVICE_UID}"),
+        5,
+        now,
+        now + time::Duration::seconds(other_lifetime),
+    );
+    let rejected_server = server(&pki, vec![Reply::Json(StatusCode::CREATED, rejected)]).await;
+    assert!(matches!(
+        client(&rejected_server, &pki, Duration::from_secs(2))
+            .register(&rejected_identity_store, &rejected_credential_store, &token())
+            .await,
+        Err(ClientError::Credential(_))
+    ));
+    assert!(!rejected_temp.path().join("credential/device.crt.json").exists());
+}
+
+#[tokio::test]
 async fn stored_credential_is_revalidated_before_reuse() {
     let temp = tempfile::tempdir().expect("temp dir");
     let (identity_store, credential_store) = stores(&temp);
@@ -710,8 +772,8 @@ async fn register_rejects_expired_and_not_yet_valid_stored_credentials() {
         &identity,
         &format!("urn:rustfs:connect:device:{DEVICE_UID}"),
         10,
-        now - time::Duration::days(2),
-        now - time::Duration::days(1),
+        now - time::Duration::seconds(EXPECTED_CERTIFICATE_LIFETIME_SECONDS + 60),
+        now - time::Duration::seconds(60),
     );
     write_stored_credential(&path, &expired);
     assert!(matches!(
@@ -724,7 +786,7 @@ async fn register_rejects_expired_and_not_yet_valid_stored_credentials() {
         &format!("urn:rustfs:connect:device:{DEVICE_UID}"),
         11,
         now + time::Duration::hours(1),
-        now + time::Duration::hours(25),
+        now + time::Duration::hours(1) + time::Duration::seconds(EXPECTED_CERTIFICATE_LIFETIME_SECONDS),
     );
     write_stored_credential(&path, &future);
     assert!(matches!(
@@ -765,7 +827,7 @@ async fn concurrent_rotation_retries_converge_and_promote_the_next_key() {
     )
     .await;
     let retry_client = client(&retries, &pki, Duration::from_millis(80));
-    let due = registered.not_after_unix - 8 * 60 * 60;
+    let due = registered.not_after_unix - EXPECTED_ROTATION_THRESHOLD_SECONDS;
     let (first, second) = tokio::join!(
         retry_client.rotate_if_due(&identity_store, &credential_store, due),
         retry_client.rotate_if_due(&identity_store, &credential_store, due)
@@ -1074,7 +1136,7 @@ async fn heartbeat_retries_with_the_new_credential_after_concurrent_rotation() {
     let due = OffsetDateTime::parse(current["notAfter"].as_str().expect("notAfter"), &Rfc3339)
         .expect("parse notAfter")
         .unix_timestamp()
-        - 8 * 60 * 60;
+        - EXPECTED_ROTATION_THRESHOLD_SECONDS;
     client(&server, &pki, Duration::from_millis(250))
         .rotate_if_due(&identity_store, &credential_store, due)
         .await
@@ -1159,7 +1221,7 @@ async fn inventory_retries_with_the_new_credential_after_concurrent_rotation() {
     let due = OffsetDateTime::parse(current["notAfter"].as_str().expect("notAfter"), &Rfc3339)
         .expect("parse notAfter")
         .unix_timestamp()
-        - 8 * 60 * 60;
+        - EXPECTED_ROTATION_THRESHOLD_SECONDS;
     client(&server, &pki, Duration::from_millis(250))
         .rotate_if_due(&identity_store, &credential_store, due)
         .await
@@ -1391,7 +1453,7 @@ async fn rotation_commit_recovers_after_each_durable_step() {
         .await
         .expect("register");
     let failed = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
-    let due = registered.not_after_unix - 8 * 60 * 60;
+    let due = registered.not_after_unix - EXPECTED_ROTATION_THRESHOLD_SECONDS;
     assert!(matches!(
         client(&failed, &pki, Duration::from_secs(2))
             .rotate_if_due(&identity_store, &credential_store, due)
@@ -1473,7 +1535,11 @@ async fn pending_reenrollment_blocks_rotation_and_resumes_original_exchange() {
 
     let rotation = server(&pki, vec![]).await;
     let error = client(&rotation, &pki, Duration::from_secs(2))
-        .rotate_if_due(&identity_store, &credential_store, registered.not_after_unix - 8 * 60 * 60)
+        .rotate_if_due(
+            &identity_store,
+            &credential_store,
+            registered.not_after_unix - EXPECTED_ROTATION_THRESHOLD_SECONDS,
+        )
         .await
         .expect_err("pending reenrollment blocks rotation");
     assert!(matches!(error, ClientError::PendingRegistration));
@@ -1660,15 +1726,25 @@ async fn rotation_waits_for_threshold_and_stops_on_revocation() {
         .register(&identity_store, &credential_store, &token())
         .await
         .expect("register");
+    assert_eq!(current.not_after_unix - current.not_before_unix, EXPECTED_CERTIFICATE_LIFETIME_SECONDS);
     assert!(
         connect
-            .rotate_if_due(&identity_store, &credential_store, current.not_before_unix)
+            .rotate_if_due(
+                &identity_store,
+                &credential_store,
+                current.not_after_unix - EXPECTED_ROTATION_THRESHOLD_SECONDS - 1,
+            )
             .await
             .expect("not due")
             .is_none()
     );
+    assert_eq!(rotation_server.seen.lock().expect("seen lock").len(), 1);
     let error = connect
-        .rotate_if_due(&identity_store, &credential_store, current.not_after_unix - 8 * 60 * 60)
+        .rotate_if_due(
+            &identity_store,
+            &credential_store,
+            current.not_after_unix - EXPECTED_ROTATION_THRESHOLD_SECONDS,
+        )
         .await
         .expect_err("revocation must stop rotation");
     assert!(matches!(error, ClientError::AccessRevoked { .. }));

@@ -57,6 +57,8 @@ tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, 
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope"]
 manual-test-runners = []
 e2e-test-hooks = []
+# Shortens Connect credentials only in debug E2E builds.
+connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
