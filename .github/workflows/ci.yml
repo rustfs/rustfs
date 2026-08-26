@@ -429,6 +429,11 @@ jobs:
       #   - test_noncurrent_{expiry,transition}_still_works_after_immediate_compensation_transition:
       #     noncurrent transition/expiry after an immediate compensation transition.
       - name: Run ignored ILM integration tests serially
+        env:
+          # Match the measured Test and Lint link budget. The default exposed
+          # all 14 pod CPUs and a cold cache spent the full 80m compiling
+          # without starting one ILM test (main run 32982910990).
+          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
         run: |
           mkdir -p artifacts/ilm-integration
           set +e

@@ -174,6 +174,36 @@ def check_vault_test_groups(root: Path) -> list[str]:
     return errors
 
 
+def check_ilm_build_budget(root: Path) -> list[str]:
+    workflow_path = root / ".github/workflows/ci.yml"
+    if not workflow_path.is_file():
+        return [".github/workflows/ci.yml: missing workflow"]
+    workflow = workflow_path.read_text()
+    job = re.search(
+        r"^  test-ilm-integration-serial:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n)",
+        workflow,
+        re.MULTILINE | re.DOTALL,
+    )
+    if job is None:
+        return [".github/workflows/ci.yml: missing test-ilm-integration-serial job"]
+
+    step = re.search(
+        r"^      - name: Run ignored ILM integration tests serially\n(?P<body>.*?)(?=^      - name:|\Z)",
+        job.group("body"),
+        re.MULTILINE | re.DOTALL,
+    )
+    if step is None:
+        return [".github/workflows/ci.yml: missing ignored ILM integration step"]
+
+    budget = (
+        "CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || "
+        "github.event_name == 'workflow_dispatch') && '3' || '2' }}"
+    )
+    if budget not in step.group("body"):
+        return [".github/workflows/ci.yml: ILM integration must keep the measured 3/2 Cargo build budget"]
+    return []
+
+
 def check_fuzz_targets(root: Path) -> list[str]:
     manifest = tomllib.loads((root / "fuzz/Cargo.toml").read_text())
     expected = {item["name"] for item in manifest.get("bin", []) if "name" in item}
@@ -738,6 +768,7 @@ def validate(root: Path) -> list[str]:
     errors: list[str] = []
     errors.extend(check_e2e_modules(root))
     errors.extend(check_vault_test_groups(root))
+    errors.extend(check_ilm_build_budget(root))
     errors.extend(check_fuzz_targets(root))
     errors.extend(check_runner_selection(root))
     errors.extend(check_s3_tests_runner(root))
@@ -748,6 +779,28 @@ def validate(root: Path) -> list[str]:
 
 
 class SelfTests(unittest.TestCase):
+    def test_ilm_lane_keeps_the_measured_cargo_build_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflow = root / ".github/workflows/ci.yml"
+            workflow.parent.mkdir(parents=True)
+            valid = (
+                "jobs:\n"
+                "  test-ilm-integration-serial:\n"
+                "    steps:\n"
+                "      - name: Run ignored ILM integration tests serially\n"
+                "        env:\n"
+                "          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}\n"
+                "        run: cargo nextest run\n"
+                "  next-job:\n"
+                "    steps: []\n"
+            )
+            workflow.write_text(valid)
+            self.assertEqual(check_ilm_build_budget(root), [])
+
+            workflow.write_text(valid.replace("          CARGO_BUILD_JOBS:", "          BUILD_JOBS:"))
+            self.assertEqual(len(check_ilm_build_budget(root)), 1)
+
     def test_vault_tests_require_cross_process_serialization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -931,6 +984,7 @@ class SelfTests(unittest.TestCase):
                 mock.patch(__name__ + ".check_runner_selection", return_value=[]),
                 mock.patch(__name__ + ".check_workflow_readiness", return_value=[]),
                 mock.patch(__name__ + ".check_profile_definitions", return_value=[]),
+                mock.patch(__name__ + ".check_ilm_build_budget", return_value=[]),
                 mock.patch(__name__ + ".check_scheduled_alerts", return_value=[]),
             ):
                 self.assertEqual(len(validate(root)), 1)
