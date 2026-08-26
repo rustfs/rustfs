@@ -104,10 +104,10 @@ pub fn get_signing_key(secret: &str, loc: &str, t: OffsetDateTime, service_type:
     );
 
     // Check cache first
-    if let Ok(cache) = SIGNING_KEY_CACHE.lock() {
-        if let Some(&key) = cache.get(&cache_key) {
-            return key;
-        }
+    if let Ok(cache) = SIGNING_KEY_CACHE.lock()
+        && let Some(&key) = cache.get(&cache_key)
+    {
+        return key;
     }
 
     // Cache miss: compute signing key
@@ -119,10 +119,11 @@ pub fn get_signing_key(secret: &str, loc: &str, t: OffsetDateTime, service_type:
     let signing_key = hmac_sha256(service, "aws4_request");
 
     if let Ok(mut cache) = SIGNING_KEY_CACHE.lock() {
-        if cache.len() >= SIGNING_KEY_CACHE_CAPACITY && !cache.contains_key(&cache_key) {
-            if let Some(evicted_key) = cache.keys().next().cloned() {
-                cache.remove(&evicted_key);
-            }
+        if cache.len() >= SIGNING_KEY_CACHE_CAPACITY
+            && !cache.contains_key(&cache_key)
+            && let Some(evicted_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&evicted_key);
         }
         cache.insert(cache_key, signing_key);
     }
