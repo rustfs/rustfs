@@ -33,8 +33,8 @@ exactly where the test stopped. Credentials never appear in the logs.
 
 ## Self-hosted runner prerequisites
 
-- Register the admin host (e.g. `heal`) as a runner with labels:
-  `self-hosted, linux, x64, rustfs-test`.
+- Register the admin host (e.g. `heal`) as a runner with the
+  `smoke-testing` label.
 - Install `jq`, `openssl`, `curl` and `warp` (only needed for `--with-warp`)
   on the runner. `rc` is **not** required.
 - The runner user must be able to SSH to all nodes without a password prompt

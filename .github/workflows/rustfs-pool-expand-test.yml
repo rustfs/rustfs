@@ -64,7 +64,7 @@ env:
 
 jobs:
   pool-expansion-test:
-    runs-on: [self-hosted, linux, x64, rustfs-test]
+    runs-on: smoke-testing
     timeout-minutes: 360
     steps:
       - name: Checkout
