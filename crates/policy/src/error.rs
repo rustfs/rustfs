@@ -60,12 +60,6 @@ pub enum Error {
     #[error("invalid service type: {0}")]
     InvalidServiceType(String),
 
-    #[error("malformed credential")]
-    ErrCredMalformed,
-
-    #[error("CredNotInitialized")]
-    CredNotInitialized,
-
     #[error("invalid access key length")]
     InvalidAccessKeyLength,
 
@@ -81,20 +75,8 @@ pub enum Error {
     #[error("jwt err {0}")]
     JWTError(#[from] jsonwebtoken::errors::Error),
 
-    #[error("no access key")]
-    NoAccessKey,
-
-    #[error("invalid token")]
-    InvalidToken,
-
-    #[error("invalid access_key")]
-    InvalidAccessKey,
-
     #[error("action not allowed")]
     IAMActionNotAllowed,
-
-    #[error("invalid expiration")]
-    InvalidExpiration,
 
     #[error("no secret key with access key")]
     NoSecretKeyWithAccessKey,
@@ -343,17 +325,11 @@ mod tests {
             (Error::InvalidArgument, "invalid arguments specified"),
             (Error::IamSysNotInitialized, "not initialized"),
             (Error::InvalidServiceType("invalid".to_string()), "invalid service type: invalid"),
-            (Error::ErrCredMalformed, "malformed credential"),
-            (Error::CredNotInitialized, "CredNotInitialized"),
             (Error::InvalidAccessKeyLength, "invalid access key length"),
             (Error::InvalidSecretKeyLength, "invalid secret key length"),
             (Error::ContainsReservedChars, "access key contains reserved characters =,"),
             (Error::GroupNameContainsReservedChars, "group name contains reserved characters =,"),
-            (Error::NoAccessKey, "no access key"),
-            (Error::InvalidToken, "invalid token"),
-            (Error::InvalidAccessKey, "invalid access_key"),
             (Error::IAMActionNotAllowed, "action not allowed"),
-            (Error::InvalidExpiration, "invalid expiration"),
             (Error::NoSecretKeyWithAccessKey, "no secret key with access key"),
             (Error::NoAccessKeyWithSecretKey, "no access key with secret key"),
             (Error::PolicyTooLarge, "policy too large"),

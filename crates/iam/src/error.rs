@@ -214,15 +214,11 @@ impl From<rustfs_policy::error::Error> for Error {
             rustfs_policy::error::Error::IamSysAlreadyInitialized => Error::IamSysAlreadyInitialized,
             // These policy variants had dead same-name twins on iam::Error (zero
             // construction and zero match sites, removed in backlog#1831); the
-            // message is preserved through StringError instead.
-            err @ (rustfs_policy::error::Error::InvalidServiceType(_)
-            | rustfs_policy::error::Error::InvalidExpiration
-            | rustfs_policy::error::Error::NoAccessKey
-            | rustfs_policy::error::Error::InvalidToken
-            | rustfs_policy::error::Error::InvalidAccessKey
-            | rustfs_policy::error::Error::JWTError(_)
-            | rustfs_policy::error::Error::CredNotInitialized
-            | rustfs_policy::error::Error::ErrCredMalformed) => Error::StringError(err.to_string()),
+            // message is preserved through StringError instead. Their six dead
+            // siblings on policy::Error were deleted outright (backlog#1845).
+            err @ (rustfs_policy::error::Error::InvalidServiceType(_) | rustfs_policy::error::Error::JWTError(_)) => {
+                Error::StringError(err.to_string())
+            }
         }
     }
 }
