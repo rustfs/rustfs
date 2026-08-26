@@ -1252,11 +1252,10 @@ impl PeerRestClient {
                     Err(status) => return Err(status.into()),
                 };
                 if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error_info
-                            .unwrap_or_else(|| "peer background heal status failed without an error".to_string()),
-                    ));
+                    return Err(match (response.error_code, response.error_info) {
+                        (None, None) => Error::other("peer background heal status failed without an error"),
+                        (error_code, error_info) => control_plane_failure("background_heal_status", None, error_code, error_info),
+                    });
                 }
                 Ok(Some(response.bg_heal_state.to_vec()))
             }
@@ -1284,11 +1283,12 @@ impl PeerRestClient {
                     Err(status) => return Err(status.into()),
                 };
                 if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error_info
-                            .unwrap_or_else(|| "peer replacement recovery status failed without an error".to_string()),
-                    ));
+                    return Err(match (response.error_code, response.error_info) {
+                        (None, None) => Error::other("peer replacement recovery status failed without an error"),
+                        (error_code, error_info) => {
+                            control_plane_failure("replacement_recovery_status", None, error_code, error_info)
+                        }
+                    });
                 }
                 Ok(Some(response.recovery_status.to_vec()))
             }
