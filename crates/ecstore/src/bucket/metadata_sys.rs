@@ -167,6 +167,53 @@ pub(crate) fn object_lock_config_state_from_authoritative_metadata(bm: &BucketMe
     Ok(ObjectLockConfigState::ConfirmedAbsent)
 }
 
+/// Convert the persisted serving-layer configuration into the storage-level
+/// [`DefaultRetention`](crate::bucket::object_lock::types::DefaultRetention)
+/// the WORM evaluation code consumes (rustfs/backlog#1842). A rule without a
+/// usable GOVERNANCE/COMPLIANCE mode converts to `None`, exactly like the
+/// evaluation code has always ignored such rules; days/years are passed
+/// through untouched so an invalid period still fails closed at evaluation.
+pub(crate) fn default_retention_from_object_lock_config(
+    config: &ObjectLockConfiguration,
+) -> Option<crate::bucket::object_lock::types::DefaultRetention> {
+    let default_retention = config.rule.as_ref()?.default_retention.as_ref()?;
+    let mode = crate::bucket::object_lock::types::RetentionMode::parse(default_retention.mode.as_ref()?.as_str())?;
+    Some(crate::bucket::object_lock::types::DefaultRetention {
+        mode,
+        days: default_retention.days,
+        years: default_retention.years,
+    })
+}
+
+/// Test-only builder for a `Configured` Object Lock state carrying a default
+/// retention, so storage-side tests do not have to name serving-layer DTOs.
+#[cfg(test)]
+pub(crate) fn configured_object_lock_state_for_tests(
+    mode: crate::bucket::object_lock::types::RetentionMode,
+    days: i32,
+) -> ObjectLockConfigState {
+    ObjectLockConfigState::Configured {
+        config: ObjectLockConfiguration {
+            object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+            rule: Some(s3s::dto::ObjectLockRule {
+                default_retention: Some(s3s::dto::DefaultRetention {
+                    mode: Some(s3s::dto::ObjectLockRetentionMode::from_static(match mode {
+                        crate::bucket::object_lock::types::RetentionMode::Governance => {
+                            s3s::dto::ObjectLockRetentionMode::GOVERNANCE
+                        }
+                        crate::bucket::object_lock::types::RetentionMode::Compliance => {
+                            s3s::dto::ObjectLockRetentionMode::COMPLIANCE
+                        }
+                    })),
+                    days: Some(days),
+                    years: None,
+                }),
+            }),
+        },
+        updated_at: OffsetDateTime::now_utc(),
+    }
+}
+
 fn validate_authoritative_object_lock_config(config: &ObjectLockConfiguration) -> Result<()> {
     if config.object_lock_enabled.as_ref().map(ObjectLockEnabled::as_str) != Some(ObjectLockEnabled::ENABLED) {
         return Err(Error::other("persisted bucket Object Lock enabled state is invalid"));

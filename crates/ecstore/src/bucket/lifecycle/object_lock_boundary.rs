@@ -26,7 +26,8 @@ pub(crate) fn check_object_lock_for_deletion_with_config(
     obj_info: &ObjectInfo,
     bypass_governance: bool,
 ) -> crate::error::Result<Option<ObjectLockBlockReason>> {
-    objectlock_sys::check_object_lock_for_deletion_with_config(config, obj_info, bypass_governance)
+    let default_retention = config.and_then(crate::bucket::metadata_sys::default_retention_from_object_lock_config);
+    objectlock_sys::check_object_lock_for_deletion_with_default_retention(default_retention.as_ref(), obj_info, bypass_governance)
 }
 
 #[cfg(test)]

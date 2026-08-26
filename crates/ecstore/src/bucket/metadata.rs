@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
-use super::object_lock::ObjectLockApi;
+use super::object_lock::{ObjectLockApi, ObjectLockStatusExt};
 use super::versioning::VersioningApi;
 use super::{quota::BucketQuota, target::BucketTargets};
 use crate::bucket::replication::invalid_replication_config_status_field;
@@ -38,6 +38,26 @@ use std::sync::Arc;
 use time::{Date, OffsetDateTime, PrimitiveDateTime, Time as CivilTime, UtcOffset};
 use tracing::error;
 use uuid::Uuid;
+
+// The serving-layer DTO impls for the storage-level Object Lock traits live
+// here because this module owns the persisted `ObjectLockConfiguration`
+// during the s3s ratchet migration (rustfs/backlog#1842).
+impl ObjectLockApi for ObjectLockConfiguration {
+    fn enabled(&self) -> bool {
+        self.object_lock_enabled
+            .as_ref()
+            .is_some_and(|v| v.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)
+    }
+}
+
+impl ObjectLockStatusExt for s3s::dto::ObjectLockLegalHoldStatus {
+    fn valid(&self) -> bool {
+        matches!(
+            self.as_str(),
+            s3s::dto::ObjectLockLegalHoldStatus::ON | s3s::dto::ObjectLockLegalHoldStatus::OFF
+        )
+    }
+}
 
 fn read_msgp_str<R: Read>(rd: &mut R) -> Result<String> {
     let len = rmp::decode::read_str_len(rd)? as usize;
