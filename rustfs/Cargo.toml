@@ -353,9 +353,6 @@ rustfs-mimalloc = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-rustfs-mimalloc-sys = { workspace = true }
-
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
 serial_test = { workspace = true }

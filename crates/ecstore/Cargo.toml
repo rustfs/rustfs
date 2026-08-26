@@ -25,6 +25,12 @@ keywords = ["erasure-coding", "storage", "rustfs", "Minio", "solomon"]
 categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-ecstore/latest/rustfs_ecstore/"
 
+[package.metadata.cargo-shear]
+ignored = [
+    "rustfs-checksums",
+    "rustfs-signer",
+    "rustfs-tls-runtime",
+]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lints]
@@ -129,7 +135,6 @@ hotpath-cpu = [
 test-util = []
 
 [dependencies]
-starshard = { workspace = true }
 hotpath.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
@@ -171,7 +176,6 @@ serde = { workspace = true, features = ["derive"] }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 bytesize.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
-quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
 s3s = { workspace = true, features = ["minio"] }
 http.workspace = true
 opentelemetry.workspace = true
@@ -193,7 +197,6 @@ tokio-util = { workspace = true, features = ["io", "compat"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 base64 = { workspace = true }
 hmac = { workspace = true }
-sha1 = { workspace = true }
 sha2 = { workspace = true }
 hex-simd = { workspace = true }
 tempfile.workspace = true
@@ -208,7 +211,6 @@ tonic = { workspace = true, features = ["gzip", "deflate"] }
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower = { workspace = true, features = ["timeout"] }
 async-channel.workspace = true
-enumset = { workspace = true }
 num_cpus = { workspace = true }
 rand = { workspace = true, features = ["serde"] }
 pin-project-lite.workspace = true
