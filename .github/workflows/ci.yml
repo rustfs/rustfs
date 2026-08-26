@@ -457,6 +457,11 @@ jobs:
         run: cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings
 
       - name: Run rio-v2 feature tests
+        env:
+          # Match the main nextest lane's #5394 link-I/O guard. A cold feature
+          # cache otherwise fans out enough rust-lld processes to exhaust this
+          # job's 90-minute budget before any test starts.
+          CARGO_BUILD_JOBS: "2"
         run: |
           cargo nextest run -p rustfs -p rustfs-ecstore --features rio-v2
           cargo test -p rustfs --doc --features rio-v2
@@ -505,6 +510,10 @@ jobs:
           cargo clippy -p rustfs -p rustfs-protocols --all-targets ${{ matrix.features.flags }} -- -D warnings
 
       - name: Run tests with ${{ matrix.features.name }}
+        env:
+          # Keep feature-test linking under the same bounded concurrency as the
+          # main nextest lane; Clippy is metadata-only and needs no such limit.
+          CARGO_BUILD_JOBS: "2"
         run: |
           cargo nextest run -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
 
