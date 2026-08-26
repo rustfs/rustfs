@@ -46,7 +46,7 @@ use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
@@ -190,6 +190,7 @@ struct TestServer {
     seen: Arc<Mutex<Vec<Value>>>,
     paths: Arc<Mutex<Vec<String>>>,
     client_certificates: Arc<Mutex<Vec<Option<String>>>>,
+    request_notify: Arc<Notify>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -211,9 +212,11 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
     let seen = Arc::new(Mutex::new(Vec::new()));
     let paths = Arc::new(Mutex::new(Vec::new()));
     let client_certificates = Arc::new(Mutex::new(Vec::new()));
+    let request_notify = Arc::new(Notify::new());
     let captured = seen.clone();
     let captured_paths = paths.clone();
     let captured_certificates = client_certificates.clone();
+    let captured_notify = request_notify.clone();
     let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -224,6 +227,7 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
             let seen = captured.clone();
             let paths = captured_paths.clone();
             let client_certificates = captured_certificates.clone();
+            let request_notify = captured_notify.clone();
             tokio::spawn(async move {
                 let Ok(stream) = acceptor.accept(stream).await else {
                     return;
@@ -239,6 +243,7 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
                     let seen = seen.clone();
                     let paths = paths.clone();
                     let client_certificates = client_certificates.clone();
+                    let request_notify = request_notify.clone();
                     let client_certificate = client_certificate.clone();
                     async move {
                         let path = request.uri().path().to_owned();
@@ -251,6 +256,7 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
                             .push(client_certificate);
                         paths.lock().expect("paths lock").push(path);
                         seen.lock().expect("seen lock").push(value.clone());
+                        request_notify.notify_waiters();
                         match reply {
                             Reply::Json(status, value) => Ok::<_, hyper::Error>(
                                 Response::builder()
@@ -330,6 +336,7 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
         seen,
         paths,
         client_certificates,
+        request_notify,
         task,
     }
 }
@@ -526,9 +533,12 @@ fn heartbeat_response(server_time: &str) -> Value {
 }
 
 async fn wait_for_requests(server: &TestServer, count: usize) {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         while server.paths.lock().expect("paths lock").len() < count {
-            tokio::task::yield_now().await;
+            tokio::select! {
+                _ = server.request_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
         }
     })
     .await
