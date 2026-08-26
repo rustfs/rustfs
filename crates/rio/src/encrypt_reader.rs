@@ -394,6 +394,22 @@ where
         }
     }
 
+    /// Decrypt a stream that starts at an arbitrary frame boundary of a
+    /// single-part v2 object.
+    ///
+    /// `starting_block_index` is the absolute index of the first frame in the
+    /// stream: both the per-block nonce derivation and the v2 AEAD associated
+    /// data bind absolute indices, so a frame served from the middle of an
+    /// object only authenticates when the caller positions the read at a true
+    /// frame boundary and names that frame's index. v1 streams are never
+    /// planned with a non-zero start (their frames have no closed-form
+    /// positions), so this constructor is v2-only by construction.
+    pub fn new_at_block(inner: R, key: [u8; 32], nonce: [u8; 12], starting_block_index: usize) -> Self {
+        let mut reader = Self::new(inner, key, nonce);
+        reader.block_index = starting_block_index;
+        reader
+    }
+
     pub fn new_multipart(inner: R, key: [u8; 32], base_nonce: [u8; 12], multipart_parts: Vec<usize>) -> Self {
         let first_part = multipart_parts.first().copied().unwrap_or(1);
         let initial_nonce = derive_part_nonce(&base_nonce, first_part);
@@ -1547,5 +1563,36 @@ mod tests {
         expected.extend_from_slice(&part_two);
         assert_eq!(decrypted.len(), expected.len(), "no segment may be dropped after an empty final frame");
         assert_eq!(decrypted, expected);
+    }
+
+    #[tokio::test]
+    async fn v2_decrypts_from_an_arbitrary_frame_boundary() {
+        let mut key = [0u8; 32];
+        let mut nonce = [0u8; 12];
+        rand::rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut nonce);
+
+        let block = super::ENCRYPTION_BLOCK_SIZE;
+        let data: Vec<u8> = (0..4 * block + 321).map(|i| (i % 247) as u8).collect();
+        let encrypted = v2_encrypt(&data, key, nonce).await;
+
+        // Serve the ciphertext window starting at frame 2 and decrypt with the
+        // matching absolute frame index: nonce and AAD both line up.
+        let window = encrypted[2 * V2_FULL_FRAME_LEN..].to_vec();
+        let mut decrypt_reader = DecryptReader::new_at_block(Cursor::new(window.clone()), key, nonce, 2);
+        let mut decrypted = Vec::new();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("mid-stream decrypt at a true frame boundary succeeds");
+        assert_eq!(decrypted, &data[2 * block..]);
+
+        // The same window with a wrong starting index fails authentication.
+        let mut decrypt_reader = DecryptReader::new_at_block(Cursor::new(window), key, nonce, 1);
+        let mut decrypted = Vec::new();
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect_err("a wrong absolute frame index must fail authentication");
     }
 }

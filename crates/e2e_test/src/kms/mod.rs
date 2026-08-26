@@ -49,6 +49,9 @@ mod encryption_metadata_test;
 mod copy_object_self_copy_sse_test;
 
 #[cfg(test)]
+mod encrypted_range_get_test;
+
+#[cfg(test)]
 mod copy_object_version_restore_sse_test;
 
 #[cfg(test)]
