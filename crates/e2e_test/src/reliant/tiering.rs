@@ -27,8 +27,8 @@
 //! loopback/SSRF restriction (that guard is replication-only), so `hot` can tier
 //! to `cold` over `http://127.0.0.1:<port>`.
 //!
-//! A single test drives the full transition main path and pins the chain
-//! required by ilm-7:
+//! The hermetic tests drive the transition and restore paths and pin the
+//! chains required by ilm-7 and the restore follow-up:
 //!   1. `AddTier(RustFS)` on `hot` targeting `cold` — the real connectivity /
 //!      in-use probe runs (no `force`), so this also proves the tier is reachable.
 //!   2. A `Transition Days=0` rule installed before a multipart PUT transitions
@@ -42,6 +42,9 @@
 //!   6. The remote object is present in the cold-tier bucket after transition.
 //!   7. `DeleteObject` on `hot` drives free-version cleanup: the cold-tier copy
 //!      eventually disappears and the hot object is gone (no local residue).
+//!   8. `RestoreObject` copy-back failures clear the in-progress marker, a
+//!      retry serves the object locally until expiry, and expiry leaves the
+//!      remote object available for a second restore.
 
 use crate::common::{RustFSTestEnvironment, local_http_client};
 use aws_sdk_s3::Client;
@@ -49,7 +52,8 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketLifecycleConfiguration, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, ExpirationStatus,
-    LifecycleRule, LifecycleRuleFilter, NoncurrentVersionTransition, Transition, TransitionStorageClass, VersioningConfiguration,
+    LifecycleRule, LifecycleRuleFilter, NoncurrentVersionTransition, RestoreRequest, Transition, TransitionStorageClass,
+    VersioningConfiguration,
 };
 use http::Method;
 use http::header::HOST;
@@ -739,6 +743,77 @@ async fn wait_for_transition(client: &Client, bucket: &str, key: &str, deadline:
     }
 }
 
+/// Poll `HEAD` until the asynchronous copy-back reports a completed restore.
+async fn wait_for_restore_complete(client: &Client, bucket: &str, key: &str, deadline: StdDuration) -> TestResult {
+    let start = Instant::now();
+    loop {
+        let head = client.head_object().bucket(bucket).key(key).send().await?;
+        if head
+            .restore()
+            .is_some_and(|restore| restore.contains("ongoing-request=\"false\""))
+        {
+            return Ok(());
+        }
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "restore for {bucket}/{key} did not complete within {}s; restore={:?}",
+                deadline.as_secs(),
+                head.restore()
+            )
+            .into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(250)).await;
+    }
+}
+
+/// Poll `HEAD` until the lifecycle restore-expiry action removes restore metadata.
+async fn wait_for_restore_clear(client: &Client, bucket: &str, key: &str, deadline: StdDuration) -> TestResult {
+    let start = Instant::now();
+    loop {
+        let head = client.head_object().bucket(bucket).key(key).send().await?;
+        if head.restore().is_none() {
+            return Ok(());
+        }
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "restore metadata for {bucket}/{key} was not cleared within {}s; restore={:?}",
+                deadline.as_secs(),
+                head.restore()
+            )
+            .into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(250)).await;
+    }
+}
+
+/// Poll `HEAD` through the failed-copy transition, proving that the request
+/// first published an in-progress marker and that the failure then removed it.
+async fn wait_for_restore_failure(client: &Client, bucket: &str, key: &str, deadline: StdDuration) -> TestResult {
+    let start = Instant::now();
+    let mut saw_ongoing = false;
+    loop {
+        let head = client.head_object().bucket(bucket).key(key).send().await?;
+        if head
+            .restore()
+            .is_some_and(|restore| restore.contains("ongoing-request=\"true\""))
+        {
+            saw_ongoing = true;
+        } else if saw_ongoing && head.restore().is_none() {
+            return Ok(());
+        }
+        if start.elapsed() >= deadline {
+            return Err(format!(
+                "failed restore for {bucket}/{key} did not publish and clear its in-progress marker within {}s; \
+                 saw_ongoing={saw_ongoing}, restore={:?}",
+                deadline.as_secs(),
+                head.restore()
+            )
+            .into());
+        }
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+    }
+}
+
 /// Poll until the cold-tier bucket is empty (remote free-version cleanup done),
 /// or fail after `deadline`.
 async fn wait_for_cold_tier_empty(cold_client: &Client, deadline: StdDuration) -> TestResult {
@@ -889,6 +964,143 @@ async fn test_hermetic_transition_main_path() -> TestResult {
         "hot GET after delete must be NoSuchKey, got {err:?}"
     );
 
+    wait_for_cold_tier_empty(&cold_client, StdDuration::from_secs(90)).await?;
+
+    Ok(())
+}
+
+/// Restore a transitioned object through a real RustFS remote tier.
+///
+/// The test covers the externally visible copy-back contract that a mock tier
+/// cannot prove: a failed remote read clears `x-amz-restore`, a retry creates a
+/// local copy that remains readable while the cold tier is unavailable, expiry
+/// removes only that local copy, and the same remote object can be restored a
+/// second time. The accelerated lifecycle clock keeps the expiry assertion
+/// bounded while the scanner remains enabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_hermetic_transition_restore_failure_expiry_and_retry() -> TestResult {
+    let mut cold = RustFSTestEnvironment::new().await?;
+    cold.access_key = "restorecoldtieradmin".to_string();
+    cold.secret_key = "restorecoldtiersecret".to_string();
+    cold.start_rustfs_server_without_cleanup(vec![]).await?;
+    let cold_client = cold.create_s3_client();
+    cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
+
+    let mut hot = RustFSTestEnvironment::new().await?;
+    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_ILM_DEBUG_DAY_SECS", "5")])
+        .await?;
+    let hot_client = hot.create_s3_client();
+    add_rustfs_tier(&hot, &cold).await?;
+
+    hot_client.create_bucket().bucket(SOURCE_BUCKET).send().await?;
+    hot_client
+        .put_bucket_lifecycle_configuration()
+        .bucket(SOURCE_BUCKET)
+        .lifecycle_configuration(BucketLifecycleConfiguration::builder().rules(transition_rule()?).build()?)
+        .send()
+        .await?;
+
+    let data = payload();
+    put_multipart_object(&hot_client, SOURCE_BUCKET, OBJECT_KEY, &data).await?;
+    wait_for_transition(&hot_client, SOURCE_BUCKET, OBJECT_KEY, StdDuration::from_secs(90)).await?;
+    let transitioned = hot_client.head_object().bucket(SOURCE_BUCKET).key(OBJECT_KEY).send().await?;
+    assert_eq!(
+        transitioned.storage_class().map(|storage_class| storage_class.as_str()),
+        Some(TIER_NAME),
+        "restore fixture must be transitioned before the copy-back request"
+    );
+    assert!(transitioned.restore().is_none(), "transitioned object must not already be restored");
+    assert_eq!(
+        cold_tier_object_count(&cold_client).await?,
+        1,
+        "cold tier should contain one restore candidate"
+    );
+
+    // A failed remote read is accepted asynchronously, but it must not leave
+    // an object permanently advertising an in-progress restore.
+    cold.stop_server();
+    hot_client
+        .restore_object()
+        .bucket(SOURCE_BUCKET)
+        .key(OBJECT_KEY)
+        .restore_request(RestoreRequest::builder().days(1).build())
+        .send()
+        .await?;
+    wait_for_restore_failure(&hot_client, SOURCE_BUCKET, OBJECT_KEY, StdDuration::from_secs(30)).await?;
+
+    // Once the tier is available again, the same object can be restored.
+    cold.restart_server_preserving_data(vec![], &[]).await?;
+    hot_client
+        .restore_object()
+        .bucket(SOURCE_BUCKET)
+        .key(OBJECT_KEY)
+        .restore_request(RestoreRequest::builder().days(1).build())
+        .send()
+        .await?;
+    wait_for_restore_complete(&hot_client, SOURCE_BUCKET, OBJECT_KEY, StdDuration::from_secs(30)).await?;
+
+    let restored = hot_client.head_object().bucket(SOURCE_BUCKET).key(OBJECT_KEY).send().await?;
+    assert_eq!(
+        restored.storage_class().map(|storage_class| storage_class.as_str()),
+        Some(TIER_NAME),
+        "restore must retain the transitioned storage class"
+    );
+    assert!(
+        restored
+            .restore()
+            .is_some_and(|restore| restore.contains("ongoing-request=\"false\"")),
+        "completed restore must advertise a finished temporary copy"
+    );
+
+    // A completed restore must be served locally even if the remote tier is
+    // temporarily unavailable.
+    cold.stop_server();
+    let local_get = hot_client.get_object().bucket(SOURCE_BUCKET).key(OBJECT_KEY).send().await?;
+    let local_body = local_get.body.collect().await?.into_bytes();
+    assert_eq!(local_body.as_ref(), data.as_slice(), "restored local copy must be byte-identical");
+
+    cold.restart_server_preserving_data(vec![], &[]).await?;
+
+    // The test clock makes the one-day restore expire in roughly five seconds.
+    wait_for_restore_clear(&hot_client, SOURCE_BUCKET, OBJECT_KEY, StdDuration::from_secs(30)).await?;
+    let expired = hot_client.head_object().bucket(SOURCE_BUCKET).key(OBJECT_KEY).send().await?;
+    assert_eq!(
+        expired.storage_class().map(|storage_class| storage_class.as_str()),
+        Some(TIER_NAME),
+        "restore expiry must not clear the transitioned storage class"
+    );
+    assert_eq!(
+        cold_tier_object_count(&cold_client).await?,
+        1,
+        "restore expiry must retain the remote object"
+    );
+
+    // After expiry the local copy is gone, so an unavailable tier must make the
+    // read fail; with the tier back, the original bytes remain readable.
+    cold.stop_server();
+    let expired_get = hot_client.get_object().bucket(SOURCE_BUCKET).key(OBJECT_KEY).send().await;
+    assert!(expired_get.is_err(), "expired restore must not leave a local copy behind");
+    cold.restart_server_preserving_data(vec![], &[]).await?;
+    let remote_get = hot_client.get_object().bucket(SOURCE_BUCKET).key(OBJECT_KEY).send().await?;
+    let remote_body = remote_get.body.collect().await?.into_bytes();
+    assert_eq!(remote_body.as_ref(), data.as_slice(), "post-expiry GET must read the remote copy");
+
+    // The remote candidate survives expiry and can be restored again.
+    hot_client
+        .restore_object()
+        .bucket(SOURCE_BUCKET)
+        .key(OBJECT_KEY)
+        .restore_request(RestoreRequest::builder().days(1).build())
+        .send()
+        .await?;
+    wait_for_restore_complete(&hot_client, SOURCE_BUCKET, OBJECT_KEY, StdDuration::from_secs(30)).await?;
+
+    hot_client
+        .delete_object()
+        .bucket(SOURCE_BUCKET)
+        .key(OBJECT_KEY)
+        .send()
+        .await?;
     wait_for_cold_tier_empty(&cold_client, StdDuration::from_secs(90)).await?;
 
     Ok(())
