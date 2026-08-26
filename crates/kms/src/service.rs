@@ -305,6 +305,41 @@ impl ObjectEncryptionService {
         self.kms_manager.backend_capabilities()
     }
 
+    /// Re-wrap an object's encrypted data key onto its master key's current
+    /// version, without the plaintext data key ever reaching the caller.
+    ///
+    /// Pure passthrough: the backend owns the format and the no-op decision
+    /// ([`RewrapDataKeyResponse::rewrapped`] false means nothing to persist).
+    /// The context must be the object's own — the backend refuses an envelope
+    /// whose recorded context the caller cannot reproduce.
+    pub async fn rewrap_data_key(
+        &self,
+        encrypted_key: &[u8],
+        context: &ObjectEncryptionContext,
+    ) -> Result<crate::types::RewrapDataKeyResponse> {
+        self.kms_manager
+            .rewrap_data_key(crate::types::RewrapDataKeyRequest {
+                ciphertext: encrypted_key.to_vec(),
+                encryption_context: request_encryption_context(context),
+            })
+            .await
+    }
+
+    /// Report which master key version wraps an object's encrypted data key,
+    /// and whether a rewrap would change anything.
+    pub async fn describe_data_key_wrapping(
+        &self,
+        encrypted_key: &[u8],
+        context: &ObjectEncryptionContext,
+    ) -> Result<crate::types::DescribeDataKeyWrappingResponse> {
+        self.kms_manager
+            .describe_data_key_wrapping(crate::types::DescribeDataKeyWrappingRequest {
+                ciphertext: encrypted_key.to_vec(),
+                encryption_context: request_encryption_context(context),
+            })
+            .await
+    }
+
     /// Create a data encryption key for object encryption
     ///
     /// # Arguments

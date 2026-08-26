@@ -54,6 +54,7 @@ use vaultrs::{
     kv2,
     transit::{data, key},
 };
+use zeroize::Zeroize as _;
 
 /// Attempt budget for metadata read-modify-write cycles: every check-and-set
 /// conflict triggers a fresh read plus state-gate re-validation, never a blind
@@ -1081,30 +1082,27 @@ impl VaultTransitKmsClient {
         })
     }
 
-    /// Re-wrap an existing envelope onto the transit key's latest version using
-    /// Vault's native rewrap endpoint.
+    /// Re-wrap an existing envelope onto the transit key's latest version.
     ///
-    /// The data key is never decrypted into this process: Vault re-encrypts the
-    /// ciphertext internally and hands back only the new ciphertext, so no
-    /// `transit/decrypt` is issued and no plaintext data key exists here to
-    /// leak, log or persist.
+    /// Envelopes without an encryption context go through Vault's native
+    /// rewrap endpoint: Vault re-encrypts the ciphertext internally, so no
+    /// plaintext data key exists in this process at all.
     ///
-    /// # Envelopes bound to an encryption context cannot be rewrapped
-    ///
-    /// This backend binds the encryption context into the wrapping as AEAD
-    /// associated data ([`Self::transit_encrypt`]), and Vault's `transit/rewrap`
-    /// endpoint accepts no `associated_data` parameter — the only way to move
-    /// such a ciphertext onto a newer version is `transit/decrypt` followed by
-    /// `transit/encrypt`, which materializes the plaintext data key inside
-    /// RustFS. That trade is refused here rather than made silently: it would
-    /// hand back a valid envelope while dropping the very property that makes a
-    /// backend-side rewrap worth having. Every object-level envelope carries a
-    /// bucket/object context, so in practice this rejects them all until the
-    /// context binding or the endpoint changes.
+    /// Envelopes that bind their context as AEAD associated data
+    /// ([`Self::transit_encrypt`]) cannot use that endpoint — Vault's
+    /// `transit/rewrap` accepts no `associated_data` parameter — so they move
+    /// via `transit/decrypt` followed by `transit/encrypt`, both carrying the
+    /// context. On that route the plaintext data key exists in this process
+    /// for exactly the length of the re-encrypt call, is zeroized immediately,
+    /// and is never persisted, logged or returned — within the trait contract,
+    /// and the same in-memory exposure every decrypt of the envelope already
+    /// has. The no-op case is answered against Vault's latest key version
+    /// before anything is decrypted, so a converged sweep re-run materializes
+    /// nothing.
     ///
     /// The context guard still runs first, so a caller that cannot reproduce the
-    /// envelope's context is told that rather than being told about the AAD
-    /// limitation of an envelope it has no claim on.
+    /// envelope's context is told that rather than anything about an envelope it
+    /// has no claim on.
     pub(crate) async fn rewrap_data_key(&self, request: &RewrapDataKeyRequest) -> Result<RewrapDataKeyResponse> {
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
             .map_err(|e| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {e}")))?;
@@ -1112,23 +1110,61 @@ impl VaultTransitKmsClient {
         self.ensure_key_state_allows(&envelope.master_key_id, StateGatedOperation::Encrypt)
             .await?;
 
-        if !envelope.encryption_context.is_empty() {
-            return Err(KmsError::rewrap_would_expose_plaintext(
-                &envelope.master_key_id,
-                "the envelope binds its encryption context as AEAD associated data, which Vault Transit's rewrap endpoint \
-                 cannot carry; rewrapping it would require decrypting the data key inside RustFS",
-            ));
-        }
-
         let source_ciphertext = std::str::from_utf8(&envelope.encrypted_key)
             .map_err(|e| KmsError::cryptographic_error("utf8", format!("Invalid Transit ciphertext: {e}")))?;
         let source_key_version = transit_ciphertext_version(source_ciphertext);
 
-        let rewrapped_ciphertext = match self.transit_rewrap(&envelope.master_key_id, source_ciphertext).await {
-            Ok(ciphertext) => ciphertext,
-            Err(error) => {
-                self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
-                return Err(error);
+        let rewrapped_ciphertext = if envelope.encryption_context.is_empty() {
+            match self.transit_rewrap(&envelope.master_key_id, source_ciphertext).await {
+                Ok(ciphertext) => ciphertext,
+                Err(error) => {
+                    self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            // Context-bound route. Most envelopes a sweep re-visits are already
+            // current: answer those from the key record alone, before any
+            // plaintext exists.
+            let latest = match self.latest_transit_key_version(&envelope.master_key_id).await {
+                Ok(latest) => latest,
+                Err(error) => {
+                    self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
+                    return Err(error);
+                }
+            };
+            if source_key_version.is_some() && source_key_version == latest {
+                return Ok(RewrapDataKeyResponse {
+                    ciphertext: request.ciphertext.clone(),
+                    key_id: envelope.master_key_id,
+                    source_key_version,
+                    destination_key_version: latest,
+                    rewrapped: false,
+                });
+            }
+
+            let mut plaintext_key = match self
+                .transit_decrypt(&envelope.master_key_id, source_ciphertext, &envelope.encryption_context)
+                .await
+            {
+                Ok(plaintext) => plaintext,
+                Err(error) => {
+                    self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
+                    return Err(error);
+                }
+            };
+            // Zeroize before the error branch: the plaintext's lifetime must not
+            // extend into error handling.
+            let reencrypted = self
+                .transit_encrypt(&envelope.master_key_id, &plaintext_key, &envelope.encryption_context)
+                .await;
+            plaintext_key.zeroize();
+            match reencrypted {
+                Ok(ciphertext) => ciphertext,
+                Err(error) => {
+                    self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
+                    return Err(error);
+                }
             }
         };
         let destination_key_version = transit_ciphertext_version(&rewrapped_ciphertext);
@@ -1494,16 +1530,14 @@ impl VaultTransitKmsBackend {
 
         let vault_config = match &config.backend_config {
             crate::config::BackendConfig::VaultTransit(vault_config) => (**vault_config).clone(),
-            crate::config::BackendConfig::VaultKv2(vault_config) => VaultTransitConfig {
-                address: vault_config.address.clone(),
-                auth_method: vault_config.auth_method.clone(),
-                namespace: vault_config.namespace.clone(),
-                mount_path: vault_config.mount_path.clone(),
-                metadata_kv_mount: vault_config.kv_mount.clone(),
-                metadata_key_prefix: vault_config.key_path_prefix.clone(),
-                tls: vault_config.tls.clone(),
-            },
-            crate::config::BackendConfig::Local(_)
+            // Deriving a Transit configuration from a KV2 one used to be
+            // accepted here, silently reinterpreting KV2's deprecated
+            // `mount_path` as the Transit engine mount and its key storage as
+            // the metadata location — a mount mismatch that surfaces as
+            // confusing Vault 404s long after configuration time. A KV2
+            // configuration reaching this constructor is a wiring bug; name it.
+            crate::config::BackendConfig::VaultKv2(_)
+            | crate::config::BackendConfig::Local(_)
             | crate::config::BackendConfig::Static(_)
             | crate::config::BackendConfig::Aws(_) => {
                 return Err(KmsError::configuration_error("Expected Vault Transit backend configuration"));
@@ -1769,11 +1803,10 @@ impl KmsBackend for VaultTransitKmsBackend {
     fn capabilities(&self) -> BackendCapabilities {
         // Vault Transit natively supports version-retaining rotation, keeps
         // prior versions addressable for decryption, and allows physical
-        // deletion once a key is pending deletion. Rewrap is advertised because
-        // the endpoint exists and works; envelopes whose encryption context is
-        // bound as associated data are still refused per envelope (see
-        // `VaultTransitKmsClient::rewrap_data_key`), which is a property of the
-        // envelope rather than of the backend.
+        // deletion once a key is pending deletion. Rewrap covers every envelope:
+        // context-free ones via Vault's native rewrap endpoint, context-bound
+        // ones via decrypt + re-encrypt with the associated data carried on
+        // both calls (see `VaultTransitKmsClient::rewrap_data_key`).
         BackendCapabilities::minimal()
             .with_rotate(true)
             .with_enable_disable(true)
@@ -3191,18 +3224,84 @@ mod tests {
     }
 
     /// Vault's `transit/rewrap` endpoint takes no `associated_data` parameter,
-    /// and this backend binds the encryption context as exactly that. The only
-    /// remaining route would decrypt the data key inside RustFS, so the request
-    /// is refused rather than silently downgraded — and refused without any call
-    /// to Vault at all.
+    /// and this backend binds the encryption context as exactly that — so a
+    /// context-bound envelope moves via decrypt + re-encrypt, with the
+    /// associated data carried on both calls. The no-op case is answered from
+    /// the key record alone, so a converged sweep never materializes a
+    /// plaintext data key.
     #[tokio::test]
-    async fn wired_transit_rewrap_refuses_an_aad_bound_envelope() {
+    async fn wired_transit_rewrap_moves_an_aad_bound_envelope_via_decrypt_reencrypt() {
+        const RECOVERED_DEK: [u8; 32] = [0x59u8; 32];
+        let context = HashMap::from([("bucket".to_string(), "photos/cat.jpg".to_string())]);
+        let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
+        let (vault, client) = scripted_client(vec![
+            // generate_data_key: metadata state gate, then the transit encrypt.
+            ScriptedResponse::ok(metadata_read_data(&metadata)),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
+            // rewrap, context-bound route: latest-version read, then decrypt,
+            // then re-encrypt under the newest version.
+            ScriptedResponse::ok(transit_key_read_data_up_to("wired-key", 2)),
+            ScriptedResponse::ok(serde_json::json!({ "plaintext": BASE64.encode(RECOVERED_DEK) })),
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v2:rewrapped" })),
+        ])
+        .await;
+
+        let data_key = client
+            .generate_data_key(&wired_key_request(context.clone()), None)
+            .await
+            .expect("generate_data_key must produce an envelope");
+
+        let response = client
+            .rewrap_data_key(&RewrapDataKeyRequest {
+                ciphertext: data_key.ciphertext.clone(),
+                encryption_context: context.clone(),
+            })
+            .await
+            .expect("a context-bound envelope must rewrap via decrypt + re-encrypt");
+        assert!(response.rewrapped);
+        assert_eq!(response.source_key_version, Some(1));
+        assert_eq!(response.destination_key_version, Some(2));
+
+        let original: DataKeyEnvelope = serde_json::from_slice(&data_key.ciphertext).expect("envelope must parse");
+        let rewrapped: DataKeyEnvelope = serde_json::from_slice(&response.ciphertext).expect("rewrapped envelope must parse");
+        assert_eq!(rewrapped.encrypted_key, b"vault:v2:rewrapped".to_vec());
+        assert_eq!(rewrapped.encryption_context, original.encryption_context);
+        assert_eq!(rewrapped.key_id, original.key_id);
+        assert_eq!(rewrapped.created_at, original.created_at);
+
+        let requests = vault.requests();
+        assert_eq!(requests[2], "GET /v1/transit/keys/wired-key", "{requests:?}");
+        assert_eq!(requests[3], "POST /v1/transit/decrypt/wired-key", "{requests:?}");
+        assert_eq!(requests[4], "POST /v1/transit/encrypt/wired-key", "{requests:?}");
+        assert!(
+            !requests.iter().any(|request| request.contains("/transit/rewrap/")),
+            "the native endpoint cannot carry the associated data: {requests:?}"
+        );
+        // Dropping the associated data on either call would silently unbind the
+        // context; both bodies must carry it.
+        let bodies = vault.request_bodies();
+        for index in [3usize, 4] {
+            let body: serde_json::Value = serde_json::from_str(&bodies[index]).expect("request body must be JSON");
+            assert!(
+                body.get("associated_data")
+                    .is_some_and(|aad| !aad.as_str().unwrap_or("").is_empty()),
+                "request {index} must carry the associated data: {body}"
+            );
+        }
+    }
+
+    /// The converged case of the context-bound route: an envelope already on
+    /// Vault's latest version is answered from the key record alone — no
+    /// decrypt is issued, no plaintext exists, and the input comes back byte
+    /// for byte so a sweep re-run performs no writes.
+    #[tokio::test]
+    async fn wired_transit_rewrap_of_a_current_bound_envelope_never_decrypts() {
         let context = HashMap::from([("bucket".to_string(), "photos/cat.jpg".to_string())]);
         let metadata = TransitKeyMetadata::from_create_request(&CreateKeyRequest::default());
         let (vault, client) = scripted_client(vec![
             ScriptedResponse::ok(metadata_read_data(&metadata)),
-            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v1:scripted" })),
-            // Only the read-only accessor below is allowed to consume this.
+            ScriptedResponse::ok(serde_json::json!({ "ciphertext": "vault:v2:scripted" })),
+            // rewrap: only the latest-version read.
             ScriptedResponse::ok(transit_key_read_data_up_to("wired-key", 2)),
         ])
         .await;
@@ -3212,42 +3311,24 @@ mod tests {
             .await
             .expect("generate_data_key must produce an envelope");
 
-        let error = client
+        let response = client
             .rewrap_data_key(&RewrapDataKeyRequest {
-                ciphertext: data_key.ciphertext.clone(),
-                encryption_context: context.clone(),
-            })
-            .await
-            .expect_err("an AAD-bound envelope must not be rewrapped by decrypting it here");
-        assert!(
-            matches!(&error, KmsError::RewrapWouldExposePlaintext { key_id, .. } if key_id == "wired-key"),
-            "got {error:?}"
-        );
-
-        // The stuck envelope must still be countable, or an inventory could not
-        // report how much of the key version is unmigratable.
-        let described = client
-            .describe_data_key_wrapping(&DescribeDataKeyWrappingRequest {
                 ciphertext: data_key.ciphertext.clone(),
                 encryption_context: context,
             })
             .await
-            .expect("describing the wrapping must work even when rewrapping it cannot");
-        assert_eq!(described.key_version, Some(1));
-        assert_eq!(described.current_key_version, Some(2));
-        assert!(!described.is_current);
+            .expect("an already-current bound envelope must be a no-op");
+        assert!(!response.rewrapped);
+        assert_eq!(response.ciphertext, data_key.ciphertext, "a no-op must hand the input back unchanged");
+        assert_eq!(response.source_key_version, Some(2));
+        assert_eq!(response.destination_key_version, Some(2));
 
         let requests = vault.requests();
         assert!(
-            !requests.iter().any(|request| request.contains("/transit/rewrap/")),
-            "the refusal must happen before any rewrap call: {requests:?}"
-        );
-        assert!(
             !requests.iter().any(|request| request.contains("/transit/decrypt/")),
-            "and above all before any decrypt: {requests:?}"
+            "the no-op must not materialize any plaintext: {requests:?}"
         );
     }
-
     /// The current version comes from Vault's own key record rather than from
     /// the RustFS metadata counter, which only advances on rotations this
     /// process performed.
