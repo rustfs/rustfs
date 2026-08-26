@@ -195,8 +195,8 @@ fn heal_control_remaining(expires_at_unix_ms: i64, now_unix_ms: i64) -> Result<D
     Ok(Duration::from_millis(remaining_ms))
 }
 
-fn validate_admin_heal_control_start(request: &rustfs_common::heal_channel::HealChannelRequest) -> Result<(), Status> {
-    if request.source != rustfs_common::heal_channel::HealRequestSource::Admin {
+fn validate_admin_heal_control_start(request: &rustfs_heal_contracts::heal_channel::HealChannelRequest) -> Result<(), Status> {
+    if request.source != rustfs_heal_contracts::heal_channel::HealRequestSource::Admin {
         return Err(Status::permission_denied("heal control start source must be admin"));
     }
     if request.pool_index.is_some() != request.set_index.is_some() {
@@ -2542,7 +2542,7 @@ mod tests {
             _bucket: &str,
             _object: &str,
             _version_id: Option<&str>,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
@@ -2550,7 +2550,7 @@ mod tests {
         async fn heal_bucket(
             &self,
             _bucket: &str,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> rustfs_heal::Result<rustfs_madmin::heal_commands::HealResultItem> {
             Ok(rustfs_madmin::heal_commands::HealResultItem::default())
         }
@@ -2618,10 +2618,14 @@ mod tests {
         let now = i64::try_from(now).expect("test clock should fit in i64");
         let metadata = || rustfs_protos::heal_control::RequestMetadata::new(rand::random(), now, now + 30_000, coordinator_epoch);
         let start = |request_id: String| {
-            let mut request =
-                rustfs_common::heal_channel::create_heal_request("bucket".to_string(), Some("prefix".to_string()), false, None);
+            let mut request = rustfs_heal_contracts::heal_channel::create_heal_request(
+                "bucket".to_string(),
+                Some("prefix".to_string()),
+                false,
+                None,
+            );
             request.id = request_id;
-            request.source = rustfs_common::heal_channel::HealRequestSource::Admin;
+            request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Admin;
             request
         };
 
@@ -3618,7 +3622,7 @@ mod tests {
             request
         }
 
-        let expired_request = rustfs_common::heal_channel::create_heal_request("bucket".to_string(), None, false, None);
+        let expired_request = rustfs_heal_contracts::heal_channel::create_heal_request("bucket".to_string(), None, false, None);
         let expired = rustfs_protos::heal_control::Envelope::start(
             expired_request,
             rustfs_protos::heal_control::RequestMetadata::new([1; 16], 1, 2, coordinator_epoch),
@@ -3631,8 +3635,9 @@ mod tests {
             .expect_err("expired commands must fail before admission");
         assert_eq!(expired.code(), tonic::Code::FailedPrecondition);
 
-        let mut non_admin_request = rustfs_common::heal_channel::create_heal_request("bucket".to_string(), None, false, None);
-        non_admin_request.source = rustfs_common::heal_channel::HealRequestSource::Scanner;
+        let mut non_admin_request =
+            rustfs_heal_contracts::heal_channel::create_heal_request("bucket".to_string(), None, false, None);
+        non_admin_request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Scanner;
         let now = OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
         let now = i64::try_from(now).expect("test clock should fit in i64");
         let non_admin = rustfs_protos::heal_control::Envelope::start(

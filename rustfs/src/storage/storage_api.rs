@@ -1545,7 +1545,7 @@ pub(crate) trait StoragePeerS3ClientExt {
     async fn heal_bucket_with_fence(
         &self,
         bucket: &str,
-        opts: &rustfs_common::heal_channel::HealOpts,
+        opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         fenced_pools: &[usize],
     ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem>;
     async fn make_bucket(&self, bucket: &str, opts: &contract::bucket::MakeBucketOptions) -> DiskResult<()>;
@@ -1562,7 +1562,7 @@ impl StoragePeerS3ClientExt for LocalPeerS3Client {
     async fn heal_bucket_with_fence(
         &self,
         bucket: &str,
-        opts: &rustfs_common::heal_channel::HealOpts,
+        opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         fenced_pools: &[usize],
     ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem> {
         ecstore_rpc::PeerS3Client::heal_bucket_with_fence(self, bucket, opts, fenced_pools).await
