@@ -424,9 +424,32 @@ jobs:
       #     noncurrent transition/expiry after an immediate compensation transition.
       - name: Run ignored ILM integration tests serially
         run: |
-          cargo nextest run -j1 --run-ignored ignored-only \
+          mkdir -p artifacts/ilm-integration
+          set +e
+          NEXTEST_HIDE_PROGRESS_BAR=1 timeout --verbose --signal=TERM --kill-after=30s 80m \
+            cargo nextest run -j1 --run-ignored ignored-only \
             -p rustfs-scanner -p rustfs \
-            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition))'
+            -E '(binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))) and not (test(test_noncurrent_expiry_still_works_after_immediate_compensation_transition) or test(test_noncurrent_transition_still_works_after_immediate_compensation_transition))' \
+            --status-level all --final-status-level all \
+            2>&1 | tee artifacts/ilm-integration/nextest.log
+          status=${PIPESTATUS[0]}
+          {
+            echo "exit_status=${status}"
+            echo "finished_at=$(date --utc --iso-8601=seconds)"
+            echo
+            echo "Remaining test-related processes:"
+            pgrep -af 'cargo|nextest|target/.*/deps/' || true
+          } > artifacts/ilm-integration/diagnostics.txt
+          exit "${status}"
+
+      - name: Upload ILM test diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ilm-integration-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            artifacts/ilm-integration
+            target/nextest/ci/junit.xml
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
