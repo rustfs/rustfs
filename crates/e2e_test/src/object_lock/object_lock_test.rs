@@ -92,14 +92,29 @@ where
     );
 }
 
-fn assert_invalid_object_lock_retention_pair<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) {
-    let err = match result {
-        Ok(_) => panic!("{context}"),
-        Err(err) => format!("{err:?}"),
-    };
-    assert!(
-        err.contains("InvalidRequest") || err.contains("must both be supplied"),
-        "{context}: expected invalid paired retention headers, got: {err}"
+fn assert_invalid_object_lock_retention_pair<T, E, R>(result: Result<T, R>, context: &str)
+where
+    T: std::fmt::Debug,
+    E: ProvideErrorMetadata + std::fmt::Debug,
+    R: Borrow<SdkError<E>> + std::fmt::Debug,
+{
+    let error = result.expect_err(context);
+    let sdk_error = error.borrow();
+    assert_eq!(
+        sdk_error.raw_response().map(|response| response.status().as_u16()),
+        Some(400),
+        "{context}: expected HTTP 400, got: {error:?}"
+    );
+    let service_error = sdk_error.as_service_error().expect("expected an S3 service error");
+    assert_eq!(
+        service_error.code(),
+        Some("InvalidRequest"),
+        "{context}: expected InvalidRequest, got: {error:?}"
+    );
+    assert_eq!(
+        service_error.message(),
+        Some("x-amz-object-lock-retain-until-date and x-amz-object-lock-mode must both be supplied"),
+        "{context}: unexpected error message: {error:?}"
     );
 }
 
@@ -2304,9 +2319,9 @@ async fn test_versioning_auto_enabled_with_object_lock() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_error_message_distinguishes_legal_hold_from_retention() {
+async fn test_legal_hold_and_retention_delete_errors_are_exact_and_non_mutating() {
     init_logging();
-    info!("🧪 Test: Error messages distinguish Legal Hold from Retention");
+    info!("🧪 Test: Legal Hold and Retention reject deletes without mutating objects");
 
     let mut env = ObjectLockTestEnvironment::new().await.unwrap();
     env.start_rustfs().await.unwrap();
@@ -2331,7 +2346,6 @@ async fn test_error_message_distinguishes_legal_hold_from_retention() {
             .await
             .unwrap();
 
-    // Delete legal hold object - check error
     let lh_delete_result = client
         .delete_object()
         .bucket(bucket)
@@ -2339,18 +2353,8 @@ async fn test_error_message_distinguishes_legal_hold_from_retention() {
         .version_id(&lh_version)
         .send()
         .await;
+    assert_access_denied(lh_delete_result, "Legal Hold must reject deleting the protected version");
 
-    if let Err(e) = lh_delete_result {
-        let error_str = format!("{:?}", e);
-        info!("Legal hold delete error: {}", error_str);
-        // Error should mention legal hold
-        assert!(
-            error_str.to_lowercase().contains("legal") || error_str.to_lowercase().contains("hold"),
-            "Error should mention legal hold"
-        );
-    }
-
-    // Delete retention object - check error
     let ret_delete_result = client
         .delete_object()
         .bucket(bucket)
@@ -2358,16 +2362,24 @@ async fn test_error_message_distinguishes_legal_hold_from_retention() {
         .version_id(&ret_version)
         .send()
         .await;
+    assert_access_denied(ret_delete_result, "COMPLIANCE retention must reject deleting the protected version");
 
-    if let Err(e) = ret_delete_result {
-        let error_str = format!("{:?}", e);
-        info!("Retention delete error: {}", error_str);
-        // Error should mention retention
-        assert!(
-            error_str.to_lowercase().contains("retention") || error_str.to_lowercase().contains("compliance"),
-            "Error should mention retention"
-        );
+    for (key, version_id) in [(legal_hold_key, &lh_version), (retention_key, &ret_version)] {
+        let body = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await
+            .expect("rejected delete must leave the protected version readable")
+            .body
+            .collect()
+            .await
+            .expect("protected version body should remain readable")
+            .into_bytes();
+        assert_eq!(body.as_ref(), b"data", "rejected delete mutated protected object {key}");
     }
 
-    info!("✅ Test passed: Error messages distinguish lock types");
+    info!("✅ Test passed: protected deletes are exact and non-mutating");
 }

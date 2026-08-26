@@ -63,6 +63,12 @@ pub async fn test_store_with_persisted_rebalance_meta(
 ) -> (Vec<tempfile::TempDir>, std::sync::Arc<crate::store::ECStore>) {
     let ctx = std::sync::Arc::new(crate::runtime::instance::InstanceContext::new());
     let (temp_dirs, pool) = crate::core::sets::make_local_two_set_sets_with_ctx(ctx.clone()).await;
+    let pools = vec![pool.clone()];
+    let pool_meta = crate::core::pools::PoolMeta::new(&pools, &crate::core::pools::PoolMeta::default());
+    pool_meta
+        .save_for_startup(pools.clone())
+        .await
+        .expect("rebalance test pool metadata should be persisted");
     meta.save(pool.clone())
         .await
         .expect("rebalance test metadata should be persisted");
@@ -70,9 +76,9 @@ pub async fn test_store_with_persisted_rebalance_meta(
     let store = std::sync::Arc::new(crate::store::ECStore {
         id: uuid::Uuid::new_v4(),
         disk_map: std::collections::HashMap::new(),
-        pools: vec![pool],
+        pools,
         peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, ctx.clone()),
-        pool_meta: tokio::sync::RwLock::new(crate::core::pools::PoolMeta::default()),
+        pool_meta: tokio::sync::RwLock::new(pool_meta),
         rebalance_meta: tokio::sync::RwLock::new(Some(meta)),
         decommission_cancelers: tokio::sync::RwLock::new(vec![None]),
         start_gate: tokio::sync::Mutex::new(()),
@@ -139,7 +145,7 @@ async fn test_two_pool_stores_with_contexts(
     }
     let pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
     pool_meta
-        .save(pools.clone())
+        .save_for_startup(pools.clone())
         .await
         .expect("baseline pool metadata should be persisted");
     if let Some(meta) = rebalance_meta.as_ref() {
