@@ -14693,10 +14693,26 @@ mod tests {
         let source_pool = 0;
         let target_pool = 1;
 
-        // Stage the relocated data before the GET, but publish xl.meta only
-        // after the initial reader opens. This mirrors rebalance's data-first,
-        // metadata-last ordering and guarantees the first reader uses the
-        // source pool while its later parts are already unavailable.
+        let input = GetObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("multi-pool resume GET input must build");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let mut response = usecase
+            .execute_get_object(build_request(input, Method::GET))
+            .await
+            .expect("multi-pool GET must commit its response");
+        let mut response_body = response
+            .output
+            .body
+            .take()
+            .expect("multi-pool GET response must include a body");
+
+        // Open the source reader before exposing a metadata-less target object.
+        // Keeping that partial target across the async GET lets background
+        // storage maintenance reclaim it as residue and makes publication race
+        // with ENOENT instead of exercising resume.
         for (source_disk, target_disk) in pool_disk_paths[source_pool].iter().zip(&pool_disk_paths[target_pool]) {
             let source_dir = source_disk.join(&bucket).join(object);
             let target_dir = target_disk.join(&bucket).join(object);
@@ -14717,21 +14733,6 @@ mod tests {
         let deleted = delete_object_part_shards(&pool_disk_paths[source_pool], &bucket, object, &[2, 3]);
         assert_eq!(deleted, pool_disk_paths[source_pool].len() * 2);
 
-        let input = GetObjectInput::builder()
-            .bucket(bucket.clone())
-            .key(object.to_string())
-            .build()
-            .expect("multi-pool resume GET input must build");
-        let usecase = DefaultObjectUsecase::with_context(Some(context));
-        let mut response = usecase
-            .execute_get_object(build_request(input, Method::GET))
-            .await
-            .expect("multi-pool GET must commit its response");
-        let mut response_body = response
-            .output
-            .body
-            .take()
-            .expect("multi-pool GET response must include a body");
         for (source_disk, target_disk) in pool_disk_paths[source_pool].iter().zip(&pool_disk_paths[target_pool]) {
             let source_meta = source_disk.join(&bucket).join(object).join("xl.meta");
             std::fs::copy(&source_meta, target_disk.join(&bucket).join(object).join("xl.meta"))

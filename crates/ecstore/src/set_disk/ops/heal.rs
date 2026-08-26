@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::super::*;
+use crate::disk::DataDirDeleteStatus;
 use crate::disk::disk_store::DiskStoreRenameDataExt;
+use crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX;
 use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
@@ -170,6 +172,21 @@ struct RecoverableMetaCandidate {
 enum DanglingDeleteSafety {
     UnsafeToDelete,
     NoRecoverableCandidate,
+}
+
+#[derive(Debug, Default)]
+struct MetadataLessDataDirCleanup {
+    matched: usize,
+    removed: usize,
+    first_error: Option<DiskError>,
+    delete_errs: Vec<Option<DiskError>>,
+    touched_disks: Vec<bool>,
+}
+
+fn metadata_less_part_file(entry: &str) -> bool {
+    entry
+        .strip_prefix("part.")
+        .is_some_and(|part_number| part_number.parse::<usize>().is_ok_and(|part_number| part_number > 0))
 }
 
 #[cfg(test)]
@@ -504,6 +521,21 @@ impl SetDisks {
             } else {
                 DiskError::FileNotFound
             };
+            if version_id.is_empty()
+                && (opts.remove || opts.dry_run)
+                && let Some(cleanup) = self
+                    .cleanup_metadata_less_data_dirs(bucket, object, &disks, opts.dry_run)
+                    .await?
+            {
+                let mut result = self
+                    .metadata_less_data_dir_heal_result(bucket, object, &cleanup, opts.dry_run)
+                    .await;
+                result.detail = format!(
+                    "metadata-less data directories matched={}, removed={}, dry_run={}",
+                    cleanup.matched, cleanup.removed, opts.dry_run
+                );
+                return Ok((result, cleanup.first_error.or(Some(err))));
+            }
             // Nothing to do, file is already gone.
             return Ok((
                 self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
@@ -1480,6 +1512,183 @@ impl SetDisks {
         }
     }
 
+    async fn cleanup_metadata_less_data_dirs(
+        &self,
+        bucket: &str,
+        object: &str,
+        disks: &[Option<DiskStore>],
+        dry_run: bool,
+    ) -> disk::error::Result<Option<MetadataLessDataDirCleanup>> {
+        if disks.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+
+        let mut per_disk_dirs = Vec::new();
+        for (disk_index, disk) in disks.iter().enumerate() {
+            let Some(disk) = disk.as_ref() else {
+                return Ok(None);
+            };
+            let entries = match disk.list_dir("", bucket, object, -1).await {
+                Ok(entries) => entries,
+                Err(
+                    DiskError::FileNotFound
+                    | DiskError::FileVersionNotFound
+                    | DiskError::PathNotFound
+                    | DiskError::VolumeNotFound,
+                ) => continue,
+                Err(err) => return Err(err),
+            };
+            for entry in entries {
+                let data_dir = entry.trim_end_matches(SLASH_SEPARATOR);
+                if !entry.ends_with(SLASH_SEPARATOR) || Uuid::parse_str(data_dir).is_err() {
+                    return Ok(None);
+                }
+                let data_dir_path = format!("{object}{SLASH_SEPARATOR}{data_dir}");
+                if !Self::metadata_less_data_dir_is_reclaimable(disk, bucket, &data_dir_path).await? {
+                    return Ok(None);
+                }
+                per_disk_dirs.push((disk_index, data_dir_path));
+            }
+        }
+
+        let matched = per_disk_dirs.len();
+        if matched == 0 {
+            return Ok(None);
+        }
+
+        let mut cleanup = MetadataLessDataDirCleanup {
+            matched,
+            delete_errs: vec![None; disks.len()],
+            touched_disks: vec![false; disks.len()],
+            ..Default::default()
+        };
+        for (disk_index, _) in &per_disk_dirs {
+            cleanup.touched_disks[*disk_index] = true;
+        }
+
+        if dry_run {
+            return Ok(Some(cleanup));
+        }
+
+        for (disk_index, data_dir_path) in per_disk_dirs {
+            let Some(disk) = disks[disk_index].as_ref() else {
+                return Ok(None);
+            };
+            match disk
+                .delete_data_dir(
+                    bucket,
+                    &data_dir_path,
+                    DeleteOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(DataDirDeleteStatus::Deleted) => {
+                    cleanup.removed = cleanup.removed.saturating_add(1);
+                }
+                Ok(DataDirDeleteStatus::Deferred) => {
+                    let err = DiskError::FileAccessDenied;
+                    cleanup.first_error.get_or_insert_with(|| err.clone());
+                    cleanup.delete_errs[disk_index] = Some(err);
+                }
+                Err(DiskError::FileNotFound | DiskError::PathNotFound | DiskError::VolumeNotFound) => {
+                    cleanup.removed = cleanup.removed.saturating_add(1);
+                }
+                Err(err) => {
+                    cleanup.first_error.get_or_insert_with(|| err.clone());
+                    cleanup.delete_errs[disk_index] = Some(err);
+                }
+            }
+        }
+
+        Ok(Some(cleanup))
+    }
+
+    async fn metadata_less_data_dir_is_reclaimable(
+        disk: &DiskStore,
+        bucket: &str,
+        data_dir_path: &str,
+    ) -> disk::error::Result<bool> {
+        let entries = match disk.list_dir("", bucket, data_dir_path, -1).await {
+            Ok(entries) => entries,
+            Err(
+                DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::PathNotFound | DiskError::VolumeNotFound,
+            ) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+
+        let mut has_part = false;
+        for entry in entries {
+            if entry.ends_with(SLASH_SEPARATOR) {
+                return Ok(false);
+            }
+            let entry_name = entry.trim_end_matches(SLASH_SEPARATOR);
+            if metadata_less_part_file(entry_name) {
+                has_part = true;
+                continue;
+            }
+            if entry_name
+                .strip_prefix(DELETE_DATA_DIR_MARKER_PREFIX)
+                .is_some_and(|transaction| Uuid::parse_str(transaction).is_ok())
+            {
+                continue;
+            }
+            return Ok(false);
+        }
+
+        Ok(has_part)
+    }
+
+    async fn metadata_less_data_dir_heal_result(
+        &self,
+        bucket: &str,
+        object: &str,
+        cleanup: &MetadataLessDataDirCleanup,
+        dry_run: bool,
+    ) -> HealResultItem {
+        let mut result = HealResultItem {
+            heal_item_type: HealItemType::Object.to_string(),
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            disk_count: self.set_endpoints.len(),
+            parity_blocks: self.default_parity_count,
+            data_blocks: self.set_endpoints.len().saturating_sub(self.default_parity_count),
+            ..Default::default()
+        };
+        result.before.drives = Vec::with_capacity(self.set_endpoints.len());
+        result.after.drives = Vec::with_capacity(self.set_endpoints.len());
+        for (index, drive) in self.set_endpoints.iter().enumerate() {
+            let endpoint = drive.to_string();
+            let before_state = if cleanup.touched_disks.get(index).copied().unwrap_or(false) {
+                DriveState::Corrupt.to_string()
+            } else {
+                DriveState::Missing.to_string()
+            };
+            let after_state = if dry_run {
+                before_state.clone()
+            } else {
+                match cleanup.delete_errs.get(index).and_then(Option::as_ref) {
+                    None => DriveState::Missing.to_string(),
+                    Some(DiskError::DiskNotFound) => DriveState::Offline.to_string(),
+                    Some(_) => DriveState::Corrupt.to_string(),
+                }
+            };
+            result.before.drives.push(HealDriveInfo {
+                uuid: String::new(),
+                endpoint: endpoint.clone(),
+                state: before_state,
+            });
+            result.after.drives.push(HealDriveInfo {
+                uuid: String::new(),
+                endpoint,
+                state: after_state,
+            });
+        }
+        result
+    }
+
     /// Prevent dangling cleanup when surviving state cannot prove that deletion
     /// is safe. Part presence proves only recoverability, never commit: the write
     /// path can durably rename data before xl.meta is committed.
@@ -1825,11 +2034,24 @@ impl SetDisks {
 }
 
 impl SetDisks {
+    #[cfg(test)]
     pub(crate) async fn heal_replacement_format(
         &self,
         dry_run: bool,
         targets: &[String],
     ) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_replacement_format_with_fence(dry_run, targets, || false).await
+    }
+
+    pub(crate) async fn heal_replacement_format_with_fence<F>(
+        &self,
+        dry_run: bool,
+        targets: &[String],
+        fence_lost: F,
+    ) -> Result<(HealResultItem, Option<Error>)>
+    where
+        F: FnMut() -> bool + Send,
+    {
         if targets.is_empty() {
             return Err(Error::other("replacement format requires at least one target"));
         }
@@ -1845,14 +2067,18 @@ impl SetDisks {
             target_slots.push(slot);
         }
 
-        self.heal_format_for_slots(dry_run, Some(&target_slots)).await
+        self.heal_format_for_slots(dry_run, Some(&target_slots), fence_lost).await
     }
 
-    async fn heal_format_for_slots(
+    async fn heal_format_for_slots<F>(
         &self,
         dry_run: bool,
         target_slots: Option<&[usize]>,
-    ) -> Result<(HealResultItem, Option<Error>)> {
+        mut fence_lost: F,
+    ) -> Result<(HealResultItem, Option<Error>)>
+    where
+        F: FnMut() -> bool + Send,
+    {
         let disks = self.disks.read().await.clone();
         let (formats, errs) = load_format_erasure_all(&disks, true).await;
         if errs.iter().any(|err| {
@@ -1922,8 +2148,14 @@ impl SetDisks {
 
                 let mut new_format = ref_format.clone();
                 new_format.erasure.this = ref_format.erasure.sets[self.set_index][disk_idx];
+                if fence_lost() {
+                    return Ok((result, Some(StorageError::SlowDown)));
+                }
                 match save_format_file(&disks[disk_idx], &Some(new_format.clone())).await {
                     Ok(()) => {
+                        if fence_lost() {
+                            return Ok((result, Some(StorageError::SlowDown)));
+                        }
                         result.after.drives[disk_idx].uuid = new_format.erasure.this.to_string();
                         result.after.drives[disk_idx].state = DriveState::Ok.to_string();
                     }
@@ -1949,7 +2181,7 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-        self.heal_format_for_slots(dry_run, None).await
+        self.heal_format_for_slots(dry_run, None, || false).await
     }
 
     #[tracing::instrument(skip(self))]
@@ -2006,6 +2238,23 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
             } else {
                 Error::FileNotFound
             };
+            if version_id.is_empty()
+                && (opts.remove || opts.dry_run)
+                && let Some(cleanup) = self
+                    .cleanup_metadata_less_data_dirs(bucket, object, &disks, opts.dry_run)
+                    .await
+                    .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?
+            {
+                let mut result = self
+                    .metadata_less_data_dir_heal_result(bucket, object, &cleanup, opts.dry_run)
+                    .await;
+                result.detail = format!(
+                    "metadata-less data directories matched={}, removed={}, dry_run={}",
+                    cleanup.matched, cleanup.removed, opts.dry_run
+                );
+                let err = cleanup.first_error.map(Error::from).or(Some(err));
+                return Ok((result, err));
+            }
             return Ok((
                 self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
                     .await,
@@ -2118,11 +2367,12 @@ mod heal_result_report_tests {
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::format::FormatV3;
+    use crate::disk::local::RESERVED_DELETE_DATA_DIR_MARKER_PREFIX;
     use crate::disk::{DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, STORAGE_FORMAT_FILE, new_disk};
     use crate::error::Error;
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::set_disk::ops::object::hermetic_set_disks_support::hermetic_set_disks_isolated;
-    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::heal::HealOperations as _;
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use crate::{
@@ -2138,6 +2388,16 @@ mod heal_result_report_tests {
     use tokio::sync::RwLock;
     use tracing_subscriber::fmt::MakeWriter;
     use uuid::Uuid;
+
+    #[test]
+    fn metadata_less_part_file_accepts_positive_part_numbers_only() {
+        assert!(super::metadata_less_part_file("part.1"));
+        assert!(super::metadata_less_part_file("part.42"));
+        assert!(!super::metadata_less_part_file("part.0"));
+        assert!(!super::metadata_less_part_file("part."));
+        assert!(!super::metadata_less_part_file("part.x"));
+        assert!(!super::metadata_less_part_file("xl.meta"));
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogs {
@@ -2942,6 +3202,144 @@ mod heal_result_report_tests {
             temp_dirs[2].path().join(bucket).join(object).is_dir(),
             "failed delete must leave the dangling directory for retry"
         );
+    }
+
+    async fn write_metadata_less_data_dir(root: &std::path::Path, bucket: &str, object: &str, data_dir: Uuid) {
+        let data_dir_path = root.join(bucket).join(object).join(data_dir.to_string());
+        tokio::fs::create_dir_all(&data_dir_path)
+            .await
+            .expect("metadata-less data dir should be created");
+        tokio::fs::write(data_dir_path.join("part.1"), b"orphaned-shard")
+            .await
+            .expect("metadata-less part should be written");
+    }
+
+    #[tokio::test]
+    async fn heal_object_remove_reclaims_metadata_less_data_dirs() {
+        let bucket = "bucket-metadata-less-remove";
+        let object = "object.bin";
+        let mut temp_dirs = Vec::new();
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+        let mut data_dirs = Vec::new();
+        for _ in 0..2 {
+            let (temp_dir, endpoint, disk) = real_disk().await;
+            disk.make_volume(bucket).await.expect("test bucket should be created");
+            let data_dir = Uuid::new_v4();
+            write_metadata_less_data_dir(temp_dir.path(), bucket, object, data_dir).await;
+            data_dirs.push(data_dir);
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+        let set = set_disks_with(disks, endpoints, 1).await;
+
+        let (result, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    remove: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("metadata-less remove should complete");
+
+        assert_eq!(err, Some(DiskError::FileNotFound));
+        assert!(
+            result.detail.contains("matched=2, removed=2"),
+            "heal result should report reclaimed metadata-less dirs: {}",
+            result.detail
+        );
+        for (temp_dir, data_dir) in temp_dirs.iter().zip(data_dirs.iter()) {
+            assert!(
+                !temp_dir.path().join(bucket).join(object).join(data_dir.to_string()).exists(),
+                "metadata-less data dir should be removed"
+            );
+        }
+
+        set.delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("metadata-less data-dir cleanup should unblock non-force bucket deletion");
+    }
+
+    #[tokio::test]
+    async fn heal_object_remove_dry_run_reports_metadata_less_data_dirs_without_deleting() {
+        let bucket = "bucket-metadata-less-dry-run";
+        let object = "object.bin";
+        let (temp_dir, endpoint, disk) = real_disk().await;
+        disk.make_volume(bucket).await.expect("test bucket should be created");
+        let data_dir = Uuid::new_v4();
+        write_metadata_less_data_dir(temp_dir.path(), bucket, object, data_dir).await;
+        let set = set_disks_with(vec![Some(disk)], vec![endpoint], 0).await;
+
+        let (result, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    dry_run: true,
+                    remove: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("metadata-less dry-run should complete");
+
+        assert_eq!(err, Some(DiskError::FileNotFound));
+        assert!(
+            result.detail.contains("matched=1, removed=0, dry_run=true"),
+            "dry-run should report a match without deletion: {}",
+            result.detail
+        );
+        assert!(
+            temp_dir.path().join(bucket).join(object).join(data_dir.to_string()).exists(),
+            "dry-run must preserve metadata-less data dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_object_remove_preserves_metadata_less_data_dir_with_precommit_marker() {
+        let bucket = "bucket-metadata-less-precommit";
+        let object = "object.bin";
+        let (temp_dir, endpoint, disk) = real_disk().await;
+        disk.make_volume(bucket).await.expect("test bucket should be created");
+        let data_dir = Uuid::new_v4();
+        write_metadata_less_data_dir(temp_dir.path(), bucket, object, data_dir).await;
+        let data_dir_path = temp_dir.path().join(bucket).join(object).join(data_dir.to_string());
+        tokio::fs::write(
+            data_dir_path.join(format!("{}{}", RESERVED_DELETE_DATA_DIR_MARKER_PREFIX, Uuid::new_v4())),
+            [],
+        )
+        .await
+        .expect("pre-commit reservation marker should be written");
+        let set = set_disks_with(vec![Some(disk)], vec![endpoint], 0).await;
+
+        let (result, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    remove: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("metadata-less precommit state should fail closed");
+
+        assert_eq!(err, Some(DiskError::FileNotFound));
+        assert!(
+            result.detail.is_empty(),
+            "pre-commit residue must not be classified as reclaimable metadata-less data"
+        );
+        assert!(data_dir_path.exists(), "pre-commit residue must be preserved");
     }
 
     #[tokio::test]

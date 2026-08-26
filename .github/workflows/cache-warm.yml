@@ -212,6 +212,9 @@ jobs:
           install-build-packaging-tools: 'false'
 
       - name: Build ci-feat-rio superset
+        env:
+          # --all-targets links the same test binaries as the reader lane.
+          CARGO_BUILD_JOBS: "2"
         run: |
           cargo build -p rustfs -p rustfs-ecstore --all-targets --features rio-v2
           cargo build -p rustfs --bins --features rio-v2,e2e-test-hooks
@@ -240,6 +243,9 @@ jobs:
           install-build-packaging-tools: 'false'
 
       - name: Build ci-feat-proto superset
+        env:
+          # Avoid an unbounded burst of concurrent test-binary links (#5394).
+          CARGO_BUILD_JOBS: "2"
         run: |
           cargo build -p rustfs -p rustfs-protocols --all-targets --features swift
           cargo build -p rustfs -p rustfs-protocols --all-targets --features sftp

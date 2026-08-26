@@ -335,7 +335,7 @@ fn valid_payload(collector: OfflineCollector, value: &serde_json::Value) -> bool
                 && object.get("totalBytes").and_then(serde_json::Value::as_u64).is_some()
                 && object.get("underPressure").and_then(serde_json::Value::as_bool).is_some()
         }),
-        OfflineCollector::FilesystemSummary => value.as_array().is_some_and(ordered_strings),
+        OfflineCollector::FilesystemSummary => value.as_array().is_some_and(|values| ordered_strings(values)),
         OfflineCollector::NetworkSummary => value.as_object().is_some_and(|object| {
             object.len() == 2
                 && object.get("bondCount").and_then(serde_json::Value::as_u64).is_some()
@@ -902,7 +902,7 @@ mod tests {
         let moved = temp.path().join("moved");
         fs::create_dir(&original).expect("original output directory");
         let swapped_output = original.join("bundle.zip");
-        let swap_original = original.clone();
+        let swap_original = original;
         let swap_moved = moved.clone();
         test_support::set(
             Stage::BeforePublish,
@@ -933,7 +933,7 @@ mod tests {
         let moved = temp.path().join("publish-moved");
         fs::create_dir(&original).expect("original publish directory");
         let swapped_output = original.join("bundle.zip");
-        let swap_original = original.clone();
+        let swap_original = original;
         let swap_moved = moved.clone();
         test_support::set(
             Stage::Rename,
