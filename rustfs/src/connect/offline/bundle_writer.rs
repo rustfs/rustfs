@@ -335,7 +335,7 @@ fn valid_payload(collector: OfflineCollector, value: &serde_json::Value) -> bool
                 && object.get("totalBytes").and_then(serde_json::Value::as_u64).is_some()
                 && object.get("underPressure").and_then(serde_json::Value::as_bool).is_some()
         }),
-        OfflineCollector::FilesystemSummary => value.as_array().is_some_and(|values| ordered_strings(values)),
+        OfflineCollector::FilesystemSummary => value.as_array().is_some_and(|values| ordered_strings(values.as_slice())),
         OfflineCollector::NetworkSummary => value.as_object().is_some_and(|object| {
             object.len() == 2
                 && object.get("bondCount").and_then(serde_json::Value::as_u64).is_some()
