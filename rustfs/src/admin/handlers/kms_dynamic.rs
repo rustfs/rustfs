@@ -286,20 +286,20 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
         Ok(data) => {
             let (data, unseal_outcome) =
                 match open_persisted_kms_config(&data, rustfs_kms::config_secret::config_secret_from_env().as_deref()) {
-                Ok(opened) => opened,
-                Err(e) => {
-                    error!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_config_unseal_failed",
-                        storage_path = KMS_CONFIG_PATH,
-                        result = "config_unseal_failed",
-                        error = %e,
-                        "admin kms dynamic state"
-                    );
-                    return None;
-                }
-            };
+                    Ok(opened) => opened,
+                    Err(e) => {
+                        error!(
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_KMS,
+                            event = "kms_config_unseal_failed",
+                            storage_path = KMS_CONFIG_PATH,
+                            result = "config_unseal_failed",
+                            error = %e,
+                            "admin kms dynamic state"
+                        );
+                        return None;
+                    }
+                };
             if !unseal_outcome.plaintext.is_empty() {
                 warn!(
                     component = LOG_COMPONENT_ADMIN,
@@ -311,40 +311,40 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
                 );
             }
             match decode_persisted_kms_config(&data) {
-            Ok((config, is_legacy_local)) => {
-                if is_legacy_local {
-                    warn!(
+                Ok((config, is_legacy_local)) => {
+                    if is_legacy_local {
+                        warn!(
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_KMS,
+                            event = "kms_legacy_local_config_loaded",
+                            storage_path = KMS_CONFIG_PATH,
+                            state = "legacy_config_accepted",
+                            "admin kms dynamic state"
+                        );
+                    }
+                    info!(
                         component = LOG_COMPONENT_ADMIN,
                         subsystem = LOG_SUBSYSTEM_KMS,
-                        event = "kms_legacy_local_config_loaded",
+                        event = "kms_config_loaded",
                         storage_path = KMS_CONFIG_PATH,
-                        state = "legacy_config_accepted",
+                        state = "config_loaded",
                         "admin kms dynamic state"
                     );
+                    Some(config)
                 }
-                info!(
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_KMS,
-                    event = "kms_config_loaded",
-                    storage_path = KMS_CONFIG_PATH,
-                    state = "config_loaded",
-                    "admin kms dynamic state"
-                );
-                Some(config)
+                Err(e) => {
+                    error!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_config_deserialize_failed",
+                        storage_path = KMS_CONFIG_PATH,
+                        result = "config_deserialize_failed",
+                        error = %e,
+                        "admin kms dynamic state"
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                error!(
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_KMS,
-                    event = "kms_config_deserialize_failed",
-                    storage_path = KMS_CONFIG_PATH,
-                    result = "config_deserialize_failed",
-                    error = %e,
-                    "admin kms dynamic state"
-                );
-                None
-            }
-        }
         }
         Err(e) => {
             // Config not found is normal on first run: `read_config` maps a missing or
@@ -1330,7 +1330,9 @@ mod tests {
         rustfs_kms::KmsConfig {
             backend: rustfs_kms::KmsBackend::VaultKv2,
             backend_config: rustfs_kms::BackendConfig::VaultKv2(Box::new(rustfs_kms::VaultConfig {
-                auth_method: rustfs_kms::VaultAuthMethod::Token { token: token.to_string() },
+                auth_method: rustfs_kms::VaultAuthMethod::Token {
+                    token: token.to_string(),
+                },
                 ..rustfs_kms::VaultConfig::default()
             })),
             ..rustfs_kms::KmsConfig::default()
@@ -1369,7 +1371,10 @@ mod tests {
 
         let bytes = seal_persisted_kms_config(&config, None).expect("warn-only persistence stays allowed");
         let rendered = String::from_utf8(bytes.clone()).expect("persisted config is utf-8 JSON");
-        assert!(rendered.contains("s.vault-root-token"), "without a secret the legacy plaintext format is kept");
+        assert!(
+            rendered.contains("s.vault-root-token"),
+            "without a secret the legacy plaintext format is kept"
+        );
 
         let (opened_bytes, outcome) = open_persisted_kms_config(&bytes, None).expect("plaintext config loads without a secret");
         assert_eq!(outcome.plaintext, vec!["kms.vault.token"]);
