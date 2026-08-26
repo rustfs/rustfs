@@ -1790,6 +1790,26 @@ mod tests {
     }
 
     #[test]
+    fn response_compat_send_sites_keep_manifest_json_encoders() {
+        // Rolling-upgrade contract (rustfs-protos compat manifest): every
+        // dual-write response field must keep producing its JSON side with the
+        // exact encoder the manifest pins. The manifest itself is pinned
+        // against node.proto by tests in rustfs-protos; this test keeps the
+        // send-site assertion in the crate that owns the source file.
+        let source = rustfs_protos::compat_manifest::production_source(include_str!("disk.rs"), "disk.rs");
+
+        for send_site in rustfs_protos::compat_manifest::RESPONSE_COMPAT_SEND_SITES {
+            assert!(
+                source.contains(send_site.json_encoder),
+                "{}.{} must keep its manifest encoder: {}",
+                send_site.field.message,
+                send_site.field.json_field,
+                send_site.json_encoder
+            );
+        }
+    }
+
+    #[test]
     fn delete_versions_response_dual_writes_typed_item_errors() {
         let raw_not_found = super::DiskError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
         let (errors, item_errors) = encode_delete_versions_errors(vec![Some(raw_not_found), None]);

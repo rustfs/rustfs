@@ -35,6 +35,13 @@ wire types still live in `rustfs-filemeta`. This keeps the temporary dependency
 centralized until those wire contracts can move without introducing a
 `rustfs-replication` / `rustfs-storage-api` cycle.
 
+Dependency direction also applies to compile-time source reads:
+`include_str!`/`include!` of a `.rs` file must not resolve outside the
+including crate's own directory (`scripts/check_layer_dependencies.sh`
+enforces this). A source-text tripwire belongs in the crate that owns the
+asserted file; shared expectations move into a contract surface such as
+`rustfs_protos::compat_manifest` and are asserted by each owning crate.
+
 Existing migration checks live in:
 
 - `scripts/check_layer_dependencies.sh`
