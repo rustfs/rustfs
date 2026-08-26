@@ -308,6 +308,9 @@ jobs:
           } > artifacts/test-and-lint/doctest-diagnostics.txt
           exit "${status}"
 
+      - name: Check offline enrollment E2E root boundary
+        run: ./scripts/check_offline_enrollment_e2e.sh
+
       - name: Upload test reports and diagnostics
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

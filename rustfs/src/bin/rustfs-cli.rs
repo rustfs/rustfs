@@ -294,7 +294,12 @@ fn enroll(arguments: &[String]) -> Result<(), String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "the system clock is before the Unix epoch".to_string())?
         .as_secs() as i64;
+    #[cfg(feature = "offline-enrollment-e2e-root")]
+    let now = enrollment_evaluation_time(now)?;
 
+    #[cfg(feature = "offline-enrollment-e2e-root")]
+    let verified = verify_enrollment_challenge(&challenge, now).map_err(|error| error.to_string())?;
+    #[cfg(not(feature = "offline-enrollment-e2e-root"))]
     let verified = OfflineEnrollment::verify_challenge(&challenge, now).map_err(|error| error.to_string())?;
 
     // First use mints the key; a retry answers with the one already enrolled,
@@ -311,6 +316,32 @@ fn enroll(arguments: &[String]) -> Result<(), String> {
     write_response(Path::new(&output_path), &response)?;
 
     Ok(())
+}
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+fn enrollment_evaluation_time(system_now: i64) -> Result<i64, String> {
+    // The public fixture gate needs a compile-time clock; real E2E builds omit it.
+    if env!("CARGO_BIN_NAME") == "rustfs-cli-e2e"
+        && let Some(value) = option_env!("RUSTFS_E2E_OFFLINE_ENROLLMENT_FIXTURE_TIME")
+    {
+        return value
+            .parse()
+            .map_err(|_| "the compiled E2E enrollment fixture time is invalid".to_owned());
+    }
+
+    Ok(system_now)
+}
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+fn verify_enrollment_challenge(
+    challenge: &[u8],
+    now: i64,
+) -> Result<rustfs::connect::offline::VerifiedChallenge, rustfs::connect::offline::EnrollmentError> {
+    if env!("CARGO_BIN_NAME") == "rustfs-cli-e2e" {
+        return OfflineEnrollment::verify_e2e_challenge(challenge, now);
+    }
+
+    OfflineEnrollment::verify_challenge(challenge, now)
 }
 
 /// Reads the challenge from a file, or from stdin when the path is `-`.
@@ -419,6 +450,26 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[cfg(feature = "offline-enrollment-e2e-root")]
+    #[test]
+    fn only_the_dedicated_e2e_target_selects_the_test_root() {
+        let challenge =
+            fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/offline-enrollment-e2e/challenge.json"))
+                .expect("read E2E enrollment challenge");
+        let result = verify_enrollment_challenge(&challenge, 4_070_908_800);
+
+        if env!("CARGO_BIN_NAME") == "rustfs-cli-e2e" {
+            result.expect("the dedicated E2E binary selects the test root");
+        } else {
+            assert_eq!(
+                result
+                    .expect_err("every production binary must retain the hosted root")
+                    .reason(),
+                "ENROLLMENT_ROOT_UNKNOWN"
+            );
+        }
+    }
 
     #[test]
     fn connect_offline_bundle_cli_shutdown_is_bounded_with_a_stuck_blocking_collector() {

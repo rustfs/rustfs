@@ -46,8 +46,22 @@ use crate::connect::identity::DeviceIdentity;
 /// The hosted enrolment root, compiled in. Both halves are pinned: the
 /// fingerprint identifies the root, and the point is what actually verifies the
 /// first link, so a build cannot be pointed at a different key by supplying one.
-const PINNED_ROOT_KEY_ID: &str = "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f";
-const PINNED_ROOT_PUBLIC_KEY: &str = "BFfx-K-FfEA5nK_Rz3IHacvRCkJyQ7JOd1geLyU6HKRZDgNezmVuKhvJ22VhemyjV__Gshk8JGGqOBzYPMD0p6s";
+const HOSTED_ROOT: EnrollmentRoot = EnrollmentRoot {
+    key_id: "df22e2806112debbe953672aafa186d699af0e97dd3fd2b09fa8359005fe348f",
+    public_key: "BFfx-K-FfEA5nK_Rz3IHacvRCkJyQ7JOd1geLyU6HKRZDgNezmVuKhvJ22VhemyjV__Gshk8JGGqOBzYPMD0p6s",
+};
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+const E2E_ROOT: EnrollmentRoot = EnrollmentRoot {
+    key_id: env!("RUSTFS_E2E_OFFLINE_ENROLLMENT_ROOT_KEY_ID"),
+    public_key: env!("RUSTFS_E2E_OFFLINE_ENROLLMENT_ROOT_PUBLIC_KEY"),
+};
+
+#[derive(Clone, Copy)]
+struct EnrollmentRoot {
+    key_id: &'static str,
+    public_key: &'static str,
+}
 
 /// Domain separation tags. A document that verifies under one of these must not
 /// be accepted for another artifact type, so the tag is part of the signature
@@ -327,6 +341,22 @@ impl OfflineEnrollment {
     /// `now_unix` is the device's reading of the current time, which the clock
     /// skew tolerance treats as advisory.
     pub fn verify_challenge(document: &[u8], now_unix: i64) -> Result<VerifiedChallenge, EnrollmentError> {
+        Self::verify_challenge_with_root(document, now_unix, HOSTED_ROOT)
+    }
+
+    /// Verify a challenge against the fixed root carried only by the dedicated
+    /// E2E CLI build. No caller can supply or replace this root at runtime.
+    #[cfg(feature = "offline-enrollment-e2e-root")]
+    #[doc(hidden)]
+    pub fn verify_e2e_challenge(document: &[u8], now_unix: i64) -> Result<VerifiedChallenge, EnrollmentError> {
+        Self::verify_challenge_with_root(document, now_unix, E2E_ROOT)
+    }
+
+    fn verify_challenge_with_root(
+        document: &[u8],
+        now_unix: i64,
+        root: EnrollmentRoot,
+    ) -> Result<VerifiedChallenge, EnrollmentError> {
         let envelope: SignedDocument = serde_json::from_slice(document).map_err(|_| EnrollmentError::MalformedDocument)?;
 
         // Step 1: the encoding is checked before anything is decoded from it, so
@@ -345,7 +375,7 @@ impl OfflineEnrollment {
         let issued_at = parse_timestamp(&routing.issued_at)?;
 
         // Steps 3 to 5.
-        let connect_key = verify_trust_chain(&routing.trust_chain, &routing.connect_key_id, issued_at)?;
+        let connect_key = verify_trust_chain(&routing.trust_chain, &routing.connect_key_id, issued_at, root)?;
 
         // Step 6. The verification key comes from the chain, so `signature.keyId`
         // is a label rather than an input: a value naming some other key simply
@@ -439,24 +469,25 @@ fn verify_trust_chain(
     chain: &[SignedDocument],
     connect_key_id: &str,
     challenge_issued_at: i64,
+    root: EnrollmentRoot,
 ) -> Result<VerifyingKey, EnrollmentError> {
     // The pinned root gate runs before the chain's shape is examined, so a
     // chain that is internally consistent under a foreign root — exactly what
     // trust on first use would have accepted — is refused for its root rather
     // than for its length.
     let first = chain.first().ok_or(EnrollmentError::EnrollmentRootUnknown)?;
-    let root = decode_trust_link(first)?;
-    if root.0.issuer_key_id != PINNED_ROOT_KEY_ID {
+    let first_link = decode_trust_link(first)?;
+    if first_link.0.issuer_key_id != root.key_id {
         return Err(EnrollmentError::EnrollmentRootUnknown);
     }
 
     let [_, second] = chain else {
         return Err(EnrollmentError::TrustChainInvalid);
     };
-    let links = [root, decode_trust_link(second)?];
+    let links = [first_link, decode_trust_link(second)?];
 
-    let mut issuer_key_id = PINNED_ROOT_KEY_ID.to_owned();
-    let (mut issuer_key, _) = decode_public_key(PINNED_ROOT_PUBLIC_KEY).ok_or(EnrollmentError::EnrollmentRootUnknown)?;
+    let mut issuer_key_id = root.key_id.to_owned();
+    let (mut issuer_key, _) = decode_public_key(root.public_key).ok_or(EnrollmentError::EnrollmentRootUnknown)?;
 
     for (index, ((link, link_bytes), entry)) in links.iter().zip(chain).enumerate() {
         if link.format_version != FORMAT_TRUST_LINK
