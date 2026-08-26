@@ -46,10 +46,10 @@ use crate::admin::handlers::service_account::AddServiceAccount;
 use crate::admin::handlers::user::ImportIam;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_app_context, current_ready_iam_handle, current_server_config_for_context};
-use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request};
+use crate::admin::utils::is_compat_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use http::{HeaderMap, StatusCode};
+use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::DEFAULT_DELIMITER;
@@ -60,7 +60,6 @@ use rustfs_madmin::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::MaskedAccessKey;
-use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
 use std::{collections::HashMap, sync::LazyLock};
@@ -991,13 +990,7 @@ fn json_response<T: Serialize>(
     status: StatusCode,
     payload: &T,
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let body = serde_json::to_vec(payload)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize error: {e}")))?;
-    let (body, content_type) = encode_compatible_admin_payload(path, secret_key, body)?;
-
-    let mut header = HeaderMap::new();
-    header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
-    Ok(S3Response::with_headers((status, Body::from(body)), header))
+    super::admin_json_response(path, secret_key, status, payload)
 }
 
 #[cfg(test)]

@@ -36,9 +36,9 @@ mod kms_contract;
 mod route_registration_test;
 
 use handlers::{
-    audit, batch_job, bucket_meta, cluster_snapshot, config_admin, diagnostics, durability as durability_handler, extensions,
-    heal, health, idp_compat, ilm_transition, inspect_archive, kms, module_switch, object_data_cache, object_zip_download, oidc,
-    plugins_catalog, plugins_instances, pools, profile_admin, quota as quota_handler, rebalance,
+    account, audit, batch_job, bucket_meta, cluster_snapshot, config_admin, diagnostics, durability as durability_handler,
+    extensions, heal, health, idp_compat, ilm_transition, inspect_archive, kms, mfa, module_switch, object_data_cache,
+    object_zip_download, oidc, plugins_catalog, plugins_instances, pools, profile_admin, quota as quota_handler, rebalance,
     replication as replication_handler, scanner, site_replication, sts, system, table_catalog, tier, tls_debug, usage_prefix,
     user,
 };
@@ -66,6 +66,8 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
     health::register_health_route(r)?;
     sts::register_admin_auth_route(r)?;
 
+    account::register_account_route(r)?;
+    mfa::register_mfa_route(r)?;
     user::register_user_route(r)?;
     system::register_system_route(r)?;
     pools::register_pool_route(r)?;

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod account;
 pub mod client;
 pub mod group;
 pub mod heal_commands;
@@ -26,6 +27,7 @@ pub mod trace;
 pub mod user;
 pub mod utils;
 
+pub use account::*;
 pub use client::*;
 pub use group::*;
 pub use info_commands::*;

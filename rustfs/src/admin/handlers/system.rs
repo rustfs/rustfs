@@ -14,6 +14,8 @@
 
 use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
+use crate::admin::handlers::account::{ACCOUNT_INFO_ROUTE, ACCOUNT_PASSWORD_ROUTE};
+use crate::admin::handlers::mfa::{ACCOUNT_MFA_ROUTE, MFA_CHALLENGE_ROUTE, USER_MFA_ROUTE};
 use crate::admin::route_policy::{
     ADMIN_ROUTE_POLICY_SPECS, DEFERRED_ADMIN_ROUTE_POLICIES, DeferredAdminRoutePolicy, DeferredRoutePolicyReason,
 };
@@ -1107,6 +1109,14 @@ fn advertised_admin_capabilities() -> Vec<AdvertisedAdminCapability> {
         ("admin.iam.access-keys-bulk", HttpMethod::Get, IAM_ACCESS_KEYS_BULK_ROUTE),
         ("admin.iam.access-keys-bulk.ldap", HttpMethod::Get, IAM_ACCESS_KEYS_BULK_LDAP_ROUTE),
         ("admin.iam.access-keys-bulk.openid", HttpMethod::Get, IAM_ACCESS_KEYS_BULK_OPENID_ROUTE),
+        // Advertised so the console can hide the profile and 2FA surfaces
+        // against an older server instead of probing and handling a 404, and so
+        // `rc admin capabilities` reports them.
+        ("admin.account.info", HttpMethod::Get, ACCOUNT_INFO_ROUTE),
+        ("admin.account.password", HttpMethod::Post, ACCOUNT_PASSWORD_ROUTE),
+        ("admin.account.mfa", HttpMethod::Get, ACCOUNT_MFA_ROUTE),
+        ("admin.mfa.challenge", HttpMethod::Get, MFA_CHALLENGE_ROUTE),
+        ("admin.user.mfa", HttpMethod::Get, USER_MFA_ROUTE),
     ]
     .into_iter()
     .map(|(name, method, route)| AdvertisedAdminCapability {

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::account::SetUserSecretKeyHandler;
 use super::user::{AddUser, GetUserInfo, ListUsers, RemoveUser, SetUserStatus};
 use crate::{
     admin::router::{AdminOperation, S3Router},
@@ -48,6 +49,12 @@ pub fn register_user_lifecycle_route(r: &mut S3Router<AdminOperation>) -> std::i
         Method::PUT,
         format!("{}{}", ADMIN_PREFIX, "/v3/set-user-status").as_str(),
         AdminOperation(&SetUserStatus {}),
+    )?;
+
+    r.insert(
+        Method::PUT,
+        format!("{}{}", ADMIN_PREFIX, "/v3/set-user-secret-key").as_str(),
+        AdminOperation(&SetUserSecretKeyHandler {}),
     )?;
 
     Ok(())

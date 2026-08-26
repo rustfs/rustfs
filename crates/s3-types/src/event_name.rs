@@ -105,6 +105,17 @@ pub enum EventName {
     KmsServiceConfigured,
     KmsServiceStarted,
     KmsServiceStopped,
+
+    // IAM identity management-plane events. Like the KMS block above they reach
+    // the audit sink only, and must keep being appended last.
+    //
+    // Deliberately coarse: only two variants for the whole account/MFA surface,
+    // because `mask()` gives every variant its own bit in a `u64` and the budget
+    // is nearly spent. The specific operation lives in `AuditEntry::api.name`
+    // and the `iamOperation` tag, which is what a SIEM filters on anyway.
+    // Splitting these per-operation would need `mask()` widened first.
+    IamIdentityCredentialChanged,
+    IamIdentityAuthChallenge,
 }
 
 // Single event type sequential array for Everything.expand()
@@ -159,7 +170,7 @@ const LAST_SINGLE_TYPE_VALUE: u32 = EventName::IntelligentTiering as u32;
 /// meaningful: `mask()` turns a leaf variant's discriminant `v` into the bit
 /// `1 << (v - 1)`, so the highest discriminant is also the highest bit index in
 /// use. Keep this pointing at whatever variant is declared last.
-const LAST_EVENT_NAME_VALUE: u32 = EventName::KmsServiceStopped as u32;
+const LAST_EVENT_NAME_VALUE: u32 = EventName::IamIdentityAuthChallenge as u32;
 
 /// `mask()` returns a `u64`, so discriminants may run from 1 to 64 inclusive.
 ///
@@ -244,6 +255,9 @@ impl EventName {
             "kms:Service:Configured" => Ok(EventName::KmsServiceConfigured),
             "kms:Service:Started" => Ok(EventName::KmsServiceStarted),
             "kms:Service:Stopped" => Ok(EventName::KmsServiceStopped),
+            // IAM events use their own namespace for the same reason KMS does.
+            "iam:Identity:CredentialChanged" => Ok(EventName::IamIdentityCredentialChanged),
+            "iam:Identity:AuthChallenge" => Ok(EventName::IamIdentityAuthChallenge),
             // `Everything` has no string representation (`as_str` yields ""), so it
             // cannot be parsed back from a string. Every other variant round-trips.
             _ => Err(ParseEventNameError(s.to_string())),
@@ -320,6 +334,8 @@ impl EventName {
             EventName::KmsServiceConfigured => "kms:Service:Configured",
             EventName::KmsServiceStarted => "kms:Service:Started",
             EventName::KmsServiceStopped => "kms:Service:Stopped",
+            EventName::IamIdentityCredentialChanged => "iam:Identity:CredentialChanged",
+            EventName::IamIdentityAuthChallenge => "iam:Identity:AuthChallenge",
         }
     }
 
@@ -466,6 +482,14 @@ impl EventName {
                 | EventName::KmsServiceStarted
                 | EventName::KmsServiceStopped
         )
+    }
+
+    /// Whether this is an IAM identity management-plane event.
+    ///
+    /// Mirrors [`Self::is_kms`]: these reach the audit sink only, so nothing in
+    /// the bucket notification path should ever select them.
+    pub fn is_iam(&self) -> bool {
+        matches!(self, EventName::IamIdentityCredentialChanged | EventName::IamIdentityAuthChallenge)
     }
 }
 
@@ -702,7 +726,9 @@ mod tests {
             | EventName::KmsKeyAccessed
             | EventName::KmsServiceConfigured
             | EventName::KmsServiceStarted
-            | EventName::KmsServiceStopped => {}
+            | EventName::KmsServiceStopped
+            | EventName::IamIdentityCredentialChanged
+            | EventName::IamIdentityAuthChallenge => {}
         }
     }
 
@@ -770,6 +796,8 @@ mod tests {
         EventName::KmsServiceConfigured,
         EventName::KmsServiceStarted,
         EventName::KmsServiceStopped,
+        EventName::IamIdentityCredentialChanged,
+        EventName::IamIdentityAuthChallenge,
     ];
 
     /// Every KMS management-plane event.
@@ -858,7 +886,7 @@ mod tests {
     /// only as one element of an array someone may forget to extend.
     #[test]
     fn test_last_variant_still_gets_its_own_bit() {
-        let last = EventName::KmsServiceStopped;
+        let last = EventName::IamIdentityAuthChallenge;
         assert_ne!(last.mask(), 0, "the last variant's mask overflowed to zero");
         assert_eq!(
             last.mask(),
@@ -1002,6 +1030,43 @@ mod tests {
 
             for s3 in &s3_selectors {
                 assert_eq!(s3.mask() & mask, 0, "KMS event {kms} mask collides with S3 selector {s3}");
+            }
+        }
+    }
+
+    /// Every IAM identity management-plane event.
+    const IAM_EVENT_NAMES: &[EventName] = &[EventName::IamIdentityCredentialChanged, EventName::IamIdentityAuthChallenge];
+
+    /// IAM event names must live in their own namespace, for the same reason
+    /// KMS ones do: a bucket notification config must not be able to subscribe
+    /// to account or authentication activity.
+    #[test]
+    fn test_iam_event_names_are_outside_the_s3_and_kms_namespaces() {
+        for ev in IAM_EVENT_NAMES {
+            assert!(ev.is_iam(), "{ev} should be classified as an IAM event");
+            assert!(!ev.is_kms(), "{ev} must not also claim the KMS namespace");
+            assert!(ev.as_str().starts_with("iam:"), "unexpected IAM event name {:?}", ev.as_str());
+            assert_eq!(EventName::parse(ev.as_str()).as_ref(), Ok(ev), "IAM event {ev} must round-trip");
+            assert_eq!(ev.expand(), vec![*ev], "IAM event {ev} must expand to itself only");
+        }
+
+        for ev in ALL_EVENT_NAMES.iter().filter(|ev| !ev.is_iam()) {
+            assert!(!ev.as_str().starts_with("iam:"), "{ev} must not claim the IAM namespace");
+        }
+    }
+
+    /// Each IAM event must own a distinct mask bit that no S3 selector shares.
+    #[test]
+    fn test_iam_event_masks_do_not_collide() {
+        let mut seen = 0u64;
+        for ev in IAM_EVENT_NAMES {
+            let mask = ev.mask();
+            assert_ne!(mask, 0, "IAM event {ev} must have a non-zero mask");
+            assert_eq!(seen & mask, 0, "IAM event {ev} mask overlaps another IAM event");
+            seen |= mask;
+
+            for kms in KMS_EVENT_NAMES {
+                assert_eq!(kms.mask() & mask, 0, "IAM event {ev} mask collides with KMS event {kms}");
             }
         }
     }

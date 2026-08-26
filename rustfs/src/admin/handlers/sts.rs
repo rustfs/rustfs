@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use super::is_admin::IsAdminHandler;
+use crate::admin::handlers::account_audit::AccountAuditContext;
+use crate::admin::handlers::mfa::verify_for_session as mfa_verify_for_session;
+use crate::admin::runtime_sources::object_store_from_req;
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::service::session_policy::populate_session_policy;
 use crate::admin::storage_api::bucket::utils::serialize;
@@ -32,6 +35,8 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_iam::federation::{FederatedSessionBindingError, FederationError};
+use rustfs_iam::mfa::service as mfa_service;
+use rustfs_madmin::account::{ERR_MFA_REQUIRED, IdentityType};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SRIAMItem, SRSTSCredential};
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,
@@ -40,6 +45,7 @@ use rustfs_policy::{
         action::{Action, StsAction},
     },
 };
+use rustfs_utils::MaskedAccessKey;
 use s3s::{
     Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result,
     dto::{AssumeRoleOutput, Credentials, Timestamp},
@@ -144,6 +150,15 @@ pub struct AssumeRoleRequest {
     pub policy: String,
     pub external_id: String,
     pub web_identity_token: String,
+    /// The login challenge from `GET /v3/mfa/challenge`, echoed back.
+    ///
+    /// AWS uses `SerialNumber` to name an MFA device; RustFS has one virtual
+    /// device per identity, so the field carries the challenge instead. It is
+    /// optional: a client that skips the challenge round trip and sends only a
+    /// `TokenCode` still authenticates.
+    pub serial_number: String,
+    /// A six-digit TOTP code or a recovery code.
+    pub token_code: String,
 }
 
 pub struct AssumeRoleHandle {}
@@ -151,6 +166,11 @@ pub struct AssumeRoleHandle {}
 impl Operation for AssumeRoleHandle {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         debug!("handle AssumeRoleHandle");
+
+        // Captured before the body is consumed: the second-factor gate needs the
+        // object store, and its audit entries need the request metadata.
+        let store = object_store_from_req(&req);
+        let audit = AccountAuditContext::from_request(&req);
 
         let mut input = req.input;
 
@@ -167,7 +187,7 @@ impl Operation for AssumeRoleHandle {
         match body.action.as_str() {
             ASSUME_ROLE_ACTION => {
                 let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-                handle_assume_role(req.credentials, req.uri, req.headers, remote_addr, body).await
+                handle_assume_role(req.credentials, req.uri, req.headers, remote_addr, body, store, &audit).await
             }
             ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION => handle_assume_role_with_web_identity(body).await,
             _ => Err(s3_error!(InvalidArgument, "unsupported Action")),
@@ -182,6 +202,8 @@ async fn handle_assume_role(
     headers: http::HeaderMap,
     remote_addr: Option<std::net::SocketAddr>,
     body: AssumeRoleRequest,
+    store: Option<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>>,
+    audit: &AccountAuditContext,
 ) -> S3Result<S3Response<(StatusCode, Body)>> {
     let Some(user) = credentials else {
         return Err(s3_error!(InvalidRequest, "get cred failed"));
@@ -223,7 +245,29 @@ async fn handle_assume_role(
         return Err(s3_error!(InvalidArgument, "not support version"));
     }
 
+    // Second-factor gate.
+    //
+    // This is the only place a second factor can be enforced, because minting an
+    // STS session is the only interactive login RustFS has. Note what is
+    // deliberately *not* gated: a request signed directly with a long-term
+    // access key. Gating that would break every script and CLI the moment a
+    // human enabled 2FA on their own account, and it would not add protection —
+    // whoever holds the secret key already has full access without ever
+    // presenting a code. Making 2FA meaningful for direct API access needs a
+    // policy condition on the session, which is tracked separately.
+    //
+    // An identity with no enrollment takes no new code path at all, so the
+    // behaviour of every existing deployment is unchanged.
+    let mfa_verified = enforce_second_factor(&cred.access_key, &body, store, audit).await?;
+
     let mut claims = cred.claims.unwrap_or_default();
+
+    if mfa_verified {
+        // Recorded on the session so a later policy condition can require it,
+        // and so an audit consumer can tell a two-factor session from a
+        // single-factor one.
+        claims.insert(MFA_VERIFIED_CLAIM.to_string(), Value::Bool(true));
+    }
 
     populate_session_policy(&mut claims, &body.policy)?;
 
@@ -295,6 +339,61 @@ async fn handle_assume_role(
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize assume role output failed: {e}")))?;
 
     Ok(S3Response::new((StatusCode::OK, Body::from(output))))
+}
+
+/// Session claim marking a session that presented a second factor.
+///
+/// Namespaced with the `x-rustfs-` prefix so it cannot collide with an OIDC
+/// claim of the same name arriving from an identity provider.
+pub(crate) const MFA_VERIFIED_CLAIM: &str = "x-rustfs-mfa-verified";
+
+/// Require and verify a second factor when `access_key` has one enrolled.
+///
+/// Returns whether a factor was actually presented and verified. `false` means
+/// the identity has no enrollment, not that verification was skipped.
+async fn enforce_second_factor(
+    access_key: &str,
+    body: &AssumeRoleRequest,
+    store: Option<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>>,
+    audit: &AccountAuditContext,
+) -> S3Result<bool> {
+    let Some(store) = store else {
+        // Failing closed here would make every login depend on the store being
+        // reachable, but failing *open* would let a store outage disable the
+        // second factor. The store is required for the lookup, so an
+        // unavailable one is reported as unavailable.
+        return Err(crate::admin::storage_api::s3::error(
+            S3ErrorCode::ServiceUnavailable,
+            "the object store is not ready",
+        ));
+    };
+
+    let now = OffsetDateTime::now_utc();
+    let required = mfa_service::is_enabled(store.clone(), access_key, now)
+        .await
+        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err.to_string()))?;
+
+    if !required {
+        return Ok(false);
+    }
+
+    if body.token_code.is_empty() {
+        debug!(
+            access_key = %MaskedAccessKey(access_key),
+            "AssumeRole requires a second factor"
+        );
+        // The message carries the sentinel clients match on to decide whether to
+        // prompt for a code rather than report a failed login.
+        return Err(S3Error::with_message(
+            S3ErrorCode::AccessDenied,
+            format!("{ERR_MFA_REQUIRED}: a second authentication factor is required"),
+        ));
+    }
+
+    let challenge = (!body.serial_number.is_empty()).then_some(body.serial_number.as_str());
+    mfa_verify_for_session(store, audit, access_key, IdentityType::Iam, challenge, &body.token_code).await?;
+
+    Ok(true)
 }
 
 /// Handle the AssumeRoleWithWebIdentity action.

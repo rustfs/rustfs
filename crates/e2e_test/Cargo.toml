@@ -109,6 +109,13 @@ hyper = { workspace = true, features = ["http2", "http1", "server"] }
 hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
 reqwest = { workspace = true, features = ["json", "multipart", "stream"] }
 rustfs-signer.workspace = true
+
+# The MFA e2e test computes RFC 6238 codes itself rather than calling the
+# server's implementation: a shared helper could agree with a bug on both sides.
+data-encoding = { workspace = true }
+hmac = { workspace = true }
+sha1 = { workspace = true }
+serde_urlencoded = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 uuid = { workspace = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
