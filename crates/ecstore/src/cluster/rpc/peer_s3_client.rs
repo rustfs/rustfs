@@ -1090,7 +1090,7 @@ impl RemotePeerS3Client {
     pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+            .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
     /// Start health monitoring for the remote peer

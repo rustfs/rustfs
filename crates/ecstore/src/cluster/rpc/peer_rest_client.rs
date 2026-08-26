@@ -626,13 +626,13 @@ impl PeerRestClient {
     pub async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
-            return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
+            return Err(Error::RemoteClientUnavailable(format!("peer {} is temporarily offline", self.grid_host)));
         }
 
         node_service_time_out_client(&self.grid_host, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| {
-                let storage_err = Error::other(format!("can not get client, err: {err}"));
+                let storage_err = Error::RemoteClientUnavailable(format!("can not get client, err: {err}"));
                 if Self::is_network_like_error(&storage_err) {
                     self.mark_offline_and_spawn_recovery();
                 }
@@ -649,13 +649,13 @@ impl PeerRestClient {
     > {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
-            return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
+            return Err(Error::RemoteClientUnavailable(format!("peer {} is temporarily offline", self.grid_host)));
         }
 
         heal_control_time_out_client(&self.grid_host, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| {
-                let storage_err = Error::other(format!("can not get heal control client, err: {err}"));
+                let storage_err = Error::RemoteClientUnavailable(format!("can not get heal control client, err: {err}"));
                 if Self::is_network_like_error(&storage_err) {
                     self.mark_offline_and_spawn_recovery();
                 }
@@ -668,13 +668,13 @@ impl PeerRestClient {
     ) -> Result<TierMutationControlServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
         if self.offline.load(Ordering::Acquire) {
             self.mark_offline_and_spawn_recovery();
-            return Err(Error::other(format!("peer {} is temporarily offline", self.grid_host)));
+            return Err(Error::RemoteClientUnavailable(format!("peer {} is temporarily offline", self.grid_host)));
         }
 
         tier_mutation_control_time_out_client(&self.grid_host, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
             .map_err(|err| {
-                let storage_err = Error::other(format!("can not get tier mutation control client, err: {err}"));
+                let storage_err = Error::RemoteClientUnavailable(format!("can not get tier mutation control client, err: {err}"));
                 if Self::is_network_like_error(&storage_err) {
                     self.mark_offline_and_spawn_recovery();
                 }
@@ -2213,17 +2213,14 @@ fn tier_config_reload_connection_outcome(err: Error) -> TierConfigReloadOutcome 
 }
 
 fn is_tier_config_reload_connection_failure(err: &Error) -> bool {
-    let message = err.to_string();
-    // A bare "unavailable" is only trusted inside the local dial-failure
-    // wrapper from `get_client`, never in application text.
-    if message
-        .to_ascii_lowercase()
-        .split_once("can not get client, err:")
-        .is_some_and(|(_, local_error)| local_error.contains("unavailable"))
+    // A bare "unavailable" is only trusted inside the local dial failure from
+    // `get_client` (typed as RemoteClientUnavailable), never in application text.
+    if let Error::RemoteClientUnavailable(detail) = err
+        && detail.to_ascii_lowercase().contains("unavailable")
     {
         return true;
     }
-    message_has_network_needle(&message)
+    message_has_network_needle(&err.to_string())
 }
 
 /// Classifies a reload the peer answered but refused to apply.
@@ -3046,15 +3043,20 @@ mod tests {
             TierConfigReloadOutcome::Terminal(_)
         ));
         assert!(matches!(
-            tier_config_reload_connection_outcome(Error::other("can not get client, err: connection unavailable")),
+            tier_config_reload_connection_outcome(Error::RemoteClientUnavailable("connection unavailable".to_string())),
             TierConfigReloadOutcome::TransientReconnect(_)
         ));
-        // The bare word is trusted only to the right of the dial-failure
-        // prefix, not anywhere in the message.
+        // The bare word is trusted only inside the typed local dial failure,
+        // not anywhere in application text — including text that mimics the
+        // old "can not get client" string form, which is retired.
         assert!(matches!(
             tier_config_reload_connection_outcome(Error::other(
                 "bucket unavailable-logs rejected it, then: can not get client, err: some other reason"
             )),
+            TierConfigReloadOutcome::Terminal(_)
+        ));
+        assert!(matches!(
+            tier_config_reload_connection_outcome(Error::other("can not get client, err: connection unavailable")),
             TierConfigReloadOutcome::Terminal(_)
         ));
     }

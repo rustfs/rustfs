@@ -148,7 +148,7 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
 
         let mut client = node_service_time_out_client(&addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+            .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))?;
 
         let request = Request::new(PingRequest {
             version: 1,

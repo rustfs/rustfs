@@ -1379,7 +1379,7 @@ impl RemoteDisk {
             let addr = addr.to_string();
             let mut client = node_service_time_out_client(&addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
                 .await
-                .map_err(|err| (Error::other(format!("can not get client, err: {err}")), true))?;
+                .map_err(|err| (Error::RemoteClientUnavailable(err.to_string()), true))?;
             let request = Request::new(DiskInfoRequest {
                 disk: endpoint.to_string(),
                 opts,
@@ -1719,7 +1719,7 @@ impl RemoteDisk {
     /// recovers even without a background monitor. The recovery monitor's own probe path calls the
     /// client directly and is unaffected.
     fn offline_bypass_error(&self) -> Option<Error> {
-        internode_offline_bypass_reason(&self.addr).map(Error::other)
+        internode_offline_bypass_reason(&self.addr).map(Error::RemoteClientUnavailable)
     }
 
     async fn get_client(&self) -> Result<NodeServiceClient<InterceptedService<AuthenticatedChannel, TonicInterceptor>>> {
@@ -1728,7 +1728,7 @@ impl RemoteDisk {
         }
         node_service_time_out_client(&self.addr, TonicInterceptor::Signature(gen_tonic_signature_interceptor()))
             .await
-            .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+            .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
     /// Client for large `bytes`-carrying RPCs (ReadAll/WriteAll/ReadMultiple/BatchReadVersion).
@@ -1745,7 +1745,7 @@ impl RemoteDisk {
             ChannelClass::Bulk,
         )
         .await
-        .map_err(|err| Error::other(format!("can not get client, err: {err}")))
+        .map_err(|err| Error::RemoteClientUnavailable(err.to_string()))
     }
 
     async fn disk_ref(&self) -> String {
@@ -2015,10 +2015,7 @@ impl RemoteDisk {
             || async {
                 let file_info = compat_json(fi)?;
                 let file_info_bin = encode_file_info_msgpack(fi)?;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(RenameDataRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
@@ -2088,10 +2085,7 @@ impl RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let options = serde_json::to_string(&opt)?;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(DeleteRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -2214,10 +2208,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(MakeVolumeRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -2253,10 +2244,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(MakeVolumesRequest {
                     disk: self.endpoint.to_string(),
                     volumes: volumes.iter().map(|s| (*s).to_string()).collect(),
@@ -2291,10 +2279,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(ListVolumesRequest {
                     disk: self.endpoint.to_string(),
                 });
@@ -2329,10 +2314,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(StatVolumeRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -2368,10 +2350,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(DeleteVolumeRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -2423,10 +2402,7 @@ impl DiskAPI for RemoteDisk {
                 let file_info = serde_json::to_string(&fi)?;
                 let opts = serde_json::to_string(&opts)?;
 
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(DeleteVersionRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -2598,10 +2574,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(DeletePathsRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -2626,10 +2599,7 @@ impl DiskAPI for RemoteDisk {
     async fn acquire_snapshot_lease(&self, volume: &str, path: &str) -> Result<SnapshotLeaseToken> {
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(SnapshotLeaseRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -2650,10 +2620,7 @@ impl DiskAPI for RemoteDisk {
     async fn renew_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<SnapshotLeaseToken> {
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(SnapshotLeaseRenewRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -2675,10 +2642,7 @@ impl DiskAPI for RemoteDisk {
     async fn release_snapshot_lease(&self, volume: &str, path: &str, token: SnapshotLeaseToken) -> Result<()> {
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(SnapshotLeaseReleaseRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -2718,10 +2682,7 @@ impl DiskAPI for RemoteDisk {
             "write_metadata",
             move || async move {
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(WriteMetadataRequest {
                     disk,
                     volume: volume.to_string(),
@@ -2753,10 +2714,7 @@ impl DiskAPI for RemoteDisk {
             "read_metadata",
             || async {
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(ReadMetadataRequest {
                     volume: volume.to_string(),
                     path: path.to_string(),
@@ -2798,10 +2756,7 @@ impl DiskAPI for RemoteDisk {
             "update_metadata",
             move || async move {
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(UpdateMetadataRequest {
                     disk,
                     volume: volume.to_string(),
@@ -2864,10 +2819,7 @@ impl DiskAPI for RemoteDisk {
                 let opts_str = opts_str.clone();
                 let opts_bin = opts_bin.clone();
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request_payload_bytes = read_version_attribution_enabled.then(|| {
                     disk.len()
                         .saturating_add(volume.len())
@@ -2969,10 +2921,7 @@ impl DiskAPI for RemoteDisk {
                 move || async move {
                     let disk = self.disk_ref().await;
                     let disk_len = disk.len();
-                    let mut client = self
-                        .get_bulk_client()
-                        .await
-                        .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                    let mut client = self.get_bulk_client().await?;
                     let request = Request::new(BatchReadVersionRequest {
                         disk,
                         batch_read_version_req,
@@ -3081,10 +3030,7 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(ReadXlRequest {
                     disk,
                     volume: volume.to_string(),
@@ -3129,10 +3075,7 @@ impl DiskAPI for RemoteDisk {
             || async {
                 let disk = self.disk_ref().await;
 
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(ListDirRequest {
                     disk,
                     volume: volume.to_string(),
@@ -3393,10 +3336,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(RenameFileRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
@@ -3438,10 +3378,7 @@ impl DiskAPI for RemoteDisk {
 
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(RenamePartRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
@@ -3477,10 +3414,7 @@ impl DiskAPI for RemoteDisk {
     ) -> Result<()> {
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(PreparePartTransactionRequest {
                     disk: self.endpoint.to_string(),
                     src_volume: src_volume.to_string(),
@@ -3507,10 +3441,7 @@ impl DiskAPI for RemoteDisk {
     async fn settle_part_transaction(&self, volume: &str, path: &str, action: PartTransactionAction) -> Result<()> {
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let mut request = Request::new(SettlePartTransactionRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -3553,10 +3484,7 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let file_info = serde_json::to_string(&fi)?;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(VerifyFileRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -3594,10 +3522,7 @@ impl DiskAPI for RemoteDisk {
         );
         self.execute_with_timeout(
             || async {
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(ReadPartsRequest {
                     disk: self.endpoint.to_string(),
                     bucket: bucket.to_string(),
@@ -3635,10 +3560,7 @@ impl DiskAPI for RemoteDisk {
         self.execute_with_timeout(
             || async {
                 let file_info = serde_json::to_string(&fi)?;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(CheckPartsRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_string(),
@@ -3680,10 +3602,7 @@ impl DiskAPI for RemoteDisk {
                 let read_multiple_req = compat_json(&req)?;
                 let read_multiple_req_bin = encode_msgpack(&req)?;
                 let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_bulk_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_bulk_client().await?;
                 let request = Request::new(ReadMultipleRequest {
                     disk,
                     read_multiple_req,
@@ -3728,9 +3647,8 @@ impl DiskAPI for RemoteDisk {
             || async {
                 let data_len = data.len();
                 let disk = self.disk_ref().await;
-                let mut client = self.get_bulk_client().await.map_err(|err| {
+                let mut client = self.get_bulk_client().await.inspect_err(|_| {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
-                    Error::other(format!("can not get client, err: {err}"))
                 })?;
                 let mut request = Request::new(WriteAllRequest {
                     disk,
@@ -3785,9 +3703,8 @@ impl DiskAPI for RemoteDisk {
             "read_all",
             || async {
                 let disk = self.disk_ref().await;
-                let mut client = self.get_bulk_client().await.map_err(|err| {
+                let mut client = self.get_bulk_client().await.inspect_err(|_| {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
-                    Error::other(format!("can not get client, err: {err}"))
                 })?;
                 let request = Request::new(ReadAllRequest {
                     disk,
@@ -3824,10 +3741,7 @@ impl DiskAPI for RemoteDisk {
             "disk_info",
             || async {
                 let opts = serde_json::to_string(&opts)?;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let mut client = self.get_client().await?;
                 let request = Request::new(DiskInfoRequest {
                     disk: self.endpoint.to_string(),
                     opts,

@@ -157,6 +157,15 @@ pub enum DiskError {
 
     #[error("invalid path")]
     InvalidPath,
+
+    /// Internode RPC client acquisition failed (channel build, auth setup, or
+    /// the peer is marked offline). The detail is diagnostic only: equality and
+    /// hashing use the wire code alone, so N disks failing for this same cause
+    /// land in one `reduce_errs` quorum bucket regardless of per-peer detail
+    /// (backlog#1845). Keep the detail in the rendered message — substring
+    /// classifiers (network needles, heal recoverability) read it from there.
+    #[error("remote rpc client unavailable: {0}")]
+    RemoteClientUnavailable(String),
 }
 
 impl From<crate::erasure::coding::ErasureConstructionError> for DiskError {
@@ -412,10 +421,10 @@ impl From<tonic::Status> for DiskError {
 impl From<rustfs_protos::proto_gen::node_service::Error> for DiskError {
     fn from(e: rustfs_protos::proto_gen::node_service::Error) -> Self {
         if let Some(err) = DiskError::from_u32(e.code) {
-            if matches!(err, DiskError::Io(_)) {
-                DiskError::other(e.error_info)
-            } else {
-                err
+            match err {
+                DiskError::Io(_) => DiskError::other(e.error_info),
+                DiskError::RemoteClientUnavailable(_) => DiskError::RemoteClientUnavailable(e.error_info),
+                err => err,
             }
         } else {
             DiskError::other(e.error_info)
@@ -525,6 +534,7 @@ impl Clone for DiskError {
             DiskError::SourceStalled => DiskError::SourceStalled,
             DiskError::Timeout => DiskError::Timeout,
             DiskError::InvalidPath => DiskError::InvalidPath,
+            DiskError::RemoteClientUnavailable(detail) => DiskError::RemoteClientUnavailable(detail.clone()),
         }
     }
 }
@@ -574,6 +584,7 @@ impl DiskError {
             DiskError::SourceStalled => 0x28,
             DiskError::Timeout => 0x29,
             DiskError::InvalidPath => 0x2A,
+            DiskError::RemoteClientUnavailable(_) => 0x2B,
         }
     }
 
@@ -621,6 +632,7 @@ impl DiskError {
             0x28 => Some(DiskError::SourceStalled),
             0x29 => Some(DiskError::Timeout),
             0x2A => Some(DiskError::InvalidPath),
+            0x2B => Some(DiskError::RemoteClientUnavailable(String::new())),
             _ => None,
         }
     }
@@ -1119,5 +1131,80 @@ mod tests {
             // The io::Error should contain the original error message
             assert!(io_error.to_string().contains(&original_message));
         }
+    }
+
+    #[test]
+    fn remote_client_unavailable_buckets_ignore_per_peer_detail() {
+        // The reason this variant exists (backlog#1845): equality and hashing
+        // use the wire code alone, so N disks failing because their peer's
+        // client could not be built land in ONE reduce_errs bucket even though
+        // each carries different diagnostic detail.
+        let a = DiskError::RemoteClientUnavailable("connection refused to peer 1".to_string());
+        let b = DiskError::RemoteClientUnavailable("connection refused to peer 2".to_string());
+        assert_eq!(a, b);
+
+        let errors: Vec<Option<DiskError>> = (0..3)
+            .map(|peer| Some(DiskError::RemoteClientUnavailable(format!("transport error: peer {peer} unreachable"))))
+            .collect();
+        let (count, err) = crate::disk::error_reduce::reduce_errs(&errors, &[]);
+        assert_eq!(count, 3);
+        assert!(matches!(err, Some(DiskError::RemoteClientUnavailable(_))));
+    }
+
+    #[test]
+    fn remote_client_unavailable_display_keeps_detail_for_substring_classifiers() {
+        // Heal recoverability and the peer network classifiers read needles
+        // ("transport error", "connection refused", "temporarily offline")
+        // from the rendered message; the typed variant must keep feeding them.
+        let err = DiskError::RemoteClientUnavailable("transport error: connection refused".to_string());
+        let rendered = err.to_string();
+        assert!(rendered.contains("remote rpc client unavailable"));
+        assert!(rendered.contains("transport error: connection refused"));
+    }
+
+    #[test]
+    fn remote_client_unavailable_wire_roundtrip_keeps_variant_and_detail() {
+        let original = DiskError::RemoteClientUnavailable("dial tcp: connection refused".to_string());
+
+        let wire: rustfs_protos::proto_gen::node_service::Error = original.clone().into();
+        assert_eq!(wire.code, 0x2B);
+        assert_eq!(wire.error_info, "remote rpc client unavailable: dial tcp: connection refused");
+
+        let back: DiskError = wire.into();
+        // The variant (and therefore quorum bucketing) survives the hop; the
+        // detail gains the display prefix, mirroring the Io re-wrap behavior.
+        assert_eq!(back, original);
+        assert!(matches!(
+            &back,
+            DiskError::RemoteClientUnavailable(detail) if detail.contains("dial tcp: connection refused")
+        ));
+    }
+
+    #[test]
+    fn remote_client_unavailable_survives_layer_and_io_bridges() {
+        let original = DiskError::RemoteClientUnavailable("handshake timed out".to_string());
+
+        let storage: crate::error::StorageError = original.clone().into();
+        assert!(matches!(
+            &storage,
+            crate::error::StorageError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
+        ));
+        let narrowed: DiskError = storage.into();
+        assert_eq!(narrowed, original);
+        assert!(matches!(
+            &narrowed,
+            DiskError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
+        ));
+
+        let io_err: std::io::Error = original.clone().into();
+        let recovered: DiskError = io_err.into();
+        assert_eq!(recovered, original);
+
+        let cloned = original.clone();
+        assert!(matches!(
+            &cloned,
+            DiskError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
+        ));
+        assert_eq!(cloned, original);
     }
 }
