@@ -30,9 +30,9 @@ use s3s::header::{
     X_AMZ_STORAGE_CLASS, X_AMZ_WEBSITE_REDIRECT_LOCATION,
 };
 //use crate::disk::{BufferReader, Reader};
-use crate::client::checksum::ChecksumMode;
-use crate::client::utils::base64_encode;
-use crate::client::{
+use crate::checksum::ChecksumMode;
+use crate::utils::base64_encode;
+use crate::{
     api_error_response::{err_entity_too_large, err_invalid_argument},
     api_put_object_common::optimal_part_info,
     api_put_object_multipart::UploadPartParams,

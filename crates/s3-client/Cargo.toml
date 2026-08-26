@@ -1,0 +1,73 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "rustfs-s3-client"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+homepage.workspace = true
+description = "S3 client used by RustFS when the storage engine consumes remote S3-compatible endpoints (tier warm backends, transition targets)."
+keywords = ["s3", "client", "tiering", "rustfs", "Minio"]
+categories = ["web-programming", "development-tools", "network-programming"]
+documentation = "https://docs.rs/rustfs-s3-client/latest/rustfs_s3_client/"
+
+[dependencies]
+rustfs-checksums.workspace = true
+rustfs-config.workspace = true
+rustfs-rio.workspace = true
+rustfs-signer.workspace = true
+rustfs-storage-api.workspace = true
+rustfs-tls-runtime.workspace = true
+rustfs-utils = { workspace = true, features = ["full"] }
+base64-simd.workspace = true
+bytes = { workspace = true, features = ["serde"] }
+hex-simd = { workspace = true }
+enumset = { workspace = true }
+futures.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body = { workspace = true }
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["http2", "http1", "server"] }
+hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs"] }
+hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
+lazy_static.workspace = true
+md-5.workspace = true
+quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
+rand = { workspace = true, features = ["serde"] }
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
+rustls-pki-types.workspace = true
+s3s = { workspace = true, features = ["minio"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+thiserror.workspace = true
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
+tokio = { workspace = true, features = ["io-util", "sync", "fs", "rt-multi-thread"] }
+tokio-util = { workspace = true, features = ["io", "compat"] }
+tower = { workspace = true, features = ["timeout"] }
+tracing.workspace = true
+url.workspace = true
+urlencoding = { workspace = true }
+uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnostics"] }
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false

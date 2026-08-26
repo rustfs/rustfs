@@ -55,7 +55,7 @@ use crate::bucket::replication::{
 };
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
+use crate::client::{object_api_utils::get_raw_etag, transition_api::ObjectReader, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
@@ -1559,8 +1559,8 @@ impl SetDisks {
     }
 }
 
-/// Get lock acquire timeout from environment variable RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT (in seconds)
-/// Defaults to 5 seconds if not set or invalid
+/// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
+/// Defaults to 30 seconds if not set or invalid
 /// Lock acquisition timeout. Cached: this is consulted on every object
 /// lock acquisition and `std::env::var` takes a process-global lock. In test
 /// builds the env var is read directly so `temp_env` overrides take effect.

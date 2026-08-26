@@ -20,7 +20,7 @@
 
 use super::constants::UNSIGNED_PAYLOAD;
 use super::credentials::SignatureType;
-use crate::client::{
+use crate::{
     api_error_response::http_resp_to_error_response,
     signer_error,
     transition_api::{CreateBucketConfiguration, LocationConstraint, TransitionClient},

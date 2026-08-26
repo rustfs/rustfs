@@ -19,11 +19,6 @@
 1|crates/ecstore/src/bucket/replication/replication_object_config.rs
 2|crates/ecstore/src/bucket/replication/replication_pool.rs
 2|crates/ecstore/src/bucket/replication/replication_target_boundary.rs
-1|crates/ecstore/src/client/api_put_object_multipart.rs
-2|crates/ecstore/src/client/api_put_object_streaming.rs
-1|crates/ecstore/src/client/api_s3_datatypes.rs
-1|crates/ecstore/src/client/signer_error.rs
-5|crates/ecstore/src/client/transition_api.rs
 3|crates/ecstore/src/cluster/rpc/http_auth.rs
 2|crates/ecstore/src/cluster/rpc/internode_data_transport.rs
 11|crates/ecstore/src/cluster/rpc/peer_rest_client.rs

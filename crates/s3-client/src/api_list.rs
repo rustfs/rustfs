@@ -18,7 +18,7 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use crate::client::{
+use crate::{
     api_error_response::http_resp_to_error_response,
     api_s3_datatypes::{
         ListBucketResult, ListBucketV2Result, ListMultipartUploadsResult, ListObjectPartsResult, ListVersionsResult, ObjectPart,
@@ -26,12 +26,12 @@ use crate::client::{
     credentials,
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, collect_response_body},
 };
-use crate::storage_api_contracts::bucket::BucketInfo;
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Body;
 use hyper::body::Bytes;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
+use rustfs_storage_api::BucketInfo;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use std::collections::HashMap;
 use std::io::ErrorKind;

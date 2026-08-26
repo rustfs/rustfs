@@ -27,6 +27,12 @@ cd "$(dirname "$0")/.."
 # to verify S3 behavior and does not widen the production s3s surface.
 S3S_IMPORT_FILES_BASELINE=211
 S3_ERROR_LINES_BASELINE=1620
+# ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
+# know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
+# client was extracted to crates/s3-client, where s3s usage is legitimate;
+# this counter ratchets the remaining serving-side s3s references out of
+# crates/ecstore. Baseline verified on 2026-08-26.
+S3S_ECSTORE_FILES_BASELINE=42
 S3S_PATH_PATTERN='(^|[^"[:alnum:]_])s3s::'
 E2E_TEST_GLOB='--glob=!crates/e2e_test/**'
 
@@ -47,11 +53,13 @@ run_rg_to() {
 
 run_rg_to "$TMP_DIR/import_files" -l "$S3S_PATH_PATTERN" --type rust $E2E_TEST_GLOB
 run_rg_to "$TMP_DIR/error_lines" -c 's3_error!' --type rust $E2E_TEST_GLOB
+run_rg_to "$TMP_DIR/ecstore_files" -l "$S3S_PATH_PATTERN" --type rust crates/ecstore/src
 
 s3s_import_files="$(grep -c . "$TMP_DIR/import_files" || true)"
 s3_error_lines="$(awk -F: '{sum += $NF} END {print sum + 0}' "$TMP_DIR/error_lines")"
+s3s_ecstore_files="$(grep -c . "$TMP_DIR/ecstore_files" || true)"
 
-for value in "$s3s_import_files" "$s3_error_lines"; do
+for value in "$s3s_import_files" "$s3_error_lines" "$s3s_ecstore_files"; do
     if ! [[ "$value" =~ ^[0-9]+$ ]]; then
         echo "error: could not compute s3s footprint counts (got: '$value')" >&2
         exit 1
@@ -82,6 +90,8 @@ check_ratchet "files importing s3s" "$s3s_import_files" "$S3S_IMPORT_FILES_BASEL
     "rg -l '$S3S_PATH_PATTERN' --type rust $E2E_TEST_GLOB"
 check_ratchet "s3_error! invocation lines" "$s3_error_lines" "$S3_ERROR_LINES_BASELINE" \
     "rg -c 's3_error!' --type rust $E2E_TEST_GLOB"
+check_ratchet "ecstore files referencing s3s" "$s3s_ecstore_files" "$S3S_ECSTORE_FILES_BASELINE" \
+    "rg -l '$S3S_PATH_PATTERN' --type rust crates/ecstore/src"
 
 if ((status != 0)); then
     exit 1

@@ -16,7 +16,7 @@ use std::error::Error as StdError;
 use std::fmt::{Display, Formatter};
 use std::io::{Error, ErrorKind};
 
-pub(crate) const SIGNER_HEADER_ERROR_MARKER: &str = "rustfs_signer_header_error";
+pub const SIGNER_HEADER_ERROR_MARKER: &str = "rustfs_signer_header_error";
 
 #[derive(Debug)]
 struct SignerHeaderError {
@@ -45,18 +45,18 @@ impl Display for SignerHeaderError {
 
 impl StdError for SignerHeaderError {}
 
-pub(crate) fn invalid_utf8_header_error(scope: &str, header_name: &str) -> Error {
+pub fn invalid_utf8_header_error(scope: &str, header_name: &str) -> Error {
     Error::new(ErrorKind::InvalidInput, SignerHeaderError::new(scope, header_name))
 }
 
-pub(crate) fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> Error {
+pub fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> Error {
     match error {
         rustfs_signer::SignV4Error::InvalidHeaderValue { name } => invalid_utf8_header_error(scope, &name),
         other => Error::other(format!("{scope}: {other}")),
     }
 }
 
-pub(crate) fn error_chain_contains_signer_header_marker(err: &(dyn StdError + 'static)) -> bool {
+pub fn error_chain_contains_signer_header_marker(err: &(dyn StdError + 'static)) -> bool {
     let mut current = Some(err);
     while let Some(source) = current {
         if source.downcast_ref::<SignerHeaderError>().is_some() {

@@ -36,15 +36,12 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::Instrument;
 
-use crate::client::utils::base64_encode;
-use crate::client::{
+use crate::transition_api::ObjectInfo;
+use crate::utils::base64_encode;
+use crate::{
     api_error_response::{ErrorResponse, http_resp_to_error_response, to_error_response},
     api_s3_datatypes::{DeleteMultiObjects, DeleteObject},
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
-};
-use crate::{
-    disk::DiskAPI,
-    object_api::{GetObjectReader, ObjectInfo},
 };
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 
@@ -366,7 +363,13 @@ impl TransitionClient {
                     body_vec.extend_from_slice(data);
                 }
             }
-            process_remove_multi_objects_response(ReaderImpl::Body(Bytes::from(body_vec)), &batch, result_tx.clone()).await;
+            process_remove_multi_objects_response(
+                ReaderImpl::Body(Bytes::from(body_vec)),
+                bucket_name,
+                &batch,
+                result_tx.clone(),
+            )
+            .await;
         }
         Ok(())
     }
@@ -553,6 +556,7 @@ pub fn generate_remove_multi_objects_request(objects: &[ObjectInfo]) -> Vec<u8> 
 
 pub async fn process_remove_multi_objects_response(
     body: ReaderImpl,
+    bucket_name: &str,
     objects: &[ObjectInfo],
     result_tx: Sender<RemoveObjectResult>,
 ) {
@@ -575,7 +579,7 @@ pub async fn process_remove_multi_objects_response(
                             err: Some(std::io::Error::other(ErrorResponse {
                                 code: S3ErrorCode::Custom("ReadDeleteResponseFailed".into()),
                                 message: format!("read multi remove response failed: {err}"),
-                                bucket_name: object.bucket.clone(),
+                                bucket_name: bucket_name.to_string(),
                                 key: object.name.clone(),
                                 resource: "".to_string(),
                                 request_id: "".to_string(),
@@ -647,7 +651,7 @@ pub async fn process_remove_multi_objects_response(
                                 "unmarshal multi remove response failed: {err}; response_body={}",
                                 body.chars().take(DELETE_RESPONSE_PREVIEW_LEN).collect::<String>()
                             ),
-                            bucket_name: object.bucket.clone(),
+                            bucket_name: bucket_name.to_string(),
                             key: object.name.clone(),
                             resource: "".to_string(),
                             request_id: "".to_string(),
@@ -707,13 +711,7 @@ pub async fn process_remove_multi_objects_response(
     }
 
     for (object_name, object_version_id) in pending {
-        let bucket_name = objects
-            .iter()
-            .find(|object| {
-                object.name == object_name && object.version_id.as_ref().map(|v| v.to_string()) == Some(object_version_id.clone())
-            })
-            .map(|o| o.bucket.clone())
-            .unwrap_or_default();
+        let bucket_name = bucket_name.to_string();
         let object_name = object_name;
         let object_version_id = object_version_id;
         let error_message = format!(
@@ -750,7 +748,7 @@ fn has_invalid_xml_char(str: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{
+    use crate::{
         credentials::{Credentials, SignatureType, Static, Value},
         transition_api::{BucketLookupType, Options},
     };
@@ -808,7 +806,6 @@ mod tests {
     #[tokio::test]
     async fn multi_object_delete_request_uses_lowercase_hex_sha256_header() {
         let objects = vec![ObjectInfo {
-            bucket: "bucket".to_string(),
             name: "object.txt".to_string(),
             ..Default::default()
         }];
