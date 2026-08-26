@@ -1364,7 +1364,7 @@ pub(in crate::set_disk) enum ReadRepairAdmissionOutcome {
 
 pub(in crate::set_disk) type ReadRepairAdmissionFuture = Pin<Box<dyn Future<Output = ReadRepairAdmissionOutcome> + Send>>;
 pub(in crate::set_disk) type ReadRepairAdmissionSubmitter =
-    fn(rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture;
+    fn(rustfs_heal_contracts::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture;
 
 pub(in crate::set_disk) struct ReadRepairHealSubmission<'a> {
     pub(in crate::set_disk) bucket: &'a str,
@@ -1385,7 +1385,7 @@ pub(in crate::set_disk) struct ReadRepairHealSubmission<'a> {
 }
 
 pub(in crate::set_disk) fn send_read_repair_heal_request(
-    request: rustfs_common::heal_channel::HealChannelRequest,
+    request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
 ) -> ReadRepairAdmissionFuture {
     Box::pin(async {
         match send_heal_request_with_admission(request).await {
@@ -1453,7 +1453,7 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(kind, bucket, object, version_uuid, Some(scope));
     }
 
-    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+    let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
         bucket.to_string(),
         Some(object.to_string()),
         false,
@@ -3580,7 +3580,7 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     tail_drain: tokio::task::JoinHandle<Option<RenameTailOutcome>>,
     guard_release: tokio::sync::oneshot::Receiver<bool>,
     guards: Guards,
-    request: rustfs_common::heal_channel::HealChannelRequest,
+    request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     finalize: Finalize,
     cleanup: Cleanup,
     submit: Submit,
@@ -3590,7 +3590,7 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     FinalizeFuture: Future<Output = ()> + Send,
     Cleanup: FnOnce(Guards, Vec<RenameTailCleanup>) -> CleanupFuture + Send,
     CleanupFuture: Future<Output = ()> + Send,
-    Submit: FnOnce(rustfs_common::heal_channel::HealChannelRequest) -> SubmitFuture + Send,
+    Submit: FnOnce(rustfs_heal_contracts::heal_channel::HealChannelRequest) -> SubmitFuture + Send,
     SubmitFuture: Future<Output = ()> + Send,
 {
     let (needs_heal, tail_cleanup, tail_complete) = match tail_drain.await {
@@ -4939,16 +4939,17 @@ impl SetDisks {
             // reclaim_orphan_data_dirs. Reuses the existing heal channel, which
             // deduplicates and back-pressures via admission; failures only drop
             // the return value (same shape as multipart's existing heal enqueue).
-            let _ =
-                rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
+            let _ = rustfs_heal_contracts::heal_channel::send_heal_request(
+                rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                     bucket.to_string(),
                     Some(object.to_string()),
                     false,
-                    Some(rustfs_common::heal_channel::HealChannelPriority::Normal),
+                    Some(rustfs_heal_contracts::heal_channel::HealChannelPriority::Normal),
                     Some(self.pool_index),
                     Some(self.set_index),
-                ))
-                .await;
+                ),
+            )
+            .await;
         }
     }
 
@@ -6800,18 +6801,24 @@ mod tests {
         write_raw_file_meta_unchecked(disk, bucket, object, metadata).await;
     }
 
-    fn failed_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn failed_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         Box::pin(async { ReadRepairAdmissionOutcome::Failed("injected submit failure".to_string()) })
     }
 
-    fn accepted_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn accepted_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
     }
 
-    fn dropped_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn dropped_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         Box::pin(async {
             ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(
-                rustfs_common::heal_channel::HealAdmissionDropReason::PolicyDropped,
+                rustfs_heal_contracts::heal_channel::HealAdmissionDropReason::PolicyDropped,
             ))
         })
     }
@@ -8853,7 +8860,7 @@ mod tests {
             tail_drain,
             released,
             (),
-            rustfs_common::heal_channel::HealChannelRequest::default(),
+            rustfs_heal_contracts::heal_channel::HealChannelRequest::default(),
             move || async move {
                 *finalize_captured.lock().expect("finalize recorder should not poison") = true;
             },

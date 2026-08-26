@@ -24,13 +24,15 @@ use crate::{
 use futures::future::join_all;
 use metrics::counter;
 use rand::seq::SliceRandom as _;
-use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics};
 #[cfg(test)]
 use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
 use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo};
 use rustfs_filemeta::FileMeta;
+use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{LockError, NamespaceLockGuard};
+use rustfs_scanner_contracts::metrics::{
+    Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics,
+};
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::{
     BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, VersioningConfiguration,

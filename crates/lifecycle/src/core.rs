@@ -62,7 +62,7 @@ const ERR_LIFECYCLE_EXPIRED_OBJECT_DELETE_MARKER_WITH_TAGS: &str =
 const ERR_LIFECYCLE_RULE_MUST_HAVE_ACTION: &str = "Rule must have at least one of Expiration, Transition, NoncurrentVersionExpiration, NoncurrentVersionTransition, or DelMarkerExpiration";
 const ERR_LIFECYCLE_PREFIX_FILTER_CONFLICT: &str = "Legacy Prefix and Filter cannot both be present in a lifecycle rule. Use Filter.Prefix instead of the top-level Prefix element.";
 
-pub use rustfs_common::metrics::IlmAction;
+pub use rustfs_scanner_contracts::metrics::IlmAction;
 
 #[async_trait::async_trait]
 pub trait RuleValidate {

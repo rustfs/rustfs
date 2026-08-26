@@ -121,14 +121,14 @@ fn test_heal_task_status_atomic_update() {
             _bucket: &str,
             _object: &str,
             _version_id: Option<&str>,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
         async fn heal_bucket(
             &self,
             _bucket: &str,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> rustfs_heal::Result<rustfs_madmin::heal_commands::HealResultItem> {
             Ok(rustfs_madmin::heal_commands::HealResultItem::default())
         }
@@ -221,7 +221,7 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             _bucket: &str,
             _object: &str,
             _version_id: Option<&str>,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> rustfs_heal::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<rustfs_heal::Error>)> {
             self.heal_object_calls.fetch_add(1, Ordering::SeqCst);
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
@@ -230,7 +230,7 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
         async fn heal_bucket(
             &self,
             _bucket: &str,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> rustfs_heal::Result<rustfs_madmin::heal_commands::HealResultItem> {
             Ok(rustfs_madmin::heal_commands::HealResultItem::default())
         }

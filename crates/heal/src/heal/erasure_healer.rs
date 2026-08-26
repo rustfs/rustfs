@@ -24,7 +24,7 @@ use crate::heal::{
 use crate::{Error, Result};
 use futures::{StreamExt, stream::FuturesUnordered};
 use metrics::{counter, gauge};
-use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::{
     Arc,
@@ -1346,7 +1346,7 @@ impl ErasureSetHealer {
 #[cfg(test)]
 mod tests {
     use super::{ErasureSetHealer, PageConcurrencyGuard};
-    use rustfs_common::heal_channel::{HealRequestSource, HealScanMode};
+    use rustfs_heal_contracts::heal_channel::{HealRequestSource, HealScanMode};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1523,7 +1523,7 @@ mod resume_loop_tests {
         BUCKET_META_PREFIX, DiskOption, DiskStore, EcstoreError, Endpoint, HealDiskExt as _, RUSTFS_META_BUCKET, new_disk,
     };
     use crate::{Error, Result};
-    use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
+    use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::sync::atomic::{AtomicBool, Ordering};

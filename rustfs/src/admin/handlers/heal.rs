@@ -28,11 +28,11 @@ use futures_util::future::join_all;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_common::heal_channel::{
-    HealAdmissionReceipt, HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource, HealScanMode,
-};
 use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_heal::heal::utils::format_set_disk_id;
+use rustfs_heal_contracts::heal_channel::{
+    HealAdmissionReceipt, HealChannelPriority, HealChannelRequest, HealOpts, HealRequestSource, HealScanMode,
+};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
 use rustfs_utils::path::path_join;
@@ -960,8 +960,8 @@ async fn submit_cluster_heal_start(
     }
 }
 
-fn reject_heal_admission(result: rustfs_common::heal_channel::HealAdmissionResult) -> s3s::S3Error {
-    use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
+fn reject_heal_admission(result: rustfs_heal_contracts::heal_channel::HealAdmissionResult) -> s3s::S3Error {
+    use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 
     match result {
         HealAdmissionResult::Full | HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull) => s3_error!(
@@ -996,10 +996,10 @@ async fn submit_cluster_heal_channel_command(
     envelope: rustfs_protos::heal_control::Envelope,
     request_id: &str,
     response_id: String,
-) -> S3Result<rustfs_common::heal_channel::HealChannelResponse> {
+) -> S3Result<rustfs_heal_contracts::heal_channel::HealChannelResponse> {
     match route_cluster_heal_control(&context, &route, envelope, request_id, false).await? {
         rustfs_protos::heal_control::Outcome::Channel { success, data, error } => {
-            Ok(rustfs_common::heal_channel::HealChannelResponse {
+            Ok(rustfs_heal_contracts::heal_channel::HealChannelResponse {
                 request_id: response_id,
                 success,
                 data,
@@ -1087,7 +1087,7 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
     } else {
         hip.hs.recursive
     };
-    let mut heal_request = rustfs_common::heal_channel::create_heal_request(
+    let mut heal_request = rustfs_heal_contracts::heal_channel::create_heal_request(
         hip.bucket.clone(),
         if hip.obj_prefix.is_empty() {
             None
@@ -1115,7 +1115,7 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
 }
 
 fn heal_channel_response_status(
-    response: &rustfs_common::heal_channel::HealChannelResponse,
+    response: &rustfs_heal_contracts::heal_channel::HealChannelResponse,
 ) -> (String, Vec<rustfs_madmin::heal_commands::HealResultItem>, bool, Option<serde_json::Value>) {
     let Some(data) = response.data.as_deref() else {
         return ("running".to_string(), Vec::new(), false, None);
@@ -1136,19 +1136,21 @@ fn heal_channel_response_status(
 }
 
 #[cfg(test)]
-fn heal_channel_response_summary(response: &rustfs_common::heal_channel::HealChannelResponse) -> String {
+fn heal_channel_response_summary(response: &rustfs_heal_contracts::heal_channel::HealChannelResponse) -> String {
     heal_channel_response_status(response).0
 }
 
 #[cfg(test)]
 fn heal_channel_response_items(
-    response: &rustfs_common::heal_channel::HealChannelResponse,
+    response: &rustfs_heal_contracts::heal_channel::HealChannelResponse,
 ) -> Vec<rustfs_madmin::heal_commands::HealResultItem> {
     heal_channel_response_status(response).1
 }
 
 #[cfg(test)]
-fn heal_channel_response_progress(response: &rustfs_common::heal_channel::HealChannelResponse) -> Option<serde_json::Value> {
+fn heal_channel_response_progress(
+    response: &rustfs_heal_contracts::heal_channel::HealChannelResponse,
+) -> Option<serde_json::Value> {
     heal_channel_response_status(response).3
 }
 
@@ -1524,7 +1526,7 @@ mod tests {
     use http::StatusCode;
     use http::Uri;
     use matchit::Router;
-    use rustfs_common::heal_channel::{
+    use rustfs_heal_contracts::heal_channel::{
         HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealOpts, HealRequestSource, HealScanMode,
     };
     use rustfs_scanner::scanner::BackgroundHealInfo;
@@ -1718,7 +1720,7 @@ mod tests {
             dry_run: false,
             remove: true,
             recreate: false,
-            scan_mode: rustfs_common::heal_channel::HealScanMode::Normal,
+            scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Normal,
             update_parity: false,
             no_lock: true,
             pool: Some(1),
@@ -2640,11 +2642,15 @@ mod tests {
 
     #[test]
     fn test_heal_channel_response_summary_defaults_to_running() {
-        let response = rustfs_common::heal_channel::create_heal_response("token".to_string(), true, None, None);
+        let response = rustfs_heal_contracts::heal_channel::create_heal_response("token".to_string(), true, None, None);
         assert_eq!(heal_channel_response_summary(&response), "running");
 
-        let response =
-            rustfs_common::heal_channel::create_heal_response("token".to_string(), true, Some(b"finished".to_vec()), None);
+        let response = rustfs_heal_contracts::heal_channel::create_heal_response(
+            "token".to_string(),
+            true,
+            Some(b"finished".to_vec()),
+            None,
+        );
         assert_eq!(heal_channel_response_summary(&response), "finished");
     }
 
@@ -2668,7 +2674,7 @@ mod tests {
                 "objectSize": 1024
             }]
         });
-        let response = rustfs_common::heal_channel::create_heal_response(
+        let response = rustfs_heal_contracts::heal_channel::create_heal_response(
             "token".to_string(),
             true,
             Some(serde_json::to_vec(&payload).expect("payload should serialize")),
@@ -2695,7 +2701,7 @@ mod tests {
             "items": [],
             "progress": progress
         });
-        let response = rustfs_common::heal_channel::create_heal_response(
+        let response = rustfs_heal_contracts::heal_channel::create_heal_response(
             "token".to_string(),
             true,
             Some(serde_json::to_vec(&payload).expect("payload should serialize")),

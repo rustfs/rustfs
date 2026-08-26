@@ -57,6 +57,7 @@ hotpath.workspace = true
 async-trait.workspace = true
 metrics.workspace = true
 rustfs-common.workspace = true
+rustfs-scanner-contracts.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-replication.workspace = true
 rustfs-storage-api.workspace = true

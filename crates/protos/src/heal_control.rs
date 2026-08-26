@@ -20,7 +20,7 @@
 //! contextual lease and nonce validation.
 
 use rmp_serde::Deserializer;
-use rustfs_common::heal_channel::{
+use rustfs_heal_contracts::heal_channel::{
     HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealChannelResponse,
     HealRequestSource, HealScanMode,
 };
@@ -617,7 +617,7 @@ mod tests {
         Admission, ENVELOPE_MAX_SIZE, Envelope, ExecutableCommand, Outcome, RESULT_MAX_SIZE, RequestMetadata, ResultEnvelope,
         decode_envelope, decode_result, encode_result,
     };
-    use rustfs_common::heal_channel::{HealChannelRequest, HealChannelResponse, HealRequestSource};
+    use rustfs_heal_contracts::heal_channel::{HealChannelRequest, HealChannelResponse, HealRequestSource};
     use serde::de::{DeserializeSeed, SeqAccess, Visitor, value::Error as ValueError};
 
     fn test_request(request_id: String) -> HealChannelRequest {

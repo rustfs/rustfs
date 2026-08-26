@@ -161,8 +161,8 @@ impl ScannerIODisk for Disk {
         let bucket = cache.info.name.clone();
         let disk_path = self.path().to_string_lossy().to_string();
         let source = match scan_mode {
-            HealScanMode::Deep => rustfs_common::metrics::ScannerWorkSource::Bitrot,
-            HealScanMode::Normal | HealScanMode::Unknown => rustfs_common::metrics::ScannerWorkSource::Usage,
+            HealScanMode::Deep => rustfs_scanner_contracts::metrics::ScannerWorkSource::Bitrot,
+            HealScanMode::Normal | HealScanMode::Unknown => rustfs_scanner_contracts::metrics::ScannerWorkSource::Usage,
         };
         global_metrics().record_scan_bucket_drive_start(source, &bucket, &disk_path);
         let mut failure_guard = BucketDriveFailureGuard::new(source, &bucket, &disk_path);

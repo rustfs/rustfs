@@ -19,7 +19,7 @@ use crate::heal::{
     utils,
 };
 use crate::{Error, Result};
-use rustfs_common::heal_channel::{
+use rustfs_heal_contracts::heal_channel::{
     HealAdmissionReceipt, HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest,
     HealChannelResponse, HealReceiptCommand, HealReceiptReceiver, HealRequestSource, HealScanMode, publish_heal_response,
 };
@@ -763,7 +763,7 @@ mod tests {
     use super::*;
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
-    use rustfs_common::heal_channel::{
+    use rustfs_heal_contracts::heal_channel::{
         HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
     };
     use std::sync::Arc;
@@ -793,14 +793,14 @@ mod tests {
             _bucket: &str,
             _object: &str,
             _version_id: Option<&str>,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> crate::Result<(rustfs_madmin::heal_commands::HealResultItem, Option<crate::Error>)> {
             Ok((rustfs_madmin::heal_commands::HealResultItem::default(), None))
         }
         async fn heal_bucket(
             &self,
             _bucket: &str,
-            _opts: &rustfs_common::heal_channel::HealOpts,
+            _opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         ) -> crate::Result<rustfs_madmin::heal_commands::HealResultItem> {
             Ok(rustfs_madmin::heal_commands::HealResultItem::default())
         }
@@ -1368,7 +1368,7 @@ mod tests {
             source: HealRequestSource::Admin,
             ..Default::default()
         };
-        let mut responses = rustfs_common::heal_channel::subscribe_heal_responses();
+        let mut responses = rustfs_heal_contracts::heal_channel::subscribe_heal_responses();
 
         let (tx, rx) = oneshot::channel();
         processor

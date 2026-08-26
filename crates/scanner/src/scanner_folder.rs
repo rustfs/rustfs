@@ -41,18 +41,18 @@ use crate::storage_api::owner::{
 #[cfg(test)]
 use crate::storage_api::owner::{EcstoreExpirationStatus as ExpirationStatus, EcstoreLifecycleRule as LifecycleRule};
 use metrics::{counter, describe_counter};
-use rustfs_common::heal_channel::{
-    HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
-    HealRequestSource, HealScanMode, send_heal_request_with_admission,
-};
-use rustfs_common::metrics::{
-    CloseDiskGuard, IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource,
-    UpdateCurrentPathFn, current_path_updater, global_metrics,
-};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit, trace_subscriber_count};
 use rustfs_filemeta::{
     MAX_META_CACHE_HEAL_CANDIDATES, MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS, MetaCacheEntries, MetaCacheEntry,
     MetaCacheHealCandidateKind,
+};
+use rustfs_heal_contracts::heal_channel::{
+    HEAL_DELETE_DANGLING, HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest,
+    HealRequestSource, HealScanMode, send_heal_request_with_admission,
+};
+use rustfs_scanner_contracts::metrics::{
+    CloseDiskGuard, IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource,
+    UpdateCurrentPathFn, current_path_updater, global_metrics,
 };
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use time::OffsetDateTime;

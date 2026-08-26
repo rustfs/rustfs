@@ -16,8 +16,8 @@ use super::runtime_boundary as runtime_sources;
 use crate::bucket::lifecycle::lifecycle;
 use crate::object_api::ObjectInfo;
 use crate::services::event_notification::{EventArgs, send_event};
-use rustfs_common::metrics::IlmAction;
 use rustfs_s3_types::EventName;
+use rustfs_scanner_contracts::metrics::IlmAction;
 
 const LIFECYCLE_EXPIRY_USER_AGENT: &str = "Internal: [ILM-Expiry]";
 const LIFECYCLE_TRANSITION_USER_AGENT: &str = "Internal: [ILM-Transition]";

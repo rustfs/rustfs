@@ -2386,8 +2386,8 @@ mod heal_result_report_tests {
         store::init_format::{load_format_erasure, save_format_file},
     };
     use bytes::Bytes;
-    use rustfs_common::heal_channel::{DriveState, HealOpts, HealScanMode};
     use rustfs_filemeta::{BLOCK_SIZE_V2, FileInfo, ObjectPartInfo, TRANSITION_COMPLETE};
+    use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealScanMode};
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
     use time::OffsetDateTime;

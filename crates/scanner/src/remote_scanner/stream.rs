@@ -26,9 +26,9 @@ use crate::{
     scanner_publication_admission_for_epoch, scanner_publication_epoch,
 };
 use hmac::{Hmac, KeyInit, Mac};
-use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{Metric, Metrics};
 use rustfs_credentials::try_get_rpc_token;
+use rustfs_heal_contracts::heal_channel::HealScanMode;
+use rustfs_scanner_contracts::metrics::{Metric, Metrics};
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;

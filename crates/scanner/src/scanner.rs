@@ -40,12 +40,6 @@ use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError, ScannerRuntimeGua
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO, ScannerObjectOptions};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult, ScannerWorkSource,
-    emit_scan_cycle_complete, emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded,
-    global_metrics,
-};
 use rustfs_config::ScannerSpeed;
 #[cfg(test)]
 use rustfs_config::{
@@ -54,7 +48,13 @@ use rustfs_config::{
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
 use rustfs_data_usage::observed_data_usage_is_newer;
+use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{NamespaceLockGuard, error::LockError};
+use rustfs_scanner_contracts::metrics::{
+    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult, ScannerWorkSource,
+    emit_scan_cycle_complete, emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded,
+    global_metrics,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, mpsc};

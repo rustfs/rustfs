@@ -24,10 +24,10 @@
 #![recursion_limit = "256"]
 
 use http::HeaderMap;
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_heal::heal::storage::{
     ECStoreHealStorage, HealListItem, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI,
 };
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use serial_test::serial;
 use std::{
     future::Future,

@@ -17,7 +17,7 @@ use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions
 use super::storage_api::test::contract::heal::HealOperations as _;
 use super::storage_api::test::contract::object::ObjectIO as _;
 use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use serial_test::serial;
 use std::{

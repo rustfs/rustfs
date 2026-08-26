@@ -16,8 +16,8 @@ use crate::module_switches::{heal_enabled_from_env, scanner_enabled_from_env};
 use crate::storage::storage_api::runtime_sources_consumer::EndpointServerPools;
 use jiff::Timestamp;
 use rmp_serde::Deserializer;
-use rustfs_common::heal_channel::HealScanMode;
 use rustfs_heal::HealOperationsSnapshot;
+use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_scanner::scanner::BackgroundHealInfo;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -770,7 +770,7 @@ mod tests {
             BackgroundHealInfo {
                 bitrot_start_time: Some(started_at),
                 bitrot_start_cycle: 9,
-                current_scan_mode: rustfs_common::heal_channel::HealScanMode::Deep,
+                current_scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
             },
             HealOperationsSnapshot::default(),
             None,
