@@ -73,7 +73,7 @@ The main crate is organized in layers, top to bottom:
 |-------|-----------|----------------|
 | **Server** | `server/` | HTTP listener, TLS, CORS, compression, middleware, graceful shutdown |
 | **Admin** | `admin/` | Admin API routing, 30+ handler modules, web console |
-| **App** | `app/` | Use-case orchestration: object_usecase, bucket_usecase, multipart_usecase |
+| **App** | `app/` | Use-case orchestration: object (per-operation modules under `app/object/`, re-exported as `object_usecase`), bucket_usecase, multipart_usecase |
 | **Storage** | `storage/` | S3 API translation, erasure-coded FS, SSE encryption, RPC, concurrency |
 | **Auth** | `auth.rs` | S3 signature verification, credential validation |
 | **Config** | `config/` | CLI parsing, config struct, workload profiles |

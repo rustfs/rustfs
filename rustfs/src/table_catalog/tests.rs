@@ -16421,13 +16421,16 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         include_str!("../app/object/extract.rs"),
         include_str!("../app/object/put.rs"),
         include_str!("../app/object/copy.rs"),
+        include_str!("../app/object/delete.rs"),
+        include_str!("../app/object/head.rs"),
+        include_str!("../app/object/restore.rs"),
     ]
     .concat();
-    let delete_object = source
+    let delete_module = include_str!("../app/object/delete.rs");
+    let delete_object = delete_module
         .split_once("pub async fn execute_delete_object")
-        .and_then(|(_, remainder)| remainder.split_once("pub async fn execute_head_object"))
-        .map(|(delete_object, _)| delete_object)
-        .expect("delete object entrypoint should remain in the object usecase");
+        .map(|(_, remainder)| remainder.split_once("\nmod tests").map_or(remainder, |(entrypoints, _)| entrypoints))
+        .expect("delete object entrypoints should remain in app/object/delete.rs");
 
     for expected in [
         "validate_object_key(&key, request_method_name)?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
