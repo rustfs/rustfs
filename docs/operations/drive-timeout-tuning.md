@@ -62,6 +62,8 @@ Explicit per-operation overrides always win over the profile, so you can select
 | `RUSTFS_DRIVE_METADATA_TIMEOUT_SECS` | `5` | `60` | Timeout for metadata reads such as `read_metadata`. |
 | `RUSTFS_DRIVE_DISK_INFO_TIMEOUT_SECS` | `5` | `60` | Timeout for `disk_info()` calls. |
 | `RUSTFS_OBJECT_DISK_READ_TIMEOUT` | `10` | `60` | Per-read stall budget while streaming an object body from disk. |
+| `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3` | `60` | Base cooperative budget for an object-capacity disk scan. |
+| `RUSTFS_CAPACITY_MAX_TIMEOUT` | `15` | `60` | Upper bound for the dynamically adjusted object-capacity scan budget. |
 | `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION` | `30` | — | Deprecated global fallback for every per-operation knob without an explicit override. Prefer the per-operation knobs. |
 
 The health-transition and probe knobs (`RUSTFS_DRIVE_TIMEOUT_HEALTH_ACTION`,

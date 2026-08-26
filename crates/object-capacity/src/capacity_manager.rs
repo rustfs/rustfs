@@ -20,19 +20,21 @@ use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, drain_global_dirty
 use futures::FutureExt;
 use rustfs_config::{
     DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS,
-    DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_FAST_UPDATE_THRESHOLD_SECS,
-    DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS, DEFAULT_STAT_TIMEOUT_SECS,
-    DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS, ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
+    DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, DEFAULT_DRIVE_TIMEOUT_PROFILE,
+    DEFAULT_FAST_UPDATE_THRESHOLD_SECS, DEFAULT_MAX_FILES_THRESHOLD, DEFAULT_SAMPLE_RATE, DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS,
+    DEFAULT_STAT_TIMEOUT_SECS, DEFAULT_WRITE_FREQUENCY_THRESHOLD, DEFAULT_WRITE_TRIGGER_DELAY_SECS,
+    DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY, DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS, ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT,
     ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_FOLLOW_SYMLINKS, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_MAX_TIMEOUT,
     ENV_CAPACITY_METRICS_INTERVAL, ENV_CAPACITY_MIN_TIMEOUT, ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_SCHEDULED_INTERVAL,
     ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+    ENV_DRIVE_TIMEOUT_PROFILE,
 };
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_current_bytes, record_capacity_degraded_reading, record_capacity_dirty_disk_count,
     record_capacity_refresh_inflight, record_capacity_refresh_joiner, record_capacity_refresh_result,
     record_capacity_update_completed, record_capacity_update_failed, record_capacity_write_operation,
 };
-use rustfs_utils::{get_env_bool, get_env_u64, get_env_usize};
+use rustfs_utils::{get_env_bool, get_env_str, get_env_u64, get_env_usize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -112,6 +114,15 @@ fn env_u64_at_least(env: &'static str, default: u64, min: u64) -> u64 {
     }
 }
 
+fn capacity_timeout_profile_default(default: u64) -> u64 {
+    let profile = get_env_str(ENV_DRIVE_TIMEOUT_PROFILE, DEFAULT_DRIVE_TIMEOUT_PROFILE);
+    if profile.trim().eq_ignore_ascii_case(DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY) {
+        DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS
+    } else {
+        default
+    }
+}
+
 impl CachedCapacityConfig {
     /// Build configuration from environment variables
     fn from_env() -> Self {
@@ -131,7 +142,11 @@ impl CachedCapacityConfig {
             )),
             max_files_threshold: env_u64_at_least(ENV_CAPACITY_MAX_FILES_THRESHOLD, DEFAULT_MAX_FILES_THRESHOLD as u64, 1)
                 as usize,
-            stat_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_STAT_TIMEOUT, DEFAULT_STAT_TIMEOUT_SECS, 1)),
+            stat_timeout: Duration::from_secs(env_u64_at_least(
+                ENV_CAPACITY_STAT_TIMEOUT,
+                capacity_timeout_profile_default(DEFAULT_STAT_TIMEOUT_SECS),
+                1,
+            )),
             sample_rate: get_env_usize(ENV_CAPACITY_SAMPLE_RATE, DEFAULT_SAMPLE_RATE),
             metrics_interval: Duration::from_secs(get_env_u64(
                 ENV_CAPACITY_METRICS_INTERVAL,
@@ -140,7 +155,11 @@ impl CachedCapacityConfig {
             follow_symlinks: get_env_bool(ENV_CAPACITY_FOLLOW_SYMLINKS, DEFAULT_CAPACITY_FOLLOW_SYMLINKS),
             enable_dynamic_timeout: get_env_bool(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, DEFAULT_CAPACITY_ENABLE_DYNAMIC_TIMEOUT),
             min_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_MIN_TIMEOUT, DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 1)),
-            max_timeout: Duration::from_secs(env_u64_at_least(ENV_CAPACITY_MAX_TIMEOUT, DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 1)),
+            max_timeout: Duration::from_secs(env_u64_at_least(
+                ENV_CAPACITY_MAX_TIMEOUT,
+                capacity_timeout_profile_default(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS),
+                1,
+            )),
         }
     }
 }
@@ -1497,9 +1516,10 @@ mod tests {
     use super::*;
     use crate::capacity_scope::{CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope};
     use rustfs_config::{
-        ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD, ENV_CAPACITY_METRICS_INTERVAL,
-        ENV_CAPACITY_SAMPLE_RATE, ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
-        ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+        DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY, ENV_CAPACITY_FAST_UPDATE_THRESHOLD, ENV_CAPACITY_MAX_FILES_THRESHOLD,
+        ENV_CAPACITY_MAX_TIMEOUT, ENV_CAPACITY_METRICS_INTERVAL, ENV_CAPACITY_MIN_TIMEOUT, ENV_CAPACITY_SAMPLE_RATE,
+        ENV_CAPACITY_STAT_TIMEOUT, ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, ENV_CAPACITY_WRITE_TRIGGER_DELAY,
+        ENV_DRIVE_TIMEOUT_PROFILE,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1719,11 +1739,13 @@ mod tests {
 
     #[test]
     fn test_config_getter_defaults() {
-        for (env_var, getter, default, _, _) in config_getter_cases() {
-            temp_env::with_var(env_var, None::<&str>, || {
-                assert_eq!(getter(), default, "{env_var}: unexpected default value");
-            });
-        }
+        temp_env::with_var_unset(ENV_DRIVE_TIMEOUT_PROFILE, || {
+            for (env_var, getter, default, _, _) in config_getter_cases() {
+                temp_env::with_var(env_var, None::<&str>, || {
+                    assert_eq!(getter(), default, "{env_var}: unexpected default value");
+                });
+            }
+        });
     }
 
     #[test]
@@ -1747,11 +1769,67 @@ mod tests {
             (ENV_CAPACITY_MIN_TIMEOUT, || get_min_timeout().as_secs(), 2),
             (ENV_CAPACITY_MAX_TIMEOUT, || get_max_timeout().as_secs(), 15),
         ];
-        for (env_var, getter, default) in zero_cases {
-            temp_env::with_var(env_var, Some("0"), || {
-                assert_eq!(getter(), default, "{env_var}: zero must clamp to default");
-            });
-        }
+        temp_env::with_var_unset(ENV_DRIVE_TIMEOUT_PROFILE, || {
+            for (env_var, getter, default) in zero_cases {
+                temp_env::with_var(env_var, Some("0"), || {
+                    assert_eq!(getter(), default, "{env_var}: zero must clamp to default");
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn capacity_timeouts_use_high_latency_drive_profile_defaults() {
+        temp_env::with_vars(
+            [
+                (ENV_DRIVE_TIMEOUT_PROFILE, Some(DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY)),
+                (ENV_CAPACITY_STAT_TIMEOUT, None),
+                (ENV_CAPACITY_MIN_TIMEOUT, None),
+                (ENV_CAPACITY_MAX_TIMEOUT, None),
+            ],
+            || {
+                let config = CachedCapacityConfig::from_env();
+                assert_eq!(config.stat_timeout, Duration::from_secs(60));
+                assert_eq!(config.min_timeout, Duration::from_secs(2));
+                assert_eq!(config.max_timeout, Duration::from_secs(60));
+            },
+        );
+    }
+
+    #[test]
+    fn explicit_capacity_timeouts_override_high_latency_drive_profile() {
+        temp_env::with_vars(
+            [
+                (ENV_DRIVE_TIMEOUT_PROFILE, Some(DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY)),
+                (ENV_CAPACITY_STAT_TIMEOUT, Some("7")),
+                (ENV_CAPACITY_MIN_TIMEOUT, Some("4")),
+                (ENV_CAPACITY_MAX_TIMEOUT, Some("11")),
+            ],
+            || {
+                let config = CachedCapacityConfig::from_env();
+                assert_eq!(config.stat_timeout, Duration::from_secs(7));
+                assert_eq!(config.min_timeout, Duration::from_secs(4));
+                assert_eq!(config.max_timeout, Duration::from_secs(11));
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_drive_profile_preserves_capacity_defaults() {
+        temp_env::with_vars(
+            [
+                (ENV_DRIVE_TIMEOUT_PROFILE, Some("invalid")),
+                (ENV_CAPACITY_STAT_TIMEOUT, None),
+                (ENV_CAPACITY_MIN_TIMEOUT, None),
+                (ENV_CAPACITY_MAX_TIMEOUT, None),
+            ],
+            || {
+                let config = CachedCapacityConfig::from_env();
+                assert_eq!(config.stat_timeout, Duration::from_secs(DEFAULT_STAT_TIMEOUT_SECS));
+                assert_eq!(config.min_timeout, Duration::from_secs(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS));
+                assert_eq!(config.max_timeout, Duration::from_secs(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS));
+            },
+        );
     }
 
     #[tokio::test]
