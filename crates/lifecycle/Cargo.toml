@@ -25,6 +25,9 @@ keywords = ["lifecycle", "storage", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-lifecycle/latest/rustfs_lifecycle/"
 
+[package.metadata.cargo-shear]
+ignored = ["rustfs-common"]
+
 [features]
 default = []
 hotpath = [
@@ -57,6 +60,7 @@ hotpath.workspace = true
 async-trait.workspace = true
 metrics.workspace = true
 rustfs-common.workspace = true
+rustfs-scanner-contracts.workspace = true
 rustfs-config = { workspace = true, features = ["constants"] }
 rustfs-replication.workspace = true
 rustfs-storage-api.workspace = true

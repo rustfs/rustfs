@@ -23,9 +23,9 @@ use crate::storage_api::cluster::control_plane::{
     ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot,
 };
 use crate::workload_admission::workload_admission_registry_snapshot;
-use rustfs_common::metrics::{ScannerMetricsReport, global_metrics};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot};
 use rustfs_io_metrics::internode_metrics::{InternodeMetricsSnapshot, global_internode_metrics};
+use rustfs_scanner_contracts::metrics::{ScannerMetricsReport, global_metrics};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterReadOnlySnapshot {

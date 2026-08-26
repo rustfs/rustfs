@@ -226,7 +226,7 @@ where
 }
 
 fn error_chain_has_upload_stream_sha256_mismatch(err: &(dyn std::error::Error + 'static)) -> bool {
-    if matches!(err.downcast_ref::<s3s::UploadStreamError>(), Some(s3s::UploadStreamError::Sha256Mismatch)) {
+    if err.to_string() == "UploadStreamError: Sha256Mismatch" {
         return true;
     }
 
@@ -239,7 +239,7 @@ fn error_chain_has_upload_stream_sha256_mismatch(err: &(dyn std::error::Error + 
 
     let mut current = err.source();
     while let Some(err) = current {
-        if matches!(err.downcast_ref::<s3s::UploadStreamError>(), Some(s3s::UploadStreamError::Sha256Mismatch)) {
+        if err.to_string() == "UploadStreamError: Sha256Mismatch" {
             return true;
         }
         current = err.source();
@@ -452,6 +452,34 @@ mod tests {
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
 
+    #[derive(Debug)]
+    enum MockUploadStreamError {
+        Underlying(IoError),
+        Sha256Mismatch,
+        LengthMismatch,
+        Incomplete,
+    }
+
+    impl std::fmt::Display for MockUploadStreamError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Underlying(err) => write!(f, "UploadStreamError: Underlying: {err}"),
+                Self::Sha256Mismatch => f.write_str("UploadStreamError: Sha256Mismatch"),
+                Self::LengthMismatch => f.write_str("UploadStreamError: LengthMismatch"),
+                Self::Incomplete => f.write_str("UploadStreamError: Incomplete"),
+            }
+        }
+    }
+
+    impl std::error::Error for MockUploadStreamError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Underlying(err) => Some(err),
+                Self::Sha256Mismatch | Self::LengthMismatch | Self::Incomplete => None,
+            }
+        }
+    }
+
     #[test]
     fn test_api_error_from_io_error() {
         let io_error = IoError::new(ErrorKind::PermissionDenied, "permission denied");
@@ -515,11 +543,11 @@ mod tests {
 
     #[test]
     fn upload_stream_sha256_mismatch_maps_to_bad_digest() {
-        let api_error = ApiError::from(IoError::other(s3s::UploadStreamError::Sha256Mismatch));
+        let api_error = ApiError::from(IoError::other(MockUploadStreamError::Sha256Mismatch));
         assert_eq!(api_error.code, S3ErrorCode::BadDigest);
         assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
 
-        let api_error = ApiError::from(StorageError::Io(IoError::other(s3s::UploadStreamError::Sha256Mismatch)));
+        let api_error = ApiError::from(StorageError::Io(IoError::other(MockUploadStreamError::Sha256Mismatch)));
         assert_eq!(api_error.code, S3ErrorCode::BadDigest);
         assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
     }
@@ -527,9 +555,9 @@ mod tests {
     #[test]
     fn other_upload_stream_errors_do_not_map_to_bad_digest() {
         let errors = [
-            s3s::UploadStreamError::Underlying(Box::new(IoError::other("underlying body error"))),
-            s3s::UploadStreamError::LengthMismatch,
-            s3s::UploadStreamError::Incomplete,
+            MockUploadStreamError::Underlying(IoError::other("underlying body error")),
+            MockUploadStreamError::LengthMismatch,
+            MockUploadStreamError::Incomplete,
         ];
 
         for error in errors {
@@ -538,9 +566,9 @@ mod tests {
         }
 
         let errors = [
-            s3s::UploadStreamError::Underlying(Box::new(IoError::other("underlying body error"))),
-            s3s::UploadStreamError::LengthMismatch,
-            s3s::UploadStreamError::Incomplete,
+            MockUploadStreamError::Underlying(IoError::other("underlying body error")),
+            MockUploadStreamError::LengthMismatch,
+            MockUploadStreamError::Incomplete,
         ];
 
         for error in errors {

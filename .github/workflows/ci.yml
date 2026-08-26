@@ -495,6 +495,64 @@ jobs:
           cargo nextest run -p rustfs -p rustfs-ecstore --features rio-v2
           cargo test -p rustfs --doc --features rio-v2
 
+  connect-short-credential-boundary:
+    name: Connect Short Credential Boundary
+    if: github.event_name != 'pull_request' || github.event.action != 'closed'
+    needs: [ quick-checks ]
+    runs-on: sm-standard-4
+    timeout-minutes: 60
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-dev
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Run short credential behavior tests
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cargo test -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials \
+            registration_enforces_build_profile_credential_lifetime -- --exact
+          cargo test -p rustfs --test connect_registration \
+            --features connect-e2e-short-credentials \
+            rotation_waits_for_threshold_and_stops_on_revocation -- --exact
+
+      - name: Reject short credentials in release builds
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          log="$(mktemp)"
+          set +e
+          CARGO_TERM_COLOR=never cargo check -p rustfs --release \
+            --features connect-e2e-short-credentials >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          expected='error: connect-e2e-short-credentials is restricted to debug builds'
+          summary="error: could not compile \`rustfs\` (lib) due to 1 previous error"
+          expected_count="$(grep -Fxc "$expected" "$log" || true)"
+          summary_count="$(grep -Fc "$summary" "$log" || true)"
+          error_count="$(grep -Ec '^error(:|\[)' "$log" || true)"
+          if [ "$status" -ne 101 ] || [ "$expected_count" -ne 1 ] \
+            || [ "$summary_count" -ne 1 ] || [ "$error_count" -ne 2 ]; then
+            echo "release feature gate did not fail solely at the expected compile_error" >&2
+            rm -f "$log"
+            exit 1
+          fi
+          rm -f "$log"
+
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
     if: github.event_name != 'pull_request' || github.event.action != 'closed'

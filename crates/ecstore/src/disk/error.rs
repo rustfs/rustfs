@@ -23,6 +23,16 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 const METACACHE_OUTPUT_STREAM_CLOSED: &str = "metacache output stream closed";
 
+/// Marker carried by a shard-read `io::Error` when the underlying reader can
+/// no longer be realigned after a fresh remote open failed.  The marker is
+/// deliberately separate from the `ErrorKind`: a terminal read must retire
+/// its reader, while its original typed disk error and I/O kind still need to
+/// survive quorum/error mapping.
+#[derive(Debug)]
+pub(crate) struct TerminalReadError {
+    source: DiskError,
+}
+
 // DiskError == StorageErr
 #[derive(Debug, thiserror::Error)]
 pub enum DiskError {
@@ -166,6 +176,67 @@ pub enum DiskError {
     /// classifiers (network needles, heal recoverability) read it from there.
     #[error("remote rpc client unavailable: {0}")]
     RemoteClientUnavailable(String),
+}
+
+impl TerminalReadError {
+    pub(crate) fn new(source: DiskError) -> Self {
+        Self { source }
+    }
+
+    fn into_source(self) -> DiskError {
+        self.source
+    }
+}
+
+impl std::fmt::Display for TerminalReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl StdError for TerminalReadError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn classify_internode_missing_error(error: &InternodeHttpError) -> Option<DiskError> {
+    if error.is_remote_file_not_found() {
+        return Some(DiskError::FileNotFound);
+    }
+    if error.is_remote_volume_not_found() {
+        return Some(DiskError::VolumeNotFound);
+    }
+    None
+}
+
+/// Wrap a terminal shard-read failure without changing its typed
+/// classification.  Timeout-like disk errors retain `TimedOut`; other errors
+/// retain their inner I/O kind or use `Other` when no more specific kind exists.
+pub(crate) fn terminal_read_error_to_io(error: DiskError) -> io::Error {
+    let kind = match &error {
+        DiskError::Io(inner) => inner.kind(),
+        DiskError::SourceStalled | DiskError::Timeout => io::ErrorKind::TimedOut,
+        DiskError::DiskNotFound
+        | DiskError::FileNotFound
+        | DiskError::FileVersionNotFound
+        | DiskError::PathNotFound
+        | DiskError::VolumeNotFound => io::ErrorKind::NotFound,
+        DiskError::DiskAccessDenied | DiskError::FileAccessDenied | DiskError::VolumeAccessDenied => {
+            io::ErrorKind::PermissionDenied
+        }
+        DiskError::DiskFull => io::ErrorKind::StorageFull,
+        DiskError::FileCorrupt | DiskError::PartMissingOrCorrupt | DiskError::BitrotHashAlgoInvalid => io::ErrorKind::InvalidData,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, TerminalReadError::new(error))
+}
+
+/// Whether an I/O error marks a shard reader as terminal for adaptive decode.
+pub(crate) fn is_terminal_read_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.downcast_ref::<TerminalReadError>().is_some())
 }
 
 impl From<crate::erasure::coding::ErasureConstructionError> for DiskError {
@@ -344,6 +415,21 @@ impl From<std::io::Error> for DiskError {
                 return DiskError::VolumeNotFound;
             }
         }
+        let e = match e.downcast::<TerminalReadError>() {
+            Ok(terminal_error) => {
+                let source = terminal_error.into_source();
+                if let DiskError::Io(io_error) = &source
+                    && let Some(internode_error) = io_error
+                        .get_ref()
+                        .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                    && let Some(classified) = classify_internode_missing_error(internode_error)
+                {
+                    return classified;
+                }
+                return source;
+            }
+            Err(e) => e,
+        };
         match e.downcast::<DiskError>() {
             Ok(disk_error) => disk_error,
             // Mirror `From<io::Error> for StorageError`: a StorageError boxed
@@ -678,6 +764,32 @@ impl std::fmt::Display for FileAccessDeniedWithContext {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn terminal_read_error_preserves_kind_and_disk_classification() {
+        let timeout = terminal_read_error_to_io(DiskError::Timeout);
+        assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
+        assert!(is_terminal_read_error(&timeout));
+        assert!(matches!(DiskError::from(timeout), DiskError::Timeout));
+
+        let missing = terminal_read_error_to_io(DiskError::FileNotFound);
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(is_terminal_read_error(&missing));
+        assert!(matches!(DiskError::from(missing), DiskError::FileNotFound));
+
+        let reset = terminal_read_error_to_io(DiskError::Io(io::Error::new(io::ErrorKind::ConnectionReset, "connection reset")));
+        assert_eq!(reset.kind(), io::ErrorKind::ConnectionReset);
+        assert!(is_terminal_read_error(&reset));
+        assert!(matches!(DiskError::from(reset), DiskError::Io(error) if error.kind() == io::ErrorKind::ConnectionReset));
+
+        for (remote_error, expected) in [
+            (rustfs_rio::new_test_remote_file_not_found_http_io_error(), DiskError::FileNotFound),
+            (rustfs_rio::new_test_remote_volume_not_found_http_io_error(), DiskError::VolumeNotFound),
+        ] {
+            let wrapped = terminal_read_error_to_io(DiskError::Io(remote_error));
+            assert_eq!(DiskError::from(wrapped), expected);
+        }
+    }
 
     #[test]
     fn other_preserves_erasure_construction_source_chain() {

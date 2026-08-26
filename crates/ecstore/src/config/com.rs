@@ -27,7 +27,6 @@ use crate::storage_api_contracts::{
 };
 use crate::store::ECStore;
 use http::HeaderMap;
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_config::audit::{
     AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
     AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS,
@@ -46,6 +45,7 @@ use rustfs_config::{
     SCANNER_SUB_SYS,
 };
 use rustfs_filemeta::FileInfo;
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -4710,7 +4710,7 @@ mod tests {
         decode_persisted_server_config, fallback_server_config_after_corruption, is_server_config_corrupt_error,
         read_config_without_migrate_with_recovery, replace_server_config_decrypt_fn_for_test,
     };
-    use rustfs_common::heal_channel::HealOpts;
+    use rustfs_heal_contracts::heal_channel::HealOpts;
     use std::sync::Mutex;
 
     /// Bytes mirroring issue #4156: a bitrot-corrupted `config.json` whose

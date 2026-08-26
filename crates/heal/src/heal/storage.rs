@@ -16,7 +16,7 @@ use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

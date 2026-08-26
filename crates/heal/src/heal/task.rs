@@ -23,8 +23,8 @@ use crate::heal::{
 };
 use crate::{Error, Result};
 use metrics::{counter, histogram};
-use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};

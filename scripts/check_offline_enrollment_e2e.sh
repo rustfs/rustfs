@@ -69,7 +69,7 @@ then
     echo 'offline enrollment E2E gate: production CLI accepted the E2E root' >&2
     exit 1
 fi
-grep -Fq 'the offline enrollment trust chain is not issued by a root pinned in this build' \
+grep -Fq 'rustfs-cli: the trust chain is not issued by a root pinned in this build' \
     "${task_root}/production.stderr" \
     || { echo 'offline enrollment E2E gate: production CLI failed for the wrong reason' >&2; exit 1; }
 test ! -e "${task_root}/production-response.json" \

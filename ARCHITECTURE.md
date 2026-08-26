@@ -73,7 +73,7 @@ The main crate is organized in layers, top to bottom:
 |-------|-----------|----------------|
 | **Server** | `server/` | HTTP listener, TLS, CORS, compression, middleware, graceful shutdown |
 | **Admin** | `admin/` | Admin API routing, 30+ handler modules, web console |
-| **App** | `app/` | Use-case orchestration: object_usecase, bucket_usecase, multipart_usecase |
+| **App** | `app/` | Use-case orchestration: object (per-operation modules under `app/object/`, re-exported as `object_usecase`), bucket_usecase, multipart_usecase |
 | **Storage** | `storage/` | S3 API translation, erasure-coded FS, SSE encryption, RPC, concurrency |
 | **Auth** | `auth.rs` | S3 signature verification, credential validation |
 | **Config** | `config/` | CLI parsing, config struct, workload profiles |
@@ -93,7 +93,7 @@ refactors.
 | Domain | Current workspace crates | Responsibility |
 |--------|--------------------------|----------------|
 | Foundation | `checksums`, `common`, `config`, `data-usage`, `heal-contracts`, `scanner-contracts`, `utils` | Shared configuration, data-usage models, heal/scanner domain contracts, utilities, and checksums. |
-| I/O and storage | `concurrency`, `ecstore`, `filemeta`, `heal`, `io-core`, `io-metrics`, `lifecycle`, `lock`, `object-capacity`, `object-data-cache`, `replication`, `rio`, `rio-v2`, `scanner`, `storage-api` | Erasure-coded object storage, metadata, recovery, lifecycle, replication, locking, cache, and I/O pipelines. |
+| I/O and storage | `concurrency`, `ecstore`, `filemeta`, `heal`, `io-core`, `io-metrics`, `lifecycle`, `lock`, `object-capacity`, `object-data-cache`, `replication`, `rio`, `rio-v2`, `s3-client`, `scanner`, `storage-api` | Erasure-coded object storage, metadata, recovery, lifecycle, replication, locking, cache, I/O pipelines, and the engine-side S3 client for remote tier/transition targets. |
 | Security and identity | `credentials`, `crypto`, `iam`, `keystone`, `kms`, `policy`, `security-governance`, `signer`, `tls-runtime`, `trusted-proxies` | Credentials, authentication, authorization, encryption, key management, TLS, and security contracts. |
 | Protocols and contracts | `extension-schema`, `madmin`, `protos`, `protocols`, `s3-ops`, `s3-types`, `s3select-api`, `s3select-query` | Admin, inter-node, S3, S3 Select, and optional protocol contracts. |
 | Operations and integration | `audit`, `notify`, `obs`, `targets`, `zip` | Auditing, observability, event delivery, notification targets, and archive support. |
@@ -138,15 +138,19 @@ default build (lifecycle:
      `BackpressureSettings` copy that lingered in io-metrics was removed
      (rustfs/backlog#1833).
 
-4. **ecstore does not know about HTTP or S3 protocol details.** It operates on
-   storage-level abstractions (objects, buckets, disks, pools).
-   - ⚠️ VIOLATED: 58 files under `crates/ecstore/src` reference `s3s`
-     (`rg -l 's3s' crates/ecstore/src | wc -l`), `crates/ecstore/src/client/`
-     is a ~9.4K-line embedded S3 HTTP client, and `crates/ecstore/Cargo.toml`
-     depends on `s3s`, `http`, `hyper`/`hyper-util`/`hyper-rustls`, and
-     `reqwest`. Target state: the engine's need to act as an S3 client
-     (tiering, replication targets) is served by an extracted client crate,
-     and ecstore holds no wire or DTO types.
+4. **ecstore does not *serve* HTTP or the S3 wire protocol.** It operates on
+   storage-level abstractions (objects, buckets, disks, pools) and holds no
+   wire or DTO types of the serving surface. *Consuming* remote S3-compatible
+   endpoints (ILM tier warm backends, transition targets) is a legitimate
+   engine capability, but it lives in the dedicated `rustfs-s3-client` crate
+   (`crates/s3-client`, extracted from the formerly embedded
+   `crates/ecstore/src/client/` by rustfs/backlog#1842), not inside ecstore.
+   - ⚠️ PARTIALLY VIOLATED: serving-side `s3s` references remain in ecstore
+     (bucket metadata/replication/lifecycle DTOs and error mapping). The
+     count is ratcheted shrink-only by `scripts/check_s3s_footprint.sh`
+     (`S3S_ECSTORE_FILES_BASELINE`; the `object_lock` module was converted to
+     storage-level types as the first ratchet step). Target state: the
+     baseline reaches zero and ecstore's `Cargo.toml` drops `s3s`.
 
 5. **The `rustfs` binary crate is the only place that wires everything together.**
    Individual crates should be testable in isolation.

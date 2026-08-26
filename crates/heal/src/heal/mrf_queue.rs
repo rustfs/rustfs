@@ -35,8 +35,8 @@
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
 use metrics::{counter, gauge};
-use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use rustfs_common::mrf_channel::{MRF_MAX_ATTEMPTS, MrfIntent};
+use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmissionResult};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
@@ -483,7 +483,7 @@ pub(crate) fn build_heal_request(intent: &MrfIntent) -> HealRequest {
         options.set_index = usize::try_from(scope.set_index).ok();
     }
     let mut request = HealRequest::new(heal_type, options, priority);
-    request.source = rustfs_common::heal_channel::HealRequestSource::Mrf;
+    request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf;
     request
 }
 

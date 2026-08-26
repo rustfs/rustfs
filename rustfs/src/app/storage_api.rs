@@ -137,7 +137,7 @@ pub(crate) mod runtime {
     pub(crate) type NotificationSys = crate::storage::storage_api::NotificationSys;
     pub(crate) type ObjectStoreResolver = crate::storage::storage_api::ObjectStoreResolver;
     pub(crate) type ReplicationStats = crate::storage::storage_api::ReplicationStats;
-    pub(crate) type ScannerMetricsReport = rustfs_common::metrics::ScannerMetricsReport;
+    pub(crate) type ScannerMetricsReport = rustfs_scanner_contracts::metrics::ScannerMetricsReport;
     pub(crate) type StorageClassConfig = crate::storage::storage_api::ecstore_config::storageclass::Config;
     pub(crate) type TierConfigMgr = crate::storage::storage_api::TierConfigMgr;
     pub(crate) type TransitionState = crate::storage::storage_api::TransitionState;
@@ -213,7 +213,7 @@ pub(crate) mod runtime {
     }
 
     pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {
-        rustfs_common::metrics::global_metrics().report().await
+        rustfs_scanner_contracts::metrics::global_metrics().report().await
     }
 
     #[cfg(test)]
@@ -559,16 +559,20 @@ pub(crate) mod bucket {
     }
 
     pub(crate) mod object_lock {
+        pub(crate) mod types {
+            pub(crate) use crate::storage::storage_api::ecstore_bucket::object_lock::types::RetentionMode;
+        }
+
         pub(crate) mod objectlock {
             pub(crate) fn get_object_legalhold_meta(
                 meta: &std::collections::HashMap<String, String>,
-            ) -> s3s::dto::ObjectLockLegalHold {
+            ) -> crate::storage::storage_api::ecstore_bucket::object_lock::types::ObjectLegalHold {
                 crate::storage::storage_api::ecstore_bucket::object_lock::objectlock::get_object_legalhold_meta(meta)
             }
 
             pub(crate) fn get_object_retention_meta(
                 meta: &std::collections::HashMap<String, String>,
-            ) -> s3s::dto::ObjectLockRetention {
+            ) -> crate::storage::storage_api::ecstore_bucket::object_lock::types::ObjectRetention {
                 crate::storage::storage_api::ecstore_bucket::object_lock::objectlock::get_object_retention_meta(meta)
             }
         }
@@ -587,7 +591,10 @@ pub(crate) mod bucket {
                 .await
             }
 
-            pub(crate) fn is_retention_active(mode: &str, retain_until_date: Option<&s3s::dto::Date>) -> bool {
+            pub(crate) fn is_retention_active(
+                mode: crate::storage::storage_api::ecstore_bucket::object_lock::types::RetentionMode,
+                retain_until_date: Option<time::OffsetDateTime>,
+            ) -> bool {
                 crate::storage::storage_api::ecstore_bucket::object_lock::objectlock_sys::is_retention_active(
                     mode,
                     retain_until_date,
@@ -1185,7 +1192,9 @@ pub(crate) mod multipart_usecase {
         }
 
         pub(crate) mod object {
-            pub(crate) use super::super::super::storage_contracts::{ObjectIO, ObjectOperations};
+            #[cfg(test)]
+            pub(crate) use super::super::super::storage_contracts::ObjectIO;
+            pub(crate) use super::super::super::storage_contracts::ObjectOperations;
         }
 
         pub(crate) mod range {

@@ -2468,6 +2468,33 @@ impl ECStore {
         Self::resolve_decommission_tiered_object_result(result, bucket, &object)
     }
 
+    /// Open a source reader for a server-side copy.
+    ///
+    /// Copy consumers hold the source reader while a destination write can
+    /// apply backpressure. Keep that read contract explicit at the storage
+    /// boundary so the lower-level legacy multipart pipeline can suppress its
+    /// speculative next-part setup without changing the public `ObjectIO`
+    /// trait or `ObjectOptions` layout.
+    pub async fn get_object_reader_for_copy(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<HTTPRangeSpec>,
+        h: HeaderMap,
+        opts: &ObjectOptions,
+    ) -> Result<(GetObjectReader, tokio_util::sync::CancellationToken)> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let reader = crate::set_disk::with_get_object_read_cancellation(
+            cancellation.clone(),
+            crate::set_disk::with_get_object_read_policy(
+                crate::set_disk::GetObjectReadPolicy::CopySource,
+                self.handle_get_object_reader(bucket, object, range, h, opts),
+            ),
+        )
+        .await?;
+        Ok((reader, cancellation))
+    }
+
     #[instrument(level = "debug", skip(self, h))]
     #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_get_object_reader(

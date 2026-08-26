@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::client::admin_handler_utils::AdminError;
 use http::status::StatusCode;
 use lazy_static::lazy_static;
+use rustfs_s3_client::admin_handler_utils::AdminError;
 
 lazy_static! {
     pub static ref ERR_TIER_ALREADY_EXISTS: AdminError = AdminError {

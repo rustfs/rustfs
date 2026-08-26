@@ -18,8 +18,8 @@ use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLock
 use time::OffsetDateTime;
 use tracing::info;
 
-use rustfs_common::metrics::IlmAction;
 use rustfs_replication::ReplicationStatusType;
+use rustfs_scanner_contracts::metrics::IlmAction;
 
 use crate::object_lock;
 use crate::{Event, Lifecycle, ObjectOpts};
@@ -197,7 +197,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use rustfs_common::metrics::IlmAction;
+    use rustfs_scanner_contracts::metrics::IlmAction;
     use s3s::dto::{
         BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule,
         NoncurrentVersionExpiration, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,

@@ -138,7 +138,7 @@ test-group = 'e2e-inline-boundaries'
 # does not cross nextest process boundaries, so keep every Vault-backed test in
 # one group.
 [[profile.default.overrides]]
-filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
+filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
 
 # ---------------------------------------------------------------------------
@@ -484,5 +484,5 @@ filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
 
 [[profile.e2e-full.overrides]]
-filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
+filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'

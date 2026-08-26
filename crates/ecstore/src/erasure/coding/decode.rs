@@ -20,7 +20,7 @@ use crate::diagnostics::get::{
     record_get_object_pipeline_failure, record_get_stage_duration_if_enabled,
 };
 use crate::disk::disk_store::get_object_disk_read_timeout;
-use crate::disk::error::Error;
+use crate::disk::error::{Error, is_terminal_read_error};
 use crate::disk::error_reduce::reduce_errs;
 use crate::erasure::codec::workspace::ShardBufferPool;
 use crate::erasure::coding::{BitrotReader, Erasure};
@@ -36,12 +36,16 @@ use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, warn};
 
 type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
+type OwnedShardReadFuture<'a, R> =
+    Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, Option<BitrotReader<R>>, bool)> + Send + 'a>>;
+pub(crate) type DeferredReaderReopener<R> = Arc<dyn Fn(usize) -> Option<BitrotReader<R>> + Send + Sync>;
 
 type ShardIndexes = SmallVec<[usize; INLINE_SHARD_SLOTS]>;
 type ActiveReaders = SmallVec<[bool; INLINE_SHARD_SLOTS]>;
@@ -55,6 +59,41 @@ const ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE: &str = "RUSTFS_GET_SHARD_
 const SHARD_LOCALITY_SCHEDULING_OFF: &str = "off";
 const SHARD_LOCALITY_SCHEDULING_OBSERVE: &str = "observe";
 const SHARD_LOCALITY_SCHEDULING_ON: &str = "on";
+
+/// Read-ahead contract selected by the caller of the erasure decoder.
+///
+/// Ordinary GETs retain the configured overlap and all-shard lockstep
+/// behavior. A server-side copy holds its source while the destination can
+/// apply backpressure, so it uses the demand-bound variant: no speculative
+/// stripe read and data shards only until reconstruction needs parity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum DecodeReadPolicy {
+    #[default]
+    Default,
+    DemandBound,
+}
+
+/// Maximum number of deferred parity reads that a demand-bound stripe may have
+/// in flight at once.  The window is deliberately small: a 16+16 layout must
+/// not turn one slow data shard into 16 simultaneous HTTP/H2 opens.  The
+/// window is refilled as results arrive, so larger erasure sets still make
+/// progress without an unbounded fan-out.
+const MAX_DEMAND_BOUND_PARITY_IN_FLIGHT: usize = 4;
+
+tokio::task_local! {
+    static DECODE_READ_POLICY: DecodeReadPolicy;
+}
+
+pub(crate) fn decode_read_policy() -> DecodeReadPolicy {
+    DECODE_READ_POLICY.try_with(|policy| *policy).unwrap_or_default()
+}
+
+pub(crate) async fn with_decode_read_policy<F>(policy: DecodeReadPolicy, future: F) -> F::Output
+where
+    F: Future,
+{
+    DECODE_READ_POLICY.scope(policy, future).await
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShardLocalitySchedulingMode {
@@ -136,10 +175,11 @@ const DEFAULT_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE: bool = false;
 
 /// Whether the data-shards-only lockstep GET read is enabled (backlog#923).
 pub(crate) fn get_lockstep_data_shards_only_enabled() -> bool {
-    rustfs_utils::get_env_bool(
-        ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE,
-        DEFAULT_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE,
-    )
+    matches!(decode_read_policy(), DecodeReadPolicy::DemandBound)
+        || rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE,
+            DEFAULT_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE,
+        )
 }
 
 /// Get whether bitrot-decode overlap is enabled.
@@ -170,7 +210,8 @@ fn is_bitrot_decode_overlap_enabled() -> bool {
 /// pre-existing strictly-serial read → reconstruct → emit behaviour, byte for
 /// byte.
 fn legacy_stripe_prefetch_enabled() -> bool {
-    get_decode_stripe_prefetch_count() > 1 || is_bitrot_decode_overlap_enabled()
+    !matches!(decode_read_policy(), DecodeReadPolicy::DemandBound)
+        && (get_decode_stripe_prefetch_count() > 1 || is_bitrot_decode_overlap_enabled())
 }
 
 /// Outcome of reconstructing and emitting a single already-read stripe in the
@@ -269,6 +310,92 @@ fn shard_role(index: usize, data_shards: usize) -> &'static str {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn read_shard_result<R>(
+    index: usize,
+    read_cost: ShardReadCost,
+    reader: &mut BitrotReader<R>,
+    recycled_buf: Option<Vec<u8>>,
+    shard_size: usize,
+    data_shards: usize,
+    read_timeout: Duration,
+    metrics_path: Option<&'static str>,
+) -> (Result<Vec<u8>, Error>, bool)
+where
+    R: crate::erasure::coding::ShardSource,
+{
+    let role = shard_role(index, data_shards);
+    // Capacity, not length: `read_appending` writes every byte it returns, so
+    // the buffer never needs zeroing first (rustfs/backlog#1159).
+    let mut buf = recycled_buf.unwrap_or_else(|| Vec::with_capacity(shard_size));
+    buf.clear();
+    let read_start = metrics_path.map(|_| Instant::now());
+    let read_result = if read_timeout.is_zero() {
+        reader.read_appending(&mut buf, shard_size).await
+    } else {
+        match tokio::time::timeout(read_timeout, reader.read_appending(&mut buf, shard_size)).await {
+            Ok(result) => result,
+            Err(_) => {
+                let timeout_error = io::Error::new(ErrorKind::TimedOut, "shard read timed out");
+                let error_class = classify_io_error(&timeout_error).as_str();
+                if let Some(path) = metrics_path {
+                    rustfs_io_metrics::record_get_object_shard_read_observation(
+                        path,
+                        index,
+                        role,
+                        read_cost.as_str(),
+                        GET_SHARD_READ_OUTCOME_ERROR,
+                        error_class,
+                        0,
+                        read_start.map_or(0.0, |read_start| read_start.elapsed().as_secs_f64()),
+                        reader.last_verify_duration().as_secs_f64(),
+                    );
+                }
+                return (Err(Error::from(timeout_error)), true);
+            }
+        }
+    };
+
+    match read_result {
+        Ok(n) => {
+            debug_assert_eq!(buf.len(), n, "read_appending must grow the buffer by exactly n");
+            if let Some(path) = metrics_path {
+                rustfs_io_metrics::record_get_object_shard_read_observation(
+                    path,
+                    index,
+                    role,
+                    read_cost.as_str(),
+                    GET_SHARD_READ_OUTCOME_SUCCESS,
+                    GET_SHARD_READ_ERROR_NONE,
+                    n,
+                    read_start.map_or(0.0, |read_start| read_start.elapsed().as_secs_f64()),
+                    reader.last_verify_duration().as_secs_f64(),
+                );
+            }
+            (Ok(buf), false)
+        }
+        Err(e) => {
+            let verify_duration_secs = reader.last_verify_duration().as_secs_f64();
+            let error_class = classify_io_error(&e).as_str();
+            let should_retire = e.kind() == ErrorKind::TimedOut || is_terminal_read_error(&e);
+            if let Some(path) = metrics_path {
+                rustfs_io_metrics::record_get_object_shard_read_observation(
+                    path,
+                    index,
+                    role,
+                    read_cost.as_str(),
+                    GET_SHARD_READ_OUTCOME_ERROR,
+                    error_class,
+                    0,
+                    read_start.map_or(0.0, |read_start| read_start.elapsed().as_secs_f64()),
+                    verify_duration_secs,
+                );
+            }
+            (Err(Error::from(e)), should_retire)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn read_shard<'a, R>(
     index: usize,
     read_cost: ShardReadCost,
@@ -285,75 +412,18 @@ where
     let role = shard_role(index, data_shards);
     if let Some(reader) = reader {
         Box::pin(async move {
-            // Capacity, not length: `read_appending` writes every byte it returns, so
-            // the buffer never needs zeroing first (rustfs/backlog#1159).
-            let mut buf = recycled_buf.unwrap_or_else(|| Vec::with_capacity(shard_size));
-            buf.clear();
-            let read_start = metrics_path.map(|_| Instant::now());
-            let read_result = if read_timeout.is_zero() {
-                reader.read_appending(&mut buf, shard_size).await
-            } else {
-                match tokio::time::timeout(read_timeout, reader.read_appending(&mut buf, shard_size)).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let timeout_error = io::Error::new(ErrorKind::TimedOut, "shard read timed out");
-                        let error_class = classify_io_error(&timeout_error).as_str();
-                        if let Some(path) = metrics_path {
-                            rustfs_io_metrics::record_get_object_shard_read_observation(
-                                path,
-                                index,
-                                role,
-                                read_cost.as_str(),
-                                GET_SHARD_READ_OUTCOME_ERROR,
-                                error_class,
-                                0,
-                                read_start.map_or(0.0, |read_start| read_start.elapsed().as_secs_f64()),
-                                reader.last_verify_duration().as_secs_f64(),
-                            );
-                        }
-                        return (index, read_cost, Err(Error::from(timeout_error)), true);
-                    }
-                }
-            };
-
-            match read_result {
-                Ok(n) => {
-                    debug_assert_eq!(buf.len(), n, "read_appending must grow the buffer by exactly n");
-                    if let Some(path) = metrics_path {
-                        rustfs_io_metrics::record_get_object_shard_read_observation(
-                            path,
-                            index,
-                            role,
-                            read_cost.as_str(),
-                            GET_SHARD_READ_OUTCOME_SUCCESS,
-                            GET_SHARD_READ_ERROR_NONE,
-                            n,
-                            read_start.map_or(0.0, |read_start| read_start.elapsed().as_secs_f64()),
-                            reader.last_verify_duration().as_secs_f64(),
-                        );
-                    }
-                    (index, read_cost, Ok(buf), false)
-                }
-                Err(e) => {
-                    let verify_duration_secs = reader.last_verify_duration().as_secs_f64();
-                    let error_class = classify_io_error(&e).as_str();
-                    let should_retire = e.kind() == ErrorKind::TimedOut;
-                    if let Some(path) = metrics_path {
-                        rustfs_io_metrics::record_get_object_shard_read_observation(
-                            path,
-                            index,
-                            role,
-                            read_cost.as_str(),
-                            GET_SHARD_READ_OUTCOME_ERROR,
-                            error_class,
-                            0,
-                            read_start.map_or(0.0, |read_start| read_start.elapsed().as_secs_f64()),
-                            verify_duration_secs,
-                        );
-                    }
-                    (index, read_cost, Err(Error::from(e)), should_retire)
-                }
-            }
+            let (result, should_retire) = read_shard_result(
+                index,
+                read_cost,
+                reader,
+                recycled_buf,
+                shard_size,
+                data_shards,
+                read_timeout,
+                metrics_path,
+            )
+            .await;
+            (index, read_cost, result, should_retire)
         })
     } else {
         Box::pin(async move {
@@ -373,6 +443,121 @@ where
             (index, read_cost, Err(Error::FileNotFound), false)
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_shard_owned<'a, R>(
+    index: usize,
+    read_cost: ShardReadCost,
+    reader: Option<BitrotReader<R>>,
+    recycled_buf: Option<Vec<u8>>,
+    shard_size: usize,
+    data_shards: usize,
+    read_timeout: Duration,
+    metrics_path: Option<&'static str>,
+) -> OwnedShardReadFuture<'a, R>
+where
+    R: crate::erasure::coding::ShardSource + 'a,
+{
+    let role = shard_role(index, data_shards);
+    Box::pin(async move {
+        let Some(mut reader) = reader else {
+            if let Some(path) = metrics_path {
+                rustfs_io_metrics::record_get_object_shard_read_observation(
+                    path,
+                    index,
+                    role,
+                    read_cost.as_str(),
+                    GET_SHARD_READ_OUTCOME_MISSING,
+                    GET_SHARD_READ_ERROR_MISSING,
+                    0,
+                    0.0,
+                    0.0,
+                );
+            }
+            return (index, read_cost, Err(Error::FileNotFound), None, false);
+        };
+        let (result, should_retire) = read_shard_result(
+            index,
+            read_cost,
+            &mut reader,
+            recycled_buf,
+            shard_size,
+            data_shards,
+            read_timeout,
+            metrics_path,
+        )
+        .await;
+        (index, read_cost, result, Some(reader), should_retire)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_owned_shard<'a, R>(
+    sets: &mut FuturesUnordered<OwnedShardReadFuture<'a, R>>,
+    readers: &mut [Option<BitrotReader<R>>],
+    buffers: &mut ShardBufferPool,
+    active: &mut [bool],
+    scheduled: &mut usize,
+    index: usize,
+    shard_size: usize,
+    data_shards: usize,
+    read_cost: ShardReadCost,
+    read_timeout: Duration,
+    metrics_path: Option<&'static str>,
+) -> bool
+where
+    R: crate::erasure::coding::ShardSource + 'a,
+{
+    let Some(reader) = readers.get_mut(index).and_then(Option::take) else {
+        return false;
+    };
+    launch_owned_reader(
+        sets,
+        buffers,
+        active,
+        scheduled,
+        index,
+        reader,
+        shard_size,
+        data_shards,
+        read_cost,
+        read_timeout,
+        metrics_path,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_owned_reader<'a, R>(
+    sets: &mut FuturesUnordered<OwnedShardReadFuture<'a, R>>,
+    buffers: &mut ShardBufferPool,
+    active: &mut [bool],
+    scheduled: &mut usize,
+    index: usize,
+    reader: BitrotReader<R>,
+    shard_size: usize,
+    data_shards: usize,
+    read_cost: ShardReadCost,
+    read_timeout: Duration,
+    metrics_path: Option<&'static str>,
+) -> bool
+where
+    R: crate::erasure::coding::ShardSource + 'a,
+{
+    let recycled_buf = Some(buffers.take(index, shard_size));
+    *scheduled += 1;
+    active[index] = true;
+    sets.push(read_shard_owned(
+        index,
+        read_cost,
+        Some(reader),
+        recycled_buf,
+        shard_size,
+        data_shards,
+        read_timeout,
+        metrics_path,
+    ));
+    true
 }
 
 pin_project! {
@@ -400,6 +585,11 @@ pub(crate) struct ParallelReader<R> {
     // it to the current stripe when it is engaged mid-object (backlog#923).
     engaged: SmallVec<[bool; INLINE_SHARD_SLOTS]>,
     deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
+    // Copy-source hedges use a fresh deferred reader so cancelling a hedge
+    // never consumes the unopened reader reserved for a later stripe. The
+    // vector is empty for callers that do not provide a reopen factory (tests
+    // and the ordinary GET path retain the handle-based behavior).
+    deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
     stripe_index: usize,
 }
 }
@@ -607,6 +797,7 @@ where
             stripe_state: None,
             engaged,
             deferred_handles: Vec::new(),
+            deferred_reopeners: Vec::new(),
             stripe_index: 0,
         }
     }
@@ -620,6 +811,17 @@ where
         handles.resize_with(self.readers.len(), || None);
         handles.truncate(self.readers.len());
         self.deferred_handles = handles;
+        self
+    }
+
+    /// Attach factories for unopened parity readers. A factory must return a
+    /// reader already aligned to the requested stripe. Keeping the original
+    /// deferred reader in `self.readers` lets a cancelled hedge be discarded
+    /// without poisoning the next-stripe reserve.
+    pub(crate) fn with_deferred_parity_reopeners(mut self, mut reopeners: Vec<Option<DeferredReaderReopener<R>>>) -> Self {
+        reopeners.resize_with(self.readers.len(), || None);
+        reopeners.truncate(self.readers.len());
+        self.deferred_reopeners = reopeners;
         self
     }
 }
@@ -673,6 +875,34 @@ fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
     } else {
         Some(read_timeout.min(Duration::from_millis(100)))
     }
+}
+
+/// Return the number of new deferred parity readers that may be admitted for
+/// the current demand-bound stripe.  The window is based on concrete state,
+/// not on setup candidates: at most `missing_data + 1` parity reads are useful
+/// for a verification quorum, and the global in-flight cap keeps a wide EC
+/// layout from opening every remaining shard at once.  As a read completes the
+/// caller invokes this again, which refills one slot after a failure or a
+/// successful-but-insufficient parity result.
+fn demand_bound_parity_admission_limit(shards: &[Option<Vec<u8>>], active: &[bool], data_shards: usize) -> usize {
+    let missing_data = shards.iter().take(data_shards).filter(|shard| shard.is_none()).count();
+    if missing_data == 0 {
+        return 0;
+    }
+
+    let successes = shards.iter().filter(|shard| shard.is_some()).count();
+    let needed_for_verification = (data_shards + 1).saturating_sub(successes);
+    let desired = missing_data
+        .saturating_add(1)
+        .min(needed_for_verification)
+        .min(MAX_DEMAND_BOUND_PARITY_IN_FLIGHT);
+    let active_parity = active
+        .iter()
+        .enumerate()
+        .skip(data_shards)
+        .filter(|(_, is_active)| **is_active)
+        .count();
+    desired.saturating_sub(active_parity)
 }
 
 fn shard_locality_remote_avoid_potential(remote_scheduled: usize, low_cost_available: usize, data_shards: usize) -> usize {
@@ -1045,6 +1275,11 @@ where
     /// realigned (no pending deferred handle) is likewise retired instead of
     /// being read out of position.
     async fn read_lockstep(&mut self, state: &mut StripeReadState) {
+        if matches!(decode_read_policy(), DecodeReadPolicy::DemandBound) {
+            self.read_lockstep_demand_bound(state).await;
+            return;
+        }
+
         let num_readers = self.readers.len();
         state.reset(num_readers, self.data_shards);
         let shard_size = if self.offset + self.shard_size > self.shard_file_size {
@@ -1102,6 +1337,7 @@ where
         }
 
         let data_shards = self.data_shards;
+
         let read_timeout = self.read_timeout;
         let metrics_path = self.metrics_path;
         let locality_preference_enabled = self.locality_preference_enabled;
@@ -1295,17 +1531,431 @@ where
         }
     }
 
-    /// Attempt to bring an as-yet-unread parity reader into the lockstep read
-    /// set at `stripe_index`.
+    /// Demand-bound lockstep stripe read used by server-side copy sources.
     ///
-    /// At stripe 0 every reader is still positioned at the stream start, so
-    /// engagement is trivially aligned. Past stripe 0 the parity reader must
-    /// still be an unopened deferred reader: its pending open offset is
-    /// advanced by `stripe_index` bitrot blocks (the `bitrot_encoded_range`
-    /// geometry) so its first read returns the current stripe. A parity reader
-    /// that cannot be realigned is retired for the rest of the object,
-    /// mirroring the retire-on-error rule: reading it would return an earlier
-    /// stripe and reintroduce the backlog#832 desync.
+    /// The ordinary lockstep path can cancel every in-flight reader once it
+    /// has a quorum because all of its parity readers are already engaged.
+    /// Copy sources keep parity unopened until a data reader is missing.  A
+    /// hedge therefore has to race the deferred parity reads against the
+    /// original data reads and may retire the latter only after the parity has
+    /// produced an actual decode-plus-verification quorum.  The futures own
+    /// their readers so disjoint data/parity slots can be admitted while the
+    /// other group is still pending; dropping an abandoned future retires its
+    /// stream without leaving a borrowed slot behind.
+    async fn read_lockstep_demand_bound(&mut self, state: &mut StripeReadState) {
+        let num_readers = self.readers.len();
+        state.reset(num_readers, self.data_shards);
+        let shard_size = if self.offset + self.shard_size > self.shard_file_size {
+            self.shard_file_size - self.offset
+        } else {
+            self.shard_size
+        };
+
+        let (shards, errs) = state.parts_mut();
+        if shard_size == 0 {
+            return;
+        }
+
+        self.offset += shard_size;
+        let stripe_index = self.stripe_index;
+        self.stripe_index += 1;
+        self.buffers.ensure_slots(num_readers);
+
+        // A data slot retired on an earlier stripe is already missing.  The
+        // bounded parity launcher below admits enough substitutes before the
+        // first data future is polled, preserving the lockstep alignment.
+        let missing_data_readers = self.readers.iter().take(self.data_shards).filter(|r| r.is_none()).count();
+
+        let data_shards = self.data_shards;
+        let read_timeout = self.read_timeout;
+        let metrics_path = self.metrics_path;
+        let stripe_read_start = metrics_path.map(|_| Instant::now());
+        let mut retire_readers = ShardIndexes::new();
+        let mut scheduled = 0usize;
+        let mut success = 0usize;
+        let mut completed = 0usize;
+        let mut failed = 0usize;
+        let mut first_shard_recorded = false;
+        let mut active = vec![false; num_readers];
+        let mut temporary_parity = vec![false; num_readers];
+        // A deferred parity slot is attempted at most once per stripe. A
+        // failed disposable hedge keeps its unopened reserve for the next
+        // stripe, but must not be relaunched in a tight same-stripe retry
+        // loop (which would defeat the bounded fan-out and amplify a remote
+        // outage).
+        let mut attempted_parity = vec![false; num_readers];
+        // Once a data reader has returned an error (or was already missing at
+        // setup), the loss is permanent for lockstep alignment. Use the
+        // deferred handle and keep parity engaged across subsequent stripes;
+        // disposable reopeners are reserved for an as-yet unresolved slow
+        // data reader.
+        let mut data_failure_seen = missing_data_readers > 0;
+        let mut sets: FuturesUnordered<OwnedShardReadFuture<'_, R>> = FuturesUnordered::new();
+        // Once a deferred parity reader has been admitted, a concrete
+        // `data_shards + 1` result is enough to finish a degraded stripe and
+        // abandon only the still-pending readers.  Setup counts never set this
+        // flag: they are candidates, not successful shards.
+        let mut fallback_admitted = false;
+
+        // Move engaged readers into owned futures.  This leaves the slots free
+        // so a deferred parity reader can be admitted while these reads wait.
+        for i in 0..num_readers {
+            if !self.engaged[i] || self.readers[i].is_none() {
+                continue;
+            }
+            let read_cost = self.read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
+            let _ = launch_owned_shard(
+                &mut sets,
+                &mut self.readers,
+                &mut self.buffers,
+                &mut active,
+                &mut scheduled,
+                i,
+                shard_size,
+                data_shards,
+                read_cost,
+                read_timeout,
+                metrics_path,
+            );
+        }
+
+        if missing_data_readers > 0 {
+            let want = (missing_data_readers + 1).min(MAX_DEMAND_BOUND_PARITY_IN_FLIGHT);
+            if self.launch_demand_bound_parity(
+                stripe_index,
+                want,
+                &mut sets,
+                &mut active,
+                &mut temporary_parity,
+                &mut attempted_parity,
+                false,
+                &mut scheduled,
+                shard_size,
+                data_shards,
+                read_timeout,
+                metrics_path,
+            ) > 0
+            {
+                fallback_admitted = true;
+            }
+        }
+
+        let hedge_delay = shard_read_hedge_delay(read_timeout);
+        let hedge_sleep = hedge_delay.map(tokio::time::sleep);
+        tokio::pin!(hedge_sleep);
+        let mut hedged = false;
+
+        loop {
+            let item = if !hedged {
+                match hedge_sleep.as_mut().as_pin_mut() {
+                    Some(sleep) => tokio::select! {
+                        biased;
+                        item = sets.next() => item,
+                        _ = sleep => {
+                            hedged = true;
+                            // Do not cancel a pending data read based on setup
+                            // counts.  Admit every still-unengaged parity
+                            // reader as a bounded hedge batch; only concrete
+                            // successful results below can satisfy the quorum.
+                            let data_missing = shards.iter().take(data_shards).any(|shard| shard.is_none());
+                            if data_missing {
+                                let launched = self.launch_demand_bound_parity(
+                                    stripe_index,
+                                    demand_bound_parity_admission_limit(shards, &active, data_shards),
+                                    &mut sets,
+                                    &mut active,
+                                    &mut temporary_parity,
+                                    &mut attempted_parity,
+                                    true,
+                                    &mut scheduled,
+                                    shard_size,
+                                    data_shards,
+                                    read_timeout,
+                                    metrics_path,
+                                );
+                                if launched > 0 {
+                                    fallback_admitted = true;
+                                }
+                            }
+                            continue;
+                        }
+                    },
+                    None => sets.next().await,
+                }
+            } else {
+                sets.next().await
+            };
+
+            let Some((i, _read_cost, result, reader, should_retire)) = item else {
+                // A fast failure can drain the initial data futures before the
+                // hedge timer fires (and a zero timeout intentionally has no
+                // timer).  Do not return a false quorum just because the
+                // FuturesUnordered is momentarily empty: admit the deferred
+                // parity candidates and race them now.
+                let data_missing = shards.iter().take(data_shards).any(|shard| shard.is_none());
+                data_failure_seen |= errs.iter().take(data_shards).any(Option::is_some);
+                if data_missing && success <= data_shards {
+                    let launched = self.launch_demand_bound_parity(
+                        stripe_index,
+                        demand_bound_parity_admission_limit(shards, &active, data_shards),
+                        &mut sets,
+                        &mut active,
+                        &mut temporary_parity,
+                        &mut attempted_parity,
+                        !data_failure_seen,
+                        &mut scheduled,
+                        shard_size,
+                        data_shards,
+                        read_timeout,
+                        metrics_path,
+                    );
+                    if launched > 0 {
+                        fallback_admitted = true;
+                        continue;
+                    }
+                }
+                break;
+            };
+            let result_failed = result.is_err();
+            active[i] = false;
+            completed += 1;
+            if !first_shard_recorded {
+                if let Some(path) = metrics_path {
+                    record_get_stage_duration_if_enabled(path, GET_STAGE_STRIPE_READ_FIRST_SHARD, stripe_read_start);
+                }
+                first_shard_recorded = true;
+            }
+
+            match result {
+                Ok(v) => {
+                    shards[i] = Some(v);
+                    success += 1;
+                    // A successful reader consumed exactly one aligned stripe
+                    // and remains usable on the following stripe.
+                    if temporary_parity[i] {
+                        // A reopener hedge is disposable.  Keep the unopened
+                        // reserve untouched even when the hedge wins: promoting
+                        // the one-stripe reader would make every later healthy
+                        // stripe read parity and would leave a reset/timeout
+                        // without a way to reopen it at the next stripe.
+                        drop(reader);
+                        self.engaged[i] = false;
+                    } else if !should_retire {
+                        self.readers[i] = reader;
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    if i < data_shards {
+                        data_failure_seen = true;
+                    }
+                    if temporary_parity[i] {
+                        // A disposable hedge reader is independent of the
+                        // unopened deferred reserve. Its timeout/reset may be
+                        // transient, so discard only the hedge and keep the
+                        // reserve available for a later stripe. The factory
+                        // already removed a slot when it could not produce an
+                        // aligned reader at all; an error after launch must
+                        // not turn that setup failure policy into permanent
+                        // disk retirement. Do not publish this disposable
+                        // error into `errs`: `emit_decoded_stripe` uses that
+                        // vector for terminal FileNotFound/FileCorrupt
+                        // attribution, and a speculative failure must not
+                        // fail a stripe that later reaches a real quorum.
+                        self.engaged[i] = false;
+                    } else {
+                        errs[i] = Some(e);
+                        // Lockstep cannot safely reuse a reader after any
+                        // error, even when the low-level classifier called it
+                        // nonfatal.
+                        self.readers[i] = None;
+                        retire_readers.push(i);
+                    }
+                }
+            }
+
+            // A degraded stripe should keep a small parity window full.  Admit
+            // it immediately after any result (especially a fast data error,
+            // or a zero-timeout read where no hedge timer exists).  Refill one
+            // slot after a parity failure/success rather than opening every
+            // candidate at once.  Pending data futures stay in `sets` and can
+            // still win the race if the source recovers.
+            let data_missing = shards.iter().take(data_shards).any(|shard| shard.is_none());
+            if data_missing && success <= data_shards && (result_failed || fallback_admitted) {
+                let launched = self.launch_demand_bound_parity(
+                    stripe_index,
+                    demand_bound_parity_admission_limit(shards, &active, data_shards),
+                    &mut sets,
+                    &mut active,
+                    &mut temporary_parity,
+                    &mut attempted_parity,
+                    !data_failure_seen,
+                    &mut scheduled,
+                    shard_size,
+                    data_shards,
+                    read_timeout,
+                    metrics_path,
+                );
+                if launched > 0 {
+                    fallback_admitted = true;
+                }
+            }
+
+            // Once a real quorum is present, abandon only the still-pending
+            // futures.  If a parity read failed, the pending original data
+            // reader remains in the race and can still rescue the stripe; no
+            // optimistic setup count may retire it early.  A healthy stripe
+            // can also finish as soon as every data shard has returned, even
+            // when the hedge timer has not fired.
+            let succeeded = shards.iter().filter(|shard| shard.is_some()).count();
+            let data_missing = shards.iter().take(data_shards).any(|shard| shard.is_none());
+            if !data_missing {
+                break;
+            }
+            if fallback_admitted && succeeded > data_shards {
+                break;
+            }
+        }
+
+        // Dropping `sets` cancels all remaining owned reads.  A temporary
+        // parity hedge has an untouched deferred reserve in `self.readers`, so
+        // it can be abandoned without poisoning the next stripe. All other
+        // active readers were consumed in this stripe and must be retired.
+        for i in 0..num_readers {
+            if active[i] {
+                if temporary_parity[i] {
+                    // The factory reader is disposable; leave the original
+                    // deferred reader unengaged and available for a later
+                    // stripe.
+                    self.engaged[i] = false;
+                    continue;
+                }
+                if shards[i].is_none() && errs[i].is_none() {
+                    errs[i] = Some(Error::from(io::Error::new(ErrorKind::TimedOut, "shard read hedged after a slow shard")));
+                    retire_readers.push(i);
+                }
+                self.readers[i] = None;
+            }
+        }
+        drop(sets);
+
+        if let Some(path) = metrics_path {
+            record_get_stage_duration_if_enabled(path, GET_STAGE_STRIPE_READ_QUORUM, stripe_read_start);
+            rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
+        }
+
+        for i in retire_readers {
+            self.readers[i] = None;
+        }
+    }
+
+    /// Launch a bounded demand admission for deferred parity. `disposable`
+    /// selects a speculative hedge (a fresh reopener whose reserve remains
+    /// unopened) versus a confirmed loss (the deferred handle is engaged and
+    /// retained across stripes). Tests and legacy callers without a reopener
+    /// use the handle-based reader as a persistent fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_demand_bound_parity<'a>(
+        &mut self,
+        stripe_index: usize,
+        max_new: usize,
+        sets: &mut FuturesUnordered<OwnedShardReadFuture<'a, R>>,
+        active: &mut [bool],
+        temporary_parity: &mut [bool],
+        attempted_parity: &mut [bool],
+        disposable: bool,
+        scheduled: &mut usize,
+        shard_size: usize,
+        data_shards: usize,
+        read_timeout: Duration,
+        metrics_path: Option<&'static str>,
+    ) -> usize
+    where
+        R: 'a,
+    {
+        let mut launched = 0;
+        for idx in self.data_shards..self.readers.len() {
+            if launched >= max_new || self.engaged[idx] || self.readers[idx].is_none() || active[idx] || attempted_parity[idx] {
+                continue;
+            }
+
+            // Mark before invoking the factory/handle so a setup failure is
+            // also bounded to one attempt for this stripe.
+            attempted_parity[idx] = true;
+
+            let reopener = self.deferred_reopeners.get(idx).and_then(Option::clone);
+            let (reader, temporary) = if disposable {
+                if let Some(reopener) = reopener {
+                    let Some(reader) = reopener(stripe_index) else {
+                        // A factory failure is terminal for this parity slot.
+                        // Do not leave an apparently available reader that
+                        // cannot be aligned to the current stripe.
+                        self.readers[idx] = None;
+                        continue;
+                    };
+                    (reader, true)
+                } else {
+                    // Tests and legacy callers without a factory retain the
+                    // handle-based fallback. It is a persistent admission,
+                    // because consuming that reserve is the only safe way to
+                    // keep the stream aligned for the next stripe.
+                    if !self.try_engage_parity(idx, stripe_index) {
+                        continue;
+                    }
+                    let Some(reader) = self.readers[idx].take() else {
+                        self.engaged[idx] = false;
+                        continue;
+                    };
+                    (reader, false)
+                }
+            } else if self.try_engage_parity(idx, stripe_index) {
+                let Some(reader) = self.readers[idx].take() else {
+                    self.engaged[idx] = false;
+                    continue;
+                };
+                (reader, false)
+            } else if let Some(reopener) = reopener {
+                // A setup without a stripe handle can still make a known
+                // missing slot persistent by promoting the factory reader.
+                // This is a compatibility fallback; production CopySource
+                // setup supplies both a reserve and a handle.
+                let Some(reader) = reopener(stripe_index) else {
+                    self.readers[idx] = None;
+                    continue;
+                };
+                // A non-disposable reopener is the persistent reserve when a
+                // setup did not retain a stripe handle. Mark it engaged just
+                // like the handle path so subsequent stripes reuse the
+                // aligned reader instead of reopening the remote shard.
+                self.engaged[idx] = true;
+                (reader, false)
+            } else {
+                continue;
+            };
+
+            let read_cost = self.read_costs.get(idx).copied().unwrap_or(ShardReadCost::Unknown);
+            if launch_owned_reader(
+                sets,
+                &mut self.buffers,
+                active,
+                scheduled,
+                idx,
+                reader,
+                shard_size,
+                data_shards,
+                read_cost,
+                read_timeout,
+                metrics_path,
+            ) {
+                temporary_parity[idx] = temporary;
+                launched += 1;
+            } else if !temporary {
+                self.engaged[idx] = false;
+            }
+        }
+        launched
+    }
+
     fn try_engage_parity(&mut self, idx: usize, stripe_index: usize) -> bool {
         if stripe_index == 0 {
             self.engaged[idx] = true;
@@ -1539,7 +2189,7 @@ impl Erasure {
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
     {
-        self.decode_inner(writer, readers, offset, length, total_length, None, Vec::new())
+        self.decode_inner(writer, readers, offset, length, total_length, None, Vec::new(), Vec::new())
             .await
     }
 
@@ -1557,13 +2207,17 @@ impl Erasure {
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
     {
-        self.decode_inner(writer, readers, offset, length, total_length, Some(read_costs), Vec::new())
+        self.decode_inner(writer, readers, offset, length, total_length, Some(read_costs), Vec::new(), Vec::new())
             .await
     }
 
     /// GET decode entry point that also carries the deferred-parity stripe
     /// handles from bitrot reader setup, so unengaged parity readers can be
     /// opened aligned to the stripe where a data shard fails (backlog#923).
+    #[allow(
+        dead_code,
+        reason = "kept as the compatibility wrapper for existing decode callers and tests"
+    )]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn decode_with_stripe_handles<W, R>(
         &self,
@@ -1579,8 +2233,49 @@ impl Erasure {
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
     {
-        self.decode_inner(writer, readers, offset, length, total_length, read_costs, deferred_handles)
-            .await
+        self.decode_with_stripe_handles_and_reopeners(
+            writer,
+            readers,
+            offset,
+            length,
+            total_length,
+            read_costs,
+            deferred_handles,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Decode entry point with disposable, stripe-aligned parity reopeners.
+    /// CopySource uses these to hedge a slow data read without consuming the
+    /// unopened parity reserve when the data stream recovers first.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn decode_with_stripe_handles_and_reopeners<W, R>(
+        &self,
+        writer: &mut W,
+        readers: Vec<Option<BitrotReader<R>>>,
+        offset: usize,
+        length: usize,
+        total_length: usize,
+        read_costs: Option<Vec<ShardReadCost>>,
+        deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
+        deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
+    ) -> (usize, Option<std::io::Error>)
+    where
+        W: AsyncWrite + Send + Sync + Unpin,
+        R: crate::erasure::coding::ShardSource,
+    {
+        self.decode_inner(
+            writer,
+            readers,
+            offset,
+            length,
+            total_length,
+            read_costs,
+            deferred_handles,
+            deferred_reopeners,
+        )
+        .await
     }
 
     /// Reconstruct and emit one already-read stripe.
@@ -1708,6 +2403,7 @@ impl Erasure {
         total_length: usize,
         read_costs: Option<Vec<ShardReadCost>>,
         deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
+        deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
     ) -> (usize, Option<std::io::Error>)
     where
         W: AsyncWrite + Send + Sync + Unpin,
@@ -1756,7 +2452,8 @@ impl Erasure {
         } else {
             ParallelReader::new_for_decode(readers, self.clone(), offset, total_length, Some(GET_OBJECT_PATH_LEGACY_DUPLEX))
         }
-        .with_deferred_parity_handles(deferred_handles);
+        .with_deferred_parity_handles(deferred_handles)
+        .with_deferred_parity_reopeners(deferred_reopeners);
 
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;
@@ -1992,12 +2689,6 @@ mod tests {
 
     #[test]
     fn parallel_reader_keeps_stripe_scratch_out_of_line() {
-        eprintln!(
-            "parallel_reader={} stripe_state={} cached_state={}",
-            std::mem::size_of::<ParallelReader<Cursor<Vec<u8>>>>(),
-            std::mem::size_of::<StripeReadState>(),
-            std::mem::size_of::<Option<Box<StripeReadState>>>()
-        );
         assert_eq!(
             std::mem::size_of::<Option<Box<StripeReadState>>>(),
             std::mem::size_of::<usize>(),
@@ -2156,11 +2847,16 @@ mod tests {
             sleep: Option<Pin<Box<Sleep>>>,
         },
         Pending,
+        /// Parks without self-waking so a surrounding timer can make a
+        /// deterministic cancellation decision (unlike `Pending`, which is
+        /// intentionally a busy-waking fixture for timeout tests).
+        Parked,
         PartialThenPending {
             data: Vec<u8>,
             emitted: bool,
         },
         TimedOut,
+        TerminalFileNotFound,
         /// Serves `cursor` (typically the first stripe's bytes) normally, then
         /// once it is exhausted parks on a long `sleep` instead of returning EOF —
         /// modelling a shard whose *next*-stripe read never completes (a wedged or
@@ -2192,6 +2888,7 @@ mod tests {
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
+                TestShardReader::Parked => Poll::Pending,
                 TestShardReader::PartialThenPending { data, emitted } => {
                     if *emitted {
                         cx.waker().wake_by_ref();
@@ -2204,6 +2901,9 @@ mod tests {
                     Poll::Ready(Ok(()))
                 }
                 TestShardReader::TimedOut => Poll::Ready(Err(io::Error::new(ErrorKind::TimedOut, "test shard read timed out"))),
+                TestShardReader::TerminalFileNotFound => {
+                    Poll::Ready(Err(crate::disk::error::terminal_read_error_to_io(Error::FileNotFound)))
+                }
                 TestShardReader::PrefixThenSlow { cursor, stall, sleep } => {
                     let before = buf.filled().len();
                     match Pin::new(cursor).poll_read(cx, buf) {
@@ -3108,6 +3808,36 @@ mod tests {
         temp_env::with_vars([(ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("1"))], || {
             assert!(!legacy_stripe_prefetch_enabled(), "count == 1 must stay serial");
         });
+    }
+
+    /// A copy source must remain demand-bound even when an operator has opted
+    /// into the ordinary GET overlap switches. The policy also enables the
+    /// deferred-parity lockstep mode so healthy copies do not consume parity
+    /// streams until reconstruction needs them.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn demand_bound_policy_disables_stripe_read_ahead_and_uses_data_only_lockstep() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT, Some("8")),
+                (ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, Some("false")),
+            ],
+            async {
+                assert!(legacy_stripe_prefetch_enabled());
+                assert!(!get_lockstep_data_shards_only_enabled());
+
+                with_decode_read_policy(DecodeReadPolicy::DemandBound, async {
+                    assert!(!legacy_stripe_prefetch_enabled());
+                    assert!(get_lockstep_data_shards_only_enabled());
+                })
+                .await;
+
+                assert!(legacy_stripe_prefetch_enabled());
+                assert!(!get_lockstep_data_shards_only_enabled());
+            },
+        )
+        .await;
     }
 
     /// Cancel-safety (https://github.com/rustfs/backlog/issues/1310): when the
@@ -4172,6 +4902,342 @@ mod tests {
         assert!(bufs[2].is_some());
         assert!(bufs[3].is_some());
         assert_eq!(DATA_SHARDS + 1, bufs.iter().filter(|buf| buf.is_some()).count());
+    }
+
+    /// Demand-bound lockstep regression: a slow data shard must be hedged as
+    /// soon as deferred parity can provide the decode-plus-verification quorum.
+    /// Before this guard, the hedge timer only looked at already-completed
+    /// readers, so a 2+2 stripe with one ready data shard waited out the full
+    /// read timeout even though both parity readers were available to engage.
+    #[tokio::test]
+    async fn test_demand_bound_lockstep_hedges_to_deferred_parity_quorum() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let slow_until = TokioInstant::now() + Duration::from_secs(60);
+        let readers = vec![
+            Some(BitrotReader::new(
+                TestShardReader::ReadyAt {
+                    cursor: Cursor::new(vec![0_u8; SHARD_SIZE * NUM_SHARDS]),
+                    ready_at: slow_until,
+                    sleep: None,
+                },
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![3_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let (bufs, errs, engaged, readers_remaining) = with_decode_read_policy(DecodeReadPolicy::DemandBound, async {
+            let mut parallel_reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+                readers,
+                erasure,
+                0,
+                NUM_SHARDS * BLOCK_SIZE,
+                None,
+                vec![ShardReadCost::Unknown; DATA_SHARDS + PARITY_SHARDS],
+                Duration::from_secs(60),
+                true,
+            );
+            let (bufs, errs) = tokio::time::timeout(Duration::from_secs(2), parallel_reader.read())
+                .await
+                .expect("deferred parity must cover a hedged data shard without waiting for read_timeout");
+            (
+                bufs,
+                errs,
+                parallel_reader.engaged.clone(),
+                parallel_reader.readers.iter().map(Option::is_some).collect::<Vec<_>>(),
+            )
+        })
+        .await;
+
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert_eq!(bufs.iter().filter(|buf| buf.is_some()).count(), DATA_SHARDS + 1);
+        assert_eq!(engaged.as_slice(), &[true, true, true, true]);
+        assert_eq!(readers_remaining, vec![false, true, true, true]);
+    }
+
+    /// A fast data failure must admit deferred parity immediately.  There is
+    /// intentionally no hedge timer when `read_timeout == 0`, so relying on
+    /// the timer would drain the initial futures and return a false quorum
+    /// before the healthy parity readers are ever opened.
+    #[tokio::test]
+    async fn test_demand_bound_admits_parity_after_fast_data_failure_without_timer() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![
+            Some(BitrotReader::new(TestShardReader::TimedOut, SHARD_SIZE, hash_algo.clone(), false)),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![3_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let (bufs, errs, engaged, readers_remaining) = with_decode_read_policy(DecodeReadPolicy::DemandBound, async {
+            let mut parallel_reader = ParallelReader::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+                readers,
+                erasure,
+                0,
+                NUM_SHARDS * BLOCK_SIZE,
+                None,
+                Duration::ZERO,
+                true,
+            );
+            let (bufs, errs) = tokio::time::timeout(Duration::from_millis(500), parallel_reader.read())
+                .await
+                .expect("fast data failure must immediately race healthy parity without a hedge timer");
+            (
+                bufs,
+                errs,
+                parallel_reader.engaged.clone(),
+                parallel_reader.readers.iter().map(Option::is_some).collect::<Vec<_>>(),
+            )
+        })
+        .await;
+
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert_eq!(bufs.iter().filter(|buf| buf.is_some()).count(), DATA_SHARDS + 1);
+        assert_eq!(engaged.as_slice(), &[true, true, true, true]);
+        assert_eq!(readers_remaining, vec![false, true, true, true]);
+    }
+
+    #[tokio::test]
+    async fn test_demand_bound_canceled_hedge_preserves_deferred_parity_for_next_stripe() {
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let parity_calls = Arc::new(AtomicUsize::new(0));
+        let mut reopeners: Vec<Option<DeferredReaderReopener<TestShardReader>>> = vec![None; DATA_SHARDS + PARITY_SHARDS];
+        for (idx, slot) in reopeners.iter_mut().enumerate().skip(DATA_SHARDS).take(PARITY_SHARDS) {
+            let parity_calls = Arc::clone(&parity_calls);
+            *slot = Some(Arc::new(move |_stripe_index| {
+                let call = parity_calls.fetch_add(1, Ordering::SeqCst);
+                let reader = if call == 0 {
+                    // One hedge succeeds before the slow data reader returns;
+                    // it must still remain disposable rather than being
+                    // promoted into the next stripe.
+                    TestShardReader::Ready(Cursor::new(vec![idx as u8; SHARD_SIZE]))
+                } else if call < PARITY_SHARDS {
+                    TestShardReader::Parked
+                } else {
+                    TestShardReader::Ready(Cursor::new(vec![idx as u8; SHARD_SIZE * 2]))
+                };
+                Some(BitrotReader::new(reader, SHARD_SIZE, HashAlgorithm::None, false))
+            }));
+        }
+
+        let slow_until = TokioInstant::now() + Duration::from_millis(150);
+        let readers = vec![
+            Some(BitrotReader::new(
+                TestShardReader::ReadyAt {
+                    cursor: Cursor::new(vec![0_u8; SHARD_SIZE * 4]),
+                    ready_at: slow_until,
+                    sleep: None,
+                },
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE * 4])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo.clone(), false)),
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo, false)),
+        ];
+
+        let (first_parity_reserved, second_result) = with_decode_read_policy(DecodeReadPolicy::DemandBound, async {
+            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+            let mut parallel_reader = ParallelReader::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+                readers,
+                erasure,
+                0,
+                BLOCK_SIZE * 4,
+                None,
+                Duration::from_secs(1),
+                true,
+            )
+            .with_deferred_parity_reopeners(reopeners);
+
+            let (first_buffers, first_errors) = tokio::time::timeout(Duration::from_secs(1), parallel_reader.read())
+                .await
+                .expect("healthy data recovery must not wait for canceled parity hedges");
+            assert_eq!(first_buffers.iter().filter(|buffer| buffer.is_some()).count(), DATA_SHARDS + 1);
+            assert!(first_errors.iter().take(DATA_SHARDS).all(Option::is_none));
+            assert_eq!(parity_calls.load(Ordering::SeqCst), PARITY_SHARDS);
+            assert!(parallel_reader.readers[2].is_some());
+            assert!(parallel_reader.readers[3].is_some());
+            assert!(!parallel_reader.engaged[2]);
+            assert!(!parallel_reader.engaged[3]);
+
+            // A healthy following stripe must not inherit the one-stripe hedge
+            // reader. If a successful temporary hedge were promoted, this
+            // read would schedule parity again and violate demand-bound
+            // read-ahead.
+            let (healthy_buffers, healthy_errors) = tokio::time::timeout(Duration::from_secs(1), parallel_reader.read())
+                .await
+                .expect("a healthy following stripe must complete without parity fan-out");
+            assert!(healthy_errors.iter().take(DATA_SHARDS).all(Option::is_none));
+            assert_eq!(healthy_buffers.iter().filter(|buffer| buffer.is_some()).count(), DATA_SHARDS);
+            assert_eq!(parity_calls.load(Ordering::SeqCst), PARITY_SHARDS);
+            assert!(!parallel_reader.engaged[2]);
+            assert!(!parallel_reader.engaged[3]);
+
+            // A later stripe loses data shard 0. The deferred reserves must be
+            // available again; the second pair of factory calls returns the
+            // aligned parity bytes for this stripe.
+            parallel_reader.readers[0] =
+                Some(BitrotReader::new(TestShardReader::TimedOut, SHARD_SIZE, HashAlgorithm::None, false));
+            let (second_buffers, second_errors) = tokio::time::timeout(Duration::from_secs(1), parallel_reader.read())
+                .await
+                .expect("the next degraded stripe must reuse the preserved parity reserve");
+            assert!(matches!(&second_errors[0], Some(DiskError::Io(error)) if error.kind() == ErrorKind::TimedOut));
+            assert_eq!(second_buffers.iter().filter(|buffer| buffer.is_some()).count(), DATA_SHARDS + 1);
+
+            // Once the parity readers have been persistently engaged, another
+            // degraded stripe reuses their aligned streams; no new factory
+            // calls (and therefore no new remote opens) are permitted.
+            let (third_buffers, third_errors) = tokio::time::timeout(Duration::from_secs(1), parallel_reader.read())
+                .await
+                .expect("persistent parity readers must cover a subsequent degraded stripe");
+            assert!(third_errors[0].is_none(), "an already-retired data slot has no new read error");
+            assert_eq!(third_buffers.iter().filter(|buffer| buffer.is_some()).count(), DATA_SHARDS + 1);
+            assert_eq!(parity_calls.load(Ordering::SeqCst), PARITY_SHARDS * 2);
+            (
+                parallel_reader.readers[2].is_some() && parallel_reader.readers[3].is_some(),
+                (third_buffers, third_errors),
+            )
+        })
+        .await;
+
+        assert!(first_parity_reserved);
+        assert_eq!(parity_calls.load(Ordering::SeqCst), PARITY_SHARDS * 2);
+        // `second_result` carries the third (persistently degraded) stripe;
+        // the data slot was already retired by the preceding stripe, so it
+        // must not emit a fresh timeout or trigger another remote open.
+        let (buffers, errors) = second_result;
+        assert!(errors[0].is_none());
+        assert_eq!(buffers.iter().filter(|buffer| buffer.is_some()).count(), DATA_SHARDS + 1);
+    }
+
+    /// A disposable parity hedge is advisory. Its terminal error must not be
+    /// copied into the stripe error vector, because the emitter treats
+    /// FileNotFound/FileCorrupt there as an object-level failure even after a
+    /// healthy data reader has recovered and supplied a complete stripe.
+    #[tokio::test]
+    async fn test_demand_bound_disposable_parity_error_does_not_poison_recovered_stripe() {
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let parity_calls = Arc::new(AtomicUsize::new(0));
+        let mut reopeners: Vec<Option<DeferredReaderReopener<TestShardReader>>> = vec![None; DATA_SHARDS + PARITY_SHARDS];
+        for (idx, slot) in reopeners.iter_mut().enumerate().skip(DATA_SHARDS).take(PARITY_SHARDS) {
+            let parity_calls = Arc::clone(&parity_calls);
+            *slot = Some(Arc::new(move |_stripe_index| {
+                let call = parity_calls.fetch_add(1, Ordering::SeqCst);
+                let reader = if call == 0 {
+                    TestShardReader::TerminalFileNotFound
+                } else {
+                    TestShardReader::Ready(Cursor::new(vec![idx as u8; SHARD_SIZE]))
+                };
+                Some(BitrotReader::new(reader, SHARD_SIZE, HashAlgorithm::None, false))
+            }));
+        }
+
+        let slow_until = TokioInstant::now() + Duration::from_millis(150);
+        let readers = vec![
+            Some(BitrotReader::new(
+                TestShardReader::ReadyAt {
+                    cursor: Cursor::new(vec![0_u8; SHARD_SIZE]),
+                    ready_at: slow_until,
+                    sleep: None,
+                },
+                SHARD_SIZE,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE])),
+                SHARD_SIZE,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, HashAlgorithm::None, false)),
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, HashAlgorithm::None, false)),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut output = Vec::new();
+        let (written, error) = with_decode_read_policy(DecodeReadPolicy::DemandBound, async {
+            erasure
+                .decode_with_stripe_handles_and_reopeners(
+                    &mut output,
+                    readers,
+                    0,
+                    BLOCK_SIZE,
+                    BLOCK_SIZE,
+                    None,
+                    Vec::new(),
+                    reopeners,
+                )
+                .await
+        })
+        .await;
+
+        assert_eq!(parity_calls.load(Ordering::SeqCst), PARITY_SHARDS);
+        assert_eq!(written, BLOCK_SIZE);
+        assert_eq!(output.len(), BLOCK_SIZE);
+        assert!(error.is_none(), "a failed disposable hedge must not fail a recovered stripe: {error:?}");
     }
 
     /// Lockstep verification-quorum regression (backlog#1156). When a data shard is

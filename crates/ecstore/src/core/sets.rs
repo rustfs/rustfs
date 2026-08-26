@@ -46,9 +46,9 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use http::HeaderMap;
-use rustfs_common::heal_channel::HealOpts;
-use rustfs_common::heal_channel::{DriveState, HealItemType};
 use rustfs_filemeta::FileInfo;
+use rustfs_heal_contracts::heal_channel::HealOpts;
+use rustfs_heal_contracts::heal_channel::{DriveState, HealItemType};
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};

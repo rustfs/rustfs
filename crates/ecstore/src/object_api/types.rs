@@ -281,7 +281,7 @@ pub struct QuotaAdmission {
 pub struct LifecycleDeleteAllRequest {
     pub(crate) version_id: Option<Uuid>,
     pub(crate) delete_marker: bool,
-    pub(crate) action: rustfs_common::metrics::IlmAction,
+    pub(crate) action: rustfs_scanner_contracts::metrics::IlmAction,
     pub(crate) rule_id: String,
     pub(crate) phase: LifecycleDeleteAllPhase,
 }

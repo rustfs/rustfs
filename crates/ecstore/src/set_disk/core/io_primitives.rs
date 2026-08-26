@@ -1364,7 +1364,7 @@ pub(in crate::set_disk) enum ReadRepairAdmissionOutcome {
 
 pub(in crate::set_disk) type ReadRepairAdmissionFuture = Pin<Box<dyn Future<Output = ReadRepairAdmissionOutcome> + Send>>;
 pub(in crate::set_disk) type ReadRepairAdmissionSubmitter =
-    fn(rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture;
+    fn(rustfs_heal_contracts::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture;
 
 pub(in crate::set_disk) struct ReadRepairHealSubmission<'a> {
     pub(in crate::set_disk) bucket: &'a str,
@@ -1385,7 +1385,7 @@ pub(in crate::set_disk) struct ReadRepairHealSubmission<'a> {
 }
 
 pub(in crate::set_disk) fn send_read_repair_heal_request(
-    request: rustfs_common::heal_channel::HealChannelRequest,
+    request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
 ) -> ReadRepairAdmissionFuture {
     Box::pin(async {
         match send_heal_request_with_admission(request).await {
@@ -1453,7 +1453,7 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
         let _ = rustfs_common::mrf_channel::try_send_mrf_intent_typed(kind, bucket, object, version_uuid, Some(scope));
     }
 
-    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+    let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
         bucket.to_string(),
         Some(object.to_string()),
         false,
@@ -1517,6 +1517,7 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
 }
 
 pub(in crate::set_disk) type ObjectBitrotReader = BitrotReader<ShardReader>;
+pub(in crate::set_disk) type DeferredReaderReopener = crate::erasure::coding::decode::DeferredReaderReopener<ShardReader>;
 pub(in crate::set_disk) type BitrotReaderTask<'a> =
     Pin<Box<dyn Future<Output = (usize, std::result::Result<Option<ObjectBitrotReader>, DiskError>)> + Send + 'a>>;
 
@@ -1533,6 +1534,10 @@ pub(in crate::set_disk) struct BitrotReaderSetup {
     /// readers. The lockstep GET decode uses them to open a parity shard
     /// aligned to the stripe where a data shard failed (backlog#923).
     pub(in crate::set_disk) deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
+    /// Factories for a fresh, stripe-aligned parity reader. CopySource hedges
+    /// use these disposable readers so an abandoned hedge leaves the original
+    /// deferred reserve untouched.
+    pub(in crate::set_disk) deferred_reopeners: Vec<Option<DeferredReaderReopener>>,
     pub(in crate::set_disk) errors: Vec<Option<DiskError>>,
     pub(in crate::set_disk) scheduled: Vec<bool>,
     pub(in crate::set_disk) attempted: Vec<bool>,
@@ -1595,6 +1600,16 @@ pub(in crate::set_disk) fn get_bitrot_reader_setup_strategy(
     mode: BitrotReaderSetupMode,
     prefer_data_blocks_first: bool,
 ) -> BitrotReaderSetupStrategy {
+    // CopyObject holds the source reader behind a backpressured destination.
+    // Keep its setup demand-bound even when an operator has retained the
+    // legacy all-shards environment setting for ordinary GETs.
+    if matches!(
+        crate::set_disk::get_object_read_policy(),
+        crate::set_disk::GetObjectReadPolicy::CopySource
+    ) {
+        return BitrotReaderSetupStrategy::DataBlocksFirst;
+    }
+
     match mode {
         BitrotReaderSetupMode::ReadQuorum
             if prefer_data_blocks_first
@@ -1620,6 +1635,7 @@ impl BitrotReaderSetup {
         Self {
             readers: (0..shards).map(|_| None).collect(),
             deferred_stripe_handles: (0..shards).map(|_| None).collect(),
+            deferred_reopeners: (0..shards).map(|_| None).collect(),
             errors: vec![Some(DiskError::DiskNotFound); shards],
             scheduled: vec![false; shards],
             attempted: vec![false; shards],
@@ -1814,6 +1830,41 @@ pub(in crate::set_disk) fn next_unscheduled_reader_index(
         .find(|idx| !setup.scheduled[*idx])
 }
 
+/// Build a cloneable opener for an unopened deferred shard. The returned
+/// reader is aligned to the requested stripe before its first poll, while the
+/// source reader created during setup remains untouched as a reserve.
+#[allow(clippy::too_many_arguments)]
+fn deferred_reader_reopener(
+    inline_data: Option<Bytes>,
+    disk: Option<DiskStore>,
+    bucket: &str,
+    path: &str,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+) -> DeferredReaderReopener {
+    let bucket = bucket.to_owned();
+    let path = path.to_owned();
+    Arc::new(move |stripe_index| {
+        let (reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
+            inline_data.clone(),
+            disk.clone(),
+            &bucket,
+            &path,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
+        );
+        handle.advance_stripes(stripe_index).then_some(reader)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     setup: &mut BitrotReaderSetup,
@@ -1836,6 +1887,15 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         return;
     }
 
+    // Only CopySource uses disposable, stripe-aligned reopeners. Ordinary GET
+    // readers use the existing deferred handle and should not retain one
+    // heap-allocated closure (plus cloned path/disk state) for every parity
+    // slot.
+    let copy_source_demand_bound = matches!(
+        crate::set_disk::get_object_read_policy(),
+        crate::set_disk::GetObjectReadPolicy::CopySource
+    );
+
     for idx in 0..disks.len() {
         if setup.attempted[idx] {
             continue;
@@ -1849,6 +1909,20 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
+        let reopener = copy_source_demand_bound.then(|| {
+            deferred_reader_reopener(
+                inline_data.clone(),
+                disk.clone(),
+                bucket,
+                &path,
+                read_offset,
+                read_length,
+                shard_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                use_mmap_read,
+            )
+        });
         let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
             inline_data,
             disk,
@@ -1862,6 +1936,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             use_mmap_read,
         );
         setup.retain_deferred_reader(idx, reader, stripe_handle);
+        setup.deferred_reopeners[idx] = reopener;
     }
 
     // With the data-shards-only lockstep gate on (backlog#923), the GET decode
@@ -1887,6 +1962,20 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
+        let reopener = copy_source_demand_bound.then(|| {
+            deferred_reader_reopener(
+                inline_data.clone(),
+                disk.clone(),
+                bucket,
+                &path,
+                read_offset,
+                read_length,
+                shard_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                use_mmap_read,
+            )
+        });
         let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
             inline_data,
             disk,
@@ -1901,6 +1990,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         );
         setup.readers[idx] = Some(reader);
         setup.deferred_stripe_handles[idx] = Some(stripe_handle);
+        setup.deferred_reopeners[idx] = reopener;
     }
 }
 
@@ -2210,6 +2300,10 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     let strategy = get_bitrot_reader_setup_strategy(mode, prefer_data_blocks_first);
 
     if use_mmap_read
+        && !matches!(
+            crate::set_disk::get_object_read_policy(),
+            crate::set_disk::GetObjectReadPolicy::CopySource
+        )
         && let Some(mut setup) = try_create_bitrot_readers_via_batch_pread(
             files,
             disks,
@@ -3580,7 +3674,7 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     tail_drain: tokio::task::JoinHandle<Option<RenameTailOutcome>>,
     guard_release: tokio::sync::oneshot::Receiver<bool>,
     guards: Guards,
-    request: rustfs_common::heal_channel::HealChannelRequest,
+    request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
     finalize: Finalize,
     cleanup: Cleanup,
     submit: Submit,
@@ -3590,7 +3684,7 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     FinalizeFuture: Future<Output = ()> + Send,
     Cleanup: FnOnce(Guards, Vec<RenameTailCleanup>) -> CleanupFuture + Send,
     CleanupFuture: Future<Output = ()> + Send,
-    Submit: FnOnce(rustfs_common::heal_channel::HealChannelRequest) -> SubmitFuture + Send,
+    Submit: FnOnce(rustfs_heal_contracts::heal_channel::HealChannelRequest) -> SubmitFuture + Send,
     SubmitFuture: Future<Output = ()> + Send,
 {
     let (needs_heal, tail_cleanup, tail_complete) = match tail_drain.await {
@@ -4939,16 +5033,17 @@ impl SetDisks {
             // reclaim_orphan_data_dirs. Reuses the existing heal channel, which
             // deduplicates and back-pressures via admission; failures only drop
             // the return value (same shape as multipart's existing heal enqueue).
-            let _ =
-                rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
+            let _ = rustfs_heal_contracts::heal_channel::send_heal_request(
+                rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                     bucket.to_string(),
                     Some(object.to_string()),
                     false,
-                    Some(rustfs_common::heal_channel::HealChannelPriority::Normal),
+                    Some(rustfs_heal_contracts::heal_channel::HealChannelPriority::Normal),
                     Some(self.pool_index),
                     Some(self.set_index),
-                ))
-                .await;
+                ),
+            )
+            .await;
         }
     }
 
@@ -6800,18 +6895,24 @@ mod tests {
         write_raw_file_meta_unchecked(disk, bucket, object, metadata).await;
     }
 
-    fn failed_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn failed_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         Box::pin(async { ReadRepairAdmissionOutcome::Failed("injected submit failure".to_string()) })
     }
 
-    fn accepted_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn accepted_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
     }
 
-    fn dropped_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn dropped_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         Box::pin(async {
             ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(
-                rustfs_common::heal_channel::HealAdmissionDropReason::PolicyDropped,
+                rustfs_heal_contracts::heal_channel::HealAdmissionDropReason::PolicyDropped,
             ))
         })
     }
@@ -8853,7 +8954,7 @@ mod tests {
             tail_drain,
             released,
             (),
-            rustfs_common::heal_channel::HealChannelRequest::default(),
+            rustfs_heal_contracts::heal_channel::HealChannelRequest::default(),
             move || async move {
                 *finalize_captured.lock().expect("finalize recorder should not poison") = true;
             },

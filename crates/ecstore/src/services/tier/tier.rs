@@ -47,7 +47,6 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::client::{admin_handler_utils::AdminError, provider_versions::ProviderVersionCapabilities};
 use crate::error::{Error, Result, StorageError};
 use crate::services::tier::{
     tier_admin::TierCreds,
@@ -80,6 +79,7 @@ use crate::{
 };
 use rustfs_filemeta::FileInfo;
 use rustfs_rio::HashReader;
+use rustfs_s3_client::{admin_handler_utils::AdminError, provider_versions::ProviderVersionCapabilities};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
 use s3s::S3ErrorCode;
 
@@ -1529,14 +1529,14 @@ impl WarmBackend for SharedWarmBackendProxy {
         self.0.validate_remote_version_id(remote_version_id)
     }
 
-    async fn put(&self, object: &str, r: crate::client::transition_api::ReaderImpl, length: i64) -> io::Result<String> {
+    async fn put(&self, object: &str, r: rustfs_s3_client::transition_api::ReaderImpl, length: i64) -> io::Result<String> {
         self.0.put(object, r, length).await
     }
 
     async fn put_with_meta(
         &self,
         object: &str,
-        r: crate::client::transition_api::ReaderImpl,
+        r: rustfs_s3_client::transition_api::ReaderImpl,
         length: i64,
         meta: HashMap<String, String>,
     ) -> io::Result<String> {
@@ -1548,7 +1548,7 @@ impl WarmBackend for SharedWarmBackendProxy {
         object: &str,
         rv: &str,
         opts: crate::services::tier::warm_backend::WarmBackendGetOpts,
-    ) -> io::Result<crate::client::transition_api::ReadCloser> {
+    ) -> io::Result<rustfs_s3_client::transition_api::ReadCloser> {
         self.0.get(object, rv, opts).await
     }
 
@@ -5778,8 +5778,8 @@ mod tests {
     //     lets us drive `remove`/`verify` through every branch.
     // ---------------------------------------------------------------------
 
-    use crate::client::transition_api::{ReadCloser, ReaderImpl};
     use crate::services::tier::warm_backend::{WarmBackend, WarmBackendGetOpts};
+    use rustfs_s3_client::transition_api::{ReadCloser, ReaderImpl};
 
     fn empty_mgr() -> TierConfigMgr {
         TierConfigMgr {

@@ -33,7 +33,9 @@ use super::storage_api::multipart_usecase::contract::http::HTTPPreconditions;
 use super::storage_api::multipart_usecase::contract::multipart::{
     CompletePart, MAX_MULTIPART_PART_NUMBER, MultipartOperations as _, MultipartUploadResult,
 };
-use super::storage_api::multipart_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
+#[cfg(test)]
+use super::storage_api::multipart_usecase::contract::object::ObjectIO as _;
+use super::storage_api::multipart_usecase::contract::object::ObjectOperations as _;
 use super::storage_api::multipart_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::multipart_usecase::data_usage::{
     quota_object_size, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
@@ -1443,8 +1445,8 @@ impl DefaultMultipartUsecase {
             .into());
         }
 
-        let src_reader = store
-            .get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
+        let (src_reader, _source_cancellation) = store
+            .get_object_reader_for_copy(&src_bucket, &src_key, rs.clone(), h, &get_opts)
             .await
             .map_err(map_get_object_reader_error)?;
 

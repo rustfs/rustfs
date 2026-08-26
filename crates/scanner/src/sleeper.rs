@@ -16,11 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
-use rustfs_common::metrics::global_metrics;
 use rustfs_config::{
     DEFAULT_SCANNER_IDLE_MODE, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS, ENV_SCANNER_IDLE_MODE, ENV_SCANNER_SPEED,
     ENV_SCANNER_YIELD_EVERY_N_OBJECTS, ScannerSpeed,
 };
+use rustfs_scanner_contracts::metrics::global_metrics;
 use tokio::time::Duration;
 
 const MIN_SLEEP: Duration = Duration::from_millis(1);

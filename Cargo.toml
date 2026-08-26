@@ -237,9 +237,9 @@ atoi = "3.1.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.11.0" }
 aws-credential-types = { version = "1.3.0" }
-aws-sdk-kms = { default-features = false, version = "1.116.0" }
-aws-sdk-s3 = { default-features = false, version = "1.143.0" }
-aws-sdk-sts = { default-features = false, version = "1.112.0" }
+aws-sdk-kms = { default-features = false, version = "1.117.0" }
+aws-sdk-s3 = { default-features = false, version = "1.144.0" }
+aws-sdk-sts = { default-features = false, version = "1.113.0" }
 aws-smithy-http-client = { default-features = false, version = "1.4.0" }
 aws-smithy-runtime-api = { version = "1.15.0" }
 aws-smithy-types = { version = "1.6.2" }
@@ -306,7 +306,7 @@ rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { git = "https://github.com/rustfs/s3s.git", rev = "5f22e8d0a37e83f531f653024aac11c72586479a", version = "0.15.0", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s.git", rev = "f4dedc905ec621fa85a4686df6304190b55375f6", version = "0.15.0", features = ["minio"] }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.3"
@@ -366,7 +366,6 @@ dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.5.1" }
-rustfs-mimalloc-sys = { version = "0.5.1" }
 hotpath = { version = "0.24.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }

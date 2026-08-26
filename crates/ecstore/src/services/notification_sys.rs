@@ -2089,7 +2089,7 @@ async fn peer_disk_health(host: &str) -> Option<PeerDiskHealth> {
                 disks.push(rustfs_madmin::Disk {
                     endpoint: ep.to_string(),
                     state: if online {
-                        rustfs_common::heal_channel::DriveState::Ok.to_string()
+                        rustfs_heal_contracts::heal_channel::DriveState::Ok.to_string()
                     } else {
                         ItemState::Offline.to_string().to_owned()
                     },

@@ -745,7 +745,7 @@ async fn test_scanner_heal_admission_accounting_maps_normal_scan_to_heal() {
         &metrics,
         HealScanMode::Normal,
         Ok(HealAdmissionResult::Dropped(
-            rustfs_common::heal_channel::HealAdmissionDropReason::QueueFull,
+            rustfs_heal_contracts::heal_channel::HealAdmissionDropReason::QueueFull,
         )),
     );
     record_scanner_heal_admission(&metrics, HealScanMode::Normal, Err(()));
@@ -1687,7 +1687,7 @@ fn test_describe_heal_admission_formats_unadmitted_results() {
     assert_eq!(describe_heal_admission(HealAdmissionResult::Full), "queue_full");
     assert_eq!(
         describe_heal_admission(HealAdmissionResult::Dropped(
-            rustfs_common::heal_channel::HealAdmissionDropReason::QueueFull
+            rustfs_heal_contracts::heal_channel::HealAdmissionDropReason::QueueFull
         )),
         "dropped:queue_full"
     );
@@ -1879,10 +1879,10 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let healed_versions = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
     let healed_versions_clone = healed_versions.clone();
     let mut heal_rx =
-        rustfs_common::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
+        rustfs_heal_contracts::heal_channel::init_heal_channel().expect("heal channel should initialize once for scanner tests");
     let _heal_responder = tokio::spawn(async move {
         while let Some(command) = heal_rx.recv().await {
-            if let rustfs_common::heal_channel::HealChannelCommand::Start {
+            if let rustfs_heal_contracts::heal_channel::HealChannelCommand::Start {
                 request, response_tx, ..
             } = command
             {

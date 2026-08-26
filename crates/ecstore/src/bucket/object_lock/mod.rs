@@ -14,27 +14,18 @@
 
 pub mod objectlock;
 pub mod objectlock_sys;
+pub mod types;
 
-use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHoldStatus};
-
+/// Whether a bucket Object Lock configuration has locking enabled. The
+/// serving-layer `ObjectLockConfiguration` DTO implements this in
+/// the bucket-metadata module, which owns the persisted configuration type
+/// during the s3s ratchet migration (rustfs/backlog#1842).
 pub trait ObjectLockApi {
     fn enabled(&self) -> bool;
 }
 
-impl ObjectLockApi for ObjectLockConfiguration {
-    fn enabled(&self) -> bool {
-        self.object_lock_enabled
-            .as_ref()
-            .is_some_and(|v| v.as_str() == ObjectLockEnabled::ENABLED)
-    }
-}
-
+/// Whether a legal-hold status value is one of the two valid wire values.
+/// Implemented for the serving-layer DTO in the bucket-metadata module.
 pub trait ObjectLockStatusExt {
     fn valid(&self) -> bool;
-}
-
-impl ObjectLockStatusExt for ObjectLockLegalHoldStatus {
-    fn valid(&self) -> bool {
-        matches!(self.as_str(), ObjectLockLegalHoldStatus::ON | ObjectLockLegalHoldStatus::OFF)
-    }
 }

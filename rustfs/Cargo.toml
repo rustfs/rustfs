@@ -57,6 +57,8 @@ tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, 
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope"]
 manual-test-runners = []
 e2e-test-hooks = []
+# Shortens Connect credentials only in debug E2E builds.
+connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
@@ -213,6 +215,8 @@ hotpath.workspace = true
 rustfs-heal = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
+rustfs-heal-contracts = { workspace = true }
+rustfs-scanner-contracts = { workspace = true }
 rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
@@ -230,6 +234,7 @@ rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
+rustfs-s3-client = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-s3-ops = { workspace = true }
 rustfs-security-governance = { workspace = true }
@@ -347,9 +352,6 @@ rustfs-mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
-
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-rustfs-mimalloc-sys = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }

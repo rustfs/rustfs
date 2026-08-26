@@ -416,7 +416,8 @@ pub(crate) mod ecstore_capacity {
 }
 
 pub(crate) mod ecstore_client {
-    pub(crate) use rustfs_ecstore::api::client::{admin_handler_utils, object_api_utils};
+    pub(crate) use rustfs_ecstore::api::object_api_utils;
+    pub(crate) use rustfs_s3_client::admin_handler_utils;
 }
 
 pub(crate) mod ecstore_compression {
@@ -1545,7 +1546,7 @@ pub(crate) trait StoragePeerS3ClientExt {
     async fn heal_bucket_with_fence(
         &self,
         bucket: &str,
-        opts: &rustfs_common::heal_channel::HealOpts,
+        opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         fenced_pools: &[usize],
     ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem>;
     async fn make_bucket(&self, bucket: &str, opts: &contract::bucket::MakeBucketOptions) -> DiskResult<()>;
@@ -1562,7 +1563,7 @@ impl StoragePeerS3ClientExt for LocalPeerS3Client {
     async fn heal_bucket_with_fence(
         &self,
         bucket: &str,
-        opts: &rustfs_common::heal_channel::HealOpts,
+        opts: &rustfs_heal_contracts::heal_channel::HealOpts,
         fenced_pools: &[usize],
     ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem> {
         ecstore_rpc::PeerS3Client::heal_bucket_with_fence(self, bucket, opts, fenced_pools).await
@@ -1745,6 +1746,10 @@ pub(crate) fn check_retention_for_modification(
     new_retain_until: Option<time::OffsetDateTime>,
     bypass_governance: bool,
 ) -> Option<ObjectLockBlockReason> {
+    // The gate compares the requested mode literally against the canonical
+    // persisted mode, so only the exact canonical spelling maps to a typed
+    // mode; anything else stays `None` and is judged as a mode change.
+    let new_mode = new_mode.and_then(ecstore_bucket::object_lock::types::RetentionMode::parse_exact);
     ecstore_bucket::object_lock::objectlock_sys::check_retention_for_modification(
         user_defined,
         new_mode,

@@ -154,6 +154,12 @@ pub mod bucket {
     pub mod object_lock {
         pub use crate::bucket::object_lock::{ObjectLockApi, ObjectLockStatusExt};
 
+        pub mod types {
+            pub use crate::bucket::object_lock::types::{
+                DefaultRetention, LegalHoldStatus, ObjectLegalHold, ObjectRetention, RetentionMode,
+            };
+        }
+
         pub mod objectlock {
             pub use crate::bucket::object_lock::objectlock::{get_object_legalhold_meta, get_object_retention_meta};
         }
@@ -249,26 +255,8 @@ pub mod capacity {
     pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
 
-pub mod client {
-    pub mod admin_handler_utils {
-        pub use crate::client::admin_handler_utils::AdminError;
-    }
-
-    pub mod api_put_object {
-        pub use crate::client::api_put_object::{AdvancedPutOptions, PutObjectOptions};
-    }
-
-    pub mod object_api_utils {
-        pub use crate::client::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
-    }
-
-    pub mod transition_api {
-        pub use crate::client::transition_api::{
-            BucketLookupType, CreateBucketConfiguration, LocationConstraint, ObjectInfo, ObjectMultipartInfo, Options,
-            PutObjectPartOptions, ReadCloser, ReaderImpl, RequestMetadata, RestoreInfo, SendRequest, TransitionClient,
-            TransitionCore, UploadInfo, to_object_info,
-        };
-    }
+pub mod object_api_utils {
+    pub use crate::object_api::object_api_utils::{ObjReaderFn, PutObjReader, get_raw_etag, new_getobjectreader, to_s3s_etag};
 }
 
 pub mod cluster {

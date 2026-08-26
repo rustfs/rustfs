@@ -26,7 +26,7 @@ use crate::{
 use crate::data_usage::load_data_usage_cache;
 use crate::storage_api_contracts::admin::StorageAdminApi;
 use crate::storage_api_contracts::bucket::BucketOptions;
-use rustfs_common::heal_channel::DriveState;
+use rustfs_heal_contracts::heal_channel::DriveState;
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, ITEM_UNKNOWN, InfoMessage, MemStats,
     ServerProperties,

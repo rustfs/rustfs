@@ -700,7 +700,6 @@ mod tests {
             validate_durable_ilm_record,
         },
         bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG},
-        client::transition_api::ReaderImpl,
         config::com,
         core::pools::DecomBucketInfo,
         data_movement::SourceCleanupDeleteBarrier,
@@ -750,6 +749,8 @@ mod tests {
     #[cfg(feature = "test-util")]
     use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
     use rustfs_rio::{Checksum, ChecksumType};
+    #[cfg(feature = "test-util")]
+    use rustfs_s3_client::transition_api::ReaderImpl;
     use rustfs_utils::{
         CompressionAlgorithm,
         http::{SUFFIX_COMPRESSION, insert_str},
@@ -9537,7 +9538,7 @@ mod tests {
                         .expect("unknown transition metadata should be written");
                     }
                     let lifecycle_event = crate::bucket::lifecycle::lifecycle::Event {
-                        action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+                        action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
                         rule_id: "delete-all-versions".to_string(),
                         ..Default::default()
                     };
@@ -9709,7 +9710,7 @@ mod tests {
                 lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
                     version_id: original.version_id,
                     delete_marker: false,
-                    action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+                    action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
                     rule_id: "rule".to_string(),
                     phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
                 }),

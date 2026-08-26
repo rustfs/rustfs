@@ -14,8 +14,8 @@
 
 mod storage_api;
 
-use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::FileInfo;
+use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use storage_api::contract_compat::{

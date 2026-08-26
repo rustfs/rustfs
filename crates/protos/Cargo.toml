@@ -65,6 +65,7 @@ hotpath-cpu = [
 [dependencies]
 hotpath.workspace = true
 rustfs-common.workspace = true
+rustfs-heal-contracts.workspace = true
 rustfs-io-metrics.workspace = true
 rustfs-config.workspace = true
 rustfs-tls-runtime.workspace = true

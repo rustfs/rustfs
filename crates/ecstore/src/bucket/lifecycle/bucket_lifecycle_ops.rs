@@ -72,9 +72,6 @@ use crate::store::ECStore;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use http::HeaderMap;
 use rand::RngExt as _;
-use rustfs_common::metrics::{
-    IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
-};
 use rustfs_config::{
     DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_QUEUE_SEND_TIMEOUT_MS, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
     DEFAULT_TRANSITION_WORKERS_CAP, ENV_MAX_EXPIRY_WORKERS, ENV_TRANSITION_QUEUE_CAPACITY, ENV_TRANSITION_QUEUE_SEND_TIMEOUT_MS,
@@ -83,6 +80,9 @@ use rustfs_config::{
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info, is_restored_object_on_disk,
+};
+use rustfs_scanner_contracts::metrics::{
+    IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
 use rustfs_utils::{
     get_env_i64, get_env_usize,
@@ -939,7 +939,7 @@ impl ExpiryState {
                         let version_count = u64::try_from(v.versions.len()).unwrap_or(u64::MAX);
                         let trace = LifecycleExpiryTrace::for_batch(&v.bucket, &v.event, &v.src, version_count);
                         trace.emit(EVENT_LIFECYCLE_DELETE_DISPATCHED, "delete_dispatched", None);
-                        crate::client::object_handlers_common::delete_object_versions(
+                        crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
                             &api,
                             &v.bucket,
                             &v.versions,
@@ -5431,8 +5431,6 @@ mod tests {
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG};
     use crate::bucket::metadata_sys;
-    #[cfg(feature = "test-util")]
-    use crate::client::transition_api::ReaderImpl;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::{RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
     use crate::error::{Error, is_err_invalid_upload_id};
@@ -5460,11 +5458,13 @@ mod tests {
     use futures::FutureExt;
     #[cfg(feature = "test-util")]
     use http::HeaderMap;
-    use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_MAX_EXPIRY_WORKERS;
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_data_usage::TierStats;
     use rustfs_filemeta::{FileInfo, FileMeta};
+    #[cfg(feature = "test-util")]
+    use rustfs_s3_client::transition_api::ReaderImpl;
+    use rustfs_scanner_contracts::metrics::{IlmAction, global_metrics};
     use s3s::dto::{
         BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, OutputLocation, RestoreRequest,
@@ -6352,7 +6352,7 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         let admin_err = err
             .get_ref()
-            .and_then(|source| source.downcast_ref::<crate::client::admin_handler_utils::AdminError>())
+            .and_then(|source| source.downcast_ref::<rustfs_s3_client::admin_handler_utils::AdminError>())
             .expect("identity mismatch should retain the typed tier error");
         assert_eq!(admin_err.code, crate::services::tier::tier::ERR_TIER_INVALID_CONFIG.code);
         assert_eq!(new_backend.get_count().await, 0);
@@ -11563,7 +11563,7 @@ mod tests {
         lease
             .put(
                 "remote/object",
-                crate::client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"candidate")),
+                rustfs_s3_client::transition_api::ReaderImpl::Body(bytes::Bytes::from_static(b"candidate")),
                 9,
             )
             .await

@@ -13,6 +13,7 @@ and rollback steps.
 | Bucket replication | `crates/ecstore/src/bucket/replication/` | 15,619 lines | Contracts extracted; runtime move pending |
 | Set disks | `crates/ecstore/src/set_disk/` | state carrier plus operation modules | Keep in ECStore |
 | Public ECStore facade | `crates/ecstore/src/api/mod.rs` | broad compatibility surface | Shrink only through guarded PRs |
+| Embedded S3 client | `crates/s3-client/` (`rustfs-s3-client`) | ~8.4K lines | Extracted (rustfs/backlog#1842) |
 
 Measured 2026-08-12: the whole crate is 265 files / ~288K lines (roughly half
 is inline `#[cfg(test)]` code). The largest single files are `disk/local.rs`
@@ -36,6 +37,12 @@ The file split inside `set_disk/` is already operation-oriented: read, write,
 list, multipart, lock, heal, and replication code live in separate modules.
 The remaining large surface is the shared `SetDisks` state and cross-cutting
 contracts, not only file layout.
+
+## Completed: S3 Client Extraction (rustfs/backlog#1842)
+
+`crates/ecstore/src/client/` was a ~8.4K-line hand-written S3 HTTP client the engine uses to *consume* remote S3-compatible endpoints (ILM tier warm backends, transition targets). It was a legitimate engine capability misfiled inside the engine: it pulled `s3s`/`hyper` wire types into ecstore against ARCHITECTURE.md invariant 4, which distinguishes serving the S3 wire protocol (forbidden in ecstore) from consuming it (allowed, but in a dedicated crate).
+
+The extraction landed as: pure move of the 21 client modules to `crates/s3-client` (`rustfs-s3-client`) with a temporary re-export shim, then direct `rustfs_s3_client::` imports and shim deletion. The two server-side modules historically misfiled under `client/` stayed in ecstore and moved to their real homes: `object_api_utils.rs` under `object_api/`, `object_handlers_common.rs` under `bucket/lifecycle/` (behind the `replication_sink` boundary). The remaining serving-side `s3s` references in ecstore are ratcheted shrink-only by the `S3S_ECSTORE_FILES_BASELINE` counter in `scripts/check_s3s_footprint.sh`; per-module conversions to storage-level types (first: `bucket/object_lock/`) lower the baseline in the same change.
 
 ## Non-Negotiable Rules
 
