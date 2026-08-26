@@ -16419,6 +16419,8 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         include_str!("../app/object/mod.rs"),
         include_str!("../app/object/shared.rs"),
         include_str!("../app/object/extract.rs"),
+        include_str!("../app/object/put.rs"),
+        include_str!("../app/object/copy.rs"),
     ]
     .concat();
     let delete_object = source
