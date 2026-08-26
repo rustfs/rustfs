@@ -700,7 +700,6 @@ mod tests {
             validate_durable_ilm_record,
         },
         bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG},
-        client::transition_api::ReaderImpl,
         config::com,
         core::pools::DecomBucketInfo,
         data_movement::SourceCleanupDeleteBarrier,
@@ -750,6 +749,8 @@ mod tests {
     #[cfg(feature = "test-util")]
     use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
     use rustfs_rio::{Checksum, ChecksumType};
+    #[cfg(feature = "test-util")]
+    use rustfs_s3_client::transition_api::ReaderImpl;
     use rustfs_utils::{
         CompressionAlgorithm,
         http::{SUFFIX_COMPRESSION, insert_str},
