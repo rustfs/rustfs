@@ -55,6 +55,112 @@ jobs:
       - name: Build RustFS
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p rustfs --bins
 
+      - name: Build DEB package
+        id: deb
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Nightly snapshot name: rustfs-nightly-<YYYY-MM-DD> (Asia/Shanghai,
+          # matching the schedule timezone so the file date always matches the
+          # cron's intended day).
+          DEB_DATE="$(TZ=Asia/Shanghai date +%Y-%m-%d)"
+          DEB_FILE="rustfs-nightly-${DEB_DATE}.deb"
+          PKG_DIR="rustfs-nightly-${DEB_DATE}"
+
+          command -v fakeroot >/dev/null 2>&1 || sudo apt-get install -y -qq fakeroot
+
+          BIN="target/x86_64-unknown-linux-gnu/release/rustfs"
+          test -x "${BIN}" || { echo "rustfs binary not found: ${BIN}"; exit 1; }
+
+          mkdir -p "${PKG_DIR}/DEBIAN"
+          mkdir -p "${PKG_DIR}/usr/bin"
+          mkdir -p "${PKG_DIR}/etc/default"
+          mkdir -p "${PKG_DIR}/lib/systemd/system"
+          mkdir -p "${PKG_DIR}/usr/share/doc/rustfs"
+
+          cp "${BIN}" "${PKG_DIR}/usr/bin/rustfs"
+          chmod 755 "${PKG_DIR}/usr/bin/rustfs"
+          cp deploy/build/rustfs.service "${PKG_DIR}/lib/systemd/system/"
+
+          cat > "${PKG_DIR}/etc/default/rustfs" << 'ENVEOF'
+          # RustFS Environment Configuration
+          # See https://rustfs.com/docs/ for more information
+          # RUSTFS_VOLUMES=""
+          # RUSTFS_ROOT_USER=""
+          # RUSTFS_ROOT_PASSWORD=""
+          ENVEOF
+
+          # dpkg versions must start with a digit and cannot contain hyphens;
+          # a date-based snapshot version keeps the nightly installable
+          # alongside release packages.
+          DEB_VERSION="${DEB_DATE//-/.}~nightly"
+
+          cat > "${PKG_DIR}/DEBIAN/control" << EOF
+          Package: rustfs
+          Version: ${DEB_VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Depends: libc6 (>= 2.31)
+          Maintainer: RustFS Team <support@rustfs.com>
+          Description: High-performance distributed object storage
+           RustFS is a high-performance distributed object storage software
+           built using Rust. It is compatible with MinIO and S3 API.
+          Homepage: https://rustfs.com
+          EOF
+
+          cat > "${PKG_DIR}/DEBIAN/conffiles" << 'CONFFILES'
+          /etc/default/rustfs
+          CONFFILES
+
+          cat > "${PKG_DIR}/DEBIAN/postinst" << 'POSTINST'
+          #!/bin/bash
+          set -e
+          if ! getent passwd rustfs > /dev/null 2>&1; then
+              useradd -r -s /bin/false -d /opt/rustfs rustfs
+          fi
+          mkdir -p /opt/rustfs /data/rustfs /var/log/rustfs
+          chown rustfs:rustfs /opt/rustfs /data/rustfs /var/log/rustfs
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          echo "RustFS installed. Configure /etc/default/rustfs then: systemctl start rustfs"
+          POSTINST
+          chmod 755 "${PKG_DIR}/DEBIAN/postinst"
+
+          cat > "${PKG_DIR}/DEBIAN/prerm" << 'PRERM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ] && systemctl is-active --quiet rustfs; then
+              systemctl stop rustfs
+          fi
+          PRERM
+          chmod 755 "${PKG_DIR}/DEBIAN/prerm"
+
+          cat > "${PKG_DIR}/DEBIAN/postrm" << 'POSTRM'
+          #!/bin/bash
+          set -e
+          if [ -d /run/systemd/system ]; then
+              systemctl daemon-reload
+          fi
+          POSTRM
+          chmod 755 "${PKG_DIR}/DEBIAN/postrm"
+
+          cp LICENSE "${PKG_DIR}/usr/share/doc/rustfs/"
+          cp README.md "${PKG_DIR}/usr/share/doc/rustfs/"
+
+          fakeroot dpkg-deb --build "${PKG_DIR}"
+          ls -lh "${DEB_FILE}"
+          echo "deb_file=${DEB_FILE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.deb.outputs.deb_file }}
+          path: ${{ steps.deb.outputs.deb_file }}
+          if-no-files-found: error
+
   # Live-Vault lane for the rustfs-kms suite (rustfs/backlog#1774).
   #
   # RUSTFS_KMS_VAULT_TOKEN is the single switch that adds the Vault KV2 and
