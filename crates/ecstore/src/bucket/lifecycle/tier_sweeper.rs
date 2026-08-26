@@ -22,11 +22,11 @@ use super::runtime_boundary as runtime_sources;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryOp;
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
-use crate::client::signer_error::error_chain_contains_signer_header_marker;
 use crate::object_api::ObjectInfo;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease};
 use crate::storage_api_contracts::lifecycle::TransitionedObject;
 use crate::store::ECStore;
+use rustfs_s3_client::signer_error::error_chain_contains_signer_header_marker;
 use rustfs_utils::get_env_usize;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -670,7 +670,7 @@ pub(crate) fn transitioned_delete_journal_entry_for_source(
 
 #[cfg(test)]
 mod test {
-    use crate::client::signer_error::invalid_utf8_header_error;
+    use rustfs_s3_client::signer_error::invalid_utf8_header_error;
 
     use super::{
         CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES, ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED,

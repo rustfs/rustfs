@@ -30,14 +30,14 @@ use google_cloud_storage::client::Storage;
 use google_cloud_storage::client::StorageControl;
 use std::convert::TryFrom;
 
-use crate::client::{
-    admin_handler_utils::AdminError,
-    api_put_object::PutObjectOptions,
-    transition_api::{Options, ReadCloser, ReaderImpl},
-};
 use crate::services::tier::{
     tier_config::TierGCS,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
+};
+use rustfs_s3_client::{
+    admin_handler_utils::AdminError,
+    api_put_object::PutObjectOptions,
+    transition_api::{Options, ReadCloser, ReaderImpl},
 };
 use tracing::warn;
 

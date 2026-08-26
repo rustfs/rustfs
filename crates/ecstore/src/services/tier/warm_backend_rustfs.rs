@@ -21,16 +21,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::client::{
-    admin_handler_utils::AdminError,
-    api_put_object::PutObjectOptions,
-    credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
-};
 use crate::services::tier::{
     tier_config::TierRustFS,
     warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     warm_backend_s3::WarmBackendS3,
+};
+use rustfs_s3_client::{
+    admin_handler_utils::AdminError,
+    api_put_object::PutObjectOptions,
+    credentials::{Credentials, SignatureType, Static, Value},
+    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
 
 const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;

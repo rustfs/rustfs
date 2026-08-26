@@ -595,8 +595,8 @@ require_source_line \
   "ECStore bucket metadata public facade explicit module"
 require_source_line \
   "crates/ecstore/src/api/mod.rs" \
-  "    pub mod admin_handler_utils {" \
-  "ECStore client admin handler public facade explicit module"
+  "pub mod object_api_utils {" \
+  "ECStore object-api utils public facade explicit module"
 require_source_line \
   "crates/ecstore/src/api/mod.rs" \
   "    pub mod com {" \
@@ -609,7 +609,7 @@ require_source_line \
   "crates/ecstore/src/api/mod.rs" \
   "    pub mod tier_config {" \
   "ECStore tier config public facade explicit module"
-for ecstore_explicit_facade in bucket client; do
+for ecstore_explicit_facade in bucket; do
   if grep -qF "pub use crate::${ecstore_explicit_facade}::{" "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
     report_failure "ECStore ${ecstore_explicit_facade} public facade must expose explicit submodules instead of whole owner module passthroughs"
   fi
@@ -626,7 +626,6 @@ fi
 for ecstore_private_module in \
   bucket \
   cache_value \
-  client \
   config \
   data_usage \
   diagnostics \

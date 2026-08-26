@@ -18,11 +18,6 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use crate::client::{
-    admin_handler_utils::AdminError,
-    api_put_object::{AdvancedPutOptions, PutObjectOptions},
-    transition_api::{ReadCloser, ReaderImpl},
-};
 use crate::error::is_err_bucket_not_found;
 use crate::services::tier::{
     tier::{ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
@@ -41,6 +36,11 @@ use crate::services::tier::{
 };
 use bytes::Bytes;
 use http::StatusCode;
+use rustfs_s3_client::{
+    admin_handler_utils::AdminError,
+    api_put_object::{AdvancedPutOptions, PutObjectOptions},
+    transition_api::{ReadCloser, ReaderImpl},
+};
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };

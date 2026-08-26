@@ -68,7 +68,6 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, Notify, RwLock};
 use uuid::Uuid;
 
-use crate::client::transition_api::{ReadCloser, ReaderImpl};
 use crate::disk::endpoint::Endpoint;
 use crate::disk::format::FormatV3;
 use crate::disk::{DiskAPI, DiskOption, FORMAT_CONFIG_FILE, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE, new_disk};
@@ -78,6 +77,7 @@ use crate::services::tier::warm_backend::{
     TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
 };
 use rustfs_filemeta::FileMeta;
+use rustfs_s3_client::transition_api::{ReadCloser, ReaderImpl};
 use rustfs_utils::path::path_join_buf;
 
 /// One-shot barrier before rejected transition cleanup resolves its ECStore.
