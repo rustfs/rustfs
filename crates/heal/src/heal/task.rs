@@ -662,6 +662,15 @@ impl HealTask {
     }
 
     fn is_transient_lock_or_timeout_error(err: &Error) -> bool {
+        // Typed-first (backlog#1845): trust the lock taxonomy and timeout
+        // variants before falling back to message needles for errors whose
+        // typed identity was stringified upstream.
+        if let Error::Storage(EcstoreError::Lock(lock_err)) = err {
+            return lock_err.is_retryable() || matches!(lock_err, rustfs_lock::LockError::QuorumNotReached { .. });
+        }
+        if matches!(err, Error::Disk(DiskError::Timeout) | Error::Storage(EcstoreError::Timeout)) {
+            return true;
+        }
         let message = err.to_string().to_ascii_lowercase();
         message.contains("lock acquisition timeout")
             || message.contains("lock acquisition failed")
