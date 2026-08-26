@@ -31,7 +31,12 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose, SanType, SerialNumber,
 };
-use rustfs::connect::{ClientError, ConnectClient, ConnectConfig, CredentialStore, IdentityStore, RegistrationToken, TokenError};
+use rustfs::connect::{
+    ClientError, CoarseNodeSummary, ConnectClient, ConnectConfig, CredentialStore, HeartbeatConfig, HeartbeatError,
+    HeartbeatSchedule, HeartbeatStatus, IdentityStore, RegistrationToken, TokenError, spawn_heartbeat_runtime,
+};
+#[cfg(target_os = "linux")]
+use rustfs::connect::{InventorySchedule, InventorySnapshot, InventoryStatus, spawn_inventory_runtime};
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject as _};
 use rustls::server::WebPkiClientVerifier;
@@ -40,7 +45,9 @@ use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 
 const ORGANIZATION_UID: &str = "0198f4b0-1a00-7c10-8d21-2e3f4a5b6c70";
 const CLUSTER_UID: &str = "0198f4b0-2b00-7d20-9e31-3f4a5b6c7d81";
@@ -48,6 +55,8 @@ const DEVICE_UID: &str = "0198f4b0-3c00-7e30-8f41-4a5b6c7d8e92";
 const TOKEN_UID: &str = "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5";
 const FRESH_TOKEN_UID: &str = "0198f4b0-7f00-7c70-a381-8e9fa0b1c2d6";
 const SECOND_TOKEN_UID: &str = "0198f4b0-8f00-7d80-b491-9fa0b1c2d3e7";
+const UNRELATED_TOKEN_UID: &str = "0198f4b0-9f00-7e90-85a1-afb1c2d3e4f8";
+const INVENTORY_UID: &str = "0198f4b0-af00-7fa0-96b1-bfc1d2e3f509";
 
 struct TestPki {
     root_params: CertificateParams,
@@ -161,6 +170,11 @@ impl TestPki {
 enum Reply {
     Json(StatusCode, Value),
     DelayedClose(Duration),
+    RateLimited(&'static str),
+    UnauthorizedAfterCredential {
+        path: std::path::PathBuf,
+        certificate_serial: String,
+    },
     VerifiedRotation {
         response: Value,
         current_public_key: Vec<u8>,
@@ -172,6 +186,8 @@ enum Reply {
 struct TestServer {
     endpoint: String,
     seen: Arc<Mutex<Vec<Value>>>,
+    paths: Arc<Mutex<Vec<String>>>,
+    client_certificates: Arc<Mutex<Vec<Option<String>>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -191,7 +207,11 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
     let acceptor = TlsAcceptor::from(Arc::new(pki.server_config(require_client)));
     let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let paths = Arc::new(Mutex::new(Vec::new()));
+    let client_certificates = Arc::new(Mutex::new(Vec::new()));
     let captured = seen.clone();
+    let captured_paths = paths.clone();
+    let captured_certificates = client_certificates.clone();
     let task = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -200,18 +220,35 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
             let acceptor = acceptor.clone();
             let replies = replies.clone();
             let seen = captured.clone();
+            let paths = captured_paths.clone();
+            let client_certificates = captured_certificates.clone();
             tokio::spawn(async move {
                 let Ok(stream) = acceptor.accept(stream).await else {
                     return;
                 };
+                let client_certificate = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|certificates| certificates.first())
+                    .map(|certificate| certificate_der_fingerprint(certificate.as_ref()));
                 let service = service_fn(move |request: Request<hyper::body::Incoming>| {
                     let replies = replies.clone();
                     let seen = seen.clone();
+                    let paths = paths.clone();
+                    let client_certificates = client_certificates.clone();
+                    let client_certificate = client_certificate.clone();
                     async move {
+                        let path = request.uri().path().to_owned();
                         let body = request.into_body().collect().await.expect("read request body").to_bytes();
                         let value: Value = serde_json::from_slice(&body).expect("request JSON");
-                        seen.lock().expect("seen lock").push(value.clone());
                         let reply = replies.lock().expect("reply lock").pop_front().expect("planned reply");
+                        client_certificates
+                            .lock()
+                            .expect("client certificates lock")
+                            .push(client_certificate);
+                        paths.lock().expect("paths lock").push(path);
+                        seen.lock().expect("seen lock").push(value.clone());
                         match reply {
                             Reply::Json(status, value) => Ok::<_, hyper::Error>(
                                 Response::builder()
@@ -225,6 +262,38 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
                                 Ok(Response::builder()
                                     .status(StatusCode::SERVICE_UNAVAILABLE)
                                     .body(Full::new(Bytes::new()))
+                                    .expect("response"))
+                            }
+                            Reply::RateLimited(retry_after) => Ok(Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .header("content-type", "application/json")
+                                .header("retry-after", retry_after)
+                                .body(Full::new(Bytes::from_static(br#"{"details":[]}"#)))
+                                .expect("response")),
+                            Reply::UnauthorizedAfterCredential {
+                                path,
+                                certificate_serial,
+                            } => {
+                                tokio::time::timeout(Duration::from_secs(3), async {
+                                    loop {
+                                        let changed = fs::read(&path)
+                                            .ok()
+                                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                                            .is_some_and(|credential| {
+                                                credential["certificateSerial"].as_str() == Some(certificate_serial.as_str())
+                                            });
+                                        if changed {
+                                            break;
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(5)).await;
+                                    }
+                                })
+                                .await
+                                .expect("rotated credential commit");
+                                Ok(Response::builder()
+                                    .status(StatusCode::UNAUTHORIZED)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from_static(br#"{"details":[{"reason":"CREDENTIAL_REVOKED"}]}"#)))
                                     .expect("response"))
                             }
                             Reply::VerifiedRotation {
@@ -257,6 +326,8 @@ async fn server_with_client_auth(pki: &TestPki, replies: Vec<Reply>, require_cli
     TestServer {
         endpoint: format!("https://localhost:{}/agent/", address.port()),
         seen,
+        paths,
+        client_certificates,
         task,
     }
 }
@@ -311,10 +382,11 @@ fn certificate_fingerprint(pem: &str) -> String {
         .next()
         .expect("leaf certificate")
         .expect("certificate PEM");
-    Sha256::digest(certificate.as_ref())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    certificate_der_fingerprint(certificate.as_ref())
+}
+
+fn certificate_der_fingerprint(certificate: &[u8]) -> String {
+    Sha256::digest(certificate).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn token_document() -> Value {
@@ -353,6 +425,89 @@ fn client(server: &TestServer, pki: &TestPki, timeout: Duration) -> ConnectClien
         timeout,
     })
     .expect("build Connect client")
+}
+
+fn due_runtime_config(
+    temp: &tempfile::TempDir,
+    pki: &TestPki,
+    endpoint: &str,
+) -> (HeartbeatConfig, Value, rustfs::connect::DeviceIdentity) {
+    runtime_config(temp, pki, endpoint, 17)
+}
+
+fn runtime_config(
+    temp: &tempfile::TempDir,
+    pki: &TestPki,
+    endpoint: &str,
+    elapsed_hours: i64,
+) -> (HeartbeatConfig, Value, rustfs::connect::DeviceIdentity) {
+    let (identity_store, credential_store) = stores(temp);
+    let identity = identity_store.load_or_create().expect("create current identity");
+    let now = OffsetDateTime::now_utc().replace_nanosecond(0).expect("whole second");
+    let credential = pki.credential_window(
+        &identity,
+        &format!("urn:rustfs:connect:device:{DEVICE_UID}"),
+        0x20,
+        now - time::Duration::hours(elapsed_hours),
+        now + time::Duration::hours(24 - elapsed_hours),
+    );
+    let not_before =
+        OffsetDateTime::parse(credential["notBefore"].as_str().expect("notBefore"), &Rfc3339).expect("parse notBefore");
+    let not_after = OffsetDateTime::parse(credential["notAfter"].as_str().expect("notAfter"), &Rfc3339).expect("parse notAfter");
+    assert_eq!(not_after - not_before, time::Duration::hours(24));
+    fs::create_dir_all(temp.path().join("credential")).expect("credential directory");
+    write_stored_credential(&temp.path().join("credential/device.crt.json"), &credential);
+    let next = identity_store.load_or_create_next().expect("create next identity");
+    let mut config = HeartbeatConfig::new(
+        endpoint,
+        pki.root_pem.as_bytes(),
+        identity_store,
+        credential_store,
+        temp.path().join("heartbeat/state.json"),
+    );
+    config.schedule = HeartbeatSchedule {
+        cadence: Duration::from_millis(100),
+        jitter: Duration::ZERO,
+        timeout: Duration::from_millis(250),
+        initial_backoff: Duration::from_millis(20),
+        max_backoff: Duration::from_secs(2),
+    };
+    (config, credential, next)
+}
+
+fn heartbeat_response(server_time: &str) -> Value {
+    json!({
+        "serverTime": server_time,
+        "acceptedVersion": "v1",
+        "capabilityHints": [],
+    })
+}
+
+async fn wait_for_requests(server: &TestServer, count: usize) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while server.paths.lock().expect("paths lock").len() < count {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("planned requests");
+}
+
+async fn wait_for_heartbeat_status(
+    status: &mut watch::Receiver<HeartbeatStatus>,
+    predicate: impl Fn(&HeartbeatStatus) -> bool,
+) -> HeartbeatStatus {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let current = status.borrow_and_update().clone();
+            if predicate(&current) {
+                return current;
+            }
+            status.changed().await.expect("heartbeat status channel");
+        }
+    })
+    .await
+    .expect("heartbeat status")
 }
 
 fn rotation_response(pki: &TestPki, identity: &rustfs::connect::DeviceIdentity, serial: u8) -> (Value, Value) {
@@ -577,7 +732,7 @@ async fn concurrent_rotation_retries_converge_and_promote_the_next_key() {
     assert!(matches!(second, Err(ClientError::Unavailable { .. })));
     let (request_id, certificate_request) = {
         let seen = retries.seen.lock().expect("seen lock");
-        assert!(seen.len() >= 3, "bounded retries must reach the server");
+        assert_eq!(seen.len(), 6, "each public rotation call makes three attempts");
         for request in &seen[1..] {
             assert_eq!(request["requestId"], seen[0]["requestId"]);
             assert_eq!(request["certificateRequest"], seen[0]["certificateRequest"]);
@@ -646,6 +801,539 @@ async fn concurrent_rotation_retries_converge_and_promote_the_next_key() {
 }
 
 #[tokio::test]
+async fn heartbeat_runtime_retries_rotation_and_reloads_the_rotated_credential() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let (mut config, current, next) = due_runtime_config(&temp, &pki, "https://localhost/agent/");
+    let (rotated, rotated_stored) = rotation_response(&pki, &next, 0x21);
+    let server = server_with_client_auth(
+        &pki,
+        vec![
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:03Z")),
+            Reply::VerifiedRotation {
+                response: rotated,
+                current_public_key: config
+                    .identity_store
+                    .load()
+                    .expect("load current identity")
+                    .expect("current identity")
+                    .public_key_der(),
+                current_certificate_fingerprint: certificate_fingerprint(
+                    current["certificate"].as_str().expect("current certificate"),
+                ),
+                device_name: current["name"].as_str().expect("device name").to_owned(),
+            },
+            Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:04Z")),
+        ],
+        true,
+    )
+    .await;
+    config.endpoint = server.endpoint.clone();
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, || CoarseNodeSummary::new(1, 1, 0).expect("node summary"))
+        .expect("start heartbeat runtime")
+        .expect("configured runtime");
+
+    wait_for_requests(&server, 4).await;
+    runtime.shutdown().await;
+
+    let rotation_path = format!("/agent/clusterDevices/{DEVICE_UID}:rotateCredential");
+    let heartbeat_path = format!("/agent/clusters/{CLUSTER_UID}/heartbeats");
+    assert_eq!(
+        &server.paths.lock().expect("paths lock")[..4],
+        [rotation_path.clone(), heartbeat_path.clone(), rotation_path, heartbeat_path,]
+    );
+    let current_fingerprint = certificate_fingerprint(current["certificate"].as_str().expect("current certificate"));
+    let rotated_fingerprint = certificate_fingerprint(rotated_stored["certificate"].as_str().expect("rotated certificate"));
+    let certificates = server.client_certificates.lock().expect("client certificates lock");
+    assert_eq!(certificates[1].as_deref(), Some(current_fingerprint.as_str()));
+    assert_eq!(certificates[3].as_deref(), Some(rotated_fingerprint.as_str()));
+    drop(certificates);
+    let stored: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("credential/device.crt.json")).expect("stored rotated credential"))
+            .expect("stored credential JSON");
+    assert_eq!(stored["name"], current["name"]);
+    assert_eq!(stored["uid"], current["uid"]);
+    assert_eq!(stored["certificateSerial"], rotated_stored["certificateSerial"]);
+}
+
+#[tokio::test]
+async fn heartbeat_runtime_respects_rotation_retry_after_without_blocking_heartbeats() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let server = server_with_client_auth(
+        &pki,
+        std::iter::once(Reply::RateLimited("1"))
+            .chain((0..8).map(|_| Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:03Z"))))
+            .collect(),
+        true,
+    )
+    .await;
+    let (config, _, _) = due_runtime_config(&temp, &pki, &server.endpoint);
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, || CoarseNodeSummary::new(1, 1, 0).expect("node summary"))
+        .expect("start heartbeat runtime")
+        .expect("configured runtime");
+    let mut status = runtime.status();
+
+    wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    runtime.shutdown().await;
+
+    let paths = server.paths.lock().expect("paths lock");
+    assert_eq!(paths.iter().filter(|path| path.ends_with(":rotateCredential")).count(), 1);
+    assert!(paths.iter().filter(|path| path.ends_with("/heartbeats")).count() >= 3);
+}
+
+#[tokio::test]
+async fn heartbeat_runtime_skips_only_valid_pending_reenrollment() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let (mut config, _, next) = due_runtime_config(&temp, &pki, "https://localhost/agent/");
+    let enrolled = pki.credential(&next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 0x24);
+    let server = server_with_client_auth(
+        &pki,
+        vec![
+            Reply::Json(StatusCode::CREATED, enrolled),
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+            Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:03Z")),
+        ],
+        true,
+    )
+    .await;
+    config.endpoint = server.endpoint.clone();
+    let validation_config = config.clone();
+    client(&server, &pki, Duration::from_millis(250))
+        .reenroll(&config.identity_store, &config.credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .await
+        .expect("complete prior reenrollment");
+    assert!(matches!(
+        client(&server, &pki, Duration::from_millis(250))
+            .reenroll(&config.identity_store, &config.credential_store, &token_with_uid(SECOND_TOKEN_UID))
+            .await,
+        Err(ClientError::Unavailable { .. })
+    ));
+    let pending_path = temp.path().join("credential/registration.pending.json");
+    let next_path = temp.path().join("identity/device.key.next");
+    let credential_path = temp.path().join("credential/device.crt.json");
+    let pending = fs::read(&pending_path).expect("pending reenrollment");
+    let next = fs::read(&next_path).expect("pending reenrollment key");
+    let credential = fs::read(&credential_path).expect("current credential");
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, || CoarseNodeSummary::new(1, 1, 0).expect("node summary"))
+        .expect("start heartbeat runtime")
+        .expect("configured runtime");
+    let mut status = runtime.status();
+
+    assert!(matches!(
+        wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        HeartbeatStatus::Online { .. }
+    ));
+    runtime.shutdown().await;
+
+    assert_eq!(fs::read(&pending_path).expect("preserved pending reenrollment"), pending);
+    assert_eq!(fs::read(&next_path).expect("preserved pending reenrollment key"), next);
+    assert_eq!(fs::read(&credential_path).expect("preserved current credential"), credential);
+    let paths = server.paths.lock().expect("paths lock");
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|path| path.ends_with("registrationTokens:exchange"))
+            .count(),
+        4
+    );
+    assert_eq!(paths.iter().filter(|path| path.ends_with(":rotateCredential")).count(), 0);
+    assert_eq!(paths.iter().filter(|path| path.ends_with("/heartbeats")).count(), 1);
+    drop(paths);
+
+    for (field, value) in [
+        ("requestId", "not-a-request-id"),
+        ("tokenUid", ""),
+        ("tokenUid", "not-a-token-uid"),
+        ("tokenUid", FRESH_TOKEN_UID),
+        ("tokenUid", UNRELATED_TOKEN_UID),
+    ] {
+        let mut corrupted_pending: Value = serde_json::from_slice(&pending).expect("pending reenrollment JSON");
+        corrupted_pending[field] = json!(value);
+        let corrupted_pending = serde_json::to_vec(&corrupted_pending).expect("corrupted pending reenrollment JSON");
+        fs::write(&pending_path, &corrupted_pending).expect("corrupt pending reenrollment");
+        set_owner_only(&pending_path);
+        let corrupted_runtime = spawn_heartbeat_runtime(Some(validation_config.clone()), &shutdown, || {
+            CoarseNodeSummary::new(1, 1, 0).expect("node summary")
+        })
+        .expect("start heartbeat runtime with corrupt pending state")
+        .expect("configured runtime");
+        let mut corrupted_status = corrupted_runtime.status();
+        assert_eq!(
+            wait_for_heartbeat_status(&mut corrupted_status, |status| matches!(status, HeartbeatStatus::Failed { .. })).await,
+            HeartbeatStatus::Failed {
+                reason: HeartbeatError::StateConflict.to_string(),
+            }
+        );
+        corrupted_runtime.shutdown().await;
+        assert_eq!(fs::read(&pending_path).expect("preserved corrupt pending state"), corrupted_pending);
+    }
+    assert_eq!(fs::read(&next_path).expect("preserved pending reenrollment key"), next);
+    assert_eq!(fs::read(&credential_path).expect("preserved current credential"), credential);
+    let paths = server.paths.lock().expect("paths lock");
+    assert_eq!(paths.iter().filter(|path| path.ends_with(":rotateCredential")).count(), 0);
+    assert_eq!(paths.iter().filter(|path| path.ends_with("/heartbeats")).count(), 1);
+}
+
+#[tokio::test]
+async fn heartbeat_retries_with_the_new_credential_after_concurrent_rotation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let (mut config, current, next) = runtime_config(&temp, &pki, "https://localhost/agent/", 1);
+    let (rotated, rotated_stored) = rotation_response(&pki, &next, 0x22);
+    let server = server_with_client_auth(
+        &pki,
+        vec![
+            Reply::UnauthorizedAfterCredential {
+                path: temp.path().join("credential/device.crt.json"),
+                certificate_serial: rotated_stored["certificateSerial"]
+                    .as_str()
+                    .expect("rotated serial")
+                    .to_owned(),
+            },
+            Reply::VerifiedRotation {
+                response: rotated,
+                current_public_key: config
+                    .identity_store
+                    .load()
+                    .expect("load current identity")
+                    .expect("current identity")
+                    .public_key_der(),
+                current_certificate_fingerprint: certificate_fingerprint(
+                    current["certificate"].as_str().expect("current certificate"),
+                ),
+                device_name: current["name"].as_str().expect("device name").to_owned(),
+            },
+            Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:03Z")),
+        ],
+        true,
+    )
+    .await;
+    config.endpoint = server.endpoint.clone();
+    let identity_store = config.identity_store.clone();
+    let credential_store = config.credential_store.clone();
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, || CoarseNodeSummary::new(1, 1, 0).expect("node summary"))
+        .expect("start heartbeat runtime")
+        .expect("configured runtime");
+    let mut status = runtime.status();
+
+    wait_for_requests(&server, 1).await;
+    let due = OffsetDateTime::parse(current["notAfter"].as_str().expect("notAfter"), &Rfc3339)
+        .expect("parse notAfter")
+        .unix_timestamp()
+        - 8 * 60 * 60;
+    client(&server, &pki, Duration::from_millis(250))
+        .rotate_if_due(&identity_store, &credential_store, due)
+        .await
+        .expect("concurrent rotation")
+        .expect("rotation due");
+    assert!(matches!(
+        wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        HeartbeatStatus::Online { .. }
+    ));
+    runtime.shutdown().await;
+
+    let heartbeat_path = format!("/agent/clusters/{CLUSTER_UID}/heartbeats");
+    assert_eq!(
+        server.paths.lock().expect("paths lock").as_slice(),
+        [
+            heartbeat_path.clone(),
+            format!("/agent/clusterDevices/{DEVICE_UID}:rotateCredential"),
+            heartbeat_path,
+        ]
+    );
+    let current_fingerprint = certificate_fingerprint(current["certificate"].as_str().expect("current certificate"));
+    let rotated_fingerprint = certificate_fingerprint(rotated_stored["certificate"].as_str().expect("rotated certificate"));
+    let certificates = server.client_certificates.lock().expect("client certificates lock");
+    assert_eq!(certificates[0].as_deref(), Some(current_fingerprint.as_str()));
+    assert_eq!(certificates[2].as_deref(), Some(rotated_fingerprint.as_str()));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn inventory_retries_with_the_new_credential_after_concurrent_rotation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let (mut config, current, next) = runtime_config(&temp, &pki, "https://localhost/agent/", 1);
+    let (rotated, rotated_stored) = rotation_response(&pki, &next, 0x23);
+    let server = server_with_client_auth(
+        &pki,
+        vec![
+            Reply::UnauthorizedAfterCredential {
+                path: temp.path().join("credential/device.crt.json"),
+                certificate_serial: rotated_stored["certificateSerial"]
+                    .as_str()
+                    .expect("rotated serial")
+                    .to_owned(),
+            },
+            Reply::VerifiedRotation {
+                response: rotated,
+                current_public_key: config
+                    .identity_store
+                    .load()
+                    .expect("load current identity")
+                    .expect("current identity")
+                    .public_key_der(),
+                current_certificate_fingerprint: certificate_fingerprint(
+                    current["certificate"].as_str().expect("current certificate"),
+                ),
+                device_name: current["name"].as_str().expect("device name").to_owned(),
+            },
+            Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})),
+        ],
+        true,
+    )
+    .await;
+    config.endpoint = server.endpoint.clone();
+    let identity_store = config.identity_store.clone();
+    let credential_store = config.credential_store.clone();
+    let snapshot = InventorySnapshot::current(1, 1, 100, 50, []).expect("inventory snapshot");
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_inventory_runtime(
+        Some(config),
+        InventorySchedule {
+            cadence: Duration::from_millis(100),
+            jitter: Duration::ZERO,
+        },
+        &shutdown,
+        move || std::future::ready(Ok(snapshot.clone())),
+    )
+    .expect("start inventory runtime")
+    .expect("configured runtime");
+    let mut status = runtime.status();
+
+    wait_for_requests(&server, 1).await;
+    let due = OffsetDateTime::parse(current["notAfter"].as_str().expect("notAfter"), &Rfc3339)
+        .expect("parse notAfter")
+        .unix_timestamp()
+        - 8 * 60 * 60;
+    client(&server, &pki, Duration::from_millis(250))
+        .rotate_if_due(&identity_store, &credential_store, due)
+        .await
+        .expect("concurrent rotation")
+        .expect("rotation due");
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let current = status.borrow_and_update().clone();
+                if matches!(current, InventoryStatus::BackingOff { .. }) {
+                    break current;
+                }
+                status.changed().await.expect("inventory status channel");
+            }
+        })
+        .await
+        .expect("inventory retry status"),
+        InventoryStatus::BackingOff { .. }
+    ));
+    runtime.shutdown().await;
+
+    let inventory_path = format!("/agent/clusters/{CLUSTER_UID}/inventorySnapshots");
+    assert_eq!(
+        server.paths.lock().expect("paths lock").as_slice(),
+        [
+            inventory_path.clone(),
+            format!("/agent/clusterDevices/{DEVICE_UID}:rotateCredential"),
+            inventory_path,
+        ]
+    );
+    let current_fingerprint = certificate_fingerprint(current["certificate"].as_str().expect("current certificate"));
+    let rotated_fingerprint = certificate_fingerprint(rotated_stored["certificate"].as_str().expect("rotated certificate"));
+    let certificates = server.client_certificates.lock().expect("client certificates lock");
+    assert_eq!(certificates[0].as_deref(), Some(current_fingerprint.as_str()));
+    assert_eq!(certificates[2].as_deref(), Some(rotated_fingerprint.as_str()));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn inventory_first_recovers_a_saved_reenrollment_before_telemetry() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let failed = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
+    let (mut config, _, next) = runtime_config(&temp, &pki, &failed.endpoint, 1);
+    assert!(matches!(
+        client(&failed, &pki, Duration::from_millis(250))
+            .reenroll(&config.identity_store, &config.credential_store, &token_with_uid(SECOND_TOKEN_UID))
+            .await,
+        Err(ClientError::Unavailable { .. })
+    ));
+    let enrolled = pki.credential(&next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 0x25);
+    write_stored_credential(&temp.path().join("credential/device.crt.json"), &enrolled);
+    assert!(temp.path().join("credential/registration.pending.json").exists());
+    assert!(temp.path().join("identity/device.key.next").exists());
+    assert_ne!(
+        config
+            .identity_store
+            .load()
+            .expect("load pre-recovery identity")
+            .expect("pre-recovery identity")
+            .public_key_der(),
+        next.public_key_der()
+    );
+
+    let snapshot = InventorySnapshot::current(1, 1, 100, 50, []).expect("inventory snapshot");
+    let content_hash = snapshot.content_hash().expect("inventory content hash");
+    let telemetry = server_with_client_auth(
+        &pki,
+        vec![
+            Reply::Json(
+                StatusCode::OK,
+                json!({
+                    "name": format!("organizations/{ORGANIZATION_UID}/clusters/{CLUSTER_UID}/inventorySnapshots/{INVENTORY_UID}"),
+                    "uid": INVENTORY_UID,
+                    "contentHash": content_hash,
+                    "receivedAt": "2026-08-25T01:02:03Z",
+                }),
+            ),
+            Reply::Json(StatusCode::OK, heartbeat_response("2026-08-25T01:02:04Z")),
+        ],
+        true,
+    )
+    .await;
+    config.endpoint = telemetry.endpoint.clone();
+    config.schedule.cadence = Duration::from_secs(60);
+    let heartbeat_config = config.clone();
+    let shutdown = CancellationToken::new();
+    let inventory_snapshot = snapshot.clone();
+    let inventory = spawn_inventory_runtime(
+        Some(config),
+        InventorySchedule {
+            cadence: Duration::from_secs(60),
+            jitter: Duration::ZERO,
+        },
+        &shutdown,
+        move || std::future::ready(Ok(inventory_snapshot.clone())),
+    )
+    .expect("start inventory runtime")
+    .expect("configured inventory runtime");
+    let mut inventory_status = inventory.status();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let current = inventory_status.borrow_and_update().clone();
+                if matches!(current, InventoryStatus::Online { .. }) {
+                    break current;
+                }
+                inventory_status.changed().await.expect("inventory status channel");
+            }
+        })
+        .await
+        .expect("inventory online status"),
+        InventoryStatus::Online { .. }
+    ));
+
+    let pending_path = temp.path().join("credential/registration.pending.json");
+    assert!(!pending_path.exists());
+    assert!(!temp.path().join("identity/device.key.next").exists());
+    assert_eq!(
+        heartbeat_config
+            .identity_store
+            .load()
+            .expect("load recovered identity")
+            .expect("recovered identity")
+            .public_key_der(),
+        next.public_key_der()
+    );
+    let completed: Value = serde_json::from_slice(
+        &fs::read(temp.path().join("credential/registration.completed.json")).expect("completed reenrollment receipt"),
+    )
+    .expect("completed reenrollment JSON");
+    assert_eq!(completed["tokenUid"], SECOND_TOKEN_UID);
+
+    let heartbeat = spawn_heartbeat_runtime(Some(heartbeat_config), &shutdown, || {
+        CoarseNodeSummary::new(1, 1, 0).expect("node summary")
+    })
+    .expect("start heartbeat runtime")
+    .expect("configured heartbeat runtime");
+    let mut heartbeat_status = heartbeat.status();
+    assert!(matches!(
+        wait_for_heartbeat_status(&mut heartbeat_status, |status| matches!(status, HeartbeatStatus::Online { .. })).await,
+        HeartbeatStatus::Online { .. }
+    ));
+    heartbeat.shutdown().await;
+    inventory.shutdown().await;
+
+    assert_eq!(failed.paths.lock().expect("registration paths").len(), 3);
+    assert_eq!(
+        telemetry.paths.lock().expect("telemetry paths").as_slice(),
+        [
+            format!("/agent/clusters/{CLUSTER_UID}/inventorySnapshots"),
+            format!("/agent/clusters/{CLUSTER_UID}/heartbeats"),
+        ]
+    );
+    let enrolled_fingerprint = certificate_fingerprint(enrolled["certificate"].as_str().expect("enrolled certificate"));
+    assert_eq!(
+        telemetry.client_certificates.lock().expect("client certificates").as_slice(),
+        [Some(enrolled_fingerprint.clone()), Some(enrolled_fingerprint)]
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_runtime_cancels_an_in_flight_rotation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let server = server_with_client_auth(&pki, vec![Reply::DelayedClose(Duration::from_secs(5))], true).await;
+    let (config, _, _) = due_runtime_config(&temp, &pki, &server.endpoint);
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, || CoarseNodeSummary::new(1, 1, 0).expect("node summary"))
+        .expect("start heartbeat runtime")
+        .expect("configured runtime");
+
+    wait_for_requests(&server, 1).await;
+    tokio::time::timeout(Duration::from_millis(250), runtime.shutdown())
+        .await
+        .expect("rotation cancellation");
+    assert_eq!(
+        server.paths.lock().expect("paths lock").as_slice(),
+        [format!("/agent/clusterDevices/{DEVICE_UID}:rotateCredential")]
+    );
+}
+
+#[tokio::test]
+async fn heartbeat_runtime_stops_when_rotation_reports_revocation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let pki = TestPki::new();
+    let server = server_with_client_auth(
+        &pki,
+        vec![Reply::Json(
+            StatusCode::UNAUTHORIZED,
+            json!({"details": [{"reason": "DEVICE_REVOKED"}]}),
+        )],
+        true,
+    )
+    .await;
+    let (config, _, _) = due_runtime_config(&temp, &pki, &server.endpoint);
+    let shutdown = CancellationToken::new();
+    let runtime = spawn_heartbeat_runtime(Some(config), &shutdown, || CoarseNodeSummary::new(1, 1, 0).expect("node summary"))
+        .expect("start heartbeat runtime")
+        .expect("configured runtime");
+    let mut status = runtime.status();
+
+    assert_eq!(
+        wait_for_heartbeat_status(&mut status, |status| matches!(status, HeartbeatStatus::AuthenticationStopped { .. })).await,
+        HeartbeatStatus::AuthenticationStopped {
+            status: 401,
+            reason: Some("DEVICE_REVOKED".to_owned()),
+        }
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        server.paths.lock().expect("paths lock").as_slice(),
+        [format!("/agent/clusterDevices/{DEVICE_UID}:rotateCredential")]
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn rotation_commit_recovers_after_each_durable_step() {
     let temp = tempfile::tempdir().expect("temp dir");
     let (identity_store, credential_store) = stores(&temp);
@@ -665,6 +1353,13 @@ async fn rotation_commit_recovers_after_each_durable_step() {
             .await,
         Err(ClientError::Unavailable { .. })
     ));
+    let failed_seen = failed.seen.lock().expect("seen lock");
+    assert_eq!(failed_seen.len(), 3, "public rotation keeps its bounded retry contract");
+    for request in &failed_seen[1..] {
+        assert_eq!(request["requestId"], failed_seen[0]["requestId"]);
+        assert_eq!(request["certificateRequest"], failed_seen[0]["certificateRequest"]);
+    }
+    drop(failed_seen);
 
     let pending_path = temp.path().join("credential/rotation.pending.json");
     let pending = fs::read(&pending_path).expect("read pending state");
@@ -754,19 +1449,31 @@ async fn pending_reenrollment_blocks_rotation_and_resumes_original_exchange() {
 async fn reenrollment_commit_recovers_after_each_durable_step() {
     let temp = tempfile::tempdir().expect("temp dir");
     let (identity_store, credential_store) = stores(&temp);
-    let current = identity_store.load_or_create().expect("create identity");
+    let initial = identity_store.load_or_create().expect("create identity");
     let pki = TestPki::new();
-    let issued = pki.credential(&current, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 13);
+    let issued = pki.credential(&initial, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 13);
     let registration = server(&pki, vec![Reply::Json(StatusCode::CREATED, issued)]).await;
     client(&registration, &pki, Duration::from_secs(2))
         .register(&identity_store, &credential_store, &token())
         .await
         .expect("register");
 
+    let first_next = identity_store
+        .load_or_create_next()
+        .expect("create first reenrollment identity");
+    let first_enrolled = pki.credential(&first_next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 14);
+    let first_reenrollment = server(&pki, vec![Reply::Json(StatusCode::CREATED, first_enrolled)]).await;
+    client(&first_reenrollment, &pki, Duration::from_secs(2))
+        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .await
+        .expect("complete prior reenrollment");
+    let completed_path = temp.path().join("credential/registration.completed.json");
+    let previous_completed = fs::read(&completed_path).expect("read prior completed receipt");
+
     let failed = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
     assert!(matches!(
         client(&failed, &pki, Duration::from_secs(2))
-            .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+            .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
             .await,
         Err(ClientError::Unavailable { .. })
     ));
@@ -775,16 +1482,41 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
     let pending = fs::read(&pending_path).expect("read pending reenrollment");
     let next_der = fs::read(temp.path().join("identity/device.key.next")).expect("read next key");
     let next = rustfs::connect::DeviceIdentity::from_pkcs8_der(&next_der).expect("parse next key");
-    let enrolled = pki.credential(&next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 14);
+    let enrolled = pki.credential(&next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 15);
     write_stored_credential(&temp.path().join("credential/device.crt.json"), &enrolled);
 
     let idle = server(&pki, vec![]).await;
     let idle_client = client(&idle, &pki, Duration::from_secs(2));
+    for token_uid in [UNRELATED_TOKEN_UID, FRESH_TOKEN_UID] {
+        let mut document: Value = serde_json::from_slice(&pending).expect("pending reenrollment JSON");
+        document["tokenUid"] = json!(token_uid);
+        let tampered_pending = serde_json::to_vec(&document).expect("tampered pending reenrollment JSON");
+        fs::write(&pending_path, &tampered_pending).expect("tamper pending after credential save");
+        set_owner_only(&pending_path);
+        assert!(matches!(
+            idle_client
+                .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
+                .await,
+            Err(ClientError::PendingRegistration)
+        ));
+        assert_eq!(fs::read(&pending_path).expect("preserved tampered pending"), tampered_pending);
+        assert_eq!(fs::read(&completed_path).expect("preserved prior completed receipt"), previous_completed);
+        assert_eq!(
+            identity_store
+                .load()
+                .expect("load current key")
+                .expect("current key")
+                .public_key_der(),
+            first_next.public_key_der()
+        );
+    }
+    fs::write(&pending_path, &pending).expect("restore bound pending after credential save");
+    set_owner_only(&pending_path);
     let recovered = idle_client
-        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
         .await
         .expect("recover after reenrollment credential save");
-    assert_eq!(recovered.certificate_serial, "0e".repeat(16));
+    assert_eq!(recovered.certificate_serial, "0f".repeat(16));
     assert_eq!(
         identity_store
             .load()
@@ -794,26 +1526,50 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
         next.public_key_der()
     );
 
-    fs::remove_file(temp.path().join("credential/registration.completed.json")).expect("remove completed receipt");
-    fs::write(&pending_path, pending).expect("restore pending after key commit");
+    fs::write(&completed_path, &previous_completed).expect("restore prior completed receipt after key commit");
+    set_owner_only(&completed_path);
+    for token_uid in [UNRELATED_TOKEN_UID, FRESH_TOKEN_UID] {
+        let mut document: Value = serde_json::from_slice(&pending).expect("pending reenrollment JSON");
+        document["tokenUid"] = json!(token_uid);
+        let tampered_pending = serde_json::to_vec(&document).expect("tampered pending reenrollment JSON");
+        fs::write(&pending_path, &tampered_pending).expect("tamper pending after key commit");
+        set_owner_only(&pending_path);
+        assert!(matches!(
+            idle_client
+                .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
+                .await,
+            Err(ClientError::PendingRegistration)
+        ));
+        assert_eq!(fs::read(&pending_path).expect("preserved tampered pending"), tampered_pending);
+        assert_eq!(fs::read(&completed_path).expect("preserved prior completed receipt"), previous_completed);
+        assert_eq!(
+            identity_store
+                .load()
+                .expect("load current key")
+                .expect("current key")
+                .public_key_der(),
+            next.public_key_der()
+        );
+    }
+    fs::write(&pending_path, pending).expect("restore bound pending after key commit");
     set_owner_only(&pending_path);
     let recovered = idle_client
-        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
         .await
         .expect("recover after reenrollment key commit");
-    assert_eq!(recovered.certificate_serial, "0e".repeat(16));
+    assert_eq!(recovered.certificate_serial, "0f".repeat(16));
     assert!(!pending_path.exists());
     let recovered = idle_client
-        .reenroll(&identity_store, &credential_store, &token_with_uid(FRESH_TOKEN_UID))
+        .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
         .await
         .expect("completed reenrollment is idempotent after pending cleanup");
-    assert_eq!(recovered.certificate_serial, "0e".repeat(16));
+    assert_eq!(recovered.certificate_serial, "0f".repeat(16));
     assert!(idle.seen.lock().expect("seen lock").is_empty());
 
     let different = server(&pki, vec![Reply::Json(StatusCode::SERVICE_UNAVAILABLE, json!({})); 3]).await;
     assert!(matches!(
         client(&different, &pki, Duration::from_secs(2))
-            .reenroll(&identity_store, &credential_store, &token_with_uid(SECOND_TOKEN_UID))
+            .reenroll(&identity_store, &credential_store, &token_with_uid(TOKEN_UID))
             .await,
         Err(ClientError::Unavailable { .. })
     ));

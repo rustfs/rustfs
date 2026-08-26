@@ -66,6 +66,7 @@ pub(crate) struct PendingRegistration {
     pub previous_credential_fingerprint: Option<String>,
     #[serde(default)]
     pub next_public_key_sha256: Option<String>,
+    pub state_proof: String,
 }
 
 #[derive(Serialize, Deserialize)]
