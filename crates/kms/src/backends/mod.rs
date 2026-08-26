@@ -615,6 +615,14 @@ pub struct BackendCapabilities {
     pub update_key_metadata: bool,
     /// Re-wrapping an existing data key envelope onto the key's current version
     pub rewrap: bool,
+    /// Whether this backend is positioned for production use.
+    ///
+    /// Backends that keep their cryptographic root on the local host (Local,
+    /// Static) are for development, testing and demos only; this flag is how
+    /// that positioning reaches logs, the status API and the console without
+    /// each consumer matching on backend names.
+    #[serde(default)]
+    pub production_supported: bool,
 }
 
 impl BackendCapabilities {
@@ -633,6 +641,7 @@ impl BackendCapabilities {
             physical_delete: false,
             update_key_metadata: false,
             rewrap: false,
+            production_supported: false,
         }
     }
 
@@ -693,6 +702,12 @@ impl BackendCapabilities {
     /// Set whether envelope rewrap onto the current key version is supported
     pub const fn with_rewrap(mut self, rewrap: bool) -> Self {
         self.rewrap = rewrap;
+        self
+    }
+
+    /// Set whether the backend is positioned for production use
+    pub const fn with_production_supported(mut self, production_supported: bool) -> Self {
+        self.production_supported = production_supported;
         self
     }
 }
@@ -775,6 +790,30 @@ mod tests {
         assert!(!capabilities.physical_delete);
         assert!(!capabilities.update_key_metadata);
         assert!(!capabilities.rewrap);
+        // Production positioning is an explicit claim, never inherited.
+        assert!(!capabilities.production_supported);
+    }
+
+    /// Older peers and consoles serialize capabilities without the
+    /// positioning flag; deserializing their payloads must not fail and must
+    /// default to the conservative claim.
+    #[test]
+    fn capabilities_without_positioning_field_deserialize_as_non_production() {
+        let legacy = serde_json::json!({
+            "encrypt": true,
+            "decrypt": true,
+            "generate_data_key": true,
+            "rotate": true,
+            "enable_disable": true,
+            "schedule_deletion": true,
+            "versioning": true,
+            "physical_delete": true,
+            "update_key_metadata": true,
+            "rewrap": true,
+        });
+        let capabilities: BackendCapabilities =
+            serde_json::from_value(legacy).expect("legacy capability payloads must stay deserializable");
+        assert!(!capabilities.production_supported);
     }
 
     #[tokio::test]

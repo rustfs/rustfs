@@ -1767,6 +1767,7 @@ impl KmsBackend for VaultTransitKmsBackend {
             .with_physical_delete(true)
             .with_update_key_metadata(true)
             .with_rewrap(true)
+            .with_production_supported(true)
     }
 
     async fn remove_expired_key(&self, key_id: &str, now: &Zoned) -> Result<ExpiredKeyRemoval> {

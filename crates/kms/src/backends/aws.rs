@@ -821,6 +821,7 @@ impl KmsBackend for AwsKmsBackend {
             .with_schedule_deletion(true)
             .with_versioning(true)
             .with_physical_delete(false)
+            .with_production_supported(true)
     }
 
     /// Observe, never destroy.

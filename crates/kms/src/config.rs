@@ -941,8 +941,15 @@ impl KmsConfig {
                     && let Some(ref tls) = config.tls
                     && !tls.skip_verify
                 {
-                    // In production, we should have proper TLS configuration
-                    if tls.ca_cert_path.is_none() && tls.client_cert_path.is_none() {
+                    if tls.ca_cert_path.is_some() || tls.client_cert_path.is_some() || tls.client_key_path.is_some() {
+                        // No configuration surface sets these paths today and the
+                        // Vault client does not consume them; warn loudly instead
+                        // of implying the certificates take effect.
+                        tracing::warn!(
+                            "Vault TLS certificate paths are configured but not applied to the Vault client; \
+                             the connection still relies on the system CA store without a client identity"
+                        );
+                    } else {
                         tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
                     }
                 }
@@ -978,10 +985,17 @@ impl KmsConfig {
                 if config.address.starts_with("https://")
                     && let Some(ref tls) = config.tls
                     && !tls.skip_verify
-                    && tls.ca_cert_path.is_none()
-                    && tls.client_cert_path.is_none()
                 {
-                    tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
+                    if tls.ca_cert_path.is_some() || tls.client_cert_path.is_some() || tls.client_key_path.is_some() {
+                        // Same as the KV2 branch: these paths are dead
+                        // configuration until the client consumes them.
+                        tracing::warn!(
+                            "Vault TLS certificate paths are configured but not applied to the Vault client; \
+                             the connection still relies on the system CA store without a client identity"
+                        );
+                    } else {
+                        tracing::warn!("Using HTTPS without custom TLS configuration - relying on system CA");
+                    }
                 }
             }
             BackendConfig::Static(config) => {
