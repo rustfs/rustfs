@@ -7,12 +7,12 @@
 
 #[cfg(test)]
 mod tests {
+    // The heal- and ecstore-owned halves of the Phase-0 overlap inventory live
+    // with their owning crates (crates/heal/tests and crates/ecstore/tests):
+    // cross-crate source includes are rejected by
+    // scripts/check_layer_dependencies.sh.
     const SCANNER_IO_SOURCE: &str = include_str!("scanner_io/io_disk.rs");
     const SCANNER_FOLDER_SOURCE: &str = include_str!("scanner_folder.rs");
-    const HEAL_AUTO_SCAN_SOURCE: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../heal/src/heal/manager/auto_scan.rs"));
-    const HEAL_OBJECT_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../ecstore/src/set_disk/ops/heal.rs"));
-    const SET_LOCKING_SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../ecstore/src/set_disk/ops/locking.rs"));
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Operation {
@@ -149,12 +149,6 @@ mod tests {
         assert!(SCANNER_IO_SOURCE.contains("scan_data_folder"));
         assert!(SCANNER_FOLDER_SOURCE.contains("send_required_scanner_heal_request"));
         assert!(SCANNER_FOLDER_SOURCE.contains("update_pending_scanner_heal_after_admission"));
-        assert!(HEAL_AUTO_SCAN_SOURCE.contains("active_heals"));
-        assert!(HEAL_AUTO_SCAN_SOURCE.contains("contains_erasure_set"));
-        assert!(HEAL_OBJECT_SOURCE.contains("heal_object"));
-        assert!(HEAL_OBJECT_SOURCE.contains("get_write_lock"));
-        assert!(SET_LOCKING_SOURCE.contains("scanning_disks"));
-        assert!(SET_LOCKING_SOURCE.contains("new_disks.extend(scanning_disks)"));
     }
 
     #[test]

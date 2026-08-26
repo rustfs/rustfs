@@ -326,6 +326,98 @@ normalize_baseline_file() {
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# --- Cross-crate Rust source include guard (rustfs/backlog#1884) ---
+#
+# `use`-based layer checks cannot see `include_str!`/`include!` edges, and a
+# crate that includes another crate's `.rs` source couples itself to that
+# crate's file layout — a contract crate reverse-including an implementation
+# or binary crate was exactly the unguarded edge found in backlog#1884. Rule:
+# an `include_str!`/`include!` whose target is a `.rs` file must not resolve
+# outside the including crate's own directory. Same-crate source includes
+# (self-asserting tripwires) stay allowed; non-`.rs` targets (protos, fixtures)
+# and `OUT_DIR` includes of generated code are out of scope.
+INCLUDE_GUARD="${TMP_DIR}/include_guard.pl"
+cat >"$INCLUDE_GUARD" <<'PERL'
+use strict;
+use warnings;
+use File::Basename qw(dirname);
+use File::Find qw(find);
+
+my ($root, @dirs) = @ARGV;
+my @files;
+find(
+    sub { push @files, $File::Find::name if -f && /\.rs$/ && $File::Find::name !~ m{/target/} },
+    map { "$root/$_" } @dirs
+);
+
+sub normalize {
+    my @parts;
+    for my $part (split m{/+}, $_[0]) {
+        next if $part eq '' || $part eq '.';
+        if ($part eq '..') { pop @parts } else { push @parts, $part }
+    }
+    return '/' . join('/', @parts);
+}
+
+my @violations;
+for my $file (sort @files) {
+    open my $fh, '<', $file or next;
+    my $src = do { local $/; <$fh> };
+    close $fh;
+
+    my $dir   = dirname($file);
+    my $crate = $dir;
+    $crate = dirname($crate) while $crate ne $root && $crate ne '/' && !-f "$crate/Cargo.toml";
+    next if $crate eq $root || $crate eq '/';
+
+    while (
+        $src =~ /include(?:_str)?!\s*\(\s*(?:concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*"([^"]+)"|"([^"]+)")/gs
+    ) {
+        my ($manifest_rel, $file_rel) = ($1, $2);
+        my $target = defined $manifest_rel ? "$crate$manifest_rel" : "$dir/$file_rel";
+        next unless $target =~ /\.rs$/;
+        my $resolved     = normalize($target);
+        my $crate_prefix = normalize($crate) . '/';
+        if (index($resolved, $crate_prefix) != 0) {
+            push @violations, "$file includes $resolved outside its crate " . normalize($crate);
+        }
+    }
+}
+print "$_\n" for @violations;
+exit(@violations ? 1 : 0);
+PERL
+
+# Self-test: a fixture workspace with one escaping file-relative include, one
+# escaping CARGO_MANIFEST_DIR include, and several allowed forms.
+FIXTURE_ROOT="${TMP_DIR}/include_fixture"
+mkdir -p "$FIXTURE_ROOT/crates/a/src" "$FIXTURE_ROOT/crates/a/tests" "$FIXTURE_ROOT/crates/b/src"
+touch "$FIXTURE_ROOT/crates/a/Cargo.toml" "$FIXTURE_ROOT/crates/b/Cargo.toml"
+cat >"$FIXTURE_ROOT/crates/a/src/lib.rs" <<'EOF'
+const ESCAPE_RELATIVE: &str = include_str!("../../b/src/lib.rs");
+const ESCAPE_MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../b/src/other.rs"));
+const SAME_CRATE: &str = include_str!("sibling.rs");
+const SAME_CRATE_MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/sibling.rs"));
+const NON_RUST: &str = include_str!("../../b/src/schema.proto");
+EOF
+cat >"$FIXTURE_ROOT/crates/a/tests/contract.rs" <<'EOF'
+const OWN_SRC: &str = include_str!("../src/lib.rs");
+EOF
+INCLUDE_SELF_TEST_OUTPUT="$(perl "$INCLUDE_GUARD" "$FIXTURE_ROOT" crates 2>&1 || true)"
+if [[ "$(printf '%s\n' "$INCLUDE_SELF_TEST_OUTPUT" | grep -c 'outside its crate')" != "2" ]] ||
+  ! grep -q 'crates/b/src/lib.rs' <<<"$INCLUDE_SELF_TEST_OUTPUT" ||
+  ! grep -q 'crates/b/src/other.rs' <<<"$INCLUDE_SELF_TEST_OUTPUT"; then
+  echo "Cross-crate include guard self-test failed; expected exactly the two escaping fixtures to be flagged:" >&2
+  printf '%s\n' "$INCLUDE_SELF_TEST_OUTPUT" >&2
+  exit 1
+fi
+
+if ! INCLUDE_VIOLATIONS="$(perl "$INCLUDE_GUARD" "$ROOT_DIR" crates rustfs 2>&1)"; then
+  echo "Cross-crate include guard failed: a Rust source include escapes its crate directory."
+  echo "Move the assertion into the crate that owns the included file (or assert the compiled artifact) instead of reading another crate's source."
+  printf '%s\n' "$INCLUDE_VIOLATIONS"
+  exit 1
+fi
+
 VIOLATIONS_RAW="${TMP_DIR}/violations_raw.txt"
 EDGES_RAW="${TMP_DIR}/edges_raw.txt"
 CURRENT_BASELINE="${TMP_DIR}/current_baseline.txt"
