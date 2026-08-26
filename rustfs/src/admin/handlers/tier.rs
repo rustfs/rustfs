@@ -24,11 +24,10 @@ use crate::admin::storage_api::tier::{
 use crate::{
     admin::runtime_sources::{current_daily_tier_stats, current_notification_system, current_tier_config_handle},
     admin::{
-        auth::validate_admin_request,
+        auth::authorize_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    auth::{check_key_valid, get_session_token},
-    server::{ADMIN_PREFIX, RemoteAddr},
+    server::ADMIN_PREFIX,
 };
 use http::{HeaderMap, StatusCode, Uri};
 use hyper::Method;
@@ -220,22 +219,11 @@ impl Operation for AddTier {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::SetTierAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut input = req.input;
         let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
@@ -436,22 +424,11 @@ impl Operation for EditTier {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::SetTierAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut input = req.input;
         let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
@@ -544,22 +521,11 @@ impl Operation for ListTiers {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ListTierAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
 
         let tier_config_mgr_handle = current_tier_config_handle();
         let tier_config_mgr = tier_config_mgr_handle.read().await;
@@ -589,22 +555,11 @@ impl Operation for RemoveTier {
             }
         };
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::SetTierAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut force: bool = false;
         let force_str = query.force.clone().unwrap_or_default();
@@ -671,22 +626,11 @@ pub struct VerifyTier {}
 #[async_trait::async_trait]
 impl Operation for VerifyTier {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ListTierAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
 
         let tier = resolve_tier_name(&req.uri, &params)?;
         let tier_config_mgr_handle = current_tier_config_handle();
@@ -705,22 +649,11 @@ pub struct GetTierInfo {}
 #[async_trait::async_trait]
 impl Operation for GetTierInfo {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ListTierAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListTierAction)]).await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -836,22 +769,11 @@ impl Operation for ClearTier {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let query = parse_clear_tier_query(&req.uri)?;
 
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::SetTierAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::SetTierAction)]).await?;
 
         let mut force: bool = false;
         let force_str = query.force;
@@ -1185,5 +1107,98 @@ mod tests {
         stats.insert("WARM".to_string(), warm);
         stats.insert("ARCHIVE".to_string(), archive);
         stats
+    }
+
+    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str, message: &str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a tier admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some(message));
+    }
+
+    /// The shared gate reports "get cred failed"; the per-handler pre-check keeps
+    /// the message each endpoint has always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn tier_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(&AddTier {}, Method::PUT, "/rustfs/admin/v3/tier", "authentication required").await;
+        assert_missing_credentials(&EditTier {}, Method::POST, "/rustfs/admin/v3/tier/WARM", "authentication required").await;
+        assert_missing_credentials(&ListTiers {}, Method::GET, "/rustfs/admin/v3/tiers", "get cred failed").await;
+        assert_missing_credentials(&RemoveTier {}, Method::DELETE, "/rustfs/admin/v3/tier/WARM", "authentication required").await;
+        assert_missing_credentials(&VerifyTier {}, Method::GET, "/rustfs/admin/v3/tier/WARM", "authentication required").await;
+        assert_missing_credentials(&GetTierInfo {}, Method::GET, "/rustfs/admin/v3/tier-stats", "get cred failed").await;
+        assert_missing_credentials(&ClearTier {}, Method::DELETE, "/rustfs/admin/v3/tiers", "authentication required").await;
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = ["\npub struct ", "\nfn ", "\n#[derive(", "\n#[cfg(test)]"]
+            .into_iter()
+            .filter_map(|boundary| block.find(boundary))
+            .min()
+            .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
+        assert_eq!(
+            block.matches("authorize_admin_request(").count(),
+            1,
+            "{item} must use exactly one shared gate"
+        );
+        assert_eq!(
+            block.matches("Action::AdminAction(").count(),
+            actions.len(),
+            "{item} must preserve its exact action-vector length"
+        );
+        for action in actions {
+            assert!(block.contains(&format!("AdminAction::{action}")), "{item} must authorize with {action}");
+        }
+        assert_eq!(
+            block.contains("let cred = authorize_admin_request("),
+            binds_credentials,
+            "{item} credential binding must match its payload-processing contract"
+        );
+    }
+
+    #[test]
+    fn tier_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("tier.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+
+        for (handler, action) in [
+            ("AddTier", "SetTierAction"),
+            ("EditTier", "SetTierAction"),
+            ("ListTiers", "ListTierAction"),
+            ("RemoveTier", "SetTierAction"),
+            ("VerifyTier", "ListTierAction"),
+            ("GetTierInfo", "ListTierAction"),
+            ("ClearTier", "SetTierAction"),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_shared_gate_wiring(block, handler, &[action], false);
+        }
+
+        assert!(!production.contains("check_key_valid(get_session_token"));
     }
 }

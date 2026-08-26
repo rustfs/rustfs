@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::handlers::supervise_admin_mutation;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
@@ -23,8 +23,7 @@ use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::storage_api::config::{
     read_admin_config_without_migrate, read_admin_server_config_snapshot, save_admin_server_config_snapshot,
 };
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
+use crate::server::{ADMIN_PREFIX, CONSOLE_PREFIX, MINIO_ADMIN_PREFIX};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -857,23 +856,15 @@ fn redirect_response(location: &str) -> S3Result<S3Response<(StatusCode, Body)>>
     Ok(resp)
 }
 
+/// The pre-check keeps this endpoint family's historical missing-credentials
+/// message; the shared gate reports "get cred failed".
 async fn authorize_oidc_config_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "authentication required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(action)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-    )
-    .await
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    Ok(())
 }
 
 async fn parse_json_body<T: DeserializeOwned>(req: &mut S3Request<Body>) -> S3Result<T> {
@@ -1846,5 +1837,66 @@ mod tests {
             .and_then(|m| m.get("kubernetes"))
             .expect("provider KVS should exist");
         assert_eq!(kvs.get(OIDC_ISSUER), "https://app.local/realms/app");
+    }
+
+    /// The OIDC config gate now authorizes through the shared admin gate, which
+    /// reports "get cred failed"; its pre-check keeps the message these endpoints
+    /// have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn oidc_config_gate_keeps_its_missing_credentials_message() {
+        for action in [AdminAction::ServerInfoAdminAction, AdminAction::ConfigUpdateAdminAction] {
+            let err = authorize_oidc_config_request(&build_oidc_request("/rustfs/admin/v3/idp/openid", None, None), action)
+                .await
+                .expect_err("a request without credentials must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(err.message(), Some("authentication required"));
+        }
+    }
+
+    #[test]
+    fn oidc_config_gate_routes_through_the_shared_gate() {
+        let production = include_str!("oidc.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let wrapper = production
+            .split_once("async fn authorize_oidc_config_request")
+            .expect("the OIDC config gate must exist")
+            .1
+            .split_once("\nasync fn parse_json_body")
+            .expect("the OIDC config gate must be followed by parse_json_body")
+            .0;
+
+        assert_eq!(
+            wrapper.matches("authorize_admin_request(").count(),
+            1,
+            "the OIDC config gate must use exactly one shared gate"
+        );
+        assert!(
+            wrapper.contains("authorize_admin_request(req, vec![Action::AdminAction(action)])"),
+            "the OIDC config gate must forward its parameterized action unchanged"
+        );
+        assert!(
+            !wrapper.contains("let cred = authorize_admin_request("),
+            "the OIDC config gate does not need the authenticated credentials"
+        );
+
+        for (handler, action) in [
+            ("GetOidcConfigHandler", "AdminAction::ServerInfoAdminAction"),
+            ("PutOidcConfigHandler", "AdminAction::ConfigUpdateAdminAction"),
+            ("DeleteOidcConfigHandler", "AdminAction::ConfigUpdateAdminAction"),
+            ("ValidateOidcConfigHandler", "AdminAction::ServerInfoAdminAction"),
+        ] {
+            let marker = format!("impl Operation for {handler}");
+            let block = production
+                .split_once(marker.as_str())
+                .unwrap_or_else(|| panic!("{handler} should exist"))
+                .1;
+            let block = &block[..block.find("\npub struct ").unwrap_or(block.len())];
+            assert!(
+                block.contains(&format!("authorize_oidc_config_request(&req, {action})")),
+                "{handler} must keep authorizing with {action}"
+            );
+        }
     }
 }
