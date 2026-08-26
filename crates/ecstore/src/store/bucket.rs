@@ -153,6 +153,38 @@ where
     await_bucket_namespace_operation(guard, bucket, "physical bucket deletion", future).await
 }
 
+async fn bucket_delete_local_blocker(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<Option<StorageError>> {
+    let local_disks = runtime_sources::local_disks_in(ctx).await;
+    let mut residue = BucketMetadataLessResidue::default();
+
+    for disk in local_disks.iter() {
+        let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
+            continue;
+        };
+        let scan = scan_metadata_less_residue(&bucket_path?).await?;
+        if scan.xlmeta_found {
+            return Ok(Some(StorageError::BucketNotEmpty(bucket.to_string())));
+        }
+        residue.files = residue.files.saturating_add(scan.files);
+        residue.uuid_data_dirs = residue.uuid_data_dirs.saturating_add(scan.uuid_data_dirs);
+        if residue.sample.is_none() {
+            residue.sample = scan.sample;
+        }
+    }
+
+    if residue.has_residue_without_xlmeta() {
+        return Ok(Some(StorageError::BucketNotEmptyWithDetails {
+            bucket: bucket.to_string(),
+            details: residue.describe(),
+        }));
+    }
+
+    Ok(None)
+}
+
 impl ECStore {
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
@@ -755,20 +787,9 @@ impl ECStore {
         if bucket_exists {
             validate_table_bucket_delete_guard(&self.ctx, bucket).await?;
 
-            // Check bucket is empty before deletion (per S3 API spec)
-            // If bucket is not empty (contains actual objects with xl.meta files) and force
-            // is not set, return BucketNotEmpty error.
-            // Note: Empty directories (left after object deletion) should NOT count as objects.
             if !opts.force {
-                let local_disks = runtime_sources::local_disks_in(&self.ctx).await;
-                for disk in local_disks.iter() {
-                    let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
-                        continue;
-                    };
-                    let bucket_path = bucket_path?;
-                    if has_xlmeta_files(&bucket_path).await? {
-                        return Err(StorageError::BucketNotEmpty(bucket.to_string()));
-                    }
+                if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket).await? {
+                    return Err(blocker);
                 }
                 delete_opts.force_if_empty = true;
             }
@@ -804,6 +825,12 @@ impl ECStore {
         if let Err(err) = delete_result
             && (!sr_delete || !is_err_strict_volume_not_found(&err))
         {
+            if delete_opts.force_if_empty
+                && matches!(&err, StorageError::BucketNotEmpty(_))
+                && let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket).await?
+            {
+                return Err(blocker);
+            }
             return Err(err);
         }
 
@@ -831,7 +858,8 @@ mod tests {
     use super::{
         SCANNER_BUCKET_LIST_SET_CONCURRENCY, await_bucket_namespace_operation, bucket_delete_metadata_cleanup_prefixes,
         bucket_deleted_marker_prefix, bucket_deleted_marker_volume, run_bucket_usage_cleanup, run_physical_bucket_deletion,
-        scanner_bucket_list_set_concurrency, should_override_created_from_metadata, validate_table_bucket_delete_allowed,
+        scan_metadata_less_residue, scanner_bucket_list_set_concurrency, should_override_created_from_metadata,
+        validate_table_bucket_delete_allowed,
     };
     use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
     use crate::bucket::metadata_sys;
@@ -1183,6 +1211,19 @@ mod tests {
         false
     }
 
+    async fn write_metadata_less_part_on_all_disks(disk_paths: &[PathBuf], bucket: &str, object: &str) {
+        for disk_path in disk_paths {
+            let data_dir = Uuid::new_v4();
+            let part_path = disk_path.join(bucket).join(object).join(data_dir.to_string()).join("part.1");
+            tokio::fs::create_dir_all(part_path.parent().expect("part path should have a parent"))
+                .await
+                .expect("metadata-less data dir should be created");
+            tokio::fs::write(part_path, b"orphan shard")
+                .await
+                .expect("metadata-less part should be written");
+        }
+    }
+
     async fn write_bucket_metadata_marker(disk_paths: &[PathBuf], metadata_prefix: &str) {
         for disk_path in disk_paths {
             let marker_path = disk_path.join(metadata_prefix).join("config.json");
@@ -1237,6 +1278,39 @@ mod tests {
         assert_eq!(scanner_bucket_list_set_concurrency(0), 1);
         assert_eq!(scanner_bucket_list_set_concurrency(2), 2);
         assert_eq!(scanner_bucket_list_set_concurrency(100), SCANNER_BUCKET_LIST_SET_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn metadata_less_residue_scan_ignores_empty_dirs_and_reports_uuid_data() {
+        let root = tempfile::tempdir().expect("temporary bucket root should be created");
+        let bucket_path = root.path().join("bucket");
+        tokio::fs::create_dir_all(bucket_path.join("empty/child"))
+            .await
+            .expect("empty directory residue should be created");
+
+        let empty = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("empty residue scan should succeed");
+        assert!(!empty.has_residue_without_xlmeta());
+
+        let data_dir = Uuid::new_v4();
+        let part_path = bucket_path.join("object").join(data_dir.to_string()).join("part.1");
+        tokio::fs::create_dir_all(part_path.parent().expect("part path should have a parent"))
+            .await
+            .expect("data dir should be created");
+        tokio::fs::write(&part_path, b"orphan shard")
+            .await
+            .expect("part file should be written");
+
+        let residue = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("metadata-less residue scan should succeed");
+        assert!(residue.has_residue_without_xlmeta());
+        assert_eq!(residue.files, 1);
+        assert_eq!(residue.uuid_data_dirs, 1);
+        let sample = residue.sample.as_deref().expect("part sample should be recorded");
+        assert!(sample.starts_with("object/"));
+        assert!(sample.ends_with("/part.1"));
     }
 
     #[tokio::test]
@@ -1757,6 +1831,49 @@ mod tests {
         assert!(
             metadata_sys::get_in(&ecstore.ctx, &bucket).await.is_ok(),
             "failed default S3 DeleteBucket must keep metadata cache"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_reports_metadata_less_residue_without_removing_it() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-delete-orphan-datadir-{}", Uuid::new_v4().simple());
+        let object = "object.txt";
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        write_metadata_less_part_on_all_disks(&disk_paths, &bucket, object).await;
+        assert!(
+            !any_disk_has_object_metadata(&disk_paths, &bucket).await,
+            "test setup must reproduce a bucket with data dirs but no xl.meta"
+        );
+
+        let err = ecstore
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect_err("metadata-less data dirs must block ordinary DeleteBucket");
+
+        match err {
+            StorageError::BucketNotEmptyWithDetails {
+                bucket: err_bucket,
+                details,
+            } => {
+                assert_eq!(err_bucket, bucket);
+                assert!(
+                    details.contains("metadata-less on-disk residue"),
+                    "diagnostic should identify metadata-less residue, got: {details}"
+                );
+                assert!(details.contains("files="), "diagnostic should include a bounded count");
+                assert!(details.contains("uuid_data_dirs="), "diagnostic should include data-dir count");
+            }
+            other => panic!("expected detailed BucketNotEmpty, got {other:?}"),
+        }
+        assert!(
+            any_disk_path_exists(&disk_paths, Path::new(&bucket).join(object)).await,
+            "ordinary DeleteBucket must preserve metadata-less data until an explicit operator action"
         );
     }
 

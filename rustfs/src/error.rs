@@ -307,7 +307,7 @@ impl From<StorageError> for ApiError {
             StorageError::InvalidArgument(_, _, _) => S3ErrorCode::InvalidArgument,
             StorageError::MethodNotAllowed => S3ErrorCode::MethodNotAllowed,
             StorageError::BucketNotFound(_) => S3ErrorCode::NoSuchBucket,
-            StorageError::BucketNotEmpty(_) => S3ErrorCode::BucketNotEmpty,
+            StorageError::BucketNotEmpty(_) | StorageError::BucketNotEmptyWithDetails { .. } => S3ErrorCode::BucketNotEmpty,
             StorageError::BucketNameInvalid(_) => S3ErrorCode::InvalidBucketName,
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
@@ -706,6 +706,13 @@ mod tests {
             (StorageError::MethodNotAllowed, S3ErrorCode::MethodNotAllowed),
             (StorageError::BucketNotFound("test".into()), S3ErrorCode::NoSuchBucket),
             (StorageError::BucketNotEmpty("test".into()), S3ErrorCode::BucketNotEmpty),
+            (
+                StorageError::BucketNotEmptyWithDetails {
+                    bucket: "test".into(),
+                    details: "metadata-less residue".into(),
+                },
+                S3ErrorCode::BucketNotEmpty,
+            ),
             (StorageError::BucketNameInvalid("test".into()), S3ErrorCode::InvalidBucketName),
             (
                 StorageError::ObjectNameInvalid("test".into(), "test".into()),
