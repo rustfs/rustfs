@@ -14,7 +14,8 @@
 
 use super::*;
 use crate::core::pools::{
-    PoolMetaReplicaState, PoolMetaWriteState, local_decommission_queue_prefix, pool_meta_has_active_decommission,
+    PoolMetaReplicaState, PoolMetaWriteState, load_pool_meta_identity_observing, local_decommission_queue_prefix,
+    persist_pool_meta_identity_for_startup, pool_meta_has_active_decommission,
 };
 use crate::error::is_err_decommission_running;
 use crate::runtime::instance::InstanceContext;
@@ -137,47 +138,84 @@ async fn load_pool_meta_for_startup<S>(
 where
     S: EcstoreObjectIO,
 {
+    load_pool_meta_identity_observing(pools.clone(), write_state)
+        .await
+        .map_err(|err| Error::other(format!("store init failed during load_pool_meta_identity: {err}")))?;
     let mut meta = PoolMeta::default();
     let replica_state = meta
         .load_no_lock_from_replicas_observing(pools, write_state)
         .await
         .map_err(|err| Error::other(format!("store init failed during load_pool_meta: {err}")))?;
     write_state.observe_replicas(replica_state);
+    write_state
+        .ensure_missing_metadata_can_initialize()
+        .map_err(|err| Error::other(format!("store init failed during classify_pool_meta_absence: {err}")))?;
     Ok((meta, replica_state))
 }
 
-async fn save_validated_pool_meta_for_startup<S>(meta: &PoolMeta, pools: Vec<Arc<S>>) -> Result<()>
+async fn establish_pool_meta_bootstrap_identity_if_proven<S>(
+    pools: Vec<Arc<S>>,
+    write_state: &mut PoolMetaWriteState,
+    elected_writer: bool,
+) -> Result<()>
 where
     S: EcstoreObjectIO,
 {
-    resolve_store_init_stage_result(meta.save_for_startup(pools).await, "save_validated_pool_meta")
+    if elected_writer && write_state.fresh_bootstrap_proven() {
+        persist_pool_meta_identity_for_startup(pools, write_state, false).await?;
+    }
+    Ok(())
+}
+
+async fn save_validated_pool_meta_for_startup<S>(
+    meta: &PoolMeta,
+    pools: Vec<Arc<S>>,
+    write_state: &mut PoolMetaWriteState,
+) -> Result<PoolMeta>
+where
+    S: EcstoreObjectIO,
+{
+    meta.save_for_startup_observing(pools, write_state)
+        .await
+        .map_err(|err| Error::other(format!("store init failed during save_validated_pool_meta: {err}")))
 }
 
 async fn persist_pool_meta_for_startup_if_safe<S>(
     meta: &PoolMeta,
     pools: Vec<Arc<S>>,
     replica_state: PoolMetaReplicaState,
-    write_state: PoolMetaWriteState,
+    write_state: &mut PoolMetaWriteState,
     topology_update: bool,
     elected_writer: bool,
-) -> Result<()>
+) -> Result<PoolMeta>
 where
     S: EcstoreObjectIO,
 {
     if !elected_writer {
-        return Ok(());
+        return Ok(meta.clone());
     }
     let should_write = topology_update || (replica_state.needs_repair && replica_state.repair_write_safe);
     if topology_update {
         replica_state.ensure_write_safe("store init failed during save_validated_pool_meta")?;
     }
-    if should_write {
+    if should_write || write_state.identity_requires_repair() {
         write_state.ensure_write_safe("store init failed during save_validated_pool_meta")?;
     }
+    let mut committed = meta.clone();
     if should_write {
-        save_validated_pool_meta_for_startup(meta, pools).await?;
+        if write_state.fresh_bootstrap_proven() || write_state.identity_is_pending() {
+            persist_pool_meta_identity_for_startup(pools.clone(), write_state, false)
+                .await
+                .map_err(|err| Error::other(format!("store init failed during prepare_pool_meta_identity: {err}")))?;
+        }
+        committed = save_validated_pool_meta_for_startup(meta, pools.clone(), write_state).await?;
     }
-    Ok(())
+    if should_write || write_state.identity_requires_repair() {
+        persist_pool_meta_identity_for_startup(pools, write_state, true)
+            .await
+            .map_err(|err| Error::other(format!("store init failed during commit_pool_meta_identity: {err}")))?;
+    }
+    Ok(committed)
 }
 
 async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken, pool_indices: Vec<usize>) {
@@ -286,6 +324,7 @@ impl ECStore {
         preflight_startup_rpc_secret(&endpoint_pools)?;
 
         let mut deployment_id = None;
+        let mut fresh_bootstrap_proven = true;
 
         // let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
 
@@ -345,7 +384,7 @@ impl ECStore {
 
             check_disk_fatal_errs(&errs)?;
 
-            let fm = {
+            let loaded_format = {
                 let mut times = 0;
                 let mut interval = 1;
                 loop {
@@ -401,6 +440,8 @@ impl ECStore {
                     }
                 }
             }?;
+            fresh_bootstrap_proven &= loaded_format.fresh_bootstrap_proven;
+            let fm = loaded_format.format;
 
             // Format loading succeeded, enable health monitoring on all disks
             for disk in disks.iter().flatten() {
@@ -436,13 +477,14 @@ impl ECStore {
             runtime_sources::record_local_disks(&instance_ctx, local_disks).await;
         }
 
+        let deployment_id = deployment_id.ok_or_else(|| Error::other("store init failed: deployment id is not initialized"))?;
         let peer_sys = S3PeerSys::new_with_instance_ctx(&endpoint_pools, instance_ctx.clone());
         let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
         pool_meta.dont_save = true;
 
         let decommission_cancelers = RwLock::new(vec![None; pools.len()]);
         let ec = Arc::new(ECStore {
-            id: deployment_id.ok_or_else(|| Error::other("store init failed: deployment id is not initialized"))?,
+            id: deployment_id,
             disk_map,
             pools,
             peer_sys,
@@ -450,7 +492,7 @@ impl ECStore {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: Mutex::new(PoolMetaWriteState::for_startup(deployment_id, fresh_bootstrap_proven)),
             // Adopt the caller's context (the process bootstrap one on the
             // legacy path) so startup writes (erasure type recorded before
             // this point) and later reads share one cell.
@@ -459,10 +501,8 @@ impl ECStore {
         });
 
         // Only set it when this instance's deployment ID is not yet configured
-        if let Some(dep_id) = deployment_id
-            && instance_ctx.deployment_id().is_none()
-        {
-            instance_ctx.set_deployment_id(dep_id);
+        if instance_ctx.deployment_id().is_none() {
+            instance_ctx.set_deployment_id(deployment_id);
         }
 
         let wait_sec = 5;
@@ -494,15 +534,21 @@ impl ECStore {
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
         runtime_sources::ensure_boot_time().await;
 
+        let should_persist_pool_meta = self
+            .pools
+            .first()
+            .is_some_and(|pool| pool_first_endpoint_is_local(&pool.endpoints));
         let (meta, pool_meta_replica_state) = {
             let mut write_state = self.pool_meta_save_gate.lock().await;
+            establish_pool_meta_bootstrap_identity_if_proven(self.pools.clone(), &mut write_state, should_persist_pool_meta)
+                .await
+                .map_err(|err| Error::other(format!("store init failed during establish_pool_meta_bootstrap_identity: {err}")))?;
             load_pool_meta_for_startup(self.pools.clone(), &mut write_state).await?
         };
         let update = meta.validate(self.pools.clone())?;
         let endpoints = runtime_sources::endpoint_pools_or_default();
-        let should_persist_pool_meta = runtime_sources::first_cluster_node_is_local().await;
 
-        let installed_pool_meta = if update {
+        let mut installed_pool_meta = if update {
             PoolMeta::new(&self.pools, &meta)
         } else {
             meta.clone()
@@ -510,12 +556,12 @@ impl ECStore {
         // Only one local node should persist validated pool metadata here; otherwise
         // distributed startup can race on the same lock and replay the prior init bug.
         {
-            let write_state = self.pool_meta_save_gate.lock().await;
-            persist_pool_meta_for_startup_if_safe(
+            let mut write_state = self.pool_meta_save_gate.lock().await;
+            installed_pool_meta = persist_pool_meta_for_startup_if_safe(
                 &installed_pool_meta,
                 self.pools.clone(),
                 pool_meta_replica_state,
-                *write_state,
+                &mut write_state,
                 update,
                 should_persist_pool_meta,
             )
@@ -615,11 +661,11 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, PoolMetaWriteState, load_pool_meta_for_startup,
-        persist_pool_meta_for_startup_if_safe, pool_first_endpoint_is_local, pool_meta_has_active_decommission,
-        preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with, resolve_store_init_stage_result,
-        save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init, should_retry_format_load,
-        should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, PoolMetaWriteState, establish_pool_meta_bootstrap_identity_if_proven,
+        load_pool_meta_for_startup, persist_pool_meta_for_startup_if_safe, pool_first_endpoint_is_local,
+        pool_meta_has_active_decommission, preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with,
+        resolve_store_init_stage_result, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
+        should_retry_format_load, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     #[cfg(feature = "test-util")]
     use crate::disk::DiskAPI;
@@ -677,7 +723,10 @@ mod tests {
     };
     use crate::{
         bucket::replication::{ReplicationState, ReplicationStatusType, replication_statuses_map},
-        core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
+        core::pools::{
+            POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus,
+            pool_meta_identity_initialized_for_test, pool_meta_v3_commit_state_for_test,
+        },
         disk::endpoint::Endpoint,
         error::{Error, Result, StorageError},
         io_support::rio::{WritePlan, compression_metadata_value},
@@ -718,6 +767,7 @@ mod tests {
     use time::OffsetDateTime;
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
 
     fn startup_pool_meta_payload(meta: &PoolMeta) -> Vec<u8> {
         meta.encode_config_data_for_test().expect("pool metadata should encode")
@@ -731,10 +781,19 @@ mod tests {
         wrote_without_lock: AtomicBool,
         wrote_with_max_parity: AtomicBool,
         written_payload: Mutex<Option<Vec<u8>>>,
+        revision: AtomicUsize,
+        pool_meta_write_attempts: AtomicUsize,
+        fail_pool_meta_write_at: AtomicUsize,
+        pool_meta_written_versions: Mutex<Vec<u16>>,
+        objects: Mutex<HashMap<String, (Vec<u8>, String)>>,
     }
 
     impl StartupPoolMetaStorage {
         fn new(read_payload: Vec<u8>) -> Self {
+            let mut objects = HashMap::new();
+            if !read_payload.is_empty() {
+                objects.insert(POOL_META_NAME.to_string(), (read_payload.clone(), "startup-pool-meta-0".to_string()));
+            }
             Self {
                 read_payload,
                 read_error: false,
@@ -742,6 +801,11 @@ mod tests {
                 wrote_without_lock: AtomicBool::new(false),
                 wrote_with_max_parity: AtomicBool::new(false),
                 written_payload: Mutex::new(None),
+                revision: AtomicUsize::new(0),
+                pool_meta_write_attempts: AtomicUsize::new(0),
+                fail_pool_meta_write_at: AtomicUsize::new(0),
+                pool_meta_written_versions: Mutex::new(Vec::new()),
+                objects: Mutex::new(objects),
             }
         }
 
@@ -753,15 +817,21 @@ mod tests {
                 wrote_without_lock: AtomicBool::new(false),
                 wrote_with_max_parity: AtomicBool::new(false),
                 written_payload: Mutex::new(None),
+                revision: AtomicUsize::new(0),
+                pool_meta_write_attempts: AtomicUsize::new(0),
+                fail_pool_meta_write_at: AtomicUsize::new(0),
+                pool_meta_written_versions: Mutex::new(Vec::new()),
+                objects: Mutex::new(HashMap::new()),
             }
         }
 
-        fn object_info(&self, bucket: &str, object: &str, size: usize) -> ObjectInfo {
+        fn object_info(&self, bucket: &str, object: &str, size: usize, etag: String) -> ObjectInfo {
             ObjectInfo {
                 bucket: bucket.to_string(),
                 name: object.to_string(),
                 size: size as i64,
                 actual_size: size as i64,
+                etag: Some(etag),
                 ..Default::default()
             }
         }
@@ -790,13 +860,19 @@ mod tests {
             if self.read_error {
                 return Err(Error::other("pool metadata read quorum unavailable"));
             }
-            if self.read_payload.is_empty() {
+            let Some((payload, etag)) = self
+                .objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(object)
+                .cloned()
+            else {
                 return Err(Error::FileNotFound);
-            }
+            };
 
             Ok(GetObjectReader {
-                stream: Box::new(Cursor::new(self.read_payload.clone())),
-                object_info: self.object_info(bucket, object, self.read_payload.len()),
+                stream: Box::new(Cursor::new(payload.clone())),
+                object_info: self.object_info(bucket, object, payload.len(), etag),
                 buffered_body: None,
                 body_source: Default::default(),
             })
@@ -812,11 +888,53 @@ mod tests {
             assert!(opts.no_lock, "store init pool metadata save must not require namespace locks");
             self.wrote_without_lock.store(true, Ordering::SeqCst);
             self.wrote_with_max_parity.store(opts.max_parity, Ordering::SeqCst);
+            if object == POOL_META_NAME {
+                let attempt = self.pool_meta_write_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.fail_pool_meta_write_at.load(Ordering::SeqCst) == attempt {
+                    return Err(Error::Timeout);
+                }
+            }
+            let current_etag = self
+                .objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(object)
+                .map(|(_, etag)| etag.clone());
+            if opts
+                .http_preconditions
+                .as_ref()
+                .and_then(|preconditions| preconditions.if_none_match_value())
+                == Some("*")
+                && current_etag.is_some()
+            {
+                return Err(Error::PreconditionFailed);
+            }
+            if let Some(expected) = opts
+                .http_preconditions
+                .as_ref()
+                .and_then(|preconditions| preconditions.if_match_value())
+                && current_etag.as_deref() != Some(expected)
+            {
+                return Err(Error::PreconditionFailed);
+            }
             let mut payload = Vec::new();
             data.stream.read_to_end(&mut payload).await?;
             let size = payload.len();
-            *self.written_payload.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload);
-            Ok(self.object_info(bucket, object, size))
+            if object == POOL_META_NAME {
+                *self.written_payload.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload.clone());
+                if payload.len() >= 4 {
+                    self.pool_meta_written_versions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(u16::from_le_bytes([payload[2], payload[3]]));
+                }
+            }
+            let etag = format!("startup-pool-meta-{}", self.revision.fetch_add(1, Ordering::SeqCst) + 1);
+            self.objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(object.to_string(), (payload, etag.clone()));
+            Ok(self.object_info(bucket, object, size, etag))
         }
     }
 
@@ -834,9 +952,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_store_init_pool_meta_io_bypasses_namespace_lock_surface() {
+    async fn test_fresh_bootstrap_pool_meta_save_reaches_v3_cas_without_blocking_itself() {
         let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
-        let mut write_state = PoolMetaWriteState::default();
+        let mut write_state = PoolMetaWriteState::for_startup(Uuid::new_v4(), true);
+        establish_pool_meta_bootstrap_identity_if_proven(vec![storage.clone()], &mut write_state, true)
+            .await
+            .expect("the elected fresh bootstrap should persist its identity before loading pool metadata");
 
         let (loaded, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut write_state)
             .await
@@ -851,11 +972,303 @@ mod tests {
             pools: Vec::new(),
             dont_save: false,
         };
-        save_validated_pool_meta_for_startup(&meta, vec![storage.clone()])
+        save_validated_pool_meta_for_startup(&meta, vec![storage.clone()], &mut write_state)
             .await
             .expect("startup pool metadata save should bypass locks");
         assert!(storage.wrote_without_lock.load(Ordering::SeqCst));
         assert!(storage.wrote_with_max_parity.load(Ordering::SeqCst));
+        assert_eq!(
+            storage.pool_meta_write_attempts.load(Ordering::SeqCst),
+            2,
+            "fresh bootstrap should reach both V3 prepare and commit CAS writes"
+        );
+        assert_eq!(
+            *storage
+                .pool_meta_written_versions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![3, 3]
+        );
+        write_state
+            .ensure_write_safe("fresh bootstrap publication")
+            .expect("successful startup publication must disarm the transaction guard");
+    }
+
+    #[tokio::test]
+    async fn test_unproven_pending_identity_cannot_authorize_all_missing_pool_meta() {
+        let deployment_id = Uuid::new_v4();
+        let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let mut proven_bootstrap = PoolMetaWriteState::for_startup(deployment_id, true);
+        establish_pool_meta_bootstrap_identity_if_proven(vec![storage.clone()], &mut proven_bootstrap, true)
+            .await
+            .expect("fresh topology proof should persist a nonce-bound pending identity");
+
+        let identity = storage
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(POOL_META_IDENTITY_NAME)
+            .map(|(payload, _)| payload.clone())
+            .expect("pending identity should be durable");
+        assert!(!pool_meta_identity_initialized_for_test(&identity).expect("decode pending identity"));
+
+        let mut unproven_restart = PoolMetaWriteState::for_startup(deployment_id, false);
+        let err = load_pool_meta_for_startup(vec![storage.clone()], &mut unproven_restart)
+            .await
+            .expect_err("a pending identity alone must not authorize an all-missing restart");
+        assert!(err.to_string().contains("no verified fresh-bootstrap proof"));
+        unproven_restart
+            .ensure_write_safe("unproven pending identity restart")
+            .expect_err("the rejected restart must latch the write gate");
+        assert!(
+            !storage
+                .objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(POOL_META_NAME),
+            "classification must not create pool metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nonfresh_identity_repair_crash_never_persists_pending_bootstrap_authority() {
+        let deployment_id = Uuid::new_v4();
+        let initial = init_test_pool_meta(None);
+        let storage = Arc::new(StartupPoolMetaStorage::new(startup_pool_meta_payload(&initial)));
+        let mut write_state = PoolMetaWriteState::for_startup(deployment_id, false);
+        let (loaded, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut write_state)
+            .await
+            .expect("an existing pool metadata snapshot may repair its missing identity");
+
+        storage.fail_pool_meta_write_at.store(1, Ordering::SeqCst);
+        persist_pool_meta_for_startup_if_safe(&loaded, vec![storage.clone()], replica_state, &mut write_state, true, true)
+            .await
+            .expect_err("the injected crash boundary should stop before the pool metadata replacement");
+
+        let identity = storage
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(POOL_META_IDENTITY_NAME)
+            .map(|(payload, _)| payload.clone())
+            .expect("identity repair should be durable before the failed topology write");
+        assert!(
+            pool_meta_identity_initialized_for_test(&identity).expect("decode repaired identity"),
+            "an existing cluster must never leave pending bootstrap authority at this crash boundary"
+        );
+
+        storage
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(POOL_META_NAME);
+        let mut restarted = PoolMetaWriteState::for_startup(deployment_id, false);
+        let err = load_pool_meta_for_startup(vec![storage], &mut restarted)
+            .await
+            .expect_err("wiping pool metadata after the crash must require recovery");
+        assert!(err.to_string().contains("initialized cluster identity exists"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(pool_meta_version_env)]
+    async fn test_existing_legacy_identity_and_replica_repair_respects_disabled_v3_gates() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_POOL_META_V3_WRITE, None::<&str>),
+                (rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED, None::<&str>),
+            ],
+            async {
+                let deployment_id = Uuid::new_v4();
+                let corrupt = Arc::new(StartupPoolMetaStorage::new(vec![0, 1, 2]));
+                let legacy = init_test_pool_meta(None);
+                let valid = Arc::new(StartupPoolMetaStorage::new(startup_pool_meta_payload(&legacy)));
+                let mut write_state = PoolMetaWriteState::for_startup(deployment_id, false);
+                let (loaded, replica_state) = load_pool_meta_for_startup(vec![corrupt.clone(), valid.clone()], &mut write_state)
+                    .await
+                    .expect("existing V2 metadata should remain readable while its identity is missing");
+                assert!(replica_state.needs_repair);
+
+                let committed = persist_pool_meta_for_startup_if_safe(
+                    &loaded,
+                    vec![corrupt.clone(), valid.clone()],
+                    replica_state,
+                    &mut write_state,
+                    true,
+                    true,
+                )
+                .await
+                .expect("legacy replica and identity repair should succeed without crossing the V3 gate");
+                assert_eq!(committed.version, POOL_META_VERSION);
+                for storage in [corrupt, valid] {
+                    assert_eq!(
+                        *storage
+                            .pool_meta_written_versions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        vec![POOL_META_VERSION],
+                        "legacy repair must write exactly one V2 snapshot"
+                    );
+                    let identity = storage
+                        .objects
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(POOL_META_IDENTITY_NAME)
+                        .map(|(payload, _)| payload.clone())
+                        .expect("identity repair should persist on every pool");
+                    assert!(pool_meta_identity_initialized_for_test(&identity).expect("decode repaired identity"));
+                }
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_store_init_distinguishes_fresh_deployment_from_wiped_lagging_node() {
+        let deployment_id = Uuid::new_v4();
+        let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let mut fresh_state = PoolMetaWriteState::for_startup(deployment_id, true);
+        establish_pool_meta_bootstrap_identity_if_proven(vec![storage.clone()], &mut fresh_state, true)
+            .await
+            .expect("fresh topology proof should become a durable pending identity");
+        let (_, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut fresh_state)
+            .await
+            .expect("new formats with no identity may initialize pool metadata exactly once");
+        let committed = persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta(None),
+            vec![storage.clone()],
+            replica_state,
+            &mut fresh_state,
+            true,
+            true,
+        )
+        .await
+        .expect("fresh deployment should durably commit identity and pool metadata");
+        assert_eq!(committed.pools[0].cmd_line, "pool-0");
+        {
+            let objects = storage.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(objects.contains_key(POOL_META_NAME));
+            assert!(objects.contains_key(POOL_META_IDENTITY_NAME));
+        }
+
+        storage
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(POOL_META_NAME);
+        let mut wiped_pool_state = PoolMetaWriteState::for_startup(deployment_id, false);
+        let err = load_pool_meta_for_startup(vec![storage.clone()], &mut wiped_pool_state)
+            .await
+            .expect_err("an initialized identity must prevent an empty pool metadata rebuild");
+        assert!(err.to_string().contains("initialized cluster identity exists"));
+
+        storage
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(POOL_META_IDENTITY_NAME);
+        let mut wiped_all_state = PoolMetaWriteState::for_startup(deployment_id, false);
+        let err = load_pool_meta_for_startup(vec![storage], &mut wiped_all_state)
+            .await
+            .expect_err("existing formats without identity or pool metadata must require recovery");
+        assert!(err.to_string().contains("no durable bootstrap identity"));
+
+        let distributed_node = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let mut non_elected_state = PoolMetaWriteState::for_startup(Uuid::new_v4(), true);
+        establish_pool_meta_bootstrap_identity_if_proven(vec![distributed_node.clone()], &mut non_elected_state, false)
+            .await
+            .expect("a non-elected distributed node must not create bootstrap authority");
+        let err = load_pool_meta_for_startup(vec![distributed_node], &mut non_elected_state)
+            .await
+            .expect_err("a distributed node without durable identity or pool metadata must require recovery");
+        assert!(err.to_string().contains("no durable bootstrap identity"));
+    }
+
+    #[tokio::test]
+    async fn test_store_init_resumes_pending_v3_bootstrap_without_legacy_overwrite() {
+        let deployment_id = Uuid::new_v4();
+        let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let mut first_bootstrap = PoolMetaWriteState::for_startup(deployment_id, true);
+        establish_pool_meta_bootstrap_identity_if_proven(vec![storage.clone()], &mut first_bootstrap, true)
+            .await
+            .expect("fresh bootstrap should persist a pending identity");
+        let (_, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut first_bootstrap)
+            .await
+            .expect("the durable pending identity should authorize the initial pool metadata write");
+
+        storage.fail_pool_meta_write_at.store(2, Ordering::SeqCst);
+        persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta(None),
+            vec![storage.clone()],
+            replica_state,
+            &mut first_bootstrap,
+            true,
+            true,
+        )
+        .await
+        .expect_err("the injected crash boundary should leave only the V3 prepare record");
+
+        let (pending_pool, pending_identity) = {
+            let objects = storage.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                objects
+                    .get(POOL_META_NAME)
+                    .map(|(payload, _)| payload.clone())
+                    .expect("the V3 prepare record should be durable"),
+                objects
+                    .get(POOL_META_IDENTITY_NAME)
+                    .map(|(payload, _)| payload.clone())
+                    .expect("the bootstrap identity should be durable"),
+            )
+        };
+        assert_eq!(pool_meta_v3_commit_state_for_test(pending_pool).expect("decode pending V3"), (1, false));
+        assert!(!pool_meta_identity_initialized_for_test(&pending_identity).expect("decode pending identity"));
+
+        storage.fail_pool_meta_write_at.store(0, Ordering::SeqCst);
+        let mut restarted = PoolMetaWriteState::for_startup(deployment_id, false);
+        let (loaded, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut restarted)
+            .await
+            .expect("restart should recover the predecessor embedded in the pending V3 record");
+        assert!(loaded.pools.is_empty());
+        assert!(replica_state.needs_repair);
+        let committed = persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta(None),
+            vec![storage.clone()],
+            replica_state,
+            &mut restarted,
+            true,
+            true,
+        )
+        .await
+        .expect("restart should finish generation 1 before promoting the identity");
+        assert_eq!(committed.version, 3);
+
+        let (committed_pool, committed_identity) = {
+            let objects = storage.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                objects
+                    .get(POOL_META_NAME)
+                    .map(|(payload, _)| payload.clone())
+                    .expect("the committed V3 record should be durable"),
+                objects
+                    .get(POOL_META_IDENTITY_NAME)
+                    .map(|(payload, _)| payload.clone())
+                    .expect("the committed identity should be durable"),
+            )
+        };
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(committed_pool).expect("decode committed V3"),
+            (1, true)
+        );
+        assert!(pool_meta_identity_initialized_for_test(&committed_identity).expect("decode committed identity"));
+        assert!(
+            storage
+                .pool_meta_written_versions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(|version| *version == 3),
+            "bootstrap recovery must never overwrite a pending V3 record with legacy metadata"
+        );
     }
 
     #[tokio::test]
@@ -880,7 +1293,7 @@ mod tests {
             &loaded,
             vec![corrupt.clone(), backup.clone()],
             replica_state,
-            write_state,
+            &mut write_state,
             false,
             true,
         )
@@ -919,7 +1332,7 @@ mod tests {
             &loaded,
             vec![valid.clone(), unreadable.clone()],
             replica_state,
-            write_state,
+            &mut write_state,
             false,
             true,
         )
@@ -932,7 +1345,7 @@ mod tests {
             &loaded,
             vec![valid.clone(), unreadable.clone()],
             replica_state,
-            write_state,
+            &mut write_state,
             true,
             true,
         )
@@ -968,9 +1381,10 @@ mod tests {
             .expect("a later startup retry may read the repaired replica");
         assert!(replica_state.repair_write_safe);
 
-        let err = persist_pool_meta_for_startup_if_safe(&loaded, vec![repaired.clone()], replica_state, write_state, true, true)
-            .await
-            .expect_err("the same store instance must not write after observing unreadable replicas");
+        let err =
+            persist_pool_meta_for_startup_if_safe(&loaded, vec![repaired.clone()], replica_state, &mut write_state, true, true)
+                .await
+                .expect_err("the same store instance must not write after observing unreadable replicas");
         assert!(
             err.to_string()
                 .contains("restart after all replicas are readable and consistent")

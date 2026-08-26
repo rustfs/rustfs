@@ -540,9 +540,12 @@ impl ECStore {
         #[cfg(test)]
         crate::core::pools::observe_pool_activation_start_attempt(crate::core::pools::PoolActivationStartKind::Rebalance);
         let fleet_proof = acquire_pool_activation_fleet_proof(&self.ctx).await?;
+        let mut pool_meta_guard = self.pool_meta_save_gate.lock().await;
+        pool_meta_guard.ensure_write_safe(stage)?;
         let activation_fence = acquire_pool_rebalance_activation_locks(pool.clone(), fleet_proof).await?;
-        let mut pool_meta = PoolMeta::default();
-        pool_meta.load_no_lock_from_replicas(self.pools.clone()).await?;
+        let pool_meta = self
+            .load_runtime_pool_meta_under_activation_fence(&mut pool_meta_guard, &activation_fence, stage)
+            .await?;
         ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
 
         merge_and_save_rebalance_meta_no_lock(
@@ -568,9 +571,12 @@ impl ECStore {
         S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
         let fleet_proof = acquire_pool_activation_fleet_proof(&self.ctx).await?;
+        let mut pool_meta_guard = self.pool_meta_save_gate.lock().await;
+        pool_meta_guard.ensure_write_safe("rebalance worker activation")?;
         let activation_fence = acquire_pool_rebalance_activation_locks(pool.clone(), fleet_proof).await?;
-        let mut pool_meta = PoolMeta::default();
-        pool_meta.load_no_lock_from_replicas(self.pools.clone()).await?;
+        let pool_meta = self
+            .load_runtime_pool_meta_under_activation_fence(&mut pool_meta_guard, &activation_fence, "rebalance worker activation")
+            .await?;
         ensure_rebalance_activation_pool_meta_allowed(&pool_meta)?;
 
         let mut persisted = RebalanceMeta::new();
@@ -1301,9 +1307,39 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::pools::{PoolActivationDurableSaveBarrier, PoolActivationStartKind, PoolActivationStartProbe};
+    use crate::config::com::delete_config;
+    use crate::core::pools::{
+        POOL_META_NAME, PoolActivationDurableSaveBarrier, PoolActivationStartKind, PoolActivationStartProbe, PoolMetaWriteState,
+        persist_pool_meta_identity_for_startup,
+    };
     use crate::object_api::NamespaceLockFence;
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
+
+    async fn persist_initialized_identity_then_remove_pool_meta(store: &Arc<ECStore>) {
+        let mut write_state = PoolMetaWriteState::for_startup(store.id, false);
+        persist_pool_meta_identity_for_startup(store.pools.clone(), &mut write_state, true)
+            .await
+            .expect("initialized pool metadata identity should persist");
+        *store.pool_meta_save_gate.lock().await = write_state;
+        for pool in &store.pools {
+            delete_config(pool.clone(), POOL_META_NAME)
+                .await
+                .expect("every pool metadata replica should be removed");
+        }
+    }
+
+    async fn assert_activation_locks_released(store: &Arc<ECStore>) {
+        let fleet_proof = acquire_pool_activation_fleet_proof(&store.ctx)
+            .await
+            .expect("fleet proof should remain available");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            acquire_pool_rebalance_activation_locks(store.pools[0].clone(), fleet_proof),
+        )
+        .await
+        .expect("a rejected activation must release namespace fences promptly")
+        .expect("a rejected activation must release both namespace fences");
+    }
 
     #[tokio::test]
     async fn rebalance_stop_wait_probe_matches_run_id() {
@@ -1354,6 +1390,90 @@ mod tests {
             .await
             .expect("retrying admission cancellation should be idempotent");
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebalance_activation_rejects_initialized_cluster_with_all_pool_meta_missing() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        persist_initialized_identity_then_remove_pool_meta(&store).await;
+        set_rebalance_disk_stats_override_for_test(
+            store.id,
+            vec![
+                DiskStat {
+                    total_space: 100,
+                    available_space: 0,
+                },
+                DiskStat {
+                    total_space: 100,
+                    available_space: 100,
+                },
+            ],
+        );
+
+        let err = store
+            .init_rebalance_start(vec!["missing-pool-meta".to_string()])
+            .await
+            .expect_err("rebalance activation must fail closed when every pool.bin is missing");
+        assert!(err.to_string().contains("initialized cluster identity exists"));
+        store
+            .ensure_pool_meta_side_effects_safe("rebalance activation after missing pool metadata")
+            .await
+            .expect_err("the missing metadata observation must latch the shared runtime gate");
+
+        let mut persisted = RebalanceMeta::new();
+        assert!(
+            matches!(persisted.load(store.pools[0].clone()).await, Err(Error::ConfigNotFound)),
+            "rejected activation must not create rebalance metadata"
+        );
+        assert_activation_locks_released(&store).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebalance_worker_rejects_initialized_cluster_with_all_pool_meta_missing() {
+        let rebalance_id = "missing-pool-meta-worker";
+        let active = RebalanceMeta {
+            id: rebalance_id.to_string(),
+            percent_free_goal: 0.5,
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: true,
+                    init_capacity: 100,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    participating: true,
+                    init_capacity: 100,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(Some(active)).await;
+        persist_initialized_identity_then_remove_pool_meta(&store).await;
+
+        let err = match store
+            .fence_rebalance_worker_activation(store.pools[0].clone(), rebalance_id)
+            .await
+        {
+            Ok(_) => panic!("worker activation must not return a fence when every pool.bin is missing"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("initialized cluster identity exists"));
+        store
+            .ensure_pool_meta_side_effects_safe("rebalance worker after missing pool metadata")
+            .await
+            .expect_err("worker validation must latch the shared runtime gate");
+        assert_activation_locks_released(&store).await;
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::core::pools::POOL_META_NAME;
+use crate::core::pools::{POOL_META_NAME, load_pool_meta_identity_observing};
 use crate::services::rebalance::{REBAL_META_NAME, RebalStatus};
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::heal::HealOperations as _;
@@ -91,7 +91,13 @@ fn heal_format_fence_lost_error() -> Error {
 impl ECStore {
     async fn acquire_heal_format_fence(
         &self,
-    ) -> Result<(NamespaceLockGuard, NamespaceLockGuard, PoolMeta, Option<RebalanceMeta>)> {
+    ) -> Result<(
+        tokio::sync::MutexGuard<'_, PoolMetaWriteState>,
+        NamespaceLockGuard,
+        NamespaceLockGuard,
+        PoolMeta,
+        Option<RebalanceMeta>,
+    )> {
         let metadata_pool = self
             .pools
             .first()
@@ -111,13 +117,14 @@ impl ECStore {
             return Err(heal_format_fence_lost_error());
         }
 
+        load_pool_meta_identity_observing(self.pools.clone(), &mut write_state).await?;
         let mut pool_meta = PoolMeta::default();
         let replica_state = pool_meta
             .load_no_lock_from_replicas_observing(self.pools.clone(), &mut write_state)
             .await?;
         write_state.observe_replicas(replica_state);
+        write_state.ensure_missing_metadata_can_initialize()?;
         write_state.ensure_write_safe("heal format fence failed")?;
-        drop(write_state);
         if pool_meta.pools.len() != self.pools.len()
             || pool_meta.pools.iter().enumerate().any(|(pool_idx, pool)| {
                 pool.id != pool_idx || pool.cmd_line.is_empty() || pool.cmd_line != self.pools[pool_idx].endpoints.cmd_line
@@ -149,11 +156,12 @@ impl ECStore {
             return Err(heal_format_fence_lost_error());
         }
 
+        write_state.ensure_write_safe("heal format fence failed")?;
         if pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost() {
             return Err(heal_format_fence_lost_error());
         }
 
-        Ok((pool_guard, rebalance_guard, pool_meta, rebalance_meta))
+        Ok((write_state, pool_guard, rebalance_guard, pool_meta, rebalance_meta))
     }
 
     fn get_pools_for_heal_object(&self, opts: &HealOpts) -> Result<Vec<Arc<Sets>>> {
@@ -234,7 +242,8 @@ impl ECStore {
         let mut count_completed = 0;
         let mut first_error = None;
         for (pool_idx, pool) in self.pools.iter().enumerate() {
-            let (pool_guard, rebalance_guard, pool_meta, rebalance_meta) = self.acquire_heal_format_fence().await?;
+            let (mut write_state, pool_guard, rebalance_guard, pool_meta, rebalance_meta) =
+                self.acquire_heal_format_fence().await?;
             if pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost() {
                 first_error.get_or_insert(heal_format_fence_lost_error());
                 break;
@@ -249,7 +258,15 @@ impl ECStore {
                 continue;
             }
 
-            let fence_lost = || pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost();
+            let fence_lost = || {
+                let lost = pool_guard.is_lock_lost()
+                    || rebalance_guard.is_lock_lost()
+                    || write_state.ensure_write_safe("heal format write fence failed").is_err();
+                if lost {
+                    write_state.block_writes_after_fence_loss();
+                }
+                lost
+            };
             let (mut result, err) = pool.heal_format_with_fence(dry_run, fence_lost).await?;
             if let Some(err) = err {
                 match err {
@@ -268,7 +285,11 @@ impl ECStore {
 
             // A lease can be lost after the final write; fail closed before
             // reporting the pool as successfully healed.
-            if pool_guard.is_lock_lost() || rebalance_guard.is_lock_lost() {
+            let fence_lost = pool_guard.is_lock_lost()
+                || rebalance_guard.is_lock_lost()
+                || write_state.ensure_write_safe("heal format publication fence failed").is_err();
+            if fence_lost {
+                write_state.block_writes_after_fence_loss();
                 first_error.get_or_insert(heal_format_fence_lost_error());
                 break;
             }
@@ -321,7 +342,33 @@ impl ECStore {
             )
         })?;
 
-        set.heal_replacement_format(dry_run, targets).await
+        let (mut write_state, pool_guard, rebalance_guard, pool_meta, rebalance_meta) = self.acquire_heal_format_fence().await?;
+        if let Some(skip) = classify_heal_format_pool(pool_index, &pool.endpoints.cmd_line, &pool_meta, rebalance_meta.as_ref()) {
+            return Ok((HealResultItem::default(), Some(heal_format_pool_skip_error(skip))));
+        }
+
+        let fence_lost = || {
+            let lost = pool_guard.is_lock_lost()
+                || rebalance_guard.is_lock_lost()
+                || write_state
+                    .ensure_write_safe("replacement format write fence failed")
+                    .is_err();
+            if lost {
+                write_state.block_writes_after_fence_loss();
+            }
+            lost
+        };
+        let result = set.heal_replacement_format_with_fence(dry_run, targets, fence_lost).await?;
+        let fence_lost = pool_guard.is_lock_lost()
+            || rebalance_guard.is_lock_lost()
+            || write_state
+                .ensure_write_safe("replacement format publication fence failed")
+                .is_err();
+        if fence_lost {
+            write_state.block_writes_after_fence_loss();
+            return Ok((result.0, Some(heal_format_fence_lost_error())));
+        }
+        Ok(result)
     }
 
     #[instrument(skip(self, targets), fields(pool_index, set_index, target_count = targets.len()))]
@@ -545,9 +592,13 @@ mod tests {
     use super::*;
     use crate::bucket::metadata_sys;
     use crate::cluster::rpc::PeerS3Client;
-    use crate::core::pools::{PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus};
+    use crate::config::com::{delete_config, read_config_no_lock_preserve_empty_with_metadata, save_config};
+    use crate::core::pools::{
+        POOL_META_IDENTITY_NAME, PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus, initialized_pool_meta_identity_for_test,
+    };
+    use crate::core::sets::HealFormatAfterSaveBarrier;
     use crate::disk::error::Result as DiskResult;
-    use crate::disk::{DeleteOptions, DiskOption, format::FormatV3, new_disk};
+    use crate::disk::{DeleteOptions, DiskOption, FORMAT_CONFIG_FILE, format::FormatV3, new_disk};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::runtime::instance::InstanceContext;
     use crate::services::rebalance::{RebalanceInfo, RebalanceStats};
@@ -557,6 +608,7 @@ mod tests {
     use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations};
     use crate::store::init_format::{load_format_erasure, save_format_file};
     use crate::store::init_local_disks_with_instance_ctx;
+    use rustfs_common::heal_channel::DriveState;
     use tokio_util::sync::CancellationToken;
 
     #[derive(Debug)]
@@ -931,6 +983,197 @@ mod tests {
         .expect("multi-pool test store should initialize");
         metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         (temp_dir, store, shutdown)
+    }
+
+    fn heal_test_format_path(temp_dir: &tempfile::TempDir, pool_index: usize, disk_index: usize) -> std::path::PathBuf {
+        temp_dir
+            .path()
+            .join(format!("pool{pool_index}-disk{disk_index}"))
+            .join(crate::disk::RUSTFS_META_BUCKET)
+            .join(FORMAT_CONFIG_FILE)
+    }
+
+    async fn remove_heal_test_format(
+        temp_dir: &tempfile::TempDir,
+        store: &ECStore,
+        pool_index: usize,
+        disk_index: usize,
+    ) -> String {
+        let target = store.pools[pool_index].endpoints.endpoints.as_ref()[disk_index].to_string();
+        let format_path = heal_test_format_path(temp_dir, pool_index, disk_index);
+        tokio::fs::remove_file(&format_path)
+            .await
+            .expect("replacement target format should be removable");
+        assert!(
+            !tokio::fs::try_exists(&format_path)
+                .await
+                .expect("replacement target format path should be inspectable")
+        );
+        target
+    }
+
+    async fn assert_heal_test_format_missing(temp_dir: &tempfile::TempDir, pool_index: usize, disk_index: usize) {
+        assert!(
+            !tokio::fs::try_exists(heal_test_format_path(temp_dir, pool_index, disk_index))
+                .await
+                .expect("replacement target format path should be inspectable"),
+            "format heal must not write the replacement target"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_format_heal_preblocked_pool_metadata_never_writes_format() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        store.pool_meta_save_gate.lock().await.observe_replicas(PoolMetaReplicaState {
+            needs_repair: true,
+            repair_write_safe: false,
+        });
+
+        let err = store
+            .handle_heal_format(false)
+            .await
+            .expect_err("a preblocked pool metadata state must reject full format heal");
+        assert!(
+            err.to_string()
+                .contains("restart after all replicas are readable and consistent")
+        );
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        store
+            .ensure_pool_meta_side_effects_safe("preblocked format heal side effect")
+            .await
+            .expect_err("the preblocked state must remain sticky");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_format_heal_future_identity_never_writes_format_and_latches() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        let (mut future_identity, _) =
+            read_config_no_lock_preserve_empty_with_metadata(store.pools[1].clone(), POOL_META_IDENTITY_NAME)
+                .await
+                .expect("current identity should be readable");
+        let future_version = u16::from_le_bytes([future_identity[2], future_identity[3]])
+            .checked_add(1)
+            .expect("identity version should have a future value");
+        future_identity[2..4].copy_from_slice(&future_version.to_le_bytes());
+        save_config(store.pools[1].clone(), POOL_META_IDENTITY_NAME, future_identity)
+            .await
+            .expect("future identity should be persisted");
+
+        let err = store
+            .handle_heal_format(false)
+            .await
+            .expect_err("a future identity must reject full format heal");
+        assert!(err.to_string().contains("pool metadata incompatible"));
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        store
+            .ensure_pool_meta_side_effects_safe("future identity format heal side effect")
+            .await
+            .expect_err("the future identity rejection must latch the write gate");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_format_heal_epoch_conflict_never_writes_format_and_latches() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        let conflicting_identity =
+            initialized_pool_meta_identity_for_test(store.id, 2).expect("conflicting identity should encode");
+        save_config(store.pools[1].clone(), POOL_META_IDENTITY_NAME, conflicting_identity)
+            .await
+            .expect("conflicting identity should be persisted");
+
+        let err = store
+            .heal_replacement_format(false, 0, 0, &[target])
+            .await
+            .expect_err("an identity epoch conflict must reject replacement format heal");
+        assert!(
+            err.to_string()
+                .contains("identity replicas disagree on cluster identity or epoch")
+        );
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        store
+            .ensure_pool_meta_side_effects_safe("epoch conflict replacement format side effect")
+            .await
+            .expect_err("the identity epoch conflict must latch the write gate");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_format_heal_initialized_identity_without_pool_meta_never_writes_and_latches() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        for pool in &store.pools {
+            delete_config(pool.clone(), POOL_META_NAME)
+                .await
+                .expect("pool metadata replica should be removable");
+        }
+
+        let err = store
+            .heal_replacement_format(false, 0, 0, &[target])
+            .await
+            .expect_err("initialized identity without pool metadata must reject replacement format heal");
+        assert!(err.to_string().contains("initialized cluster identity exists"));
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+        store
+            .ensure_pool_meta_side_effects_safe("missing pool metadata replacement format side effect")
+            .await
+            .expect_err("missing initialized pool metadata must latch the write gate");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_format_heal_lost_after_last_save_does_not_publish_or_renew_and_latches() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        store.pools[0].disk_set[0].disks.write().await[3] = None;
+        let barrier = HealFormatAfterSaveBarrier::install(&store.pools[0], 3);
+        let recovery_latch = store.pool_meta_save_gate.lock().await.aborted_transaction_latch_for_test();
+        let mut heal = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.handle_heal_format(false).await }
+        });
+
+        barrier.wait_until_paused().await;
+        let saved = tokio::fs::read(heal_test_format_path(&temp_dir, 0, 3))
+            .await
+            .expect("the last replacement format must be durable before fence loss");
+        let saved = FormatV3::try_from(saved.as_slice()).expect("the durable replacement format should decode");
+        assert_eq!(saved.erasure.this, store.pools[0].format.erasure.sets[0][3]);
+        recovery_latch.store(true, std::sync::atomic::Ordering::SeqCst);
+        barrier.release();
+
+        let (result, err) = tokio::time::timeout(std::time::Duration::from_secs(30), &mut heal)
+            .await
+            .expect("format heal should stop after the lost fence")
+            .expect("format heal task should not panic")
+            .expect("format heal should return its fenced result");
+        assert!(matches!(err, Some(StorageError::SlowDown)));
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .any(|drive| drive.endpoint == target && drive.state == DriveState::Missing.to_string()),
+            "the lost fence must prevent the durable format from being published in the heal result"
+        );
+        assert!(
+            store.pools[0].disk_set[0].disks.read().await[3].is_none(),
+            "the lost fence must prevent renew_disk from attaching the replacement"
+        );
+        recovery_latch.store(false, std::sync::atomic::Ordering::SeqCst);
+        store
+            .ensure_pool_meta_side_effects_safe("post-save format fence loss side effect")
+            .await
+            .expect_err("post-save format fence loss must remain sticky");
+        shutdown.cancel();
     }
 
     #[tokio::test]
@@ -1573,13 +1816,18 @@ mod tests {
             .handle_heal_format(false)
             .await
             .expect_err("missing pool metadata must fail closed before format writes");
-        assert!(matches!(err, StorageError::SlowDown));
+        assert!(err.to_string().contains("no durable bootstrap identity or pool.bin replica"));
+        store
+            .ensure_pool_meta_side_effects_safe("missing format-heal metadata side effect")
+            .await
+            .expect_err("missing metadata must latch the format-heal write gate");
 
         let pool_meta = PoolMeta::new(&store.pools, &PoolMeta::default());
         pool_meta
             .save(store.pools.clone())
             .await
             .expect("pool metadata should be persisted before format heal");
+        *store.pool_meta_save_gate.lock().await = PoolMetaWriteState::default();
 
         let (result, err) = store
             .handle_heal_format(false)
