@@ -1,6 +1,6 @@
 ---
 name: rustfs-release-publish
-description: "Run the end-to-end RustFS console gate, version bump, preview validation, and final-tag publication pipeline. Use only when the user explicitly asks to release or publish a RustFS version (发版/发布)."
+description: "Run the end-to-end RustFS console gate, version bump, preview validation, human confirmation, and final-tag publication pipeline. Use only when the user explicitly asks to release or publish a RustFS version (发版/发布)."
 ---
 # RustFS Release Publish (preview-validated pipeline)
 
@@ -17,6 +17,7 @@ check console main against its latest Release
   -> tag <preview-tag> at that commit -> CI green
   -> verify preview Release assets -> run binary locally + console checks
   -> validate with latest rc client
+  -> report preview acceptance results -> STOP for explicit human confirmation
   -> tag <target> at the SAME commit (zero delta) -> re-verify CI/release
 ```
 
@@ -60,6 +61,8 @@ Rules:
 - When a previous deliverable exists, GitHub Release notes for the preview and final tags MUST use it as their shared comparison baseline: the most recently published non-preview Release before the target. Internal `-preview.N` Releases are explicitly excluded from that selection, even when they point at the same commit as the final tag. If no previous deliverable exists, omit `previous_tag_name` and record that GitHub's default baseline fallback was used.
 - Generated Release notes carry a workflow-management marker so retries can repair them. Before manually curating a generated body, remove that marker; unmarked non-placeholder notes are preserved by later workflow runs.
 - Phases run in order; a failure in any phase blocks everything after it. After the fix lands on main, restart from Phase 2 with the next preview iteration against the new `origin/main` hash — do not resume mid-pipeline against a stale hash.
+- Completing preview acceptance does not authorize the final tag. After Phases 3–5 pass, report the acceptance evidence and stop until the user explicitly confirms continuation. The original release request, an earlier confirmation, silence, or an automated follow-up does not satisfy this gate.
+- Confirmation is scoped to the reported `<target>`, `<preview-tag>`, and `PREVIEW_HASH`. A failed or repeated acceptance cycle, including any new preview iteration, invalidates prior confirmation and requires a new one.
 - If the release is abandoned after Phase 1 merged, main's version files claim a version that was never tagged. Either revert the bump PR or leave it to be overwritten by the next release — but tell the user explicitly and record the decision.
 - User-facing status updates in Chinese; commits, PR titles/bodies, and tag messages in English. No hard-wrapping in commit messages, PR bodies, or documentation prose — one logical line per sentence/paragraph, let soft wrap handle display.
 
@@ -207,6 +210,12 @@ rc alias remove preview
 
 - Any FAIL blocks the release. Afterwards stop the server and delete the scratch data directory.
 
+### Manual confirmation gate
+
+After every Phase 3–5 check passes, report the target, preview tag, `PREVIEW_HASH`, preview Release URL, console result, and rc matrix, then explicitly ask the user whether to publish the final tag. End the turn without creating or pushing `<target>`.
+
+Continue to Phase 6 only after a new user reply explicitly confirms the reported target, preview tag, and commit. A clear affirmative reply to that exact report, such as `确认继续`, is sufficient; if the reply is ambiguous or any reported value changed, ask again.
+
 ## Phase 6 — Publish the final tag on the validated commit
 
 No second version bump, no release branch. The final tag goes on the exact commit the preview validated:
@@ -229,5 +238,6 @@ Always report:
 
 - Console gate result: previous/latest Console tags, whether merged changes required a release, `CONSOLE_HASH`, and Console run/Release URLs when a release was published.
 - Target version, preview tag(s) used, `PREVIEW_HASH` (which both tags point at).
+- Manual confirmation gate status (`WAITING_FOR_CONFIRMATION` or `CONFIRMED`) and its exact target, preview tag, and `PREVIEW_HASH`.
 - Per-phase result (PASS/FAIL/BLOCKED) with key evidence: preview and final Release URLs, preview `isPrerelease`/`isLatest` state, final latest-channel state, console check results, and the rc command matrix.
 - Any deviation from this pipeline and why the user approved it.
