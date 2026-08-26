@@ -2172,8 +2172,14 @@ mod tests {
         Some((format!("http://{addr}/stream"), handle))
     }
 
-    async fn start_temporarily_blocked_h2_server(blocked_for: Duration) -> Option<(String, tokio::task::JoinHandle<()>)> {
-        let listener = match TcpListener::bind("127.0.0.1:0").await {
+    struct BlockedH2Server {
+        url: String,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    fn start_temporarily_blocked_h2_server(blocked_for: Duration) -> Option<BlockedH2Server> {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => listener,
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
             Err(err) => panic!("HTTP/2 test listener should bind: {err}"),
@@ -2181,34 +2187,49 @@ mod tests {
         let addr = listener
             .local_addr()
             .expect("HTTP/2 test listener address should be available");
-        let handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("HTTP/2 test server should accept client");
-            let service = service_fn(move |_request: Request<Incoming>| async move {
-                let body_stream =
-                    stream::once(async { Ok::<_, Infallible>(Bytes::from_static(b"partial")) }).chain(stream::once(async move {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        // Model a saturated peer whose connection task cannot
-                        // process a PING ACK even though an active response body
-                        // remains valid. Blocking this one connection task is
-                        // intentional; the multi-thread test runtime keeps the
-                        // client timer and transport progressing.
-                        tokio::task::block_in_place(|| std::thread::sleep(blocked_for));
-                        Ok::<_, Infallible>(Bytes::from_static(b"complete"))
-                    }));
-                Ok::<_, Infallible>(Response::new(Body::from_stream(body_stream)))
+        listener
+            .set_nonblocking(true)
+            .expect("HTTP/2 test listener should become nonblocking");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("HTTP/2 test runtime should build");
+            runtime.block_on(async move {
+                let listener = TcpListener::from_std(listener).expect("HTTP/2 test listener should attach to its runtime");
+                let (stream, _) = listener.accept().await.expect("HTTP/2 test server should accept client");
+                let service = service_fn(move |_request: Request<Incoming>| async move {
+                    let body_stream = stream::once(async { Ok::<_, Infallible>(Bytes::from_static(b"partial")) }).chain(
+                        stream::once(async move {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            // Model a saturated peer whose connection task cannot
+                            // process a PING ACK even though an active response body
+                            // remains valid. The server has its own runtime so this
+                            // cannot starve the client-side keepalive timer.
+                            std::thread::sleep(blocked_for);
+                            Ok::<_, Infallible>(Bytes::from_static(b"complete"))
+                        }),
+                    );
+                    Ok::<_, Infallible>(Response::new(Body::from_stream(body_stream)))
+                });
+                tokio::select! {
+                    _ = http2::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(stream), service) => {},
+                    _ = shutdown_rx => {},
+                }
             });
-            let _ = http2::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(stream), service)
-                .await;
         });
 
-        Some((format!("http://{addr}"), handle))
+        Some(BlockedH2Server {
+            url: format!("http://{addr}"),
+            shutdown: shutdown_tx,
+            handle,
+        })
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn data_plane_liveness_does_not_abort_a_valid_h2_stream_while_peer_is_busy() {
-        let blocked_for = Duration::from_millis(500);
-        let Some((baseline_url, baseline_server)) = start_temporarily_blocked_h2_server(blocked_for).await else {
+        let Some(baseline_server) = start_temporarily_blocked_h2_server(Duration::from_secs(2)) else {
             return;
         };
         let aggressive_keepalive_client = Client::builder()
@@ -2220,8 +2241,13 @@ mod tests {
             .build()
             .expect("aggressive HTTP/2 keepalive client should build");
 
-        let baseline_result = tokio::time::timeout(Duration::from_secs(2), async {
-            aggressive_keepalive_client.get(&baseline_url).send().await?.bytes().await
+        let baseline_result = tokio::time::timeout(Duration::from_secs(4), async {
+            aggressive_keepalive_client
+                .get(&baseline_server.url)
+                .send()
+                .await?
+                .bytes()
+                .await
         })
         .await
         .expect("aggressive keepalive body should finish before the outer test deadline");
@@ -2229,16 +2255,20 @@ mod tests {
             baseline_result.is_err(),
             "fixture must reproduce a PING timeout while the server connection task is blocked"
         );
-        baseline_server.abort();
+        let _ = baseline_server.shutdown.send(());
+        baseline_server
+            .handle
+            .join()
+            .expect("baseline HTTP/2 test server should exit");
 
-        let Some((candidate_url, candidate_server)) = start_temporarily_blocked_h2_server(blocked_for).await else {
+        let Some(candidate_server) = start_temporarily_blocked_h2_server(Duration::from_millis(500)) else {
             return;
         };
         let candidate_client = apply_http_data_plane_liveness(Client::builder().no_proxy().http2_prior_knowledge())
             .build()
             .expect("internode data-plane HTTP/2 client should build");
         let response = tokio::time::timeout(Duration::from_secs(2), async {
-            let response = candidate_client.get(&candidate_url).send().await?;
+            let response = candidate_client.get(&candidate_server.url).send().await?;
             let version = response.version();
             let body = response.bytes().await?;
             Ok::<_, reqwest::Error>((version, body))
@@ -2249,7 +2279,11 @@ mod tests {
 
         assert_eq!(response.0, Version::HTTP_2);
         assert_eq!(response.1, Bytes::from_static(b"partialcomplete"));
-        candidate_server.abort();
+        let _ = candidate_server.shutdown.send(());
+        candidate_server
+            .handle
+            .join()
+            .expect("candidate HTTP/2 test server should exit");
     }
 
     #[test]
