@@ -73,6 +73,80 @@ pub struct DataKeyEnvelope {
     /// byte-identical to the historical seven-field JSON shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_key_version: Option<u32>,
+    /// How `encryption_context` is cryptographically bound into `encrypted_key`.
+    ///
+    /// `None` on legacy envelopes: the context rides in the envelope
+    /// unauthenticated and is checked only by field comparison.
+    /// [`CONTEXT_BINDING_AAD_V1`] means the canonical context bytes
+    /// ([`context_aad`]) were passed as AES-GCM additional data when the DEK
+    /// was wrapped, so rewriting the stored context (or the flag) makes the
+    /// unwrap fail authentication. Any other value belongs to a newer format
+    /// and must fail closed rather than decrypt without the binding.
+    ///
+    /// Optional and omitted when `None` so legacy-writing nodes and readers
+    /// keep exchanging the historical JSON shape unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_binding: Option<u8>,
+}
+
+/// `context_binding` value: the canonical encryption context is bound as
+/// AES-GCM additional data over `encrypted_key`.
+pub const CONTEXT_BINDING_AAD_V1: u8 = 1;
+
+/// Resolve the AAD bytes an envelope's wrap was sealed with.
+///
+/// Legacy envelopes were sealed without additional data, which for AES-GCM is
+/// byte-identical to an empty AAD — so `None` maps to empty bytes and both
+/// generations decrypt through the same code path. An unrecognized binding
+/// version is a format from a newer release: decrypting it while ignoring its
+/// binding would silently drop an authentication the writer relied on, so it
+/// fails closed instead.
+pub fn envelope_wrap_aad(envelope: &DataKeyEnvelope) -> Result<Vec<u8>> {
+    match envelope.context_binding {
+        None => Ok(Vec::new()),
+        Some(CONTEXT_BINDING_AAD_V1) => context_aad(&envelope.encryption_context),
+        Some(version) => Err(KmsError::cryptographic_error(
+            "context_binding",
+            format!("unsupported data-key envelope context binding version {version}; written by a newer RustFS release"),
+        )),
+    }
+}
+
+/// The binding a rewrap of this envelope must produce.
+///
+/// Never below the envelope's existing binding — a bound envelope must not
+/// regress to the unbound format whatever the write switch says — and upgraded
+/// to [`CONTEXT_BINDING_AAD_V1`] when the write switch is on. Shared by
+/// `rewrap_data_key` and `describe_data_key_wrapping` so the sweep and the
+/// scan agree on which envelopes still need rewriting; two divergent copies of
+/// this rule would leave a sweep that never converges.
+pub fn desired_context_binding(existing: Option<u8>) -> Option<u8> {
+    if existing == Some(CONTEXT_BINDING_AAD_V1) || envelope_aad_write_enabled() {
+        Some(CONTEXT_BINDING_AAD_V1)
+    } else {
+        existing
+    }
+}
+
+/// Whether newly wrapped DEK envelopes bind their encryption context as AAD.
+///
+/// Default off for one release: an envelope written with the binding cannot be
+/// opened by a node that predates it (the unwrap fails authentication), so the
+/// switch must only be enabled once every node in the cluster runs a release
+/// that understands `context_binding`. Reading bound envelopes needs no switch.
+pub fn envelope_aad_write_enabled() -> bool {
+    use crate::config::ENV_KMS_ENVELOPE_AAD;
+    use rustfs_utils::get_env_bool;
+
+    #[cfg(test)]
+    {
+        get_env_bool(ENV_KMS_ENVELOPE_AAD, false)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| get_env_bool(ENV_KMS_ENVELOPE_AAD, false));
+        *ENABLED
+    }
 }
 
 impl<'de> Deserialize<'de> for DataKeyEnvelope {
@@ -89,6 +163,7 @@ impl<'de> Deserialize<'de> for DataKeyEnvelope {
             EncryptionContext,
             CreatedAt,
             MasterKeyVersion,
+            ContextBinding,
             Unknown(BoundedUnknownFieldName),
         }
 
@@ -119,6 +194,7 @@ impl<'de> Deserialize<'de> for DataKeyEnvelope {
                             "encryption_context" => Field::EncryptionContext,
                             "created_at" => Field::CreatedAt,
                             "master_key_version" => Field::MasterKeyVersion,
+                            "context_binding" => Field::ContextBinding,
                             _ => Field::Unknown(BoundedUnknownFieldName::new(value)),
                         })
                     }
@@ -161,6 +237,7 @@ impl<'de> Deserialize<'de> for DataKeyEnvelope {
                 let mut encryption_context = None;
                 let mut created_at: Option<ZonedValue> = None;
                 let mut master_key_version = None;
+                let mut context_binding = None;
                 let mut unknown_fields = UnknownFieldSummary::default();
 
                 while let Some(field) = map.next_key()? {
@@ -173,6 +250,7 @@ impl<'de> Deserialize<'de> for DataKeyEnvelope {
                         Field::EncryptionContext => read_field!(encryption_context, "encryption_context"),
                         Field::CreatedAt => read_field!(created_at, "created_at"),
                         Field::MasterKeyVersion => read_field!(master_key_version, "master_key_version"),
+                        Field::ContextBinding => read_field!(context_binding, "context_binding"),
                         Field::Unknown(field) => {
                             let _: IgnoredAny = map.next_value()?;
                             unknown_fields.observe(field);
@@ -189,6 +267,7 @@ impl<'de> Deserialize<'de> for DataKeyEnvelope {
                     encryption_context: encryption_context.ok_or_else(|| de::Error::missing_field("encryption_context"))?,
                     created_at: created_at.ok_or_else(|| de::Error::missing_field("created_at"))?.0,
                     master_key_version: master_key_version.unwrap_or(None),
+                    context_binding: context_binding.unwrap_or(None),
                 };
                 unknown_fields.record_for_data_key_envelope();
                 Ok(envelope)
@@ -204,6 +283,7 @@ impl<'de> Deserialize<'de> for DataKeyEnvelope {
             "encryption_context",
             "created_at",
             "master_key_version",
+            "context_binding",
         ];
         deserializer.deserialize_struct("DataKeyEnvelope", FIELDS, DataKeyEnvelopeVisitor)
     }
@@ -267,7 +347,10 @@ pub trait DekCrypto: Send + Sync {
     /// A tuple of (ciphertext, nonce) where:
     /// - `ciphertext` - The encrypted data
     /// - `nonce` - The nonce used for encryption (should be stored with ciphertext)
-    async fn encrypt(&self, key_material: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)>;
+    ///
+    /// `aad` is authenticated but not encrypted; pass empty bytes for the
+    /// legacy unbound format (for AES-GCM the two are byte-identical).
+    async fn encrypt(&self, key_material: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)>;
 
     /// Decrypt ciphertext data using a master key material
     ///
@@ -278,7 +361,10 @@ pub trait DekCrypto: Send + Sync {
     ///
     /// # Returns
     /// The decrypted plaintext data
-    async fn decrypt(&self, key_material: &[u8], ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>>;
+    ///
+    /// `aad` must be byte-identical to the value used at encryption time or
+    /// authentication fails; pass empty bytes for legacy unbound ciphertext.
+    async fn decrypt(&self, key_material: &[u8], ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Vec<u8>>;
 
     /// Get the algorithm name used by this implementation
     #[allow(dead_code)] // May be used by implementations or for debugging
@@ -301,10 +387,10 @@ impl AesDekCrypto {
 
 #[async_trait]
 impl DekCrypto for AesDekCrypto {
-    async fn encrypt(&self, key_material: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    async fn encrypt(&self, key_material: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         use aes_gcm::{
             Aes256Gcm, Key, Nonce,
-            aead::{Aead, KeyInit},
+            aead::{Aead, KeyInit, Payload},
         };
 
         // Validate key material length
@@ -325,18 +411,18 @@ impl DekCrypto for AesDekCrypto {
         rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from(nonce_bytes);
 
-        // Encrypt plaintext
+        // Encrypt plaintext; an empty `aad` produces the same bytes as no AAD.
         let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
+            .encrypt(&nonce, Payload { msg: plaintext, aad })
             .map_err(|e| KmsError::cryptographic_error("encrypt", e.to_string()))?;
 
         Ok((ciphertext, nonce_bytes.to_vec()))
     }
 
-    async fn decrypt(&self, key_material: &[u8], ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
+    async fn decrypt(&self, key_material: &[u8], ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         use aes_gcm::{
             Aes256Gcm, Key, Nonce,
-            aead::{Aead, KeyInit},
+            aead::{Aead, KeyInit, Payload},
         };
 
         // Validate nonce length
@@ -362,9 +448,9 @@ impl DekCrypto for AesDekCrypto {
         nonce_array.copy_from_slice(nonce);
         let nonce_ref = Nonce::from(nonce_array);
 
-        // Decrypt ciphertext
+        // Decrypt ciphertext; the AAD must match the encryption-time bytes.
         let plaintext = cipher
-            .decrypt(&nonce_ref, ciphertext)
+            .decrypt(&nonce_ref, Payload { msg: ciphertext, aad })
             .map_err(|e| KmsError::cryptographic_error("decrypt", e.to_string()))?;
 
         Ok(plaintext)
@@ -424,7 +510,7 @@ mod tests {
 
         // Test encryption
         let (ciphertext, nonce) = crypto
-            .encrypt(&key_material, plaintext)
+            .encrypt(&key_material, plaintext, &[])
             .await
             .expect("Encryption should succeed");
 
@@ -434,7 +520,7 @@ mod tests {
 
         // Test decryption
         let decrypted = crypto
-            .decrypt(&key_material, &ciphertext, &nonce)
+            .decrypt(&key_material, &ciphertext, &nonce, &[])
             .await
             .expect("Decryption should succeed");
 
@@ -447,7 +533,7 @@ mod tests {
         let invalid_key = vec![0u8; 16]; // Too short
         let plaintext = b"test";
 
-        let result = crypto.encrypt(&invalid_key, plaintext).await;
+        let result = crypto.encrypt(&invalid_key, plaintext, &[]).await;
         assert!(result.is_err());
     }
 
@@ -458,8 +544,107 @@ mod tests {
         let ciphertext = vec![0u8; 16];
         let invalid_nonce = vec![0u8; 8]; // Too short
 
-        let result = crypto.decrypt(&key_material, &ciphertext, &invalid_nonce).await;
+        let result = crypto.decrypt(&key_material, &ciphertext, &invalid_nonce, &[]).await;
         assert!(result.is_err());
+    }
+
+    /// The AAD parameter genuinely binds the ciphertext: the same bytes must
+    /// be presented at decrypt time, and empty AAD is byte-compatible with the
+    /// legacy no-AAD format so both generations share one code path.
+    #[tokio::test]
+    async fn test_aad_binds_the_ciphertext() {
+        let crypto = AesDekCrypto::new();
+        let key_material = generate_key_material("AES_256").expect("Failed to generate key material");
+        let context = HashMap::from([("bucket".to_string(), "aad-bucket".to_string())]);
+        let aad = context_aad(&context).expect("context must canonicalize");
+
+        let (ciphertext, nonce) = crypto
+            .encrypt(&key_material, b"bound-dek", &aad)
+            .await
+            .expect("encryption with AAD should succeed");
+        assert_eq!(
+            crypto
+                .decrypt(&key_material, &ciphertext, &nonce, &aad)
+                .await
+                .expect("matching AAD must decrypt"),
+            b"bound-dek"
+        );
+        assert!(
+            crypto.decrypt(&key_material, &ciphertext, &nonce, &[]).await.is_err(),
+            "stripping the AAD must fail authentication"
+        );
+        let other = context_aad(&HashMap::from([("bucket".to_string(), "other".to_string())])).expect("canonicalize");
+        assert!(
+            crypto.decrypt(&key_material, &ciphertext, &nonce, &other).await.is_err(),
+            "a different AAD must fail authentication"
+        );
+    }
+
+    /// `envelope_wrap_aad` maps the binding flag to the exact AAD bytes the
+    /// wrap was sealed with, and fails closed on versions from the future.
+    #[test]
+    fn test_envelope_wrap_aad_mapping() {
+        let mut envelope = DataKeyEnvelope {
+            key_id: "test-key-id".to_string(),
+            master_key_id: "master-key-id".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key: vec![1, 2, 3, 4],
+            nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            encryption_context: HashMap::from([("bucket".to_string(), "b".to_string())]),
+            created_at: Zoned::now(),
+            master_key_version: None,
+            context_binding: None,
+        };
+
+        assert!(
+            envelope_wrap_aad(&envelope).expect("legacy envelopes are valid").is_empty(),
+            "legacy envelopes were sealed without AAD"
+        );
+
+        envelope.context_binding = Some(CONTEXT_BINDING_AAD_V1);
+        assert_eq!(
+            envelope_wrap_aad(&envelope).expect("v1 binding is valid"),
+            context_aad(&envelope.encryption_context).expect("canonicalize"),
+            "the v1 binding must reproduce the canonical context bytes"
+        );
+
+        envelope.context_binding = Some(9);
+        let error = envelope_wrap_aad(&envelope).expect_err("an unknown binding version must fail closed");
+        assert!(error.to_string().contains("context binding version"), "got {error:?}");
+    }
+
+    /// The binding flag round-trips through JSON, stays absent for `None` so
+    /// legacy writers and readers keep the historical shape, and defaults to
+    /// `None` on envelopes that predate it.
+    #[test]
+    fn test_context_binding_serde_round_trip() {
+        let mut envelope = DataKeyEnvelope {
+            key_id: "test-key-id".to_string(),
+            master_key_id: "master-key-id".to_string(),
+            key_spec: "AES_256".to_string(),
+            encrypted_key: vec![1, 2, 3, 4],
+            nonce: vec![5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            encryption_context: HashMap::new(),
+            created_at: Zoned::now(),
+            master_key_version: None,
+            context_binding: Some(CONTEXT_BINDING_AAD_V1),
+        };
+
+        let serialized = serde_json::to_vec(&envelope).expect("serialize envelope");
+        let value: serde_json::Value = serde_json::from_slice(&serialized).expect("parse serialized envelope");
+        assert_eq!(value.get("context_binding"), Some(&serde_json::json!(1)));
+        let deserialized: DataKeyEnvelope = serde_json::from_slice(&serialized).expect("deserialize envelope");
+        assert_eq!(deserialized.context_binding, Some(CONTEXT_BINDING_AAD_V1));
+
+        envelope.context_binding = None;
+        let value = serde_json::to_value(&envelope).expect("serialize envelope");
+        assert!(
+            !value
+                .as_object()
+                .expect("envelope is an object")
+                .contains_key("context_binding"),
+            "None must keep the historical shape"
+        );
     }
 
     #[tokio::test]
@@ -493,6 +678,7 @@ mod tests {
             },
             created_at: Zoned::now(),
             master_key_version: None,
+            context_binding: None,
         };
 
         // Test serialization
@@ -628,6 +814,7 @@ mod tests {
             encryption_context: HashMap::new(),
             created_at: Zoned::now(),
             master_key_version: None,
+            context_binding: None,
         };
 
         let value = serde_json::to_value(&envelope).expect("serialize envelope");
@@ -647,6 +834,7 @@ mod tests {
             encryption_context: HashMap::new(),
             created_at: Zoned::now(),
             master_key_version: Some(7),
+            context_binding: None,
         };
 
         let serialized = serde_json::to_vec(&envelope).expect("serialize envelope");

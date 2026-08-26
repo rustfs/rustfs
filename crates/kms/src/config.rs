@@ -24,6 +24,11 @@ use std::time::Duration;
 use url::Url;
 
 pub const ENV_KMS_ALLOW_INSECURE_DEV_DEFAULTS: &str = "RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS";
+/// Write-side switch for binding the encryption context into DEK envelopes as
+/// AES-GCM additional data. Read-side support is unconditional; see
+/// [`crate::encryption::dek::envelope_aad_write_enabled`] for the rollout
+/// constraint that keeps this default-off for one release.
+pub const ENV_KMS_ENVELOPE_AAD: &str = "RUSTFS_KMS_ENVELOPE_AAD";
 pub const ENV_KMS_ALLOW_IMMEDIATE_DELETION: &str = "RUSTFS_KMS_ALLOW_IMMEDIATE_DELETION";
 pub const ENV_KMS_VAULT_ADDRESS: &str = "RUSTFS_KMS_VAULT_ADDRESS";
 pub const ENV_KMS_VAULT_TOKEN: &str = "RUSTFS_KMS_VAULT_TOKEN";

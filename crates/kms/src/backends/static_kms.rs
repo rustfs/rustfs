@@ -152,6 +152,10 @@ impl StaticKmsBackend {
             created_at: Zoned::now(),
             // The static backend has a single fixed key with no rotation.
             master_key_version: None,
+            // The context is already bound as AAD by the Static cipher path
+            // unconditionally; this field describes only the DekCrypto-layer
+            // binding, which Static envelopes never use.
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&envelope)?;
 
@@ -199,6 +203,10 @@ impl StaticKmsBackend {
             created_at: Zoned::now(),
             // The static backend has a single fixed key with no rotation.
             master_key_version: None,
+            // The context is already bound as AAD by the Static cipher path
+            // unconditionally; this field describes only the DekCrypto-layer
+            // binding, which Static envelopes never use.
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&envelope)?;
 

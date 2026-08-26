@@ -100,7 +100,7 @@ anyhow = { workspace = true }
 metrics-util = { workspace = true, features = ["debugging"] }
 insta = { workspace = true, features = ["yaml", "json"] }
 tempfile = { workspace = true }
-temp-env = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
 rcgen = { workspace = true }
 # "net" backs the scripted loopback Vault used by the policy wiring tests.
 tokio = { workspace = true, features = ["net", "test-util"] }
