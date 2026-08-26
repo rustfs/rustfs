@@ -119,6 +119,8 @@ pub enum StorageError {
     BucketExists(String),
     #[error("Bucket not empty: {0}")]
     BucketNotEmpty(String),
+    #[error("Bucket not empty: {bucket} ({details})")]
+    BucketNotEmptyWithDetails { bucket: String, details: String },
     #[error("Bucket name invalid: {0}")]
     BucketNameInvalid(String),
 
@@ -493,6 +495,10 @@ impl Clone for StorageError {
             StorageError::MethodNotAllowed => StorageError::MethodNotAllowed,
             StorageError::BucketNotFound(a) => StorageError::BucketNotFound(a.clone()),
             StorageError::BucketNotEmpty(a) => StorageError::BucketNotEmpty(a.clone()),
+            StorageError::BucketNotEmptyWithDetails { bucket, details } => StorageError::BucketNotEmptyWithDetails {
+                bucket: bucket.clone(),
+                details: details.clone(),
+            },
             StorageError::BucketNameInvalid(a) => StorageError::BucketNameInvalid(a.clone()),
             StorageError::ObjectNameInvalid(a, b) => StorageError::ObjectNameInvalid(a.clone(), b.clone()),
             StorageError::BucketExists(a) => StorageError::BucketExists(a.clone()),
@@ -600,7 +606,7 @@ impl StorageError {
             StorageError::InvalidArgument(_, _, _) => StorageErrorCode::InvalidArgument,
             StorageError::MethodNotAllowed => StorageErrorCode::MethodNotAllowed,
             StorageError::BucketNotFound(_) => StorageErrorCode::BucketNotFound,
-            StorageError::BucketNotEmpty(_) => StorageErrorCode::BucketNotEmpty,
+            StorageError::BucketNotEmpty(_) | StorageError::BucketNotEmptyWithDetails { .. } => StorageErrorCode::BucketNotEmpty,
             StorageError::BucketNameInvalid(_) => StorageErrorCode::BucketNameInvalid,
             StorageError::ObjectNameInvalid(_, _) => StorageErrorCode::ObjectNameInvalid,
             StorageError::BucketExists(_) => StorageErrorCode::BucketExists,

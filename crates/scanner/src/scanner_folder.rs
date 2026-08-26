@@ -1648,7 +1648,7 @@ impl FolderScanner {
                             bucket.clone(),
                             Some(object.clone()),
                             None,
-                            build_object_heal_request(bucket, object, None, self.scan_mode, HealChannelPriority::High),
+                            build_non_destructive_object_heal_request(bucket, object, self.scan_mode, HealChannelPriority::High),
                         )
                         .await?;
                     }
