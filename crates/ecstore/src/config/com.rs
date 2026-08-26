@@ -704,7 +704,12 @@ where
     save_config_with_opts_inner(api, file, data, opts, false).await.map(|_| ())
 }
 
-async fn save_config_with_opts_and_metadata<S>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<ObjectInfo>
+pub(crate) async fn save_config_with_opts_and_metadata<S>(
+    api: Arc<S>,
+    file: &str,
+    data: Vec<u8>,
+    opts: &ObjectOptions,
+) -> Result<ObjectInfo>
 where
     S: ObjectIO<
             Error = Error,
