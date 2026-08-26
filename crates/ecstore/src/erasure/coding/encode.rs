@@ -680,6 +680,8 @@ impl Erasure {
                 // capacity and never reallocates. Reading into uninitialized spare capacity
                 // (instead of resize + slice read) also skips zero-filling each fresh buffer.
                 let ingest_capacity = expanded_block_bytes.max(block_size);
+                // Pre-allocate buffer pool for this encoding session
+                let mut buf_pool: Vec<BytesMut> = Vec::with_capacity(4);
                 let mut buf = BytesMut::with_capacity(ingest_capacity);
                 loop {
                     match read_full_buf_or_eof(&mut reader, &mut buf, block_size).await {
@@ -689,7 +691,8 @@ impl Erasure {
                             total += n;
                             let encode_buf = buf;
                             let res = self.clone().encode_block_bytes_mut(encode_buf, n).await?;
-                            buf = BytesMut::with_capacity(ingest_capacity);
+                            // Try to reuse buffer from pool, or allocate new one
+                            buf = buf_pool.pop().unwrap_or_else(|| BytesMut::with_capacity(ingest_capacity));
                             let queued_bytes = res.queued_bytes();
                             let _producer_stage = rustfs_io_metrics::track_ec_encode_producer_bytes(queued_bytes);
                             let send_wait_stage_start = stage_timer_if_enabled();
@@ -697,6 +700,11 @@ impl Erasure {
                                 return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
                             }
                             record_internal_stage_if_enabled("erasure_encode_send_wait", send_wait_stage_start);
+                            // Return buffer to pool if it has sufficient capacity
+                            if buf.capacity() >= ingest_capacity && buf_pool.len() < 4 {
+                                buf_pool.push(buf);
+                                buf = BytesMut::with_capacity(ingest_capacity);
+                            }
                         }
                         Ok(None) => break,
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
