@@ -105,6 +105,8 @@ workspace = true
 hotpath.workspace = true
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
+rustfs-heal-contracts = { workspace = true }
+rustfs-scanner-contracts = { workspace = true }
 rustfs-config = { workspace = true, features = ["observability"] }
 # NOTE: This dependency on rustfs-ecstore is a known architectural limitation.
 # The obs crate imports types from ecstore for metrics collection.
