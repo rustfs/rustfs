@@ -641,6 +641,12 @@ for ecstore_private_module in \
     "mod ${ecstore_private_module};" \
     "ECStore legacy ${ecstore_private_module} root module crate-private visibility"
 done
+ECSTORE_CLIENT_SHIM_IMPORT_HITS_FILE="${TMP_DIR}/ecstore_client_shim_import_hits.txt"
+if rg -n --no-heading --glob '*.rs' 'crate::client::|^[[:space:]]+client::' \
+  "${ROOT_DIR}/crates/ecstore/src" >"${ECSTORE_CLIENT_SHIM_IMPORT_HITS_FILE}"; then
+  report_failure "ECStore client shim imports must use rustfs_s3_client directly"
+  cat "${ECSTORE_CLIENT_SHIM_IMPORT_HITS_FILE}" >&2
+fi
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
