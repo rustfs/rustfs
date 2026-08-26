@@ -57,6 +57,7 @@ const TOKEN_UID: &str = "0198f4b0-6f00-7b60-9271-7d8e9fa0b1c5";
 const FRESH_TOKEN_UID: &str = "0198f4b0-7f00-7c70-a381-8e9fa0b1c2d6";
 const SECOND_TOKEN_UID: &str = "0198f4b0-8f00-7d80-b491-9fa0b1c2d3e7";
 const UNRELATED_TOKEN_UID: &str = "0198f4b0-9f00-7e90-85a1-afb1c2d3e4f8";
+#[cfg(target_os = "linux")]
 const INVENTORY_UID: &str = "0198f4b0-af00-7fa0-96b1-bfc1d2e3f509";
 
 struct TestPki {
