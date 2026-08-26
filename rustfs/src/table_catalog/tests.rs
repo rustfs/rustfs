@@ -16429,7 +16429,11 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
     let delete_module = include_str!("../app/object/delete.rs");
     let delete_object = delete_module
         .split_once("pub async fn execute_delete_object")
-        .map(|(_, remainder)| remainder.split_once("\nmod tests").map_or(remainder, |(entrypoints, _)| entrypoints))
+        .map(|(_, remainder)| {
+            remainder
+                .split_once("\nmod tests")
+                .map_or(remainder, |(entrypoints, _)| entrypoints)
+        })
         .expect("delete object entrypoints should remain in app/object/delete.rs");
 
     for expected in [
