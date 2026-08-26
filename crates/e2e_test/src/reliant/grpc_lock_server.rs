@@ -23,8 +23,9 @@ use rustfs_protos::{
     proto_gen::node_service::{
         BatchGenerallyLockRequest, BatchGenerallyLockResponse, BatchReadVersionRequest, BatchReadVersionResponse,
         GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult, PingRequest, PingResponse,
-        SnapshotLeaseMutationResponse, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        SnapshotLeaseResponse, node_service_server::NodeService,
+        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseReleaseResponse, ScannerPublicationLeaseRequest,
+        ScannerPublicationLeaseResponse, SnapshotLeaseMutationResponse, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
+        SnapshotLeaseRequest, SnapshotLeaseResponse, node_service_server::NodeService,
     },
 };
 use std::pin::Pin;
@@ -102,6 +103,20 @@ impl NodeService for MinimalLockNodeService {
         &self,
         _request: Request<BatchReadVersionRequest>,
     ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn acquire_scanner_publication_lease(
+        &self,
+        _request: Request<ScannerPublicationLeaseRequest>,
+    ) -> Result<Response<ScannerPublicationLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn release_scanner_publication_lease(
+        &self,
+        _request: Request<ScannerPublicationLeaseReleaseRequest>,
+    ) -> Result<Response<ScannerPublicationLeaseReleaseResponse>, Status> {
         Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
     }
 
