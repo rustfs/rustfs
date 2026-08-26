@@ -1098,6 +1098,9 @@ pub struct ErrorResponse {
 }
 
 #[cfg(test)]
+mod conversion_roundtrip_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Error as IoError, ErrorKind};
