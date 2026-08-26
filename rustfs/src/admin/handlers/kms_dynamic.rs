@@ -178,7 +178,7 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
         return Err("Storage layer not initialized".to_string());
     };
 
-    let data = serde_json::to_vec(config).map_err(|e| format!("Failed to serialize KMS config: {e}"))?;
+    let data = seal_persisted_kms_config(config, rustfs_kms::config_secret::config_secret_from_env().as_deref())?;
 
     save_admin_config(store, KMS_CONFIG_PATH, data)
         .await
@@ -193,6 +193,46 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
         "admin kms dynamic state"
     );
     Ok(())
+}
+
+/// Serialize a config for persistence, sealing its secret fields when the
+/// per-node config secret is set.
+///
+/// Without a secret this is warn-only by contract: existing clusters persist
+/// plaintext exactly as before, and the warning names the exposed fields.
+fn seal_persisted_kms_config(config: &KmsConfig, config_secret: Option<&str>) -> Result<Vec<u8>, String> {
+    if let Some(secret) = config_secret {
+        rustfs_kms::config_secret::ensure_config_secret_is_independent(secret, config).map_err(|e| e.to_string())?;
+    }
+    let mut document = serde_json::to_value(config).map_err(|e| format!("Failed to serialize KMS config: {e}"))?;
+    let seal_outcome = rustfs_kms::config_secret::seal_config_secrets(&mut document, config_secret)
+        .map_err(|e| format!("Failed to seal KMS config secrets: {e}"))?;
+    if !seal_outcome.plaintext.is_empty() {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            event = "kms_config_secret_unset",
+            exposed_fields = ?seal_outcome.plaintext,
+            state = "persisting_plaintext_secrets",
+            "persisted KMS configuration carries cleartext secrets; set RUSTFS_KMS_CONFIG_SECRET on every node to seal them"
+        );
+    }
+    serde_json::to_vec(&document).map_err(|e| format!("Failed to serialize KMS config: {e}"))
+}
+
+/// Unseal any sealed secret fields of the persisted config document.
+///
+/// Returns the opened bytes plus the outcome (which fields were sealed vs
+/// still plaintext). Fails closed: a sealed field with a missing or wrong
+/// `RUSTFS_KMS_CONFIG_SECRET` is a load error, never treated as plaintext.
+fn open_persisted_kms_config(
+    data: &[u8],
+    config_secret: Option<&str>,
+) -> Result<(Vec<u8>, rustfs_kms::config_secret::ConfigSecretOutcome), String> {
+    let mut document: serde_json::Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
+    let outcome = rustfs_kms::config_secret::open_config_secrets(&mut document, config_secret).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&document).map_err(|e| e.to_string())?;
+    Ok((bytes, outcome))
 }
 
 fn decode_persisted_kms_config(data: &[u8]) -> serde_json::Result<(KmsConfig, bool)> {
@@ -243,7 +283,34 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
     };
 
     match read_admin_config(store, KMS_CONFIG_PATH).await {
-        Ok(data) => match decode_persisted_kms_config(&data) {
+        Ok(data) => {
+            let (data, unseal_outcome) =
+                match open_persisted_kms_config(&data, rustfs_kms::config_secret::config_secret_from_env().as_deref()) {
+                Ok(opened) => opened,
+                Err(e) => {
+                    error!(
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        event = "kms_config_unseal_failed",
+                        storage_path = KMS_CONFIG_PATH,
+                        result = "config_unseal_failed",
+                        error = %e,
+                        "admin kms dynamic state"
+                    );
+                    return None;
+                }
+            };
+            if !unseal_outcome.plaintext.is_empty() {
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    event = "kms_config_secret_unset",
+                    exposed_fields = ?unseal_outcome.plaintext,
+                    state = "loaded_plaintext_secrets",
+                    "persisted KMS configuration carries cleartext secrets; set RUSTFS_KMS_CONFIG_SECRET on every node and re-save to seal them"
+                );
+            }
+            match decode_persisted_kms_config(&data) {
             Ok((config, is_legacy_local)) => {
                 if is_legacy_local {
                     warn!(
@@ -277,7 +344,8 @@ pub async fn load_kms_config() -> Option<KmsConfig> {
                 );
                 None
             }
-        },
+        }
+        }
         Err(e) => {
             // Config not found is normal on first run: `read_config` maps a missing or
             // empty config object to `ConfigNotFound`, so that variant is the only
@@ -1193,7 +1261,7 @@ mod tests {
     use super::{
         decode_persisted_kms_config, ensure_kms_config_persistable, ensure_kms_request_persistable, kms_config_fingerprint,
         kms_config_is_unchanged, kms_configure_actions, kms_service_control_actions, local_success_with_peer_report,
-        normalize_configure_request_secrets, redacted_canonical_config,
+        normalize_configure_request_secrets, open_persisted_kms_config, redacted_canonical_config, seal_persisted_kms_config,
     };
     use rustfs_policy::policy::action::{Action, AdminAction, KmsAction};
     use std::path::PathBuf;
@@ -1256,6 +1324,71 @@ mod tests {
         let duplicate = serialized.replacen('{', r#"{"allow_insecure_dev_defaults":true,"#, 1);
 
         assert!(decode_persisted_kms_config(duplicate.as_bytes()).is_err());
+    }
+
+    fn vault_token_config(token: &str) -> rustfs_kms::KmsConfig {
+        rustfs_kms::KmsConfig {
+            backend: rustfs_kms::KmsBackend::VaultKv2,
+            backend_config: rustfs_kms::BackendConfig::VaultKv2(Box::new(rustfs_kms::VaultConfig {
+                auth_method: rustfs_kms::VaultAuthMethod::Token { token: token.to_string() },
+                ..rustfs_kms::VaultConfig::default()
+            })),
+            ..rustfs_kms::KmsConfig::default()
+        }
+    }
+
+    #[test]
+    fn persisted_config_secrets_seal_and_open_round_trip() {
+        let config = vault_token_config("s.vault-root-token");
+
+        let sealed_bytes = seal_persisted_kms_config(&config, Some("operator-secret")).expect("sealing succeeds");
+        let rendered = String::from_utf8(sealed_bytes.clone()).expect("persisted config is utf-8 JSON");
+        assert!(!rendered.contains("s.vault-root-token"), "sealed persistence must not carry the token");
+
+        // Fail closed without the secret, and with a wrong secret.
+        open_persisted_kms_config(&sealed_bytes, None).expect_err("sealed config must not load without the secret");
+        open_persisted_kms_config(&sealed_bytes, Some("wrong")).expect_err("sealed config must not load with a wrong secret");
+
+        // The right secret recovers the original configuration.
+        let (opened_bytes, outcome) =
+            open_persisted_kms_config(&sealed_bytes, Some("operator-secret")).expect("unsealing succeeds");
+        assert_eq!(outcome.sealed, vec!["kms.vault.token"]);
+        let (decoded, _) = decode_persisted_kms_config(&opened_bytes).expect("decode opened config");
+        match &decoded.backend_config {
+            rustfs_kms::BackendConfig::VaultKv2(vault) => match &vault.auth_method {
+                rustfs_kms::VaultAuthMethod::Token { token } => assert_eq!(token, "s.vault-root-token"),
+                other => panic!("unexpected auth method after unseal: {other:?}"),
+            },
+            other => panic!("unexpected backend after unseal: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn persisted_config_without_config_secret_stays_plaintext_and_loads() {
+        let config = vault_token_config("s.vault-root-token");
+
+        let bytes = seal_persisted_kms_config(&config, None).expect("warn-only persistence stays allowed");
+        let rendered = String::from_utf8(bytes.clone()).expect("persisted config is utf-8 JSON");
+        assert!(rendered.contains("s.vault-root-token"), "without a secret the legacy plaintext format is kept");
+
+        let (opened_bytes, outcome) = open_persisted_kms_config(&bytes, None).expect("plaintext config loads without a secret");
+        assert_eq!(outcome.plaintext, vec!["kms.vault.token"]);
+        assert!(outcome.sealed.is_empty());
+        let (decoded, _) = decode_persisted_kms_config(&opened_bytes).expect("decode plaintext config");
+        assert!(matches!(decoded.backend_config, rustfs_kms::BackendConfig::VaultKv2(_)));
+    }
+
+    #[test]
+    fn config_secret_reusing_a_backend_secret_is_refused() {
+        let temp_dir = TempDir::new().expect("create local KMS directory");
+        let mut config = rustfs_kms::KmsConfig::local(temp_dir.path().to_path_buf());
+        if let rustfs_kms::BackendConfig::Local(local) = &mut config.backend_config {
+            local.master_key = Some("shared-secret".to_string());
+        }
+
+        seal_persisted_kms_config(&config, Some("shared-secret"))
+            .expect_err("the config secret must be an independent trust root");
+        seal_persisted_kms_config(&config, Some("independent-secret")).expect("an independent secret seals");
     }
 
     #[test]

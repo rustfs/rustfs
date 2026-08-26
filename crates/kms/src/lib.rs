@@ -70,6 +70,7 @@ pub mod backends;
 pub mod backup;
 mod cache;
 pub mod config;
+pub mod config_secret;
 pub mod deletion_worker;
 mod encryption;
 mod error;
