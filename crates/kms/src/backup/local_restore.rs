@@ -72,7 +72,7 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64_simd::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -640,7 +640,7 @@ fn decode_key_record(
         return Err(BackupError::corrupted(format!("bundled key record '{stem}' carries no key material")).into());
     }
     let material =
-        Zeroizing::new(BASE64.decode(&probe.encrypted_key_material).map_err(|error| {
+        Zeroizing::new(BASE64.decode_to_vec(&probe.encrypted_key_material).map_err(|error| {
             BackupError::corrupted(format!("bundled key record '{stem}' material is not valid base64: {error}"))
         })?);
     if !allowed_modes.contains(&protection_mode(probe.at_rest_protection)) {

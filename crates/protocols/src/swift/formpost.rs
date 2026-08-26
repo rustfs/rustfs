@@ -182,7 +182,7 @@ pub fn generate_signature(
     mac.update(message.as_bytes());
 
     let result = mac.finalize();
-    let signature = hex::encode(result.into_bytes());
+    let signature = hex_simd::encode_to_string(result.into_bytes(), hex_simd::AsciiCase::Lower);
 
     Ok(signature)
 }
@@ -213,10 +213,10 @@ pub fn validate_formpost(path: &str, request: &FormPostRequest, key: &str) -> Sw
     // the sibling TempURL/SFTP checks. Decode the hex first so the comparison runs
     // over the raw HMAC bytes and does not leak via string length; a non-hex
     // provided signature can never match and is rejected the same way.
-    let expected_bytes =
-        hex::decode(&expected_sig).map_err(|e| SwiftError::InternalServerError(format!("Signature encoding error: {}", e)))?;
+    let expected_bytes = hex_simd::decode_to_vec(&expected_sig)
+        .map_err(|e| SwiftError::InternalServerError(format!("Signature encoding error: {}", e)))?;
 
-    let signatures_match = match hex::decode(request.signature.trim()) {
+    let signatures_match = match hex_simd::decode_to_vec(request.signature.trim()) {
         Ok(provided_bytes) => super::tempurl::constant_time_compare(&provided_bytes, &expected_bytes),
         Err(_) => false,
     };

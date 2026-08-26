@@ -446,7 +446,6 @@ mod tests {
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
     use crate::storage::access::ReqInfo;
     use crate::storage::request_context::RequestContext;
-    use base64::Engine as _;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
     use rustfs_audit::ObjectVersion;
@@ -765,10 +764,7 @@ mod tests {
         std::collections::HashMap::from([
             ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
             ("x-rustfs-encryption-key-id".to_string(), "finance-key".to_string()),
-            (
-                "x-rustfs-encryption-key".to_string(),
-                base64::engine::general_purpose::STANDARD.encode([7u8; 48]),
-            ),
+            ("x-rustfs-encryption-key".to_string(), base64_simd::STANDARD.encode_to_string([7u8; 48])),
             ("x-rustfs-encryption-algorithm".to_string(), "aws:kms".to_string()),
         ])
     }
@@ -840,7 +836,7 @@ mod tests {
 
                 let rendered = serde_json::to_string(&tags).expect("audit tags serialize");
                 assert!(
-                    !rendered.contains(&base64::engine::general_purpose::STANDARD.encode([7u8; 48])),
+                    !rendered.contains(&base64_simd::STANDARD.encode_to_string([7u8; 48])),
                     "the audit entry must not carry the wrapped data key: {rendered}"
                 );
             },

@@ -667,7 +667,7 @@ async fn sse_c_round_trips_and_rejects_the_wrong_key() {
 async fn sse_c_validates_the_supplied_key_md5() {
     let (_kms, service) = service_with_key("sse-c-md5-unused").await;
     let customer_key = [0x33u8; 32];
-    let correct_md5 = hex::encode(md5_of(&customer_key));
+    let correct_md5 = hex_simd::encode_to_string(md5_of(&customer_key), hex_simd::AsciiCase::Lower);
 
     service
         .encrypt_object_with_customer_key(BUCKET, "md5-ok.bin", payload(64).as_slice(), &customer_key, Some(&correct_md5))

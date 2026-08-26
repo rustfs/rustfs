@@ -84,7 +84,11 @@ impl SLOManifest {
 
         let mut hasher = Md5::new();
         hasher.update(etag_concat.as_bytes());
-        format!("\"{}-{}\"", hex::encode(hasher.finalize()), self.segments.len())
+        format!(
+            "\"{}-{}\"",
+            hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower),
+            self.segments.len()
+        )
     }
 
     /// Validate manifest against actual segments

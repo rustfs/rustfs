@@ -177,7 +177,7 @@ async fn test_comprehensive_key_isolation() -> Result<(), Box<dyn std::error::Er
     // Verify that files cannot be read with wrong keys
     info!("🔒 Verify key isolation");
     let wrong_key = "11111111111111111111111111111111";
-    let wrong_key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, wrong_key);
+    let wrong_key_b64 = base64_simd::STANDARD.encode_to_string(wrong_key);
     let wrong_key_md5 = sse_customer_key_md5_base64(wrong_key);
 
     // Try to read file encrypted with key1 using wrong key

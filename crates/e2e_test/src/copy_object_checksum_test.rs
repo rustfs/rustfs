@@ -27,8 +27,7 @@ mod tests {
         VersioningConfiguration,
     };
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64_simd::STANDARD as BASE64;
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
     use sha2::{Digest, Sha256};
     use tracing::info;
@@ -465,7 +464,7 @@ mod tests {
         create_versioned_bucket(&client, dst_bucket).await;
 
         let content = b"deterministic synthetic payload for copy-object checksum #4996";
-        let expected_sha256 = BASE64.encode(Sha256::digest(content));
+        let expected_sha256 = BASE64.encode_to_string(Sha256::digest(content));
 
         client
             .put_object()
@@ -534,7 +533,7 @@ mod tests {
         create_versioned_bucket(&client, dst_bucket).await;
 
         let content = b"another deterministic payload whose source checksum must survive the copy";
-        let expected_sha256 = BASE64.encode(Sha256::digest(content));
+        let expected_sha256 = BASE64.encode_to_string(Sha256::digest(content));
 
         // Store the source WITH a SHA-256 checksum so it has one to preserve.
         let put_src = client
@@ -614,7 +613,7 @@ mod tests {
         create_versioned_bucket(&client, dst_bucket).await;
 
         let content = b"payload whose copy must be re-checksummed with a different algorithm";
-        let expected_sha256 = BASE64.encode(Sha256::digest(content));
+        let expected_sha256 = BASE64.encode_to_string(Sha256::digest(content));
 
         // Source is stored WITH a SHA-256 checksum.
         client

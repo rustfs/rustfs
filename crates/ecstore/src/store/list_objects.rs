@@ -42,7 +42,7 @@ use crate::storage_api_contracts::{
 };
 use crate::store::ECStore;
 use crate::store::utils::is_reserved_or_invalid_bucket;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
@@ -1398,11 +1398,11 @@ async fn persist_observed_list_objects_mutation(store: Option<&ECStore>, bucket:
 }
 
 fn encode_persistent_list_metadata_string(value: &str) -> String {
-    BASE64_STANDARD.encode(value.as_bytes())
+    BASE64_STANDARD.encode_to_string(value.as_bytes())
 }
 
 fn decode_persistent_list_metadata_string(value: &str) -> Option<String> {
-    let bytes = BASE64_STANDARD.decode(value).ok()?;
+    let bytes = BASE64_STANDARD.decode_to_vec(value).ok()?;
     String::from_utf8(bytes).ok()
 }
 

@@ -763,10 +763,10 @@ pub async fn get_global_encryption_service() -> Option<Arc<ObjectEncryptionServi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use base64_simd::STANDARD as BASE64_STANDARD;
 
     fn static_config(key_id: &str, fill: u8) -> KmsConfig {
-        KmsConfig::static_kms(key_id.to_string(), BASE64_STANDARD.encode([fill; 32]))
+        KmsConfig::static_kms(key_id.to_string(), BASE64_STANDARD.encode_to_string([fill; 32]))
     }
 
     /// End-to-end wiring check for the AWS backend: an admin configure request
@@ -822,7 +822,7 @@ mod tests {
     #[tokio::test]
     async fn redacted_config_omits_static_key_material() {
         let manager = KmsServiceManager::new();
-        let encoded_key = base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]);
+        let encoded_key = base64_simd::STANDARD.encode_to_string([0x5au8; 32]);
         manager
             .configure(KmsConfig::static_kms("static-key".to_string(), encoded_key))
             .await
@@ -1020,7 +1020,6 @@ mod tests {
 
     #[tokio::test]
     async fn configure_cannot_replace_existing_local_backend() {
-        use base64::Engine as _;
         use tempfile::TempDir;
 
         let key_dir = TempDir::new().expect("create local KMS directory");
@@ -1029,7 +1028,7 @@ mod tests {
         let manager = KmsServiceManager::new();
         manager.configure(local.clone()).await.expect("configure local KMS");
 
-        let encoded_key = base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]);
+        let encoded_key = base64_simd::STANDARD.encode_to_string([0x5au8; 32]);
         let error = manager
             .configure(KmsConfig::static_kms("static-key".to_string(), encoded_key))
             .await

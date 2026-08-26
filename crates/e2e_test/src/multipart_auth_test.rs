@@ -22,7 +22,6 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
-use base64::Engine;
 use chrono::{Duration as ChronoDuration, Utc};
 use flate2::{Compression, write::GzEncoder};
 use http::HeaderValue;
@@ -47,19 +46,19 @@ fn encode_post_policy(conditions: Vec<serde_json::Value>) -> String {
         "conditions": conditions,
     });
 
-    base64::engine::general_purpose::STANDARD.encode(policy.to_string())
+    base64_simd::STANDARD.encode_to_string(policy.to_string())
 }
 
 fn sse_customer_key_md5_base64(key: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(key.as_bytes());
-    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+    base64_simd::STANDARD.encode_to_string(hasher.finalize())
 }
 
 fn md5_hex(input: impl AsRef<[u8]>) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_ref());
-    hex::encode(hasher.finalize())
+    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
 }
 
 async fn create_restricted_user(
@@ -97,7 +96,7 @@ fn restricted_user_client(env: &RustFSTestEnvironment, username: &str, secret_ke
 const LOCAL_SSE_MASTER_KEY_ENV: &str = "RUSTFS_SSE_S3_MASTER_KEY";
 
 fn local_sse_master_key_value() -> String {
-    base64::engine::general_purpose::STANDARD.encode([0x42u8; 32])
+    base64_simd::STANDARD.encode_to_string([0x42u8; 32])
 }
 
 async fn make_tar(files: &[(&str, &[u8])], dirs: &[&str]) -> Vec<u8> {
@@ -1887,7 +1886,7 @@ async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_condition
     let object_key = "sse-c-object.txt";
     let expected_body = b"anonymous-post-sse-c".to_vec();
     let customer_key = "01234567890123456789012345678901";
-    let customer_key_b64 = base64::engine::general_purpose::STANDARD.encode(customer_key);
+    let customer_key_b64 = base64_simd::STANDARD.encode_to_string(customer_key);
     let customer_key_md5 = sse_customer_key_md5_base64(customer_key);
 
     let admin_client = env.create_s3_client();
@@ -1941,7 +1940,7 @@ async fn test_anonymous_post_object_allows_sse_c_fields_outside_policy_condition
         .bucket(bucket)
         .key(object_key)
         .sse_customer_algorithm("AES256")
-        .sse_customer_key(base64::engine::general_purpose::STANDARD.encode(customer_key))
+        .sse_customer_key(base64_simd::STANDARD.encode_to_string(customer_key))
         .sse_customer_key_md5(customer_key_md5)
         .send()
         .await?;
@@ -1963,8 +1962,8 @@ async fn test_anonymous_post_object_rejects_sse_c_exact_policy_mismatch() -> Res
     let object_key = "sse-c-mismatch-object.txt";
     let policy_key = "01234567890123456789012345678901";
     let request_key = "abcdefghijklmnopqrstuvwxyzABCDEF";
-    let policy_key_b64 = base64::engine::general_purpose::STANDARD.encode(policy_key);
-    let request_key_b64 = base64::engine::general_purpose::STANDARD.encode(request_key);
+    let policy_key_b64 = base64_simd::STANDARD.encode_to_string(policy_key);
+    let request_key_b64 = base64_simd::STANDARD.encode_to_string(request_key);
 
     let admin_client = env.create_s3_client();
     admin_client.create_bucket().bucket(bucket).send().await?;
@@ -3526,7 +3525,7 @@ async fn test_signed_put_object_extract_preserves_sse_s3_and_redirect() -> Resul
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let sse_master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     env.start_rustfs_server_with_env(vec![], &[("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key.as_str())])
         .await?;
 
@@ -3799,7 +3798,7 @@ async fn test_signed_put_object_extract_uses_bucket_default_sse_s3() -> Result<(
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
-    let sse_master_key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let sse_master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
     env.start_rustfs_server_with_env(vec![], &[("RUSTFS_SSE_S3_MASTER_KEY", sse_master_key.as_str())])
         .await?;
 
@@ -3925,7 +3924,7 @@ async fn test_signed_put_object_extract_preserves_sse_c() -> Result<(), Box<dyn 
     let extracted_key = "nested/file.txt";
     let expected_body = b"extract-sse-c-body".to_vec();
     let customer_key = "01234567890123456789012345678901";
-    let customer_key_b64 = base64::engine::general_purpose::STANDARD.encode(customer_key);
+    let customer_key_b64 = base64_simd::STANDARD.encode_to_string(customer_key);
     let customer_key_md5 = sse_customer_key_md5_base64(customer_key);
 
     let client = env.create_s3_client();

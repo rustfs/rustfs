@@ -20,8 +20,7 @@
 //! module produces, so any divergence is a protocol break rather than a
 //! local behaviour change.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
+use base64_simd::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey};
 use p256::elliptic_curve::Generate as _;
@@ -112,7 +111,7 @@ impl RegistrationTranscript {
         }
 
         let expiry = expires_unix.to_string();
-        let csr_digest = BASE64_URL_NO_PAD.encode(Sha256::digest(certificate_request));
+        let csr_digest = BASE64_URL_NO_PAD.encode_to_string(Sha256::digest(certificate_request));
 
         let fields: [(&'static str, &str); FIELD_COUNT] = [
             ("registrationTokenUid", registration_token_uid),
@@ -238,7 +237,7 @@ impl DeviceIdentity {
 
     /// Standard padded base64 of the certificate request, as the body carries it.
     pub fn certificate_request_base64(&self) -> Result<String, IdentityError> {
-        Ok(BASE64_STANDARD.encode(self.certificate_request_der()?))
+        Ok(BASE64_STANDARD.encode_to_string(self.certificate_request_der()?))
     }
 
     /// Sign a transcript, producing the low-S fixed-width proof.
@@ -252,20 +251,20 @@ impl DeviceIdentity {
 
         RegistrationProof {
             algorithm: PROOF_ALGORITHM.to_string(),
-            value: BASE64_URL_NO_PAD.encode(canonical.to_bytes()),
+            value: BASE64_URL_NO_PAD.encode_to_string(canonical.to_bytes()),
         }
     }
 
     pub(crate) fn sign_pending_registration_state(&self, state: &[u8]) -> String {
         let signature: Signature = self.signing_key.sign(state);
-        BASE64_URL_NO_PAD.encode(signature.normalize_s().to_bytes())
+        BASE64_URL_NO_PAD.encode_to_string(signature.normalize_s().to_bytes())
     }
 
     pub(crate) fn verifies_pending_registration_state(&self, state: &[u8], proof: &str) -> bool {
-        let Ok(octets) = BASE64_URL_NO_PAD.decode(proof) else {
+        let Ok(octets) = BASE64_URL_NO_PAD.decode_to_vec(proof) else {
             return false;
         };
-        if BASE64_URL_NO_PAD.encode(&octets) != proof {
+        if BASE64_URL_NO_PAD.encode_to_string(&octets) != proof {
             return false;
         }
         let Ok(signature) = Signature::from_slice(&octets) else {

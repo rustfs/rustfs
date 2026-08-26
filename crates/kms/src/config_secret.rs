@@ -46,8 +46,7 @@ use crate::error::{KmsError, Result};
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64_simd::STANDARD as BASE64_STANDARD;
 use rand::RngExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -284,14 +283,16 @@ fn seal_value(label: &str, plaintext: &str, secret: &str) -> Result<String> {
     payload.extend_from_slice(&salt);
     payload.extend_from_slice(&nonce);
     payload.extend_from_slice(&ciphertext);
-    Ok(format!("{SEALED_VALUE_PREFIX}{}", BASE64_STANDARD.encode(payload)))
+    Ok(format!("{SEALED_VALUE_PREFIX}{}", BASE64_STANDARD.encode_to_string(payload)))
 }
 
 fn open_value(label: &str, sealed: &str, secret: &str) -> Result<String> {
     let encoded = sealed
         .strip_prefix(SEALED_VALUE_PREFIX)
         .expect("caller checks the sealed prefix");
-    let payload = BASE64_STANDARD.decode(encoded).map_err(|_| sealed_value_unreadable(label))?;
+    let payload = BASE64_STANDARD
+        .decode_to_vec(encoded)
+        .map_err(|_| sealed_value_unreadable(label))?;
     if payload.len() <= LOCAL_KMS_MASTER_KEY_SALT_LEN + NONCE_LEN {
         return Err(sealed_value_unreadable(label));
     }

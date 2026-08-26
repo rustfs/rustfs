@@ -35,7 +35,6 @@ use crate::common::local_http_client;
 use crate::common::rustfs_binary_path_with_features;
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
-use base64::Engine;
 use http::header::{CONTENT_TYPE, HOST};
 use reqwest::Client;
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
@@ -64,7 +63,7 @@ fn basic_auth_header() -> String {
 
 fn basic_auth_header_for(access_key: &str, secret_key: &str) -> String {
     let credentials = format!("{}:{}", access_key, secret_key);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+    let encoded = base64_simd::STANDARD.encode_to_string(credentials);
     format!("Basic {}", encoded)
 }
 

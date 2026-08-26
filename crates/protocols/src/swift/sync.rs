@@ -300,7 +300,7 @@ pub fn generate_sync_signature(path: &str, key: &str) -> SwiftResult<String> {
     mac.update(path.as_bytes());
 
     let result = mac.finalize();
-    Ok(hex::encode(result.into_bytes()))
+    Ok(hex_simd::encode_to_string(result.into_bytes(), hex_simd::AsciiCase::Lower))
 }
 
 /// Verify sync signature

@@ -1422,12 +1422,8 @@ mod tests {
 
     #[test]
     fn static_kms_config_is_not_persisted_with_cluster_configuration() {
-        use base64::Engine as _;
-
-        let config = rustfs_kms::KmsConfig::static_kms(
-            "static-key".to_string(),
-            base64::engine::general_purpose::STANDARD.encode([0x5au8; 32]),
-        );
+        let config =
+            rustfs_kms::KmsConfig::static_kms("static-key".to_string(), base64_simd::STANDARD.encode_to_string([0x5au8; 32]));
 
         assert!(ensure_kms_config_persistable(&config).is_err());
     }

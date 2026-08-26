@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use crate::{Error, Result};
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -827,7 +826,7 @@ impl CheckpointManager {
     }
 
     fn checkpoint_digest(checkpoint_data: &[u8]) -> String {
-        base64::engine::general_purpose::STANDARD.encode(Sha256::digest(checkpoint_data))
+        base64_simd::STANDARD.encode_to_string(Sha256::digest(checkpoint_data))
     }
 
     fn digest_path(task_id: &str) -> std::path::PathBuf {

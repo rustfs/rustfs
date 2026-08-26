@@ -27,7 +27,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ServerSideEncryption;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64_simd::STANDARD as BASE64;
 use http::header::{CONTENT_TYPE, HOST};
 use md5::{Digest as Md5Digest, Md5};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
@@ -64,7 +64,7 @@ pub fn init_logging() {
 pub fn sse_customer_key_md5_base64(key: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(key.as_bytes());
-    BASE64.encode(hasher.finalize())
+    BASE64.encode_to_string(hasher.finalize())
 }
 
 pub fn assert_s3_error<T, E>(result: Result<T, SdkError<E>>, status: u16, code: &str, message: &str, context: &str)
@@ -365,7 +365,7 @@ pub async fn create_key_with_specific_id(key_dir: &str, key_id: &str) -> Result<
         "created_at": format!("{}[UTC]", chrono::Utc::now().to_rfc3339()),
         "rotated_at": serde_json::Value::Null,
         "created_by": "e2e-test",
-        "encrypted_key_material": BASE64.encode(key_data),
+        "encrypted_key_material": BASE64.encode_to_string(key_data),
         "nonce": Vec::<u8>::new()
     });
 
@@ -383,7 +383,7 @@ pub async fn test_sse_c_encryption(s3_client: &Client, bucket: &str) -> Result<(
     info!("Testing SSE-C encryption");
 
     let test_key = "01234567890123456789012345678901"; // 32-byte key
-    let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
+    let test_key_b64 = base64_simd::STANDARD.encode_to_string(test_key);
     let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let test_data = b"Hello, KMS SSE-C World!";
     let object_key = "test-sse-c-object";
@@ -551,8 +551,8 @@ pub async fn test_error_scenarios(s3_client: &Client, bucket: &str) -> Result<()
     // Test SSE-C with wrong key for download
     let test_key = "01234567890123456789012345678901";
     let wrong_key = "98765432109876543210987654321098";
-    let test_key_b64 = base64::engine::general_purpose::STANDARD.encode(test_key);
-    let wrong_key_b64 = base64::engine::general_purpose::STANDARD.encode(wrong_key);
+    let test_key_b64 = base64_simd::STANDARD.encode_to_string(test_key);
+    let wrong_key_b64 = base64_simd::STANDARD.encode_to_string(wrong_key);
     let test_key_md5 = sse_customer_key_md5_base64(test_key);
     let wrong_key_md5 = sse_customer_key_md5_base64(wrong_key);
     let test_data = b"Test data for error scenarios";
@@ -807,7 +807,7 @@ pub async fn test_multipart_upload_with_config(
     // Prepare encryption parameters
     let (sse_c_key_b64, sse_c_key_md5) = match &config.encryption_type {
         EncryptionType::SSEC { key, key_md5 } => {
-            let key_b64 = base64::engine::general_purpose::STANDARD.encode(key);
+            let key_b64 = base64_simd::STANDARD.encode_to_string(key);
             (Some(key_b64), Some(key_md5.clone()))
         }
         _ => (None, None),

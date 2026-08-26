@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64_simd::STANDARD as BASE64_STANDARD;
 use rustfs_kms::{LocalConfig, backends::local::LocalKmsClient};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -69,7 +69,7 @@ async fn run() -> Result<(), String> {
         .decrypt_key_material_for_export(&key_id)
         .await
         .map_err(|error| error.to_string())?;
-    let encoded = Zeroizing::new(BASE64_STANDARD.encode(key_material.as_ref()));
+    let encoded = Zeroizing::new(BASE64_STANDARD.encode_to_string(key_material.as_ref()));
 
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "{}", encoded.as_str()).map_err(|error| format!("failed to write decrypted key: {error}"))

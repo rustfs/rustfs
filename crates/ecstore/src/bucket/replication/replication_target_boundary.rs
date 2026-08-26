@@ -200,7 +200,7 @@ impl ReplicationTargetStore {
 }
 
 pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use base64_simd::STANDARD as BASE64_STANDARD;
     use rustfs_utils::http::{AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT};
 
     let mut meta = HashMap::new();
@@ -252,7 +252,7 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
         && !checksum_data.is_empty()
     {
         if is_ssec {
-            let encoded = BASE64_STANDARD.encode(checksum_data);
+            let encoded = BASE64_STANDARD.encode_to_string(checksum_data);
             insert_header_map(&mut meta, SUFFIX_REPLICATION_SSEC_CRC, encoded);
         } else if object_info.is_encrypted() {
             // Encrypted checksums cannot be exposed as plaintext headers, and

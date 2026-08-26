@@ -439,7 +439,6 @@ fn dispatch(entry: AuditEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
     use rustfs_kms::backends::local::LocalKmsBackend;
     use rustfs_kms::config::KmsConfig;
     use rustfs_kms::types::{CreateKeyRequest, DeleteKeyRequest, DescribeKeyRequest, GenerateDataKeyRequest, KeySpec};
@@ -689,8 +688,8 @@ mod tests {
             .expect("data key should be generated");
 
         // What the endpoint hands back, and therefore what must not reappear.
-        let plaintext_b64 = base64::prelude::BASE64_STANDARD.encode(&response.plaintext_key);
-        let ciphertext_b64 = base64::prelude::BASE64_STANDARD.encode(&response.ciphertext_blob);
+        let plaintext_b64 = base64_simd::STANDARD.encode_to_string(&response.plaintext_key);
+        let ciphertext_b64 = base64_simd::STANDARD.encode_to_string(&response.ciphertext_blob);
         assert!(!response.plaintext_key.is_empty(), "the test must drive real key material");
 
         let redacted = rustfs_kms::redact_encryption_context(&std::collections::HashMap::from([

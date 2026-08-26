@@ -675,7 +675,6 @@ mod tests {
     use crate::error::KmsError;
     use crate::types::{KeyMetadata, KeySpec, KeyState, KeyStatus, KeyUsage};
     use async_trait::async_trait;
-    use base64::Engine as _;
     use jiff::Zoned;
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -1110,8 +1109,13 @@ mod tests {
             .await
             .expect("enable should succeed");
 
-        let base64 = base64::engine::general_purpose::STANDARD;
-        let encodings = |bytes: &[u8]| vec![hex::encode(bytes), base64.encode(bytes)];
+        let base64 = base64_simd::STANDARD;
+        let encodings = |bytes: &[u8]| {
+            vec![
+                hex_simd::encode_to_string(bytes, hex_simd::AsciiCase::Lower),
+                base64.encode_to_string(bytes),
+            ]
+        };
         let mut forbidden = vec![grant_token.to_string()];
         forbidden.extend(encodings(&data_key.plaintext_key));
         forbidden.extend(encodings(&decrypted.plaintext));

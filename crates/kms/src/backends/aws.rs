@@ -848,8 +848,7 @@ mod tests {
     use aws_sdk_kms::config::{BehaviorVersion, Credentials, Region};
     use aws_smithy_http_client::test_util::{NeverClient, ReplayEvent, StaticReplayClient};
     use aws_smithy_types::body::SdkBody;
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64_simd::STANDARD as BASE64;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// AWS KMS speaks awsJson1_1; every request goes to `/` on the regional
@@ -977,8 +976,8 @@ mod tests {
         let ciphertext = b"encrypted-data-key".to_vec();
         let (http_client, backend) = scripted_backend(vec![ok_event(serde_json::json!({
             "KeyId": "arn:aws:kms:us-east-1:111122223333:key/test-key",
-            "Plaintext": BASE64.encode(&plaintext),
-            "CiphertextBlob": BASE64.encode(&ciphertext),
+            "Plaintext": BASE64.encode_to_string(&plaintext),
+            "CiphertextBlob": BASE64.encode_to_string(&ciphertext),
         }))]);
 
         let response = backend
@@ -997,7 +996,7 @@ mod tests {
         let plaintext = b"recovered-data-key".to_vec();
         let (_http, backend) = scripted_backend(vec![ok_event(serde_json::json!({
             "KeyId": "arn:aws:kms:us-east-1:111122223333:key/test-key",
-            "Plaintext": BASE64.encode(&plaintext),
+            "Plaintext": BASE64.encode_to_string(&plaintext),
             "EncryptionAlgorithm": "SYMMETRIC_DEFAULT",
         }))]);
 
@@ -1061,8 +1060,8 @@ mod tests {
             error_event(400, "ThrottlingException", "rate exceeded"),
             ok_event(serde_json::json!({
                 "KeyId": "test-key",
-                "Plaintext": BASE64.encode([1u8; 32]),
-                "CiphertextBlob": BASE64.encode(b"blob"),
+                "Plaintext": BASE64.encode_to_string([1u8; 32]),
+                "CiphertextBlob": BASE64.encode_to_string(b"blob"),
             })),
         ]);
 
