@@ -21,14 +21,12 @@ use std::{
 use s3s::header::{X_AMZ_DELETE_MARKER, X_AMZ_VERSION_ID};
 use uuid::Uuid;
 
-use crate::{
-    client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl},
-    services::tier::{
-        tier_config::{TierS3, TierWasabi},
-        warm_backend::{WarmBackend, WarmBackendGetOpts},
-        warm_backend_s3::WarmBackendS3,
-    },
+use crate::services::tier::{
+    tier_config::{TierS3, TierWasabi},
+    warm_backend::{WarmBackend, WarmBackendGetOpts},
+    warm_backend_s3::WarmBackendS3,
 };
+use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
 
 const WASABI_VERSIONING_DRIFT_ERROR: &str = "Wasabi tier bucket versioning changed after configuration";
 
@@ -184,7 +182,7 @@ impl WarmBackend for WarmBackendWasabi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{
+    use rustfs_s3_client::{
         credentials::{Credentials, SignatureType, Static, Value},
         transition_api::{Options, TransitionCore},
     };
@@ -221,7 +219,7 @@ mod tests {
 
     async fn backend_for_endpoint(endpoint: &str, max_retries: i64) -> WarmBackendWasabi {
         let client = Arc::new(
-            crate::client::transition_api::TransitionClient::new(
+            rustfs_s3_client::transition_api::TransitionClient::new(
                 endpoint,
                 Options {
                     creds: Credentials::new(Static(Value {
@@ -653,7 +651,7 @@ mod tests {
                 assert_ne!(read, 0, "connection closed before request headers were received");
                 request.extend_from_slice(&buffer[..read]);
             }
-            let body = vec![b'x'; crate::client::transition_api::MAX_S3_ERROR_RESPONSE_SIZE + 1];
+            let body = vec![b'x'; rustfs_s3_client::transition_api::MAX_S3_ERROR_RESPONSE_SIZE + 1];
             let head = format!(
                 "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()

@@ -14,6 +14,8 @@
 
 // #730: object API readers keep staged compatibility paths during facade migration.
 
+pub mod object_api_utils;
+
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::replication::{
     DeleteReplicationConfigSnapshot, ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,

@@ -22,7 +22,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
 
-use crate::client::{
+use crate::services::tier::{
+    tier_config::TierS3,
+    warm_backend::{
+        TransitionCandidateIdentity, TransitionCandidateProbe, TransitionCandidateReconciler, WarmBackend, WarmBackendGetOpts,
+        build_transition_put_options,
+    },
+};
+use http::HeaderMap;
+use rustfs_s3_client::{
     api_get_options::GetObjectOptions,
     api_list::ListObjectsOptions,
     api_put_object::PutObjectOptions,
@@ -33,14 +41,6 @@ use crate::client::{
     transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
-use crate::services::tier::{
-    tier_config::TierS3,
-    warm_backend::{
-        TransitionCandidateIdentity, TransitionCandidateProbe, TransitionCandidateReconciler, WarmBackend, WarmBackendGetOpts,
-        build_transition_put_options,
-    },
-};
-use http::HeaderMap;
 use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use s3s::dto::BucketVersioningStatus;
@@ -379,7 +379,7 @@ impl TransitionCandidateVersions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::api_s3_datatypes::{ListVersionsResult, Version};
+    use rustfs_s3_client::api_s3_datatypes::{ListVersionsResult, Version};
 
     #[tokio::test]
     async fn new_rejects_loopback_endpoint_before_network_setup() {

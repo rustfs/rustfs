@@ -22,9 +22,9 @@ use super::tier_mutation_intent::{
     MAX_TIER_MUTATION_INTENT_SIZE, TierMutationIntent, TierMutationIntentState, advance_tier_mutation_intent_record_idempotent,
     load_tier_mutation_intent_record, save_tier_mutation_intent_record_if_absent,
 };
-use crate::client::admin_handler_utils::AdminError;
 use crate::error::{Error, StorageError};
 use crate::store::ECStore;
+use rustfs_s3_client::admin_handler_utils::AdminError;
 
 pub const MAX_TIER_MUTATION_PEER_COMMIT_ETAG_SIZE: usize = rustfs_protos::TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE;
 

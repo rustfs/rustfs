@@ -56,7 +56,6 @@ mod storage_api_contracts;
 mod store;
 
 // pub mod checksum;
-mod client;
 mod event;
 
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;

@@ -416,7 +416,8 @@ pub(crate) mod ecstore_capacity {
 }
 
 pub(crate) mod ecstore_client {
-    pub(crate) use rustfs_ecstore::api::client::{admin_handler_utils, object_api_utils};
+    pub(crate) use rustfs_ecstore::api::object_api_utils;
+    pub(crate) use rustfs_s3_client::admin_handler_utils;
 }
 
 pub(crate) mod ecstore_compression {
