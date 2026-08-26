@@ -54,7 +54,7 @@ use vaultrs::{
     kv2,
     transit::{data, key},
 };
-use zeroize::Zeroize as _;
+use zeroize::Zeroizing;
 
 /// Attempt budget for metadata read-modify-write cycles: every check-and-set
 /// conflict triggers a fresh read plus state-gate re-validation, never a blind
@@ -1143,22 +1143,24 @@ impl VaultTransitKmsClient {
                 });
             }
 
-            let mut plaintext_key = match self
-                .transit_decrypt(&envelope.master_key_id, source_ciphertext, &envelope.encryption_context)
-                .await
-            {
-                Ok(plaintext) => plaintext,
-                Err(error) => {
-                    self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
-                    return Err(error);
-                }
-            };
-            // Zeroize before the error branch: the plaintext's lifetime must not
-            // extend into error handling.
+            let plaintext_key = Zeroizing::new(
+                match self
+                    .transit_decrypt(&envelope.master_key_id, source_ciphertext, &envelope.encryption_context)
+                    .await
+                {
+                    Ok(plaintext) => plaintext,
+                    Err(error) => {
+                        self.invalidate_metadata_on_state_error(&envelope.master_key_id, &error).await;
+                        return Err(error);
+                    }
+                },
+            );
+            // Keep the plaintext in a zeroizing wrapper across the await so
+            // cancellation cannot bypass clearing it on drop.
             let reencrypted = self
                 .transit_encrypt(&envelope.master_key_id, &plaintext_key, &envelope.encryption_context)
                 .await;
-            plaintext_key.zeroize();
+            drop(plaintext_key);
             match reencrypted {
                 Ok(ciphertext) => ciphertext,
                 Err(error) => {
