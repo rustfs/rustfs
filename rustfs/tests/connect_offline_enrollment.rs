@@ -326,9 +326,9 @@ fn e2e_public_chain_matches_the_challenge_and_every_signature_verifies() {
     );
 
     let mut issuer = verifying_key(field(&root, "publicKey"));
-    let mut issuer_id = field(&root, "keyId");
+    let mut issuer_id = field(&root, "keyId").to_owned();
     for link in chain.as_array().expect("E2E chain is a list") {
-        assert_eq!(field(&link["signature"], "keyId"), issuer_id);
+        assert_eq!(field(&link["signature"], "keyId"), issuer_id.as_str());
         let signature = BASE64_URL_NO_PAD
             .decode(field(&link["signature"], "value"))
             .expect("trust-link signature is base64url");
@@ -339,11 +339,11 @@ fn e2e_public_chain_matches_the_challenge_and_every_signature_verifies() {
             )
             .expect("trust-link signature verifies");
         let document = signed_document(link);
-        issuer_id = field(&document, "subjectKeyId");
+        issuer_id = field(&document, "subjectKeyId").to_owned();
         issuer = verifying_key(field(&document, "subjectPublicKey"));
     }
 
-    assert_eq!(field(&challenge, "connectKeyId"), issuer_id);
+    assert_eq!(field(&challenge, "connectKeyId"), issuer_id.as_str());
     let signature = BASE64_URL_NO_PAD
         .decode(field(&challenge_envelope["signature"], "value"))
         .expect("challenge signature is base64url");
