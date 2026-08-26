@@ -3593,13 +3593,23 @@ mod tests {
         // reduce_errs groups Io errors by kind plus rendered message: peers failing the
         // same operation must stay a single dominant error instead of one bucket per peer.
         let per_peer_errs = (0..4)
-            .map(|_| Some(DiskError::from(peer_failure_without_details("load_bucket_metadata", Some("shared")))))
+            .map(|_| {
+                Some(
+                    peer_failure_without_details("load_bucket_metadata", Some("shared"))
+                        .narrow_to_disk()
+                        .unwrap_or_else(DiskError::other),
+                )
+            })
             .collect::<Vec<_>>();
         let (count, dominant) = reduce_errs(&per_peer_errs, &[]);
         assert_eq!(count, 4, "one shared failure must not split into per-peer buckets");
         assert_eq!(
             dominant,
-            Some(DiskError::from(peer_failure_without_details("load_bucket_metadata", Some("shared"))))
+            Some(
+                peer_failure_without_details("load_bucket_metadata", Some("shared"))
+                    .narrow_to_disk()
+                    .unwrap_or_else(DiskError::other)
+            )
         );
 
         assert_ne!(

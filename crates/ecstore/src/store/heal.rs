@@ -659,7 +659,7 @@ mod tests {
             let _movement_guard = self
                 .movement_gate
                 .try_read()
-                .map_err(|_| crate::error::StorageError::SlowDown)?;
+                .map_err(|_| crate::disk::error::DiskError::TooManyOpenFiles)?;
             Ok(HealResultItem::default())
         }
 
