@@ -221,6 +221,13 @@ pub enum StorageError {
     Io(#[source] std::io::Error),
     #[error("Lock error: {0}")]
     Lock(#[from] rustfs_lock::LockError),
+
+    /// Internode RPC client acquisition failed. Mirrors
+    /// `DiskError::RemoteClientUnavailable`: the detail is diagnostic only and
+    /// excluded from equality/hashing so same-cause failures bucket together
+    /// during quorum aggregation (backlog#1845).
+    #[error("remote rpc client unavailable: {0}")]
+    RemoteClientUnavailable(String),
 }
 
 impl From<crate::erasure::coding::ErasureConstructionError> for StorageError {
@@ -315,6 +322,7 @@ impl From<DiskError> for StorageError {
             DiskError::SourceStalled => StorageError::SourceStalled,
             DiskError::Timeout => StorageError::Timeout,
             DiskError::InvalidPath => StorageError::InvalidPath,
+            DiskError::RemoteClientUnavailable(detail) => StorageError::RemoteClientUnavailable(detail),
         }
     }
 }
@@ -366,6 +374,7 @@ impl From<StorageError> for DiskError {
             StorageError::VolumeNotEmpty => DiskError::VolumeNotEmpty,
             StorageError::VolumeAccessDenied => DiskError::VolumeAccessDenied,
             StorageError::FileAccessDenied => DiskError::FileAccessDenied,
+            StorageError::RemoteClientUnavailable(detail) => DiskError::RemoteClientUnavailable(detail),
             _ => DiskError::other(val),
         }
     }
@@ -558,6 +567,7 @@ impl Clone for StorageError {
                 current: *current,
                 limit: *limit,
             },
+            StorageError::RemoteClientUnavailable(detail) => StorageError::RemoteClientUnavailable(detail.clone()),
         }
     }
 }
@@ -646,6 +656,7 @@ impl StorageError {
             StorageError::InvalidPartNumber(_) => StorageErrorCode::InvalidPartNumber,
             StorageError::NamespaceLockQuorumUnavailable { .. } => StorageErrorCode::NamespaceLockQuorumUnavailable,
             StorageError::QuotaExceeded { .. } => StorageErrorCode::QuotaExceeded,
+            StorageError::RemoteClientUnavailable(_) => StorageErrorCode::RemoteClientUnavailable,
         }
     }
 
@@ -775,6 +786,7 @@ impl StorageError {
                 current: Default::default(),
                 limit: Default::default(),
             }),
+            StorageErrorCode::RemoteClientUnavailable => Some(StorageError::RemoteClientUnavailable(Default::default())),
         }
     }
 }
