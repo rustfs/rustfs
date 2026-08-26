@@ -1824,7 +1824,7 @@ mod tests {
 
         let pool_meta = PoolMeta::new(&store.pools, &PoolMeta::default());
         pool_meta
-            .save(store.pools.clone())
+            .save_for_startup(store.pools.clone())
             .await
             .expect("pool metadata should be persisted before format heal");
         *store.pool_meta_save_gate.lock().await = PoolMetaWriteState::default();
