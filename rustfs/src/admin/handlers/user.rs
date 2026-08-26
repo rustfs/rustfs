@@ -17,7 +17,7 @@ use super::{account_info, group, service_account, user_iam, user_lifecycle, user
 use crate::{
     admin::runtime_sources::current_action_credentials,
     admin::{
-        auth::validate_admin_request,
+        auth::{authorize_admin_request, validate_admin_request},
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
         utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
@@ -360,7 +360,7 @@ impl Operation for SetUserStatus {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         };
 
@@ -368,18 +368,7 @@ impl Operation for SetUserStatus {
             return Err(s3_error!(InvalidArgument, "cannot change the status of the current user"));
         }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::EnableUserAdminAction)]).await?;
 
         let status = AccountStatus::try_from(query.status.as_deref().unwrap_or_default())
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e))?;
@@ -439,22 +428,11 @@ pub struct ListUsers {}
 #[async_trait::async_trait]
 impl Operation for ListUsers {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ListUsersAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let cred = authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ListUsersAdminAction)]).await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -499,22 +477,11 @@ pub struct RemoveUser {}
 #[async_trait::async_trait]
 impl Operation for RemoveUser {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "authentication required"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        let cred = authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::DeleteUserAdminAction)]).await?;
 
         let query = {
             if let Some(query) = req.uri.query() {
@@ -695,22 +662,11 @@ pub struct ExportIam {}
 #[async_trait::async_trait]
 impl Operation for ExportIam {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::ExportIAMAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::ExportIAMAction)]).await?;
 
         let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
@@ -1373,18 +1329,77 @@ impl Operation for ImportIam {
 #[cfg(test)]
 mod tests {
     use super::{
-        GROUP_POLICY_MAPPING_USER_TYPE, MAX_IAM_IMPORT_EXPANDED_SIZE, MAX_IAM_IMPORT_SIZE,
-        SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR, add_user_targets_requester_parent,
-        imported_service_account_access_key_failure, imported_service_account_parent_allowed,
-        imported_service_account_parent_scope_failure, imported_service_account_status, map_add_user_create_error,
-        read_import_member, should_check_deny_only, should_reject_group_import_name, should_restore_group_as_disabled,
+        ExportIam, GROUP_POLICY_MAPPING_USER_TYPE, HeaderMap, ListUsers, MAX_IAM_IMPORT_EXPANDED_SIZE, MAX_IAM_IMPORT_SIZE,
+        Operation, Params, RemoveUser, SERVICE_ACCOUNT_ACCESS_KEY_MISMATCH_ERROR, SERVICE_ACCOUNT_PARENT_SCOPE_ERROR,
+        SetUserStatus, add_user_targets_requester_parent, imported_service_account_access_key_failure,
+        imported_service_account_parent_allowed, imported_service_account_parent_scope_failure, imported_service_account_status,
+        map_add_user_create_error, read_import_member, should_check_deny_only, should_reject_group_import_name,
+        should_restore_group_as_disabled,
     };
+    use http::{Extensions, Method, Uri};
     use rustfs_credentials::{Credentials, IAM_POLICY_CLAIM_NAME_SA};
     use rustfs_iam::error::Error as IamError;
     use rustfs_madmin::user::SRSvcAccCreate;
-    use s3s::S3ErrorCode;
+    use s3s::{Body, S3ErrorCode, S3Request};
     use serde_json::Value;
     use std::collections::HashMap;
+
+    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str, message: &str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a user admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some(message));
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = ["\npub struct ", "\nfn ", "\nconst ", "\n#[cfg(test)]"]
+            .into_iter()
+            .filter_map(|boundary| block.find(boundary))
+            .min()
+            .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
+        assert_eq!(
+            block.matches("authorize_admin_request(").count(),
+            1,
+            "{item} must use exactly one shared gate"
+        );
+        assert_eq!(
+            block.matches("Action::AdminAction(").count(),
+            actions.len(),
+            "{item} must preserve its exact action-vector length"
+        );
+        for action in actions {
+            assert!(block.contains(&format!("AdminAction::{action}")), "{item} must authorize with {action}");
+        }
+        assert_eq!(
+            block.contains("let cred = authorize_admin_request("),
+            binds_credentials,
+            "{item} credential binding must match its payload-processing contract"
+        );
+    }
 
     #[test]
     fn add_user_maps_duplicate_access_keys_to_s3_errors() {
@@ -1776,5 +1791,65 @@ mod tests {
             MAX_IAM_IMPORT_EXPANDED_SIZE >= MAX_IAM_IMPORT_SIZE as u64,
             "expanded budget must not be smaller than the compressed upload cap"
         );
+    }
+
+    /// The shared admin gate answers a credential-less request with `InvalidRequest "get cred failed"`.
+    /// Each converted handler keeps a pre-check ahead of the gate so its own wire response survives
+    /// the refactor unchanged.
+    #[tokio::test]
+    async fn user_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(
+            &SetUserStatus {},
+            Method::PUT,
+            "/rustfs/admin/v3/set-user-status?accessKey=alice",
+            "authentication required",
+        )
+        .await;
+        assert_missing_credentials(&ListUsers {}, Method::GET, "/rustfs/admin/v3/list-users", "authentication required").await;
+        assert_missing_credentials(&RemoveUser {}, Method::DELETE, "/rustfs/admin/v3/remove-user", "authentication required")
+            .await;
+        assert_missing_credentials(&ExportIam {}, Method::GET, "/rustfs/admin/v3/export-iam", "get cred failed").await;
+    }
+
+    #[test]
+    fn user_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("user.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+
+        for (handler, action, binds_credentials) in [
+            ("SetUserStatus", "EnableUserAdminAction", false),
+            ("ListUsers", "ListUsersAdminAction", true),
+            ("RemoveUser", "DeleteUserAdminAction", true),
+            ("ExportIam", "ExportIAMAction", false),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_shared_gate_wiring(block, handler, &[action], binds_credentials);
+        }
+
+        // AddUser and GetUserInfo derive a per-request `deny_only` from `should_check_deny_only`, and
+        // ImportIam consumes the `owner` flag while restoring service accounts. The shared gate pins
+        // `deny_only = false` and hands back only the credentials, so these three keep the explicit
+        // `check_key_valid` + `validate_admin_request` preamble.
+        for (handler, marker) in [
+            ("AddUser", "should_check_deny_only(ak, &cred)"),
+            ("GetUserInfo", "should_check_deny_only(ak, &cred)"),
+            ("ImportIam", "if !owner {"),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert!(
+                block.contains(marker),
+                "{handler} must keep the context that rules out the shared gate ({marker})"
+            );
+            assert!(
+                !block.contains("authorize_admin_request("),
+                "{handler} must not be routed through the shared gate"
+            );
+            assert!(
+                block.contains("validate_admin_request("),
+                "{handler} must keep its explicit validate_admin_request call"
+            );
+        }
     }
 }
