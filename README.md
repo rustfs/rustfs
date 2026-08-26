@@ -361,3 +361,5 @@ RustFS is a community-driven project, and we appreciate all contributions. Check
 [Apache 2.0](https://opensource.org/licenses/Apache-2.0)
 
 **RustFS** is a trademark of RustFS, Inc. All other trademarks are the property of their respective owners.
+
+<!-- CI probe (backlog#1843 attribution): pristine main + this comment only. -->
