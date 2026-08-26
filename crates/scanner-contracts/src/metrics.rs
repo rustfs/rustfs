@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::heal_channel::HealScanMode;
 use crate::last_minute::{AccElem, LastMinuteLatency};
 use chrono::{DateTime, Utc};
 use jiff::Timestamp;
+use rustfs_heal_contracts::heal_channel::HealScanMode;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -3243,7 +3243,7 @@ impl Metrics {
             has_cycle
         };
 
-        if !has_cycle && let Some(init_time) = crate::get_global_init_time().await {
+        if !has_cycle && let Some(init_time) = crate::init_time::get_global_init_time().await {
             m.current_started = chrono_to_jiff_timestamp(init_time);
         }
 
@@ -4401,10 +4401,10 @@ mod tests {
 
     #[tokio::test]
     async fn report_preserves_current_cycle_started_time() {
-        let previous_init_time = *crate::globals::GLOBAL_INIT_TIME.read().await;
+        let previous_init_time = *crate::init_time::GLOBAL_INIT_TIME.read().await;
         let init_time = Utc::now() - chrono::Duration::hours(1);
         let cycle_started = Utc::now();
-        *crate::globals::GLOBAL_INIT_TIME.write().await = Some(init_time);
+        *crate::init_time::GLOBAL_INIT_TIME.write().await = Some(init_time);
 
         let metrics = Metrics::new();
         metrics
@@ -4416,7 +4416,7 @@ mod tests {
             .await;
 
         let report = metrics.report().await;
-        *crate::globals::GLOBAL_INIT_TIME.write().await = previous_init_time;
+        *crate::init_time::GLOBAL_INIT_TIME.write().await = previous_init_time;
 
         assert_eq!(report.current_started, chrono_to_jiff_timestamp(cycle_started));
     }

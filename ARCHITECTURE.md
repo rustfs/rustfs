@@ -92,7 +92,7 @@ refactors.
 
 | Domain | Current workspace crates | Responsibility |
 |--------|--------------------------|----------------|
-| Foundation | `checksums`, `common`, `config`, `data-usage`, `utils` | Shared configuration, data-usage models, utilities, and checksums. |
+| Foundation | `checksums`, `common`, `config`, `data-usage`, `heal-contracts`, `scanner-contracts`, `utils` | Shared configuration, data-usage models, heal/scanner domain contracts, utilities, and checksums. |
 | I/O and storage | `concurrency`, `ecstore`, `filemeta`, `heal`, `io-core`, `io-metrics`, `lifecycle`, `lock`, `object-capacity`, `object-data-cache`, `replication`, `rio`, `rio-v2`, `scanner`, `storage-api` | Erasure-coded object storage, metadata, recovery, lifecycle, replication, locking, cache, and I/O pipelines. |
 | Security and identity | `credentials`, `crypto`, `iam`, `keystone`, `kms`, `policy`, `security-governance`, `signer`, `tls-runtime`, `trusted-proxies` | Credentials, authentication, authorization, encryption, key management, TLS, and security contracts. |
 | Protocols and contracts | `extension-schema`, `madmin`, `protos`, `protocols`, `s3-ops`, `s3-types`, `s3select-api`, `s3select-query` | Admin, inter-node, S3, S3 Select, and optional protocol contracts. |
@@ -128,7 +128,7 @@ default build (lifecycle:
      `crates/ecstore/src/bucket/replication/replication_state.rs`) — a naming
      collision, not copies; renaming is tracked in rustfs/backlog#1847.
    - `LastMinuteLatency` has two deliberately different implementations: the
-     per-second bucketed accumulator in `crates/common/src/last_minute.rs` and
+     per-second bucketed accumulator in `crates/scanner-contracts/src/last_minute.rs` and
      the in-memory endpoint-health sample tracker in
      `crates/ecstore/src/bucket/bucket_target_sys.rs` (its doc comment explains
      why it stays local).

@@ -26,6 +26,7 @@ members = [
     "crates/e2e_test", # End-to-end test suite
     "crates/filemeta", # File metadata management
     "crates/heal", # Erasure set and object healing
+    "crates/heal-contracts", # Heal request/response channel contracts
     "crates/iam", # Identity and Access Management
     "crates/keystone", # OpenStack Keystone integration
     "crates/lifecycle", # Lifecycle rule evaluation contracts
@@ -49,6 +50,7 @@ members = [
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
     "crates/scanner", # Scanner for data integrity checks and health monitoring
+    "crates/scanner-contracts", # Scanner metrics and cycle contracts
     "crates/security-governance", # Security governance contracts
     "crates/extension-schema", # Extension schema contracts
     "crates/signer", # client signer
@@ -88,6 +90,8 @@ redundant_clone = "warn"
 # RustFS Internal Crates
 rustfs = { path = "./rustfs", version = "1.0.0-rc.3" }
 rustfs-heal = { path = "crates/heal", version = "1.0.0-rc.3" }
+rustfs-heal-contracts = { path = "crates/heal-contracts", version = "1.0.0-rc.3" }
+rustfs-scanner-contracts = { path = "crates/scanner-contracts", version = "1.0.0-rc.3" }
 rustfs-audit = { path = "crates/audit", version = "1.0.0-rc.3" }
 rustfs-checksums = { path = "crates/checksums", version = "1.0.0-rc.3" }
 rustfs-common = { path = "crates/common", version = "1.0.0-rc.3" }
