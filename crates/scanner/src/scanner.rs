@@ -685,15 +685,15 @@ fn prepare_cycle_for_usage_floor_bootstrap(
     cycle_info: &mut CurrentCycle,
     usage_floor: PersistedUsageFloor,
     startup: PersistedUsageFloorStartup,
-) -> bool {
+) -> (bool, bool) {
     match startup {
-        PersistedUsageFloorStartup::Authoritative => false,
+        PersistedUsageFloorStartup::Authoritative => (false, false),
         PersistedUsageFloorStartup::Missing => {
             // Cycle progress without its corresponding usage floor cannot
             // prove namespace coverage. Restart from cycle zero while keeping
             // the separately fenced leader epoch monotonic.
             *cycle_info = CurrentCycle::default();
-            true
+            (true, true)
         }
         PersistedUsageFloorStartup::BootstrapPending => {
             // An unfenced marker may have been written before an upgrade's old
@@ -702,7 +702,7 @@ fn prepare_cycle_for_usage_floor_bootstrap(
             if usage_floor.leader_epoch == 0 {
                 *cycle_info = CurrentCycle::default();
             }
-            true
+            (true, usage_floor.leader_epoch == 0)
         }
     }
 }
@@ -1223,7 +1223,7 @@ where
     LockLost: Future<Output = ()>,
 {
     let fence_ctx = ctx.child_token();
-    let claim = claim_scanner_leadership(&fence_ctx, storeapi, cycle_info, cycle_revision, leader_epoch, false);
+    let claim = claim_scanner_leadership(&fence_ctx, storeapi, cycle_info, cycle_revision, leader_epoch, false, false);
     tokio::pin!(claim);
     tokio::pin!(lock_lost);
     tokio::select! {
@@ -2206,7 +2206,7 @@ async fn run_data_scanner_with_maintenance_state(
             return Ok(());
         }
     };
-    let allow_usage_floor_bootstrap_pending =
+    let (allow_usage_floor_bootstrap_pending, reset_usage_floor_bootstrap_cycle_on_conflict) =
         prepare_cycle_for_usage_floor_bootstrap(&mut cycle_info, usage_floor, usage_floor_startup);
     apply_persisted_usage_floor(&mut cycle_info, &mut leader_epoch, usage_floor);
     match usage_floor_startup {
@@ -2262,6 +2262,7 @@ async fn run_data_scanner_with_maintenance_state(
             &mut cycle_revision,
             &mut leader_epoch,
             allow_usage_floor_bootstrap_pending,
+            reset_usage_floor_bootstrap_cycle_on_conflict,
         ),
         guard.lock_lost_notified(),
     )

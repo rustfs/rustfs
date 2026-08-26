@@ -302,6 +302,7 @@ pub(super) async fn claim_scanner_leadership(
     revision: &mut DataUsageCacheRevision,
     persisted_epoch: &mut u64,
     allow_bootstrap_pending: bool,
+    reset_bootstrap_cycle_on_conflict: bool,
 ) -> bool {
     for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
         if ctx.is_cancelled() {
@@ -430,7 +431,12 @@ pub(super) async fn claim_scanner_leadership(
                         )
                         .await;
                     }
-                    Ok(ScannerLeadershipClaimReconcile::Changed) if retry < SCANNER_PERSIST_CAS_RETRIES => continue,
+                    Ok(ScannerLeadershipClaimReconcile::Changed) if retry < SCANNER_PERSIST_CAS_RETRIES => {
+                        if reset_bootstrap_cycle_on_conflict {
+                            *cycle_info = CurrentCycle::default();
+                        }
+                        continue;
+                    }
                     Ok(ScannerLeadershipClaimReconcile::Changed | ScannerLeadershipClaimReconcile::Unchanged) => {
                         error!(
                             target: "rustfs::scanner",
@@ -484,11 +490,17 @@ pub(super) async fn claim_scanner_leadership(
                     Ok(ScannerLeadershipClaimReconcile::Changed)
                         if retry < SCANNER_PERSIST_CAS_RETRIES && !ctx.is_cancelled() =>
                     {
+                        if reset_bootstrap_cycle_on_conflict {
+                            *cycle_info = CurrentCycle::default();
+                        }
                         continue;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Unchanged)
                         if precondition_failed && retry < SCANNER_PERSIST_CAS_RETRIES && !ctx.is_cancelled() =>
                     {
+                        if reset_bootstrap_cycle_on_conflict {
+                            *cycle_info = CurrentCycle::default();
+                        }
                         continue;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Changed | ScannerLeadershipClaimReconcile::Unchanged) => {

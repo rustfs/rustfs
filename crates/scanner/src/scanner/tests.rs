@@ -2200,21 +2200,23 @@ fn missing_usage_floor_discards_unfenced_cycle_progress() {
         started: Utc::now(),
     };
 
-    assert!(prepare_cycle_for_usage_floor_bootstrap(
-        &mut cycle,
-        PersistedUsageFloor::default(),
-        PersistedUsageFloorStartup::Missing,
-    ));
+    assert_eq!(
+        prepare_cycle_for_usage_floor_bootstrap(&mut cycle, PersistedUsageFloor::default(), PersistedUsageFloorStartup::Missing,),
+        (true, true)
+    );
     assert_eq!(cycle.next, 0);
     assert_eq!(cycle.current, 0);
     assert!(cycle.cycle_completed.is_empty());
 
     cycle.next = 12;
-    assert!(prepare_cycle_for_usage_floor_bootstrap(
-        &mut cycle,
-        PersistedUsageFloor::default(),
-        PersistedUsageFloorStartup::BootstrapPending,
-    ));
+    assert_eq!(
+        prepare_cycle_for_usage_floor_bootstrap(
+            &mut cycle,
+            PersistedUsageFloor::default(),
+            PersistedUsageFloorStartup::BootstrapPending,
+        ),
+        (true, true)
+    );
     assert_eq!(cycle.next, 0);
 }
 
@@ -2225,24 +2227,30 @@ fn fenced_usage_bootstrap_retains_partial_cycle_progress() {
         ..Default::default()
     };
 
-    assert!(prepare_cycle_for_usage_floor_bootstrap(
-        &mut cycle,
-        PersistedUsageFloor {
-            next_cycle: 0,
-            leader_epoch: 7,
-        },
-        PersistedUsageFloorStartup::BootstrapPending,
-    ));
+    assert_eq!(
+        prepare_cycle_for_usage_floor_bootstrap(
+            &mut cycle,
+            PersistedUsageFloor {
+                next_cycle: 0,
+                leader_epoch: 7,
+            },
+            PersistedUsageFloorStartup::BootstrapPending,
+        ),
+        (true, false)
+    );
     assert_eq!(cycle.next, 12);
 
-    assert!(!prepare_cycle_for_usage_floor_bootstrap(
-        &mut cycle,
-        PersistedUsageFloor {
-            next_cycle: 13,
-            leader_epoch: 7,
-        },
-        PersistedUsageFloorStartup::Authoritative,
-    ));
+    assert_eq!(
+        prepare_cycle_for_usage_floor_bootstrap(
+            &mut cycle,
+            PersistedUsageFloor {
+                next_cycle: 13,
+                leader_epoch: 7,
+            },
+            PersistedUsageFloorStartup::Authoritative,
+        ),
+        (false, false)
+    );
     assert_eq!(cycle.next, 12);
 }
 
@@ -2272,7 +2280,8 @@ async fn missing_usage_floor_rebuilds_persisted_cycle_before_leadership_claim() 
         .await
         .expect("stably missing usage floor should admit a bootstrap marker");
     assert_eq!(startup, PersistedUsageFloorStartup::Missing);
-    let allow_bootstrap_pending = prepare_cycle_for_usage_floor_bootstrap(&mut cycle_info, usage_floor, startup);
+    let (allow_bootstrap_pending, reset_bootstrap_cycle_on_conflict) =
+        prepare_cycle_for_usage_floor_bootstrap(&mut cycle_info, usage_floor, startup);
     apply_persisted_usage_floor(&mut cycle_info, &mut persisted_epoch, usage_floor);
     initialize_usage_baseline_bootstrap(store.clone())
         .await
@@ -2286,6 +2295,7 @@ async fn missing_usage_floor_rebuilds_persisted_cycle_before_leadership_claim() 
             &mut cycle_revision,
             &mut persisted_epoch,
             allow_bootstrap_pending,
+            reset_bootstrap_cycle_on_conflict,
         )
         .await
     );
@@ -2640,7 +2650,7 @@ async fn test_leadership_claim_preserves_usage_epoch_floor_across_old_epoch_conf
     );
 
     let mut persisted_epoch = 8;
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
+    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
 
     let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
         .await
@@ -2650,6 +2660,42 @@ async fn test_leadership_claim_preserves_usage_epoch_floor_across_old_epoch_conf
     assert_eq!(claimed_epoch, 9);
     assert_eq!(persisted_epoch, 9);
     assert_eq!(store.put_counts.lock().await.get(&key), Some(&3));
+}
+
+#[tokio::test]
+async fn unfenced_usage_bootstrap_discards_old_epoch_conflict_progress() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let ctx = CancellationToken::new();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle {
+        next: 12,
+        ..Default::default()
+    };
+    assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 1).await);
+    initialize_usage_baseline_bootstrap(store.clone())
+        .await
+        .expect("missing usage floor should publish a pending marker");
+
+    cycle = CurrentCycle::default();
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    let stale_cycle = CurrentCycle {
+        next: 14,
+        ..Default::default()
+    };
+    store.interleaving_puts.lock().await.insert(
+        key,
+        (2, encode_scanner_cycle_state(&stale_cycle, 1).expect("stale cycle state should encode")),
+    );
+
+    let mut persisted_epoch = 1;
+    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, true, true).await);
+
+    let state = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .expect("rebuilt leadership claim should remain persisted");
+    let (claimed_cycle, claimed_epoch) = decode_scanner_cycle_state(&state).expect("claimed cycle state should decode");
+    assert_eq!(claimed_cycle.next, 0);
+    assert_eq!(claimed_epoch, 2);
 }
 
 #[tokio::test]
@@ -2663,7 +2709,7 @@ async fn test_leadership_claim_rejects_terminal_epoch() {
     };
     let mut persisted_epoch = u64::MAX - 1;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
     assert_eq!(persisted_epoch, u64::MAX - 1);
     assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
 }
@@ -2679,7 +2725,7 @@ async fn scanner_defers_leadership_when_usage_snapshots_are_stably_absent() {
     };
     let mut persisted_epoch = 0;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
     assert!(read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
     assert!(read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str()).await.is_err());
 }
@@ -2695,9 +2741,9 @@ async fn usage_bootstrap_pending_unblocks_first_leadership_claim() {
     let mut revision = DataUsageCacheRevision::Missing;
     let mut cycle = CurrentCycle::default();
     let mut persisted_epoch = 0;
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false,).await);
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false,).await);
     assert!(read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, true).await);
+    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, true, true).await);
 
     let usage = read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
@@ -2785,7 +2831,7 @@ async fn leadership_claim_defers_on_corrupt_usage_baseline_without_bloom_write()
     };
     let mut persisted_epoch = 0;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
     assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
 }
 
@@ -2805,7 +2851,7 @@ async fn leadership_claim_defers_on_unidentified_usage_baseline_without_bloom_wr
     };
     let mut persisted_epoch = 0;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
+    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
     assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
 }
 
@@ -2827,7 +2873,7 @@ async fn test_leadership_claim_confirms_commit_after_returned_error() {
     let mut persisted_epoch = 0;
     seed_usage_snapshot_for_leadership_claim(&store).await;
 
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
+    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
 
     let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
         .await
@@ -2883,7 +2929,7 @@ async fn test_leadership_claim_usage_fence_rejects_old_inflight_writer() {
         ..Default::default()
     };
     let mut persisted_epoch = 4;
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false).await);
+    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
 
     let (fenced_data, fenced_revision) = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
@@ -2948,6 +2994,7 @@ async fn cycle_budget_lease_takeover_rejects_old_generation() {
             &mut replacement_cycle,
             &mut replacement_revision,
             &mut replacement_epoch,
+            false,
             false,
         )
         .await
