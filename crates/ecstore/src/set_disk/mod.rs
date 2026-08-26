@@ -792,6 +792,65 @@ const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX: &str = "RUSTFS_GET_M
 const ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH: &str = "RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH";
 const DEFAULT_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH: bool = true;
 
+/// Identifies the caller's read contract for policies that are deliberately
+/// narrower than the storage API's ordinary GET contract.
+///
+/// Server-side copy consumes a source reader while a destination writer is
+/// applying backpressure.  Its source read must not speculatively open the
+/// next multipart part: those extra shard streams can share an internode H2
+/// connection with the current part and starve the lockstep decoder.  Keep
+/// this context internal so the public `ObjectOptions` and storage traits do
+/// not acquire a copy-only field.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum GetObjectReadPolicy {
+    #[default]
+    Default,
+    CopySource,
+}
+
+impl GetObjectReadPolicy {
+    pub(crate) const fn allows_multipart_setup_prefetch(self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
+tokio::task_local! {
+    static GET_OBJECT_READ_POLICY: GetObjectReadPolicy;
+    static GET_OBJECT_READ_CANCELLATION: tokio_util::sync::CancellationToken;
+}
+
+pub(crate) fn get_object_read_policy() -> GetObjectReadPolicy {
+    GET_OBJECT_READ_POLICY.try_with(|policy| *policy).unwrap_or_default()
+}
+
+pub(crate) async fn with_get_object_read_policy<F>(policy: GetObjectReadPolicy, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let decode_policy = match policy {
+        GetObjectReadPolicy::Default => crate::erasure::coding::decode::DecodeReadPolicy::Default,
+        GetObjectReadPolicy::CopySource => crate::erasure::coding::decode::DecodeReadPolicy::DemandBound,
+    };
+    crate::erasure::coding::decode::with_decode_read_policy(decode_policy, GET_OBJECT_READ_POLICY.scope(policy, future)).await
+}
+
+/// Return the request-owned cancellation token for a copy source, when one is
+/// installed. The token is read before the detached legacy producer is spawned;
+/// Tokio task-local values do not cross that spawn boundary on their own.
+pub(crate) fn get_object_read_cancellation() -> Option<tokio_util::sync::CancellationToken> {
+    GET_OBJECT_READ_CANCELLATION.try_with(|token| token.clone()).ok()
+}
+
+pub(crate) async fn with_get_object_read_cancellation<F>(
+    cancellation: tokio_util::sync::CancellationToken,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    GET_OBJECT_READ_CANCELLATION.scope(cancellation, future).await
+}
+
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod core;
@@ -2296,6 +2355,7 @@ enum GetCodecStreamingFallbackReason {
     InvalidMinSize,
     ReadQuorumNotSafe,
     MultipartPartLimit,
+    CopySourceDemandBound,
 }
 
 impl GetCodecStreamingFallbackReason {
@@ -2317,6 +2377,7 @@ impl GetCodecStreamingFallbackReason {
             Self::InvalidMinSize => "invalid_min_size",
             Self::ReadQuorumNotSafe => "read_quorum_not_safe",
             Self::MultipartPartLimit => "multipart_part_limit",
+            Self::CopySourceDemandBound => "copy_source_demand_bound",
         }
     }
 }
@@ -2620,6 +2681,17 @@ fn get_codec_streaming_reader_gate(
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled),
+            prefer_data_blocks_first_reader_setup: false,
+        };
+    }
+    if matches!(get_object_read_policy(), GetObjectReadPolicy::CopySource) {
+        // The codec reader has its own bounded fill worker.  It may still
+        // request an additional stripe for a plain single-part object even
+        // when multipart setup prefetch is disabled, so copy sources use the
+        // legacy demand-bound reader for every object class.
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::CopySourceDemandBound),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
@@ -5907,6 +5979,29 @@ mod tests {
     use time::OffsetDateTime;
     use tokio::fs;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn copy_source_read_policy_is_scoped_and_demand_bound() {
+        assert_eq!(get_object_read_policy(), GetObjectReadPolicy::Default);
+        assert!(GetObjectReadPolicy::Default.allows_multipart_setup_prefetch());
+        assert!(!GetObjectReadPolicy::CopySource.allows_multipart_setup_prefetch());
+
+        with_get_object_read_policy(GetObjectReadPolicy::CopySource, async {
+            assert_eq!(get_object_read_policy(), GetObjectReadPolicy::CopySource);
+            assert!(!get_object_read_policy().allows_multipart_setup_prefetch());
+            assert_eq!(
+                crate::erasure::coding::decode::decode_read_policy(),
+                crate::erasure::coding::decode::DecodeReadPolicy::DemandBound
+            );
+        })
+        .await;
+
+        assert_eq!(get_object_read_policy(), GetObjectReadPolicy::Default);
+        assert_eq!(
+            crate::erasure::coding::decode::decode_read_policy(),
+            crate::erasure::coding::decode::DecodeReadPolicy::Default
+        );
+    }
 
     #[test]
     fn complete_part_error_maps_confirmed_missing_to_invalid_part() {

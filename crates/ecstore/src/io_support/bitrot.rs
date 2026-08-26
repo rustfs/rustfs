@@ -346,16 +346,11 @@ impl AsyncRead for DeferredObjectReader {
 }
 
 fn disk_error_to_io_error(err: DiskError) -> io::Error {
-    let kind = match err {
-        DiskError::Timeout | DiskError::SourceStalled => io::ErrorKind::TimedOut,
-        DiskError::DiskNotFound | DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::PathNotFound => {
-            io::ErrorKind::NotFound
-        }
-        DiskError::FileCorrupt | DiskError::PartMissingOrCorrupt | DiskError::BitrotHashAlgoInvalid => io::ErrorKind::InvalidData,
-        DiskError::Io(io_err) => return io_err,
-        _ => io::ErrorKind::Other,
-    };
-    io::Error::new(kind, err.to_string())
+    // Keep the typed disk error attached to deferred-reader failures. The
+    // decoder uses the marker to retire a stream that can no longer be
+    // realigned, while quorum reduction still sees Timeout/NotFound instead
+    // of an opaque `DiskError::Io` wrapper.
+    crate::disk::error::terminal_read_error_to_io(err)
 }
 
 async fn open_disk_reader(

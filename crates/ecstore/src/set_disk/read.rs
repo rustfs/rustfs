@@ -792,7 +792,7 @@ impl SetDisks {
         let use_mmap_read = object_mmap_read_enabled();
         let files = Arc::new(files);
         let disks = Arc::new(disks);
-        let prefetch_enabled = is_multipart_reader_setup_prefetch_enabled();
+        let prefetch_enabled = multipart_reader_setup_prefetch_enabled(get_object_read_policy());
         let mut prefetched: Option<(usize, PrefetchedReaderSetup)> = None;
 
         let mut total_read = 0;
@@ -1065,8 +1065,9 @@ impl SetDisks {
             let unattempted_data_shards = !reader_setup.data_shards_attempted(erasure.data_shards);
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
+            let deferred_reopeners = reader_setup.deferred_reopeners;
             let (written, err) = erasure
-                .decode_with_stripe_handles(
+                .decode_with_stripe_handles_and_reopeners(
                     writer,
                     readers,
                     part_offset,
@@ -1074,6 +1075,7 @@ impl SetDisks {
                     part_size,
                     read_costs,
                     deferred_stripe_handles,
+                    deferred_reopeners,
                 )
                 .await;
             let decode_elapsed = decode_stage_start.elapsed();
@@ -1476,6 +1478,7 @@ impl SetDisks {
                     erasure.clone(),
                     reader_setup.readers,
                     reader_setup.deferred_stripe_handles,
+                    reader_setup.deferred_reopeners,
                     read_costs,
                     part_offset,
                     part_length,
@@ -1488,6 +1491,7 @@ impl SetDisks {
 
         let readers = reader_setup.readers;
         let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
+        let deferred_reopeners = reader_setup.deferred_reopeners;
         let source = if let Some(read_costs) = read_costs {
             coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
                 readers,
@@ -1506,7 +1510,8 @@ impl SetDisks {
                 Some(metrics_path),
             )
         }
-        .with_deferred_parity_handles(deferred_stripe_handles);
+        .with_deferred_parity_handles(deferred_stripe_handles)
+        .with_deferred_parity_reopeners(deferred_reopeners);
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader =
             coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?;
@@ -1533,6 +1538,10 @@ fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgori
     } else {
         checksum_info.algorithm
     }
+}
+
+fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool {
+    policy.allows_multipart_setup_prefetch() && is_multipart_reader_setup_prefetch_enabled()
 }
 
 /// Run one part's bitrot reader setup and measure its wall-clock duration.
@@ -1762,10 +1771,12 @@ impl Drop for LazyMultipartCodecStreamingReader {
 /// background task drives the decode into the write half while the returned
 /// reader drains the read half. No extra file descriptors are opened — the
 /// readers are moved in from the setup that just ran.
+#[allow(clippy::too_many_arguments)]
 fn build_legacy_per_part_fallback_reader(
     erasure: coding::Erasure,
     readers: Vec<Option<ObjectBitrotReader>>,
     deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
+    deferred_reopeners: Vec<Option<DeferredReaderReopener>>,
     read_costs: Option<Vec<ShardReadCost>>,
     part_offset: usize,
     part_length: usize,
@@ -1775,7 +1786,7 @@ fn build_legacy_per_part_fallback_reader(
     let (read_half, mut write_half) = tokio::io::duplex(buffer);
     let decode = tokio::spawn(async move {
         let (_written, err) = erasure
-            .decode_with_stripe_handles(
+            .decode_with_stripe_handles_and_reopeners(
                 &mut write_half,
                 readers,
                 part_offset,
@@ -1783,6 +1794,7 @@ fn build_legacy_per_part_fallback_reader(
                 part_size,
                 read_costs,
                 deferred_stripe_handles,
+                deferred_reopeners,
             )
             .await;
         // Dropping `write_half` on return signals EOF to the reader half.
@@ -3230,6 +3242,7 @@ mod metadata_cache_tests {
 mod tests {
     use super::*;
     use crate::erasure::coding::BitrotWriter;
+    use serial_test::serial;
     use std::io::{Cursor, ErrorKind, IoSlice};
     use std::sync::{
         Arc,
@@ -3239,6 +3252,15 @@ mod tests {
 
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
+
+    #[test]
+    #[serial]
+    fn multipart_reader_setup_prefetch_is_disabled_only_for_copy_sources() {
+        temp_env::with_var(ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH, Some("true"), || {
+            assert!(multipart_reader_setup_prefetch_enabled(GetObjectReadPolicy::Default));
+            assert!(!multipart_reader_setup_prefetch_enabled(GetObjectReadPolicy::CopySource));
+        });
+    }
 
     #[tokio::test]
     async fn downstream_writer_marks_closed_duplex_reader_as_downstream_close() {
@@ -5475,6 +5497,7 @@ mod tests {
             erasure,
             setup.readers,
             setup.deferred_stripe_handles,
+            Vec::new(),
             None,
             0,
             data.len(),
@@ -5525,6 +5548,7 @@ mod tests {
                     erasure,
                     setup.readers,
                     setup.deferred_stripe_handles,
+                    Vec::new(),
                     None,
                     0,
                     part2_len,
@@ -5565,6 +5589,7 @@ mod tests {
             erasure,
             setup.readers,
             setup.deferred_stripe_handles,
+            Vec::new(),
             None,
             0,
             data.len(),
@@ -6001,6 +6026,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn codec_streaming_reader_gate_keeps_copy_source_demand_bound_for_all_classes() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            async {
+                let fi = codec_streaming_test_fileinfo(1024, 2);
+                let object_info = codec_streaming_test_object_info(&fi);
+                let normal = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+                assert_eq!(normal.decision, GetCodecStreamingDecision::Use);
+
+                let plain_fi = codec_streaming_test_fileinfo(1024, 1);
+                let plain_object_info = codec_streaming_test_object_info(&plain_fi);
+                let normal_plain = codec_streaming_reader_gate_for_test(&None, &plain_object_info, &plain_fi, true);
+                assert_eq!(normal_plain.object_class, GetCodecStreamingObjectClass::PlainSinglePart);
+                assert_eq!(normal_plain.decision, GetCodecStreamingDecision::Use);
+
+                let copy = with_get_object_read_policy(GetObjectReadPolicy::CopySource, async {
+                    let multipart = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+                    let plain = codec_streaming_reader_gate_for_test(&None, &plain_object_info, &plain_fi, true);
+                    (multipart, plain)
+                })
+                .await;
+                assert_eq!(
+                    copy.0.decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::CopySourceDemandBound)
+                );
+                assert_eq!(
+                    copy.1.decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::CopySourceDemandBound)
+                );
+            },
+        )
+        .await;
+    }
+
     #[test]
     fn codec_streaming_reader_gate_keeps_multipart_default_off() {
         temp_env::with_vars(
@@ -6102,6 +6170,10 @@ mod tests {
         assert_eq!(GetCodecStreamingFallbackReason::InvalidMinSize.as_str(), "invalid_min_size");
         assert_eq!(GetCodecStreamingFallbackReason::ReadQuorumNotSafe.as_str(), "read_quorum_not_safe");
         assert_eq!(GetCodecStreamingFallbackReason::MultipartPartLimit.as_str(), "multipart_part_limit");
+        assert_eq!(
+            GetCodecStreamingFallbackReason::CopySourceDemandBound.as_str(),
+            "copy_source_demand_bound"
+        );
         assert_eq!(GetCodecStreamingObjectClass::PlainSinglePart.as_str(), "plain_single_part");
         assert_eq!(GetCodecStreamingObjectClass::Range.as_str(), "range");
         assert_eq!(GetCodecStreamingObjectClass::Encrypted.as_str(), "encrypted");
