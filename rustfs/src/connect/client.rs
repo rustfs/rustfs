@@ -64,7 +64,7 @@ pub(crate) enum RotationAttempt {
 }
 
 enum SingleRequest {
-    Response(CredentialResponse),
+    Response(Box<CredentialResponse>),
     Unavailable {
         status: Option<StatusCode>,
         retry_after: Option<Duration>,
@@ -329,7 +329,7 @@ impl ConnectClient {
         let path = format!("clusterDevices/{}:rotateCredential", credential.uid);
         let url = self.url(&path)?;
         let response = match self.send_once(StatusCode::OK, client.post(url).json(&body)).await? {
-            SingleRequest::Response(response) => response,
+            SingleRequest::Response(response) => *response,
             SingleRequest::Unavailable { status, retry_after } => {
                 return Ok(RotationAttempt::Unavailable { status, retry_after });
             }
@@ -520,7 +520,9 @@ impl ConnectClient {
         };
         let status = response.status();
         if status == success {
-            return decode_response(response).await.map(SingleRequest::Response);
+            return decode_response(response)
+                .await
+                .map(|response| SingleRequest::Response(Box::new(response)));
         }
         if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
             let reason = decode_reason(response).await;

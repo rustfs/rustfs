@@ -3275,9 +3275,8 @@ fn successful_delete_audit_objects(
         .objects
         .iter()
         .zip(successful_results)
-        .filter_map(|(requested, successful)| {
-            successful.then(|| AuditObjectVersion::new(requested.key.clone(), requested.version_id.clone()))
-        })
+        .filter(|(_, successful)| *successful)
+        .map(|(requested, _)| AuditObjectVersion::new(requested.key.clone(), requested.version_id.clone()))
         .collect()
 }
 
