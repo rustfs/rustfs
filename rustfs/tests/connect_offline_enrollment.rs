@@ -54,6 +54,14 @@ fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../protocol/agent/v1/fixtures/offline-enrollment")
 }
 
+#[cfg(feature = "offline-enrollment-e2e-root")]
+fn e2e_fixture(name: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/offline-enrollment-e2e")
+        .join(name);
+    fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -266,6 +274,85 @@ fn every_challenge_accept_vector_verifies_and_exposes_the_signed_fields() {
         verified_count, 3,
         "accept-vectors.json publishes three challenge vectors; a fourth is a protocol change"
     );
+}
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+#[test]
+fn e2e_root_is_fixed_and_disjoint_from_the_hosted_root() {
+    let challenge = e2e_fixture("challenge.json");
+    let now = unix("2099-01-01T00:00:00Z");
+
+    let verified =
+        OfflineEnrollment::verify_e2e_challenge(&challenge, now).expect("the dedicated E2E root verifies its challenge");
+    assert_eq!(verified.challenge_id, "018f7e6d-9d6a-7d93-8f64-8b20b3384712");
+    assert_eq!(
+        OfflineEnrollment::verify_challenge(&challenge, now)
+            .expect_err("the production verifier must not trust the E2E root")
+            .reason(),
+        "ENROLLMENT_ROOT_UNKNOWN"
+    );
+
+    let hosted = accept_vector_named("challenge signed by a chained signing key under the pinned root");
+    let hosted_now = unix(field(&hosted, "evaluationTime"));
+    assert_eq!(
+        OfflineEnrollment::verify_e2e_challenge(&envelope(&hosted["document"]), hosted_now)
+            .expect_err("the E2E verifier must not silently retain the hosted root")
+            .reason(),
+        "ENROLLMENT_ROOT_UNKNOWN"
+    );
+}
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+#[test]
+fn e2e_public_chain_matches_the_challenge_and_every_signature_verifies() {
+    use p256::ecdsa::signature::Verifier as _;
+
+    let root: Value = serde_json::from_slice(&e2e_fixture("root.json")).expect("E2E root parses");
+    let chain_bytes = e2e_fixture("trust-chain.json");
+    let chain: Value = serde_json::from_slice(&chain_bytes).expect("E2E chain parses");
+    let challenge_envelope: Value = serde_json::from_slice(&e2e_fixture("challenge.json")).expect("E2E challenge parses");
+    let challenge_bytes = signed_octets(&challenge_envelope);
+    let challenge: Value = serde_json::from_slice(&challenge_bytes).expect("signed E2E challenge parses");
+
+    assert_eq!(challenge["trustChain"], chain, "the independent and embedded chain JSON must match");
+    let compact_chain = chain_bytes
+        .strip_suffix(b"\n")
+        .expect("the chain fixture has one final newline");
+    assert!(
+        challenge_bytes
+            .windows(compact_chain.len())
+            .any(|window| window == compact_chain),
+        "the signed challenge must embed the independent chain byte for byte"
+    );
+
+    let mut issuer = verifying_key(field(&root, "publicKey"));
+    let mut issuer_id = field(&root, "keyId");
+    for link in chain.as_array().expect("E2E chain is a list") {
+        assert_eq!(field(&link["signature"], "keyId"), issuer_id);
+        let signature = BASE64_URL_NO_PAD
+            .decode(field(&link["signature"], "value"))
+            .expect("trust-link signature is base64url");
+        issuer
+            .verify(
+                &signing_input("rustfs-offline-trust-link-v1", &signed_octets(link)),
+                &p256::ecdsa::Signature::from_slice(&signature).expect("trust-link signature parses"),
+            )
+            .expect("trust-link signature verifies");
+        let document = signed_document(link);
+        issuer_id = field(&document, "subjectKeyId");
+        issuer = verifying_key(field(&document, "subjectPublicKey"));
+    }
+
+    assert_eq!(field(&challenge, "connectKeyId"), issuer_id);
+    let signature = BASE64_URL_NO_PAD
+        .decode(field(&challenge_envelope["signature"], "value"))
+        .expect("challenge signature is base64url");
+    issuer
+        .verify(
+            &signing_input("rustfs-offline-enrollment-challenge-v1", &challenge_bytes),
+            &p256::ecdsa::Signature::from_slice(&signature).expect("challenge signature parses"),
+        )
+        .expect("challenge signature verifies");
 }
 
 /// Connect's own producer wrote the response accept vectors. Rebuilding them

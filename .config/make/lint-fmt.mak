@@ -80,6 +80,11 @@ embedded-secrets-check: ## Check no private key material or credential literal i
 	@echo "🔑 Checking embedded secret material guard..."
 	./scripts/check_embedded_secrets.sh
 
+.PHONY: offline-enrollment-e2e-check
+offline-enrollment-e2e-check: core-deps ## Build and exercise the dedicated offline enrollment E2E root
+	@echo "🔐 Checking the offline enrollment E2E root boundary..."
+	./scripts/check_offline_enrollment_e2e.sh
+
 .PHONY: test-wiring-check
 test-wiring-check: ## Check tests stay registered and selected by their intended runners
 	@echo "🧪 Checking test wiring..."
