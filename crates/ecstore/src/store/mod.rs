@@ -89,6 +89,28 @@ type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 pub const SCANNER_PUBLICATION_LEASE_TTL_MS: u64 = 60_000;
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct BucketMetadataLessResidue {
+    pub(crate) xlmeta_found: bool,
+    pub(crate) files: usize,
+    pub(crate) uuid_data_dirs: usize,
+    pub(crate) sample: Option<String>,
+}
+
+impl BucketMetadataLessResidue {
+    pub(crate) fn has_residue_without_xlmeta(&self) -> bool {
+        !self.xlmeta_found && self.files > 0
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        let sample = self.sample.as_deref().unwrap_or("<none>");
+        format!(
+            "metadata-less on-disk residue remains after empty-bucket verification: files={}, uuid_data_dirs={}, sample={sample}",
+            self.files, self.uuid_data_dirs
+        )
+    }
+}
+
 /// Check if a directory contains any xl.meta files (indicating actual S3 objects)
 /// This is used to determine if a bucket is empty for deletion purposes.
 pub(crate) async fn has_xlmeta_files(path: &std::path::Path) -> std::io::Result<bool> {
@@ -121,6 +143,53 @@ pub(crate) async fn has_xlmeta_files(path: &std::path::Path) -> std::io::Result<
     }
 
     Ok(false)
+}
+
+pub(crate) async fn scan_metadata_less_residue(path: &std::path::Path) -> std::io::Result<BucketMetadataLessResidue> {
+    use crate::disk::STORAGE_FORMAT_FILE;
+    use tokio::fs;
+
+    let mut scan = BucketMetadataLessResidue::default();
+    let mut stack = vec![path.to_path_buf()];
+
+    while let Some(current_path) = stack.pop() {
+        let mut entries = match fs::read_dir(&current_path).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            if file_name_str == STORAGE_FORMAT_FILE {
+                scan.xlmeta_found = true;
+                continue;
+            }
+
+            if file_type.is_dir() {
+                if Uuid::parse_str(&file_name_str).is_ok() {
+                    scan.uuid_data_dirs = scan.uuid_data_dirs.saturating_add(1);
+                }
+                stack.push(entry.path());
+            } else {
+                scan.files = scan.files.saturating_add(1);
+                if scan.sample.is_none() {
+                    let entry_path = entry.path();
+                    let sample = entry_path
+                        .strip_prefix(path)
+                        .unwrap_or(entry_path.as_path())
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/");
+                    scan.sample = Some(sample);
+                }
+            }
+        }
+    }
+
+    Ok(scan)
 }
 
 async fn enqueue_transition_after_write(result: Result<ObjectInfo>, src: LcEventSrc) -> Result<ObjectInfo> {
