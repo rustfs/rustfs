@@ -2815,6 +2815,130 @@ pub struct SsecParams {
 }
 
 // ============================================================================
+// Object-level DEK rewrap adapter
+// ============================================================================
+
+/// Outcome of a single object's DEK rewrap attempt.
+// Consumed by the bulk rekey sweep in the follow-up PR; tests exercise it now.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum ObjectDekRewrapOutcome {
+    /// The object carries no KMS-wrapped RustFS data-key envelope this build
+    /// can rewrap: plaintext, SSE-C, or a MinIO-sealed data key.
+    NotApplicable,
+    /// The envelope is already on the current master key version and format;
+    /// the caller must persist nothing, so a sweep re-run converges.
+    AlreadyCurrent,
+    /// The envelope was rewrapped. `metadata` holds the overrides to merge
+    /// into the object's user-defined metadata — every stored copy of the old
+    /// envelope, replaced — via `ObjectLayer::put_object_metadata`.
+    Rewrapped { metadata: HashMap<String, String> },
+}
+
+/// Rewrap the KMS-wrapped data key in an object's stored metadata onto its
+/// master key's current version (and current envelope format), without
+/// touching the object's data or its plaintext DEK.
+///
+/// Mirrors the managed decrypt path byte for byte where it matters: the
+/// envelope is located through the same normalized-header resolution, and the
+/// encryption context is rebuilt with the same helpers, so an envelope the
+/// read path can open is exactly an envelope this can rewrap. The KMS backend
+/// owns the format and the no-op decision.
+///
+/// The returned overrides replace every stored copy of the old envelope
+/// (RustFS's internal header and the MinIO-compatible slots that the writer
+/// fills with the same bytes). A copy left behind would win a read-path
+/// fallback and resurrect the old wrapping, so finding no replaceable copy is
+/// an error, never a silent success.
+#[allow(dead_code)] // Consumed by the bulk rekey sweep in the follow-up PR; tests exercise it now.
+pub(crate) async fn rewrap_object_encryption_metadata(
+    bucket: &str,
+    key: &str,
+    metadata: &HashMap<String, String>,
+) -> Result<ObjectDekRewrapOutcome, ApiError> {
+    if !contains_managed_encryption_metadata(metadata) {
+        return Ok(ObjectDekRewrapOutcome::NotApplicable);
+    }
+
+    let encryption_type = match metadata.get("x-amz-server-side-encryption").map(String::as_str) {
+        Some(ServerSideEncryption::AWS_KMS) => SSEType::SseKms,
+        Some(_) => SSEType::SseS3,
+        // MinIO-written objects synthesize the public header on read; their
+        // sealed data keys are not RustFS envelopes and fall out below.
+        None => SSEType::SseS3,
+    };
+
+    let normalized_metadata = normalize_managed_metadata(metadata, Some(recode_minio_kms_context));
+    let Some(envelope_b64) = normalized_metadata
+        .get(INTERNAL_ENCRYPTION_KEY_HEADER)
+        .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER))
+    else {
+        return Ok(ObjectDekRewrapOutcome::NotApplicable);
+    };
+    let encrypted_data_key = BASE64_STANDARD
+        .decode(envelope_b64)
+        .map_err(|e| ApiError::from(StorageError::other(format!("Failed to decode encrypted key: {e}"))))?;
+    // Only RustFS envelopes are rewrappable here; MinIO's builtin-KMS
+    // ciphertext is opaque bytes owned by a different root of trust.
+    if !is_data_key_envelope(&encrypted_data_key) {
+        return Ok(ObjectDekRewrapOutcome::NotApplicable);
+    }
+
+    let kms_context = if matches!(encryption_type, SSEType::SseKms) {
+        decode_minio_kms_context(metadata)?
+    } else {
+        None
+    };
+    let object_context = build_object_encryption_context(bucket, key, kms_context.as_ref());
+
+    // The same provider selection as the managed decrypt path: the
+    // test-injected provider when registered, the KMS-backed one otherwise.
+    let provider: Arc<dyn SseDekProvider> =
+        if let Some(cached) = GLOBAL_KMS_DEK_PROVIDER.read().ok().and_then(|guard| guard.as_ref().cloned()) {
+            cached
+        } else {
+            Arc::new(KmsSseDekProvider::new().await?)
+        };
+    let response = provider.rewrap_sse_dek(&encrypted_data_key, &object_context).await?;
+    if !response.rewrapped {
+        return Ok(ObjectDekRewrapOutcome::AlreadyCurrent);
+    }
+
+    // Replace every stored copy of the old envelope, keyed by value and
+    // matched case-insensitively: metadata key casing drifts through the
+    // storage layer, and an override inserted under a differently-cased name
+    // would sit beside the old copy instead of replacing it. The MinIO
+    // sealed-key slots can instead hold a sealed *object* key (rio-v2 writer);
+    // those bytes differ from the envelope and are untouched — the data key
+    // they seal is unchanged by a rewrap.
+    const REWRAP_ENVELOPE_HEADERS: [&str; 4] = [
+        INTERNAL_ENCRYPTION_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+    ];
+    let old_envelope_b64 = envelope_b64.clone();
+    let new_envelope_b64 = BASE64_STANDARD.encode(&response.ciphertext);
+    let mut overrides = HashMap::new();
+    for (stored_name, stored_value) in metadata {
+        let is_envelope_slot = REWRAP_ENVELOPE_HEADERS
+            .iter()
+            .any(|header| stored_name.eq_ignore_ascii_case(header));
+        if is_envelope_slot && *stored_value == old_envelope_b64 {
+            overrides.insert(stored_name.clone(), new_envelope_b64.clone());
+        }
+    }
+    if overrides.is_empty() {
+        return Err(ApiError::from(StorageError::other(
+            "rewrapped a data-key envelope but found no stored metadata copy to replace; refusing a write that would \
+             leave the old wrapping live",
+        )));
+    }
+
+    Ok(ObjectDekRewrapOutcome::Rewrapped { metadata: overrides })
+}
+
+// ============================================================================
 // SSE DEK Provider Abstraction (Factory Pattern)
 // ============================================================================
 
@@ -2833,6 +2957,22 @@ pub trait SseDekProvider: Send + Sync {
         kms_key_id: &str,
         context: &ObjectEncryptionContext,
     ) -> Result<[u8; 32], ApiError>;
+
+    /// Re-wrap a KMS-wrapped DEK envelope onto its master key's current
+    /// version without exposing the plaintext DEK to the caller.
+    ///
+    /// Defaults to refusing: only the KMS-backed provider can rewrap, and a
+    /// provider that cannot must say so rather than hand back the input as if
+    /// it had been re-protected.
+    async fn rewrap_sse_dek(
+        &self,
+        _encrypted_dek: &[u8],
+        _context: &ObjectEncryptionContext,
+    ) -> Result<rustfs_kms::types::RewrapDataKeyResponse, ApiError> {
+        Err(ApiError::from(StorageError::other(
+            "This DEK provider cannot rewrap KMS-wrapped data keys",
+        )))
+    }
 
     /// Decrypt a DEK from positively identified legacy managed metadata.
     #[cfg(feature = "rio-v2")]
@@ -2945,6 +3085,21 @@ impl SseDekProvider for KmsSseDekProvider {
             .map_err(kms_operation_error)?;
 
         Ok((data_key, encrypted_data_key))
+    }
+
+    async fn rewrap_sse_dek(
+        &self,
+        encrypted_dek: &[u8],
+        context: &ObjectEncryptionContext,
+    ) -> Result<rustfs_kms::types::RewrapDataKeyResponse, ApiError> {
+        let service = self
+            .current_service()
+            .await
+            .ok_or_else(|| ApiError::from(StorageError::other(KmsUnavailableError)))?;
+        service
+            .rewrap_data_key(encrypted_dek, context)
+            .await
+            .map_err(kms_operation_error)
     }
 
     async fn decrypt_sse_dek(
@@ -3781,18 +3936,20 @@ mod tests {
         EncryptionResolutionErrorKind, INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
         INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsAction, KmsKeyAuthorizer, KmsSseDekProvider,
         KmsUnavailableError, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
-        ObjectEncryptionResolver, PrepareEncryptionRequest, ReadEncryptionMode, ReadEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER,
-        SSEType, SseDekProvider, SseKmsPrincipal, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
+        MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, ObjectDekRewrapOutcome, ObjectEncryptionResolver,
+        PrepareEncryptionRequest, ReadEncryptionMode, ReadEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER, SSEType, SseDekProvider,
+        SseKmsPrincipal, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
         apply_managed_decryption_material, apply_managed_encryption_material, authorize_sse_kms_object_read,
-        classify_sse_read_response, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
-        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse,
-        kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata, md5_base64,
-        normalize_managed_metadata, recode_minio_kms_context, reset_sse_dek_provider, resolve_effective_kms_key_id,
-        sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
-        validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params, verify_ssec_key_match,
+        build_kms_request_context, classify_sse_read_response, encode_minio_kms_context, encryption_material_to_metadata,
+        extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
+        generate_ssec_nonce, is_managed_sse, kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata,
+        md5_base64, normalize_managed_metadata, recode_minio_kms_context, reset_sse_dek_provider, resolve_effective_kms_key_id,
+        rewrap_object_encryption_metadata, sse_decryption, sse_encryption, sse_prepare_encryption,
+        strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+        validate_ssec_params, verify_ssec_key_match,
     };
     #[cfg(feature = "rio-v2")]
     use super::{
@@ -4845,6 +5002,251 @@ mod tests {
         let kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), None, || Some("bucket-default".to_string()));
 
         assert_eq!(kms_key_id.as_deref(), Some("bucket-default"));
+    }
+
+    /// One recorded rewrap call: (envelope bytes, bucket, object key, context).
+    type RecordedRewrapCall = (Vec<u8>, String, String, HashMap<String, String>);
+
+    /// Test double for the rewrap seam: records what it was asked to rewrap
+    /// and answers with a canned response.
+    struct RewrapProbeProvider {
+        rewrapped: bool,
+        new_ciphertext: Vec<u8>,
+        calls: std::sync::Mutex<Vec<RecordedRewrapCall>>,
+    }
+
+    #[async_trait]
+    impl SseDekProvider for RewrapProbeProvider {
+        async fn generate_sse_dek(
+            &self,
+            _context: &ObjectEncryptionContext,
+            _kms_key_id: &str,
+        ) -> Result<(DataKey, Vec<u8>), ApiError> {
+            unreachable!("rewrap tests never generate keys")
+        }
+
+        async fn decrypt_sse_dek(
+            &self,
+            _encrypted_dek: &[u8],
+            _kms_key_id: &str,
+            _context: &ObjectEncryptionContext,
+        ) -> Result<[u8; 32], ApiError> {
+            unreachable!("rewrap tests never decrypt keys")
+        }
+
+        async fn rewrap_sse_dek(
+            &self,
+            encrypted_dek: &[u8],
+            context: &ObjectEncryptionContext,
+        ) -> Result<rustfs_kms::types::RewrapDataKeyResponse, ApiError> {
+            self.calls.lock().expect("probe lock").push((
+                encrypted_dek.to_vec(),
+                context.bucket.clone(),
+                context.object_key.clone(),
+                context.encryption_context.clone(),
+            ));
+            Ok(rustfs_kms::types::RewrapDataKeyResponse {
+                ciphertext: if self.rewrapped {
+                    self.new_ciphertext.clone()
+                } else {
+                    encrypted_dek.to_vec()
+                },
+                key_id: "probe-key".to_string(),
+                source_key_version: Some(1),
+                destination_key_version: Some(2),
+                rewrapped: self.rewrapped,
+            })
+        }
+    }
+
+    /// A minimal but well-formed data-key envelope, the shape
+    /// `is_data_key_envelope` recognizes.
+    fn probe_envelope_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "key_id": "dek-id",
+            "master_key_id": "master-key",
+            "key_spec": "AES_256",
+            "encrypted_key": [1, 2, 3, 4],
+            "nonce": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            "encryption_context": {"bucket": "bucket/dir/object"},
+            "created_at": "2024-01-01T00:00:00+00:00"
+        }))
+        .expect("serialize probe envelope")
+    }
+
+    /// The adapter must replace every stored copy of the old envelope — under
+    /// whatever key casing the storage layer preserved — and leave slots
+    /// holding different bytes (a sealed object key) untouched. Its context
+    /// must be rebuilt exactly as the managed decrypt path rebuilds it.
+    #[tokio::test]
+    async fn rewrap_object_metadata_replaces_every_stored_envelope_copy() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        let envelope = probe_envelope_json();
+        let envelope_b64 = BASE64_STANDARD.encode(&envelope);
+        let client_context = HashMap::from([("tenant".to_string(), "alpha".to_string())]);
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+            // Mixed casing on the internal header, exactly as the storage layer
+            // can hand it back.
+            ("X-Rustfs-Encryption-Key".to_string(), envelope_b64.clone()),
+            (MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(), envelope_b64.clone()),
+            // A sealed object key: different bytes, must not be rewritten.
+            (
+                MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER.to_string(),
+                BASE64_STANDARD.encode(b"sealed-object-key-not-the-envelope"),
+            ),
+            (
+                MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER.to_string(),
+                encode_minio_kms_context(&client_context).expect("encode context"),
+            ),
+        ]);
+
+        let new_ciphertext = b"rewrapped-envelope-bytes".to_vec();
+        let provider = Arc::new(RewrapProbeProvider {
+            rewrapped: true,
+            new_ciphertext: new_ciphertext.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        super::set_sse_dek_provider_for_test(provider.clone());
+
+        let outcome = rewrap_object_encryption_metadata("bucket", "dir/object", &metadata)
+            .await
+            .expect("rewrap must succeed");
+        let ObjectDekRewrapOutcome::Rewrapped { metadata: overrides } = outcome else {
+            panic!("expected a rewrapped outcome, got {outcome:?}");
+        };
+
+        let new_b64 = BASE64_STANDARD.encode(&new_ciphertext);
+        assert_eq!(
+            overrides,
+            HashMap::from([
+                ("X-Rustfs-Encryption-Key".to_string(), new_b64.clone()),
+                (MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(), new_b64),
+            ]),
+            "every envelope copy must be replaced under its stored name and nothing else touched"
+        );
+
+        let calls = provider.calls.lock().expect("probe lock");
+        let (sent_envelope, bucket, object_key, sent_context) = calls.first().expect("the provider must be called");
+        assert_eq!(*sent_envelope, envelope, "the decoded stored envelope must reach the provider");
+        assert_eq!(bucket, "bucket");
+        assert_eq!(object_key, "dir/object");
+        assert_eq!(
+            *sent_context,
+            build_kms_request_context("bucket", "dir/object", Some(&client_context)),
+            "the context must be rebuilt exactly as the managed decrypt path rebuilds it"
+        );
+
+        reset_sse_dek_provider();
+    }
+
+    /// `rewrapped: false` from the backend means nothing to persist; the
+    /// adapter must answer AlreadyCurrent so a sweep re-run converges.
+    #[tokio::test]
+    async fn rewrap_object_metadata_converges_when_already_current() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        let envelope_b64 = BASE64_STANDARD.encode(probe_envelope_json());
+        let metadata = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), "AES256".to_string()),
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), envelope_b64),
+        ]);
+        let provider = Arc::new(RewrapProbeProvider {
+            rewrapped: false,
+            new_ciphertext: Vec::new(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        super::set_sse_dek_provider_for_test(provider.clone());
+
+        let outcome = rewrap_object_encryption_metadata("bucket", "object", &metadata)
+            .await
+            .expect("rewrap must succeed");
+        assert!(matches!(outcome, ObjectDekRewrapOutcome::AlreadyCurrent), "got {outcome:?}");
+        assert_eq!(provider.calls.lock().expect("probe lock").len(), 1);
+
+        reset_sse_dek_provider();
+    }
+
+    /// The KMS-backed provider's rewrap threads through the encryption
+    /// service to the backend. The Local test backend has no rewrap support,
+    /// so the capability refusal coming back proves the whole chain is wired —
+    /// a stub that silently succeeded would return Ok here.
+    #[tokio::test]
+    async fn kms_provider_rewrap_reaches_the_backend_through_the_service() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        let manager = configure_test_global_local_kms().await;
+        let provider = KmsSseDekProvider::new_with_service_manager(manager)
+            .await
+            .expect("kms provider should initialize from the configured test manager");
+
+        let context = super::build_object_encryption_context("bucket", "object", None);
+        let error = provider
+            .rewrap_sse_dek(b"{}", &context)
+            .await
+            .expect_err("the Local backend must refuse rewrap through the full chain");
+        assert!(
+            error.to_string().contains("rewrap") || format!("{:?}", error.source).contains("rewrap_data_key"),
+            "the refusal must come from the backend capability gate: {error:?}"
+        );
+
+        reset_sse_dek_provider();
+    }
+
+    /// Objects without a rewrappable envelope — plaintext, SSE-C, or a
+    /// MinIO-sealed opaque data key — are reported NotApplicable without any
+    /// provider call.
+    #[tokio::test]
+    async fn rewrap_object_metadata_skips_objects_without_a_rustfs_envelope() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+
+        let provider = Arc::new(RewrapProbeProvider {
+            rewrapped: true,
+            new_ciphertext: b"never-used".to_vec(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        super::set_sse_dek_provider_for_test(provider.clone());
+
+        // Plaintext object.
+        let outcome = rewrap_object_encryption_metadata("bucket", "object", &HashMap::new())
+            .await
+            .expect("plaintext objects must not error");
+        assert!(matches!(outcome, ObjectDekRewrapOutcome::NotApplicable), "got {outcome:?}");
+
+        // SSE-C object: customer-key encryption never reaches KMS.
+        let ssec = HashMap::from([
+            ("X-Amz-Server-Side-Encryption-Customer-Algorithm".to_string(), "AES256".to_string()),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode([1u8; 12])),
+        ]);
+        let outcome = rewrap_object_encryption_metadata("bucket", "object", &ssec)
+            .await
+            .expect("SSE-C objects must not error");
+        assert!(matches!(outcome, ObjectDekRewrapOutcome::NotApplicable), "got {outcome:?}");
+
+        // MinIO builtin-KMS ciphertext: opaque bytes, not a RustFS envelope.
+        let minio = HashMap::from([
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+            (
+                MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER.to_string(),
+                BASE64_STANDARD.encode(b"opaque-minio-sealed-bytes"),
+            ),
+        ]);
+        let outcome = rewrap_object_encryption_metadata("bucket", "object", &minio)
+            .await
+            .expect("MinIO-sealed objects must not error");
+        assert!(matches!(outcome, ObjectDekRewrapOutcome::NotApplicable), "got {outcome:?}");
+
+        assert!(
+            provider.calls.lock().expect("probe lock").is_empty(),
+            "no provider call may happen for non-rewrappable objects"
+        );
+
+        reset_sse_dek_provider();
     }
 
     #[tokio::test]
