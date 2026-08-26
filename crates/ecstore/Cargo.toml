@@ -25,13 +25,6 @@ keywords = ["erasure-coding", "storage", "rustfs", "Minio", "solomon"]
 categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-ecstore/latest/rustfs_ecstore/"
 
-[package.metadata.cargo-shear]
-ignored = [
-    "rustfs-checksums",
-    "rustfs-signer",
-    "rustfs-tls-runtime",
-]
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lints]
 workspace = true
@@ -51,7 +44,6 @@ hotpath = [
     "hotpath/async-channel",
     "hotpath/parking_lot",
     "hotpath/reqwest-0-13",
-    "rustfs-checksums/hotpath",
     "rustfs-common/hotpath",
     "rustfs-concurrency/hotpath",
     "rustfs-config/hotpath",
@@ -69,16 +61,13 @@ hotpath = [
     "rustfs-rio/hotpath",
     "rustfs-rio-v2?/hotpath",
     "rustfs-s3-types/hotpath",
-    "rustfs-signer/hotpath",
     "rustfs-storage-api/hotpath",
-    "rustfs-tls-runtime/hotpath",
     "rustfs-utils/hotpath",
     "rustfs-crypto/hotpath",
 ]
 hotpath-alloc = [
     "hotpath",
     "hotpath/hotpath-alloc",
-    "rustfs-checksums/hotpath-alloc",
     "rustfs-common/hotpath-alloc",
     "rustfs-concurrency/hotpath-alloc",
     "rustfs-config/hotpath-alloc",
@@ -96,16 +85,13 @@ hotpath-alloc = [
     "rustfs-rio/hotpath-alloc",
     "rustfs-rio-v2?/hotpath-alloc",
     "rustfs-s3-types/hotpath-alloc",
-    "rustfs-signer/hotpath-alloc",
     "rustfs-storage-api/hotpath-alloc",
-    "rustfs-tls-runtime/hotpath-alloc",
     "rustfs-utils/hotpath-alloc",
     "rustfs-crypto/hotpath-alloc",
 ]
 hotpath-cpu = [
     "hotpath",
     "hotpath/hotpath-cpu",
-    "rustfs-checksums/hotpath-cpu",
     "rustfs-common/hotpath-cpu",
     "rustfs-concurrency/hotpath-cpu",
     "rustfs-config/hotpath-cpu",
@@ -123,9 +109,7 @@ hotpath-cpu = [
     "rustfs-rio/hotpath-cpu",
     "rustfs-rio-v2?/hotpath-cpu",
     "rustfs-s3-types/hotpath-cpu",
-    "rustfs-signer/hotpath-cpu",
     "rustfs-storage-api/hotpath-cpu",
-    "rustfs-tls-runtime/hotpath-cpu",
     "rustfs-utils/hotpath-cpu",
     "rustfs-crypto/hotpath-cpu",
 ]
@@ -140,10 +124,7 @@ rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
 rustfs-rio-v2 = { workspace = true, optional = true }
-rustfs-signer.workspace = true
 rustfs-storage-api.workspace = true
-rustfs-tls-runtime.workspace = true
-rustfs-checksums.workspace = true
 rustfs-config = { workspace = true, features = ["notify", "audit", "server-config-model"] }
 rustfs-concurrency.workspace = true
 rustfs-credentials = { workspace = true }
