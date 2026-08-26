@@ -87,9 +87,19 @@ pub(crate) mod kms {
         pub(crate) mod bucket {
             pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions};
         }
+
+        pub(crate) mod list {
+            pub(crate) use super::super::super::storage_contracts::ListOperations;
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::storage_contracts::ObjectOperations;
+        }
     }
 
     pub(crate) use crate::storage::storage_api::{ECStore, StorageError};
+    pub(crate) type StorageObjectOptions = crate::storage::storage_api::StorageObjectOptions;
+    pub(crate) use crate::storage::storage_api::{ObjectDekRewrapOutcome, rewrap_object_encryption_metadata};
 
     /// Bucket SSE configuration for the KMS deletion reference gate;
     /// `Err(StorageError::ConfigNotFound)` when the bucket has none.

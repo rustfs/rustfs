@@ -65,6 +65,7 @@ const KMS_DISABLE_KEY: AdminActionRef = AdminActionRef::new("kms:DisableKey");
 const KMS_ENABLE_KEY: AdminActionRef = AdminActionRef::new("kms:EnableKey");
 const KMS_GENERATE_DATA_KEY: AdminActionRef = AdminActionRef::new("kms:GenerateDataKey");
 const KMS_LIST_KEYS: AdminActionRef = AdminActionRef::new("kms:ListKeys");
+const KMS_REKEY: AdminActionRef = AdminActionRef::new("kms:Rekey");
 const KMS_RESTORE: AdminActionRef = AdminActionRef::new("kms:Restore");
 const KMS_ROTATE_KEY: AdminActionRef = AdminActionRef::new("kms:RotateKey");
 const KMS_SERVICE_CONTROL: AdminActionRef = AdminActionRef::new("kms:ServiceControl");
@@ -821,6 +822,21 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/rotate", KMS_ROTATE_KEY, RouteRiskLevel::High),
+    // The rekey sweep walks and rewrites object metadata across buckets, so it
+    // carries its own cluster-scoped action rather than reusing a per-key one.
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/rekey", KMS_REKEY, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/kms/keys/rekey/status",
+        KMS_REKEY,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/kms/keys/rekey/cancel",
+        KMS_REKEY,
+        RouteRiskLevel::High,
+    ),
     // Backup and restore act on the material of every key at once, so they
     // carry their own actions rather than reusing any per-key one.
     admin(HttpMethod::Get, "/rustfs/admin/v3/kms/backup", KMS_BACKUP, RouteRiskLevel::Sensitive),

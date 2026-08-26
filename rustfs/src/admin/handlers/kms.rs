@@ -14,7 +14,7 @@
 
 //! KMS admin handlers for HTTP API
 
-use super::{kms_backup, kms_dynamic, kms_key_lifecycle, kms_key_metadata, kms_keys, kms_management};
+use super::{kms_backup, kms_dynamic, kms_key_lifecycle, kms_key_metadata, kms_keys, kms_management, kms_rekey};
 use crate::admin::router::{AdminOperation, S3Router};
 
 pub fn register_kms_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -24,5 +24,6 @@ pub fn register_kms_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<(
     kms_key_lifecycle::register_kms_key_lifecycle_route(r)?;
     kms_backup::register_kms_backup_route(r)?;
     kms_key_metadata::register_kms_key_metadata_route(r)?;
+    kms_rekey::register_kms_rekey_route(r)?;
     Ok(())
 }

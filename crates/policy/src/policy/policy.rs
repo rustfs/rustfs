@@ -854,13 +854,14 @@ mod test {
 
     /// Actions that act on the service or on every key's material at once. No role
     /// template may confer them.
-    const KMS_CLUSTER_ADMIN_ACTIONS: [KmsAction; 6] = [
+    const KMS_CLUSTER_ADMIN_ACTIONS: [KmsAction; 7] = [
         KmsAction::AllActions,
         KmsAction::ConfigureAction,
         KmsAction::ServiceControlAction,
         KmsAction::ClearCacheAction,
         KmsAction::BackupAction,
         KmsAction::RestoreAction,
+        KmsAction::RekeyAction,
     ];
 
     const KMS_ROLE_TEMPLATES: [&str; 3] = [default::KMS_KEY_ADMINISTRATOR, default::KMS_KEY_USER, default::KMS_AUDITOR];

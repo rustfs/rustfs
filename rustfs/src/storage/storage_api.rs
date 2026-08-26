@@ -109,10 +109,10 @@ pub(crate) use super::ecfs_extend::{
     validate_list_object_unordered_with_delimiter, validate_object_key, wrap_response_with_cors,
 };
 pub(crate) use super::sse::{
-    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, authorize_sse_kms_object_read,
-    classify_sse_read_response, extract_server_side_encryption_from_headers, sse_decryption, sse_encryption,
-    sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write,
-    validate_ssec_for_read,
+    DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
+    authorize_sse_kms_object_read, classify_sse_read_response, extract_server_side_encryption_from_headers,
+    rewrap_object_encryption_metadata, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
+    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
 };
 
 pub(crate) mod access_consumer {

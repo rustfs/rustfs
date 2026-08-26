@@ -712,6 +712,12 @@ pub enum KmsAction {
     /// Preflight or execute a KMS restore.
     #[strum(serialize = "kms:Restore")]
     RestoreAction,
+    /// Run the bulk rekey sweep that rewraps stored object DEK envelopes onto
+    /// current master key versions. Cluster-scoped: it walks and rewrites
+    /// object metadata across buckets, so it is never conferred by a per-key
+    /// role template.
+    #[strum(serialize = "kms:Rekey")]
+    RekeyAction,
 }
 
 #[cfg(test)]
@@ -754,6 +760,7 @@ mod tests {
             ("kms:Decrypt", KmsAction::DecryptAction),
             ("kms:Backup", KmsAction::BackupAction),
             ("kms:Restore", KmsAction::RestoreAction),
+            ("kms:Rekey", KmsAction::RekeyAction),
         ] {
             let action = Action::try_from(raw).expect("Should parse KMS action");
             assert_eq!(action, Action::KmsAction(expected));
