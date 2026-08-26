@@ -28,7 +28,7 @@ use tokio::io::BufReader;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::client::{
+use crate::{
     api_error_response::{ErrorResponse, err_invalid_argument, http_resp_to_error_response},
     api_get_options::GetObjectOptions,
     transition_api::{

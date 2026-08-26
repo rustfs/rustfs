@@ -147,6 +147,7 @@ rustfs-policy.workspace = true
 rustfs-protos.workspace = true
 rustfs-replication.workspace = true
 rustfs-lifecycle.workspace = true
+rustfs-s3-client = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-data-usage.workspace = true
 rustfs-object-capacity.workspace = true

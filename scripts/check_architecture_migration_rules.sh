@@ -5494,7 +5494,7 @@ ECSTORE_LINT_EXPECTED="${TMP_DIR}/ecstore_lint_expected.txt"
 
 (
   cd "$ROOT_DIR"
-  rg -n '^#!\[allow\(dead_code\)\]' crates/ecstore/src/ 2>/dev/null || true
+  rg -n '^#!\[allow\(dead_code\)\]' crates/ecstore/src/ crates/s3-client/src/ 2>/dev/null || true
 ) >"$ECSTORE_DEAD_CODE_HITS"
 
 if [[ -s "$ECSTORE_DEAD_CODE_HITS" ]]; then
@@ -5503,7 +5503,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n '^#!\[allow\((unused_variables|unused_must_use|clippy::all)\)\]' crates/ecstore/src/ 2>/dev/null |
+  rg -n '^#!\[allow\((unused_variables|unused_must_use|clippy::all)\)\]' crates/ecstore/src/ crates/s3-client/src/ 2>/dev/null |
     sed -E 's#^([^:]+):[0-9]+:\#!\[allow\(([^)]+)\)\]#\1|\2#' | sort -u
 ) >"$ECSTORE_LINT_ACTUAL"
 

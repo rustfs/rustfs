@@ -24,7 +24,7 @@ const MAX_REMOTE_VERSION_ID_LEN: usize = 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code, reason = "bucket versioning states kept as a complete vocabulary (backlog#1823)")]
-pub(crate) enum BucketVersioningState {
+pub enum BucketVersioningState {
     Unknown,
     Disabled,
     Suspended,
@@ -32,7 +32,7 @@ pub(crate) enum BucketVersioningState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RemoteVersion {
+pub enum RemoteVersion {
     Unknown,
     Disabled,
     SuspendedNull,
@@ -40,7 +40,7 @@ pub(crate) enum RemoteVersion {
 }
 
 impl RemoteVersion {
-    pub(crate) fn exact_id(&self) -> Option<&str> {
+    pub fn exact_id(&self) -> Option<&str> {
         match self {
             Self::SuspendedNull => Some("null"),
             Self::Exact(version_id) => Some(version_id),
@@ -49,7 +49,7 @@ impl RemoteVersion {
     }
 
     #[allow(dead_code, reason = "MinIO-parity accessor with no caller in this port (backlog#1823)")]
-    pub(crate) fn exact_request_id(&self) -> Result<Option<&str>, Error> {
+    pub fn exact_request_id(&self) -> Result<Option<&str>, Error> {
         match self {
             Self::Unknown => Err(Error::new(
                 ErrorKind::InvalidData,
@@ -63,23 +63,23 @@ impl RemoteVersion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConditionalCreateCapability {
+pub enum ConditionalCreateCapability {
     Unsupported,
     IfNoneMatchStar,
     GenerationMatchZero,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ProviderVersionCapabilities {
+pub struct ProviderVersionCapabilities {
     raw_version_header: Option<&'static str>,
-    pub(crate) bucket_versioning_state: bool,
-    pub(crate) list_object_versions: bool,
-    pub(crate) conditional_create: ConditionalCreateCapability,
-    pub(crate) exact_get_delete: bool,
+    pub bucket_versioning_state: bool,
+    pub list_object_versions: bool,
+    pub conditional_create: ConditionalCreateCapability,
+    pub exact_get_delete: bool,
 }
 
 impl ProviderVersionCapabilities {
-    pub(crate) fn for_tier_type(tier_type: &str) -> Self {
+    pub fn for_tier_type(tier_type: &str) -> Self {
         if tier_type.eq_ignore_ascii_case("s3")
             || tier_type.eq_ignore_ascii_case("rustfs")
             || tier_type.eq_ignore_ascii_case("minio")
@@ -144,7 +144,7 @@ impl ProviderVersionCapabilities {
         }
     }
 
-    pub(crate) fn raw_version_id(self, headers: &HeaderMap) -> Result<Option<&str>, Error> {
+    pub fn raw_version_id(self, headers: &HeaderMap) -> Result<Option<&str>, Error> {
         let Some(header_name) = self.raw_version_header else {
             return Ok(None);
         };
@@ -158,7 +158,7 @@ impl ProviderVersionCapabilities {
         Ok(Some(value))
     }
 
-    pub(crate) fn remote_version(self, headers: &HeaderMap, versioning: BucketVersioningState) -> Result<RemoteVersion, Error> {
+    pub fn remote_version(self, headers: &HeaderMap, versioning: BucketVersioningState) -> Result<RemoteVersion, Error> {
         let Some(value) = self.raw_version_id(headers)? else {
             return Ok(match versioning {
                 BucketVersioningState::Disabled => RemoteVersion::Disabled,
@@ -174,7 +174,7 @@ impl ProviderVersionCapabilities {
     }
 }
 
-pub(crate) fn validate_remote_version_id(version_id: &str) -> Result<(), Error> {
+pub fn validate_remote_version_id(version_id: &str) -> Result<(), Error> {
     if version_id.is_empty() {
         return Err(Error::new(
             ErrorKind::InvalidData,

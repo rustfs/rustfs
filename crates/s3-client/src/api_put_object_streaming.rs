@@ -31,8 +31,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::client::checksum::{ChecksumMode, add_auto_checksum_headers, apply_auto_checksum};
-use crate::client::{
+use crate::checksum::{ChecksumMode, add_auto_checksum_headers, apply_auto_checksum};
+use crate::{
     api_error_response::{err_invalid_argument, err_unexpected_eof, http_resp_to_error_response},
     api_put_object::PutObjectOptions,
     api_put_object_common::{is_object, optimal_part_info},
@@ -42,7 +42,7 @@ use crate::client::{
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient, UploadInfo},
 };
 
-use crate::client::utils::base64_encode;
+use crate::utils::base64_encode;
 use rustfs_utils::path::trim_etag;
 use s3s::header::X_AMZ_EXPIRATION;
 
@@ -620,7 +620,7 @@ fn collect_complete_parts(parts_info: &HashMap<i64, ObjectPart>, total_parts_cou
 #[cfg(test)]
 mod tests {
     use super::{ObjectPart, ReaderImpl, collect_complete_parts, lock_md5_hasher, read_multipart_part};
-    use crate::object_api::GetObjectReader;
+    use crate::transition_api::ObjectReader;
     use bytes::Bytes;
     use rustfs_utils::hash::HashAlgorithm;
     use std::collections::HashMap;
@@ -654,12 +654,7 @@ mod tests {
             let data: Vec<u8> = (0..total).map(|i| i as u8).collect();
             w.write_all(&data).await.unwrap();
         });
-        let reader = ReaderImpl::ObjectBody(GetObjectReader {
-            stream: Box::new(r),
-            object_info: Default::default(),
-            buffered_body: None,
-            body_source: Default::default(),
-        });
+        let reader = ReaderImpl::ObjectBody(ObjectReader::new(r));
 
         let sizes = collect_part_sizes(reader, total, 100, 50).await;
         assert_eq!(sizes, vec![100, 100, 50]);
@@ -684,12 +679,7 @@ mod tests {
             use tokio::io::AsyncWriteExt;
             w.write_all(&[1u8; 30]).await.unwrap();
         });
-        let mut reader = ReaderImpl::ObjectBody(GetObjectReader {
-            stream: Box::new(r),
-            object_info: Default::default(),
-            buffered_body: None,
-            body_source: Default::default(),
-        });
+        let mut reader = ReaderImpl::ObjectBody(ObjectReader::new(r));
         let buf = read_multipart_part(&mut reader, 100).await.unwrap();
         assert_eq!(buf.len(), 30);
     }
