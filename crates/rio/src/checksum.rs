@@ -31,14 +31,28 @@ pub const RUSTFS_MULTIPART_CHECKSUM_TYPE: &str = "x-rustfs-multipart-checksum-ty
 
 /// Checksum type enumeration with flags
 ///
-/// One of three deliberately separate checksum registries (backlog#1833):
-/// this bitset owns the **on-disk xl.meta encoding** — the raw `u32` is
+/// This bitset owns the **on-disk xl.meta encoding** — the raw `u32` is
 /// varint-serialized into xl.meta (see `append_to`), so bits are append-only
-/// and must never be renumbered. `rustfs_checksums::ChecksumAlgorithm`
-/// (crates/checksums/src/lib.rs) owns the streaming-hash algorithm registry,
-/// and the MinIO-port client keeps its own `ChecksumMode`
-/// (crates/ecstore/src/client/checksum.rs). When adding an algorithm, extend
-/// all three (or record why not) — they do not derive from each other.
+/// and must never be renumbered. Canonical per-algorithm metadata (wire
+/// names, headers, digest lengths, checksum-type capabilities) lives in
+/// `rustfs_checksums::ChecksumAlgorithm` (crates/checksums/src/lib.rs), which
+/// the MinIO-port client's `ChecksumMode`
+/// (crates/s3-client/src/checksum.rs) consumes through its `algorithm()`
+/// bridge (backlog#1844).
+///
+/// The hasher implementations below stay rio-native rather than delegating
+/// to rustfs-checksums (backlog#1844 PR3 verdict): `ChecksumHasher` needs a
+/// non-consuming `finalize` plus `reset` on the server hot path, while the
+/// checksums `Checksum` trait finalizes by consuming the box; MD5 is a base
+/// type here (x-amz-checksum-md5, bit 14) but deliberately not a
+/// `ChecksumAlgorithm` variant; and both crates already drive the same
+/// backends (crc_fast, sha1/sha2, xxhash_rust, md5). Equivalence is enforced
+/// instead by pinning both sides to the same official known-answer vectors —
+/// see `hashers_match_rustfs_checksums_known_answer_vectors` below and the
+/// digest tests in crates/checksums. When adding an algorithm: extend
+/// `ChecksumAlgorithm` (exhaustive matches force the metadata), bridge it in
+/// the client, allocate a bit + hasher here, and pin the shared vector in
+/// both test suites (or record why a surface is skipped).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChecksumType(pub u32);
 
@@ -1643,6 +1657,24 @@ mod tests {
                 ..Default::default()
             };
             assert!(acc.add_part(&c1, part1.len() as i64).is_err(), "{t:?} must not be full-object mergeable");
+        }
+    }
+
+    // Drift lock for the backlog#1844 PR3 verdict: rio keeps its own hasher
+    // shells instead of delegating to rustfs-checksums, so both sides pin the
+    // SAME input and official digests (crates/checksums/src/lib.rs pins these
+    // values for "test data" in its own tests). If either implementation ever
+    // changes backend, seed, or byte order, one of the two suites fails loudly.
+    #[test]
+    fn hashers_match_rustfs_checksums_known_answer_vectors() {
+        for (t, want_hex) in [
+            (ChecksumType::CRC32, "d308aeb2"),
+            (ChecksumType::CRC32C, "3379b4ca"),
+            (ChecksumType::CRC64_NVME, "aecaf3af9c98a855"),
+            (ChecksumType::SHA1, "f48dd853820860816c75d54d0f584dc863327a7c"),
+            (ChecksumType::SHA256, "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"),
+        ] {
+            assert_eq!(raw_hex(t, b"test data"), want_hex, "{t:?} digest drifted from the shared vector");
         }
     }
 
