@@ -596,9 +596,9 @@ impl MockWarmBackend {
                 if let Some(limit) = limit {
                     let limit =
                         u64::try_from(limit).map_err(|_| std::io::Error::other("mock PUT read limit exceeds u64::MAX"))?;
-                    reader.stream.take(limit).read_to_end(&mut buf).await?;
+                    (&mut reader).take(limit).read_to_end(&mut buf).await?;
                 } else {
-                    reader.stream.read_to_end(&mut buf).await?;
+                    reader.read_to_end(&mut buf).await?;
                 }
                 Ok(buf)
             }

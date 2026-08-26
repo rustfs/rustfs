@@ -26,9 +26,9 @@ use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::client::checksum::ChecksumMode;
-use crate::client::utils::base64_encode;
-use crate::client::{
+use crate::checksum::ChecksumMode;
+use crate::utils::base64_encode;
+use crate::{
     api_error_response::{
         err_entity_too_large, err_entity_too_small, err_invalid_argument, http_resp_to_error_response, to_error_response,
     },
@@ -448,7 +448,7 @@ pub struct UploadPartParams {
 
 #[cfg(test)]
 mod tests {
-    use crate::client::api_s3_datatypes::{CompleteMultipartUpload, CompletePart, InitiateMultipartUploadResult};
+    use crate::api_s3_datatypes::{CompleteMultipartUpload, CompletePart, InitiateMultipartUploadResult};
 
     #[test]
     fn complete_multipart_upload_serializes_s3_part_elements() {

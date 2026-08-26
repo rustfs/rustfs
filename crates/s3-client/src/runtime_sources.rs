@@ -16,10 +16,10 @@ use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, load_global_outbound_t
 
 const ECSTORE_TRANSITION_CLIENT_TLS_CONSUMER: &str = "ecstore_transition_client";
 
-pub(crate) async fn transition_client_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
+pub async fn transition_client_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
     load_global_outbound_tls_state().await
 }
 
-pub(crate) fn record_transition_client_tls_generation(generation: u64) {
+pub fn record_transition_client_tls_generation(generation: u64) {
     record_tls_generation(ECSTORE_TRANSITION_CLIENT_TLS_CONSUMER, generation);
 }

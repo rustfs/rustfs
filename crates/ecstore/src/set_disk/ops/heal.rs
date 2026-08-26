@@ -474,13 +474,15 @@ impl SetDisks {
         // Bound, not `_`: this guard must live to the end of the scope. A bare
         // `_` would drop it here and release the namespace write lock.
         let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(
-                ns_lock
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-            )
+            let ns_lock = self
+                .new_ns_lock(bucket, object)
+                .await
+                .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                self.map_namespace_lock_error(bucket, object, "write", e)
+                    .narrow_to_disk()
+                    .unwrap_or_else(DiskError::other)
+            })?)
         } else {
             None
         };
@@ -2200,13 +2202,15 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
         let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(
-                ns_lock
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-            )
+            let ns_lock = self
+                .new_ns_lock(bucket, object)
+                .await
+                .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                self.map_namespace_lock_error(bucket, object, "write", e)
+                    .narrow_to_disk()
+                    .unwrap_or_else(DiskError::other)
+            })?)
         } else {
             None
         };
@@ -2306,13 +2310,15 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
     async fn check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
         let started_at = std::time::Instant::now();
         let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self.new_ns_lock(bucket, object).await?;
-            Some(
-                ns_lock
-                    .get_write_lock(get_lock_acquire_timeout())
-                    .await
-                    .map_err(|e| self.map_namespace_lock_error(bucket, object, "write", e))?,
-            )
+            let ns_lock = self
+                .new_ns_lock(bucket, object)
+                .await
+                .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
+                self.map_namespace_lock_error(bucket, object, "write", e)
+                    .narrow_to_disk()
+                    .unwrap_or_else(DiskError::other)
+            })?)
         } else {
             None
         };

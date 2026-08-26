@@ -49,62 +49,74 @@ const RESYNC_ERROR_SENSITIVE_MARKERS: &[&str] = &[
     "password",
 ];
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, ResyncStateError>;
 
+/// Error type for the persisted resync/MRF state files (backlog#1845 step 7:
+/// renamed from the crate-generic `Error`, with `Io` kept typed instead of
+/// collapsing into a string so callers can still classify the io failure).
 #[derive(Debug)]
-pub enum Error {
+pub enum ResyncStateError {
     CorruptedFormat,
+    Io(std::io::Error),
     Other(String),
 }
 
-impl Error {
+impl ResyncStateError {
     fn other(err: impl Into<String>) -> Self {
         Self::Other(err.into())
     }
 }
 
-impl fmt::Display for Error {
+impl fmt::Display for ResyncStateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CorruptedFormat => write!(f, "corrupted format"),
+            Self::Io(err) => write!(f, "{err}"),
             Self::Other(err) => write!(f, "{err}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Self::other(err.to_string())
+impl std::error::Error for ResyncStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
     }
 }
 
-impl From<std::string::FromUtf8Error> for Error {
+impl From<std::io::Error> for ResyncStateError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<std::string::FromUtf8Error> for ResyncStateError {
     fn from(err: std::string::FromUtf8Error) -> Self {
         Self::other(err.to_string())
     }
 }
 
-impl From<rmp::encode::ValueWriteError> for Error {
+impl From<rmp::encode::ValueWriteError> for ResyncStateError {
     fn from(err: rmp::encode::ValueWriteError) -> Self {
         Self::other(err.to_string())
     }
 }
 
-impl From<rmp::decode::ValueReadError> for Error {
+impl From<rmp::decode::ValueReadError> for ResyncStateError {
     fn from(err: rmp::decode::ValueReadError) -> Self {
         Self::other(err.to_string())
     }
 }
 
-impl From<rmp::decode::NumValueReadError> for Error {
+impl From<rmp::decode::NumValueReadError> for ResyncStateError {
     fn from(err: rmp::decode::NumValueReadError) -> Self {
         Self::other(err.to_string())
     }
 }
 
-impl From<rmp_serde::decode::Error> for Error {
+impl From<rmp_serde::decode::Error> for ResyncStateError {
     fn from(err: rmp_serde::decode::Error) -> Self {
         Self::other(err.to_string())
     }
@@ -360,7 +372,7 @@ impl BucketReplicationResyncStatus {
         rmp::encode::write_str(&mut wr, "v")?;
         rmp::encode::write_i32(&mut wr, i32::from(self.version))?;
         rmp::encode::write_str(&mut wr, "brs")?;
-        let target_count = u32::try_from(self.targets_map.len()).map_err(|_| Error::CorruptedFormat)?;
+        let target_count = u32::try_from(self.targets_map.len()).map_err(|_| ResyncStateError::CorruptedFormat)?;
         rmp::encode::write_map_len(&mut wr, target_count)?;
         for (arn, status) in &self.targets_map {
             rmp::encode::write_str(&mut wr, arn)?;
@@ -386,11 +398,11 @@ impl BucketReplicationResyncStatus {
             match key.as_str() {
                 "v" => {
                     let v: i32 = rmp::decode::read_int(&mut rd)?;
-                    out.version = u16::try_from(v).map_err(|_| Error::other("invalid resync version"))?;
+                    out.version = u16::try_from(v).map_err(|_| ResyncStateError::other("invalid resync version"))?;
                 }
                 "brs" => {
                     let map_len = rmp::decode::read_map_len(&mut rd)?;
-                    let target_count = usize::try_from(map_len).map_err(|_| Error::CorruptedFormat)?;
+                    let target_count = usize::try_from(map_len).map_err(|_| ResyncStateError::CorruptedFormat)?;
                     let mut targets = HashMap::with_capacity(target_count);
                     for _ in 0..map_len {
                         let arn = read_msgp_str(&mut rd)?;
@@ -436,19 +448,19 @@ pub fn encode_resync_file(status: &BucketReplicationResyncStatus) -> Result<Vec<
 
 pub fn decode_resync_file(data: &[u8]) -> Result<BucketReplicationResyncStatus> {
     if data.len() <= RESYNC_FILE_HEADER_LEN || data.len() > RESYNC_FILE_MAX_BYTES {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
 
     let mut major = [0u8; 2];
     major.copy_from_slice(&data[0..2]);
     if LittleEndian::read_u16(&major) != RESYNC_META_FORMAT {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
 
     let mut minor = [0u8; 2];
     minor.copy_from_slice(&data[2..4]);
     if LittleEndian::read_u16(&minor) != RESYNC_META_VERSION {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
 
     let status = match BucketReplicationResyncStatus::unmarshal_msg(&data[4..]) {
@@ -456,7 +468,7 @@ pub fn decode_resync_file(data: &[u8]) -> Result<BucketReplicationResyncStatus> 
         Err(_) => BucketReplicationResyncStatus::unmarshal_legacy_msg(&data[4..])?,
     };
     if status.version != RESYNC_META_VERSION {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
     Ok(status)
 }
@@ -478,28 +490,28 @@ fn wire_zero_time() -> OffsetDateTime {
 
 fn validate_msgp_payload(data: &[u8]) -> Result<()> {
     if data.len() > RESYNC_MSGP_MAX_BYTES {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
 
     let mut rd = Cursor::new(data);
     let mut values = 0usize;
     validate_msgp_value(&mut rd, 0, &mut values)?;
     if usize::try_from(rd.position()).ok() != Some(data.len()) {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
     Ok(())
 }
 
 fn validate_msgp_value<R: Read>(rd: &mut R, depth: usize, values: &mut usize) -> Result<()> {
     if depth > RESYNC_MSGP_MAX_DEPTH {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
-    *values = values.checked_add(1).ok_or(Error::CorruptedFormat)?;
+    *values = values.checked_add(1).ok_or(ResyncStateError::CorruptedFormat)?;
     if *values > RESYNC_MSGP_MAX_VALUES {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
 
-    let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let marker = rmp::decode::read_marker(rd).map_err(|e| ResyncStateError::other(format!("{e:?}")))?;
     let skip_len = match marker {
         Marker::Null | Marker::False | Marker::True | Marker::FixPos(_) | Marker::FixNeg(_) => 0,
         Marker::U8 | Marker::I8 => 1,
@@ -558,7 +570,7 @@ fn validate_msgp_value<R: Read>(rd: &mut R, depth: usize, values: &mut usize) ->
             skip_exact(rd, 1)?;
             return skip_exact(rd, len);
         }
-        Marker::Reserved => return Err(Error::CorruptedFormat),
+        Marker::Reserved => return Err(ResyncStateError::CorruptedFormat),
     };
     let skip_len = validate_msgp_element_len(skip_len)?;
     skip_exact(rd, skip_len)
@@ -566,10 +578,10 @@ fn validate_msgp_value<R: Read>(rd: &mut R, depth: usize, values: &mut usize) ->
 
 fn validate_msgp_collection<R: Read>(rd: &mut R, len: usize, depth: usize, values: &mut usize, is_map: bool) -> Result<()> {
     if len > RESYNC_MSGP_MAX_COLLECTION_ITEMS {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
     let values_per_item = if is_map { 2 } else { 1 };
-    let child_count = len.checked_mul(values_per_item).ok_or(Error::CorruptedFormat)?;
+    let child_count = len.checked_mul(values_per_item).ok_or(ResyncStateError::CorruptedFormat)?;
     for _ in 0..child_count {
         validate_msgp_value(rd, depth + 1, values)?;
     }
@@ -578,7 +590,7 @@ fn validate_msgp_collection<R: Read>(rd: &mut R, len: usize, depth: usize, value
 
 fn validate_msgp_element_len(len: usize) -> Result<usize> {
     if len > RESYNC_MSGP_MAX_ELEMENT_BYTES {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
     Ok(len)
 }
@@ -591,11 +603,11 @@ fn read_msgp_str<R: Read>(rd: &mut R) -> Result<String> {
 }
 
 fn read_msgp_time_or_nil<R: Read>(rd: &mut R) -> Result<Option<OffsetDateTime>> {
-    let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
+    let marker = rmp::decode::read_marker(rd).map_err(|e| ResyncStateError::other(format!("{e:?}")))?;
     match marker {
         Marker::Null => Ok(None),
         Marker::Ext8 => Ok(Some(read_msgp_ext8_time(rd)?)),
-        other => Err(Error::other(format!("expected time ext or nil, got marker: {other:?}"))),
+        other => Err(ResyncStateError::other(format!("expected time ext or nil, got marker: {other:?}"))),
     }
 }
 
@@ -604,21 +616,21 @@ fn read_msgp_ext8_time<R: Read>(rd: &mut R) -> Result<OffsetDateTime> {
     rd.read_exact(&mut len_buf)?;
     let len = len_buf[0] as usize;
     if len != MSGP_TIME_LEN as usize {
-        return Err(Error::other(format!("invalid msgp time len: {len}")));
+        return Err(ResyncStateError::other(format!("invalid msgp time len: {len}")));
     }
     let mut type_buf = [0u8; 1];
     rd.read_exact(&mut type_buf)?;
     if type_buf[0] != MSGP_TIME_EXT_TYPE as u8 {
-        return Err(Error::other(format!("invalid msgp time type: {}", type_buf[0])));
+        return Err(ResyncStateError::other(format!("invalid msgp time type: {}", type_buf[0])));
     }
     let mut buf = [0u8; 12];
     rd.read_exact(&mut buf)?;
     let sec = BigEndian::read_i64(&buf[0..8]);
     let nsec = BigEndian::read_u32(&buf[8..12]);
     OffsetDateTime::from_unix_timestamp(sec)
-        .map_err(|_| Error::other("invalid timestamp"))?
+        .map_err(|_| ResyncStateError::other("invalid timestamp"))?
         .replace_nanosecond(nsec)
-        .map_err(|_| Error::other("invalid nanosecond"))
+        .map_err(|_| ResyncStateError::other("invalid nanosecond"))
 }
 
 fn write_msgp_time<W: Write>(wr: &mut W, time: OffsetDateTime) -> Result<()> {
@@ -660,9 +672,9 @@ fn read_skip_len<R: Read>(rd: &mut R, bytes: usize) -> Result<usize> {
         4 => {
             let mut buf = [0u8; 4];
             rd.read_exact(&mut buf)?;
-            usize::try_from(u32::from_be_bytes(buf)).map_err(|_| Error::CorruptedFormat)
+            usize::try_from(u32::from_be_bytes(buf)).map_err(|_| ResyncStateError::CorruptedFormat)
         }
-        _ => Err(Error::other("invalid MessagePack length width")),
+        _ => Err(ResyncStateError::other("invalid MessagePack length width")),
     }
 }
 
@@ -685,7 +697,7 @@ fn resync_status_from_i32(code: i32) -> Result<ResyncStatusType> {
         3 => Ok(ResyncStatusType::ResyncStarted),
         4 => Ok(ResyncStatusType::ResyncCompleted),
         5 => Ok(ResyncStatusType::ResyncFailed),
-        _ => Err(Error::other(format!("invalid resync status code: {code}"))),
+        _ => Err(ResyncStateError::other(format!("invalid resync status code: {code}"))),
     }
 }
 
@@ -847,14 +859,14 @@ mod tests {
         let mut data = encode_resync_file(&status).expect("resync status should encode");
         data.push(0xc0);
 
-        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+        assert!(matches!(decode_resync_file(&data), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]
     fn resync_file_rejects_reserved_messagepack_marker() {
         let data = resync_file_with_unknown_value(&[0xc1]);
 
-        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+        assert!(matches!(decode_resync_file(&data), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]
@@ -866,7 +878,7 @@ mod tests {
         let value = msgp_str32(RESYNC_MSGP_MAX_ELEMENT_BYTES + 1);
         let data = resync_file_with_unknown_value(&value);
 
-        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+        assert!(matches!(decode_resync_file(&data), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]
@@ -899,7 +911,7 @@ mod tests {
 
         for value in [array, map] {
             let data = resync_file_with_unknown_value(&value);
-            assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+            assert!(matches!(decode_resync_file(&data), Err(ResyncStateError::CorruptedFormat)));
         }
     }
 
@@ -921,7 +933,7 @@ mod tests {
 
         let data = resync_file_with_unknown_value(&extension(RESYNC_MSGP_MAX_ELEMENT_BYTES + 1));
 
-        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+        assert!(matches!(decode_resync_file(&data), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]
@@ -935,7 +947,7 @@ mod tests {
         let mut rejected = vec![0x91; RESYNC_MSGP_MAX_DEPTH];
         rejected.push(0xc0);
         let data = resync_file_with_unknown_value(&rejected);
-        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+        assert!(matches!(decode_resync_file(&data), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]
@@ -973,7 +985,7 @@ mod tests {
 
         let data = resync_file_with_unknown_value(&nested_arrays(accepted_leaf_count + 1));
 
-        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+        assert!(matches!(decode_resync_file(&data), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]
@@ -1004,7 +1016,7 @@ mod tests {
 
         data.push(0xc0);
         assert_eq!(data.len(), RESYNC_FILE_MAX_BYTES + 1);
-        assert!(matches!(decode_resync_file(&data), Err(Error::CorruptedFormat)));
+        assert!(matches!(decode_resync_file(&data), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]
@@ -1030,7 +1042,7 @@ mod tests {
             );
         }
 
-        assert!(matches!(encode_resync_file(&status), Err(Error::CorruptedFormat)));
+        assert!(matches!(encode_resync_file(&status), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]
@@ -1044,7 +1056,7 @@ mod tests {
             },
         );
 
-        assert!(matches!(encode_resync_file(&status), Err(Error::CorruptedFormat)));
+        assert!(matches!(encode_resync_file(&status), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]
@@ -1115,7 +1127,7 @@ mod tests {
 
         assert!(matches!(
             BucketReplicationResyncStatus::unmarshal_legacy_msg(&payload),
-            Err(Error::CorruptedFormat)
+            Err(ResyncStateError::CorruptedFormat)
         ));
     }
 
@@ -1172,5 +1184,20 @@ mod tests {
             skip_msgp_value(&mut cursor).expect("fixext should skip");
             assert!(matches!(rmp::decode::read_marker(&mut cursor), Ok(Marker::FixPos(1))));
         }
+    }
+
+    #[test]
+    fn io_errors_stay_typed_in_resync_state_error() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "state file locked");
+        let err: ResyncStateError = io_err.into();
+        match &err {
+            ResyncStateError::Io(inner) => {
+                assert_eq!(inner.kind(), std::io::ErrorKind::PermissionDenied);
+                assert_eq!(inner.to_string(), "state file locked");
+            }
+            other => panic!("io::Error must stay typed, got {other:?}"),
+        }
+        assert_eq!(err.to_string(), "state file locked");
+        assert!(std::error::Error::source(&err).is_some(), "Io must expose its source");
     }
 }

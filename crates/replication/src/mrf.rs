@@ -15,7 +15,7 @@
 use byteorder::{ByteOrder, LittleEndian};
 use std::fmt;
 
-use crate::{Error, Result};
+use crate::{Result, ResyncStateError};
 
 pub use crate::filemeta::{MrfOpKind, MrfReplicateEntry};
 
@@ -569,7 +569,7 @@ impl MrfV2Envelope {
     }
 }
 pub fn encode_mrf_file(entries: &[MrfReplicateEntry]) -> Result<Vec<u8>> {
-    let payload = rmp_serde::to_vec_named(entries).map_err(|e| Error::Other(e.to_string()))?;
+    let payload = rmp_serde::to_vec_named(entries).map_err(|e| ResyncStateError::Other(e.to_string()))?;
     let mut data = Vec::with_capacity(4 + payload.len());
     let mut fmt = [0u8; 2];
     LittleEndian::write_u16(&mut fmt, MRF_META_FORMAT);
@@ -583,19 +583,19 @@ pub fn encode_mrf_file(entries: &[MrfReplicateEntry]) -> Result<Vec<u8>> {
 
 pub fn decode_mrf_file(data: &[u8]) -> Result<Vec<MrfReplicateEntry>> {
     if data.len() <= 4 {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
     let mut fmt = [0u8; 2];
     fmt.copy_from_slice(&data[0..2]);
     if LittleEndian::read_u16(&fmt) != MRF_META_FORMAT {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
     let mut ver = [0u8; 2];
     ver.copy_from_slice(&data[2..4]);
     if LittleEndian::read_u16(&ver) != MRF_META_VERSION {
-        return Err(Error::CorruptedFormat);
+        return Err(ResyncStateError::CorruptedFormat);
     }
-    rmp_serde::from_slice(&data[4..]).map_err(|e| Error::Other(e.to_string()))
+    rmp_serde::from_slice(&data[4..]).map_err(|e| ResyncStateError::Other(e.to_string()))
 }
 
 #[cfg(test)]
@@ -755,7 +755,7 @@ mod tests {
         data.extend_from_slice(&MRF_META_VERSION.to_le_bytes());
         data.push(0x90);
 
-        assert!(matches!(decode_mrf_file(&data), Err(Error::CorruptedFormat)));
+        assert!(matches!(decode_mrf_file(&data), Err(ResyncStateError::CorruptedFormat)));
     }
 
     #[test]

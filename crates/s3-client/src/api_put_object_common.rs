@@ -18,7 +18,7 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use crate::client::{
+use crate::{
     api_error_response::{err_entity_too_large, err_invalid_argument},
     api_put_object::PutObjectOptions,
     constants::{ABS_MIN_PART_SIZE, MAX_MULTIPART_PUT_OBJECT_SIZE, MAX_PART_SIZE, MAX_PARTS_COUNT, MIN_PART_SIZE},

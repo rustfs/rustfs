@@ -49,7 +49,7 @@ fn heal_matched_disk_variants() -> Vec<DiskError> {
 fn disk_to_storage_to_disk_preserves_heal_matched_variants() {
     for disk_err in heal_matched_disk_variants() {
         let storage: StorageError = disk_err.clone().into();
-        let back: DiskError = storage.into();
+        let back: DiskError = storage.narrow_to_disk().expect("heal-matched variants must narrow");
         assert_eq!(back, disk_err, "DiskError → StorageError → DiskError must be identity for {disk_err:?}");
     }
 }
@@ -63,7 +63,10 @@ fn storage_to_disk_to_storage_preserves_heal_matched_variants() {
         StorageError::ErasureWriteQuorum,
     ];
     for storage_err in variants {
-        let disk: DiskError = storage_err.clone().into();
+        let disk: DiskError = storage_err
+            .clone()
+            .narrow_to_disk()
+            .expect("heal-matched variants must narrow");
         let back: StorageError = disk.into();
         assert_eq!(
             back, storage_err,
@@ -77,11 +80,11 @@ fn storage_to_disk_to_storage_preserves_heal_matched_variants() {
 /// A classifier on the far side of the disk boundary can no longer tell
 /// backpressure ("please slow down") apart from fd exhaustion.
 ///
-/// Pinned as-is for backlog#1845; PR4's fallible `narrow_to_disk()` is the
-/// planned place to surface this loss explicitly.
+/// The fallible `narrow_to_disk()` keeps this collapse as a documented arm;
+/// only variants with no disk-layer identity at all narrow to `Err`.
 #[test]
 fn slowdown_collapses_to_too_many_open_files_across_disk_boundary() {
-    let disk: DiskError = StorageError::SlowDown.into();
+    let disk: DiskError = StorageError::SlowDown.narrow_to_disk().expect("SlowDown narrows, lossily");
     assert_eq!(disk, DiskError::TooManyOpenFiles);
 
     let back: StorageError = disk.into();
@@ -96,7 +99,9 @@ fn slowdown_collapses_to_too_many_open_files_across_disk_boundary() {
 /// and comes back as `DiskFull`.
 #[test]
 fn storage_full_collapses_to_disk_full_across_disk_boundary() {
-    let disk: DiskError = StorageError::StorageFull.into();
+    let disk: DiskError = StorageError::StorageFull
+        .narrow_to_disk()
+        .expect("StorageFull narrows, lossily");
     assert_eq!(disk, DiskError::DiskFull);
 
     let back: StorageError = disk.into();
@@ -204,7 +209,10 @@ fn storage_to_filemeta_to_storage_preserves_matched_variants() {
         StorageError::Unexpected,
     ];
     for storage_err in variants {
-        let filemeta: rustfs_filemeta::Error = storage_err.clone().into();
+        let filemeta: rustfs_filemeta::Error = storage_err
+            .clone()
+            .narrow_to_filemeta()
+            .expect("matched variants must narrow");
         let back: StorageError = filemeta.into();
         assert_eq!(
             back, storage_err,
@@ -219,7 +227,13 @@ fn storage_to_filemeta_to_storage_preserves_matched_variants() {
 /// recovers identity" property of the by-design bridge stays load-bearing.
 #[test]
 fn storage_to_filemeta_other_recovers_identity_via_io_bridge() {
-    let filemeta: rustfs_filemeta::Error = StorageError::SlowDown.into();
+    // A variant with no filemeta identity narrows to Err; callers that need a
+    // total conversion fold it into the io-backed other(), and the identity
+    // bridge recovers the boxed StorageError on the way back.
+    let refused = StorageError::SlowDown
+        .narrow_to_filemeta()
+        .expect_err("SlowDown has no filemeta identity");
+    let filemeta = rustfs_filemeta::Error::other(refused);
     assert!(
         matches!(filemeta, rustfs_filemeta::Error::Io(_)),
         "unmatched variants fold into the io-backed other()"

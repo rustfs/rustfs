@@ -327,9 +327,20 @@ impl From<DiskError> for StorageError {
     }
 }
 
-impl From<StorageError> for DiskError {
-    fn from(val: StorageError) -> Self {
-        match val {
+impl StorageError {
+    /// Narrow a store-layer error to the disk-layer vocabulary.
+    ///
+    /// This used to be a blanket `impl From<StorageError> for DiskError`, which
+    /// let `?` silently push store-only errors across the disk boundary into
+    /// `DiskError::other`, fragmenting `reduce_errs` quorum buckets
+    /// (backlog#1845). Narrowing is now a named, fallible operation: variants
+    /// with a disk-layer identity map across (including two documented lossy
+    /// collapses kept for compatibility — `SlowDown` → `TooManyOpenFiles` and
+    /// `StorageFull` → `DiskFull`, pinned by conversion_roundtrip_tests), and
+    /// everything else comes back as `Err(self)` so the caller decides what
+    /// crossing the boundary means for it.
+    pub fn narrow_to_disk(self) -> core::result::Result<DiskError, StorageError> {
+        Ok(match self {
             StorageError::Io(io_error) => io_error.into(),
             StorageError::Unexpected => DiskError::Unexpected,
             StorageError::FileNotFound => DiskError::FileNotFound,
@@ -375,8 +386,26 @@ impl From<StorageError> for DiskError {
             StorageError::VolumeAccessDenied => DiskError::VolumeAccessDenied,
             StorageError::FileAccessDenied => DiskError::FileAccessDenied,
             StorageError::RemoteClientUnavailable(detail) => DiskError::RemoteClientUnavailable(detail),
-            _ => DiskError::other(val),
-        }
+            val => return Err(val),
+        })
+    }
+
+    /// Same contract as [`StorageError::narrow_to_disk`], for the
+    /// `rustfs_filemeta::Error` vocabulary (formerly a blanket `From` impl
+    /// with an `other()` catch-all). No production path currently narrows in
+    /// this direction; the named form keeps future callers deliberate.
+    pub fn narrow_to_filemeta(self) -> core::result::Result<rustfs_filemeta::Error, StorageError> {
+        Ok(match self {
+            StorageError::Unexpected => rustfs_filemeta::Error::Unexpected,
+            StorageError::FileNotFound => rustfs_filemeta::Error::FileNotFound,
+            StorageError::FileVersionNotFound => rustfs_filemeta::Error::FileVersionNotFound,
+            StorageError::FileCorrupt => rustfs_filemeta::Error::FileCorrupt,
+            StorageError::DoneForNow => rustfs_filemeta::Error::DoneForNow,
+            StorageError::MethodNotAllowed => rustfs_filemeta::Error::MethodNotAllowed,
+            StorageError::VolumeNotFound => rustfs_filemeta::Error::VolumeNotFound,
+            StorageError::Io(io_error) => io_error.into(),
+            val => return Err(val),
+        })
     }
 }
 
@@ -429,22 +458,6 @@ impl From<rustfs_filemeta::Error> for StorageError {
             rustfs_filemeta::Error::Unexpected => StorageError::Unexpected,
             rustfs_filemeta::Error::Io(io_error) => io_error.into(),
             _ => StorageError::Io(std::io::Error::other(e)),
-        }
-    }
-}
-
-impl From<StorageError> for rustfs_filemeta::Error {
-    fn from(val: StorageError) -> Self {
-        match val {
-            StorageError::Unexpected => rustfs_filemeta::Error::Unexpected,
-            StorageError::FileNotFound => rustfs_filemeta::Error::FileNotFound,
-            StorageError::FileVersionNotFound => rustfs_filemeta::Error::FileVersionNotFound,
-            StorageError::FileCorrupt => rustfs_filemeta::Error::FileCorrupt,
-            StorageError::DoneForNow => rustfs_filemeta::Error::DoneForNow,
-            StorageError::MethodNotAllowed => rustfs_filemeta::Error::MethodNotAllowed,
-            StorageError::VolumeNotFound => rustfs_filemeta::Error::VolumeNotFound,
-            StorageError::Io(io_error) => io_error.into(),
-            _ => rustfs_filemeta::Error::other(val),
         }
     }
 }
@@ -1438,7 +1451,9 @@ mod tests {
 
         for original in all_variants {
             let storage_error: StorageError = original.clone().into();
-            let round_tripped: DiskError = storage_error.into();
+            let round_tripped: DiskError = storage_error
+                .narrow_to_disk()
+                .expect("every disk-representable StorageError must narrow back");
 
             assert_eq!(
                 std::mem::discriminant(&original),
@@ -1452,7 +1467,7 @@ mod tests {
         // message must both survive the round trip.
         let io_original = DiskError::Io(IoError::new(ErrorKind::PermissionDenied, "denied"));
         let storage_error: StorageError = io_original.clone().into();
-        let io_round_tripped: DiskError = storage_error.into();
+        let io_round_tripped: DiskError = storage_error.narrow_to_disk().expect("Io narrows through the bridge");
         assert_eq!(io_original, io_round_tripped);
         match io_round_tripped {
             DiskError::Io(inner) => {
@@ -1700,8 +1715,13 @@ mod tests {
             assert_eq!(converted_storage_error, expected_storage_error);
 
             // Test reverse conversion
-            let converted_back: rustfs_filemeta::Error = converted_storage_error.into();
-            assert_eq!(converted_back, expected_storage_error.into());
+            let converted_back: rustfs_filemeta::Error = converted_storage_error
+                .narrow_to_filemeta()
+                .expect("matched variants must narrow to filemeta");
+            let expected_back: rustfs_filemeta::Error = expected_storage_error
+                .narrow_to_filemeta()
+                .expect("matched variants must narrow to filemeta");
+            assert_eq!(converted_back, expected_back);
         }
     }
 
