@@ -1559,8 +1559,8 @@ impl SetDisks {
     }
 }
 
-/// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
-/// Defaults to 30 seconds if not set or invalid
+/// Get lock acquire timeout from environment variable RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT (in seconds)
+/// Defaults to 5 seconds if not set or invalid
 /// Lock acquisition timeout. Cached: this is consulted on every object
 /// lock acquisition and `std::env::var` takes a process-global lock. In test
 /// builds the env var is read directly so `temp_env` overrides take effect.
