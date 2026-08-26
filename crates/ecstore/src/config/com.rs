@@ -48,6 +48,7 @@ use rustfs_filemeta::FileInfo;
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::LazyLock;
 use std::sync::{Arc, RwLock};
 use tokio::io::AsyncReadExt;
@@ -168,6 +169,7 @@ const EVENT_SERVER_CONFIG_READ_FAILED: &str = "server_config_read_failed";
 const EVENT_SERVER_CONFIG_HEAL_RESULT: &str = "server_config_heal_result";
 const EVENT_SERVER_CONFIG_RECOVERED: &str = "server_config_recovered_after_heal";
 const EVENT_SERVER_CONFIG_FALLBACK: &str = "server_config_corruption_fallback";
+const EVENT_SERVER_CONFIG_SCALAR_SECTION_IGNORED: &str = "server_config_scalar_section_ignored";
 
 fn config_corruption_recovery_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_CONFIG_RECOVER_ON_CORRUPTION, DEFAULT_CONFIG_RECOVER_ON_CORRUPTION)
@@ -216,6 +218,55 @@ pub fn register_server_config_decrypt_fn(decrypt_fn: ServerConfigDecryptFn) {
 
 fn server_config_decrypt_fn() -> Option<ServerConfigDecryptFn> {
     SERVER_CONFIG_DECRYPT_FN.read().ok().and_then(|guard| guard.clone())
+}
+
+/// Dedup set for [`warn_ignored_scalar_section`], keyed by (subsystem, value)
+/// hash. The persisted config is re-read on a short interval (event-notifier
+/// reconcile runs every 5s), so an undeduplicated warn would flood the log with
+/// one line per cycle for the same unchanged remnant.
+static IGNORED_SCALAR_SECTION_WARNED: LazyLock<RwLock<HashSet<u64>>> = LazyLock::new(|| RwLock::new(HashSet::new()));
+const IGNORED_SCALAR_SECTION_WARNED_CAP: usize = 64;
+
+fn should_warn_ignored_scalar_section(subsystem_key: &str, config_value: &Value) -> bool {
+    let mut hasher = DefaultHasher::new();
+    subsystem_key.hash(&mut hasher);
+    config_value.to_string().hash(&mut hasher);
+    let digest = hasher.finish();
+
+    let Ok(mut seen) = IGNORED_SCALAR_SECTION_WARNED.write() else {
+        return true;
+    };
+    if seen.contains(&digest) {
+        return false;
+    }
+    if seen.len() >= IGNORED_SCALAR_SECTION_WARNED_CAP {
+        seen.clear();
+    }
+    seen.insert(digest);
+    true
+}
+
+fn warn_ignored_scalar_section(subsystem_key: &str, config_value: &Value) {
+    if !should_warn_ignored_scalar_section(subsystem_key, config_value) {
+        return;
+    }
+    let mut rendered = config_value.to_string();
+    if rendered.len() > 128 {
+        let mut cut = 128;
+        while !rendered.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        rendered.truncate(cut);
+        rendered.push('…');
+    }
+    warn!(
+        event = EVENT_SERVER_CONFIG_SCALAR_SECTION_IGNORED,
+        component = LOG_COMPONENT_CONFIG,
+        subsystem = LOG_SUBSYSTEM_CONFIG,
+        config_subsystem = subsystem_key,
+        ignored_value = %rendered,
+        "Ignoring persisted {subsystem_key} config with a legacy scalar shape; it carries no decodable settings and is dropped on the next config save"
+    );
 }
 
 #[cfg(test)]
@@ -980,10 +1031,20 @@ fn decode_scalar_config_value(config_value: &Value, descriptor: ScalarConfigDesc
             }
             Ok(overrides)
         }
-        _ => Err(Error::other(format!(
-            "invalid external {} config shape: expected an object or KVS array",
-            descriptor.subsystem_key
-        ))),
+        // Scalar and null section shapes (`"heal": ""`, `"scanner": null`,
+        // `"heal": {"default": null}`) are legacy remnants that carry no
+        // decodable settings; failing the whole config decode over them bricks
+        // every consumer of the persisted config (startup falls back to the
+        // default config, the admin config API cannot read-modify-write, and
+        // the notify reconciler retries forever). Ignore them with a deduped
+        // warning instead; the next config save scrubs them (see
+        // `normalize_scalar_section_seed`). Malformed values inside object or
+        // KVS-array shapes stay hard errors above — those shapes are where
+        // data (including fields from newer versions) can live.
+        _ => {
+            warn_ignored_scalar_section(descriptor.subsystem_key, config_value);
+            Ok(KVS::new())
+        }
     }
 }
 
@@ -1190,6 +1251,44 @@ fn decode_server_config_blob(data: &[u8]) -> Result<Config> {
         return Err(Error::other("unrecognized external server config shape"));
     }
     Ok(cfg)
+}
+
+/// True when a persisted scanner/heal section value is a shape the decoder
+/// warn-ignores instead of decoding: a bare scalar or null, or an object whose
+/// nested `default`/`_` member is such a shape. Object and KVS-array shapes
+/// with decodable structure are never ignorable — they are where data
+/// (including fields written by newer versions) can live.
+fn scalar_section_shape_is_ignorable(value: &Value) -> bool {
+    match value {
+        Value::Object(config_obj) => config_obj
+            .get("default")
+            .or_else(|| config_obj.get(DEFAULT_DELIMITER))
+            .is_some_and(scalar_section_shape_is_ignorable),
+        Value::Array(_) => false,
+        _ => true,
+    }
+}
+
+/// Strip warn-ignored scalar section shapes (see
+/// [`scalar_section_shape_is_ignorable`]) from a scanner/heal seed value so the
+/// canonical rewrite drops the remnant instead of preserving it verbatim, which
+/// would keep tripping the decoder on every future read.
+fn normalize_scalar_section_seed(existing: Option<Value>) -> Option<Value> {
+    match existing? {
+        Value::Object(mut config_obj) => {
+            for nested_key in ["default", DEFAULT_DELIMITER] {
+                if config_obj.get(nested_key).is_some_and(scalar_section_shape_is_ignorable) {
+                    let nested = config_obj.remove(nested_key);
+                    if let Some(normalized) = normalize_scalar_section_seed(nested) {
+                        config_obj.insert(nested_key.to_string(), normalized);
+                    }
+                }
+            }
+            (!config_obj.is_empty()).then_some(Value::Object(config_obj))
+        }
+        value if scalar_section_shape_is_ignorable(&value) => None,
+        value => Some(value),
+    }
 }
 
 fn parse_object_seed(data: &[u8]) -> Option<Map<String, Value>> {
@@ -1811,10 +1910,7 @@ fn encode_server_config_blob(cfg: &Config, seed: Option<&[u8]>) -> Result<Vec<u8
     root.remove("storage_class");
 
     for descriptor in [scanner_config_descriptor(), heal_config_descriptor()] {
-        let mut existing = root.remove(descriptor.subsystem_key);
-        if descriptor.subsystem_key == HEAL_SUB_SYS && existing.as_ref().is_some_and(Value::is_null) {
-            existing = None;
-        }
+        let existing = normalize_scalar_section_seed(root.remove(descriptor.subsystem_key));
         let rendered = build_scalar_config_object(cfg, descriptor);
         if let Some(config_value) = sync_rendered_scalar_config_value(existing, &rendered, descriptor)? {
             root.insert(descriptor.subsystem_key.to_string(), config_value);
@@ -1871,7 +1967,8 @@ fn is_standard_object_server_config(data: &[u8]) -> bool {
     matches!(root.get("version"), Some(Value::String(v)) if !v.trim().is_empty())
         && matches!(root.get("storageclass"), Some(Value::Object(_)))
         && !root.contains_key("storage_class")
-        && !matches!(root.get(HEAL_SUB_SYS), Some(Value::Null))
+        && !matches!(root.get(HEAL_SUB_SYS), Some(value) if scalar_section_shape_is_ignorable(value))
+        && !matches!(root.get(SCANNER_SUB_SYS), Some(value) if scalar_section_shape_is_ignorable(value))
 }
 
 fn configs_semantically_equal(lhs: &Config, rhs: &Config) -> bool {
@@ -2701,7 +2798,7 @@ mod tests {
         lookup_configs, new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata,
         read_config_preserve_empty, read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot,
         save_server_config, save_server_config_snapshot, save_server_config_snapshot_with_generation,
-        server_config_transaction_lock_path, storage_class_kvs_mut,
+        server_config_transaction_lock_path, should_warn_ignored_scalar_section, storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
     use crate::disk::endpoint::Endpoint;
@@ -3550,26 +3647,96 @@ mod tests {
     }
 
     #[test]
-    fn invalid_scalar_and_nested_null_config_shapes_remain_rejected() {
+    fn legacy_scalar_section_shapes_decode_as_no_override_and_canonicalize_on_save() {
+        let base = decode_server_config_blob(br#"{"version":"33","storageclass":{"standard":"","rrs":""}}"#)
+            .expect("base config should decode");
+
+        let ignorable_sections = [
+            (SCANNER_SUB_SYS, r#""scanner":null"#),
+            (SCANNER_SUB_SYS, r#""scanner":"cycle=61""#),
+            (HEAL_SUB_SYS, r#""heal":"""#),
+            (HEAL_SUB_SYS, r#""heal":false"#),
+            (HEAL_SUB_SYS, r#""heal":0"#),
+            (HEAL_SUB_SYS, r#""heal":{"default":null}"#),
+            (HEAL_SUB_SYS, r#""heal":{"_":null}"#),
+        ];
+
+        for (section_key, section) in ignorable_sections {
+            let input = format!(r#"{{"version":"33","storageclass":{{"standard":"","rrs":""}},{section}}}"#);
+            let cfg = decode_server_config_blob(input.as_bytes())
+                .unwrap_or_else(|err| panic!("legacy scalar section {section} should be ignored, got: {err}"));
+            assert_eq!(cfg, base, "ignored section {section} must contribute no overrides");
+            assert!(
+                !is_standard_object_server_config(input.as_bytes()),
+                "seed with {section} must not count as standard so a save rewrites it"
+            );
+
+            let encoded =
+                encode_server_config_blob(&cfg, Some(input.as_bytes())).expect("legacy seed should canonicalize on save");
+            let value: Value = serde_json::from_slice(&encoded).expect("canonical config should be valid JSON");
+            assert!(
+                value.get(section_key).is_none(),
+                "canonical save must scrub the {section} remnant, got: {value}"
+            );
+            assert!(is_standard_object_server_config(&encoded));
+            decode_server_config_blob(&encoded).expect("canonicalized config must decode cleanly");
+        }
+    }
+
+    #[test]
+    fn scrubbing_ignorable_nested_member_preserves_unknown_section_fields() {
+        let input = br#"{"version":"33","storageclass":{"standard":"","rrs":""},"heal":{"_":null,"future_flag":"keep"}}"#;
+
+        let cfg = decode_server_config_blob(input).expect("ignorable nested member should not fail decode");
+        assert!(!is_standard_object_server_config(input));
+
+        let encoded = encode_server_config_blob(&cfg, Some(input)).expect("seed should canonicalize on save");
+        let value: Value = serde_json::from_slice(&encoded).expect("canonical config should be valid JSON");
+        assert!(value[HEAL_SUB_SYS].get(DEFAULT_DELIMITER).is_none(), "null member must be scrubbed");
+        assert_eq!(
+            value[HEAL_SUB_SYS]["future_flag"].as_str(),
+            Some("keep"),
+            "unknown section fields must survive the scrub"
+        );
+        assert!(is_standard_object_server_config(&encoded));
+        decode_server_config_blob(&encoded).expect("canonicalized config must decode cleanly");
+    }
+
+    #[test]
+    fn value_level_scalar_config_errors_remain_rejected() {
         let invalid_sections = [
-            r#""scanner":null"#,
-            r#""heal":"""#,
-            r#""heal":false"#,
-            r#""heal":0"#,
-            r#""heal":{"default":null}"#,
-            r#""heal":{"_":null}"#,
             r#""heal":{"bitrot_cycle":null}"#,
             r#""heal":[{"key":"bitrot_cycle","value":null}]"#,
         ];
 
         for section in invalid_sections {
             let input = format!(r#"{{"version":"33","storageclass":{{"standard":"","rrs":""}},{section}}}"#);
-            let err = decode_server_config_blob(input.as_bytes()).expect_err("invalid scalar shape must remain rejected");
+            let err = decode_server_config_blob(input.as_bytes())
+                .expect_err("value-level errors inside object/array shapes must remain rejected");
             assert!(
-                err.to_string().contains("expected"),
+                err.to_string().contains("expected a scalar"),
                 "invalid section {section} returned an unrelated error: {err}"
             );
         }
+    }
+
+    #[test]
+    fn ignored_scalar_sections_do_not_defeat_unrecognized_config_detection() {
+        let err = decode_server_config_blob(br#"{"scanner":"","heal":null}"#)
+            .expect_err("a config with only ignorable sections and no recognized header is still unrecognized");
+        assert!(
+            err.to_string().contains("unrecognized external server config shape"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn ignored_scalar_section_warning_dedups_by_content() {
+        let value = Value::String("dedup-probe".to_string());
+        assert!(should_warn_ignored_scalar_section("dedup-test-subsystem", &value));
+        assert!(!should_warn_ignored_scalar_section("dedup-test-subsystem", &value));
+        let changed = Value::String("dedup-probe-changed".to_string());
+        assert!(should_warn_ignored_scalar_section("dedup-test-subsystem", &changed));
     }
 
     #[test]
@@ -4014,18 +4181,6 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("invalid external scanner config value for cycle: expected a scalar"),
-            "unexpected scanner decode error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_decode_rejects_scalar_scanner_section() {
-        let err = decode_server_config_blob(br#"{"version":"33","scanner":"cycle=61"}"#)
-            .expect_err("scalar scanner sections should be rejected");
-
-        assert!(
-            err.to_string()
-                .contains("invalid external scanner config shape: expected an object or KVS array"),
             "unexpected scanner decode error: {err}"
         );
     }

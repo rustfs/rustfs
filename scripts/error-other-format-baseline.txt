@@ -24,7 +24,7 @@
 11|crates/ecstore/src/cluster/rpc/peer_rest_client.rs
 10|crates/ecstore/src/cluster/rpc/peer_s3_client.rs
 10|crates/ecstore/src/cluster/rpc/remote_disk.rs
-7|crates/ecstore/src/config/com.rs
+6|crates/ecstore/src/config/com.rs
 14|crates/ecstore/src/config/storageclass.rs
 185|crates/ecstore/src/core/pools.rs
 8|crates/ecstore/src/data_movement/mod.rs
