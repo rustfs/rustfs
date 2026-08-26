@@ -114,3 +114,5 @@ mod tests {
         unsafe { allocator.dealloc(grown_ptr, grown_layout) };
     }
 }
+
+// CI probe (backlog#1843 attribution): comment-only change to trigger the Rust CI lanes.
