@@ -150,9 +150,10 @@ Drive timeout health-action policy:
 Drive timeout profile preset:
 - `RUSTFS_DRIVE_TIMEOUT_PROFILE`
   - `default` (default): keep current timeout defaults.
-  - `high_latency`: use 60s default timeout for scanner-sensitive operations when no per-operation timeout override is set (`read_metadata`, `disk_info`, `list_dir`, `walk_dir`, `walk_dir_stall`).
+  - `high_latency`: use 60s default timeout for scanner-sensitive operations when no operation-specific override is set (`read_metadata`, `disk_info`, `list_dir`, `walk_dir`, `walk_dir_stall`, and object-capacity scan base/maximum budgets).
 - Precedence:
   - Explicit per-operation timeout env (`RUSTFS_DRIVE_*_TIMEOUT_SECS`) takes highest precedence.
+  - Explicit object-capacity timeout env (`RUSTFS_CAPACITY_STAT_TIMEOUT`, `RUSTFS_CAPACITY_MAX_TIMEOUT`) takes precedence for capacity scans.
   - Then `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION` legacy fallback.
   - Then the profile-derived default (`default` or `high_latency`).
 

@@ -287,14 +287,17 @@ The configuration constants are defined in `crates/config/src/constants/capacity
 | `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` | `5` | Recent 60-second write-frequency threshold |
 | `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` | `30s` | Cache age required before fast refresh is considered |
 | `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` | `200000` | Exact-count file threshold |
-| `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3s` | Base scan timeout |
+| `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3s` (`60s` with `RUSTFS_DRIVE_TIMEOUT_PROFILE=high_latency`) | Base scan timeout |
 | `RUSTFS_CAPACITY_SAMPLE_RATE` | `200` | Overflow-file sampling interval |
 | `RUSTFS_CAPACITY_METRICS_INTERVAL` | `600s` | Runtime summary emission interval |
 | `RUSTFS_CAPACITY_FOLLOW_SYMLINKS` | `false` | Whether to follow symlinks |
 | `RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT` | `true` | Whether to enable dynamic timeout scaling |
 | `RUSTFS_CAPACITY_MIN_TIMEOUT` | `2s` | Dynamic-timeout lower bound |
-| `RUSTFS_CAPACITY_MAX_TIMEOUT` | `15s` | Dynamic-timeout upper bound |
+| `RUSTFS_CAPACITY_MAX_TIMEOUT` | `15s` (`60s` with `RUSTFS_DRIVE_TIMEOUT_PROFILE=high_latency`) | Dynamic-timeout upper bound |
 | `RUSTFS_CAPACITY_STALL_TIMEOUT` | `20s` | Stall-detection threshold |
+
+Explicit `RUSTFS_CAPACITY_STAT_TIMEOUT` and `RUSTFS_CAPACITY_MAX_TIMEOUT` values
+take precedence over the drive-timeout profile.
 
 ### Configuration-Caching Note
 
