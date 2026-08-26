@@ -14569,18 +14569,30 @@ mod tests {
         body
     }
 
-    // Deletes the given part files from every version data dir on every disk,
-    // simulating rebalance removing the object data while xl.meta stays
-    // readable. Returns the number of files removed.
-    fn delete_object_part_shards(disk_paths: &[std::path::PathBuf], bucket: &str, object: &str, part_numbers: &[usize]) -> usize {
+    // Deletes the given part files from every version data dir present on the
+    // disks, simulating rebalance removing the object data while xl.meta stays
+    // readable. Returns the number of version dirs visited and files removed.
+    fn delete_object_part_shards(
+        disk_paths: &[std::path::PathBuf],
+        bucket: &str,
+        object: &str,
+        part_numbers: &[usize],
+    ) -> (usize, usize) {
+        let mut version_dirs = 0;
         let mut deleted = 0;
         for disk_path in disk_paths {
             let object_dir = disk_path.join(bucket).join(object);
-            for entry in std::fs::read_dir(&object_dir).expect("object directory must exist") {
+            let entries = match std::fs::read_dir(&object_dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("object directory must be readable: {error}"),
+            };
+            for entry in entries {
                 let entry = entry.expect("object directory entry must read");
                 if !entry.file_type().expect("entry file type must read").is_dir() {
                     continue;
                 }
+                version_dirs += 1;
                 for part_number in part_numbers {
                     let part_file = entry.path().join(format!("part.{part_number}"));
                     if part_file.exists() {
@@ -14590,7 +14602,7 @@ mod tests {
                 }
             }
         }
-        deleted
+        (version_dirs, deleted)
     }
 
     // The surfaced mid-stream failure must be the original trigger: a typed
@@ -14633,8 +14645,9 @@ mod tests {
         // so no file descriptor for them can exist: the stream must fail at the
         // part-2 boundary, and every reopen resolves intact metadata whose data
         // is gone, so the whole resume budget burns down.
-        let deleted = delete_object_part_shards(&disk_paths, &bucket, object, &[2, 3]);
-        assert_eq!(deleted, disk_paths.len() * 2);
+        let (version_dirs, deleted) = delete_object_part_shards(&disk_paths, &bucket, object, &[2, 3]);
+        assert!(version_dirs > 0, "the multipart object must have at least one version data directory");
+        assert_eq!(deleted, version_dirs * 2);
 
         let input = GetObjectInput::builder()
             .bucket(bucket)
@@ -14753,8 +14766,9 @@ mod tests {
                 }
             }
         }
-        let deleted = delete_object_part_shards(&pool_disk_paths[source_pool], &bucket, object, &[2, 3]);
-        assert_eq!(deleted, pool_disk_paths[source_pool].len() * 2);
+        let (version_dirs, deleted) = delete_object_part_shards(&pool_disk_paths[source_pool], &bucket, object, &[2, 3]);
+        assert!(version_dirs > 0, "the source pool must have at least one version data directory");
+        assert_eq!(deleted, version_dirs * 2);
 
         for (source_disk, target_disk) in pool_disk_paths[source_pool].iter().zip(&pool_disk_paths[target_pool]) {
             let source_meta = source_disk.join(&bucket).join(object).join("xl.meta");
