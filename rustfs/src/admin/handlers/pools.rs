@@ -30,11 +30,10 @@ use crate::{
         AdminPoolStatus, QueryPoolStatusRequest, current_endpoints_handle, current_notification_system, default_admin_usecase,
     },
     admin::{
-        auth::validate_admin_request,
+        auth::authorize_admin_request,
         router::{AdminOperation, Operation, S3Router},
         storage_api::runtime::{EndpointServerPools, PeerRestClient},
     },
-    auth::{check_key_valid, get_session_token},
     error::ApiError,
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -480,23 +479,16 @@ impl Operation for ListPools {
     // GET <endpoint>/<admin-API>/pools/list
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(pool_admin_missing_credentials_error("list pools"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
+        authorize_admin_request(
+            &req,
             vec![
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
             ],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -577,23 +569,16 @@ impl Operation for StatusPool {
     // GET <endpoint>/<admin-API>/pools/status?pool=http://server{1...4}/disk{1...4}
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(pool_admin_missing_credentials_error("load pool status"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
+        authorize_admin_request(
+            &req,
             vec![
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
             ],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -632,23 +617,16 @@ impl Operation for StatusDecommission {
     // GET <endpoint>/<admin-API>/decommission/status[?pool=http://server{1...4}/disk{1...4}]
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(input_cred) = req.credentials else {
+        if req.credentials.is_none() {
             return Err(pool_admin_missing_credentials_error("load decommission status"));
-        };
+        }
 
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
+        authorize_admin_request(
+            &req,
             vec![
                 Action::AdminAction(AdminAction::ServerInfoAdminAction),
                 Action::AdminAction(AdminAction::DecommissionAdminAction),
             ],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
         )
         .await?;
 
@@ -702,27 +680,16 @@ impl Operation for StartDecommission {
             "admin pool request state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(pool_admin_missing_credentials_error_with_request(
                 "start decommission",
                 &request_id,
                 &remote_addr,
             ));
         };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
         let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::DecommissionAdminAction)]).await?;
         let audit = PoolAuditContext::new(&request_id, &actor, &remote_addr);
 
         let Some(endpoints) = endpoints_from_context() else {
@@ -866,27 +833,16 @@ impl Operation for CancelDecommission {
             "admin pool request state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(pool_admin_missing_credentials_error_with_request(
                 "cancel decommission",
                 &request_id,
                 &remote_addr,
             ));
         };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
         let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::DecommissionAdminAction)]).await?;
         let audit = PoolAuditContext::new(&request_id, &actor, &remote_addr);
 
         let Some(endpoints) = endpoints_from_context() else {
@@ -979,27 +935,16 @@ impl Operation for ClearDecommission {
             "admin pool request state"
         );
 
-        let Some(input_cred) = req.credentials else {
+        let Some(input_cred) = req.credentials.as_ref() else {
             return Err(pool_admin_missing_credentials_error_with_request(
                 "clear decommission",
                 &request_id,
                 &remote_addr,
             ));
         };
-
-        let (cred, owner) =
-            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
         let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-        validate_admin_request(
-            &req.headers,
-            &cred,
-            owner,
-            false,
-            vec![Action::AdminAction(AdminAction::DecommissionAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
-        )
-        .await?;
+        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::DecommissionAdminAction)]).await?;
         let audit = PoolAuditContext::new(&request_id, &actor, &remote_addr);
 
         let Some(endpoints) = endpoints_from_context() else {
@@ -1073,14 +1018,39 @@ impl Operation for ClearDecommission {
 #[cfg(test)]
 mod pools_handler_tests {
     use super::{
-        AdminPoolStatus, PoolAuditContext, contextualize_admin_pool_api_error,
-        decommission_admin_not_initialized_error_with_audit, decommission_peer_target, has_duplicate_indices,
-        parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query, pool_admin_missing_credentials_error,
-        pool_admin_missing_credentials_error_with_request, pool_admin_pool_index_error_with_audit,
-        pool_admin_pool_not_found_error_with_audit, pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error,
-        pool_admin_query_parse_error_with_audit, validate_pool_mutation_leader, validate_start_decommission_guards,
+        AdminPoolStatus, Body, CancelDecommission, ClearDecommission, HeaderMap, ListPools, Method, Operation, Params,
+        PoolAuditContext, S3ErrorCode, S3Request, StartDecommission, StatusDecommission, StatusPool, Uri,
+        contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit, decommission_peer_target,
+        has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query,
+        pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
+        pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error_with_audit,
+        pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error, pool_admin_query_parse_error_with_audit,
+        validate_pool_mutation_leader, validate_start_decommission_guards,
     };
     use crate::admin::storage_api::runtime::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+
+    fn credential_less_request(method: Method, uri: &'static str) -> S3Request<Body> {
+        S3Request {
+            input: Body::empty(),
+            method,
+            uri: Uri::from_static(uri),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn assert_missing_credentials(operation: &dyn Operation, method: Method, uri: &'static str, message: &str) {
+        let err = operation
+            .call(credential_less_request(method, uri), Params::new())
+            .await
+            .expect_err("a pool admin request without credentials must fail");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some(message));
+    }
 
     fn test_pool_endpoints(is_local: bool) -> EndpointServerPools {
         let mut endpoint = Endpoint::try_from("http://127.0.0.1:9000/disk").expect("test endpoint should parse");
@@ -1379,5 +1349,125 @@ mod pools_handler_tests {
         assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
         assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
         assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
+    }
+
+    /// Routing the pool handlers through the shared admin gate must not change
+    /// the wire response a caller sees when it sends no credentials at all: each
+    /// handler keeps its own operation-scoped message (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn pool_handlers_keep_their_missing_credentials_response() {
+        assert_missing_credentials(
+            &ListPools {},
+            Method::GET,
+            "/rustfs/admin/v3/pools/list",
+            "Failed to list pools: missing credentials",
+        )
+        .await;
+        assert_missing_credentials(
+            &StatusPool {},
+            Method::GET,
+            "/rustfs/admin/v3/pools/status",
+            "Failed to load pool status: missing credentials",
+        )
+        .await;
+        assert_missing_credentials(
+            &StatusDecommission {},
+            Method::GET,
+            "/rustfs/admin/v3/decommission/status",
+            "Failed to load decommission status: missing credentials",
+        )
+        .await;
+        assert_missing_credentials(
+            &StartDecommission {},
+            Method::POST,
+            "/rustfs/admin/v3/pools/decommission",
+            "Failed to start decommission: missing credentials",
+        )
+        .await;
+        assert_missing_credentials(
+            &CancelDecommission {},
+            Method::POST,
+            "/rustfs/admin/v3/pools/cancel",
+            "Failed to cancel decommission: missing credentials",
+        )
+        .await;
+        assert_missing_credentials(
+            &ClearDecommission {},
+            Method::POST,
+            "/rustfs/admin/v3/pools/clear",
+            "Failed to clear decommission: missing credentials",
+        )
+        .await;
+    }
+
+    fn source_block<'a>(production: &'a str, marker: &str) -> &'a str {
+        let block = production
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} should exist"))
+            .1;
+        let end = ["\npub struct ", "\nasync fn ", "\npub(crate) async fn ", "\n#[cfg(test)]"]
+            .into_iter()
+            .filter_map(|boundary| block.find(boundary))
+            .min()
+            .unwrap_or(block.len());
+        &block[..end]
+    }
+
+    fn assert_shared_gate_wiring(block: &str, item: &str, actions: &[&str], binds_credentials: bool) {
+        assert_eq!(
+            block.matches("authorize_admin_request(").count(),
+            1,
+            "{item} must use exactly one shared gate"
+        );
+        assert_eq!(
+            block.matches("Action::AdminAction(").count(),
+            actions.len(),
+            "{item} must preserve its exact action-vector length"
+        );
+        for action in actions {
+            assert!(block.contains(&format!("AdminAction::{action}")), "{item} must authorize with {action}");
+        }
+        assert_eq!(
+            block.contains("let cred = authorize_admin_request("),
+            binds_credentials,
+            "{item} credential binding must match its payload-processing contract"
+        );
+    }
+
+    /// Pins the gate wiring itself: every pool handler authorizes through
+    /// `authorize_admin_request` with the same action vector it used before the
+    /// deduplication, and the mutating handlers keep deriving their audit actor
+    /// from the caller-supplied access key (rustfs/backlog#1829).
+    #[test]
+    fn pool_handlers_use_the_shared_admin_gate_with_their_actions() {
+        let production = include_str!("pools.rs")
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("production source must precede the test module");
+
+        let read_actions = ["ServerInfoAdminAction", "DecommissionAdminAction"];
+        let mutate_actions = ["DecommissionAdminAction"];
+        for (handler, actions) in [
+            ("ListPools", read_actions.as_slice()),
+            ("StatusPool", read_actions.as_slice()),
+            ("StatusDecommission", read_actions.as_slice()),
+            ("StartDecommission", mutate_actions.as_slice()),
+            ("CancelDecommission", mutate_actions.as_slice()),
+            ("ClearDecommission", mutate_actions.as_slice()),
+        ] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert_shared_gate_wiring(block, handler, actions, false);
+        }
+
+        for handler in ["StartDecommission", "CancelDecommission", "ClearDecommission"] {
+            let block = source_block(production, &format!("impl Operation for {handler}"));
+            assert!(
+                block.contains("let actor = MaskedAccessKey(&input_cred.access_key).to_string();"),
+                "{handler} must keep masking the caller access key for its audit trail"
+            );
+        }
+
+        assert!(!production.contains("check_key_valid(get_session_token"));
+        assert!(!production.contains("validate_admin_request("));
     }
 }
