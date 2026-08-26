@@ -152,6 +152,28 @@ def check_e2e_modules(root: Path) -> list[str]:
     return errors
 
 
+def check_vault_test_groups(root: Path) -> list[str]:
+    src = root / "crates/e2e_test/src"
+    vault_modules = {
+        path.relative_to(src).with_suffix("").as_posix().replace("/", "::")
+        for path in src.rglob("*_test.rs")
+        if "VaultTestEnvironment" in rust_code_only(path.read_text())
+    }
+    config = tomllib.loads((root / ".config/nextest.toml").read_text())
+    errors: list[str] = []
+    for profile in ("default", "e2e-full"):
+        overrides = config.get("profile", {}).get(profile, {}).get("overrides", [])
+        filters = "\n".join(
+            override.get("filter", "")
+            for override in overrides
+            if override.get("test-group") == "e2e-vault"
+        )
+        for module in sorted(vault_modules):
+            if f"{module}::" not in filters:
+                errors.append(f".config/nextest.toml: profile.{profile} does not serialize Vault module {module}")
+    return errors
+
+
 def check_fuzz_targets(root: Path) -> list[str]:
     manifest = tomllib.loads((root / "fuzz/Cargo.toml").read_text())
     expected = {item["name"] for item in manifest.get("bin", []) if "name" in item}
@@ -715,6 +737,7 @@ def check_profile_listing(root: Path, profile: str, listing: Path) -> list[str]:
 def validate(root: Path) -> list[str]:
     errors: list[str] = []
     errors.extend(check_e2e_modules(root))
+    errors.extend(check_vault_test_groups(root))
     errors.extend(check_fuzz_targets(root))
     errors.extend(check_runner_selection(root))
     errors.extend(check_s3_tests_runner(root))
@@ -725,6 +748,30 @@ def validate(root: Path) -> list[str]:
 
 
 class SelfTests(unittest.TestCase):
+    def test_vault_tests_require_cross_process_serialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "crates/e2e_test/src/kms"
+            src.mkdir(parents=True)
+            (src / "vault_test.rs").write_text("fn test(env: VaultTestEnvironment) {}\n")
+            config = root / ".config/nextest.toml"
+            config.parent.mkdir()
+            config.write_text(
+                "[profile.default]\n"
+                "[[profile.default.overrides]]\n"
+                "filter = 'test(/^kms::vault_test::/)'\n"
+                "test-group = 'e2e-vault'\n"
+                "[profile.e2e-full]\n"
+            )
+            self.assertEqual(len(check_vault_test_groups(root)), 1)
+            config.write_text(
+                config.read_text()
+                + "[[profile.e2e-full.overrides]]\n"
+                + "filter = 'test(/^kms::vault_test::/)'\n"
+                + "test-group = 'e2e-vault'\n"
+            )
+            self.assertEqual(check_vault_test_groups(root), [])
+
     def test_runner_readiness_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -879,6 +926,7 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(len(check_s3_tests_runner(root)), 1)
             with (
                 mock.patch(__name__ + ".check_e2e_modules", return_value=[]),
+                mock.patch(__name__ + ".check_vault_test_groups", return_value=[]),
                 mock.patch(__name__ + ".check_fuzz_targets", return_value=[]),
                 mock.patch(__name__ + ".check_runner_selection", return_value=[]),
                 mock.patch(__name__ + ".check_workflow_readiness", return_value=[]),
