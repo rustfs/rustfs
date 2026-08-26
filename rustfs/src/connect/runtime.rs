@@ -607,6 +607,9 @@ mod tests {
             _lock: lock,
         };
 
+        // Directory link counts change when unrelated sibling directories
+        // come and go; that must not look like an anchored path replacement.
+        std::fs::create_dir(temp.path().join("unrelated-sibling")).expect("unrelated sibling directory");
         drop(runtime);
         assert!(matches!(store.try_runtime_lock(), Err(InventoryError::AlreadyRunning)));
         release.send(()).expect("release inventory task");

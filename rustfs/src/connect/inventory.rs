@@ -1083,10 +1083,10 @@ fn unix_regular_file_is_secure(owner: u32, mode: u32, links: u64, process: u32) 
 
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // Used by the crate-private stopped-server reader.
-fn file_identity(file: &fs::File) -> Result<(u64, u64, u64), InventoryError> {
+fn file_identity(file: &fs::File) -> Result<(u64, u64), InventoryError> {
     use std::os::unix::fs::MetadataExt as _;
     let metadata = file.metadata().map_err(|_| InventoryError::StateIo)?;
-    Ok((metadata.dev(), metadata.ino(), metadata.nlink()))
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(target_os = "linux")]
