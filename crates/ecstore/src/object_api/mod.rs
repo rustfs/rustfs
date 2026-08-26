@@ -77,6 +77,7 @@ pub(crate) fn has_encrypted_part_layout_marker(metadata: &HashMap<String, String
 }
 
 pub(crate) fn legacy_encrypted_range_seek_enabled() -> bool {
+    // RUSTFS_COMPAT_TODO(backlog-1316): keep the rolling-upgrade kill switch. Remove after the minimum supported release uses the marker protocol.
     // On by default (backlog-1316 Phase A): every misfit direction falls back to the
     // conservative full read — MPUs created without a candidate marker, completions
     // that cannot revalidate the candidate against the data_dir under the uploadId

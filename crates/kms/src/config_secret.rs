@@ -79,7 +79,13 @@ const SECRET_FIELDS: &[SecretField] = &[
         label: "kms.local.master_key",
     },
     SecretField {
-        segments: &[&["backend_config"], &["VaultKV2", "Vault"], &["auth_method"], &["Token"], &["token"]],
+        segments: &[
+            &["backend_config"],
+            &["VaultKV2", "Vault"],
+            &["auth_method"],
+            &["Token"],
+            &["token"],
+        ],
         label: "kms.vault.token",
     },
     SecretField {
@@ -93,7 +99,13 @@ const SECRET_FIELDS: &[SecretField] = &[
         label: "kms.vault.approle.secret_id",
     },
     SecretField {
-        segments: &[&["backend_config"], &["VaultTransit"], &["auth_method"], &["Token"], &["token"]],
+        segments: &[
+            &["backend_config"],
+            &["VaultTransit"],
+            &["auth_method"],
+            &["Token"],
+            &["token"],
+        ],
         label: "kms.vault_transit.token",
     },
     SecretField {
@@ -279,9 +291,7 @@ fn open_value(label: &str, sealed: &str, secret: &str) -> Result<String> {
     let encoded = sealed
         .strip_prefix(SEALED_VALUE_PREFIX)
         .expect("caller checks the sealed prefix");
-    let payload = BASE64_STANDARD
-        .decode(encoded)
-        .map_err(|_| sealed_value_unreadable(label))?;
+    let payload = BASE64_STANDARD.decode(encoded).map_err(|_| sealed_value_unreadable(label))?;
     if payload.len() <= LOCAL_KMS_MASTER_KEY_SALT_LEN + NONCE_LEN {
         return Err(sealed_value_unreadable(label));
     }
