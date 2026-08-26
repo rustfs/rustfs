@@ -955,6 +955,10 @@ impl VaultTransitKmsClient {
             // Transit ciphertext already self-describes its key version
             // ("vault:vN:..."), so the envelope never carries one.
             master_key_version: None,
+            // The context is bound as Vault Transit associated_data over
+            // `encrypted_key`; this field describes only the local DekCrypto
+            // binding, which Transit envelopes never use.
+            context_binding: None,
         };
 
         let ciphertext = serde_json::to_vec(&envelope)?;
@@ -996,6 +1000,10 @@ impl VaultTransitKmsClient {
             // Transit ciphertext already self-describes its key version
             // ("vault:vN:..."), so the envelope never carries one.
             master_key_version: None,
+            // The context is bound as Vault Transit associated_data over
+            // `encrypted_key`; this field describes only the local DekCrypto
+            // binding, which Transit envelopes never use.
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&envelope)?;
 
@@ -1150,6 +1158,10 @@ impl VaultTransitKmsClient {
             // Transit ciphertext still self-describes its version, so the
             // envelope field stays absent exactly as generate_data_key leaves it.
             master_key_version: None,
+            // The context is bound as Vault Transit associated_data over
+            // `encrypted_key`; this field describes only the local DekCrypto
+            // binding, which Transit envelopes never use.
+            context_binding: None,
         };
         let ciphertext = serde_json::to_vec(&rewrapped_envelope)?;
 

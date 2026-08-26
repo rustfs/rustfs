@@ -172,6 +172,12 @@ Nothing in this list requires a coordinated format cutover. The compatibility is
 
 The one-way hazard is the rotation constraint above: an older binary reading a *new* envelope silently ignores the version field and decrypts with the current material.
 
+### DEK envelope context binding (`RUSTFS_KMS_ENVELOPE_AAD`)
+
+Historically the KV2 and Local backends sealed only the DEK plaintext; the `encryption_context` rode in the envelope unauthenticated and was checked by field comparison alone, so a party able to rewrite the stored envelope could rewrite the context to match whatever it presented. With `RUSTFS_KMS_ENVELOPE_AAD=true`, newly wrapped envelopes bind the canonical context bytes as AES-GCM additional data and carry `context_binding: 1`; rewriting the stored context, or stripping the flag, then fails authentication. (Static, Vault Transit and AWS already bound the context through their own mechanisms and are unaffected.)
+
+Rollout constraint: **reading bound envelopes needs no switch, but a node that predates the field cannot open them** — its unwrap runs without the additional data and fails authentication. Enable the switch only after every node in the cluster runs a release that understands `context_binding`; the default stays off for one release for exactly this reason, mirroring the `RUSTFS_ENCRYPTION_FRAME_V2` rollout. Rewrap migrates existing envelopes: with the switch on, a rewrap sweep upgrades unbound envelopes to the bound format (converging to zero writes on re-run), and a bound envelope never regresses to the unbound shape whatever the switch says. An envelope carrying an unrecognized `context_binding` value is refused rather than decrypted without its binding.
+
 ### Guarantees that hold only once every node is upgraded
 
 These are properties of the upgraded code, so a single node left behind removes them for the whole cluster.

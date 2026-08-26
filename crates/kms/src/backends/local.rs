@@ -20,7 +20,10 @@ use crate::backends::{
 };
 use crate::config::KmsConfig;
 use crate::config::LocalConfig;
-use crate::encryption::{AesDekCrypto, DataKeyEnvelope, DekCrypto, generate_key_material};
+use crate::encryption::{
+    AesDekCrypto, CONTEXT_BINDING_AAD_V1, DataKeyEnvelope, DekCrypto, context_aad, envelope_aad_write_enabled, envelope_wrap_aad,
+    generate_key_material,
+};
 use crate::error::{KmsError, Result};
 use crate::persisted_observability::{BoundedUnknownFieldName, UnknownFieldSummary};
 use crate::types::*;
@@ -1503,17 +1506,17 @@ impl LocalKmsClient {
     }
 
     /// Encrypt data using a master key
-    async fn encrypt_with_master_key(&self, key_id: &str, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    async fn encrypt_with_master_key(&self, key_id: &str, plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         // Load the actual master key material
         let key_material = self.get_key_material(key_id).await?;
-        self.dek_crypto.encrypt(&key_material, plaintext).await
+        self.dek_crypto.encrypt(&key_material, plaintext, aad).await
     }
 
     /// Decrypt data using a master key
-    async fn decrypt_with_master_key(&self, key_id: &str, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
+    async fn decrypt_with_master_key(&self, key_id: &str, ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         // Load the actual master key material
         let key_material = self.get_key_material(key_id).await?;
-        self.dek_crypto.decrypt(&key_material, ciphertext, nonce).await
+        self.dek_crypto.decrypt(&key_material, ciphertext, nonce, aad).await
     }
 }
 
@@ -1532,7 +1535,14 @@ impl LocalKmsClient {
         let plaintext_key = generate_key_material(&request.key_spec)?;
 
         // Encrypt the data key with the master key
-        let (encrypted_key, nonce) = self.encrypt_with_master_key(&request.master_key_id, &plaintext_key).await?;
+        let context_binding = envelope_aad_write_enabled().then_some(CONTEXT_BINDING_AAD_V1);
+        let wrap_aad = match context_binding {
+            Some(_) => context_aad(&request.encryption_context)?,
+            None => Vec::new(),
+        };
+        let (encrypted_key, nonce) = self
+            .encrypt_with_master_key(&request.master_key_id, &plaintext_key, &wrap_aad)
+            .await?;
 
         // Local rotation is rejected, so every envelope is wrapped by the key's sole
         // material and needs no master key version.
@@ -1545,6 +1555,7 @@ impl LocalKmsClient {
             encryption_context: request.encryption_context.clone(),
             created_at: Zoned::now(),
             master_key_version: None,
+            context_binding,
         };
 
         // Serialize the envelope as the ciphertext
@@ -1563,7 +1574,14 @@ impl LocalKmsClient {
         let key_info = self.describe_key(&request.key_id, context).await?;
         ensure_key_status_permits(&request.key_id, &key_info.status, StateGatedOperation::Encrypt)?;
 
-        let (encrypted_key, nonce) = self.encrypt_with_master_key(&request.key_id, &request.plaintext).await?;
+        let context_binding = envelope_aad_write_enabled().then_some(CONTEXT_BINDING_AAD_V1);
+        let wrap_aad = match context_binding {
+            Some(_) => context_aad(&request.encryption_context)?,
+            None => Vec::new(),
+        };
+        let (encrypted_key, nonce) = self
+            .encrypt_with_master_key(&request.key_id, &request.plaintext, &wrap_aad)
+            .await?;
 
         // The ciphertext must be the same envelope `decrypt` parses: the nonce
         // and the bound context live in it, so handing back the bare AES-GCM
@@ -1578,6 +1596,7 @@ impl LocalKmsClient {
             created_at: Zoned::now(),
             // Local rotation is rejected, so the key has a single material version.
             master_key_version: None,
+            context_binding,
         };
         let ciphertext = serde_json::to_vec(&envelope)?;
 
@@ -1603,13 +1622,12 @@ impl LocalKmsClient {
         let envelope: DataKeyEnvelope = serde_json::from_slice(&request.ciphertext)
             .map_err(|error| KmsError::cryptographic_error("parse", format!("Failed to parse data key envelope: {error}")))?;
 
-        // NOTE: this comparison is an authorization check, not a cryptographic
-        // binding. `DekCrypto` seals only the plaintext, so `encryption_context`
-        // rides in the envelope unauthenticated: anyone able to rewrite the
-        // stored envelope can rewrite this field and present a matching context.
-        // The Static and Vault Transit backends do bind it (as AEAD AAD and as
-        // the Transit KDF context respectively); closing the gap here needs a
-        // versioned envelope, since existing ciphertext was sealed without AAD.
+        // Two layers guard the context. On envelopes with a context binding,
+        // the stored `encryption_context` is authenticated: it was sealed into
+        // the wrap as AAD, so rewriting the stored field (or stripping the
+        // binding flag) makes the unwrap below fail. On legacy envelopes the
+        // field rides unauthenticated and only this comparison covers it —
+        // which is an authorization check, not a cryptographic binding.
         // Verify encryption context matches
         // Check that all keys in envelope.encryption_context are present in request.encryption_context
         // and their values match. This ensures the context used for decryption matches what was used for encryption.
@@ -1630,8 +1648,9 @@ impl LocalKmsClient {
         }
 
         // Decrypt the data key
+        let wrap_aad = envelope_wrap_aad(&envelope)?;
         let plaintext = self
-            .decrypt_with_master_key(&envelope.master_key_id, &envelope.encrypted_key, &envelope.nonce)
+            .decrypt_with_master_key(&envelope.master_key_id, &envelope.encrypted_key, &envelope.nonce, &wrap_aad)
             .await?;
 
         debug!("Local KMS data decrypted");
@@ -2362,6 +2381,112 @@ mod tests {
         };
         let client = LocalKmsClient::new(config).await.expect("Failed to create dev-mode client");
         (client, temp_dir)
+    }
+
+    /// With the AAD write switch on, the Local backend seals the stored
+    /// encryption context into the wrap exactly like KV2: the bound envelope
+    /// round-trips, a rewritten stored context fails authentication even with
+    /// a matching request context, and legacy envelopes keep decrypting.
+    #[tokio::test]
+    async fn test_local_bound_envelope_authenticates_its_stored_context() {
+        let (client, _temp_dir) = create_test_client().await;
+        client
+            .create_key("aad-key", "AES_256", None)
+            .await
+            .expect("Failed to create key");
+        let context = HashMap::from([("bucket".to_string(), "local-aad".to_string())]);
+
+        // Legacy envelope written with the default (switch off).
+        let legacy = client
+            .generate_data_key(
+                &GenerateKeyRequest {
+                    master_key_id: "aad-key".to_string(),
+                    key_spec: "AES_256".to_string(),
+                    encryption_context: context.clone(),
+                    grant_tokens: Vec::new(),
+                    key_length: None,
+                },
+                None,
+            )
+            .await
+            .expect("legacy generate must succeed");
+        let legacy_value: serde_json::Value = serde_json::from_slice(&legacy.ciphertext).expect("envelope must parse");
+        assert!(
+            !legacy_value
+                .as_object()
+                .expect("envelope is a JSON object")
+                .contains_key("context_binding"),
+            "default writes must keep the historical envelope shape"
+        );
+
+        let bound = temp_env::async_with_vars([(crate::config::ENV_KMS_ENVELOPE_AAD, Some("true"))], async {
+            client
+                .generate_data_key(
+                    &GenerateKeyRequest {
+                        master_key_id: "aad-key".to_string(),
+                        key_spec: "AES_256".to_string(),
+                        encryption_context: context.clone(),
+                        grant_tokens: Vec::new(),
+                        key_length: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("bound generate must succeed")
+        })
+        .await;
+        let envelope: DataKeyEnvelope = serde_json::from_slice(&bound.ciphertext).expect("envelope must parse");
+        assert_eq!(envelope.context_binding, Some(CONTEXT_BINDING_AAD_V1));
+
+        // Both generations decrypt, with no switch involved on the read side.
+        for ciphertext in [&legacy.ciphertext, &bound.ciphertext] {
+            client
+                .decrypt(
+                    &DecryptRequest {
+                        ciphertext: ciphertext.clone(),
+                        encryption_context: context.clone(),
+                        grant_tokens: Vec::new(),
+                    },
+                    None,
+                )
+                .await
+                .expect("both envelope generations must decrypt");
+        }
+
+        // Rewriting the stored context defeats the comparison but not the AAD.
+        let mut tampered: serde_json::Value = serde_json::from_slice(&bound.ciphertext).expect("envelope must parse");
+        tampered["encryption_context"] = serde_json::json!({"bucket": "stolen"});
+        let error = client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: serde_json::to_vec(&tampered).expect("serialize tampered envelope"),
+                    encryption_context: HashMap::from([("bucket".to_string(), "stolen".to_string())]),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect_err("a rewritten stored context must fail authentication");
+        assert!(
+            !matches!(error, KmsError::ContextMismatch { .. }),
+            "the failure must come from the AAD, not the field comparison: {error:?}"
+        );
+
+        // The same tamper against the legacy envelope shows what the binding
+        // adds: the comparison alone accepts it.
+        let mut legacy_tampered: serde_json::Value = serde_json::from_slice(&legacy.ciphertext).expect("envelope must parse");
+        legacy_tampered["encryption_context"] = serde_json::json!({"bucket": "stolen"});
+        client
+            .decrypt(
+                &DecryptRequest {
+                    ciphertext: serde_json::to_vec(&legacy_tampered).expect("serialize tampered envelope"),
+                    encryption_context: HashMap::from([("bucket".to_string(), "stolen".to_string())]),
+                    grant_tokens: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("the legacy format cannot detect a rewritten stored context; this is the gap the binding closes");
     }
 
     #[tokio::test]
