@@ -10373,6 +10373,17 @@ mod tests {
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio_tar::{Builder, EntryType, Header};
 
+    #[derive(Debug)]
+    struct MockUploadStreamSha256Mismatch;
+
+    impl std::fmt::Display for MockUploadStreamSha256Mismatch {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("UploadStreamError: Sha256Mismatch")
+        }
+    }
+
+    impl std::error::Error for MockUploadStreamSha256Mismatch {}
+
     #[tokio::test]
     async fn cancelled_eager_put_commit_owner_reaps_stalled_storage_task() {
         let health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
@@ -16386,20 +16397,20 @@ mod tests {
 
     #[test]
     fn s3s_body_error_to_io_preserves_upload_stream_error_source() {
-        let error = s3s_body_error_to_io(Box::new(s3s::UploadStreamError::Sha256Mismatch));
+        let error = s3s_body_error_to_io(Box::new(MockUploadStreamSha256Mismatch));
 
         assert!(matches!(
             error
                 .get_ref()
-                .and_then(|source| source.downcast_ref::<s3s::UploadStreamError>()),
-            Some(s3s::UploadStreamError::Sha256Mismatch)
+                .and_then(|source| source.downcast_ref::<MockUploadStreamSha256Mismatch>()),
+            Some(MockUploadStreamSha256Mismatch)
         ));
     }
 
     #[tokio::test]
     async fn read_small_put_body_maps_upload_stream_sha256_mismatch_to_bad_digest() {
         let body = StreamReader::new(futures::stream::iter(vec![Err::<Bytes, std::io::Error>(s3s_body_error_to_io(Box::new(
-            s3s::UploadStreamError::Sha256Mismatch,
+            MockUploadStreamSha256Mismatch,
         )))]));
 
         let error = read_small_put_body_exact_direct(body, 1)
@@ -16411,7 +16422,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_zero_copy_put_body_maps_upload_stream_sha256_mismatch_to_bad_digest() {
-        let body = futures::stream::iter(vec![Err::<Bytes, s3s::UploadStreamError>(s3s::UploadStreamError::Sha256Mismatch)]);
+        let body = futures::stream::iter(vec![Err::<Bytes, MockUploadStreamSha256Mismatch>(MockUploadStreamSha256Mismatch)]);
 
         let error = match read_zero_copy_put_body_exact(body, 1).await {
             Ok(_) => panic!("SHA256 mismatch should reject the zero-copy PUT body"),
