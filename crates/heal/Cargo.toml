@@ -74,6 +74,7 @@ hotpath.workspace = true
 rustfs-config = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-ecstore = { workspace = true }
+rustfs-lock = { workspace = true }
 rustfs-storage-api = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-madmin = { workspace = true }

@@ -9664,6 +9664,7 @@ dependencies = [
  "rustfs-concurrency",
  "rustfs-config",
  "rustfs-ecstore",
+ "rustfs-lock",
  "rustfs-madmin",
  "rustfs-storage-api",
  "rustfs-test-utils",
