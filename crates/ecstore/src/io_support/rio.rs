@@ -328,7 +328,9 @@ pub struct WriteEncryption {
 /// after every node (and every RustFS warm/replication target that receives
 /// raw ciphertext) runs a release with v2 read support. Reading v2 objects
 /// needs no switch — the decrypt reader dispatches on the frame type byte.
+#[cfg(not(feature = "rio-v2"))]
 pub(crate) const ENV_RUSTFS_ENCRYPTION_FRAME_V2: &str = "RUSTFS_ENCRYPTION_FRAME_V2";
+#[cfg(not(feature = "rio-v2"))]
 pub(crate) const DEFAULT_RUSTFS_ENCRYPTION_FRAME_V2: bool = false;
 
 #[cfg(not(feature = "rio-v2"))]

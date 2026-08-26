@@ -338,7 +338,7 @@ mod tests {
         serde_json::to_value(&config).expect("config serializes")
     }
 
-    fn token_at<'a>(document: &'a Value) -> &'a str {
+    fn token_at(document: &Value) -> &str {
         document["backend_config"]["VaultKV2"]["auth_method"]["Token"]["token"]
             .as_str()
             .expect("token leaf exists")
