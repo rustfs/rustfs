@@ -20,12 +20,12 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_validations(path: Path) -> list[tuple[str, int]]:
+def load_validations(path: Path) -> list[tuple[str, int, datetime | None]]:
     data = json.loads(path.read_text())
     if not isinstance(data, list) or not data:
         raise ValueError("scheduled validation config must be a non-empty list")
 
-    validations: list[tuple[str, int]] = []
+    validations: list[tuple[str, int, datetime | None]] = []
     seen: set[str] = set()
     for item in data:
         if not isinstance(item, dict):
@@ -44,8 +44,21 @@ def load_validations(path: Path) -> list[tuple[str, int]]:
             or max_age_hours <= 0
         ):
             raise ValueError(f"invalid max_age_hours for {workflow}: {max_age_hours!r}")
+        grace_raw = item.get("never_ran_grace_until")
+        grace: datetime | None = None
+        if grace_raw is not None:
+            if not isinstance(grace_raw, str):
+                raise ValueError(
+                    f"invalid never_ran_grace_until for {workflow}: {grace_raw!r}"
+                )
+            try:
+                grace = parse_timestamp(grace_raw)
+            except ValueError as error:
+                raise ValueError(
+                    f"invalid never_ran_grace_until for {workflow}: {error}"
+                ) from error
         seen.add(workflow)
-        validations.append((workflow, max_age_hours))
+        validations.append((workflow, max_age_hours, grace))
     return validations
 
 
@@ -59,9 +72,18 @@ def parse_timestamp(value: object) -> datetime:
 
 
 def stale_reason(
-    run: dict[str, object] | None, now: datetime, max_age_hours: int
+    run: dict[str, object] | None,
+    now: datetime,
+    max_age_hours: int,
+    never_ran_grace_until: datetime | None = None,
 ) -> str | None:
     if run is None:
+        # The grace deadline only covers a workflow whose first scheduled slot
+        # has not arrived yet (for example a monthly cron enabled mid-month).
+        # A recorded-but-old run proves the schedule used to fire and stopped,
+        # so the grace never masks that case.
+        if never_ran_grace_until is not None and now <= never_ran_grace_until:
+            return None
         return "no scheduled run has been recorded"
     created_at = parse_timestamp(run.get("created_at"))
     age = now - created_at
@@ -126,10 +148,10 @@ def check_freshness(
 ) -> int:
     now = datetime.now(timezone.utc)
     failures: list[tuple[str, int, str, str]] = []
-    for workflow, max_age_hours in load_validations(config):
+    for workflow, max_age_hours, never_ran_grace_until in load_validations(config):
         try:
             run = fetch_latest_scheduled_run(repository, workflow, token, api_url)
-            reason = stale_reason(run, now, max_age_hours)
+            reason = stale_reason(run, now, max_age_hours, never_ran_grace_until)
             if reason is not None:
                 run_url = str(run.get("html_url", "")) if run else ""
                 failures.append((workflow, max_age_hours, reason, run_url))
@@ -151,6 +173,15 @@ class SelfTests(unittest.TestCase):
         self.assertIsNotNone(stale_reason(past_limit, self.NOW, 36))
         self.assertIsNotNone(stale_reason(None, self.NOW, 36))
 
+    def test_never_ran_grace_only_covers_missing_runs(self) -> None:
+        future_grace = self.NOW + timedelta(hours=1)
+        past_grace = self.NOW - timedelta(seconds=1)
+        self.assertIsNone(stale_reason(None, self.NOW, 36, future_grace))
+        self.assertIsNone(stale_reason(None, self.NOW, 36, self.NOW))
+        self.assertIsNotNone(stale_reason(None, self.NOW, 36, past_grace))
+        stale_run = {"created_at": "2026-08-20T23:59:59Z"}
+        self.assertIsNotNone(stale_reason(stale_run, self.NOW, 36, future_grace))
+
     def test_config_rejects_duplicate_and_invalid_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "validations.json"
@@ -171,6 +202,41 @@ class SelfTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 load_validations(path)
+            for bad_grace in (36, "not-a-timestamp", "2026-09-01T00:00:00"):
+                path.write_text(
+                    json.dumps(
+                        [
+                            {
+                                "workflow": ".github/workflows/ci.yml",
+                                "max_age_hours": 36,
+                                "never_ran_grace_until": bad_grace,
+                            }
+                        ]
+                    )
+                )
+                with self.assertRaises(ValueError):
+                    load_validations(path)
+            path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "workflow": ".github/workflows/ci.yml",
+                            "max_age_hours": 36,
+                            "never_ran_grace_until": "2026-09-02T06:37:00Z",
+                        }
+                    ]
+                )
+            )
+            self.assertEqual(
+                load_validations(path),
+                [
+                    (
+                        ".github/workflows/ci.yml",
+                        36,
+                        datetime(2026, 9, 2, 6, 37, tzinfo=timezone.utc),
+                    )
+                ],
+            )
 
     def test_check_reports_missing_runs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
