@@ -199,7 +199,7 @@ upgrade.
 When the cluster-level generation capability is **not** negotiated on every
 target disk, the behavior **falls back to current semantics** (existing lock +
 `is_lock_lost()` check for #1312; degraded-allow read-check for #1318 at
-`rustfs/src/app/object_usecase.rs`; full fanout for #1314). Fail-closed is
+`rustfs/src/app/object/get.rs`; full fanout for #1314). Fail-closed is
 **only** an explicit administrator strict mode. Defaulting to fail-closed is
 forbidden — it makes writes unavailable for the whole rolling-upgrade window.
 

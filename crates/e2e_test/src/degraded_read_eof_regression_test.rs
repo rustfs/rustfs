@@ -23,8 +23,8 @@
 //! It was fixed in three layers on `main`, each with its own *unit* regression:
 //!   * rustfs#4594 — `GetObjectStreamingReader::poll_read` now returns
 //!     `UnexpectedEof` on a short body instead of a clean `Ok(())`
-//!     (`rustfs/src/app/object_usecase.rs`,
-//!     `app::object_usecase::tests::get_object_streaming_reader_errors_on_short_eof`).
+//!     (`rustfs/src/app/object/get.rs`,
+//!     `app::object::get::tests::get_object_streaming_reader_errors_on_short_eof`).
 //!   * rustfs#4560 — the lazy multipart codec reader degrades a later part to
 //!     the legacy per-part decode in place, and surfaces reconstruction errors
 //!     instead of silently truncating

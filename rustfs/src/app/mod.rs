@@ -20,6 +20,7 @@ pub mod bucket_usecase;
 pub mod context;
 pub(crate) mod metadata_route;
 pub mod multipart_usecase;
+pub mod object;
 pub(crate) mod object_data_cache;
 pub(crate) mod object_traffic_health;
 pub mod object_usecase;
