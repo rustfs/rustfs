@@ -35,6 +35,19 @@ wire types still live in `rustfs-filemeta`. This keeps the temporary dependency
 centralized until those wire contracts can move without introducing a
 `rustfs-replication` / `rustfs-storage-api` cycle.
 
+Leaf crates carry exactly one adjudicated allowed edge:
+`io-metrics -> rustfs-s3-ops` (transitively `rustfs-s3-types`). Both are pure
+contract crates — types and enums only, no I/O, no global state, no non-contract
+internal dependencies — so `io-metrics` reuses the `S3Operation` vocabulary
+instead of copying it. The allowance covers that edge and nothing else: the
+leaf-crate allowlist in `scripts/check_architecture_migration_rules.sh` fails any
+other `rustfs-*` dependency in `config`, `credentials`, `crypto`, `io-metrics`,
+or `madmin`. Adjudicated in
+[`rustfs/backlog#1834`](https://github.com/rustfs/backlog/issues/1834); a further
+exception must meet the same criterion — pure contract crate, no I/O, no globals,
+no non-contract internal dependencies — and land its guard allowlist entry
+alongside the dependency.
+
 Dependency direction also applies to compile-time source reads:
 `include_str!`/`include!` of a `.rs` file must not resolve outside the
 including crate's own directory (`scripts/check_layer_dependencies.sh`

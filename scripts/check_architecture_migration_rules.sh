@@ -5448,9 +5448,11 @@ require_source_contains \
 # --- Leaf crates must stay free of internal dependencies (backlog#1834) ---
 # ARCHITECTURE.md invariant 2 names config, credentials, crypto, io-metrics,
 # and madmin as leaf crates that depend only on external crates. Allowlist:
-# io-metrics -> rustfs-s3-ops (contract crate; leaf-allowance adjudication is
-# tracked as backlog#1834 PR2). Adding any other rustfs-* dependency to a leaf
-# crate needs a maintainer decision, not a quiet Cargo.toml edit.
+# io-metrics -> rustfs-s3-ops. That edge is DECIDED in backlog#1834: allowed as a
+# pure-contract-crate exception (types/enums only, no I/O, no globals, no
+# non-contract internal deps), narrowed to exactly this edge. Adding any other
+# rustfs-* dependency to a leaf crate needs its own adjudication, not a quiet
+# Cargo.toml edit.
 LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
 : >"$LEAF_CRATE_DEP_HITS_FILE"
 (
@@ -5472,7 +5474,7 @@ LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
 )
 
 if [[ -s "$LEAF_CRATE_DEP_HITS_FILE" ]]; then
-  report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (allowlist: io-metrics -> rustfs-s3-ops, backlog#1834): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
+  report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (sole adjudicated exception, decided in backlog#1834: io-metrics -> rustfs-s3-ops, a pure contract crate; any new edge needs its own adjudication): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
 fi
 
 # --- ecstore module-level lint blankets (backlog#1823 step 9) ---
