@@ -23,7 +23,7 @@
 //! Exit status is the verdict: 0 when every check held, 1 otherwise, so a
 //! scheduled drill fails its job instead of quietly filing a bad report.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64_simd::STANDARD as BASE64;
 use rustfs_kms::backup::{BackupKek, DrillDataset, DrillDisaster, DrillRequest, DrillVerdict, run_local_drill};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -100,7 +100,11 @@ fn disaster_from_env() -> Result<DrillDisaster, String> {
 
 fn kek_from_env() -> Result<BackupKek, String> {
     let raw = Zeroizing::new(required(ENV_KEK)?);
-    let decoded = Zeroizing::new(BASE64.decode(raw.trim()).map_err(|_| format!("{ENV_KEK} must be base64"))?);
+    let decoded = Zeroizing::new(
+        BASE64
+            .decode_to_vec(raw.trim())
+            .map_err(|_| format!("{ENV_KEK} must be base64"))?,
+    );
     if decoded.len() != 32 {
         return Err(format!("{ENV_KEK} must decode to exactly 32 bytes"));
     }
