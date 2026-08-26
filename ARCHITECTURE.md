@@ -115,11 +115,13 @@ default build (lifecycle:
 1. **Layers flow downward.** Server → Admin/App → Storage → ecstore → rio/io-core.
    No upward imports.
 
-2. **Leaf crates depend only on external crates, with one adjudicated exception.**
-   `config`, `credentials`, `crypto`, `io-metrics`, and `madmin` take no internal
-   dependency except `io-metrics → rustfs-s3-ops` (transitively `rustfs-s3-types`),
-   a pure contract crate with no I/O and no global state. Adjudicated in
-   rustfs/backlog#1834 and pinned by the leaf allowlist in
+2. **Leaf crates depend only on external crates, with adjudicated exceptions
+   pinned by a guard.** `config`, `credentials`, and `crypto` take no internal
+   dependency. `io-metrics` takes exactly `rustfs-s3-ops` (transitively
+   `rustfs-s3-types`), a pure contract crate with no I/O and no global state —
+   adjudicated in rustfs/backlog#1834. `madmin` left the leaf set when #6166 made
+   it the SigV4-signed admin SDK client; its internal dependency surface is pinned
+   to exactly `rustfs-signer`. Both pins live in the leaf allowlist in
    `scripts/check_architecture_migration_rules.sh`; any other internal dependency
    fails the guard ([crate boundaries](docs/architecture/crate-boundaries.md)).
    - ✅ RESOLVED: the historical `utils → config` and `common → filemeta`/`madmin`

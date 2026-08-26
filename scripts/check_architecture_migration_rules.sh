@@ -5452,13 +5452,17 @@ require_source_contains \
   "SetDisks storage-api HealOperations compile-time coverage test"
 
 # --- Leaf crates must stay free of internal dependencies (backlog#1834) ---
-# ARCHITECTURE.md invariant 2 names config, credentials, crypto, io-metrics,
-# and madmin as leaf crates that depend only on external crates. Allowlist:
+# ARCHITECTURE.md invariant 2 names config, credentials, crypto, and io-metrics
+# as leaf crates that depend only on external crates. Allowlist:
 # io-metrics -> rustfs-s3-ops. That edge is DECIDED in backlog#1834: allowed as a
 # pure-contract-crate exception (types/enums only, no I/O, no globals, no
-# non-contract internal deps), narrowed to exactly this edge. Adding any other
-# rustfs-* dependency to a leaf crate needs its own adjudication, not a quiet
-# Cargo.toml edit.
+# non-contract internal deps), narrowed to exactly this edge.
+# madmin left the leaf set when #6166 made it the SigV4-signed admin SDK client;
+# its internal dependency surface is pinned to exactly rustfs-signer so it cannot
+# quietly grow storage-side dependencies. Adding any other rustfs-* dependency to
+# any of these five crates needs its own adjudication, not a quiet Cargo.toml edit.
+# The pattern matches both TOML dependency spellings: `rustfs-x = ...` and the
+# dotted `rustfs-x.workspace = true` form (which previously escaped this guard).
 LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
 : >"$LEAF_CRATE_DEP_HITS_FILE"
 (
@@ -5467,20 +5471,26 @@ LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
     manifest="crates/${leaf}/Cargo.toml"
     [[ -f "$manifest" ]] || continue
     leaf_dep_status=0
-    rg -n --with-filename '^rustfs-[a-z0-9-]+ *=' "$manifest" >"${TMP_DIR}/leaf_dep_raw.txt" || leaf_dep_status=$?
+    rg -n --with-filename '^rustfs-[a-z0-9-]+(\.[a-zA-Z_-]+)* *=' "$manifest" >"${TMP_DIR}/leaf_dep_raw.txt" || leaf_dep_status=$?
     if [[ "$leaf_dep_status" -ne 0 && "$leaf_dep_status" -ne 1 ]]; then
       exit "$leaf_dep_status"
     fi
-    if [[ "$leaf" == "io-metrics" ]]; then
-      rg -v '^[^:]*:[0-9]+:rustfs-s3-ops *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
-    else
-      cat "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE"
-    fi
+    case "$leaf" in
+      io-metrics)
+        rg -v '^[^:]*:[0-9]+:rustfs-s3-ops(\.[a-zA-Z_-]+)* *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
+        ;;
+      madmin)
+        rg -v '^[^:]*:[0-9]+:rustfs-signer(\.[a-zA-Z_-]+)* *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
+        ;;
+      *)
+        cat "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE"
+        ;;
+    esac
   done
 )
 
 if [[ -s "$LEAF_CRATE_DEP_HITS_FILE" ]]; then
-  report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (sole adjudicated exception, decided in backlog#1834: io-metrics -> rustfs-s3-ops, a pure contract crate; any new edge needs its own adjudication): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
+  report_failure "leaf/pinned-dep crates: config/credentials/crypto take no internal rustfs-* dependency; io-metrics only rustfs-s3-ops (pure contract crate, backlog#1834); madmin only rustfs-signer (admin SDK SigV4 client, #6166); any new edge needs its own adjudication: $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
 fi
 
 # --- ecstore module-level lint blankets (backlog#1823 step 9) ---
