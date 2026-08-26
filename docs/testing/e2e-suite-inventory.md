@@ -18,6 +18,7 @@
 |---|---|---|
 | admin_auth_test | 4 | ✅ |
 | admin_iam_crud_test | 3 | ✅ |
+| admin_mfa_test | 4 |  |
 | admin_pools_test | 1 | ✅ |
 | admin_timeout_regression_test | 1 | 🌙 |
 | anonymous_access_test | 4 | ✅ |
@@ -30,7 +31,7 @@
 | checksum_upload_test | 7 |  |
 | cluster_concurrency_test | 3 | 🌙 |
 | cluster_multidrive_pool_test | 2 | 🌙 |
-| common | 16 |  |
+| common | 17 |  |
 | compression_test | 6 | ✅ |
 | connection_cap_test | 2 |  |
 | console_smoke_test | 1 | ✅ |
@@ -59,7 +60,7 @@
 | heal_erasure_disk_rebuild_test | 4 | 🌙 |
 | inline_fast_path_cluster_test | 16 |  |
 | internode_rpc_signature_e2e_test | 5 |  |
-| kms | 48 |  |
+| kms | 50 |  |
 | leading_slash_key_test | 2 | ✅ |
 | lifecycle_regression_test | 4 |  |
 | list_buckets_auth_test | 1 | ✅ |
@@ -75,7 +76,7 @@
 | multipart_auth_test | 75 |  |
 | multipart_storage_class_test | 3 | ✅ |
 | namespace_lock_quorum_test | 2 | 🌙 |
-| negative_sigv4_test | 6 | ✅ |
+| negative_sigv4_test | 7 | ✅ |
 | notification_startup_regression_test | 2 |  |
 | notification_webhook_test | 3 | ✅ |
 | object_lambda_test | 16 | 🌙 |
@@ -86,7 +87,7 @@
 | protocols | 16 | 🌙 |
 | quota_test | 14 |  |
 | reliability_disk_fault_test | 4 |  |
-| reliant | 31 | 19 ✅ |
+| reliant | 43 | 20 ✅ |
 | replication_extension_test | 76 | 20 ✅ +56 🌙 |
 | replication_lww_receiver_test | 1 |  |
 | security_boundary_test | 4 |  |
@@ -102,4 +103,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 591 tests across 83 modules · PR smoke: 163 tests / 36 modules · merge/main full: 467 tests / 74 modules · nightly replication: 56 tests · nightly cluster faults: 29 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-23.
+**Total listed: 619 tests across 86 modules · PR smoke: 165 tests / 36 modules · merge/main full: 495 tests / 77 modules · nightly replication: 56 tests · nightly cluster faults: 29 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-26.
