@@ -2166,7 +2166,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::app::(?:bucket_usecase|multipart_usecase|object_usecase)|Default(?:Bucket|Multipart|Object)Usecase::from_global\(\)' \
+  rg -n --with-filename 'crate::app::(?:bucket_usecase|multipart_usecase|object_usecase|object\b)|Default(?:Bucket|Multipart|Object)Usecase::from_global\(\)' \
     rustfs/src/storage/ecfs.rs \
     --glob '*.rs' || true
 ) >"$RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE"
@@ -2220,7 +2220,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'use crate::storage::\*;' rustfs/src/app --glob '*_usecase.rs' || true
+  rg -n --with-filename 'use crate::storage::\*;' rustfs/src/app --glob '*_usecase.rs' --glob 'object/*.rs' || true
 ) >"$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE" ]]; then
@@ -2238,7 +2238,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::storage::s3_api::|use crate::storage::s3_api|super::s3_api::|use super::s3_api' rustfs/src/app --glob '*_usecase.rs' || true
+  rg -n --with-filename 'crate::storage::s3_api::|use crate::storage::s3_api|super::s3_api::|use super::s3_api' rustfs/src/app --glob '*_usecase.rs' --glob 'object/*.rs' || true
 ) >"$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE" ]]; then
@@ -2250,13 +2250,13 @@ fi
   {
     rg -n --with-filename \
       '(use crate::storage::(access|helper|options|request_context|sse|timeout_wrapper|head_prefix|concurrency|ecfs)|crate::storage::sse::EncryptionKeyKind|use crate::storage::\{|use crate::storage::[A-Z])' \
-      rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs || true
+      rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs rustfs/src/app/object || true
     rg -n --with-filename \
       'use super::(?:\{[^}]*\b(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|StorageError|DiskError|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b|(?:object_api_utils::to_s3s_etag|storageclass|StorageError|DiskError|DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b)' \
-      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs || true
+      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/object rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs || true
     rg -n --with-filename \
       'use super::(?:\{[^}]*\b(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b|(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b)|super::(?:lifecycle|metadata_sys|object_lock|quota|replication|tagging|target|utils|versioning_sys|transition_api)::|super::super::(?:metadata_sys|lifecycle|target)::' \
-      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs rustfs/src/app/capacity_dirty_scope_test.rs rustfs/src/app/context.rs rustfs/src/app/context/handles.rs rustfs/src/app/context/interfaces.rs rustfs/src/app/context/runtime_sources.rs || true
+      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/object rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs rustfs/src/app/capacity_dirty_scope_test.rs rustfs/src/app/context.rs rustfs/src/app/context/handles.rs rustfs/src/app/context/interfaces.rs rustfs/src/app/context/runtime_sources.rs || true
   }
 ) >"$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE"
 

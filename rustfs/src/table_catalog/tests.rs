@@ -16415,7 +16415,12 @@ fn table_metadata_pointer_json_round_trips() {
 
 #[test]
 fn object_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = include_str!("../app/object_usecase.rs");
+    let source = [
+        include_str!("../app/object/mod.rs"),
+        include_str!("../app/object/shared.rs"),
+        include_str!("../app/object/extract.rs"),
+    ]
+    .concat();
     let delete_object = source
         .split_once("pub async fn execute_delete_object")
         .and_then(|(_, remainder)| remainder.split_once("pub async fn execute_head_object"))
