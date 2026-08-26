@@ -161,6 +161,49 @@ jobs:
           path: ${{ steps.deb.outputs.deb_file }}
           if-no-files-found: error
 
+      # Persist the nightly deb on Cloudflare R2 (same channel as package.yml)
+      # so it can be downloaded later with a stable, unauthenticated URL —
+      # e.g. https://dl.rustfs.com/artifacts/rustfs/packages/nightly/... .
+      # Skipped when the R2 secrets are not configured (artifact-only mode).
+      - name: Upload DEB to Cloudflare R2
+        if: env.R2_ACCESS_KEY_ID != ''
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_EC2_METADATA_DISABLED: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" || -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
+            echo "⚠️ R2 credentials missing, skipping upload"
+            exit 0
+          fi
+
+          if ! command -v aws >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y -qq awscli
+          fi
+
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
+
+          DEB_FILE="${{ steps.deb.outputs.deb_file }}"
+          R2_PREFIX="s3://${R2_BUCKET}/artifacts/rustfs/packages/nightly/"
+
+          echo "📤 Uploading ${DEB_FILE} to ${R2_PREFIX}"
+          aws s3 cp "${DEB_FILE}" "${R2_PREFIX}" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+
+          # Stable "latest" alias so tests can fetch the newest nightly
+          # without knowing today's date.
+          echo "📤 Uploading latest alias"
+          aws s3 cp "${DEB_FILE}" "${R2_PREFIX}rustfs-nightly-latest.deb" \
+            --endpoint-url "$R2_ENDPOINT" --only-show-errors
+
+          echo "✅ R2 upload complete"
+
   # Live-Vault lane for the rustfs-kms suite (rustfs/backlog#1774).
   #
   # RUSTFS_KMS_VAULT_TOKEN is the single switch that adds the Vault KV2 and
