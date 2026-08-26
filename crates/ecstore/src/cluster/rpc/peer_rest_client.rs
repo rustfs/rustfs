@@ -113,6 +113,21 @@ fn peer_failure_without_details(op: &str, bucket: Option<&str>) -> Error {
     }
 }
 
+/// Decode a control-plane response failure. Peers at or above the typed
+/// `ControlPlaneErrorCode` change (backlog#1845) carry a machine-readable
+/// discriminant beside the legacy `error_info` string; prefer it, then fall
+/// back to the string, then to the detail-free per-op failure.
+/// RUSTFS_COMPAT_TODO(not-initialized-error-code-v1): string fallback for peers that predate the typed wire code. Remove after the minimum supported RustFS peer version always sends error_code.
+fn control_plane_failure(op: &str, bucket: Option<&str>, error_code: Option<i32>, error_info: Option<String>) -> Error {
+    if error_code == Some(rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32) {
+        return Error::RemoteNotInitialized;
+    }
+    match error_info {
+        Some(msg) => Error::other(msg),
+        None => peer_failure_without_details(op, bucket),
+    }
+}
+
 fn decode_bucket_stats_response(response: GetBucketStatsDataResponse) -> Result<BucketStats> {
     if !response.success {
         return Err(Error::other(
@@ -845,10 +860,12 @@ impl PeerRestClient {
 
         let response = client.local_storage_info(request).await?.into_inner();
         if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(peer_failure_without_details("local_storage_info", None));
+            return Err(control_plane_failure(
+                "local_storage_info",
+                None,
+                response.error_code,
+                response.error_info,
+            ));
         }
         let data = response.storage_info;
 
@@ -1489,10 +1506,12 @@ impl PeerRestClient {
 
         let response = client.load_bucket_metadata(request).await?.into_inner();
         if !response.success {
-            if let Some(msg) = response.error_info {
-                return Err(Error::other(msg));
-            }
-            return Err(peer_failure_without_details("load_bucket_metadata", Some(bucket)));
+            return Err(control_plane_failure(
+                "load_bucket_metadata",
+                Some(bucket),
+                response.error_code,
+                response.error_info,
+            ));
         }
         Ok(())
     }
@@ -1531,10 +1550,7 @@ impl PeerRestClient {
 
                 let response = client.delete_policy(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("delete_policy", None));
+                    return Err(control_plane_failure("delete_policy", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1554,10 +1570,7 @@ impl PeerRestClient {
 
                 let response = client.load_policy(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_policy", None));
+                    return Err(control_plane_failure("load_policy", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1579,10 +1592,12 @@ impl PeerRestClient {
 
                 let response = client.load_policy_mapping(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_policy_mapping", None));
+                    return Err(control_plane_failure(
+                        "load_policy_mapping",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
                 Ok(())
             }
@@ -1602,10 +1617,7 @@ impl PeerRestClient {
 
                 let response = client.delete_user(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("delete_user", None));
+                    return Err(control_plane_failure("delete_user", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1625,10 +1637,12 @@ impl PeerRestClient {
 
                 let response = client.delete_service_account(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("delete_service_account", None));
+                    return Err(control_plane_failure(
+                        "delete_service_account",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
                 Ok(())
             }
@@ -1649,10 +1663,7 @@ impl PeerRestClient {
 
                 let response = client.load_user(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_user", None));
+                    return Err(control_plane_failure("load_user", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1672,10 +1683,12 @@ impl PeerRestClient {
 
                 let response = client.load_service_account(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_service_account", None));
+                    return Err(control_plane_failure(
+                        "load_service_account",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
                 Ok(())
             }
@@ -1695,10 +1708,7 @@ impl PeerRestClient {
 
                 let response = client.load_group(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_group", None));
+                    return Err(control_plane_failure("load_group", None, response.error_code, response.error_info));
                 }
                 Ok(())
             }
@@ -1716,10 +1726,12 @@ impl PeerRestClient {
 
                 let response = client.reload_site_replication_config(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("reload_site_replication_config", None));
+                    return Err(control_plane_failure(
+                        "reload_site_replication_config",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
                 Ok(())
             }
@@ -1987,10 +1999,7 @@ impl PeerRestClient {
 
                 let response = client.reload_pool_meta(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("reload_pool_meta", None));
+                    return Err(control_plane_failure("reload_pool_meta", None, response.error_code, response.error_info));
                 }
 
                 Ok(())
@@ -2011,10 +2020,7 @@ impl PeerRestClient {
 
                 let response = client.stop_rebalance(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("stop_rebalance", None));
+                    return Err(control_plane_failure("stop_rebalance", None, response.error_code, response.error_info));
                 }
 
                 Ok(())
@@ -2045,10 +2051,12 @@ impl PeerRestClient {
                     "peer rebalance metadata response"
                 );
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("load_rebalance_meta", None));
+                    return Err(control_plane_failure(
+                        "load_rebalance_meta",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
 
                 Ok(())
@@ -2073,10 +2081,12 @@ impl PeerRestClient {
 
                 let response = client.start_decommission(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("start_decommission", None));
+                    return Err(control_plane_failure(
+                        "start_decommission",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
 
                 Ok(())
@@ -2097,10 +2107,12 @@ impl PeerRestClient {
 
                 let response = client.cancel_decommission(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("decommission_cancel", None));
+                    return Err(control_plane_failure(
+                        "decommission_cancel",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
 
                 Ok(())
@@ -2121,10 +2133,12 @@ impl PeerRestClient {
 
                 let response = client.clear_decommission(request).await?.into_inner();
                 if !response.success {
-                    if let Some(msg) = response.error_info {
-                        return Err(Error::other(msg));
-                    }
-                    return Err(peer_failure_without_details("clear_decommission", None));
+                    return Err(control_plane_failure(
+                        "clear_decommission",
+                        None,
+                        response.error_code,
+                        response.error_info,
+                    ));
                 }
 
                 Ok(())
@@ -2180,7 +2194,7 @@ impl PeerRestClient {
             Err(status) => return tier_config_reload_status_outcome(status),
         };
         if !response.success {
-            return tier_config_reload_remote_failure(response.error_info);
+            return tier_config_reload_remote_failure(response.error_code, response.error_info);
         }
 
         TierConfigReloadOutcome::Success
@@ -2239,7 +2253,13 @@ fn is_tier_config_reload_connection_failure(err: &Error) -> bool {
 /// reload every `TIER_CONFIG_RELOAD_RETRY_CAP`, and `Terminal` stays reachable
 /// for transport and gRPC status failures, which is where a genuinely
 /// unrecoverable peer surfaces.
-fn tier_config_reload_remote_failure(error_info: Option<String>) -> TierConfigReloadOutcome {
+fn tier_config_reload_remote_failure(error_code: Option<i32>, error_info: Option<String>) -> TierConfigReloadOutcome {
+    // Remote rejections are transient by design (see the doc comment above);
+    // the typed not-initialized code keeps the error typed for downstream
+    // classifiers instead of a bare string (backlog#1845).
+    if error_code == Some(rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32) {
+        return TierConfigReloadOutcome::TransientRetrySameChannel(Error::RemoteNotInitialized);
+    }
     TierConfigReloadOutcome::TransientRetrySameChannel(Error::other(error_info.unwrap_or_default()))
 }
 
@@ -2277,6 +2297,63 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use temp_env::async_with_vars;
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
+
+    #[test]
+    fn control_plane_failure_prefers_typed_not_initialized_code() {
+        use rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode;
+        let code = Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32);
+
+        // Typed code wins even when the legacy string is present (dual-write).
+        let err = control_plane_failure("load_bucket_metadata", Some("b"), code, Some("errServerNotInitialized".to_string()));
+        assert!(matches!(err, Error::RemoteNotInitialized));
+        assert!(crate::error::is_err_not_initialized(&err), "typed variant must satisfy the predicate");
+
+        // Legacy peers: no code, string only — the substring fallback still classifies.
+        let err = control_plane_failure("load_bucket_metadata", Some("b"), None, Some("errServerNotInitialized".to_string()));
+        assert!(crate::error::is_err_not_initialized(&err), "legacy string form must keep classifying");
+
+        // No code, no string: detail-free per-op failure, not misread as not-initialized.
+        let err = control_plane_failure("load_bucket_metadata", Some("b"), None, None);
+        assert!(!crate::error::is_err_not_initialized(&err));
+        assert!(err.to_string().contains("load_bucket_metadata"));
+
+        // Unspecified code behaves like no code.
+        let err = control_plane_failure(
+            "load_bucket_metadata",
+            None,
+            Some(ControlPlaneErrorCode::ControlPlaneErrorUnspecified as i32),
+            Some("boom".to_string()),
+        );
+        assert!(!matches!(err, Error::RemoteNotInitialized));
+        assert_eq!(err.to_string(), "Io error: boom");
+    }
+
+    #[test]
+    fn control_plane_not_initialized_wire_value_is_pinned() {
+        // The discriminant is wire contract: old peers ignore it, but a renumber
+        // would silently flip classification on mixed-version clusters.
+        use rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode;
+        assert_eq!(ControlPlaneErrorCode::ControlPlaneErrorUnspecified as i32, 0);
+        assert_eq!(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32, 1);
+    }
+
+    #[test]
+    fn tier_config_reload_remote_failure_keeps_typed_not_initialized() {
+        use rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode;
+        let outcome = tier_config_reload_remote_failure(
+            Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
+            Some("errServerNotInitialized".to_string()),
+        );
+        match outcome {
+            TierConfigReloadOutcome::TransientRetrySameChannel(err) => {
+                assert!(matches!(err, Error::RemoteNotInitialized));
+            }
+            TierConfigReloadOutcome::TransientReconnect(err) | TierConfigReloadOutcome::Terminal(err) => {
+                panic!("not-initialized must stay retry-same-channel, got {err}")
+            }
+            TierConfigReloadOutcome::Success => panic!("a rejection cannot classify as success"),
+        }
+    }
 
     #[test]
     fn scanner_publication_lease_response_rejects_stale_generation_and_session() {
@@ -3031,11 +3108,11 @@ mod tests {
         // retired: the channel is healthy, so the rejection reflects remote state
         // that the next attempt can find healed.
         assert!(matches!(
-            tier_config_reload_remote_failure(Some("backend unavailable".to_string())),
+            tier_config_reload_remote_failure(None, Some("backend unavailable".to_string())),
             TierConfigReloadOutcome::TransientRetrySameChannel(_)
         ));
         assert!(matches!(
-            tier_config_reload_remote_failure(Some("errServerNotInitialized".to_string())),
+            tier_config_reload_remote_failure(None, Some("errServerNotInitialized".to_string())),
             TierConfigReloadOutcome::TransientRetrySameChannel(_)
         ));
         assert!(matches!(
@@ -3080,7 +3157,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    tier_config_reload_remote_failure(Some(error_info.to_string())),
+                    tier_config_reload_remote_failure(None, Some(error_info.to_string())),
                     TierConfigReloadOutcome::TransientRetrySameChannel(_)
                 ),
                 "a peer that rejected the apply must stay retryable so it converges: {error_info}"
@@ -3089,7 +3166,7 @@ mod tests {
 
         // An absent error message is still a rejection, not a reason to stop.
         assert!(matches!(
-            tier_config_reload_remote_failure(None),
+            tier_config_reload_remote_failure(None, None),
             TierConfigReloadOutcome::TransientRetrySameChannel(_)
         ));
 

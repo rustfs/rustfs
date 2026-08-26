@@ -385,10 +385,12 @@ fn background_rebalance_start_error_message(result: StorageResult<()>) -> Option
 fn stop_rebalance_response(result: StorageResult<()>) -> StopRebalanceResponse {
     match result {
         Ok(_) => StopRebalanceResponse {
+            error_code: None,
             success: true,
             error_info: None,
         },
         Err(err) => StopRebalanceResponse {
+            error_code: None,
             success: false,
             error_info: Some(err.to_string()),
         },
@@ -1498,6 +1500,7 @@ impl Node for NodeService {
         let policy = request.policy_name;
         if policy.is_empty() {
             return Ok(Response::new(DeletePolicyResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("policy name is missing".to_string()),
             }));
@@ -1507,17 +1510,20 @@ impl Node for NodeService {
             return Ok(Response::new(DeletePolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
         let resp = iam_sys.delete_policy(&policy, false).await;
         if let Err(err) = resp {
             return Ok(Response::new(DeletePolicyResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(Response::new(DeletePolicyResponse {
+            error_code: None,
             success: true,
             error_info: None,
         }))
@@ -1529,6 +1535,7 @@ impl Node for NodeService {
         let policy = request.policy_name;
         if policy.is_empty() {
             return Ok(Response::new(LoadPolicyResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("policy name is missing".to_string()),
             }));
@@ -1537,17 +1544,20 @@ impl Node for NodeService {
             return Ok(Response::new(LoadPolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
         let resp = iam_sys.load_policy(&policy).await;
         if let Err(err) = resp {
             return Ok(Response::new(LoadPolicyResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(Response::new(LoadPolicyResponse {
+            error_code: None,
             success: true,
             error_info: None,
         }))
@@ -1562,12 +1572,14 @@ impl Node for NodeService {
         let user_or_group = request.user_or_group;
         if user_or_group.is_empty() {
             return Ok(Response::new(LoadPolicyMappingResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("user_or_group name is missing".to_string()),
             }));
         }
         let Some(user_type) = UserType::from_u64(request.user_type) else {
             return Ok(Response::new(LoadPolicyMappingResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("invalid user type".to_string()),
             }));
@@ -1577,16 +1589,19 @@ impl Node for NodeService {
             return Ok(Response::new(LoadPolicyMappingResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
         let resp = iam_sys.load_policy_mapping(&user_or_group, user_type, is_group).await;
         if let Err(err) = resp {
             return Ok(Response::new(LoadPolicyMappingResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(Response::new(LoadPolicyMappingResponse {
+            error_code: None,
             success: true,
             error_info: None,
         }))
@@ -1598,6 +1613,7 @@ impl Node for NodeService {
         let access_key = request.access_key;
         if access_key.is_empty() {
             return Ok(Response::new(DeleteUserResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("access_key name is missing".to_string()),
             }));
@@ -1606,17 +1622,20 @@ impl Node for NodeService {
             return Ok(Response::new(DeleteUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
         let resp = iam_sys.delete_user(&access_key, false).await;
         if let Err(err) = resp {
             return Ok(Response::new(DeleteUserResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(Response::new(DeleteUserResponse {
+            error_code: None,
             success: true,
             error_info: None,
         }))
@@ -1631,6 +1650,7 @@ impl Node for NodeService {
         let access_key = request.access_key;
         if access_key.is_empty() {
             return Ok(Response::new(DeleteServiceAccountResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("access_key name is missing".to_string()),
             }));
@@ -1644,6 +1664,7 @@ impl Node for NodeService {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
         // This legacy RPC is a cache notification. Reloading shared state keeps a
@@ -1651,11 +1672,13 @@ impl Node for NodeService {
         let resp = iam_sys.load_service_account(&access_key).await;
         if let Err(err) = resp {
             return Ok(Response::new(DeleteServiceAccountResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(Response::new(DeleteServiceAccountResponse {
+            error_code: None,
             success: true,
             error_info: None,
         }))
@@ -1668,6 +1691,7 @@ impl Node for NodeService {
         let temp = request.temp;
         if access_key.is_empty() {
             return Ok(Response::new(LoadUserResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("access_key name is missing".to_string()),
             }));
@@ -1677,6 +1701,7 @@ impl Node for NodeService {
             return Ok(Response::new(LoadUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
@@ -1685,12 +1710,14 @@ impl Node for NodeService {
         let resp = iam_sys.load_user(&access_key, user_type).await;
         if let Err(err) = resp {
             return Ok(Response::new(LoadUserResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
         }
 
         Ok(Response::new(LoadUserResponse {
+            error_code: None,
             success: true,
             error_info: None,
         }))
@@ -1705,6 +1732,7 @@ impl Node for NodeService {
         let access_key = request.access_key;
         if access_key.is_empty() {
             return Ok(Response::new(LoadServiceAccountResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("access_key name is missing".to_string()),
             }));
@@ -1714,18 +1742,21 @@ impl Node for NodeService {
             return Ok(Response::new(LoadServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
         let resp = iam_sys.load_service_account(&access_key).await;
         if let Err(err) = resp {
             return Ok(Response::new(LoadServiceAccountResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
         }
 
         Ok(Response::new(LoadServiceAccountResponse {
+            error_code: None,
             success: true,
             error_info: None,
         }))
@@ -1737,6 +1768,7 @@ impl Node for NodeService {
         let group = request.group;
         if group.is_empty() {
             return Ok(Response::new(LoadGroupResponse {
+                error_code: None,
                 success: false,
                 error_info: Some("group name is missing".to_string()),
             }));
@@ -1746,17 +1778,20 @@ impl Node for NodeService {
             return Ok(Response::new(LoadGroupResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
         let resp = iam_sys.load_group(&group).await;
         if let Err(err) = resp {
             return Ok(Response::new(LoadGroupResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
         }
         Ok(Response::new(LoadGroupResponse {
+            error_code: None,
             success: true,
             error_info: None,
         }))
@@ -1771,14 +1806,17 @@ impl Node for NodeService {
             return Ok(Response::new(ReloadSiteReplicationConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
         match reload_site_replication_runtime_state().await {
             Ok(()) => Ok(Response::new(ReloadSiteReplicationConfigResponse {
+                error_code: None,
                 success: true,
                 error_info: None,
             })),
             Err(err) => Ok(Response::new(ReloadSiteReplicationConfigResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             })),
@@ -2098,6 +2136,7 @@ impl Node for NodeService {
                 success: false,
                 bg_heal_state: Bytes::new(),
                 error_info: Some("storage layer not initialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         }
         let snapshot = heal::capture_node_heal_status(rustfs_scanner::scanner::BackgroundHealInfo::default()).await;
@@ -2106,11 +2145,13 @@ impl Node for NodeService {
                 success: true,
                 bg_heal_state: bg_heal_state.into(),
                 error_info: None,
+                error_code: None,
             })),
             Err(err) => Ok(Response::new(BackgroundHealStatusResponse {
                 success: false,
                 bg_heal_state: Bytes::new(),
                 error_info: Some(err),
+                error_code: None,
             })),
         }
     }
@@ -2124,16 +2165,19 @@ impl Node for NodeService {
                 success: false,
                 recovery_status: Bytes::new(),
                 error_info: Some("storage layer not initialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         }
         let snapshot = heal::capture_node_replacement_recovery_status().await;
         match heal::encode_node_replacement_recovery_status(&snapshot) {
             Ok(recovery_status) => Ok(Response::new(ReplacementRecoveryStatusResponse {
+                error_code: None,
                 success: true,
                 recovery_status: recovery_status.into(),
                 error_info: None,
             })),
             Err(err) => Ok(Response::new(ReplacementRecoveryStatusResponse {
+                error_code: None,
                 success: false,
                 recovery_status: Bytes::new(),
                 error_info: Some(err),
@@ -2164,6 +2208,7 @@ impl Node for NodeService {
             return Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
         // Recover missing workers only after the reload merged newer state; a
@@ -2171,19 +2216,23 @@ impl Node for NodeService {
         match store.reload_pool_meta().await {
             Ok(true) => match store.spawn_missing_local_decommission_routines().await {
                 Ok(_) => Ok(Response::new(ReloadPoolMetaResponse {
+                    error_code: None,
                     success: true,
                     error_info: None,
                 })),
                 Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
+                    error_code: None,
                     success: false,
                     error_info: Some(err.to_string()),
                 })),
             },
             Ok(false) => Ok(Response::new(ReloadPoolMetaResponse {
+                error_code: None,
                 success: true,
                 error_info: None,
             })),
             Err(err) => Ok(Response::new(ReloadPoolMetaResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             })),
@@ -2196,6 +2245,7 @@ impl Node for NodeService {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
@@ -2219,6 +2269,7 @@ impl Node for NodeService {
             return Ok(Response::new(LoadRebalanceMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
@@ -2242,6 +2293,7 @@ impl Node for NodeService {
                     "node rpc background task failed"
                 );
                 return Ok(Response::new(LoadRebalanceMetaResponse {
+                    error_code: None,
                     success: false,
                     error_info: Some(message),
                 }));
@@ -2249,6 +2301,7 @@ impl Node for NodeService {
         }
 
         Ok(Response::new(LoadRebalanceMetaResponse {
+            error_code: None,
             success: true,
             error_info: None,
         }))
@@ -2263,6 +2316,7 @@ impl Node for NodeService {
             return Ok(Response::new(StartDecommissionResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
@@ -2276,10 +2330,12 @@ impl Node for NodeService {
 
         match store.decommission(CancellationToken::new(), indices).await {
             Ok(()) => Ok(Response::new(StartDecommissionResponse {
+                error_code: None,
                 success: true,
                 error_info: None,
             })),
             Err(err) => Ok(Response::new(StartDecommissionResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             })),
@@ -2295,6 +2351,7 @@ impl Node for NodeService {
             return Ok(Response::new(CancelDecommissionResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
@@ -2302,6 +2359,7 @@ impl Node for NodeService {
             .map_err(|_| Status::invalid_argument("decommission pool index exceeds local range"))?;
         if let Err(err) = ensure_rpc_decommission_local_leader(&store, idx) {
             return Ok(Response::new(CancelDecommissionResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
@@ -2309,10 +2367,12 @@ impl Node for NodeService {
 
         match store.decommission_cancel(idx).await {
             Ok(()) => Ok(Response::new(CancelDecommissionResponse {
+                error_code: None,
                 success: true,
                 error_info: None,
             })),
             Err(err) => Ok(Response::new(CancelDecommissionResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             })),
@@ -2328,6 +2388,7 @@ impl Node for NodeService {
             return Ok(Response::new(ClearDecommissionResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
@@ -2335,6 +2396,7 @@ impl Node for NodeService {
             .map_err(|_| Status::invalid_argument("decommission pool index exceeds local range"))?;
         if let Err(err) = ensure_rpc_decommission_local_leader(&store, idx) {
             return Ok(Response::new(ClearDecommissionResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             }));
@@ -2342,10 +2404,12 @@ impl Node for NodeService {
 
         match store.clear_decommission(idx).await {
             Ok(()) => Ok(Response::new(ClearDecommissionResponse {
+                error_code: None,
                 success: true,
                 error_info: None,
             })),
             Err(err) => Ok(Response::new(ClearDecommissionResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             })),
@@ -2361,15 +2425,18 @@ impl Node for NodeService {
             return Ok(Response::new(LoadTransitionTierConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
+                error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32),
             }));
         };
 
         match reload_transition_tier_config(store).await {
             Ok(_) => Ok(Response::new(LoadTransitionTierConfigResponse {
+                error_code: None,
                 success: true,
                 error_info: None,
             })),
             Err(err) => Ok(Response::new(LoadTransitionTierConfigResponse {
+                error_code: None,
                 success: false,
                 error_info: Some(err.to_string()),
             })),

@@ -105,6 +105,7 @@ pub enum StorageErrorCode {
     InvalidPath,
     QuotaExceeded,
     RemoteClientUnavailable,
+    RemoteNotInitialized,
 }
 
 impl StorageErrorCode {
@@ -192,6 +193,7 @@ impl StorageErrorCode {
             Self::InvalidPath => 0x52,
             Self::QuotaExceeded => 0x53,
             Self::RemoteClientUnavailable => 0x54,
+            Self::RemoteNotInitialized => 0x55,
         }
     }
 
@@ -279,6 +281,7 @@ impl StorageErrorCode {
             0x52 => Some(Self::InvalidPath),
             0x53 => Some(Self::QuotaExceeded),
             0x54 => Some(Self::RemoteClientUnavailable),
+            0x55 => Some(Self::RemoteNotInitialized),
             _ => None,
         }
     }
@@ -355,6 +358,7 @@ mod tests {
         (StorageErrorCode::NamespaceLockQuorumUnavailable, 0x42),
         (StorageErrorCode::QuotaExceeded, 0x53),
         (StorageErrorCode::RemoteClientUnavailable, 0x54),
+        (StorageErrorCode::RemoteNotInitialized, 0x55),
     ];
 
     const DISK_PRESERVATION_ERROR_CODES: &[(StorageErrorCode, u32)] = &[
