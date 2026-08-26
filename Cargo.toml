@@ -365,8 +365,8 @@ russh-sftp = "2.4.0"
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-rustfs-mimalloc = { version = "0.5.0" }
-rustfs-mimalloc-sys = { version = "0.5.0" }
+rustfs-mimalloc = { version = "0.5.1" }
+rustfs-mimalloc-sys = { version = "0.5.1" }
 hotpath = { version = "0.24.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }

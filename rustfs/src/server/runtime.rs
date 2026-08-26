@@ -160,15 +160,22 @@ pub fn tokio_runtime_builder() -> tokio::runtime::Builder {
         rustfs_utils::get_env_usize(rustfs_config::ENV_MAX_IO_EVENTS_PER_TICK, rustfs_config::DEFAULT_MAX_IO_EVENTS_PER_TICK);
     builder.enable_all().max_io_events_per_tick(max_io_events_per_tick);
 
-    // Optional: Simple log of thread start/stop
+    // mimalloc threadpool optimization: call mi_thread_set_in_threadpool() for each Tokio worker thread
+    // This helps mimalloc optimize memory allocation for thread pool patterns (reduces reabandon)
+    // See: https://github.com/microsoft/mimalloc/issues/1372
+    #[allow(unsafe_code)]
+    builder.on_thread_start(|| {
+        unsafe {
+            rustfs_mimalloc_sys::mi_thread_set_in_threadpool();
+        }
+        if print_tokio_thread_enable() {
+            tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread started");
+        }
+    });
     if print_tokio_thread_enable() {
-        builder
-            .on_thread_start(|| {
-                tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread started");
-            })
-            .on_thread_stop(|| {
-                tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread stopped");
-            });
+        builder.on_thread_stop(|| {
+            tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread stopped");
+        });
     }
     if !rustfs_obs::is_production_environment() {
         println!(
