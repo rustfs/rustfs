@@ -39,14 +39,18 @@ Leaf crates carry exactly one adjudicated allowed edge:
 `io-metrics -> rustfs-s3-ops` (transitively `rustfs-s3-types`). Both are pure
 contract crates — types and enums only, no I/O, no global state, no non-contract
 internal dependencies — so `io-metrics` reuses the `S3Operation` vocabulary
-instead of copying it. The allowance covers that edge and nothing else: the
-leaf-crate allowlist in `scripts/check_architecture_migration_rules.sh` fails any
-other `rustfs-*` dependency in `config`, `credentials`, `crypto`, `io-metrics`,
-or `madmin`. Adjudicated in
+instead of copying it. `madmin` is no longer counted a leaf: since #6166 it is
+the SigV4-signed admin SDK client and deliberately depends on `rustfs-signer`;
+the guard pins its internal dependency surface to exactly that edge so it cannot
+quietly grow storage-side dependencies. The leaf-crate allowlist in
+`scripts/check_architecture_migration_rules.sh` fails any other `rustfs-*`
+dependency in `config`, `credentials`, `crypto`, `io-metrics`, or `madmin`, in
+either TOML spelling (`rustfs-x = ...` or `rustfs-x.workspace = true`).
+Adjudicated in
 [`rustfs/backlog#1834`](https://github.com/rustfs/backlog/issues/1834); a further
-exception must meet the same criterion — pure contract crate, no I/O, no globals,
-no non-contract internal dependencies — and land its guard allowlist entry
-alongside the dependency.
+leaf exception must meet the pure-contract criterion — types and enums only, no
+I/O, no globals, no non-contract internal dependencies — and land its guard
+allowlist entry alongside the dependency.
 
 Dependency direction also applies to compile-time source reads:
 `include_str!`/`include!` of a `.rs` file must not resolve outside the
