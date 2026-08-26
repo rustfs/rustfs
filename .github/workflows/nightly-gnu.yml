@@ -34,7 +34,7 @@ env:
 jobs:
   build:
     name: Build x86_64 GNU
-    runs-on: sm-standard-2
+    runs-on: sm-standard-4
     timeout-minutes: 150
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
