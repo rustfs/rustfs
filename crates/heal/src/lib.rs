@@ -176,7 +176,7 @@ pub async fn init_heal_manager_with_workload_provider(
         let channel_receiver = if force_channel_failure {
             Err("forced heal channel initialization failure")
         } else {
-            rustfs_common::heal_channel::init_heal_channels()
+            rustfs_heal_contracts::heal_channel::init_heal_channels()
         };
         let (receiver, receipt_receiver) = match channel_receiver {
             Ok(receivers) => receivers,
@@ -358,7 +358,7 @@ mod tests {
         heal::storage::HealStorageAPI, init_heal_manager, run_owned_initialization,
     };
     use crate::heal::storage_api::status::BucketInfo;
-    use rustfs_common::heal_channel::HealOpts;
+    use rustfs_heal_contracts::heal_channel::HealOpts;
     use rustfs_madmin::heal_commands::HealResultItem;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

@@ -20,8 +20,10 @@ use crate::heal::{
 };
 use crate::{Error, Result};
 use metrics::{counter, gauge};
-use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionReceipt, HealAdmissionResult, HealRequestSource};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+use rustfs_heal_contracts::heal_channel::{
+    HealAdmissionDropReason, HealAdmissionReceipt, HealAdmissionResult, HealRequestSource,
+};
 use rustfs_madmin::heal_commands::HealResultItem;
 #[cfg(test)]
 use std::sync::LazyLock;
