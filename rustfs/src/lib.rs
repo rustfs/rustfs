@@ -89,6 +89,7 @@ pub mod error;
 pub mod init;
 pub mod inspect;
 pub(crate) mod kms_deletion_gate;
+pub(crate) mod kms_rekey;
 pub mod license;
 pub mod memory_observability;
 pub mod module_switches;

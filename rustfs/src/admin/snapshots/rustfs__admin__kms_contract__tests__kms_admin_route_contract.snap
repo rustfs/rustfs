@@ -41,6 +41,12 @@ expression: kms_route_contract()
   },
   {
     "method": "GET",
+    "path": "/rustfs/admin/v3/kms/keys/rekey/status",
+    "action": "kms:Rekey",
+    "risk": "Sensitive"
+  },
+  {
+    "method": "GET",
     "path": "/rustfs/admin/v3/kms/keys/{key_id}",
     "action": "kms:DescribeKey",
     "risk": "Sensitive"
@@ -121,6 +127,18 @@ expression: kms_route_contract()
     "method": "POST",
     "path": "/rustfs/admin/v3/kms/keys/enable",
     "action": "kms:EnableKey",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys/rekey",
+    "action": "kms:Rekey",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
+    "path": "/rustfs/admin/v3/kms/keys/rekey/cancel",
+    "action": "kms:Rekey",
     "risk": "High"
   },
   {

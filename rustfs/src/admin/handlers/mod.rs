@@ -41,6 +41,7 @@ pub mod kms_key_lifecycle;
 pub mod kms_key_metadata;
 pub mod kms_keys;
 pub mod kms_management;
+pub mod kms_rekey;
 pub mod metrics;
 pub mod mfa;
 pub mod module_switch;

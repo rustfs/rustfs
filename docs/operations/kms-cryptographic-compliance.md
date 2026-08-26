@@ -147,4 +147,4 @@ Retirement moves an algorithm through these states, never skipping one:
 
 ### Known gap
 
-Step 3 is currently unreachable for object data. There is no object rewrap or re-encryption capability, so there is no supported way to migrate already-written objects off an algorithm or off a master key version — the same gap that forces the rotation retention rule in [KMS backend security properties](kms-backend-security.md#retention-and-destruction-preconditions). Until a rewrap capability exists, treat every algorithm that has ever been written as permanently read-required, and confine deprecation to step 1.
+Step 3 is partially reachable for object data: the bulk rekey sweep (`POST /rustfs/admin/v3/kms/keys/rekey`) migrates stored DEK envelopes off superseded **master key versions** without touching object bodies. It does not re-encrypt object data, so migrating off a data-encryption **algorithm** still has no supported path — treat every algorithm that has ever been written as permanently read-required, and confine algorithm deprecation to step 1.
