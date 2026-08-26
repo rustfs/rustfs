@@ -9486,8 +9486,6 @@ version = "1.0.0-rc.3"
 dependencies = [
  "hotpath",
  "metrics",
- "rustfs-heal-contracts",
- "rustfs-scanner-contracts",
  "smallvec",
  "tokio",
  "tonic",

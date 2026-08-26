@@ -27,10 +27,6 @@ pub static GLOBAL_ROOT_CERT: LazyLock<RwLock<Option<Vec<u8>>>> = LazyLock::new(|
 pub static GLOBAL_MTLS_IDENTITY: LazyLock<RwLock<Option<MtlsIdentityPem>>> = LazyLock::new(|| RwLock::new(None));
 pub static GLOBAL_OUTBOUND_TLS_GENERATION: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
-// Transitional re-export shim (backlog#1843): the node init-time global moved
-// to rustfs-scanner-contracts, whose metrics report reads it directly.
-pub use rustfs_scanner_contracts::{GLOBAL_INIT_TIME, get_global_init_time, set_global_init_time_now};
-
 /// Log level to use when reporting cached gRPC connection eviction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionEvictionLogLevel {
