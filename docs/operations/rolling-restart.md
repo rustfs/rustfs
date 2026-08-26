@@ -40,6 +40,14 @@ failure pattern reported in rustfs/rustfs#4304.
 > binaries or rollback builds cannot read it. Unresolved decommission entries
 > fail closed instead of being written in the version 1 format.
 
+> [!WARNING]
+> Pool metadata version 3 remains inactive on an existing cluster unless both
+> `RUSTFS_POOL_META_V3_WRITE=true` and
+> `RUSTFS_POOL_META_V3_FLEET_CONFIRMED=true`. V3 adds durable generations and a
+> recoverable cross-pool commit protocol. Once committed, V1/V2-only binaries
+> cannot rejoin. Follow [Pool metadata upgrade and recovery](pool-metadata-recovery.md)
+> for the compatibility matrix and disk-replacement order.
+
 ## TL;DR
 
 - **Rolling restart (no downtime):** restart **one node at a time**, and wait

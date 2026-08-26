@@ -1,0 +1,192 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Targets Integration
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/actions/setup/**"
+      - ".github/workflows/targets-integration.yml"
+      - "crates/targets/**"
+      - "Cargo.lock"
+  schedule:
+    - cron: "17 2 * * *"
+      timezone: "Asia/Shanghai"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: targets-integration-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  targets-live:
+    name: PostgreSQL, MySQL, AMQP, and NATS
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      NO_PROXY: 127.0.0.1,localhost
+      RUSTFS_TEST_PG_DSN: postgres://postgres:rustfs@127.0.0.1:5432/rustfs_events
+      RUSTFS_TEST_MYSQL_DSN: root:testpass@tcp(127.0.0.1:3306)/testdb
+      RUSTFS_TEST_AMQP_URL: amqp://rustfs:rustfs@127.0.0.1:5672/%2f
+      RUSTFS_TEST_NATS_URL: nats://127.0.0.1:4222
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: targets-live-lane
+          cache-save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
+          install-build-packaging-tools: 'false'
+          install-test-tools: 'false'
+
+      - name: Start target services
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/targets-live/services
+          docker run -d --name rustfs-targets-postgres \
+            -e POSTGRES_PASSWORD=rustfs \
+            -e POSTGRES_DB=rustfs_events \
+            -p 5432:5432 postgres:16
+          docker run -d --name rustfs-targets-mysql \
+            -e MYSQL_ROOT_PASSWORD=testpass \
+            -e MYSQL_DATABASE=testdb \
+            -p 3306:3306 mysql:8.0.36
+          docker run -d --name rustfs-targets-rabbitmq \
+            -e RABBITMQ_DEFAULT_USER=rustfs \
+            -e RABBITMQ_DEFAULT_PASS=rustfs \
+            -p 5672:5672 rabbitmq:3
+          docker run -d --name rustfs-targets-nats \
+            -p 4222:4222 -p 8222:8222 nats:2 -js -m 8222
+
+          for _ in $(seq 1 120); do
+            docker exec rustfs-targets-postgres pg_isready -U postgres -d rustfs_events >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec rustfs-targets-postgres pg_isready -U postgres -d rustfs_events
+
+          for _ in $(seq 1 120); do
+            docker exec rustfs-targets-mysql mysqladmin ping -h 127.0.0.1 -uroot -ptestpass --silent >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec rustfs-targets-mysql mysqladmin ping -h 127.0.0.1 -uroot -ptestpass --silent
+
+          for _ in $(seq 1 120); do
+            docker exec rustfs-targets-rabbitmq rabbitmq-diagnostics -q ping >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec rustfs-targets-rabbitmq rabbitmq-diagnostics -q ping
+
+          for _ in $(seq 1 120); do
+            curl -fsS http://127.0.0.1:8222/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8222/healthz
+
+      - name: Run live target tests
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          set +e
+          timeout --verbose --signal=TERM --kill-after=30s 75m bash <<'TESTS' \
+            2>&1 | tee artifacts/targets-live/tests.log
+          result=0
+
+          echo "::group::PostgreSQL"
+          cargo test --locked -p rustfs-targets --test postgres_integration -- --ignored --test-threads=1 || result=1
+          echo "::endgroup::"
+
+          echo "::group::MySQL"
+          cargo test --locked -p rustfs-targets --test mysql_integration -- --ignored --test-threads=1 || result=1
+          echo "::endgroup::"
+
+          echo "::group::AMQP"
+          cargo test --locked -p rustfs-targets --test amqp_integration -- --ignored --test-threads=1 || result=1
+          echo "::endgroup::"
+
+          echo "::group::NATS integration"
+          cargo test --locked -p rustfs-targets --test nats_jetstream_validation_integration -- --ignored --test-threads=1 || result=1
+          cargo test --locked -p rustfs-targets --test nats_jetstream_regression_guards -- --ignored --test-threads=1 || result=1
+          cargo test --locked -p rustfs-targets --lib target::nats::jetstream -- --ignored --test-threads=1 || result=1
+          echo "::endgroup::"
+
+          exit "${result}"
+          TESTS
+          status=${PIPESTATUS[0]}
+          {
+            echo "exit_status=${status}"
+            echo "finished_at=$(date --utc --iso-8601=seconds)"
+            echo
+            echo "Remaining test-related processes:"
+            pgrep -af 'cargo|target/.*/deps/' || true
+          } > artifacts/targets-live/diagnostics.txt
+          exit "${status}"
+
+      - name: Collect service logs
+        if: always()
+        run: |
+          mkdir -p artifacts/targets-live/services
+          for container in postgres mysql rabbitmq nats; do
+            docker logs --tail 500 "rustfs-targets-${container}" \
+              > "artifacts/targets-live/services/${container}.log" 2>&1 || true
+          done
+
+      - name: Stop target services
+        if: always()
+        run: |
+          docker rm -f \
+            rustfs-targets-postgres \
+            rustfs-targets-mysql \
+            rustfs-targets-rabbitmq \
+            rustfs-targets-nats >/dev/null 2>&1 || true
+
+      - name: Upload target integration diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: targets-integration-${{ github.run_number }}-${{ github.run_attempt }}
+          path: artifacts/targets-live
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [targets-live]
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -106,6 +106,89 @@ impl Drop for Sets {
     }
 }
 
+#[cfg(test)]
+struct HealFormatAfterSaveBarrierState {
+    pool_key: usize,
+    disk_index: usize,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static HEAL_FORMAT_AFTER_SAVE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<HealFormatAfterSaveBarrierState>>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct HealFormatAfterSaveBarrier {
+    state: Arc<HealFormatAfterSaveBarrierState>,
+}
+
+#[cfg(test)]
+impl HealFormatAfterSaveBarrier {
+    pub(crate) fn install(pool: &Arc<Sets>, disk_index: usize) -> Self {
+        let state = Arc::new(HealFormatAfterSaveBarrierState {
+            pool_key: Arc::as_ptr(pool) as usize,
+            disk_index,
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut barrier = HEAL_FORMAT_AFTER_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("heal format after-save barrier should not be poisoned");
+        assert!(barrier.is_none(), "heal format after-save barrier must be unique");
+        *barrier = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("format heal should reach the after-save barrier");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for HealFormatAfterSaveBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut barrier = HEAL_FORMAT_AFTER_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("heal format after-save barrier should not be poisoned");
+        if barrier.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *barrier = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_heal_format_after_save(pool: &Sets, disk_index: usize) {
+    let pool_key = std::ptr::from_ref(pool) as usize;
+    let barrier = {
+        let mut barrier = HEAL_FORMAT_AFTER_SAVE_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("heal format after-save barrier should not be poisoned");
+        if barrier
+            .as_ref()
+            .is_some_and(|state| state.pool_key == pool_key && state.disk_index == disk_index)
+        {
+            barrier.take()
+        } else {
+            None
+        }
+    };
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 impl Sets {
     #[tracing::instrument(level = "debug", skip(disks, endpoints, fm, pool_idx, parity_count))]
     pub async fn new(
@@ -989,9 +1072,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
 }
 
 impl Sets {
-    pub(crate) async fn heal_format_with_fence<F>(&self, dry_run: bool, fence_lost: F) -> Result<(HealResultItem, Option<Error>)>
+    pub(crate) async fn heal_format_with_fence<F>(
+        &self,
+        dry_run: bool,
+        mut fence_lost: F,
+    ) -> Result<(HealResultItem, Option<Error>)>
     where
-        F: Fn() -> bool + Send + Sync,
+        F: FnMut() -> bool + Send,
     {
         let (disks, init_errs) = init_storage_disks_with_errors(
             &self.endpoints.endpoints,
@@ -1074,6 +1161,11 @@ impl Sets {
                         }
                         return Ok((res, Some(err.into())));
                     }
+                    #[cfg(test)]
+                    pause_heal_format_after_save(self, index).await;
+                    if fence_lost() {
+                        return Ok((res, Some(StorageError::SlowDown)));
+                    }
                     if let Some(saved_format) = fm.as_ref() {
                         res.after.drives[index].uuid = saved_format.erasure.this.to_string();
                         res.after.drives[index].state = DriveState::Ok.to_string();
@@ -1081,8 +1173,14 @@ impl Sets {
                 }
             }
 
+            if fence_lost() {
+                return Ok((res, Some(StorageError::SlowDown)));
+            }
             for (index, fm) in tmp_new_formats.iter().enumerate() {
                 if let Some(fm) = fm {
+                    if fence_lost() {
+                        return Ok((res, Some(StorageError::SlowDown)));
+                    }
                     let (m, n) = match ref_format.find_disk_index_by_disk_id(fm.erasure.this) {
                         Ok((m, n)) => (m, n),
                         Err(_) => continue,
@@ -1094,6 +1192,9 @@ impl Sets {
                     }
 
                     if let Some(Some(disk)) = disks.get(index) {
+                        if fence_lost() {
+                            return Ok((res, Some(StorageError::SlowDown)));
+                        }
                         self.disk_set[m].renew_disk(&disk.endpoint()).await;
                     }
                 }

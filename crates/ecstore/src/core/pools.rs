@@ -34,7 +34,7 @@ use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{
     CONFIG_PREFIX, delete_config, read_config_limited_preserve_empty, read_config_limited_preserve_empty_with_metadata,
     read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, save_config_with_opts,
-    save_config_with_opts_quiet,
+    save_config_with_opts_and_metadata,
 };
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
@@ -131,9 +131,20 @@ const DECOMMISSION_DURABLE_ILM_RECEIPT_CAS_ATTEMPTS: usize = 3;
 const DECOMMISSION_BACKGROUND_WALKDIR_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub const POOL_META_NAME: &str = "pool.bin";
+pub(crate) const POOL_META_IDENTITY_NAME: &str = "pool.bin.identity";
 pub const POOL_META_FORMAT: u16 = 1;
 const POOL_META_V1_VERSION: u16 = 1;
 pub const POOL_META_VERSION: u16 = 2;
+const POOL_META_GENERATION_VERSION: u16 = 3;
+const POOL_META_IDENTITY_FORMAT: u16 = 1;
+const POOL_META_IDENTITY_VERSION: u16 = 1;
+const POOL_META_INITIAL_EPOCH: u64 = 1;
+const POOL_META_CAS_MAX_ATTEMPTS: usize = 3;
+const METRIC_POOL_META_STALE_WRITE_REJECTIONS_TOTAL: &str = "rustfs_pool_meta_stale_write_rejections_total";
+
+fn record_pool_meta_stale_write_rejection(reason: &'static str) {
+    metrics::counter!(METRIC_POOL_META_STALE_WRITE_REJECTIONS_TOTAL, "reason" => reason).increment(1);
+}
 
 fn pool_meta_v2_writer_enabled_for(requested: bool, fleet_confirmed: bool) -> bool {
     requested && fleet_confirmed
@@ -145,6 +156,20 @@ fn pool_meta_v2_writer_enabled() -> bool {
         rustfs_utils::get_env_bool(
             rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED,
             rustfs_config::DEFAULT_POOL_META_V2_FLEET_CONFIRMED,
+        ),
+    )
+}
+
+fn pool_meta_v3_writer_enabled_for(requested: bool, fleet_confirmed: bool) -> bool {
+    requested && fleet_confirmed
+}
+
+fn pool_meta_v3_writer_enabled() -> bool {
+    pool_meta_v3_writer_enabled_for(
+        rustfs_utils::get_env_bool(rustfs_config::ENV_POOL_META_V3_WRITE, rustfs_config::DEFAULT_POOL_META_V3_WRITE),
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED,
+            rustfs_config::DEFAULT_POOL_META_V3_FLEET_CONFIRMED,
         ),
     )
 }
@@ -1705,6 +1730,44 @@ fn merge_pool_meta_updates_for_save(
         if current_pool.id != idx || persisted_pool.id != idx || current_pool.cmd_line != persisted_pool.cmd_line {
             return Err(Error::other(format!("{operation}: pool metadata layout changed for pool {idx}")));
         }
+        if current_pool.decommission.is_none()
+            && persisted_pool.decommission.as_ref().is_some_and(|info| {
+                info.has_decommission_state() && is_decommission_active(info.complete, info.failed, info.canceled)
+            })
+        {
+            record_pool_meta_stale_write_rejection("nonterminal_decommission_clear");
+            return Err(Error::other(format!(
+                "{operation}: stale pool metadata update rejected for pool {idx}; persisted active or queued decommission cannot be cleared"
+            )));
+        }
+        if current_pool.last_update < persisted_pool.last_update {
+            record_pool_meta_stale_write_rejection("older_pool_revision");
+            return Err(Error::other(format!(
+                "{operation}: stale pool metadata update rejected for pool {idx}; persisted update is newer"
+            )));
+        }
+        if let (Some(persisted_info), Some(current_info)) =
+            (persisted_pool.decommission.as_ref(), current_pool.decommission.as_ref())
+        {
+            let persisted_terminal = (persisted_info.complete, persisted_info.failed, persisted_info.canceled);
+            let current_terminal = (current_info.complete, current_info.failed, current_info.canceled);
+            if persisted_terminal != (false, false, false) && persisted_terminal != current_terminal {
+                record_pool_meta_stale_write_rejection("terminal_state_regression");
+                return Err(Error::other(format!(
+                    "{operation}: stale pool metadata update rejected for pool {idx}; terminal state cannot be replaced"
+                )));
+            }
+            if current_info.items_decommissioned < persisted_info.items_decommissioned
+                || current_info.items_decommission_failed < persisted_info.items_decommission_failed
+                || current_info.bytes_done < persisted_info.bytes_done
+                || current_info.bytes_failed < persisted_info.bytes_failed
+            {
+                record_pool_meta_stale_write_rejection("progress_regression");
+                return Err(Error::other(format!(
+                    "{operation}: stale pool metadata update rejected for pool {idx}; durable progress cannot decrease"
+                )));
+            }
+        }
         *persisted_pool = current_pool.clone();
     }
 
@@ -1712,6 +1775,7 @@ fn merge_pool_meta_updates_for_save(
 }
 
 fn publish_pool_meta_updates(current: &mut PoolMeta, saved: &PoolMeta, indices: &[usize]) {
+    current.version = current.version.max(saved.version);
     for &idx in indices {
         let Some(saved_pool) = saved.pools.get(idx) else {
             continue;
@@ -1852,6 +1916,7 @@ struct PoolActivationDurableSaveBarrierState {
     pool_key: usize,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    force_fence_loss: AtomicBool,
 }
 
 #[cfg(test)]
@@ -1876,6 +1941,7 @@ impl PoolActivationDurableSaveBarrier {
             pool_key: pool_activation_test_pool_key(pool),
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            force_fence_loss: AtomicBool::new(false),
         });
         let mut barrier = POOL_ACTIVATION_DURABLE_SAVE_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -1893,6 +1959,11 @@ impl PoolActivationDurableSaveBarrier {
     }
 
     pub(crate) fn release_after_fence_loss(&self) {
+        self.state.force_fence_loss.store(true, Ordering::Release);
+        self.state.release.notify_one();
+    }
+
+    pub(crate) fn release_without_fence_loss(&self) {
         self.state.release.notify_one();
     }
 }
@@ -1928,7 +1999,9 @@ pub(crate) async fn pause_pool_activation_after_durable_save<S>(pool: &Arc<S>, f
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
         barrier.release.notified().await;
-        fence.force_lost_for_test();
+        if barrier.force_fence_loss.load(Ordering::Acquire) {
+            fence.force_lost_for_test();
+        }
     }
 }
 
@@ -2709,6 +2782,38 @@ pub struct PoolMeta {
     pub dont_save: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PoolMetaRevision {
+    version: u16,
+    cluster_id: Option<uuid::Uuid>,
+    epoch: u64,
+    generation: u64,
+    transaction_id: Option<uuid::Uuid>,
+}
+
+impl PoolMetaRevision {
+    fn legacy(version: u16) -> Self {
+        Self {
+            version,
+            cluster_id: None,
+            epoch: 0,
+            generation: 0,
+            transaction_id: None,
+        }
+    }
+
+    fn is_generation_protocol(self) -> bool {
+        self.version == POOL_META_GENERATION_VERSION
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PoolMetaCommittedCandidate {
+    canonical: Vec<u8>,
+    meta: PoolMeta,
+    revision: PoolMetaRevision,
+}
+
 #[derive(Debug)]
 enum PoolMetaReplica {
     Missing,
@@ -2716,10 +2821,35 @@ enum PoolMetaReplica {
         raw: Vec<u8>,
         canonical: Vec<u8>,
         meta: PoolMeta,
+        revision: PoolMetaRevision,
+        committed: bool,
+        previous: Option<Box<PoolMetaCommittedCandidate>>,
     },
     Corrupt(String),
     Incompatible(String),
     Unreadable(String),
+}
+
+#[derive(Debug, Clone)]
+enum PoolMetaCasToken {
+    Missing,
+    Existing(String),
+    Unsafe,
+}
+
+#[derive(Debug)]
+struct PoolMetaReplicaRead {
+    replica: PoolMetaReplica,
+    cas: PoolMetaCasToken,
+}
+
+impl From<PoolMetaReplica> for PoolMetaReplicaRead {
+    fn from(replica: PoolMetaReplica) -> Self {
+        Self {
+            replica,
+            cas: PoolMetaCasToken::Unsafe,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2739,12 +2869,51 @@ impl PoolMetaReplicaState {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct PoolMetaWriteState {
     write_blocked: bool,
+    aborted_transaction: Arc<AtomicBool>,
+    expected_cluster_id: Option<uuid::Uuid>,
+    cluster_epoch: Option<u64>,
+    pool_meta_absent: bool,
+    fresh_bootstrap_proven: bool,
+    identity_initialized: Option<bool>,
+    identity_fresh_bootstrap_nonce: Option<uuid::Uuid>,
+    identity_needs_repair: bool,
 }
 
 impl PoolMetaWriteState {
+    pub(crate) fn for_startup(cluster_id: uuid::Uuid, fresh_bootstrap_proven: bool) -> Self {
+        Self {
+            expected_cluster_id: Some(cluster_id),
+            fresh_bootstrap_proven,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn fresh_bootstrap_proven(&self) -> bool {
+        self.fresh_bootstrap_proven
+    }
+
+    pub(crate) fn identity_is_pending(&self) -> bool {
+        self.identity_initialized == Some(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aborted_transaction_latch_for_test(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.aborted_transaction)
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn for_test_bootstrap() -> Self {
+        Self {
+            fresh_bootstrap_proven: true,
+            identity_initialized: Some(false),
+            identity_fresh_bootstrap_nonce: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn observe_replicas(&mut self, replica_state: PoolMetaReplicaState) {
         self.write_blocked |= !replica_state.repair_write_safe;
     }
@@ -2753,12 +2922,104 @@ impl PoolMetaWriteState {
         self.write_blocked = true;
     }
 
-    fn restore_writes(&mut self, was_write_blocked: bool) {
-        self.write_blocked = was_write_blocked;
+    pub(crate) fn block_writes_after_fence_loss(&mut self) {
+        self.block_writes();
     }
 
-    pub(crate) fn ensure_write_safe(self, operation: &str) -> Result<()> {
-        if !self.write_blocked {
+    fn arm_transaction(&self) -> PoolMetaTransactionArm {
+        PoolMetaTransactionArm {
+            aborted_transaction: Arc::clone(&self.aborted_transaction),
+            armed: true,
+        }
+    }
+
+    fn observe_selection(&mut self, selection: &PoolMetaSelection) -> Result<()> {
+        self.pool_meta_absent = selection.absent;
+        if let Some(expected_cluster_id) = self.expected_cluster_id
+            && let Some((cluster_id, _)) = selection.generation_identity
+            && cluster_id != expected_cluster_id
+        {
+            self.block_writes();
+            return Err(Error::other(format!(
+                "pool metadata incompatible: cluster identity {cluster_id} does not match deployment {expected_cluster_id}"
+            )));
+        }
+        if let Some(identity_epoch) = self.cluster_epoch
+            && let Some((_, metadata_epoch)) = selection.generation_identity
+            && metadata_epoch != identity_epoch
+        {
+            self.block_writes();
+            return Err(Error::other(format!(
+                "pool metadata recovery required: committed epoch {} does not match cluster identity epoch {identity_epoch}",
+                metadata_epoch
+            )));
+        }
+        if self.cluster_epoch.is_none()
+            && let Some((_, metadata_epoch)) = selection.generation_identity
+        {
+            self.cluster_epoch = Some(metadata_epoch);
+        }
+        Ok(())
+    }
+
+    fn observe_identity(&mut self, selection: &PoolMetaIdentitySelection) -> Result<()> {
+        self.identity_needs_repair = selection.needs_repair;
+        self.identity_initialized = selection.identity.map(|identity| identity.initialized);
+        self.identity_fresh_bootstrap_nonce = selection.identity.and_then(|identity| identity.fresh_bootstrap_nonce);
+        if let Some(identity) = selection.identity {
+            if identity.initialized {
+                self.fresh_bootstrap_proven = false;
+            }
+            if let Some(metadata_epoch) = self.cluster_epoch
+                && metadata_epoch != identity.epoch
+            {
+                self.block_writes();
+                return Err(Error::other(format!(
+                    "pool metadata recovery required: metadata epoch {metadata_epoch} does not match cluster identity epoch {}",
+                    identity.epoch
+                )));
+            }
+            self.cluster_epoch = Some(identity.epoch);
+        }
+        if !selection.repair_write_safe {
+            self.block_writes();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_missing_metadata_can_initialize(&mut self) -> Result<()> {
+        if !self.pool_meta_absent {
+            return Ok(());
+        }
+        match self.identity_initialized {
+            Some(false) if self.fresh_bootstrap_proven && self.identity_fresh_bootstrap_nonce.is_some() => Ok(()),
+            Some(false) => {
+                self.block_writes();
+                Err(Error::other(
+                    "pool metadata recovery required: pending cluster identity exists but this startup has no verified fresh-bootstrap proof",
+                ))
+            }
+            Some(true) => {
+                self.block_writes();
+                Err(Error::other(
+                    "pool metadata recovery required: initialized cluster identity exists but every pool.bin replica is missing",
+                ))
+            }
+            None => {
+                self.block_writes();
+                Err(Error::other(
+                    "pool metadata recovery required: no durable bootstrap identity or pool.bin replica is available",
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn identity_requires_repair(&self) -> bool {
+        self.expected_cluster_id.is_some() && (self.identity_needs_repair || self.identity_initialized != Some(true))
+    }
+
+    pub(crate) fn ensure_write_safe(&self, operation: &str) -> Result<()> {
+        if !self.write_blocked && !self.aborted_transaction.load(Ordering::SeqCst) {
             return Ok(());
         }
         Err(Error::other(format!(
@@ -2768,9 +3029,35 @@ impl PoolMetaWriteState {
 }
 
 #[derive(Debug)]
+struct PoolMetaTransactionArm {
+    aborted_transaction: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl PoolMetaTransactionArm {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PoolMetaTransactionArm {
+    fn drop(&mut self) {
+        if self.armed {
+            self.aborted_transaction.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[derive(Debug)]
 struct PoolMetaSelection {
     meta: PoolMeta,
+    revision: PoolMetaRevision,
+    canonical: Option<Vec<u8>>,
     replica_state: PoolMetaReplicaState,
+    cas_tokens: Vec<PoolMetaCasToken>,
+    absent: bool,
+    generation_protocol_observed: bool,
+    generation_identity: Option<(uuid::Uuid, u64)>,
 }
 
 fn classify_pool_meta_tuple_decode_error(kind: &str, err: rmp_serde::decode::Error) -> PoolMetaReplica {
@@ -2787,6 +3074,159 @@ fn classify_pool_meta_tuple_decode_error(kind: &str, err: rmp_serde::decode::Err
     }
 }
 
+fn parse_pool_meta_uuid(value: &str, field: &str) -> Result<uuid::Uuid> {
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|err| Error::other(format!("pool metadata corrupt: invalid {field} `{value}`: {err}")))?;
+    if parsed.is_nil() || parsed == uuid::Uuid::max() {
+        return Err(Error::other(format!("pool metadata corrupt: {field} must be a non-reserved UUID")));
+    }
+    Ok(parsed)
+}
+
+fn pool_meta_generation_revision(
+    cluster_id: &str,
+    epoch: u64,
+    generation: u64,
+    transaction_id: &str,
+) -> Result<PoolMetaRevision> {
+    if epoch == 0 || generation == 0 {
+        return Err(Error::other(
+            "pool metadata corrupt: version 3 epoch and generation must both be non-zero",
+        ));
+    }
+    Ok(PoolMetaRevision {
+        version: POOL_META_GENERATION_VERSION,
+        cluster_id: Some(parse_pool_meta_uuid(cluster_id, "cluster identity")?),
+        epoch,
+        generation,
+        transaction_id: Some(parse_pool_meta_uuid(transaction_id, "transaction id")?),
+    })
+}
+
+fn pool_meta_from_v3_statuses(version: u16, pools: Vec<PersistedPoolStatus>) -> Result<PoolMeta> {
+    if !matches!(version, POOL_META_V1_VERSION | POOL_META_VERSION | POOL_META_GENERATION_VERSION) {
+        return Err(Error::other(format!(
+            "pool metadata corrupt: version 3 previous snapshot has unsupported source version {version}"
+        )));
+    }
+    Ok(PoolMeta {
+        version,
+        pools: pools.into_iter().map(TryInto::try_into).collect::<Result<Vec<_>>>()?,
+        dont_save: false,
+    })
+}
+
+fn pool_meta_previous_candidate(value: PersistedPoolMetaV3Previous) -> Result<PoolMetaCommittedCandidate> {
+    let revision = match value.version {
+        POOL_META_V1_VERSION | POOL_META_VERSION => {
+            if value.cluster_id.is_some() || value.epoch != 0 || value.generation != 0 || value.transaction_id.is_some() {
+                return Err(Error::other(
+                    "pool metadata corrupt: legacy previous snapshot carries version 3 revision fields",
+                ));
+            }
+            PoolMetaRevision::legacy(value.version)
+        }
+        POOL_META_GENERATION_VERSION => pool_meta_generation_revision(
+            value
+                .cluster_id
+                .as_deref()
+                .ok_or_else(|| Error::other("pool metadata corrupt: version 3 previous snapshot has no cluster identity"))?,
+            value.epoch,
+            value.generation,
+            value
+                .transaction_id
+                .as_deref()
+                .ok_or_else(|| Error::other("pool metadata corrupt: version 3 previous snapshot has no transaction id"))?,
+        )?,
+        version => {
+            return Err(Error::other(format!(
+                "pool metadata corrupt: previous snapshot has unsupported version {version}"
+            )));
+        }
+    };
+    let meta = pool_meta_from_v3_statuses(value.version, value.pools)?;
+    let canonical = if revision.is_generation_protocol() {
+        encode_pool_meta_v3_envelope(&meta, revision, true, None)?
+    } else {
+        meta.encode_config_data_for_v2_gate(true)?
+    };
+    Ok(PoolMetaCommittedCandidate {
+        canonical,
+        meta,
+        revision,
+    })
+}
+
+fn decode_pool_meta_v3(data: Vec<u8>) -> PoolMetaReplica {
+    let persisted = match rmp_serde::from_slice::<PersistedPoolMetaV3>(&data[4..]) {
+        Ok(persisted) => persisted,
+        Err(err) => return classify_pool_meta_tuple_decode_error("v3", err),
+    };
+    if persisted.version != POOL_META_GENERATION_VERSION {
+        return PoolMetaReplica::Corrupt(format!(
+            "v3 payload has version {}, expected {POOL_META_GENERATION_VERSION}",
+            persisted.version
+        ));
+    }
+    let revision = match pool_meta_generation_revision(
+        &persisted.cluster_id,
+        persisted.epoch,
+        persisted.generation,
+        &persisted.transaction_id,
+    ) {
+        Ok(revision) => revision,
+        Err(err) => return PoolMetaReplica::Corrupt(err.to_string()),
+    };
+    let meta = match pool_meta_from_v3_statuses(POOL_META_GENERATION_VERSION, persisted.pools) {
+        Ok(meta) => meta,
+        Err(err) => return PoolMetaReplica::Corrupt(err.to_string()),
+    };
+    let previous = match persisted.previous.map(pool_meta_previous_candidate).transpose() {
+        Ok(previous) => previous,
+        Err(err) => return PoolMetaReplica::Corrupt(err.to_string()),
+    };
+    if persisted.committed && previous.is_some() {
+        return PoolMetaReplica::Corrupt("committed v3 payload unexpectedly retains a previous snapshot".to_string());
+    }
+    if !persisted.committed {
+        match previous.as_ref() {
+            Some(previous) if previous.revision.is_generation_protocol() => {
+                if previous.revision.cluster_id != revision.cluster_id
+                    || previous.revision.epoch != revision.epoch
+                    || previous.revision.generation.checked_add(1) != Some(revision.generation)
+                {
+                    return PoolMetaReplica::Corrupt(
+                        "pending v3 payload does not advance exactly one generation from its previous snapshot".to_string(),
+                    );
+                }
+            }
+            Some(_) if revision.generation != 1 => {
+                return PoolMetaReplica::Corrupt(
+                    "first v3 generation must be generation 1 when migrating a legacy snapshot".to_string(),
+                );
+            }
+            None if revision.generation != 1 => {
+                return PoolMetaReplica::Corrupt(
+                    "pending v3 payload without a previous snapshot must be the initial generation".to_string(),
+                );
+            }
+            _ => {}
+        }
+    }
+    let canonical = match encode_pool_meta_v3_envelope(&meta, revision, true, None) {
+        Ok(canonical) => canonical,
+        Err(err) => return PoolMetaReplica::Corrupt(err.to_string()),
+    };
+    PoolMetaReplica::Valid {
+        raw: data,
+        canonical,
+        meta,
+        revision,
+        committed: persisted.committed,
+        previous: previous.map(Box::new),
+    }
+}
+
 fn decode_pool_meta_replica(data: Vec<u8>) -> PoolMetaReplica {
     if data.len() <= 4 {
         return PoolMetaReplica::Corrupt("metadata payload is empty or truncated".to_string());
@@ -2797,8 +3237,11 @@ fn decode_pool_meta_replica(data: Vec<u8>) -> PoolMetaReplica {
         return PoolMetaReplica::Incompatible(format!("unsupported format {format}"));
     }
     let version = LittleEndian::read_u16(&data[2..4]);
-    if !matches!(version, POOL_META_V1_VERSION | POOL_META_VERSION) {
+    if !matches!(version, POOL_META_V1_VERSION | POOL_META_VERSION | POOL_META_GENERATION_VERSION) {
         return PoolMetaReplica::Incompatible(format!("unsupported version {version}"));
+    }
+    if version == POOL_META_GENERATION_VERSION {
+        return decode_pool_meta_v3(data);
     }
 
     let payload = &data[4..];
@@ -2851,47 +3294,73 @@ fn decode_pool_meta_replica(data: Vec<u8>) -> PoolMetaReplica {
             raw: data,
             canonical,
             meta,
+            revision: PoolMetaRevision::legacy(version),
+            committed: true,
+            previous: None,
         },
         Err(err) => PoolMetaReplica::Corrupt(err.to_string()),
     }
 }
 
-async fn read_pool_meta_replica<S>(pool: Arc<S>, no_lock: bool) -> PoolMetaReplica
+#[cfg(test)]
+pub(crate) fn pool_meta_v3_commit_state_for_test(data: Vec<u8>) -> Result<(u64, bool)> {
+    match decode_pool_meta_replica(data) {
+        PoolMetaReplica::Valid { revision, committed, .. } if revision.is_generation_protocol() => {
+            Ok((revision.generation, committed))
+        }
+        _ => Err(Error::other("test pool metadata is not a valid V3 replica")),
+    }
+}
+
+async fn read_pool_meta_replica<S>(pool: Arc<S>, no_lock: bool) -> PoolMetaReplicaRead
 where
     S: EcstoreObjectIO,
 {
     let result = if no_lock {
         read_config_no_lock_preserve_empty_with_metadata(pool, POOL_META_NAME)
             .await
-            .map(|(data, _)| data)
+            .map(|(data, object_info)| (data, object_info.etag))
     } else {
-        read_config_preserve_empty(pool, POOL_META_NAME).await
+        read_config_preserve_empty(pool, POOL_META_NAME)
+            .await
+            .map(|data| (data, None))
     };
     match result {
-        Ok(data) => decode_pool_meta_replica(data),
-        Err(Error::ConfigNotFound) => PoolMetaReplica::Missing,
-        Err(err) => PoolMetaReplica::Unreadable(err.to_string()),
+        Ok((data, etag)) => PoolMetaReplicaRead {
+            replica: decode_pool_meta_replica(data),
+            cas: etag
+                .filter(|etag| !etag.trim().is_empty())
+                .map(PoolMetaCasToken::Existing)
+                .unwrap_or(PoolMetaCasToken::Unsafe),
+        },
+        Err(Error::ConfigNotFound) => PoolMetaReplicaRead {
+            replica: PoolMetaReplica::Missing,
+            cas: PoolMetaCasToken::Missing,
+        },
+        Err(err) => PoolMetaReplicaRead {
+            replica: PoolMetaReplica::Unreadable(err.to_string()),
+            cas: PoolMetaCasToken::Unsafe,
+        },
     }
 }
 
-fn select_pool_meta_replica(replicas: Vec<PoolMetaReplica>) -> Result<PoolMetaSelection> {
-    if replicas.is_empty() {
+fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<PoolMetaSelection> {
+    if reads.is_empty() {
         return Err(Error::other("pool metadata recovery required: no storage pools available"));
     }
 
-    // Pool metadata has no durable generation. Pool zero remains the canonical
-    // commit record because every writer saves it first and legacy startup read
-    // it alone. Divergent backups are ambiguous when pool zero is unavailable
-    // and require an operator-selected recovery source.
-    let mut selected: Option<(usize, Vec<u8>, Vec<u8>, PoolMeta)> = None;
+    let cas_tokens = reads.iter().map(|read| read.cas.clone()).collect();
+    let mut committed = Vec::<(usize, Vec<u8>, PoolMetaCommittedCandidate)>::new();
     let mut needs_repair = false;
     let mut repair_write_safe = true;
     let mut missing = 0usize;
     let mut unusable = Vec::new();
     let mut observed_version = POOL_META_V1_VERSION;
+    let mut generation_protocol_observed = false;
+    let mut generation_identity = None;
 
-    for (idx, replica) in replicas.into_iter().enumerate() {
-        match replica {
+    for (idx, read) in reads.into_iter().enumerate() {
+        match read.replica {
             PoolMetaReplica::Missing => {
                 missing += 1;
                 needs_repair = true;
@@ -2910,87 +3379,212 @@ fn select_pool_meta_replica(replicas: Vec<PoolMetaReplica>) -> Result<PoolMetaSe
                     "pool metadata recovery required: pool {idx} is incompatible ({reason}); upgrade or restore a compatible replica without overwriting it"
                 )));
             }
-            PoolMetaReplica::Valid { raw, canonical, meta } => {
-                observed_version = observed_version.max(meta.version);
-                if let Some((selected_idx, selected_raw, selected_canonical, selected_meta)) = selected.as_ref() {
-                    if selected_canonical != &canonical {
-                        if selected_meta.version == meta.version && *selected_idx == 0 {
-                            // Pool zero is the durable commit record: every
-                            // pool metadata writer commits it before replicas,
-                            // and pre-replica-recovery startup read it alone.
-                            // This ordering is safe only within one format
-                            // version because V1 cannot preserve V2-only data.
-                            needs_repair = true;
-                        } else {
-                            return Err(Error::other(format!(
-                                "pool metadata recovery required: valid replicas in pools {selected_idx} and {idx} diverge; restore one matching pool.bin snapshot before restart"
-                            )));
-                        }
-                    } else {
-                        needs_repair |= selected_raw != &raw;
+            PoolMetaReplica::Valid {
+                raw,
+                canonical,
+                meta,
+                revision,
+                committed: is_committed,
+                previous,
+            } => {
+                generation_protocol_observed |= revision.is_generation_protocol();
+                if revision.is_generation_protocol() {
+                    let identity = (
+                        revision
+                            .cluster_id
+                            .expect("validated V3 revision should carry a cluster identity"),
+                        revision.epoch,
+                    );
+                    if generation_identity.is_some_and(|current| current != identity) {
+                        return Err(Error::other(
+                            "pool metadata recovery required: V3 replicas disagree on cluster identity or epoch",
+                        ));
                     }
+                    generation_identity = Some(identity);
+                }
+                if is_committed {
+                    observed_version = observed_version.max(meta.version);
+                    committed.push((
+                        idx,
+                        raw,
+                        PoolMetaCommittedCandidate {
+                            canonical,
+                            meta,
+                            revision,
+                        },
+                    ));
+                } else if let Some(previous) = previous {
+                    observed_version = observed_version.max(previous.meta.version);
+                    needs_repair = true;
+                    committed.push((idx, raw, *previous));
                 } else {
-                    selected = Some((idx, raw, canonical, meta));
+                    needs_repair = true;
+                    unusable.push(format!("pool {idx} contains an uncommitted initial generation"));
                 }
             }
         }
     }
 
-    if let Some((_, _, _, mut meta)) = selected {
-        meta.version = observed_version;
-        return Ok(PoolMetaSelection {
-            meta,
-            replica_state: PoolMetaReplicaState {
-                needs_repair,
-                repair_write_safe,
-            },
-        });
-    }
-    if missing > 0 && unusable.is_empty() {
+    if committed.is_empty() && missing > 0 && unusable.is_empty() {
         return Ok(PoolMetaSelection {
             meta: PoolMeta::default(),
+            revision: PoolMetaRevision::legacy(0),
+            canonical: None,
             replica_state: PoolMetaReplicaState {
                 needs_repair: false,
                 repair_write_safe: true,
             },
+            cas_tokens,
+            absent: true,
+            generation_protocol_observed,
+            generation_identity,
+        });
+    }
+    if committed.is_empty() {
+        return Err(Error::other(format!(
+            "pool metadata recovery required: no valid committed replica is available ({})",
+            unusable.join("; ")
+        )));
+    }
+
+    if committed
+        .iter()
+        .any(|(_, _, candidate)| candidate.revision.is_generation_protocol())
+    {
+        let highest = committed
+            .iter()
+            .filter(|(_, _, candidate)| candidate.revision.is_generation_protocol())
+            .map(|(_, _, candidate)| candidate.revision.generation)
+            .max()
+            .ok_or_else(|| Error::other("pool metadata recovery required: no committed V3 generation is available"))?;
+        let mut selected: Option<(usize, &PoolMetaCommittedCandidate)> = None;
+        for (idx, _, candidate) in &committed {
+            if !candidate.revision.is_generation_protocol() || candidate.revision.generation != highest {
+                needs_repair = true;
+                continue;
+            }
+            if let Some((selected_idx, selected_candidate)) = selected {
+                if selected_candidate.canonical != candidate.canonical
+                    || selected_candidate.revision.transaction_id != candidate.revision.transaction_id
+                {
+                    return Err(Error::other(format!(
+                        "pool metadata recovery required: committed generation {highest} diverges between pools {selected_idx} and {idx}"
+                    )));
+                }
+            } else {
+                selected = Some((*idx, candidate));
+            }
+        }
+        let (_, selected) = selected
+            .ok_or_else(|| Error::other("pool metadata recovery required: highest V3 generation has no valid snapshot"))?;
+        for (_, raw, candidate) in &committed {
+            needs_repair |= candidate.canonical != selected.canonical || raw != &selected.canonical;
+        }
+        return Ok(PoolMetaSelection {
+            meta: selected.meta.clone(),
+            revision: selected.revision,
+            canonical: Some(selected.canonical.clone()),
+            replica_state: PoolMetaReplicaState {
+                needs_repair,
+                repair_write_safe,
+            },
+            cas_tokens,
+            absent: false,
+            generation_protocol_observed,
+            generation_identity,
         });
     }
 
-    Err(Error::other(format!(
-        "pool metadata recovery required: no valid replica is available ({})",
-        unusable.join("; ")
-    )))
+    // Legacy V1/V2 has no durable generation. Pool zero remains the commit
+    // record; divergent backups without it are ambiguous and fail closed.
+    let mut selected: Option<(usize, Vec<u8>, PoolMetaCommittedCandidate)> = None;
+    for (idx, raw, candidate) in committed {
+        if let Some((selected_idx, selected_raw, selected_candidate)) = selected.as_ref() {
+            if selected_candidate.canonical != candidate.canonical {
+                if selected_candidate.meta.version == candidate.meta.version && *selected_idx == 0 {
+                    needs_repair = true;
+                } else {
+                    return Err(Error::other(format!(
+                        "pool metadata recovery required: valid replicas in pools {selected_idx} and {idx} diverge; restore one matching pool.bin snapshot before restart"
+                    )));
+                }
+            } else {
+                needs_repair |= selected_raw != &raw;
+            }
+        } else {
+            selected = Some((idx, raw, candidate));
+        }
+    }
+    let (_, _, mut selected) =
+        selected.ok_or_else(|| Error::other("pool metadata recovery required: no valid legacy replica is available"))?;
+    selected.meta.version = observed_version;
+    selected.revision.version = observed_version;
+    Ok(PoolMetaSelection {
+        meta: selected.meta,
+        revision: selected.revision,
+        canonical: Some(selected.canonical),
+        replica_state: PoolMetaReplicaState {
+            needs_repair,
+            repair_write_safe,
+        },
+        cas_tokens,
+        absent: false,
+        generation_protocol_observed,
+        generation_identity,
+    })
 }
 
-async fn read_pool_meta_replicas<S>(pools: Vec<Arc<S>>, no_lock: bool) -> Vec<PoolMetaReplica>
+#[cfg(test)]
+fn select_pool_meta_replica(replicas: Vec<PoolMetaReplica>) -> Result<PoolMetaSelection> {
+    select_pool_meta_replica_reads(
+        replicas
+            .into_iter()
+            .map(|replica| PoolMetaReplicaRead {
+                replica,
+                cas: PoolMetaCasToken::Unsafe,
+            })
+            .collect(),
+    )
+}
+
+async fn read_pool_meta_replicas<S>(pools: Vec<Arc<S>>, no_lock: bool) -> Vec<PoolMetaReplicaRead>
 where
     S: EcstoreObjectIO,
 {
     join_all(pools.into_iter().map(|pool| read_pool_meta_replica(pool, no_lock))).await
 }
 
-fn select_pool_meta_replicas_observing(
-    write_state: &mut PoolMetaWriteState,
-    replicas: Vec<PoolMetaReplica>,
-) -> Result<PoolMetaSelection> {
+fn select_pool_meta_replicas_observing<R>(write_state: &mut PoolMetaWriteState, replicas: Vec<R>) -> Result<PoolMetaSelection>
+where
+    R: Into<PoolMetaReplicaRead>,
+{
+    let replicas = replicas.into_iter().map(Into::into).collect::<Vec<_>>();
     if replicas
         .iter()
-        .any(|replica| matches!(replica, PoolMetaReplica::Unreadable(_)))
+        .any(|replica| matches!(&replica.replica, PoolMetaReplica::Unreadable(_)))
     {
         write_state.block_writes();
     }
-    let selection = select_pool_meta_replica(replicas);
-    if selection.is_err() {
-        write_state.block_writes();
+    match select_pool_meta_replica_reads(replicas) {
+        Ok(selection) => {
+            if let Err(err) = write_state.observe_selection(&selection) {
+                write_state.block_writes();
+                return Err(err);
+            }
+            Ok(selection)
+        }
+        Err(err) => {
+            write_state.block_writes();
+            Err(err)
+        }
     }
-    selection
 }
 
 async fn load_pool_meta_replicas<S>(pools: Vec<Arc<S>>, no_lock: bool) -> Result<PoolMetaSelection>
 where
     S: EcstoreObjectIO,
 {
-    select_pool_meta_replica(read_pool_meta_replicas(pools, no_lock).await)
+    select_pool_meta_replica_reads(read_pool_meta_replicas(pools, no_lock).await)
 }
 
 async fn load_pool_meta_replicas_observing<S>(
@@ -3003,6 +3597,451 @@ where
 {
     let replicas = read_pool_meta_replicas(pools, no_lock).await;
     select_pool_meta_replicas_observing(write_state, replicas)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPoolMetaV3 {
+    version: u16,
+    cluster_id: String,
+    epoch: u64,
+    generation: u64,
+    transaction_id: String,
+    committed: bool,
+    pools: Vec<PersistedPoolStatus>,
+    previous: Option<PersistedPoolMetaV3Previous>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPoolMetaV3Previous {
+    version: u16,
+    cluster_id: Option<String>,
+    epoch: u64,
+    generation: u64,
+    transaction_id: Option<String>,
+    pools: Vec<PersistedPoolStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPoolMetaIdentity {
+    version: u16,
+    cluster_id: uuid::Uuid,
+    epoch: u64,
+    initialized: bool,
+    fresh_bootstrap_nonce: Option<uuid::Uuid>,
+}
+
+#[derive(Debug)]
+enum PoolMetaIdentityReplica {
+    Missing,
+    Valid(PersistedPoolMetaIdentity),
+    Corrupt(String),
+    Incompatible(String),
+    Unreadable(String),
+}
+
+#[derive(Debug)]
+struct PoolMetaIdentityRead {
+    replica: PoolMetaIdentityReplica,
+    cas: PoolMetaCasToken,
+}
+
+#[derive(Debug)]
+struct PoolMetaIdentitySelection {
+    identity: Option<PersistedPoolMetaIdentity>,
+    needs_repair: bool,
+    repair_write_safe: bool,
+    cas_tokens: Vec<PoolMetaCasToken>,
+}
+
+fn encode_pool_meta_identity(identity: PersistedPoolMetaIdentity) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    data.write_u16::<LittleEndian>(POOL_META_IDENTITY_FORMAT)?;
+    data.write_u16::<LittleEndian>(POOL_META_IDENTITY_VERSION)?;
+    identity.serialize(&mut Serializer::new(&mut data))?;
+    Ok(data)
+}
+
+fn decode_pool_meta_identity(data: &[u8]) -> PoolMetaIdentityReplica {
+    if data.len() <= 4 {
+        return PoolMetaIdentityReplica::Corrupt("identity payload is empty or truncated".to_string());
+    }
+    let format = LittleEndian::read_u16(&data[0..2]);
+    let version = LittleEndian::read_u16(&data[2..4]);
+    if format != POOL_META_IDENTITY_FORMAT || version != POOL_META_IDENTITY_VERSION {
+        return PoolMetaIdentityReplica::Incompatible(format!("unsupported identity format {format} version {version}"));
+    }
+    let identity = match rmp_serde::from_slice::<PersistedPoolMetaIdentity>(&data[4..]) {
+        Ok(identity) => identity,
+        Err(err) => return PoolMetaIdentityReplica::Corrupt(format!("identity payload is not decodable: {err}")),
+    };
+    let invalid_bootstrap_nonce = identity
+        .fresh_bootstrap_nonce
+        .is_some_and(|nonce| nonce.is_nil() || nonce == uuid::Uuid::max());
+    if identity.version != POOL_META_IDENTITY_VERSION
+        || identity.cluster_id.is_nil()
+        || identity.cluster_id == uuid::Uuid::max()
+        || identity.epoch == 0
+        || invalid_bootstrap_nonce
+        || identity.initialized == identity.fresh_bootstrap_nonce.is_some()
+    {
+        return PoolMetaIdentityReplica::Corrupt(
+            "identity payload contains an invalid version, UUID, epoch, or fresh-bootstrap proof".to_string(),
+        );
+    }
+    PoolMetaIdentityReplica::Valid(identity)
+}
+
+#[cfg(test)]
+pub(crate) fn pool_meta_identity_initialized_for_test(data: &[u8]) -> Result<bool> {
+    match decode_pool_meta_identity(data) {
+        PoolMetaIdentityReplica::Valid(identity) => Ok(identity.initialized),
+        _ => Err(Error::other("test pool metadata identity is not valid")),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn initialized_pool_meta_identity_for_test(cluster_id: uuid::Uuid, epoch: u64) -> Result<Vec<u8>> {
+    encode_pool_meta_identity(PersistedPoolMetaIdentity {
+        version: POOL_META_IDENTITY_VERSION,
+        cluster_id,
+        epoch,
+        initialized: true,
+        fresh_bootstrap_nonce: None,
+    })
+}
+
+async fn read_pool_meta_identity_replica<S>(pool: Arc<S>) -> PoolMetaIdentityRead
+where
+    S: EcstoreObjectIO,
+{
+    match read_config_no_lock_preserve_empty_with_metadata(pool, POOL_META_IDENTITY_NAME).await {
+        Ok((data, object_info)) => PoolMetaIdentityRead {
+            replica: decode_pool_meta_identity(&data),
+            cas: object_info
+                .etag
+                .filter(|etag| !etag.trim().is_empty())
+                .map(PoolMetaCasToken::Existing)
+                .unwrap_or(PoolMetaCasToken::Unsafe),
+        },
+        Err(Error::ConfigNotFound) => PoolMetaIdentityRead {
+            replica: PoolMetaIdentityReplica::Missing,
+            cas: PoolMetaCasToken::Missing,
+        },
+        Err(err) => PoolMetaIdentityRead {
+            replica: PoolMetaIdentityReplica::Unreadable(err.to_string()),
+            cas: PoolMetaCasToken::Unsafe,
+        },
+    }
+}
+
+fn select_pool_meta_identity(
+    reads: Vec<PoolMetaIdentityRead>,
+    expected_cluster_id: uuid::Uuid,
+) -> Result<PoolMetaIdentitySelection> {
+    let cas_tokens = reads.iter().map(|read| read.cas.clone()).collect();
+    let mut selected: Option<PersistedPoolMetaIdentity> = None;
+    let mut needs_repair = false;
+    let mut repair_write_safe = true;
+    let mut unusable = Vec::new();
+    for (idx, read) in reads.into_iter().enumerate() {
+        match read.replica {
+            PoolMetaIdentityReplica::Missing => needs_repair = true,
+            PoolMetaIdentityReplica::Corrupt(reason) => {
+                needs_repair = true;
+                unusable.push(format!("pool {idx} identity is corrupt: {reason}"));
+            }
+            PoolMetaIdentityReplica::Unreadable(reason) => {
+                needs_repair = true;
+                repair_write_safe = false;
+                unusable.push(format!("pool {idx} identity is unreadable: {reason}"));
+            }
+            PoolMetaIdentityReplica::Incompatible(reason) => {
+                return Err(Error::other(format!("pool metadata incompatible: pool {idx} identity uses {reason}")));
+            }
+            PoolMetaIdentityReplica::Valid(identity) => {
+                if identity.cluster_id != expected_cluster_id {
+                    return Err(Error::other(format!(
+                        "pool metadata incompatible: pool {idx} identity {} does not match deployment {expected_cluster_id}",
+                        identity.cluster_id
+                    )));
+                }
+                if let Some(current) = selected {
+                    if current.cluster_id != identity.cluster_id || current.epoch != identity.epoch {
+                        return Err(Error::other(
+                            "pool metadata recovery required: identity replicas disagree on cluster identity or epoch",
+                        ));
+                    }
+                    if current.initialized != identity.initialized {
+                        needs_repair = true;
+                        selected = Some(if current.initialized { current } else { identity });
+                    } else if !current.initialized && current.fresh_bootstrap_nonce != identity.fresh_bootstrap_nonce {
+                        return Err(Error::other(
+                            "pool metadata recovery required: pending identity replicas disagree on fresh-bootstrap proof",
+                        ));
+                    }
+                } else {
+                    selected = Some(identity);
+                }
+            }
+        }
+    }
+    if selected.is_none() && !unusable.is_empty() {
+        return Err(Error::other(format!(
+            "pool metadata recovery required: no valid cluster identity replica is available ({})",
+            unusable.join("; ")
+        )));
+    }
+    Ok(PoolMetaIdentitySelection {
+        identity: selected,
+        needs_repair,
+        repair_write_safe,
+        cas_tokens,
+    })
+}
+
+async fn load_pool_meta_identity<S>(pools: Vec<Arc<S>>, expected_cluster_id: uuid::Uuid) -> Result<PoolMetaIdentitySelection>
+where
+    S: EcstoreObjectIO,
+{
+    let reads = join_all(pools.into_iter().map(read_pool_meta_identity_replica)).await;
+    select_pool_meta_identity(reads, expected_cluster_id)
+}
+
+async fn load_pool_meta_identity_selection_observing<S>(
+    pools: Vec<Arc<S>>,
+    write_state: &mut PoolMetaWriteState,
+    expected_cluster_id: uuid::Uuid,
+) -> Result<PoolMetaIdentitySelection>
+where
+    S: EcstoreObjectIO,
+{
+    let selection = match load_pool_meta_identity(pools, expected_cluster_id).await {
+        Ok(selection) => selection,
+        Err(err) => {
+            write_state.block_writes();
+            return Err(err);
+        }
+    };
+    if let Err(err) = write_state.observe_identity(&selection) {
+        write_state.block_writes();
+        return Err(err);
+    }
+    Ok(selection)
+}
+
+fn persisted_pool_meta_v3_previous(candidate: &PoolMetaCommittedCandidate) -> PersistedPoolMetaV3Previous {
+    PersistedPoolMetaV3Previous {
+        version: candidate.revision.version,
+        cluster_id: candidate.revision.cluster_id.map(|id| id.to_string()),
+        epoch: candidate.revision.epoch,
+        generation: candidate.revision.generation,
+        transaction_id: candidate.revision.transaction_id.map(|id| id.to_string()),
+        pools: candidate.meta.pools.iter().map(Into::into).collect(),
+    }
+}
+
+fn encode_pool_meta_v3_envelope(
+    meta: &PoolMeta,
+    revision: PoolMetaRevision,
+    committed: bool,
+    previous: Option<&PoolMetaCommittedCandidate>,
+) -> Result<Vec<u8>> {
+    if meta.dont_save {
+        return Ok(Vec::new());
+    }
+    let cluster_id = revision
+        .cluster_id
+        .ok_or_else(|| Error::other("pool metadata V3 save failed: cluster identity is not initialized"))?;
+    let transaction_id = revision
+        .transaction_id
+        .ok_or_else(|| Error::other("pool metadata V3 save failed: transaction id is not initialized"))?;
+    if revision.version != POOL_META_GENERATION_VERSION || revision.epoch == 0 || revision.generation == 0 {
+        return Err(Error::other("pool metadata V3 save failed: invalid durable revision"));
+    }
+    let persisted = PersistedPoolMetaV3 {
+        version: POOL_META_GENERATION_VERSION,
+        cluster_id: cluster_id.to_string(),
+        epoch: revision.epoch,
+        generation: revision.generation,
+        transaction_id: transaction_id.to_string(),
+        committed,
+        pools: meta.pools.iter().map(Into::into).collect(),
+        previous: previous.map(persisted_pool_meta_v3_previous),
+    };
+    let mut data = Vec::new();
+    data.write_u16::<LittleEndian>(POOL_META_FORMAT)?;
+    data.write_u16::<LittleEndian>(POOL_META_GENERATION_VERSION)?;
+    persisted.serialize(&mut Serializer::new(&mut data))?;
+    Ok(data)
+}
+
+enum PoolMetaPersistenceFence<'a> {
+    Distributed(Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>),
+    Activation(&'a PoolRebalanceActivationFence),
+}
+
+impl PoolMetaPersistenceFence<'_> {
+    fn ensure_held(&self) -> Result<()> {
+        match self {
+            Self::Distributed(Some(signal)) if signal.is_lost() => {
+                Err(Error::other("pool metadata distributed fence was lost before a replica write"))
+            }
+            Self::Activation(fence) => fence.ensure_held(),
+            _ => Ok(()),
+        }
+    }
+
+    fn add_to_options(&self, opts: &mut ObjectOptions) {
+        match self {
+            Self::Distributed(Some(signal)) => opts.add_namespace_lock_lost_signal(Arc::clone(signal)),
+            Self::Activation(fence) => fence.add_namespace_lock_fence(opts),
+            Self::Distributed(None) => {}
+        }
+    }
+
+    fn is_activation(&self) -> bool {
+        matches!(self, Self::Activation(_))
+    }
+}
+
+fn pool_meta_cas_preconditions(token: &PoolMetaCasToken, object: &str) -> Result<HTTPPreconditions> {
+    match token {
+        PoolMetaCasToken::Missing => Ok(HTTPPreconditions {
+            if_none_match: Some("*".to_string()),
+            ..Default::default()
+        }),
+        PoolMetaCasToken::Existing(etag) => Ok(HTTPPreconditions {
+            if_match: Some(etag.clone()),
+            ..Default::default()
+        }),
+        PoolMetaCasToken::Unsafe => Err(Error::other(format!(
+            "pool metadata recovery required: {object} replica has no safe conditional-write revision"
+        ))),
+    }
+}
+
+async fn save_pool_meta_object_cas<S>(
+    pool: Arc<S>,
+    object: &str,
+    data: Vec<u8>,
+    token: &PoolMetaCasToken,
+    fence: &PoolMetaPersistenceFence<'_>,
+    phase: &'static str,
+) -> Result<crate::object_api::ObjectInfo>
+where
+    S: EcstoreObjectIO,
+{
+    fence.ensure_held()?;
+    let mut opts = ObjectOptions {
+        max_parity: true,
+        no_lock: true,
+        http_preconditions: Some(pool_meta_cas_preconditions(token, object)?),
+        ..Default::default()
+    };
+    fence.add_to_options(&mut opts);
+    let result = save_config_with_opts_and_metadata(pool, object, data, &opts).await;
+    if matches!(&result, Err(Error::PreconditionFailed)) {
+        record_pool_meta_stale_write_rejection(phase);
+    }
+    let object_info = result?;
+    fence.ensure_held()?;
+    Ok(object_info)
+}
+
+async fn persist_pool_meta_identity<S>(
+    pools: Vec<Arc<S>>,
+    write_state: &mut PoolMetaWriteState,
+    initialized: bool,
+    fence: &PoolMetaPersistenceFence<'_>,
+) -> Result<()>
+where
+    S: EcstoreObjectIO,
+{
+    let Some(cluster_id) = write_state.expected_cluster_id else {
+        return Ok(());
+    };
+    for attempt in 0..POOL_META_CAS_MAX_ATTEMPTS {
+        let selection = load_pool_meta_identity_selection_observing(pools.clone(), write_state, cluster_id).await?;
+        if !selection.repair_write_safe {
+            write_state.block_writes();
+            return Err(Error::other(
+                "pool metadata recovery required: cluster identity has an unreadable replica",
+            ));
+        }
+        let identity = match selection.identity {
+            Some(identity) if identity.initialized || initialized => PersistedPoolMetaIdentity {
+                initialized: true,
+                fresh_bootstrap_nonce: None,
+                ..identity
+            },
+            Some(identity) => identity,
+            None if !initialized && !write_state.fresh_bootstrap_proven() => {
+                write_state.block_writes();
+                return Err(Error::other(
+                    "pool metadata recovery required: cannot create a pending cluster identity without verified fresh-bootstrap proof",
+                ));
+            }
+            None => PersistedPoolMetaIdentity {
+                version: POOL_META_IDENTITY_VERSION,
+                cluster_id,
+                epoch: write_state.cluster_epoch.unwrap_or(POOL_META_INITIAL_EPOCH),
+                initialized,
+                fresh_bootstrap_nonce: (!initialized).then(uuid::Uuid::new_v4),
+            },
+        };
+        if selection.identity == Some(identity) && !selection.needs_repair {
+            return Ok(());
+        }
+        let data = encode_pool_meta_identity(identity)?;
+        let mut conflict = false;
+        for (pool, token) in pools.iter().cloned().zip(&selection.cas_tokens) {
+            match save_pool_meta_object_cas(pool, POOL_META_IDENTITY_NAME, data.clone(), token, fence, "identity_cas").await {
+                Ok(_) => {}
+                Err(Error::PreconditionFailed) => {
+                    conflict = true;
+                    break;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if conflict {
+            if attempt + 1 < POOL_META_CAS_MAX_ATTEMPTS {
+                continue;
+            }
+            return Err(Error::PreconditionFailed);
+        }
+        let confirmed = load_pool_meta_identity_selection_observing(pools.clone(), write_state, cluster_id).await?;
+        if confirmed.identity == Some(identity) && !confirmed.needs_repair {
+            return Ok(());
+        }
+    }
+    Err(Error::PreconditionFailed)
+}
+
+pub(crate) async fn load_pool_meta_identity_observing<S>(pools: Vec<Arc<S>>, write_state: &mut PoolMetaWriteState) -> Result<()>
+where
+    S: EcstoreObjectIO,
+{
+    let Some(cluster_id) = write_state.expected_cluster_id else {
+        return Ok(());
+    };
+    load_pool_meta_identity_selection_observing(pools, write_state, cluster_id)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn persist_pool_meta_identity_for_startup<S>(
+    pools: Vec<Arc<S>>,
+    write_state: &mut PoolMetaWriteState,
+    initialized: bool,
+) -> Result<()>
+where
+    S: EcstoreObjectIO,
+{
+    persist_pool_meta_identity(pools, write_state, initialized, &PoolMetaPersistenceFence::Distributed(None)).await
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3465,6 +4504,23 @@ impl From<&PoolDecommissionInfo> for PersistedPoolDecommissionInfoV1 {
     }
 }
 
+#[derive(Debug)]
+struct PoolMetaSaveOutcome {
+    transaction_arm: PoolMetaTransactionArm,
+    committed: PoolMeta,
+}
+
+impl PoolMetaSaveOutcome {
+    fn disarm(mut self) {
+        self.transaction_arm.disarm();
+    }
+
+    fn into_committed(mut self) -> PoolMeta {
+        self.transaction_arm.disarm();
+        self.committed
+    }
+}
+
 impl PoolMeta {
     fn decode_pool_meta_payload(version: u16, payload: &[u8]) -> Result<Self> {
         match version {
@@ -3488,7 +4544,9 @@ impl PoolMeta {
 
     pub fn new(pools: &[Arc<Sets>], prev_meta: &PoolMeta) -> Self {
         let mut new_meta = Self {
-            version: if prev_meta.version == POOL_META_VERSION || pool_meta_v2_writer_enabled() {
+            version: if prev_meta.version == POOL_META_GENERATION_VERSION || pool_meta_v3_writer_enabled() {
+                POOL_META_GENERATION_VERSION
+            } else if prev_meta.version == POOL_META_VERSION || pool_meta_v2_writer_enabled() {
                 POOL_META_VERSION
             } else {
                 POOL_META_V1_VERSION
@@ -3626,13 +4684,26 @@ impl PoolMeta {
             return Err(Error::other(format!("pool metadata load failed: unknown format {format}")));
         }
         let version = LittleEndian::read_u16(&data[2..4]);
-        if !matches!(version, POOL_META_V1_VERSION | POOL_META_VERSION) {
+        if !matches!(version, POOL_META_V1_VERSION | POOL_META_VERSION | POOL_META_GENERATION_VERSION) {
             return Err(Error::other(format!("pool metadata load failed: unknown version {version}")));
+        }
+
+        if version == POOL_META_GENERATION_VERSION {
+            let PoolMetaReplica::Valid {
+                meta, committed: true, ..
+            } = decode_pool_meta_replica(data)
+            else {
+                return Err(Error::other(
+                    "pool metadata load failed: V3 payload is corrupt, incompatible, or not committed",
+                ));
+            };
+            *self = meta;
+            return Ok(());
         }
 
         *self = Self::decode_pool_meta_payload(version, &data[4..])?;
 
-        if !matches!(self.version, POOL_META_V1_VERSION | POOL_META_VERSION) {
+        if !matches!(self.version, POOL_META_V1_VERSION | POOL_META_VERSION | POOL_META_GENERATION_VERSION) {
             return Err(Error::other(format!(
                 "pool metadata load failed: unexpected decoded version {}",
                 self.version
@@ -3673,6 +4744,7 @@ impl PoolMeta {
         Ok(selection.replica_state)
     }
 
+    #[cfg(test)]
     fn encode_config_data(&self) -> Result<Vec<u8>> {
         self.encode_config_data_for_v2_gate(pool_meta_v2_writer_enabled())
     }
@@ -3680,6 +4752,11 @@ impl PoolMeta {
     fn encode_config_data_for_v2_gate(&self, v2_enabled: bool) -> Result<Vec<u8>> {
         if self.dont_save {
             return Ok(Vec::new());
+        }
+        if self.version == POOL_META_GENERATION_VERSION {
+            return Err(Error::other(
+                "pool metadata V3 save requires cluster identity and generation transaction context",
+            ));
         }
         if !matches!(self.version, 0 | POOL_META_V1_VERSION | POOL_META_VERSION) {
             return Err(Error::other(format!(
@@ -3730,56 +4807,51 @@ impl PoolMeta {
             .ok_or_else(|| Error::other("pool metadata save failed: no storage pools available"))?;
         let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
         let pool_meta_guard = pool_meta_lock.get_write_lock(get_lock_acquire_timeout()).await?;
-        let selection = load_pool_meta_replicas(pools.clone(), true).await?;
-        selection.replica_state.ensure_write_safe("pool metadata save failed")?;
-        self.save_no_lock_with_fence(pools, pool_meta_guard.lock_lost_signal()).await
+        let mut write_state = PoolMetaWriteState::default();
+        let indices = (0..self.pools.len()).collect::<Vec<_>>();
+        let outcome = self
+            .save_no_lock_armed_scoped(pools, &mut write_state, pool_meta_guard.lock_lost_signal(), Some(&indices))
+            .await?;
+        outcome.disarm();
+        Ok(())
     }
 
     /// Startup has a single elected local writer, so it must not depend on namespace locks here.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) async fn save_for_startup<S>(&self, pools: Vec<Arc<S>>) -> Result<()>
     where
         S: EcstoreObjectIO,
     {
-        self.save_no_lock(pools).await
+        let mut write_state = PoolMetaWriteState::for_test_bootstrap();
+        self.save_for_startup_observing(pools, &mut write_state).await.map(|_| ())
     }
 
-    async fn save_no_lock<S>(&self, pools: Vec<Arc<S>>) -> Result<()>
+    pub(crate) async fn save_for_startup_observing<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        write_state: &mut PoolMetaWriteState,
+    ) -> Result<PoolMeta>
     where
         S: EcstoreObjectIO,
     {
-        self.save_no_lock_with_fence(pools, None).await
+        let outcome = self.save_no_lock_armed_scoped(pools, write_state, None, None).await?;
+        Ok(outcome.into_committed())
     }
 
     async fn save_no_lock_with_fence<S>(
         &self,
         pools: Vec<Arc<S>>,
         lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+        indices: &[usize],
     ) -> Result<()>
     where
         S: EcstoreObjectIO,
     {
-        let data = self.encode_config_data()?;
-        if data.is_empty() {
-            return Ok(());
-        }
-        for pool in pools {
-            if lock_lost.as_ref().is_some_and(|signal| signal.is_lost()) {
-                return Err(Error::other("pool metadata distributed fence was lost before a replica write"));
-            }
-            let mut opts = ObjectOptions {
-                max_parity: true,
-                no_lock: true,
-                ..Default::default()
-            };
-            if let Some(signal) = lock_lost.as_ref() {
-                opts.add_namespace_lock_lost_signal(signal.clone());
-            }
-            save_config_with_opts(pool, POOL_META_NAME, data.clone(), &opts).await?;
-            if lock_lost.as_ref().is_some_and(|signal| signal.is_lost()) {
-                return Err(Error::other("pool metadata distributed fence was lost during a replica write"));
-            }
-        }
-
+        let mut write_state = PoolMetaWriteState::default();
+        let outcome = self
+            .save_no_lock_armed_scoped(pools, &mut write_state, lock_lost, Some(indices))
+            .await?;
+        outcome.disarm();
         Ok(())
     }
 
@@ -3787,66 +4859,22 @@ impl PoolMeta {
         &self,
         pools: Vec<Arc<S>>,
         write_state: &mut PoolMetaWriteState,
-        activation_fence: PoolRebalanceActivationFence,
-    ) -> Result<bool>
+        activation_fence: &PoolRebalanceActivationFence,
+        indices: &[usize],
+    ) -> Result<PoolMetaSaveOutcome>
     where
         S: EcstoreObjectIO,
     {
-        let was_write_blocked = write_state.write_blocked;
-        // Arm before the first replica write. If this future is dropped, the
-        // mutex guard is released with the sticky write gate still blocked.
-        write_state.block_writes();
-        let data = self.encode_config_data()?;
-        if data.is_empty() {
-            return Ok(was_write_blocked);
-        }
-        let mut pools = pools.into_iter();
-        let Some(canonical_pool) = pools.next() else {
-            return Ok(was_write_blocked);
-        };
-        let mut opts = ObjectOptions {
-            max_parity: true,
-            no_lock: true,
-            ..Default::default()
-        };
-        activation_fence.add_namespace_lock_fence(&mut opts);
-        activation_fence.ensure_held()?;
-        #[cfg(test)]
-        let barrier_pool = canonical_pool.clone();
-        save_config_with_opts(canonical_pool, POOL_META_NAME, data.clone(), &opts).await?;
-        #[cfg(test)]
-        pause_pool_activation_after_durable_save(&barrier_pool, &activation_fence).await;
-
-        // Pool zero is canonical. Once its save succeeds, later writes only
-        // replicate committed state and must not reuse the admission fence.
-        // Failed replicas remain repairable by the next full pool metadata save.
-        drop(activation_fence);
-        for (pool_index, pool) in pools.enumerate() {
-            if let Err(err) = save_config_with_opts_quiet(
-                pool,
-                POOL_META_NAME,
-                data.clone(),
-                &ObjectOptions {
-                    max_parity: true,
-                    no_lock: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            {
-                warn!(
-                    event = EVENT_DECOMMISSION_STATE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_POOLS,
-                    pool_index = pool_index + 1,
-                    state = "activation_replica_repair_pending",
-                    error = %err,
-                    "Decommission activation replica repair pending"
-                );
-            }
-        }
-
-        Ok(was_write_blocked)
+        write_state.ensure_write_safe("pool metadata activation save failed")?;
+        let transaction_arm = write_state.arm_transaction();
+        let fence = PoolMetaPersistenceFence::Activation(activation_fence);
+        let committed = self
+            .save_no_lock_transaction(pools, write_state, &fence, Some(indices))
+            .await?;
+        Ok(PoolMetaSaveOutcome {
+            transaction_arm,
+            committed,
+        })
     }
 
     async fn save_no_lock_armed<S>(
@@ -3854,16 +4882,283 @@ impl PoolMeta {
         pools: Vec<Arc<S>>,
         write_state: &mut PoolMetaWriteState,
         lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
-    ) -> Result<bool>
+        indices: &[usize],
+    ) -> Result<PoolMetaSaveOutcome>
     where
         S: EcstoreObjectIO,
     {
-        let was_write_blocked = write_state.write_blocked;
-        // Arm before the first replica write. If this future is dropped, the
-        // mutex guard is released with the sticky write gate still blocked.
-        write_state.block_writes();
-        self.save_no_lock_with_fence(pools, lock_lost).await?;
-        Ok(was_write_blocked)
+        self.save_no_lock_armed_scoped(pools, write_state, lock_lost, Some(indices))
+            .await
+    }
+
+    async fn save_no_lock_armed_scoped<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        write_state: &mut PoolMetaWriteState,
+        lock_lost: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
+        indices: Option<&[usize]>,
+    ) -> Result<PoolMetaSaveOutcome>
+    where
+        S: EcstoreObjectIO,
+    {
+        write_state.ensure_write_safe("pool metadata save failed")?;
+        // The arm does not block its own transaction. If this future or its
+        // returned outcome is dropped before publication, Drop latches the
+        // sticky recovery gate.
+        let transaction_arm = write_state.arm_transaction();
+        let fence = PoolMetaPersistenceFence::Distributed(lock_lost);
+        let committed = self.save_no_lock_transaction(pools, write_state, &fence, indices).await?;
+        Ok(PoolMetaSaveOutcome {
+            transaction_arm,
+            committed,
+        })
+    }
+
+    async fn save_no_lock_transaction<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        write_state: &mut PoolMetaWriteState,
+        fence: &PoolMetaPersistenceFence<'_>,
+        indices: Option<&[usize]>,
+    ) -> Result<PoolMeta>
+    where
+        S: EcstoreObjectIO,
+    {
+        if pools.is_empty() {
+            return Err(Error::other("pool metadata save failed: no storage pools available"));
+        }
+        if self.dont_save {
+            return Ok(self.clone());
+        }
+        for attempt in 0..POOL_META_CAS_MAX_ATTEMPTS {
+            match self
+                .save_no_lock_transaction_once(pools.clone(), write_state, fence, indices)
+                .await
+            {
+                Ok(committed) => return Ok(committed),
+                Err(Error::PreconditionFailed) if attempt + 1 < POOL_META_CAS_MAX_ATTEMPTS => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(Error::PreconditionFailed)
+    }
+
+    async fn save_no_lock_transaction_once<S>(
+        &self,
+        pools: Vec<Arc<S>>,
+        write_state: &mut PoolMetaWriteState,
+        fence: &PoolMetaPersistenceFence<'_>,
+        indices: Option<&[usize]>,
+    ) -> Result<PoolMeta>
+    where
+        S: EcstoreObjectIO,
+    {
+        fence.ensure_held()?;
+        let selection = load_pool_meta_replicas_observing(pools.clone(), true, write_state).await?;
+        write_state.observe_replicas(selection.replica_state);
+        write_state.ensure_write_safe("pool metadata save failed")?;
+        let mut bootstrap_generation_required = false;
+        if let Some(cluster_id) = write_state.expected_cluster_id {
+            let identity = load_pool_meta_identity_selection_observing(pools.clone(), write_state, cluster_id).await?;
+            bootstrap_generation_required = selection.absent || write_state.identity_initialized == Some(false);
+            if !identity.repair_write_safe {
+                write_state.block_writes();
+                return Err(Error::other(
+                    "pool metadata recovery required: cluster identity has an unreadable replica",
+                ));
+            }
+            if let Some(identity) = identity.identity
+                && selection.revision.is_generation_protocol()
+                && identity.epoch != selection.revision.epoch
+            {
+                write_state.block_writes();
+                return Err(Error::other(format!(
+                    "pool metadata recovery required: committed epoch {} does not match cluster identity epoch {}",
+                    selection.revision.epoch, identity.epoch
+                )));
+            }
+            if !selection.absent && write_state.identity_requires_repair() {
+                let initialized = write_state.identity_initialized != Some(false) || selection.revision.is_generation_protocol();
+                persist_pool_meta_identity(pools.clone(), write_state, initialized, fence).await?;
+            }
+        }
+        // Startup is the only path allowed to create an all-missing metadata
+        // set. Runtime callers without an identity context must fail closed.
+        write_state.ensure_missing_metadata_can_initialize()?;
+
+        let mut committed = if let Some(indices) = indices {
+            if selection.meta.pools.is_empty() {
+                self.clone()
+            } else {
+                let mut requested = self.clone();
+                requested.version = selection.meta.version;
+                let mut latest = selection.meta.clone();
+                merge_pool_meta_updates_for_save(&mut latest, &requested, indices, "pool metadata save failed")?;
+                latest
+            }
+        } else {
+            self.clone()
+        };
+        let target_version = if selection.generation_protocol_observed
+            || selection.revision.is_generation_protocol()
+            || pool_meta_v3_writer_enabled()
+            || bootstrap_generation_required
+        {
+            POOL_META_GENERATION_VERSION
+        } else if selection.meta.version == POOL_META_VERSION
+            || self.version == POOL_META_VERSION
+            || pool_meta_v2_writer_enabled()
+        {
+            POOL_META_VERSION
+        } else {
+            POOL_META_V1_VERSION
+        };
+        committed.version = target_version;
+
+        if target_version != POOL_META_GENERATION_VERSION {
+            let data = committed.encode_config_data_for_v2_gate(target_version == POOL_META_VERSION)?;
+            let mut canonical_saved = false;
+            for (pool_index, (pool, token)) in pools.iter().cloned().zip(&selection.cas_tokens).enumerate() {
+                let result =
+                    save_pool_meta_object_cas(pool.clone(), POOL_META_NAME, data.clone(), token, fence, "legacy_cas").await;
+                if result.is_ok() && pool_index == 0 {
+                    canonical_saved = true;
+                    #[cfg(test)]
+                    if let PoolMetaPersistenceFence::Activation(activation_fence) = fence {
+                        pause_pool_activation_after_durable_save(&pool, activation_fence).await;
+                    }
+                }
+                if let Err(err) = result {
+                    if canonical_saved && fence.is_activation() {
+                        warn!(
+                            event = EVENT_DECOMMISSION_STATE,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_POOLS,
+                            pool_index,
+                            state = "activation_replica_repair_pending",
+                            error = %err,
+                            "Decommission activation replica repair pending"
+                        );
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+            let confirmed = if fence.is_activation() {
+                load_pool_meta_replicas(pools, true).await?
+            } else {
+                let confirmed = load_pool_meta_replicas_observing(pools, true, write_state).await?;
+                write_state.observe_replicas(confirmed.replica_state);
+                confirmed
+            };
+            let expected = committed.encode_config_data_for_v2_gate(true)?;
+            if confirmed.canonical.as_ref() != Some(&expected) {
+                record_pool_meta_stale_write_rejection("legacy_verify");
+                return Err(Error::PreconditionFailed);
+            }
+            return Ok(confirmed.meta);
+        }
+
+        let cluster_id = selection
+            .revision
+            .cluster_id
+            .or(selection.generation_identity.map(|(cluster_id, _)| cluster_id))
+            .or(write_state.expected_cluster_id)
+            .ok_or_else(|| Error::other("pool metadata V3 save failed: cluster identity is not initialized"))?;
+        let epoch = if selection.revision.is_generation_protocol() {
+            selection.revision.epoch
+        } else {
+            selection
+                .generation_identity
+                .map(|(_, epoch)| epoch)
+                .or(write_state.cluster_epoch)
+                .unwrap_or(POOL_META_INITIAL_EPOCH)
+        };
+        let generation = if selection.revision.is_generation_protocol() {
+            selection
+                .revision
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| Error::other("pool metadata V3 generation exhausted"))?
+        } else {
+            1
+        };
+        let revision = PoolMetaRevision {
+            version: POOL_META_GENERATION_VERSION,
+            cluster_id: Some(cluster_id),
+            epoch,
+            generation,
+            transaction_id: Some(uuid::Uuid::new_v4()),
+        };
+        let previous = if let Some(canonical) = selection.canonical.clone() {
+            PoolMetaCommittedCandidate {
+                canonical,
+                meta: selection.meta.clone(),
+                revision: selection.revision,
+            }
+        } else {
+            let empty = PoolMeta {
+                version: POOL_META_V1_VERSION,
+                ..Default::default()
+            };
+            PoolMetaCommittedCandidate {
+                canonical: empty.encode_config_data_for_v2_gate(true)?,
+                meta: empty,
+                revision: PoolMetaRevision::legacy(POOL_META_V1_VERSION),
+            }
+        };
+        let pending = encode_pool_meta_v3_envelope(&committed, revision, false, Some(&previous))?;
+        let durable = encode_pool_meta_v3_envelope(&committed, revision, true, None)?;
+        let mut pending_tokens = Vec::with_capacity(pools.len());
+        for (pool, token) in pools.iter().cloned().zip(&selection.cas_tokens) {
+            let object_info =
+                save_pool_meta_object_cas(pool, POOL_META_NAME, pending.clone(), token, fence, "prepare_cas").await?;
+            let etag = object_info
+                .etag
+                .filter(|etag| !etag.trim().is_empty())
+                .ok_or_else(|| Error::other("pool metadata V3 prepare succeeded without a conditional-write revision"))?;
+            pending_tokens.push(PoolMetaCasToken::Existing(etag));
+        }
+
+        let mut commit_error = None;
+        let mut commit_succeeded = false;
+        #[cfg(test)]
+        let mut first_pool = true;
+        for (pool, token) in pools.iter().cloned().zip(&pending_tokens) {
+            match save_pool_meta_object_cas(pool.clone(), POOL_META_NAME, durable.clone(), token, fence, "commit_cas").await {
+                Ok(_) => {
+                    commit_succeeded = true;
+                    #[cfg(test)]
+                    if first_pool && let PoolMetaPersistenceFence::Activation(activation_fence) = fence {
+                        pause_pool_activation_after_durable_save(&pool, activation_fence).await;
+                    }
+                }
+                Err(err) => {
+                    commit_error.get_or_insert(err);
+                }
+            }
+            #[cfg(test)]
+            {
+                first_pool = false;
+            }
+        }
+        let confirmed = if fence.is_activation() {
+            load_pool_meta_replicas(pools.clone(), true).await?
+        } else {
+            let confirmed = load_pool_meta_replicas_observing(pools.clone(), true, write_state).await?;
+            write_state.observe_replicas(confirmed.replica_state);
+            confirmed
+        };
+        if confirmed.revision == revision && confirmed.canonical.as_ref() == Some(&durable) {
+            persist_pool_meta_identity(pools, write_state, true, fence).await?;
+            return Ok(confirmed.meta);
+        }
+        if !commit_succeeded {
+            return Err(commit_error.unwrap_or(Error::PreconditionFailed));
+        }
+        Err(commit_error.unwrap_or_else(|| {
+            Error::other("pool metadata recovery required: committed V3 transaction was not selected after write")
+        }))
     }
 
     #[cfg(test)]
@@ -3871,8 +5166,9 @@ impl PoolMeta {
     where
         S: EcstoreObjectIO,
     {
-        let was_write_blocked = self.save_no_lock_armed(pools, write_state, None).await?;
-        write_state.restore_writes(was_write_blocked);
+        let indices = (0..self.pools.len()).collect::<Vec<_>>();
+        let outcome = self.save_no_lock_armed(pools, write_state, None, &indices).await?;
+        outcome.disarm();
         Ok(())
     }
 
@@ -4747,6 +6043,7 @@ impl ECStore {
         operation: &str,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)> {
         write_state.ensure_write_safe(operation)?;
+        load_pool_meta_identity_observing(self.pools.clone(), write_state).await?;
         let pool = self
             .pools
             .first()
@@ -4767,6 +6064,31 @@ impl ECStore {
         self.pool_meta_save_gate.lock().await.ensure_write_safe(operation)
     }
 
+    async fn load_runtime_pool_meta_observing(&self, write_state: &mut PoolMetaWriteState, operation: &str) -> Result<PoolMeta> {
+        write_state.ensure_write_safe(operation)?;
+        load_pool_meta_identity_observing(self.pools.clone(), write_state).await?;
+        let mut pool_meta = PoolMeta::default();
+        let replica_state = pool_meta
+            .load_no_lock_from_replicas_observing(self.pools.clone(), write_state)
+            .await?;
+        write_state.observe_replicas(replica_state);
+        write_state.ensure_missing_metadata_can_initialize()?;
+        write_state.ensure_write_safe(operation)?;
+        Ok(pool_meta)
+    }
+
+    pub(crate) async fn load_runtime_pool_meta_under_activation_fence(
+        &self,
+        write_state: &mut PoolMetaWriteState,
+        activation_fence: &PoolRebalanceActivationFence,
+        operation: &str,
+    ) -> Result<PoolMeta> {
+        activation_fence.ensure_held()?;
+        let pool_meta = self.load_runtime_pool_meta_observing(write_state, operation).await?;
+        activation_fence.ensure_held()?;
+        Ok(pool_meta)
+    }
+
     pub(crate) async fn load_runtime_pool_meta(&self, operation: &str) -> Result<PoolMeta> {
         let mut write_state = self.pool_meta_save_gate.lock().await;
         write_state.ensure_write_safe(operation)?;
@@ -4777,13 +6099,7 @@ impl ECStore {
             .ok_or_else(|| Error::other(format!("{operation}: no storage pools available")))?;
         let pool_meta_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
         let _pool_meta_guard = pool_meta_lock.get_read_lock(get_lock_acquire_timeout()).await?;
-        let mut pool_meta = PoolMeta::default();
-        let replica_state = pool_meta
-            .load_no_lock_from_replicas_observing(self.pools.clone(), &mut write_state)
-            .await?;
-        write_state.observe_replicas(replica_state);
-        write_state.ensure_write_safe(operation)?;
-        Ok(pool_meta)
+        self.load_runtime_pool_meta_observing(&mut write_state, operation).await
     }
 
     async fn run_guarded_decommission_side_effect<T, E, F, Fut>(
@@ -4829,16 +6145,21 @@ impl ECStore {
             let pool_meta = self.pool_meta.read().await;
             merge_pool_meta_updates_for_save(&mut snapshot, &pool_meta, indices, "pool metadata save failed")?;
         }
-        let was_write_blocked = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
+        let outcome = snapshot
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), indices)
             .await?;
         let mut pool_meta = self.pool_meta.write().await;
         ensure_pool_meta_write_fence(&pool_meta_guard, "pool metadata save failed")?;
-        publish_pool_meta_updates(&mut pool_meta, &snapshot, indices);
+        publish_pool_meta_updates(&mut pool_meta, &outcome.committed, indices);
         ensure_pool_meta_write_fence(&pool_meta_guard, "pool metadata save failed")?;
         drop(pool_meta);
-        save_guard.restore_writes(was_write_blocked);
+        outcome.disarm();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn save_current_pool_meta_for_test(&self, indices: &[usize]) -> Result<()> {
+        self.save_current_pool_meta(indices).await
     }
 
     async fn persist_decommission_unresolved_entry(
@@ -4885,11 +6206,11 @@ impl ECStore {
             (snapshot, checkpoint)
         };
 
-        let was_write_blocked = match snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
+        let outcome = match snapshot
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
             .await
         {
-            Ok(was_write_blocked) => was_write_blocked,
+            Ok(outcome) => outcome,
             Err(err) => {
                 let retry_after = OffsetDateTime::now_utc() + DECOMMISSION_PROGRESS_SAVE_RETRY_BACKOFF;
                 let mut pool_meta = self.pool_meta.write().await;
@@ -4900,10 +6221,11 @@ impl ECStore {
 
         let mut pool_meta = self.pool_meta.write().await;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission progress save failed")?;
+        pool_meta.version = pool_meta.version.max(outcome.committed.version);
         let committed = pool_meta.commit_decommission_progress_checkpoint(idx, checkpoint);
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission progress save failed")?;
         drop(pool_meta);
-        save_guard.restore_writes(was_write_blocked);
+        outcome.disarm();
         Ok(committed)
     }
 
@@ -4929,18 +6251,19 @@ impl ECStore {
             return Ok(false);
         }
 
-        let was_write_blocked = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
+        let outcome = snapshot
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
             .await
             .map_err(|err| {
                 Error::other(format!("decommission metadata save failed for pool {idx} bucket {}: {err}", bucket.name))
             })?;
         let mut pool_meta = self.pool_meta.write().await;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission bucket completion save failed")?;
+        pool_meta.version = pool_meta.version.max(outcome.committed.version);
         pool_meta.mark_decommission_progress_saved();
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission bucket completion save failed")?;
         drop(pool_meta);
-        save_guard.restore_writes(was_write_blocked);
+        outcome.disarm();
         Ok(true)
     }
 
@@ -5010,14 +6333,16 @@ impl ECStore {
         }
 
         activation_fence.ensure_held()?;
-        let was_write_blocked = latest_pool_meta
-            .save_no_lock_with_activation_fence(self.pools.clone(), &mut save_guard, activation_fence)
+        let outcome = latest_pool_meta
+            .save_no_lock_with_activation_fence(self.pools.clone(), &mut save_guard, &activation_fence, indices)
             .await?;
+        activation_fence.ensure_held()?;
         {
             let mut pool_meta = self.pool_meta.write().await;
-            publish_pool_meta_updates(&mut pool_meta, &latest_pool_meta, indices);
+            publish_pool_meta_updates(&mut pool_meta, &outcome.committed, indices);
         }
-        save_guard.restore_writes(was_write_blocked);
+        activation_fence.ensure_held()?;
+        outcome.disarm();
 
         Ok(previous_pool_meta)
     }
@@ -5034,15 +6359,15 @@ impl ECStore {
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission start rollback failed")
             .await?;
         rollback_start_decommission_pool_meta(&mut snapshot, previous_pool_meta, indices);
-        let was_write_blocked = snapshot
-            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
+        let outcome = snapshot
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), indices)
             .await?;
         let mut pool_meta = self.pool_meta.write().await;
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission start rollback failed")?;
-        publish_pool_meta_updates(&mut pool_meta, &snapshot, indices);
+        publish_pool_meta_updates(&mut pool_meta, &outcome.committed, indices);
         ensure_pool_meta_write_fence(&pool_meta_guard, "decommission start rollback failed")?;
         drop(pool_meta);
-        save_guard.restore_writes(was_write_blocked);
+        outcome.disarm();
         self.ctx.advance_data_movement_operation_epoch();
         Ok(())
     }
@@ -5426,7 +6751,7 @@ impl ECStore {
         tokio::spawn(async move {
             store
                 .decommission_cancel_transaction(idx, owner, true, move |snapshot, pool_meta_fence| async move {
-                    snapshot.save_no_lock_with_fence(pools, pool_meta_fence).await
+                    snapshot.save_no_lock_with_fence(pools, pool_meta_fence, &[idx]).await
                 })
                 .await
         })
@@ -5559,12 +6884,12 @@ impl ECStore {
             }
             drop(pool_meta);
 
-            let (was_write_blocked, save_error) = if changed {
+            let (save_outcome, save_error) = if changed {
                 match snapshot
-                    .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal())
+                    .save_no_lock_armed(self.pools.clone(), &mut save_guard, pool_meta_guard.lock_lost_signal(), &[idx])
                     .await
                 {
-                    Ok(was_write_blocked) => (Some(was_write_blocked), None),
+                    Ok(outcome) => (Some(outcome), None),
                     Err(err) => (None, Some(err)),
                 }
             } else {
@@ -5572,8 +6897,11 @@ impl ECStore {
             };
             let generation = self.active_decommission_generation(idx).await?;
             ensure_pool_meta_write_fence(&pool_meta_guard, "decommission promotion failed")?;
-            if let Some(was_write_blocked) = was_write_blocked {
-                save_guard.restore_writes(was_write_blocked);
+            if let Some(outcome) = save_outcome {
+                let mut pool_meta = self.pool_meta.write().await;
+                pool_meta.version = pool_meta.version.max(outcome.committed.version);
+                drop(pool_meta);
+                outcome.disarm();
             }
             (changed, generation, save_error)
         };
@@ -9502,7 +10830,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn decommission_activation_replicates_commit_after_post_save_fence_loss() {
+    async fn decommission_activation_fence_loss_after_durable_save_blocks_publication() {
         let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
         let barrier = PoolActivationDurableSaveBarrier::install(&store.pools[0]);
         let start_store = Arc::clone(&store);
@@ -9525,27 +10853,33 @@ mod tests {
 
         barrier.wait_until_paused().await;
         barrier.release_after_fence_loss();
-        tokio::time::timeout(std::time::Duration::from_secs(30), start_task)
+        let err = tokio::time::timeout(std::time::Duration::from_secs(30), start_task)
             .await
-            .expect("decommission activation should finish after its canonical commit")
+            .expect("decommission activation should stop after losing its fence")
             .expect("decommission activation task should not panic")
-            .expect("post-commit fence loss must not report the committed activation as failed");
+            .expect_err("post-durable-save fence loss must reject in-memory publication");
+        assert!(err.to_string().contains("activation lock lost"));
 
         let local = store.pool_meta.read().await;
-        assert!(pool_meta_has_active_decommission(&local));
+        assert!(
+            !pool_meta_has_active_decommission(&local),
+            "the activation must not publish after its durable fence is lost"
+        );
         drop(local);
+        store
+            .ensure_pool_meta_side_effects_safe("post-durable-save activation fence loss")
+            .await
+            .expect_err("the undisarmed transaction must latch the sticky pool metadata gate");
 
-        for pool in &store.pools {
-            let mut persisted = PoolMeta::default();
-            persisted
-                .load_no_lock_from_replicas(vec![pool.clone()])
-                .await
-                .expect("every pool should retain readable committed decommission metadata");
-            assert!(
-                pool_meta_has_active_decommission(&persisted),
-                "every pool must adopt the canonical committed activation"
-            );
-        }
+        let mut persisted = PoolMeta::default();
+        persisted
+            .load_no_lock_from_replicas(vec![store.pools[0].clone()])
+            .await
+            .expect("the durable replica should remain readable for recovery");
+        assert!(
+            pool_meta_has_active_decommission(&persisted),
+            "the test must lose the fence only after one durable replica commit"
+        );
     }
 
     #[tokio::test]
@@ -9579,7 +10913,7 @@ mod tests {
             *disks = vec![None; saved.len()];
             replica_disks.push(saved);
         }
-        barrier.release_after_fence_loss();
+        barrier.release_without_fence_loss();
 
         tokio::time::timeout(std::time::Duration::from_secs(30), start_task)
             .await
@@ -9761,7 +11095,10 @@ mod tests {
             ..Default::default()
         });
         let data = pool_meta_v1_replica_test_data(&source);
-        let PoolMetaReplica::Valid { raw, canonical, meta } = decode_pool_meta_replica(data) else {
+        let PoolMetaReplica::Valid {
+            raw, canonical, meta, ..
+        } = decode_pool_meta_replica(data)
+        else {
             panic!("v1 pool metadata should remain readable");
         };
 
@@ -9779,7 +11116,10 @@ mod tests {
     #[test]
     fn pool_meta_legacy_v1_replica_migrates_to_v2_canonical_form() {
         let data = pool_meta_legacy_v1_replica_test_data("pool-0");
-        let PoolMetaReplica::Valid { raw, canonical, meta } = decode_pool_meta_replica(data) else {
+        let PoolMetaReplica::Valid {
+            raw, canonical, meta, ..
+        } = decode_pool_meta_replica(data)
+        else {
             panic!("legacy v1 pool metadata should remain readable");
         };
 
@@ -9851,6 +11191,238 @@ mod tests {
     }
 
     #[test]
+    fn pool_meta_v3_writer_requires_both_gates() {
+        assert!(!pool_meta_v3_writer_enabled_for(false, false));
+        assert!(!pool_meta_v3_writer_enabled_for(true, false));
+        assert!(!pool_meta_v3_writer_enabled_for(false, true));
+        assert!(pool_meta_v3_writer_enabled_for(true, true));
+    }
+
+    #[test]
+    fn pool_meta_stale_write_rejection_metric_is_countable() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_pool_meta_stale_write_rejection("prepare_cas");
+            record_pool_meta_stale_write_rejection("prepare_cas");
+        });
+
+        let total = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == METRIC_POOL_META_STALE_WRITE_REJECTIONS_TOTAL)
+            .filter_map(|(_, _, _, value)| match value {
+                metrics_util::debugging::DebugValue::Counter(value) => Some(value),
+                _ => None,
+            })
+            .sum::<u64>();
+        assert_eq!(total, 2);
+    }
+
+    fn pool_meta_v3_test_revision(cluster_id: uuid::Uuid, generation: u64, transaction_id: uuid::Uuid) -> PoolMetaRevision {
+        PoolMetaRevision {
+            version: POOL_META_GENERATION_VERSION,
+            cluster_id: Some(cluster_id),
+            epoch: POOL_META_INITIAL_EPOCH,
+            generation,
+            transaction_id: Some(transaction_id),
+        }
+    }
+
+    fn pool_meta_legacy_candidate(meta: PoolMeta) -> PoolMetaCommittedCandidate {
+        PoolMetaCommittedCandidate {
+            canonical: meta
+                .encode_config_data_for_v2_gate(true)
+                .expect("legacy pool metadata should encode"),
+            revision: PoolMetaRevision::legacy(meta.version),
+            meta,
+        }
+    }
+
+    #[test]
+    fn pool_meta_v3_pending_prepare_recovers_previous_snapshot_after_restart() {
+        let previous = pool_meta_replica_test_meta("pool-before");
+        let mut next = pool_meta_replica_test_meta("pool-after");
+        next.version = POOL_META_GENERATION_VERSION;
+        let revision = pool_meta_v3_test_revision(uuid::Uuid::new_v4(), 1, uuid::Uuid::new_v4());
+        let pending = encode_pool_meta_v3_envelope(&next, revision, false, Some(&pool_meta_legacy_candidate(previous.clone())))
+            .expect("pending generation should encode");
+
+        let selected = select_pool_meta_replica(vec![
+            decode_pool_meta_replica(pending),
+            decode_pool_meta_replica(
+                previous
+                    .encode_config_data_for_v2_gate(true)
+                    .expect("previous snapshot should encode"),
+            ),
+        ])
+        .expect("a prepare-only transaction should expose its committed predecessor");
+
+        assert_eq!(selected.meta.pools[0].cmd_line, "pool-before");
+        assert_eq!(selected.revision.version, POOL_META_VERSION);
+        assert!(selected.replica_state.needs_repair);
+    }
+
+    #[test]
+    fn pool_meta_v3_partial_commit_selects_new_generation_after_restart() {
+        let previous = pool_meta_replica_test_meta("pool-before");
+        let mut next = pool_meta_replica_test_meta("pool-after");
+        next.version = POOL_META_GENERATION_VERSION;
+        let revision = pool_meta_v3_test_revision(uuid::Uuid::new_v4(), 1, uuid::Uuid::new_v4());
+        let pending = encode_pool_meta_v3_envelope(&next, revision, false, Some(&pool_meta_legacy_candidate(previous)))
+            .expect("pending generation should encode");
+        let committed = encode_pool_meta_v3_envelope(&next, revision, true, None).expect("committed generation should encode");
+
+        let selected = select_pool_meta_replica(vec![decode_pool_meta_replica(committed), decode_pool_meta_replica(pending)])
+            .expect("one committed replica should make the cross-pool transaction durable");
+
+        assert_eq!(selected.meta.pools[0].cmd_line, "pool-after");
+        assert_eq!(selected.revision, revision);
+        assert!(selected.replica_state.needs_repair);
+    }
+
+    #[test]
+    fn pool_meta_v3_uses_valid_committed_backup_but_rejects_same_generation_fork() {
+        let cluster_id = uuid::Uuid::new_v4();
+        let mut next = pool_meta_replica_test_meta("pool-after");
+        next.version = POOL_META_GENERATION_VERSION;
+        let revision = pool_meta_v3_test_revision(cluster_id, 7, uuid::Uuid::new_v4());
+        let committed = encode_pool_meta_v3_envelope(&next, revision, true, None).expect("committed generation should encode");
+        let selected = select_pool_meta_replica(vec![
+            PoolMetaReplica::Corrupt("truncated".to_string()),
+            decode_pool_meta_replica(committed.clone()),
+        ])
+        .expect("a corrupt first copy should fall back to a valid committed generation");
+        assert_eq!(selected.revision, revision);
+        assert!(selected.replica_state.needs_repair);
+
+        let fork_revision = pool_meta_v3_test_revision(cluster_id, 7, uuid::Uuid::new_v4());
+        let fork = encode_pool_meta_v3_envelope(&next, fork_revision, true, None).expect("fork generation should encode");
+        let err = select_pool_meta_replica(vec![decode_pool_meta_replica(committed), decode_pool_meta_replica(fork)])
+            .expect_err("same-generation transactions must never be selected by pool order");
+        assert!(err.to_string().contains("committed generation 7 diverges"));
+    }
+
+    #[test]
+    fn pool_meta_v3_migration_keeps_legacy_committed_until_commit_record_exists() {
+        let previous = pool_meta_replica_test_meta("pool-before");
+        let mut next = pool_meta_replica_test_meta("pool-after");
+        next.version = POOL_META_GENERATION_VERSION;
+        let revision = pool_meta_v3_test_revision(uuid::Uuid::new_v4(), 1, uuid::Uuid::new_v4());
+        let pending = encode_pool_meta_v3_envelope(&next, revision, false, Some(&pool_meta_legacy_candidate(previous.clone())))
+            .expect("pending migration should encode");
+        let legacy = previous
+            .encode_config_data_for_v2_gate(true)
+            .expect("legacy snapshot should encode");
+
+        let prepared = select_pool_meta_replica(vec![decode_pool_meta_replica(pending), decode_pool_meta_replica(legacy)])
+            .expect("prepared migration should retain the legacy commit");
+        assert_eq!(prepared.meta.version, POOL_META_VERSION);
+        assert_eq!(prepared.meta.pools[0].cmd_line, "pool-before");
+
+        let committed = encode_pool_meta_v3_envelope(&next, revision, true, None).expect("committed migration should encode");
+        let migrated = select_pool_meta_replica(vec![decode_pool_meta_replica(committed)])
+            .expect("committed migration should establish the V3 floor");
+        assert_eq!(migrated.meta.version, POOL_META_GENERATION_VERSION);
+        assert_eq!(migrated.meta.pools[0].cmd_line, "pool-after");
+    }
+
+    #[test]
+    fn pool_meta_v3_unknown_fields_remain_incompatible_not_silently_ignored() {
+        #[derive(Serialize)]
+        struct FuturePoolMetaV3 {
+            version: u16,
+            cluster_id: String,
+            epoch: u64,
+            generation: u64,
+            transaction_id: String,
+            committed: bool,
+            pools: Vec<PersistedPoolStatus>,
+            previous: Option<PersistedPoolMetaV3Previous>,
+            future_guard: u64,
+        }
+
+        let mut data = Vec::new();
+        data.write_u16::<LittleEndian>(POOL_META_FORMAT)
+            .expect("pool metadata format should encode");
+        data.write_u16::<LittleEndian>(POOL_META_GENERATION_VERSION)
+            .expect("pool metadata version should encode");
+        FuturePoolMetaV3 {
+            version: POOL_META_GENERATION_VERSION,
+            cluster_id: uuid::Uuid::new_v4().to_string(),
+            epoch: POOL_META_INITIAL_EPOCH,
+            generation: 1,
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            committed: true,
+            pools: Vec::new(),
+            previous: None,
+            future_guard: 1,
+        }
+        .serialize(&mut Serializer::new(&mut data))
+        .expect("future V3 payload should encode");
+
+        assert!(matches!(decode_pool_meta_replica(data), PoolMetaReplica::Incompatible(_)));
+    }
+
+    #[test]
+    fn pool_meta_identity_classifies_corrupt_incompatible_and_divergent_replicas() {
+        let cluster_id = uuid::Uuid::new_v4();
+        let identity = PersistedPoolMetaIdentity {
+            version: POOL_META_IDENTITY_VERSION,
+            cluster_id,
+            epoch: POOL_META_INITIAL_EPOCH,
+            initialized: true,
+            fresh_bootstrap_nonce: None,
+        };
+        let selected = select_pool_meta_identity(
+            vec![
+                PoolMetaIdentityRead {
+                    replica: PoolMetaIdentityReplica::Corrupt("truncated".to_string()),
+                    cas: PoolMetaCasToken::Existing("corrupt".to_string()),
+                },
+                PoolMetaIdentityRead {
+                    replica: PoolMetaIdentityReplica::Valid(identity),
+                    cas: PoolMetaCasToken::Existing("valid".to_string()),
+                },
+            ],
+            cluster_id,
+        )
+        .expect("a verified identity backup should survive a corrupt first replica");
+        assert_eq!(selected.identity, Some(identity));
+        assert!(selected.needs_repair);
+
+        let incompatible = select_pool_meta_identity(
+            vec![PoolMetaIdentityRead {
+                replica: PoolMetaIdentityReplica::Incompatible("future version".to_string()),
+                cas: PoolMetaCasToken::Existing("future".to_string()),
+            }],
+            cluster_id,
+        )
+        .expect_err("an incompatible identity must fail closed");
+        assert!(incompatible.to_string().contains("incompatible"));
+
+        let divergent = select_pool_meta_identity(
+            vec![
+                PoolMetaIdentityRead {
+                    replica: PoolMetaIdentityReplica::Valid(identity),
+                    cas: PoolMetaCasToken::Existing("epoch-1".to_string()),
+                },
+                PoolMetaIdentityRead {
+                    replica: PoolMetaIdentityReplica::Valid(PersistedPoolMetaIdentity {
+                        epoch: POOL_META_INITIAL_EPOCH + 1,
+                        ..identity
+                    }),
+                    cas: PoolMetaCasToken::Existing("epoch-2".to_string()),
+                },
+            ],
+            cluster_id,
+        )
+        .expect_err("identity epoch divergence must require recovery");
+        assert!(divergent.to_string().contains("recovery required"));
+    }
+
+    #[test]
     fn pool_meta_v2_floor_is_sticky_after_observation() {
         let meta = pool_meta_replica_test_meta("pool-0");
         let data = meta
@@ -9917,7 +11489,7 @@ mod tests {
             PoolMetaReplica::Unreadable("read quorum unavailable".to_string()),
         ])
         .expect_err("an unreadable replica must not be treated as a new deployment");
-        assert!(err.to_string().contains("no valid replica is available"));
+        assert!(err.to_string().contains("no valid committed replica is available"));
         assert!(err.to_string().contains("pool 1 is unreadable"));
     }
 
@@ -11183,19 +12755,19 @@ mod pools_tests {
         DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD,
         DECOMMISSION_SOURCE_CHANGED_EXHAUSTION_LIMIT, DecomBucketInfo, DecommissionCanceler, DecommissionDurableIlmReceipt,
         DecommissionEntryEnqueueResult, DecommissionStartPoolState, DecommissionTerminalState, DecommissionUnresolvedEntry,
-        ListCallback, POOL_META_NAME, POOL_META_V1_VERSION, POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo,
-        PoolStatus, QueuedDecommissionEntry, REBAL_META_NAME, acquire_pool_rebalance_activation_locks,
-        apply_decommission_status_space_info, await_decommission_worker, bind_decommission_cancelers,
-        bind_missing_decommission_cancelers, cancel_decommission_canceler, clamp_decommission_entry_concurrency,
-        classify_decommission_terminal_state, count_decommission_item, decommission_cancel_signal_result,
-        decommission_durable_ilm_receipt_path, decommission_durable_ilm_receipt_run_prefix,
-        decommission_durable_ilm_receipt_run_token, decommission_entry_queue_capacity, decommission_item_size,
-        decommission_meta_bucket_options, decommission_retry_backoff_delay, decommission_start_pool_state,
-        decommission_unresolved_listing_error, dedup_indices, default_decommission_bucket_concurrency,
-        default_decommission_entry_concurrency, drain_decommission_entry_queue, enqueue_decommission_entry,
-        ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_generation,
-        ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing, ensure_decommission_start_allowed,
-        ensure_decommission_start_keeps_active_pool, ensure_decommission_start_local_leader,
+        ListCallback, POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_V1_VERSION, POOL_META_VERSION, PoolDecommissionInfo,
+        PoolMeta, PoolMetaCasToken, PoolMetaPersistenceFence, PoolSpaceInfo, PoolStatus, QueuedDecommissionEntry,
+        REBAL_META_NAME, acquire_pool_rebalance_activation_locks, apply_decommission_status_space_info,
+        await_decommission_worker, bind_decommission_cancelers, bind_missing_decommission_cancelers,
+        cancel_decommission_canceler, clamp_decommission_entry_concurrency, classify_decommission_terminal_state,
+        count_decommission_item, decommission_cancel_signal_result, decommission_durable_ilm_receipt_path,
+        decommission_durable_ilm_receipt_run_prefix, decommission_durable_ilm_receipt_run_token,
+        decommission_entry_queue_capacity, decommission_item_size, decommission_meta_bucket_options,
+        decommission_retry_backoff_delay, decommission_start_pool_state, decommission_unresolved_listing_error, dedup_indices,
+        default_decommission_bucket_concurrency, default_decommission_entry_concurrency, drain_decommission_entry_queue,
+        enqueue_decommission_entry, ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed,
+        ensure_decommission_generation, ensure_decommission_listing_disks_available, ensure_decommission_not_rebalancing,
+        ensure_decommission_start_allowed, ensure_decommission_start_keeps_active_pool, ensure_decommission_start_local_leader,
         ensure_decommission_start_pool_states, ensure_decommission_start_rebalance_meta_allowed,
         ensure_decommission_start_target_capacity, ensure_decommission_terminal_operation_supported,
         ensure_decommission_unresolved_verification_disk_count, ensure_local_decommission_pool_leaders,
@@ -11204,18 +12776,19 @@ mod pools_tests {
         load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
         merge_decommission_durable_ilm_receipts, merge_pool_meta_updates_for_save, merge_pool_status_refresh,
         missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
-        publish_pool_meta_updates, reconcile_decommission_meta_buckets, reconcile_decommission_unresolved_entries_for_completion,
-        record_decommission_unresolved_entry, require_decommission_store, reserve_decommission_start_cancelers,
-        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
-        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions,
-        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
-        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
-        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
-        resumable_decommission_queue_indices, rollback_start_decommission_pool_meta, run_decommission_buckets_bounded,
-        run_decommission_listing_with_retry, run_decommission_listing_with_retry_and_drain, run_decommission_phases,
-        run_decommission_side_effect, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        publish_pool_meta_updates, read_pool_meta_replica, reconcile_decommission_meta_buckets,
+        reconcile_decommission_unresolved_entries_for_completion, record_decommission_unresolved_entry,
+        require_decommission_store, reserve_decommission_start_cancelers, resolve_decommission_bucket_state,
+        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
+        resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
+        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
+        resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
+        resolve_decommission_progress_save_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
+        resolve_start_decommission_pool_meta_reload_result, resumable_decommission_queue_indices,
+        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, run_decommission_listing_with_retry,
+        run_decommission_listing_with_retry_and_drain, run_decommission_phases, run_decommission_side_effect,
+        save_pool_meta_object_cas, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
         should_count_decommission_version_complete, should_fail_decommission_pool_after_exhausted_source_changed,
         should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
         should_retry_decommission_cancel_reload, should_retry_decommission_listing, should_skip_canceled_decommission_routine,
@@ -11238,6 +12811,7 @@ mod pools_tests {
     use crate::runtime::instance::InstanceContext;
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::storage_api_contracts::object::HTTPPreconditions;
     use crate::storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec};
     use crate::store::ECStore;
     use byteorder::{ByteOrder, LittleEndian};
@@ -11246,6 +12820,7 @@ mod pools_tests {
     use rustfs_lock::{GlobalLockManager, LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use rustfs_rio::Index;
     use std::future::Future;
+    use std::io::Cursor;
     use std::sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -11253,6 +12828,7 @@ mod pools_tests {
     use std::task::{Context, Poll};
     use std::time::Duration as StdDuration;
     use time::{Duration, OffsetDateTime};
+    use tokio::io::AsyncReadExt;
     use tokio::sync::Semaphore;
     use tokio_util::sync::CancellationToken;
 
@@ -11300,7 +12876,7 @@ mod pools_tests {
             rebalance_meta: tokio::sync::RwLock::new(None),
             decommission_cancelers: tokio::sync::RwLock::new(cancelers),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::default(),
+            pool_meta_save_gate: tokio::sync::Mutex::new(super::PoolMetaWriteState::for_test_bootstrap()),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
@@ -11309,9 +12885,13 @@ mod pools_tests {
     #[derive(Debug)]
     struct PartialPoolMetaWriteStorage {
         fail_write: bool,
+        fail_after_first_write: bool,
         pending_write: bool,
         write_started: tokio::sync::Notify,
         wrote: AtomicBool,
+        revision: AtomicUsize,
+        stored: StdMutex<Option<(Vec<u8>, String)>>,
+        identity: StdMutex<Option<(Vec<u8>, String)>>,
     }
 
     #[async_trait::async_trait]
@@ -11326,32 +12906,217 @@ mod pools_tests {
 
         async fn get_object_reader(
             &self,
-            _bucket: &str,
-            _object: &str,
+            bucket: &str,
+            object: &str,
             _range: Option<Self::RangeSpec>,
             _h: Self::HeaderMap,
             _opts: &Self::ObjectOptions,
         ) -> std::result::Result<Self::GetObjectReader, Error> {
-            Err(Error::FileNotFound)
+            let stored = if object == POOL_META_IDENTITY_NAME {
+                &self.identity
+            } else {
+                &self.stored
+            };
+            let Some((data, etag)) = stored
+                .lock()
+                .expect("pool metadata test storage should not be poisoned")
+                .clone()
+            else {
+                return Err(Error::FileNotFound);
+            };
+            Ok(crate::object_api::GetObjectReader {
+                stream: Box::new(Cursor::new(data.clone())),
+                object_info: crate::object_api::ObjectInfo {
+                    bucket: bucket.to_string(),
+                    name: object.to_string(),
+                    size: data.len() as i64,
+                    etag: Some(etag),
+                    ..Default::default()
+                },
+                buffered_body: None,
+                body_source: Default::default(),
+            })
         }
 
         async fn put_object(
             &self,
             _bucket: &str,
-            _object: &str,
-            _data: &mut Self::PutObjectReader,
-            _opts: &Self::ObjectOptions,
+            object: &str,
+            data: &mut Self::PutObjectReader,
+            opts: &Self::ObjectOptions,
         ) -> std::result::Result<Self::ObjectInfo, Error> {
             self.write_started.notify_one();
             if self.pending_write {
                 std::future::pending().await
             }
-            if self.fail_write {
+            if object == POOL_META_NAME
+                && (self.fail_write || (self.fail_after_first_write && self.revision.load(Ordering::SeqCst) > 0))
+            {
                 return Err(Error::Timeout);
             }
+            let stored = if object == POOL_META_IDENTITY_NAME {
+                &self.identity
+            } else {
+                &self.stored
+            };
+            let current_etag = stored
+                .lock()
+                .expect("pool metadata test storage should not be poisoned")
+                .as_ref()
+                .map(|(_, etag)| etag.clone());
+            if opts
+                .http_preconditions
+                .as_ref()
+                .and_then(HTTPPreconditions::if_none_match_value)
+                == Some("*")
+                && current_etag.is_some()
+            {
+                return Err(Error::PreconditionFailed);
+            }
+            if let Some(expected) = opts.http_preconditions.as_ref().and_then(HTTPPreconditions::if_match_value)
+                && current_etag.as_deref() != Some(expected)
+            {
+                return Err(Error::PreconditionFailed);
+            }
+            let mut payload = Vec::new();
+            data.stream.read_to_end(&mut payload).await?;
+            let etag = format!("pool-meta-test-{}", self.revision.fetch_add(1, Ordering::SeqCst) + 1);
+            *stored.lock().expect("pool metadata test storage should not be poisoned") = Some((payload, etag.clone()));
             self.wrote.store(true, Ordering::SeqCst);
-            Ok(crate::object_api::ObjectInfo::default())
+            Ok(crate::object_api::ObjectInfo {
+                etag: Some(etag),
+                ..Default::default()
+            })
         }
+    }
+
+    #[tokio::test]
+    async fn test_pool_meta_cas_deterministically_rejects_stale_writer() {
+        let storage = Arc::new(PartialPoolMetaWriteStorage {
+            fail_write: false,
+            fail_after_first_write: false,
+            pending_write: false,
+            write_started: tokio::sync::Notify::new(),
+            wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
+        });
+        let stale_token = read_pool_meta_replica(storage.clone(), true).await.cas;
+        assert!(matches!(&stale_token, PoolMetaCasToken::Missing));
+        let winner = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None)],
+            ..Default::default()
+        }
+        .encode_config_data_for_test()
+        .expect("winning pool metadata should encode");
+        let stale = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        }
+        .encode_config_data_for_test()
+        .expect("stale pool metadata should encode");
+        let fence = PoolMetaPersistenceFence::Distributed(None);
+
+        save_pool_meta_object_cas(storage.clone(), POOL_META_NAME, winner.clone(), &stale_token, &fence, "prepare_cas")
+            .await
+            .expect("the first writer should create pool metadata");
+        let err = save_pool_meta_object_cas(storage.clone(), POOL_META_NAME, stale, &stale_token, &fence, "prepare_cas")
+            .await
+            .expect_err("the second writer must not reuse the stale missing-object revision");
+
+        assert_eq!(err, Error::PreconditionFailed);
+        let stored = storage
+            .stored
+            .lock()
+            .expect("pool metadata test storage should not be poisoned")
+            .as_ref()
+            .map(|(data, _)| data.clone())
+            .expect("the winning pool metadata should remain stored");
+        assert_eq!(stored, winner);
+    }
+
+    #[tokio::test]
+    async fn test_pool_meta_v3_single_replica_commit_failure_recovers_on_restart() {
+        let committed_replica = Arc::new(PartialPoolMetaWriteStorage {
+            fail_write: false,
+            fail_after_first_write: false,
+            pending_write: false,
+            write_started: tokio::sync::Notify::new(),
+            wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
+        });
+        let pending_replica = Arc::new(PartialPoolMetaWriteStorage {
+            fail_write: false,
+            fail_after_first_write: true,
+            pending_write: false,
+            write_started: tokio::sync::Notify::new(),
+            wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
+        });
+        let cluster_id = uuid::Uuid::new_v4();
+        let fresh_bootstrap_nonce = uuid::Uuid::new_v4();
+        let identity = super::encode_pool_meta_identity(super::PersistedPoolMetaIdentity {
+            version: super::POOL_META_IDENTITY_VERSION,
+            cluster_id,
+            epoch: super::POOL_META_INITIAL_EPOCH,
+            initialized: false,
+            fresh_bootstrap_nonce: Some(fresh_bootstrap_nonce),
+        })
+        .expect("pending bootstrap identity should encode");
+        *committed_replica
+            .identity
+            .lock()
+            .expect("identity storage should not be poisoned") = Some((identity.clone(), "identity-0".to_string()));
+        *pending_replica
+            .identity
+            .lock()
+            .expect("identity storage should not be poisoned") = Some((identity, "identity-0".to_string()));
+        let mut write_state = super::PoolMetaWriteState::for_startup(cluster_id, true);
+        let snapshot = PoolMeta {
+            version: super::POOL_META_GENERATION_VERSION,
+            pools: vec![decommission_test_pool_status(
+                0,
+                Some(PoolDecommissionInfo {
+                    queued: true,
+                    ..Default::default()
+                }),
+            )],
+            ..Default::default()
+        };
+
+        snapshot
+            .save_no_lock_observing(vec![committed_replica.clone(), pending_replica.clone()], &mut write_state)
+            .await
+            .expect("one committed replica should durably complete the V3 transaction");
+
+        let mut restarted = PoolMeta::default();
+        let replica_state = restarted
+            .load_no_lock_from_replicas(vec![committed_replica, pending_replica.clone()])
+            .await
+            .expect("restart should select the committed generation over a pending replica");
+        assert_eq!(restarted.version, super::POOL_META_GENERATION_VERSION);
+        assert!(restarted.pools[0].decommission.as_ref().is_some_and(|info| info.queued));
+        assert!(replica_state.needs_repair);
+
+        let mut pending_only = PoolMeta::default();
+        pending_only
+            .load_no_lock_from_replicas(vec![pending_replica])
+            .await
+            .expect("a prepare-only replica should expose the embedded predecessor");
+        assert!(pending_only.pools.is_empty());
     }
 
     #[tokio::test]
@@ -11359,15 +13124,23 @@ mod pools_tests {
         let store = decommission_worker_test_store(PoolMeta::default(), Vec::new());
         let committed = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: false,
+            fail_after_first_write: false,
             pending_write: false,
             write_started: tokio::sync::Notify::new(),
             wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
         });
         let failed = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: true,
+            fail_after_first_write: false,
             pending_write: false,
             write_started: tokio::sync::Notify::new(),
             wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
         });
         let snapshot = PoolMeta {
             version: super::POOL_META_VERSION,
@@ -11403,15 +13176,23 @@ mod pools_tests {
         let store = decommission_worker_test_store(PoolMeta::default(), Vec::new());
         let committed = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: false,
+            fail_after_first_write: false,
             pending_write: false,
             write_started: tokio::sync::Notify::new(),
             wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
         });
         let pending = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: false,
+            fail_after_first_write: false,
             pending_write: true,
             write_started: tokio::sync::Notify::new(),
             wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
         });
         let snapshot = PoolMeta {
             version: super::POOL_META_VERSION,
@@ -11464,9 +13245,13 @@ mod pools_tests {
         let store = decommission_worker_test_store(PoolMeta::default(), Vec::new());
         let committed = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: false,
+            fail_after_first_write: false,
             pending_write: false,
             write_started: tokio::sync::Notify::new(),
             wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
         });
         let snapshot = PoolMeta {
             version: super::POOL_META_VERSION,
@@ -11481,12 +13266,12 @@ mod pools_tests {
         let task_publish_release = publish_release.clone();
         let save_task = tokio::spawn(async move {
             let mut save_guard = save_store.pool_meta_save_gate.lock().await;
-            let was_write_blocked = snapshot
-                .save_no_lock_armed(vec![save_committed], &mut save_guard, None)
+            let outcome = snapshot
+                .save_no_lock_armed(vec![save_committed], &mut save_guard, None, &[0])
                 .await?;
             task_publish_started.notify_one();
             task_publish_release.notified().await;
-            save_guard.restore_writes(was_write_blocked);
+            outcome.disarm();
             Ok::<(), Error>(())
         });
 
@@ -11532,9 +13317,13 @@ mod pools_tests {
 
         let storage = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: false,
+            fail_after_first_write: false,
             pending_write: false,
             write_started: tokio::sync::Notify::new(),
             wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
         });
         let snapshot = PoolMeta {
             version: super::POOL_META_VERSION,
@@ -11543,7 +13332,7 @@ mod pools_tests {
         };
         let mut write_state = super::PoolMetaWriteState::default();
         let err = snapshot
-            .save_no_lock_armed(vec![storage.clone()], &mut write_state, guard.lock_lost_signal())
+            .save_no_lock_armed(vec![storage.clone()], &mut write_state, guard.lock_lost_signal(), &[0])
             .await
             .expect_err("a writer must not persist after losing the distributed pool metadata fence");
 
@@ -11573,9 +13362,13 @@ mod pools_tests {
             .expect("the publishing writer should acquire the pool metadata fence");
         let storage = Arc::new(PartialPoolMetaWriteStorage {
             fail_write: false,
+            fail_after_first_write: false,
             pending_write: false,
             write_started: tokio::sync::Notify::new(),
             wrote: AtomicBool::new(false),
+            revision: AtomicUsize::new(0),
+            stored: StdMutex::new(None),
+            identity: StdMutex::new(None),
         });
         let mut saved = PoolMeta {
             version: super::POOL_META_VERSION,
@@ -11585,9 +13378,9 @@ mod pools_tests {
         saved.pools[0].last_update = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
         let mut current = saved.clone();
         current.pools[0].last_update = OffsetDateTime::UNIX_EPOCH;
-        let mut write_state = super::PoolMetaWriteState::default();
-        let was_write_blocked = saved
-            .save_no_lock_armed(vec![storage], &mut write_state, guard.lock_lost_signal())
+        let mut write_state = super::PoolMetaWriteState::for_test_bootstrap();
+        let outcome = saved
+            .save_no_lock_armed(vec![storage], &mut write_state, guard.lock_lost_signal(), &[0])
             .await
             .expect("the replica save should finish while the fence is valid");
 
@@ -11601,7 +13394,7 @@ mod pools_tests {
             .expect_err("the post-publication fence check must observe the loss");
 
         assert_eq!(current.pools[0].last_update, saved.pools[0].last_update);
-        assert!(!was_write_blocked);
+        drop(outcome);
         write_state
             .ensure_write_safe("lost pool metadata publish fence")
             .expect_err("the sticky write gate must remain armed after post-publication fence loss");
@@ -12103,6 +13896,42 @@ mod pools_tests {
         assert!(persisted.pools[0].decommission.is_none());
         assert_eq!(persisted.pools[1].last_update, newer);
         assert!(persisted.pools[1].decommission.as_ref().is_some_and(|info| info.failed));
+    }
+
+    #[test]
+    fn test_pool_meta_save_merge_rejects_stale_terminal_resurrection() {
+        let older = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let newer = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
+        let mut persisted = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: newer,
+                decommission: Some(PoolDecommissionInfo {
+                    canceled: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let stale = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: older,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(older),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        let err = merge_pool_meta_updates_for_save(&mut persisted, &stale, &[0], "stale writer")
+            .expect_err("a stale active snapshot must not resurrect a canceled pool");
+
+        assert!(err.to_string().contains("stale pool metadata update rejected"));
+        assert!(persisted.pools[0].decommission.as_ref().is_some_and(|info| info.canceled));
     }
 
     #[test]
@@ -13447,20 +15276,18 @@ mod pools_tests {
             .expect("test bucket should be created");
 
         let generation = OffsetDateTime::now_utc();
-        let active_meta = {
+        {
             let mut pool_meta = store.pool_meta.write().await;
-            pool_meta.version = POOL_META_VERSION;
             pool_meta.dont_save = false;
             pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
                 start_time: Some(generation),
                 ..Default::default()
             });
-            pool_meta.clone()
-        };
-        active_meta
-            .save(store.pools.clone())
+        }
+        store
+            .save_current_pool_meta_for_test(&[0])
             .await
-            .expect("active V2 decommission metadata should be persisted before the final sweep");
+            .expect("active decommission metadata should be persisted before the final sweep");
 
         for (disk_index, dir) in dirs.iter().enumerate() {
             let object_dir = dir.path().join(bucket).join(object);

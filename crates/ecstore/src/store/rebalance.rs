@@ -931,8 +931,12 @@ fn lifecycle_delete_all_test_failure(phase: crate::object_api::LifecycleDeleteAl
 mod tests {
     use super::*;
     use crate::bucket::replication::{ReplicationStatusType, VersionPurgeStatusType};
+    use crate::config::com::{read_config_no_lock_preserve_empty_with_metadata, save_config};
     use crate::config::storageclass::{CLASS_RRS, CLASS_STANDARD, lookup_config_for_pools_without_env};
-    use crate::core::pools::{POOL_META_NAME, POOL_META_VERSION, PoolDecommissionInfo, PoolStatus};
+    use crate::core::pools::{
+        POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_VERSION, PoolDecommissionInfo, PoolStatus,
+        initialized_pool_meta_identity_for_test, pool_meta_v3_commit_state_for_test,
+    };
     use crate::disk::error::DiskError;
     use crate::layout::endpoint::Endpoint;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
@@ -2377,6 +2381,135 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn runtime_save_current_pool_meta_reaches_v3_cas_and_disarms_transaction() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-runtime-cas", &[2]).await;
+        let bootstrapped = store
+            .load_runtime_pool_meta("verify fresh bootstrap V3 CAS save")
+            .await
+            .expect("fresh startup should durably publish pool metadata");
+        assert_eq!(bootstrapped.version, 3);
+        let (bootstrap_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), POOL_META_NAME)
+            .await
+            .expect("fresh bootstrap V3 replica should be readable");
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(bootstrap_payload).expect("fresh bootstrap V3 envelope should decode"),
+            (1, true)
+        );
+
+        let saved_at = OffsetDateTime::now_utc() + TimeDuration::seconds(30);
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[0].last_update = saved_at;
+        }
+
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("runtime pool metadata save should reach V3 conditional writes");
+        store
+            .ensure_pool_meta_side_effects_safe("runtime save publication")
+            .await
+            .expect("successful runtime publication must disarm the transaction guard");
+        let persisted = store
+            .load_runtime_pool_meta("verify runtime V3 CAS save")
+            .await
+            .expect("runtime load should observe the committed save");
+        assert_eq!(persisted.version, 3);
+        assert_eq!(persisted.pools[0].last_update, saved_at);
+        let (runtime_payload, _) = read_config_no_lock_preserve_empty_with_metadata(store.pools[0].clone(), POOL_META_NAME)
+            .await
+            .expect("runtime V3 replica should be readable");
+        assert_eq!(
+            pool_meta_v3_commit_state_for_test(runtime_payload).expect("runtime V3 envelope should decode"),
+            (2, true)
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_clear_decommission_cannot_erase_active_or_queued_replacement() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-stale-clear", &[2, 2]).await;
+        let replacement_time = OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(100);
+        let cases = [
+            (
+                "failed-active",
+                PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                },
+                PoolDecommissionInfo {
+                    start_time: Some(replacement_time),
+                    ..Default::default()
+                },
+            ),
+            (
+                "canceled-queued",
+                PoolDecommissionInfo {
+                    canceled: true,
+                    ..Default::default()
+                },
+                PoolDecommissionInfo {
+                    queued: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (case, stale_terminal, replacement_info) in cases {
+            let mut replacement = store
+                .load_runtime_pool_meta("prepare stale clear replacement")
+                .await
+                .expect("the current durable pool metadata should load");
+            replacement.pools[0].last_update = replacement_time;
+            replacement.pools[0].decommission = Some(replacement_info.clone());
+            persist_reload_snapshot(&store, &replacement).await;
+
+            let mut stale_local = replacement.clone();
+            stale_local.pools[0].last_update = OffsetDateTime::UNIX_EPOCH;
+            stale_local.pools[0].decommission = Some(stale_terminal.clone());
+            *store.pool_meta.write().await = stale_local;
+
+            let err = store
+                .clear_decommission(0)
+                .await
+                .expect_err("a stale terminal clear must not erase a durable replacement");
+            assert!(
+                err.to_string()
+                    .contains("persisted active or queued decommission cannot be cleared"),
+                "unexpected {case} rejection: {err}"
+            );
+
+            let durable = store
+                .load_runtime_pool_meta("verify stale clear replacement")
+                .await
+                .expect("the durable replacement should remain readable");
+            let durable_info = durable.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the durable replacement must not be cleared");
+            assert_eq!(durable.pools[0].last_update, replacement_time, "{case} replacement revision changed");
+            assert_eq!(
+                durable_info.start_time, replacement_info.start_time,
+                "{case} replacement generation changed"
+            );
+            assert_eq!(durable_info.queued, replacement_info.queued, "{case} replacement queue state changed");
+
+            let local = store.pool_meta.read().await;
+            let local_info = local.pools[0]
+                .decommission
+                .as_ref()
+                .expect("the failed clear must roll back the stale local terminal state");
+            assert_eq!(local_info.failed, stale_terminal.failed, "{case} failed state was not rolled back");
+            assert_eq!(local_info.canceled, stale_terminal.canceled, "{case} canceled state was not rolled back");
+        }
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn peer_pool_meta_reload_does_not_rollback_newer_local_states() {
         let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-stale", &[2]).await;
 
@@ -2565,7 +2698,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn peer_pool_meta_reload_fails_closed_when_persisted_metadata_is_missing() {
+    async fn peer_pool_meta_reload_latches_recovery_when_initialized_metadata_is_missing() {
         let (temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-missing", &[2]).await;
 
         let kept_time = OffsetDateTime::now_utc();
@@ -2612,11 +2745,15 @@ mod tests {
             panic!("no pool.bin found under {:?}", temp_dir.path());
         }
 
-        let merged_newer = store
+        let err = store
             .reload_pool_meta()
             .await
-            .expect("reload with missing metadata should fail closed, not error");
-        assert!(!merged_newer, "missing persisted metadata must not count as merged state");
+            .expect_err("an initialized cluster with every pool.bin missing must require recovery");
+        assert!(err.to_string().contains("initialized cluster identity exists"));
+        store
+            .ensure_pool_meta_side_effects_safe("test reload side effect")
+            .await
+            .expect_err("the recovery-required reload must latch the runtime side-effect gate");
 
         let pool_meta = store.pool_meta.read().await;
         let info = pool_meta.pools[0]
@@ -2625,6 +2762,62 @@ mod tests {
             .expect("missing persisted metadata must not default local state away");
         assert!(info.complete);
         assert_eq!(pool_meta.pools[0].last_update, kept_time);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_latches_recovery_after_identity_epoch_conflict() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-identity-conflict", &[2, 2]).await;
+        let conflicting_identity =
+            initialized_pool_meta_identity_for_test(store.id, 2).expect("conflicting initialized identity should encode");
+        save_config(store.pools[1].clone(), POOL_META_IDENTITY_NAME, conflicting_identity)
+            .await
+            .expect("second pool identity should be replaced for the conflict scenario");
+
+        let err = store
+            .reload_pool_meta()
+            .await
+            .expect_err("divergent identity epochs must reject runtime reload");
+        assert!(
+            err.to_string()
+                .contains("identity replicas disagree on cluster identity or epoch")
+        );
+        store
+            .ensure_pool_meta_side_effects_safe("identity epoch conflict side effect")
+            .await
+            .expect_err("identity epoch conflict must latch the runtime side-effect gate");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn peer_pool_meta_reload_latches_recovery_after_future_identity_version() {
+        let (_temp_dir, store, shutdown) = setup_multi_pool_test_store("pool-meta-reload-future-identity", &[2, 2]).await;
+        let (mut future_identity, _) =
+            read_config_no_lock_preserve_empty_with_metadata(store.pools[1].clone(), POOL_META_IDENTITY_NAME)
+                .await
+                .expect("current identity should be readable");
+        let current_version = u16::from_le_bytes([future_identity[2], future_identity[3]]);
+        let future_version = current_version
+            .checked_add(1)
+            .expect("identity version should have a future value");
+        future_identity[2..4].copy_from_slice(&future_version.to_le_bytes());
+        save_config(store.pools[1].clone(), POOL_META_IDENTITY_NAME, future_identity)
+            .await
+            .expect("second pool identity should be replaced with a future version");
+
+        let err = store
+            .reload_pool_meta()
+            .await
+            .expect_err("a future identity version must reject runtime reload");
+        assert!(err.to_string().contains("pool metadata incompatible"));
+        store
+            .ensure_pool_meta_side_effects_safe("future identity version side effect")
+            .await
+            .expect_err("future identity version must latch the runtime side-effect gate");
 
         shutdown.cancel();
     }

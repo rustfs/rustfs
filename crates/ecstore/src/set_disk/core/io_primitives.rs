@@ -2803,6 +2803,7 @@ impl SetDisks {
                 let result = if let Some(disk) = disk {
                     Self::record_read_version_call(&object, disk_index);
                     if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(disk_index)) {
+                        Self::record_metadata_slowtail_fault(&object, disk_index);
                         tokio::time::sleep(delay).await;
                     }
                     read_version_via_coalescer(disk, &org_bucket, &bucket, &object, &version_id, &task_opts, allow_coalescing)
@@ -2919,6 +2920,7 @@ impl SetDisks {
                         #[cfg(test)]
                         Self::read_version_fanout_barrier(&object, index).await;
                         if let Some(delay) = slowtail_fault.as_ref().and_then(|fault| fault.delay_for_disk(index)) {
+                            Self::record_metadata_slowtail_fault(&object, index);
                             tokio::time::sleep(delay).await;
                         }
                         read_version_via_coalescer(disk, &org_bucket, &bucket, &object, &version_id, &task_opts, allow_coalescing)
@@ -4832,6 +4834,16 @@ impl SetDisks {
 
     #[cfg(test)]
     #[inline]
+    fn record_metadata_slowtail_fault(object: &str, disk_index: usize) {
+        disk_call_counters::record(object, disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT, disk_index);
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn record_metadata_slowtail_fault(_object: &str, _disk_index: usize) {}
+
+    #[cfg(test)]
+    #[inline]
     async fn read_version_fanout_barrier(object: &str, disk_index: usize) {
         rename_fanout_barrier::checkpoint(object, disk_index, rename_fanout_barrier::PHASE_READ_VERSION).await;
     }
@@ -6332,6 +6344,7 @@ pub(crate) mod disk_call_counters {
     /// Kind label for the per-disk `read_version` metadata RPC.
     pub const KIND_READ_VERSION: &str = "read_version";
     pub const KIND_BATCH_READ_VERSION: &str = "batch_read_version";
+    pub const KIND_METADATA_SLOWTAIL_FAULT: &str = "metadata_slowtail_fault";
 
     /// Registry key: (object, kind, disk_index).
     type CountKey = (String, String, usize);
@@ -6941,22 +6954,22 @@ mod tests {
                 (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
             ],
             async {
+                let calls = disk_call_counters::observe(object);
                 let read_without_data =
                     SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", false, false, false, true, 2);
-                tokio::time::timeout(Duration::from_millis(100), read_without_data)
+                let (_, _, diagnostics) = tokio::time::timeout(Duration::from_secs(2), read_without_data)
                     .await
-                    .expect("non-data metadata fanout must not be delayed by the data-read slowtail hook")
+                    .expect("non-data metadata fanout should complete")
                     .expect("metadata fanout without read_data should resolve");
-
-                let mut read_with_data = Box::pin(SetDisks::read_all_fileinfo_observed(
-                    &disks, bucket, bucket, object, "", true, false, false, true, 2,
-                ));
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(40), &mut read_with_data)
-                        .await
-                        .is_err(),
-                    "data-read metadata fanout must wait for the injected slow read_version response"
+                assert_eq!(diagnostics.total_responses(), DISKS);
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT),
+                    0,
+                    "non-data metadata fanout must not apply the data-read slowtail hook"
                 );
+
+                let read_with_data =
+                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", true, false, false, true, 2);
                 let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_secs(2), read_with_data)
                     .await
                     .expect("injected slowtail should eventually complete")
@@ -6964,6 +6977,16 @@ mod tests {
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
                 assert!(errs.iter().all(Option::is_none));
                 assert_eq!(diagnostics.total_responses(), DISKS);
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT),
+                    1,
+                    "exactly one data-read metadata task should apply the slowtail hook"
+                );
+                assert_eq!(
+                    calls.for_disk(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT, 3),
+                    1,
+                    "the configured slow disk should apply the slowtail hook exactly once"
+                );
             },
         )
         .await;

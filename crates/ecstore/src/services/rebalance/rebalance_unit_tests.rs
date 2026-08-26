@@ -2793,7 +2793,10 @@ async fn test_rebalance_start_save_failure_retries_persisted_completed_state() {
         .start_rebalance_under_gate()
         .await
         .expect_err("the injected first activation save must fail through the real start path");
-    assert!(err.to_string().contains("injected rebalance activation save failure"));
+    assert!(
+        err.to_string().contains("injected rebalance activation save failure"),
+        "unexpected activation error: {err}"
+    );
     {
         let local = store.rebalance_meta.read().await;
         let local = local.as_ref().expect("local rebalance metadata should remain present");
@@ -2854,7 +2857,10 @@ async fn test_rebalance_start_save_failure_retries_persisted_stopped_state() {
         .start_rebalance_under_gate()
         .await
         .expect_err("the injected first stopped-state save must fail through the real start path");
-    assert!(err.to_string().contains("injected rebalance activation save failure"));
+    assert!(
+        err.to_string().contains("injected rebalance activation save failure"),
+        "unexpected activation error: {err}"
+    );
     let mut after_failure = RebalanceMeta::new();
     after_failure
         .load(store.pools[0].clone())
