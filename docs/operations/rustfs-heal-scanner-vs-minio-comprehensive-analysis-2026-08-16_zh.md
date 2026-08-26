@@ -3,7 +3,7 @@
 > English version: [rustfs-heal-scanner-vs-minio-comprehensive-analysis-2026-08-16.md](rustfs-heal-scanner-vs-minio-comprehensive-analysis-2026-08-16.md)
 
 - 日期：2026-08-16（基于 main 分支当日代码，审计时 HEAD ≈ `a118d7e4f`）
-- 范围：`crates/heal`（src 19,560 行 + tests 2,274 行）、`crates/scanner`（src 约 26,000 行 + tests）、`crates/data-usage`、`crates/ecstore` 中 heal/heal_walk/bitrot_self_verify 与 config、`crates/common/src/heal_channel.rs`、`crates/madmin`（heal/scanner wire 类型）、`rustfs/src`（startup wiring、admin handlers、集群 RPC）
+- 范围：`crates/heal`（src 19,560 行 + tests 2,274 行）、`crates/scanner`（src 约 26,000 行 + tests）、`crates/data-usage`、`crates/ecstore` 中 heal/heal_walk/bitrot_self_verify 与 config、`crates/heal-contracts/src/heal_channel.rs`、`crates/madmin`（heal/scanner wire 类型）、`rustfs/src`（startup wiring、admin handlers、集群 RPC）
 - 对标基线：minio/minio master（HEAD `7aac2a2c5b`，仓库已进入维护模式，master 冻结，即最终态）
 - 方法：四路并行审计（heal crate / scanner crate / ecstore 集成层 / MinIO 源码研究），关键结论逐条人工抽验（文内标注"已亲验"处为一手验证）
 - 本文档取代 `docs/rustfs-heal-scanner-vs-minio-parity-assessment.md`（2026-06-15 v1）。v1 之后 heal/scanner 相关提交超过 80 个（换盘自动修复全链路、resume 状态机、usage 收敛权威化、集群级 heal 协调、ILM restore 语义等），v1 的功能清单与差距判断已全面过时；v1 中"bloom filter 缺失"等结论经本次核实为**误判**（详见 §5.4）。
@@ -31,7 +31,7 @@ RustFS 把 MinIO 在 `cmd/` 内单体的 heal/scanner 拆成三层 + 两个独�
 | 原语层 | `crates/ecstore/src/set_disk/ops/heal.rs`（~3,240 行）、`ops/heal_walk.rs`、`ops/bitrot_self_verify.rs`；上层封装 `store/heal.rs`、`store/heal_walk.rs`、`core/sets.rs` | 对象/桶/format/替换盘格式修复、disk-walk 并集枚举、写入路径 bitrot 自校验；由 `SetDisks`/`Sets`/`ECStore` 实现 `rustfs_storage_api::HealOperations` 契约（`crates/storage-api/src/object.rs:503-519`） |
 | heal 运行时 | `crates/heal` | 进程级 HealManager（优先级队列/调度器/auto disk scanner/断点续传 resume）、HealChannelProcessor（消费全局 heal channel）、换盘替换恢复状态机 |
 | scanner 运行时 | `crates/scanner` | 数据使用扫描、ILM 评估与入队、heal 候选生产、复制用量统计、remote scanner RPC |
-| 共享协议 | `crates/common/src/heal_channel.rs`（~776 行） | Start/Query/Cancel 命令通道、`HealOpts`/`HealScanMode`/`HealRequestSource`/`HealAdmission*` 共享类型、`HealResultItem`（madmin） |
+| 共享协议 | `crates/heal-contracts/src/heal_channel.rs`（~776 行） | Start/Query/Cancel 命令通道、`HealOpts`/`HealScanMode`/`HealRequestSource`/`HealAdmission*` 共享类型、`HealResultItem`（madmin） |
 | 共享数据 | `crates/data-usage` | `DataUsageEntry/Info`、直方图、`hash_path`；scanner 产生、ecstore/admin 消费 |
 
 启动链路（已亲验 wiring）：
@@ -214,7 +214,7 @@ heal crate 侧包装（`task.rs:855-1146`）：存在性检查（瞬时错误转
 ### 3.5 ILM 集成
 
 - 每对象 `ScannerItem::apply_actions`（`scanner_folder.rs:747-1032`）：`Evaluator::new(lifecycle).with_lock_retention(...).with_replication_config(...).eval()` 批量评估。
-- 已实现动作（IlmAction 全集，`common/src/metrics.rs:34-45`）：expiry 删除（Delete/DeleteRestored/DeleteRestoredVersion）、全版本删除（DeleteAllVersions/DelMarkerDeleteAllVersions，处理后停止后续版本）、transition（Transition/TransitionVersion，tier 列表运行时读取）、noncurrent 批量（DeleteVersionAction → `enqueue_by_newer_noncurrent`）、free-version 清理（`enqueue_free_version`）、object-lock retention 约束。**与 MinIO 的 9 个 ILM 动作一一对应**。
+- 已实现动作（IlmAction 全集，`scanner-contracts/src/metrics.rs:34-45`）：expiry 删除（Delete/DeleteRestored/DeleteRestoredVersion）、全版本删除（DeleteAllVersions/DelMarkerDeleteAllVersions，处理后停止后续版本）、transition（Transition/TransitionVersion，tier 列表运行时读取）、noncurrent 批量（DeleteVersionAction → `enqueue_by_newer_noncurrent`）、free-version 清理（`enqueue_free_version`）、object-lock retention 约束。**与 MinIO 的 9 个 ILM 动作一一对应**。
 - 执行模型：scanner 是"发现与入队"角色（expiry 队列/transition 队列在 ecstore `bucket_lifecycle_ops.rs`），动作由 worker 池消费——与 MinIO globalExpiryState/globalTransitionState 同型。
 - AbortIncompleteMultipartUpload 不在 scanner/ILM 内执行（MinIO 同样不在：`internal/bucket/lifecycle/rule.go` 有 FIXME，实际由 `erasureSets.cleanupStaleUploads` 全局例程承担）；RustFS 由 ecstore 独立后台任务 `init_background_stale_multipart_upload_cleanup`（`bucket_lifecycle_ops.rs:3289-3320`）+ 桶删除时 on-demand。
 - 集成测试覆盖：transition+restore、free-version、noncurrent、delete-marker、0-day、后台扫描过期（`scanner/tests/lifecycle_integration_test.rs:1071-2095`）。

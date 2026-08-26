@@ -19,13 +19,6 @@ mod readiness;
 pub mod table_catalog;
 pub mod trace_bus;
 
-// Transitional re-export shims (backlog#1843): these modules moved to the
-// rustfs-heal-contracts / rustfs-scanner-contracts crates. Consumers migrate
-// to the new paths crate by crate; the shims are deleted once
-// `rg 'rustfs_common::(metrics|heal_channel|last_minute)'` reports zero hits.
-pub use rustfs_heal_contracts::heal_channel;
-pub use rustfs_scanner_contracts::{last_minute, metrics};
-
 pub use globals::*;
 pub use readiness::{GlobalReadiness, SystemStage};
 
