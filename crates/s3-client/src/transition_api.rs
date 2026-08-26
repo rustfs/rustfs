@@ -19,7 +19,6 @@
 #![allow(clippy::all)]
 
 use crate::bucket_cache::BucketLocationCache;
-use crate::checksum::ChecksumMode;
 use crate::{
     api_error_response::ErrorResponse,
     api_error_response::{err_invalid_argument, http_resp_to_error_response, to_error_response},
@@ -898,7 +897,6 @@ pub struct RequestMetadata {
     pub content_md5_base64: String,
     pub content_sha256_hex: String,
     pub stream_sha256: bool,
-    pub add_crc: ChecksumMode,
     pub trailer: HeaderMap,
 }
 

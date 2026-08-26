@@ -26,7 +26,7 @@ use time::OffsetDateTime;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::checksum::ChecksumMode;
+use crate::checksum::{ChecksumMode, checksum_header_value};
 use crate::utils::base64_encode;
 use crate::{
     api_error_response::{
@@ -223,7 +223,6 @@ impl TransitionClient {
             stream_sha256: false,
             trailer: HeaderMap::new(),
             pre_sign_url: Default::default(),
-            add_crc: Default::default(),
             extra_pre_sign_header: Default::default(),
             bucket_location: Default::default(),
             expires: Default::default(),
@@ -306,7 +305,6 @@ impl TransitionClient {
             stream_sha256: p.stream_sha256,
             trailer: p.trailer.clone(),
             pre_sign_url: Default::default(),
-            add_crc: Default::default(),
             extra_pre_sign_header: Default::default(),
             bucket_location: Default::default(),
             expires: Default::default(),
@@ -329,31 +327,11 @@ impl TransitionClient {
         //}
         let h = resp.headers();
         let mut obj_part = ObjectPart {
-            checksum_crc32: if let Some(h_checksum_crc32) = h.get(ChecksumMode::ChecksumCRC32.key()) {
-                h_checksum_crc32.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
-            checksum_crc32c: if let Some(h_checksum_crc32c) = h.get(ChecksumMode::ChecksumCRC32C.key()) {
-                h_checksum_crc32c.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
-            checksum_sha1: if let Some(h_checksum_sha1) = h.get(ChecksumMode::ChecksumSHA1.key()) {
-                h_checksum_sha1.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
-            checksum_sha256: if let Some(h_checksum_sha256) = h.get(ChecksumMode::ChecksumSHA256.key()) {
-                h_checksum_sha256.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
-            checksum_crc64nvme: if let Some(h_checksum_crc64nvme) = h.get(ChecksumMode::ChecksumCRC64NVME.key()) {
-                h_checksum_crc64nvme.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
+            checksum_crc32: checksum_header_value(h, ChecksumMode::ChecksumCRC32),
+            checksum_crc32c: checksum_header_value(h, ChecksumMode::ChecksumCRC32C),
+            checksum_sha1: checksum_header_value(h, ChecksumMode::ChecksumSHA1),
+            checksum_sha256: checksum_header_value(h, ChecksumMode::ChecksumSHA256),
+            checksum_crc64nvme: checksum_header_value(h, ChecksumMode::ChecksumCRC64NVME),
             ..Default::default()
         };
         obj_part.size = p.size;
@@ -393,7 +371,6 @@ impl TransitionClient {
             stream_sha256: Default::default(),
             trailer: Default::default(),
             pre_sign_url: Default::default(),
-            add_crc: Default::default(),
             extra_pre_sign_header: Default::default(),
             bucket_location: Default::default(),
             expires: Default::default(),

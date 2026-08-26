@@ -262,32 +262,6 @@ pub struct CompletePart {
     pub checksum_crc64nvme: String,
 }
 
-impl CompletePart {
-    #[allow(dead_code, reason = "MinIO-parity accessor with no caller in this port (backlog#1823)")]
-    fn checksum(&self, t: &ChecksumMode) -> String {
-        match t {
-            ChecksumMode::ChecksumCRC32C => {
-                return self.checksum_crc32c.clone();
-            }
-            ChecksumMode::ChecksumCRC32 => {
-                return self.checksum_crc32.clone();
-            }
-            ChecksumMode::ChecksumSHA1 => {
-                return self.checksum_sha1.clone();
-            }
-            ChecksumMode::ChecksumSHA256 => {
-                return self.checksum_sha256.clone();
-            }
-            ChecksumMode::ChecksumCRC64NVME => {
-                return self.checksum_crc64nvme.clone();
-            }
-            _ => {
-                return "".to_string();
-            }
-        }
-    }
-}
-
 #[derive(Debug, Default, serde::Serialize)]
 #[serde(rename = "CompleteMultipartUpload")]
 pub struct CompleteMultipartUpload {
