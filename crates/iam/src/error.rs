@@ -186,6 +186,16 @@ impl From<Error> for IamStorageError {
     }
 }
 
+/// Deliberately a flat, exhaustive mapping rather than a wrapper variant
+/// (backlog#1845 step 8 verdict): folding iam::Error into a
+/// `Policy(Arc<policy::Error>)` wrapper would leave ~140 production
+/// construction/match sites across iam and the admin handlers to migrate in
+/// auth-critical code, and a type alias is blocked by the orphan rule (iam's
+/// `From<IamStorageError>` / io conversions cannot be implemented for a
+/// foreign type). The drift risk the fold aimed at is already covered by the
+/// compiler: this match has no catch-all, so any new policy variant fails the
+/// build here until mapped, and `policy_to_iam_mapping_preserves_messages`
+/// pins that every arm keeps the rendered message intact.
 impl From<rustfs_policy::error::Error> for Error {
     fn from(e: rustfs_policy::error::Error) -> Self {
         match e {
@@ -436,5 +446,51 @@ mod tests {
         for (error, expected_message) in test_cases {
             assert_eq!(error.to_string(), expected_message);
         }
+    }
+
+    #[test]
+    fn policy_to_iam_mapping_preserves_messages() {
+        use rustfs_policy::error::Error as PErr;
+        // One representative per policy::error::Error variant. When a new
+        // variant is added, the exhaustive From match breaks the build first;
+        // extend this list in the same change so the message stays pinned.
+        let representatives: Vec<PErr> = vec![
+            PErr::PolicyError(rustfs_policy::policy::Error::NonResource),
+            PErr::StringError("free-form".to_string()),
+            PErr::NoSuchUser("u".to_string()),
+            PErr::NoSuchAccount("a".to_string()),
+            PErr::NoSuchServiceAccount("sa".to_string()),
+            PErr::NoSuchTempAccount("ta".to_string()),
+            PErr::NoSuchGroup("g".to_string()),
+            PErr::NoSuchPolicy,
+            PErr::PolicyInUse,
+            PErr::GroupNotEmpty,
+            PErr::InvalidArgument,
+            PErr::IamSysNotInitialized,
+            PErr::InvalidServiceType("svc".to_string()),
+            PErr::InvalidAccessKeyLength,
+            PErr::InvalidSecretKeyLength,
+            PErr::ContainsReservedChars,
+            PErr::GroupNameContainsReservedChars,
+            PErr::IAMActionNotAllowed,
+            PErr::NoSecretKeyWithAccessKey,
+            PErr::NoAccessKeyWithSecretKey,
+            PErr::PolicyTooLarge,
+            PErr::Io(std::io::Error::other("io detail")),
+            PErr::IamSysAlreadyInitialized,
+        ];
+
+        for policy_err in representatives {
+            let rendered = policy_err.to_string();
+            let iam_err: Error = policy_err.into();
+            assert_eq!(iam_err.to_string(), rendered, "policy->iam conversion must preserve the rendered message");
+        }
+
+        // The one #[from] payload variant: rendering is preserved end to end.
+        let jwt_err =
+            rustfs_policy::error::Error::from(jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidToken));
+        let rendered = jwt_err.to_string();
+        let iam_err: Error = jwt_err.into();
+        assert_eq!(iam_err.to_string(), rendered);
     }
 }
