@@ -142,6 +142,9 @@ jobs:
       - name: Check logging guardrails
         run: ./scripts/check_logging_guardrails.sh
 
+      - name: Check error other(format!) ratchet
+        run: ./scripts/check_error_other_format_ratchet.sh
+
       - name: Check tokio io-uring feature guard
         run: ./scripts/check_no_tokio_io_uring.sh
 
