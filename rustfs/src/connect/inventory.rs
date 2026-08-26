@@ -1333,7 +1333,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn reader_bounds_the_opened_latest_file_and_reports_missing_state() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
 
         let temp = safe_tempdir();
         let store = InventoryStateStore::from_state_root(temp.path()).expect("store");
@@ -1343,8 +1343,15 @@ mod tests {
         assert!(matches!(store.read_latest(now), Err(InventoryError::StateMissing)));
 
         let latest = temp.path().join("inventory/latest.json");
-        fs::write(&latest, vec![b'x'; MAX_PERSISTED_BYTES]).expect("bounded latest");
-        fs::set_permissions(&latest, fs::Permissions::from_mode(0o600)).expect("mode");
+        let mut latest_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .open(&latest)
+            .expect("secure bounded latest");
+        let bounded = vec![b'x'; MAX_PERSISTED_BYTES];
+        latest_file.write_all(&bounded).expect("bounded latest");
+        drop(latest_file);
         assert!(matches!(store.read_latest(now), Err(InventoryError::EnvelopeInvalid)));
         fs::write(&latest, vec![b'x'; MAX_PERSISTED_BYTES + 1]).expect("oversized latest");
         assert!(matches!(store.read_latest(now), Err(InventoryError::StateOversize)));
