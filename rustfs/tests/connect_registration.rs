@@ -14,6 +14,7 @@
 
 use std::collections::VecDeque;
 use std::fs;
+use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,8 +33,8 @@ use rcgen::{
     KeyUsagePurpose, SanType, SerialNumber,
 };
 use rustfs::connect::{
-    ClientError, CoarseNodeSummary, ConnectClient, ConnectConfig, CredentialStore, HeartbeatConfig, HeartbeatError,
-    HeartbeatSchedule, HeartbeatStatus, IdentityStore, RegistrationToken, TokenError, spawn_heartbeat_runtime,
+    ClientError, CoarseNodeSummary, ConnectClient, ConnectConfig, CredentialStore, DeviceIdentity, HeartbeatConfig,
+    HeartbeatError, HeartbeatSchedule, HeartbeatStatus, IdentityStore, RegistrationToken, TokenError, spawn_heartbeat_runtime,
 };
 #[cfg(target_os = "linux")]
 use rustfs::connect::{InventorySchedule, InventorySnapshot, InventoryStatus, spawn_inventory_runtime};
@@ -418,6 +419,29 @@ fn stores(temp: &tempfile::TempDir) -> (IdentityStore, CredentialStore) {
     )
 }
 
+fn stage_next_identity(temp: &tempfile::TempDir) -> DeviceIdentity {
+    let directory = temp.path().join("identity");
+    fs::create_dir_all(&directory).expect("identity directory");
+    let identity = DeviceIdentity::generate();
+    let der = identity.to_pkcs8_der().expect("encode next identity");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(directory.join("device.key.next")).expect("create next identity");
+    file.write_all(&der).expect("write next identity");
+    file.sync_all().expect("sync next identity");
+    #[cfg(unix)]
+    fs::File::open(&directory)
+        .expect("open identity directory")
+        .sync_all()
+        .expect("sync identity directory");
+    identity
+}
+
 fn client(server: &TestServer, pki: &TestPki, timeout: Duration) -> ConnectClient {
     ConnectClient::new(ConnectConfig {
         endpoint: &server.endpoint,
@@ -457,7 +481,7 @@ fn runtime_config(
     assert_eq!(not_after - not_before, time::Duration::hours(24));
     fs::create_dir_all(temp.path().join("credential")).expect("credential directory");
     write_stored_credential(&temp.path().join("credential/device.crt.json"), &credential);
-    let next = identity_store.load_or_create_next().expect("create next identity");
+    let next = stage_next_identity(temp);
     let mut config = HeartbeatConfig::new(
         endpoint,
         pki.root_pem.as_bytes(),
@@ -1458,9 +1482,7 @@ async fn reenrollment_commit_recovers_after_each_durable_step() {
         .await
         .expect("register");
 
-    let first_next = identity_store
-        .load_or_create_next()
-        .expect("create first reenrollment identity");
+    let first_next = stage_next_identity(&temp);
     let first_enrolled = pki.credential(&first_next, &format!("urn:rustfs:connect:device:{DEVICE_UID}"), 14);
     let first_reenrollment = server(&pki, vec![Reply::Json(StatusCode::CREATED, first_enrolled)]).await;
     client(&first_reenrollment, &pki, Duration::from_secs(2))
