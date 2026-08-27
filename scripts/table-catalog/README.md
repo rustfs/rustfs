@@ -558,6 +558,8 @@ The script requires the same PyIceberg, PyArrow, and boto3 dependencies as the
 PyIceberg smoke because it verifies both cross-engine directions. It creates an
 isolated namespace, keeps the final verified table at two rows for the shared
 evidence contract, and cleans all smoke tables only when `--cleanup` is set.
+It refuses to remove pre-existing suffixed smoke tables unless `--replace` is
+set explicitly. Cleanup preserves a namespace that existed before the run.
 
 The automated claim is limited to DuckDB 1.5.5, static S3 credentials, and the
 single-table scenarios exercised by this script. It does not claim DuckDB's AWS

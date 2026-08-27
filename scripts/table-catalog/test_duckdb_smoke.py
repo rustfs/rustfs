@@ -30,6 +30,7 @@ class DuckDBSmokeTest(unittest.TestCase):
             duckdb_version="1.5.5",
             timeout=60.0,
             cleanup=True,
+            replace=False,
             insecure=False,
             live_evidence_output=None,
             rustfs_build="rustfs-test",
@@ -90,7 +91,49 @@ class DuckDBSmokeTest(unittest.TestCase):
         self.assertIn("MERGE INTO", sql)
         self.assertIn("ALTER TABLE", sql)
         self.assertIn("iceberg_snapshots", sql)
+        self.assertNotIn("DROP TABLE IF EXISTS", sql)
         self.assertIn('DROP TABLE "rustfs_duckdb"."duckdb_smoke"."events_drop"', sql)
+
+    def test_prepare_smoke_tables_refuses_existing_identifiers_without_replace(self) -> None:
+        catalog = mock.Mock()
+        catalog.table_exists.side_effect = lambda identifier: identifier[1] == "events_write"
+
+        with self.assertRaisesRegex(RuntimeError, "duckdb_smoke.events_write"):
+            duckdb_smoke.prepare_smoke_tables(
+                catalog,
+                "duckdb_smoke",
+                ["events_seed", "events_write"],
+                replace=False,
+            )
+
+        catalog.drop_table.assert_not_called()
+
+    def test_prepare_smoke_tables_replaces_only_existing_identifiers_when_requested(self) -> None:
+        catalog = mock.Mock()
+        catalog.table_exists.side_effect = lambda identifier: identifier[1] == "events_write"
+
+        duckdb_smoke.prepare_smoke_tables(
+            catalog,
+            "duckdb_smoke",
+            ["events_seed", "events_write"],
+            replace=True,
+        )
+
+        catalog.drop_table.assert_called_once_with(("duckdb_smoke", "events_write"))
+
+    def test_cleanup_preserves_a_preexisting_namespace(self) -> None:
+        catalog = mock.Mock()
+        catalog.table_exists.return_value = False
+
+        result = duckdb_smoke.cleanup_tables(
+            catalog,
+            "duckdb_smoke",
+            ["events_seed", "events_write"],
+            drop_namespace=False,
+        )
+
+        self.assertEqual(result, "dropped-tables-preserved-existing-namespace")
+        catalog.drop_namespace.assert_not_called()
 
     def test_alias_sql_uses_s3tables_signing(self) -> None:
         sql = duckdb_smoke.alias_sql(self.args(), "events_write")

@@ -57,6 +57,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--duckdb-version", default=DEFAULT_DUCKDB_VERSION)
     parser.add_argument("--timeout", type=float, default=float(os.getenv("RUSTFS_TABLE_SMOKE_TIMEOUT", "60")))
     parser.add_argument("--cleanup", action="store_true")
+    parser.add_argument("--replace", action="store_true", help="Drop existing smoke tables with matching identifiers first.")
     parser.add_argument("--insecure", action="store_true")
     parser.add_argument("--live-evidence-output")
     parser.add_argument("--rustfs-build", default=os.getenv("RUSTFS_BUILD", "operator-recorded"))
@@ -226,9 +227,6 @@ def canonical_positive_sql(args: argparse.Namespace, seed_table: str, write_tabl
     return profile_sql(args, catalog=catalog, table=seed_table) + "\n".join(
         [
             f"CREATE SCHEMA IF NOT EXISTS {namespace};",
-            f"DROP TABLE IF EXISTS {write_identifier};",
-            f"DROP TABLE IF EXISTS {purge_identifier};",
-            f"DROP TABLE IF EXISTS {drop_identifier};",
             f"CREATE TABLE {write_identifier} (id BIGINT, payload VARCHAR);",
             f"INSERT INTO {write_identifier} VALUES (10, 'ten'), (20, 'twenty');",
             f"UPDATE {write_identifier} SET payload = 'TWENTY' WHERE id = 20;",
@@ -351,13 +349,17 @@ def pyiceberg_args(args: argparse.Namespace) -> argparse.Namespace:
     )
 
 
-def seed_pyiceberg_table(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps, table: str) -> Any:
-    iceberg_args = pyiceberg_args(args)
-    catalog = deps.load_catalog(iceberg_args.catalog_name, **pyiceberg_smoke.catalog_properties(iceberg_args))
-    pyiceberg_smoke.install_rustfs_rest_sigv4_adapter(catalog, iceberg_args, deps)
-    pyiceberg_smoke.ensure_namespace(catalog, args.namespace)
+def prepare_smoke_tables(catalog: Any, namespace: str, tables: list[str], replace: bool) -> None:
+    existing = [table for table in tables if pyiceberg_smoke.table_exists(catalog, (namespace, table))]
+    if existing and not replace:
+        identifiers = ", ".join(f"{namespace}.{table}" for table in existing)
+        raise RuntimeError(f"DuckDB smoke tables already exist: {identifiers}; rerun with --replace to remove them")
+    for table in existing:
+        catalog.drop_table((namespace, table))
+
+
+def seed_pyiceberg_table(catalog: Any, args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps, table: str) -> None:
     identifier = (args.namespace, table)
-    pyiceberg_smoke.drop_table_if_present(catalog, identifier)
     schema = deps.pyarrow.schema(
         [
             deps.pyarrow.field("id", deps.pyarrow.int64(), nullable=False),
@@ -371,7 +373,6 @@ def seed_pyiceberg_table(args: argparse.Namespace, deps: pyiceberg_smoke.Runtime
             schema=schema,
         )
     )
-    return catalog
 
 
 def pyiceberg_rows(catalog: Any, namespace: str, table: str) -> list[dict[str, Any]]:
@@ -400,20 +401,21 @@ def run_concurrent_inserts(executable: str, args: argparse.Namespace, write_tabl
     return "passed-with-serial-retry" if retried else "passed-concurrently"
 
 
-def cleanup_tables(catalog: Any, namespace: str, tables: list[str]) -> str:
+def cleanup_tables(catalog: Any, namespace: str, tables: list[str], *, drop_namespace: bool) -> str:
     cleanup_errors: list[str] = []
     for table in tables:
         try:
             pyiceberg_smoke.drop_table_if_present(catalog, (namespace, table))
         except Exception as error:
             cleanup_errors.append(f"{table}: {error}")
-    try:
-        catalog.drop_namespace(namespace)
-    except Exception as error:
-        cleanup_errors.append(f"namespace: {error}")
+    if drop_namespace:
+        try:
+            catalog.drop_namespace(namespace)
+        except Exception as error:
+            cleanup_errors.append(f"namespace: {error}")
     if cleanup_errors:
         raise RuntimeError("DuckDB smoke cleanup failed: " + "; ".join(cleanup_errors))
-    return "dropped-tables-and-namespace"
+    return "dropped-tables-and-namespace" if drop_namespace else "dropped-tables-preserved-existing-namespace"
 
 
 def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> DuckDBSmokeResult:
@@ -435,9 +437,13 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
     drop_table = table_name(args.table, "drop")
     stage_table = table_name(args.table, "stage")
     v3_table = table_name(args.table, "v3")
-    catalog = seed_pyiceberg_table(args, deps, seed_table)
-    for table in [write_table, purge_table, drop_table, stage_table, v3_table]:
-        pyiceberg_smoke.drop_table_if_present(catalog, (args.namespace, table))
+    smoke_tables = [seed_table, write_table, purge_table, drop_table, stage_table, v3_table]
+    catalog = deps.load_catalog(iceberg_args.catalog_name, **pyiceberg_smoke.catalog_properties(iceberg_args))
+    pyiceberg_smoke.install_rustfs_rest_sigv4_adapter(catalog, iceberg_args, deps)
+    namespace_preexisting = bool(catalog.namespace_exists(args.namespace))
+    prepare_smoke_tables(catalog, args.namespace, smoke_tables, args.replace)
+    pyiceberg_smoke.ensure_namespace(catalog, args.namespace)
+    seed_pyiceberg_table(catalog, args, deps, seed_table)
 
     checks: dict[str, str] = {}
     cleanup_result = "not-requested"
@@ -585,7 +591,8 @@ def run_smoke(args: argparse.Namespace, deps: pyiceberg_smoke.RuntimeDeps) -> Du
             cleanup_result = cleanup_tables(
                 catalog,
                 args.namespace,
-                [seed_table, write_table, purge_table, drop_table, stage_table, v3_table],
+                smoke_tables,
+                drop_namespace=not namespace_preexisting,
             )
 
     return DuckDBSmokeResult(client_version, metadata_location, 2, cleanup_result, checks)
