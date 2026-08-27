@@ -190,9 +190,7 @@ use tracing::error;
 use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 
-pub(super) fn restore_operation_id_from_metadata<S: std::hash::BuildHasher>(
-    metadata: &HashMap<String, String, S>,
-) -> Result<Option<Uuid>> {
+pub(super) fn restore_operation_id_from_metadata(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
     let Some(value) = rustfs_utils::http::metadata_compat::get_consistent_str(metadata, SUFFIX_RESTORE_OPERATION_ID) else {
         if rustfs_utils::http::metadata_compat::contains_key_str(metadata, SUFFIX_RESTORE_OPERATION_ID) {
             return Err(Error::other("invalid restore operation id metadata".to_string()));
@@ -206,19 +204,14 @@ pub(super) fn restore_operation_id_from_metadata<S: std::hash::BuildHasher>(
     Ok(Some(id))
 }
 
-pub(super) fn require_restore_operation_id<S: std::hash::BuildHasher>(
-    metadata: &HashMap<String, String, S>,
-    expected: Uuid,
-) -> Result<()> {
+pub(super) fn require_restore_operation_id(metadata: &HashMap<String, String>, expected: Uuid) -> Result<()> {
     match restore_operation_id_from_metadata(metadata)? {
         Some(actual) if actual == expected => Ok(()),
         _ => Err(Error::other("restore operation id changed before copy-back".to_string())),
     }
 }
 
-pub(super) fn restore_commit_operation_id_from_metadata<S: std::hash::BuildHasher>(
-    metadata: &HashMap<String, String, S>,
-) -> Result<Option<Uuid>> {
+pub(super) fn restore_commit_operation_id_from_metadata(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
     if !metadata.contains_key(X_AMZ_RESTORE.as_str()) {
         return Ok(None);
     }
@@ -473,13 +466,13 @@ fn release_materialized_read_lock(bucket: &str, object: &str, read_lock_guard: O
     drop(read_lock_guard);
 }
 
-pub(crate) fn strip_internal_multipart_metadata<S: std::hash::BuildHasher>(metadata: &mut HashMap<String, String, S>) {
+pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
     metadata.remove(RUSTFS_MULTIPART_OBJECT_KEY);
     rustfs_utils::http::metadata_compat::remove_str(metadata, SUFFIX_BUCKET_INCARNATION_ID);
 }
 
-fn should_persist_encryption_original_size<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> bool {
+fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
     metadata.keys().any(|key| is_object_encryption_marker(key))
 }
 
@@ -8802,7 +8795,7 @@ mod tests {
     #[test]
     fn test_list_object_etags() {
         // Test extracting etags from file info metadata
-        let mut metadata = AHashMap::new();
+        let mut metadata = HashMap::new();
         metadata.insert("etag".to_string(), "test-etag".to_string());
 
         let file_info = FileInfo {

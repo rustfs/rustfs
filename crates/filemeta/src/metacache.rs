@@ -1676,7 +1676,7 @@ mod tests {
     }
 
     fn metacache_entry_with_mod_time(mod_time: OffsetDateTime, etag: &str) -> MetaCacheEntry {
-        let mut metadata = ahash::AHashMap::new();
+        let mut metadata = HashMap::new();
         metadata.insert("etag".to_string(), etag.to_string());
 
         let mut meta = FileMeta::new();
@@ -1705,7 +1705,7 @@ mod tests {
         data_blocks: usize,
         parity_blocks: usize,
     ) -> MetaCacheEntry {
-        let mut metadata = ahash::AHashMap::new();
+        let mut metadata = HashMap::new();
         metadata.insert("etag".to_string(), etag.to_string());
 
         let mut fi = FileInfo::new("object", data_blocks, parity_blocks);
@@ -1730,7 +1730,7 @@ mod tests {
     fn metacache_entry_with_erasure_versions(versions: &[(OffsetDateTime, &str, usize, usize)]) -> MetaCacheEntry {
         let mut meta = FileMeta::new();
         for (idx, (mod_time, etag, data_blocks, parity_blocks)) in versions.iter().enumerate() {
-            let mut metadata = ahash::AHashMap::new();
+            let mut metadata = HashMap::new();
             metadata.insert("etag".to_string(), (*etag).to_string());
 
             let mut fi = FileInfo::new("object", *data_blocks, *parity_blocks);
@@ -1776,7 +1776,7 @@ mod tests {
     /// Build an entry holding a single object version with an explicit version id
     /// and mod_time, so a set of these can model DISJOINT per-disk version sets.
     fn metacache_entry_single_version(version_u128: u128, mod_time: OffsetDateTime, etag: &str) -> MetaCacheEntry {
-        let mut metadata = ahash::AHashMap::new();
+        let mut metadata = HashMap::new();
         metadata.insert("etag".to_string(), etag.to_string());
 
         let mut fi = FileInfo::new("object", 4, 2);
