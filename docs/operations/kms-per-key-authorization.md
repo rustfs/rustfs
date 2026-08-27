@@ -81,7 +81,7 @@ Scope and exemptions:
 
 - **SSE-KMS only.** SSE-S3 wraps its data key with a server-owned key the caller never names, and SSE-C never reaches KMS; both are exempt, matching AWS.
 - **The resolved key**, not the header. A bucket default encryption rule naming a KMS key is authorized the same way an explicit `x-amz-server-side-encryption-aws-kms-key-id` header is.
-- **Anonymous requests are exempt.** They have no identity policy to evaluate, and denying them would break public buckets holding SSE-KMS objects. They remain governed by bucket policy.
+- **Anonymous requests are denied.** An anonymous caller has no identity policy and therefore holds no `kms` grants, so under enforcement every anonymous read or write of an SSE-KMS object fails with `AccessDenied` — even when a bucket policy makes the bucket public. This matches AWS, where anonymous requests cannot use SSE-KMS objects at all, and it keeps the per-key gate meaningful: were anonymous requests exempt, any denied identity could bypass the gate on a public bucket by simply dropping its credentials. **A public bucket serving SSE-KMS objects is incompatible with enforcement** — serve public content unencrypted or under SSE-S3 instead. With enforcement off (the default), anonymous access to SSE-KMS objects remains governed by bucket policy alone. The server warns once per process when it first denies an anonymous request; per-request denials appear on audit entries (`kmsOutcome=failure`, `kmsErrorClass=access_denied`, empty requester identity) and at debug level.
 - **Internal work is exempt.** Replication, lifecycle transitions, healing and the scanner run as the system principal.
 - **Authorization runs before key state is checked**, so a denial cannot be used to probe whether a key exists, is disabled, or is pending deletion. The response is always `AccessDenied`.
 - **Multipart uploads are authorized at create time**, where the session data key is generated. Part uploads and completion reuse that envelope and are not re-authorized against the destination key.
@@ -89,13 +89,13 @@ Scope and exemptions:
 
 ## Migration
 
-Data-path enforcement is **off by default in this release** because it changes the outcome of requests that succeed today: an identity holding only `s3:PutObject` can currently encrypt under any key. Turning it on without preparing policies will produce `AccessDenied` on working workloads.
+Data-path enforcement is **off by default** because it changes the outcome of requests that succeed today: an identity holding only `s3:PutObject` can currently encrypt under any key. Turning it on without preparing policies will produce `AccessDenied` on working workloads.
 
 ```bash
 RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY=true
 ```
 
-The server logs the configured mode once at startup, and warns while enforcement is off. A later release defaults it to enabled.
+The server logs the configured mode once at startup, and warns while enforcement is off. Enforcement stays opt-in: there is no roadmap to flip the default.
 
 Recommended sequence:
 

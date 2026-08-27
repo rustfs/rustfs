@@ -961,9 +961,9 @@ fn sse_kms_key_policy_enforced(principal: Option<&SseKmsPrincipal>) -> bool {
 
 /// Report the configured SSE-KMS authorization mode once, at startup.
 ///
-/// The disabled case warns rather than logs: it is the compatibility default for this
-/// release only, and operators need the lead time to grant the kms actions before the
-/// default flips.
+/// The disabled case warns rather than logs: while enforcement is off, any identity
+/// allowed to write an object can encrypt it under any key, and operators should hear
+/// about that even though disabled is the long-term default.
 pub(crate) fn log_sse_kms_key_policy_mode() {
     if sse_kms_key_policy_enforced(None) {
         tracing::info!(
@@ -984,7 +984,7 @@ pub(crate) fn log_sse_kms_key_policy_mode() {
         "SSE-KMS requests are not authorized against the KMS key they name; any identity allowed to \
          write an object may encrypt it under any key, and any identity allowed to read it may have it \
          decrypted. Grant kms:GenerateDataKey and kms:Decrypt on the keys your workloads use, then set \
-         {ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY}=true. A later release defaults this to enabled."
+         {ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY}=true."
     );
 }
 
@@ -1026,6 +1026,25 @@ async fn authorize_sse_kms_key(
         action = ?action,
         "Principal is not authorized for the KMS key resolved for this request"
     );
+
+    // One warn per process, not per request: anonymous denials are driven by
+    // unauthenticated traffic, so a per-request warn would let anyone flood the
+    // log. Per-request detail stays on the audit entry and the debug event above.
+    if principal.account.is_empty() {
+        static ANONYMOUS_DENIAL_WARNED: std::sync::Once = std::sync::Once::new();
+        ANONYMOUS_DENIAL_WARNED.call_once(|| {
+            tracing::warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_SSE,
+                event = "sse_kms_anonymous_key_authorization_denied",
+                action = ?action,
+                "Anonymous requests are being denied by SSE-KMS per-key authorization: anonymous \
+                 callers hold no kms grants, so a public bucket serving SSE-KMS objects is \
+                 incompatible with {ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY}=true. Reported once per \
+                 process; per-request denials are on audit entries and at debug level."
+            );
+        });
+    }
 
     Err(ApiError {
         code: S3ErrorCode::AccessDenied,
