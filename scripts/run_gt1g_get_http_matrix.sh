@@ -84,7 +84,7 @@ run_rust_helper_fallback() {
     helper_out_dir="$PWD/$helper_out_dir"
   fi
 
-  echo "mc not found; falling back to rustfs/tests/gt1g_get_benchmark_tool.rs"
+  echo "mc not found; falling back to rustfs/examples/gt1g_get_benchmark_tool.rs"
 
   GT1G_GET_ACTION=bench \
   GT1G_GET_ENDPOINT="$ENDPOINT" \
@@ -99,7 +99,7 @@ run_rust_helper_fallback() {
   GT1G_GET_ROUNDS="$ROUNDS" \
   GT1G_GET_COOLDOWN_SECS="$COOLDOWN_SECS" \
   GT1G_GET_OUT_DIR="$helper_out_dir" \
-  cargo test -p rustfs --test gt1g_get_benchmark_tool gt1g_get_benchmark_tool -- --ignored --nocapture
+  cargo run -p rustfs --example gt1g_get_benchmark_tool
 }
 
 parse_args() {

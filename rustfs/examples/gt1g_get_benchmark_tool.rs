@@ -1,3 +1,20 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Manual >1GiB GET benchmark: requires a running RustFS server configured via
+//! `GT1G_GET_*` env vars. Run with `cargo run -p rustfs --example gt1g_get_benchmark_tool`.
+
 use anyhow::{Context, Result, anyhow};
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
@@ -511,9 +528,8 @@ async fn run_bench(settings: &ToolSettings, client: &Client) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-#[ignore = "manual >1GiB GET benchmark: requires a running RustFS server configured via env vars"]
-async fn gt1g_get_benchmark_tool() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let settings = ToolSettings::from_env()?;
     let client = build_client(&settings).await?;
 

@@ -1,4 +1,4 @@
-# Concurrent Download Tool (tests)
+# Concurrent Download Tool (example)
 
 This tool downloads multiple URLs concurrently and saves files to a target directory.
 
@@ -34,7 +34,7 @@ After run, the tool prints:
 - latency p95 ms
 - failure details (`[index] url => error`) when failures exist
 
-If any task fails, the test returns error after printing the summary.
+If any task fails, the tool exits with an error after printing the summary.
 
 Retry is triggered only for recoverable cases:
 
@@ -45,13 +45,13 @@ Retry is triggered only for recoverable cases:
 ## Compile check
 
 ```bash
-cargo test -p rustfs --test concurrent_download_tool --no-run
+cargo build -p rustfs --example concurrent_download_tool
 ```
 
 ## Manual run example
 
 The commands below are for manual execution only.
-They are not part of automated test runs.
+The tool is an example binary, so it is built on demand and never runs as part of the test suites.
 
 ```bash
 DOWNLOAD_URLS="http://127.0.0.1:9001/demo/google-cloud-aiplugin-1.46.1-253.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=HAXVOTZK9MLBJT8KWI4E%2F20260329%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260329T105159Z&X-Amz-Expires=86400&X-Amz-Security-Token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzUxMiJ9.eyJwYXJlbnQiOiJydXN0ZnNhZG1pbiIsImV4cCI6MTc3NDgyMDgyMX0.tYhQoPRcg0Ysx4KVw9ez7ZpYxsqGgqomtsP_iaeTsKzoii8EVNt74BZm2wbUjXW-FbGXc1pqEYX6wZ5Ncpk9Iw&X-Amz-Signature=15f47b19832f53b34f9e0fe1862d53d71660bbf8f1a512669bb2d041ac8d0697&X-Amz-SignedHeaders=host&x-amz-checksum-mode=ENABLED&x-id=GetObject" \
@@ -60,6 +60,6 @@ DOWNLOAD_CONCURRENCY="40" \
 DOWNLOAD_REPEAT="40" \
 DOWNLOAD_MAX_RETRIES="2" \
 DOWNLOAD_RETRY_BACKOFF_MS="300" \
-cargo test -p rustfs --test concurrent_download_tool -- --ignored --nocapture
+cargo run -p rustfs --example concurrent_download_tool
 ```
 

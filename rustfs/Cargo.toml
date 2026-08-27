@@ -44,6 +44,18 @@ name = "rustfs-cli-e2e"
 path = "src/bin/rustfs-cli.rs"
 required-features = ["offline-enrollment-e2e-root"]
 
+# The Swift protocol suites are manual (#[ignore]) and need a server built with
+# the `swift` feature; gating the test binaries on the same feature keeps the
+# default `cargo test` / nextest build from linking two dead test binaries
+# (backlog#1846 cluster 4).
+[[test]]
+name = "swift_container_integration_test"
+required-features = ["swift"]
+
+[[test]]
+name = "swift_object_integration_test"
+required-features = ["swift"]
+
 [features]
 default = ["ftps", "webdav"]
 metrics-gpu = ["rustfs-obs/gpu"]
