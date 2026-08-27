@@ -16,6 +16,8 @@
 
 use super::*;
 
+use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
+
 fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
     match err {
         rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
@@ -92,6 +94,11 @@ impl DefaultObjectUsecase {
 
     #[instrument(name = "execute_copy_object", level = "debug", skip(self, req))]
     async fn execute_copy_object_inner(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+        reject_presigned_put_max_content_length_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?;
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
