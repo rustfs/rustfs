@@ -26,8 +26,9 @@ All status checks talk to the RustFS admin API directly (SigV4-signed,
    `{"recursive":true}` (retried, returns a `clientToken`).
 6. Monitors the heal task via `POST /rustfs/admin/v3/heal/?clientToken=<token>`
    until the summary is a terminal success (`finished`/`completed`),
-   `objects_failed == 0`, **and** the outage node's disk usage reaches
-   `HEAL_TARGET_GB` (default 40 GiB).
+   `objects_failed == 0`, **and** the outage node's disk usage reaches the
+   target: at least 90% of the least-used surviving node (an absolute
+   `HEAL_TARGET_GB` floor may override; default 0 = relative only).
 7. Result analysis: heal stats (scanned/healed/failed), per-node disk usage,
    pass/fail verdict.
 
@@ -66,7 +67,7 @@ Same repository secrets/variables as the pool expansion workflow:
 | `package_url`    | nightly | Direct `.deb` URL; empty = latest nightly |
 | `stop_node_gb`   | `15`    | Stop outage node at N GiB on survivors    |
 | `warp_stop_gb`   | `40`    | Stop warp at N GiB on survivors           |
-| `heal_target_gb` | `40`    | Outage node must reach N GiB after heal   |
+| `heal_target_gb` | `0`     | Absolute GiB floor; 0 = relative (≥90% of the least-used surviving node) |
 | `cleanup_before` | `true`  | Reset nodes before the test               |
 | `cleanup_after`  | `true`  | Reset nodes after the test                |
 

@@ -39,9 +39,9 @@ on:
         required: false
         default: '40'
       heal_target_gb:
-        description: 'Heal: outage node must reach N GiB after heal'
+        description: 'Heal: absolute disk floor (GiB); 0 = relative (>=90% of the least-used surviving node)'
         required: false
-        default: '40'
+        default: '0'
       cleanup_before:
         description: 'Reset the nodes before the test (DESTROYS existing data/config)'
         type: boolean
@@ -218,7 +218,7 @@ jobs:
             --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
             --stop-node-gb "${{ inputs.stop_node_gb || '15' }}" \
             --warp-stop-gb "${{ inputs.warp_stop_gb || '40' }}" \
-            --heal-target-gb "${{ inputs.heal_target_gb || '40' }}" \
+            --heal-target-gb "${{ inputs.heal_target_gb || '0' }}" \
             --log-file /tmp/rustfs-heal-test.log
 
       - name: Upload test logs

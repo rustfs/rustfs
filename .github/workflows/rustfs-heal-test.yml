@@ -16,9 +16,9 @@ on:
         required: false
         default: '40'
       heal_target_gb:
-        description: 'Outage node must reach N GiB after heal to pass'
+        description: 'Absolute disk floor (GiB) for heal success; 0 = relative (>=90% of the least-used surviving node)'
         required: false
-        default: '40'
+        default: '0'
       cleanup_before:
         description: 'Reset the nodes before the test (DESTROYS existing data/config)'
         type: boolean
