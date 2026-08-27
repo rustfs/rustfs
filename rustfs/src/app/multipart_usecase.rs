@@ -67,6 +67,7 @@ use super::storage_api::multipart_usecase::sse::{
 use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
 };
+use crate::app::object::{guard_put_object_body_read_timeout, put_object_body_read_timeout};
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
     invalidate_object_data_cache_before_mutation,
@@ -78,7 +79,11 @@ use crate::app::object_usecase::{
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
-use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
+use crate::auth::{
+    VerifiedPresignedRequest, VerifiedSigV4Request, parse_presigned_multipart_max_total_object_size,
+    reject_presigned_multipart_max_total_object_size_for_other_operation,
+    reject_presigned_put_max_content_length_for_other_operation,
+};
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::table_catalog;
@@ -92,8 +97,9 @@ use rustfs_utils::CompressionAlgorithm;
 #[cfg(test)]
 use rustfs_utils::http::insert_header;
 use rustfs_utils::http::{
-    SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
-    SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_header, get_source_scheme,
+    SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS,
+    SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_consistent_str, get_header,
+    get_source_scheme,
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     insert_str,
 };
@@ -108,6 +114,7 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_util::io::StreamReader;
 use tracing::{instrument, warn};
@@ -224,6 +231,22 @@ fn create_multipart_upload_metadata(
     }
 
     metadata
+}
+
+fn multipart_max_total_object_size(metadata: &HashMap<String, String>) -> S3Result<Option<u64>> {
+    if !contains_key_str(metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE) {
+        return Ok(None);
+    }
+
+    let value = get_consistent_str(metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE).ok_or_else(|| {
+        S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "multipart size capability metadata is missing or inconsistent".to_string(),
+        )
+    })?;
+    value.parse::<u64>().map(Some).map_err(|_| {
+        S3Error::with_message(S3ErrorCode::InvalidRequest, "multipart size capability metadata is invalid".to_string())
+    })
 }
 
 /// A multipart session advertises disk compression only when the staged-rollout
@@ -398,6 +421,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        reject_presigned_multipart_max_total_object_size_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+        )?;
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -444,6 +472,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        reject_presigned_multipart_max_total_object_size_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+        )?;
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -752,6 +785,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        let multipart_max_total_object_size = parse_presigned_multipart_max_total_object_size(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+        )?;
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -807,6 +845,9 @@ impl DefaultMultipartUsecase {
         )?;
 
         let mut metadata = create_multipart_upload_metadata(input_metadata, &req.headers, tagging, storage_class.as_ref());
+        if let Some(limit) = multipart_max_total_object_size {
+            insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, limit.to_string());
+        }
 
         let has_explicit_object_lock_retention = object_lock_mode.is_some()
             || object_lock_retain_until_date.is_some()
@@ -978,6 +1019,11 @@ impl DefaultMultipartUsecase {
     #[instrument(level = "debug", skip(self, req))]
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        reject_presigned_multipart_max_total_object_size_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+        )?;
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -1006,6 +1052,40 @@ impl DefaultMultipartUsecase {
 
         let mut size = resolve_upload_part_size(&req.headers, content_length)?;
         let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
+        let Some(store) = self.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+        let fi = store
+            .get_multipart_info(&bucket, &key, &upload_id, &opts)
+            .await
+            .map_err(ApiError::from)?;
+        let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
+        if max_total_object_size.is_some() && size.is_some_and(|size| size < 0) {
+            return Err(S3Error::new(S3ErrorCode::UnexpectedContent));
+        }
+        if max_total_object_size.is_some() && size.is_none() {
+            return Err(S3Error::new(S3ErrorCode::UnexpectedContent));
+        }
+        if let (Some(limit), Some(size)) = (max_total_object_size, size)
+            && u64::try_from(size).is_ok_and(|size| size > limit)
+        {
+            return Err(S3Error::new(S3ErrorCode::EntityTooLarge));
+        }
+        if max_total_object_size.is_some() {
+            let request_id = req
+                .extensions
+                .get::<super::storage_api::multipart_usecase::request_context::RequestContext>()
+                .map(|ctx| ctx.request_id.clone())
+                .unwrap_or_default();
+            body_stream = guard_put_object_body_read_timeout(
+                body_stream,
+                &bucket,
+                &key,
+                &request_id,
+                content_length,
+                put_object_body_read_timeout().max(Duration::from_secs(rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT)),
+            );
+        }
 
         if size.is_none() {
             let mut total = 0i64;
@@ -1025,16 +1105,6 @@ impl DefaultMultipartUsecase {
             let stream = futures::stream::once(async move { Ok::<Bytes, std::io::Error>(combined) });
             body_stream = StreamingBlob::wrap(stream);
         }
-
-        // Get multipart info early to check if managed encryption will be applied
-        let Some(store) = self.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        let fi = store
-            .get_multipart_info(&bucket, &key, &upload_id, &opts)
-            .await
-            .map_err(ApiError::from)?;
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
         let ingress_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(std::time::Instant::now);
@@ -1250,6 +1320,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        reject_presigned_multipart_max_total_object_size_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+        )?;
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -1302,6 +1377,11 @@ impl DefaultMultipartUsecase {
     }
 
     pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+        reject_presigned_multipart_max_total_object_size_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+        )?;
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -1338,6 +1418,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        reject_presigned_multipart_max_total_object_size_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedSigV4Request>().is_some(),
+        )?;
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -1441,6 +1526,7 @@ impl DefaultMultipartUsecase {
             .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
             .await
             .map_err(ApiError::from)?;
+        let destination_size_limit = multipart_max_total_object_size(&mp_info.user_defined)?;
         EncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -1523,19 +1609,25 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(PreconditionFailed));
         }
 
+        let source_logical_size = match src_info.get_actual_size() {
+            Ok(size) if size >= 0 => size,
+            Ok(_) | Err(_) if destination_size_limit.is_some() => {
+                return Err(S3Error::new(S3ErrorCode::UnexpectedContent));
+            }
+            Ok(_) | Err(_) => src_info.size,
+        };
+
         let (_start_offset, length) = if let Some(ref range_spec) = rs {
             // Copy-source ranges are expressed over the logical plaintext object.
             // Encrypted (and compressed) objects have a larger or smaller physical
             // representation, so validating against `size` rejects valid later parts.
-            let validation_size = src_info.get_actual_size().unwrap_or(src_info.size);
-
-            validate_copy_source_range_not_exceeds(range_spec, validation_size)?;
+            validate_copy_source_range_not_exceeds(range_spec, source_logical_size)?;
 
             range_spec
-                .get_offset_length(validation_size)
+                .get_offset_length(source_logical_size)
                 .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRange, e.to_string()))?
         } else {
-            (0, src_info.size)
+            (0, source_logical_size)
         };
 
         let is_disk_compressed =
@@ -2135,6 +2227,16 @@ mod tests {
         assert_eq!(metadata.get(AMZ_STORAGE_CLASS), Some(&"REDUCED_REDUNDANCY".to_string()));
         assert_eq!(metadata.get("x-amz-meta-x-amz-storage-class"), Some(&"user-storage-class".to_string()));
         assert_eq!(metadata.get(AMZ_OBJECT_TAGGING), Some(&"project=rustfs".to_string()));
+    }
+
+    #[test]
+    fn multipart_max_total_object_size_reads_compatible_internal_metadata() {
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, "104857600".to_string());
+        assert_eq!(multipart_max_total_object_size(&metadata).unwrap(), Some(104_857_600));
+
+        metadata.insert("x-minio-internal-max-total-object-size".to_string(), "1".to_string());
+        assert!(multipart_max_total_object_size(&metadata).is_err());
     }
 
     #[tokio::test]

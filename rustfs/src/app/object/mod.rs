@@ -195,6 +195,7 @@ pub(crate) use self::delete::*;
 pub(crate) use self::extract::*;
 pub(crate) use self::get::*;
 use self::put::*;
+pub(crate) use self::put::{guard_put_object_body_read_timeout, put_object_body_read_timeout};
 pub(crate) use self::shared::*;
 #[cfg(test)]
 use self::test_support::*;

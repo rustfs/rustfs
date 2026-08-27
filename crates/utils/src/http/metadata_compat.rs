@@ -44,6 +44,8 @@ pub const SUFFIX_COMPRESSION: &str = "compression";
 pub const SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT: &str = "replication-preserve-ciphertext";
 pub const SUFFIX_COMPRESSION_SIZE: &str = "compression-size";
 pub const SUFFIX_ACTUAL_SIZE: &str = "actual-size";
+/// Maximum logical object size for a capability-bound multipart upload.
+pub const SUFFIX_MAX_TOTAL_OBJECT_SIZE: &str = "max-total-object-size";
 pub const SUFFIX_ACTUAL_OBJECT_SIZE: &str = "actual-object-size";
 /// Used by replication; key stored with capital A
 pub const SUFFIX_ACTUAL_OBJECT_SIZE_CAP: &str = "Actual-Object-Size";

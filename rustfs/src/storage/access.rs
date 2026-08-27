@@ -16,9 +16,10 @@ use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, ReplicationStatusType, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
 use crate::auth::{
-    AuthType, RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, check_key_valid_with_context,
-    get_condition_values_with_client_info, get_condition_values_with_query_and_client_info, get_request_auth_type_with_query,
-    get_session_token, parse_presigned_put_max_content_length,
+    AuthType, RUSTFS_MAX_CONTENT_LENGTH_QUERY, RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY, VerifiedPresignedRequest,
+    VerifiedSigV4Request, check_key_valid_with_context, get_condition_values_with_client_info,
+    get_condition_values_with_query_and_client_info, get_request_auth_type_with_query, get_session_token,
+    parse_presigned_multipart_max_total_object_size, parse_presigned_put_max_content_length,
 };
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -1771,13 +1772,18 @@ impl S3Access for FS {
 
         // Publish this server's context slot so downstream data-plane handlers
         // resolve the same store (backlog#1052 S6).
-        let verified_presigned = matches!(get_request_auth_type_with_query(cx.headers(), cx.uri().query()), AuthType::Presigned);
+        let auth_type = get_request_auth_type_with_query(cx.headers(), cx.uri().query());
+        let verified_presigned = matches!(auth_type, AuthType::Presigned);
+        let verified_sigv4 = matches!(auth_type, AuthType::Presigned | AuthType::Signed);
         {
             let ext = cx.extensions_mut();
             ext.insert(self.server_ctx().clone());
             ext.insert(req_info);
             if verified_presigned {
                 ext.insert(VerifiedPresignedRequest);
+            }
+            if verified_sigv4 {
+                ext.insert(VerifiedSigV4Request);
             }
         }
 
@@ -1791,6 +1797,14 @@ impl S3Access for FS {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
                 format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
+            ));
+        }
+        if parse_presigned_multipart_max_total_object_size(cx.headers(), cx.uri().query(), verified_sigv4)?.is_some()
+            && cx.s3_op().name() != "CreateMultipartUpload"
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
             ));
         }
         license_check().map_err(|er| match er.kind() {
