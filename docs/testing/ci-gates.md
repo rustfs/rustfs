@@ -119,6 +119,11 @@ pull-request gate.
 Use an exact preview tag for end-to-end release rehearsal. Manual dispatches
 are backfill/debug paths and do not prove the automatic `workflow_run` chain.
 
+A preview Release is internal validation state, not a deliverable: after the
+final tag's release is published, `cleanup-preview-releases` deletes every
+`<target>-preview.<N>` Release for that target. The tags themselves are kept, so
+the validated commit stays traceable.
+
 ## Evidence requirements
 
 A green check is useful only when it proves the intended behavior ran:

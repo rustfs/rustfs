@@ -99,6 +99,8 @@ fn preflight_startup_rpc_secret_with(
 const LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES: usize = 6;
 const LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(60 * 3);
 const LOCAL_DECOMMISSION_RESUME_RETRY_DELAY: Duration = Duration::from_secs(30);
+const REBALANCE_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(10);
+const REBALANCE_RESUME_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 fn should_retry_local_decommission_resume(err: &Error, attempt: usize) -> bool {
     matches!(err, Error::ConfigNotFound) && attempt < LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
@@ -108,8 +110,12 @@ fn should_retry_format_load(err: &Error) -> bool {
     !matches!(err, Error::CorruptedFormat)
 }
 
-fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_meta_loaded: bool) -> bool {
-    rebalance_meta_loaded && !decommission_running
+fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_resume_required: bool) -> bool {
+    rebalance_resume_required && !decommission_running
+}
+
+fn should_defer_rebalance_auto_start(distributed: bool, fleet_proof_available: bool) -> bool {
+    distributed && !fleet_proof_available
 }
 
 fn should_schedule_local_decommission_resume(
@@ -125,6 +131,17 @@ async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay:
         _ = rx.cancelled() => false,
         _ = tokio::time::sleep(delay) => true,
     }
+}
+
+async fn wait_for_rebalance_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
+    tokio::select! {
+        _ = rx.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
+}
+
+async fn wait_for_rebalance_resume_retry(rx: &CancellationToken) -> bool {
+    wait_for_rebalance_resume_delay(rx, REBALANCE_RESUME_RETRY_DELAY).await
 }
 
 fn resolve_store_init_stage_result(result: Result<()>, stage: &str) -> Result<()> {
@@ -276,6 +293,71 @@ async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: Cancellat
                     error = %err,
                     reason = "resume_failed",
                     "Failed to resume decommission"
+                );
+                return;
+            }
+        }
+    }
+}
+
+async fn resume_rebalance_after_init(store: Arc<ECStore>, rx: CancellationToken) {
+    if !wait_for_rebalance_resume_delay(&rx, REBALANCE_INITIAL_RESUME_DELAY).await {
+        return;
+    }
+
+    loop {
+        if rx.is_cancelled() {
+            return;
+        }
+
+        let resume_required = store
+            .rebalance_meta
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(crate::services::rebalance::rebalance_requires_worker_activation);
+        if !resume_required {
+            return;
+        }
+
+        if should_defer_rebalance_auto_start(
+            store.ctx.is_dist_erasure().await,
+            crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof().is_some(),
+        ) {
+            if !wait_for_rebalance_resume_retry(&rx).await {
+                return;
+            }
+            continue;
+        }
+
+        match store.start_rebalance().await {
+            Ok(()) => return,
+            Err(err) if crate::core::pools::is_pool_activation_fleet_proof_error(&err) => {
+                warn!(
+                    event = EVENT_ECSTORE_INIT_STATUS,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                    stage = "start_rebalance",
+                    state = "retrying",
+                    reason = "fleet_capability_proof_unavailable",
+                    error = %err,
+                    retry_delay_secs = REBALANCE_RESUME_RETRY_DELAY.as_secs(),
+                    "Retrying deferred rebalance auto-start"
+                );
+                if !wait_for_rebalance_resume_retry(&rx).await {
+                    return;
+                }
+            }
+            Err(err) => {
+                error!(
+                    event = EVENT_ECSTORE_INIT_STATUS,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                    stage = "start_rebalance",
+                    state = "failed",
+                    reason = "deferred_resume_failed",
+                    error = %err,
+                    "Failed to resume rebalance after store initialization"
                 );
                 return;
             }
@@ -574,12 +656,49 @@ impl ECStore {
         }
 
         resolve_store_init_stage_result(self.load_rebalance_meta().await, "load_rebalance_meta")?;
-        let rebalance_meta_loaded = self.rebalance_meta.read().await.is_some();
+        let rebalance_resume_required = {
+            let rebalance_meta = self.rebalance_meta.read().await;
+            rebalance_meta
+                .as_ref()
+                .is_some_and(crate::services::rebalance::rebalance_requires_worker_activation)
+        };
         let decommission_running =
             pool_meta_has_active_decommission(&installed_pool_meta) || self.is_decommission_running().await;
-        if should_auto_start_rebalance_after_init(decommission_running, rebalance_meta_loaded) {
-            resolve_store_init_stage_result(self.start_rebalance().await, "start_rebalance")?;
-        } else if decommission_running && rebalance_meta_loaded {
+        let distributed = self.ctx.is_dist_erasure().await;
+        let fleet_proof_available = crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof().is_some();
+        let mut rebalance_auto_start_deferred = false;
+        if should_auto_start_rebalance_after_init(decommission_running, rebalance_resume_required) {
+            if should_defer_rebalance_auto_start(distributed, fleet_proof_available) {
+                rebalance_auto_start_deferred = true;
+                warn!(
+                    event = EVENT_ECSTORE_INIT_STATUS,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                    stage = "start_rebalance",
+                    state = "deferred",
+                    reason = "fleet_capability_proof_unavailable",
+                    retry_delay_secs = REBALANCE_RESUME_RETRY_DELAY.as_secs(),
+                    "Deferred rebalance auto-start until a live fleet capability proof is available"
+                );
+            } else if let Err(err) = self.start_rebalance().await {
+                if crate::core::pools::is_pool_activation_fleet_proof_error(&err) {
+                    rebalance_auto_start_deferred = true;
+                    warn!(
+                        event = EVENT_ECSTORE_INIT_STATUS,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_STORE_INIT,
+                        stage = "start_rebalance",
+                        state = "deferred",
+                        reason = "fleet_capability_proof_changed",
+                        error = %err,
+                        retry_delay_secs = REBALANCE_RESUME_RETRY_DELAY.as_secs(),
+                        "Deferred rebalance auto-start after the fleet capability proof changed"
+                    );
+                } else {
+                    return resolve_store_init_stage_result(Err(err), "start_rebalance");
+                }
+            }
+        } else if decommission_running && rebalance_resume_required {
             warn!(
                 event = EVENT_ECSTORE_INIT_STATUS,
                 component = LOG_COMPONENT_ECSTORE,
@@ -616,12 +735,13 @@ impl ECStore {
             .is_ok();
         if should_schedule_local_decommission_resume(&local_pool_indices, pool_meta_replica_state, pool_meta_write_safe) {
             let store = self.clone();
+            let decommission_rx = rx.clone();
 
             tokio::spawn(async move {
-                if !wait_for_local_decommission_resume_delay(&rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
+                if !wait_for_local_decommission_resume_delay(&decommission_rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
                     return;
                 }
-                resume_local_decommission_after_init(store, rx, local_pool_indices).await;
+                resume_local_decommission_after_init(store, decommission_rx, local_pool_indices).await;
             });
         } else if !local_pool_indices.is_empty() {
             error!(
@@ -648,6 +768,11 @@ impl ECStore {
             info!("TierConfigMgr init error: {}", err);
         }
 
+        if rebalance_auto_start_deferred {
+            let store = self.clone();
+            tokio::spawn(resume_rebalance_after_init(store, rx));
+        }
+
         Ok(())
     }
 
@@ -665,7 +790,8 @@ mod tests {
         load_pool_meta_for_startup, persist_pool_meta_for_startup_if_safe, pool_first_endpoint_is_local,
         pool_meta_has_active_decommission, preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with,
         resolve_store_init_stage_result, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
-        should_retry_format_load, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
+        should_defer_rebalance_auto_start, should_retry_format_load, should_retry_local_decommission_resume,
+        wait_for_local_decommission_resume_delay,
     };
     #[cfg(feature = "test-util")]
     use crate::disk::DiskAPI;
@@ -1450,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_should_auto_start_rebalance_after_init_allows_loaded_rebalance_without_decommission() {
+    fn test_should_auto_start_rebalance_after_init_allows_active_rebalance_without_decommission() {
         assert!(should_auto_start_rebalance_after_init(false, true));
     }
 
@@ -1460,8 +1586,15 @@ mod tests {
     }
 
     #[test]
-    fn test_should_auto_start_rebalance_after_init_rejects_missing_rebalance_meta() {
+    fn test_should_auto_start_rebalance_after_init_rejects_terminal_or_missing_rebalance() {
         assert!(!should_auto_start_rebalance_after_init(false, false));
+    }
+
+    #[test]
+    fn test_should_defer_rebalance_auto_start_only_without_distributed_fleet_proof() {
+        assert!(should_defer_rebalance_auto_start(true, false));
+        assert!(!should_defer_rebalance_auto_start(true, true));
+        assert!(!should_defer_rebalance_auto_start(false, false));
     }
 
     #[test]
@@ -1473,22 +1606,69 @@ mod tests {
             canceled: false,
             ..Default::default()
         }));
-        let rebalance_meta = Some(RebalanceMeta::default());
+        let rebalance_meta = Some(RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
 
         assert!(!should_auto_start_rebalance_after_init(
             pool_meta_has_active_decommission(&pool_meta),
-            rebalance_meta.is_some()
+            rebalance_meta
+                .as_ref()
+                .is_some_and(crate::services::rebalance::rebalance_requires_worker_activation)
         ));
     }
 
     #[test]
-    fn test_store_init_recovery_allows_rebalance_when_only_rebalance_metadata_exists() {
+    fn test_store_init_recovery_allows_active_rebalance_without_decommission() {
         let pool_meta = init_test_pool_meta(None);
-        let rebalance_meta = Some(RebalanceMeta::default());
+        let rebalance_meta = Some(RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
 
         assert!(should_auto_start_rebalance_after_init(
             pool_meta_has_active_decommission(&pool_meta),
-            rebalance_meta.is_some()
+            rebalance_meta
+                .as_ref()
+                .is_some_and(crate::services::rebalance::rebalance_requires_worker_activation)
+        ));
+    }
+
+    #[test]
+    fn test_store_init_recovery_skips_completed_rebalance_metadata() {
+        let pool_meta = init_test_pool_meta(None);
+        let rebalance_meta = Some(RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        assert!(!should_auto_start_rebalance_after_init(
+            pool_meta_has_active_decommission(&pool_meta),
+            rebalance_meta
+                .as_ref()
+                .is_some_and(crate::services::rebalance::rebalance_requires_worker_activation)
         ));
     }
 
