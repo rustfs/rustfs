@@ -445,8 +445,8 @@ pub(crate) mod replication {
     pub(crate) use super::ecstore_bucket::replication::{
         OperatorRuleContract, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS,
         REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
-        REPLICATION_WRITABLE_FIELDS, assign_site_replication_rule_priorities, is_site_replication_role,
-        merge_incoming_replication_config, replication_target_arn_deployment_id, site_replication_rule_deployment_id,
+        REPLICATION_WRITABLE_FIELDS, assign_site_replication_rule_priorities, merge_incoming_replication_config,
+        replication_target_arn_deployment_id,
     };
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
@@ -653,8 +653,6 @@ pub(crate) mod replication {
 
 pub(crate) mod target {
     pub(crate) use super::ecstore_bucket::target::duration_from_secs_or_nanos;
-    #[allow(clippy::upper_case_acronyms)]
-    pub(crate) type ARN = super::ecstore_bucket::target::ARN;
     pub(crate) type BucketTarget = super::ecstore_bucket::target::BucketTarget;
     pub(crate) type BucketTargetType = super::ecstore_bucket::target::BucketTargetType;
     pub(crate) type BucketTargets = super::ecstore_bucket::target::BucketTargets;

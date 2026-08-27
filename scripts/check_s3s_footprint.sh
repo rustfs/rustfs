@@ -38,8 +38,14 @@ cd "$(dirname "$0")/.."
 # files, zero new s3s code — the same handler-layer surface redistributed).
 # The file counter is split-sensitive; the s3_error! line counter confirms
 # no growth (unchanged at 1620).
+# 1620 → 1616 on 2026-08-27: backlog#1840 moved the site-replication service
+# subsystem to rustfs/src/site_replication/ (s3s access funneled through the
+# root storage facade's s3 shim, keeping the file count at 215). The move
+# inlined one s3_error! call in transport.rs (+1); measured 1615 on the
+# pre-move main (after #6694) and 1616 after, so the slack 1620 baseline is
+# retightened to the measured 1616.
 S3S_IMPORT_FILES_BASELINE=215
-S3_ERROR_LINES_BASELINE=1620
+S3_ERROR_LINES_BASELINE=1616
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;

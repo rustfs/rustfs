@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::admin::runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context};
-use crate::admin::site_replication_identity::{
+use crate::admin::storage_api::error::Error as StorageError;
+use crate::site_replication::identity::{
     deployment_id_for_endpoint, mark_unknown_peer_sync_enabled, normalize_peer_map_by_identity_with,
 };
-use crate::admin::site_replication_state::{SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock_on};
-use crate::admin::storage_api::error::Error as StorageError;
+use crate::site_replication::state_lock::{SITE_REPLICATION_STATE_PATH, with_site_replication_state_lock_on};
 use crate::storage::storage_api::{read_config_no_lock, save_config_no_lock};
 use rustfs_madmin::PeerInfo;
 use s3s::{S3Error, S3ErrorCode, S3Result};

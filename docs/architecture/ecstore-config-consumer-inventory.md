@@ -123,7 +123,7 @@ behind narrower contracts.
 | Files | Current usage |
 |---|---|
 | `rustfs/src/admin/handlers/kms_dynamic.rs` | Uses generic `read_config` and `save_config` for dynamic KMS config objects. |
-| `rustfs/src/admin/handlers/site_replication.rs` | Uses generic `read_config`, `save_config`, and `delete_config` for site-replication state objects. |
+| `rustfs/src/site_replication/state.rs` | Uses generic `read_config`, `save_config`, and `delete_config` (via the root storage facade) for site-replication state objects. |
 | `rustfs/src/admin/service/site_replication.rs` | Uses generic `read_config` and `save_config` for site-replication state normalization. |
 | `rustfs/src/server/module_switch.rs` | Uses generic `read_config` and `save_config` for module-switch config objects. |
 | `crates/iam/src/store/object.rs` | Uses generic `read_config_no_lock`, `read_config_with_metadata`, `save_config`, `save_config_with_opts`, and `delete_config` helper variants for IAM object-store persistence paths. |

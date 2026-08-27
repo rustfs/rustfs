@@ -34,12 +34,11 @@
 //! Lock order: lifecycle -> bucket operation -> repair admission
 //! -> state object lock -> per-bucket metadata.
 
-use crate::admin::storage_api::runtime::ECStore;
-use crate::admin::storage_api::s3::{S3Error, S3ErrorCode, S3Result};
-use crate::storage::storage_api::with_config_object_write_lock;
+use super::{S3Error, S3ErrorCode, S3Result};
+use crate::storage_api::site_replication::{ECStore, with_config_object_write_lock};
 use std::sync::Arc;
 
-use super::runtime_sources::current_object_store_handle;
+use crate::runtime_sources::current_object_store_handle;
 
 /// Config object holding the whole site-replication state, including the
 /// retry-event queue. Shared by the typed handler-side accessors and the

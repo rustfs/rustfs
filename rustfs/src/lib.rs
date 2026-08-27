@@ -100,6 +100,7 @@ pub mod runtime_capabilities;
 pub(crate) mod runtime_sources;
 pub mod server;
 pub mod shared_types;
+pub(crate) mod site_replication;
 pub(crate) mod site_replication_reconcile;
 pub(crate) mod startup_audit;
 pub(crate) mod startup_auth;
