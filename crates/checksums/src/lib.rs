@@ -41,14 +41,18 @@ pub const XXHASH_64_NAME: &str = "xxhash64";
 pub const XXHASH_128_NAME: &str = "xxhash128";
 pub const MD5_NAME: &str = "md5";
 
-/// One of three deliberately separate checksum registries (backlog#1833):
-/// this enum owns the **streaming-hash algorithm registry**, including the
-/// RustFS extensions (sha512, xxhash3/64/128). The on-disk xl.meta bitset
-/// lives in `rustfs_rio::ChecksumType` (crates/rio/src/checksum.rs, varint
-/// bits are append-only), and the MinIO-port client keeps its own
-/// `ChecksumMode` (crates/ecstore/src/client/checksum.rs). When adding an
-/// algorithm, extend all three (or record why not) — they do not derive from
-/// each other.
+/// The canonical checksum-algorithm registry (backlog#1833, backlog#1844):
+/// this enum owns the streaming-hash implementations and, via the exhaustive
+/// per-algorithm metadata methods below, the wire names, header names, digest
+/// lengths, and checksum-type capabilities — including the RustFS extensions
+/// (sha512, xxhash3/64/128). The MinIO-port client's `ChecksumMode`
+/// (crates/s3-client/src/checksum.rs) delegates all per-algorithm dispatch
+/// here through its `algorithm()` bridge. The on-disk xl.meta bitset remains
+/// deliberately separate in `rustfs_rio::ChecksumType`
+/// (crates/rio/src/checksum.rs, varint bits are append-only). When adding an
+/// algorithm: add the variant here (the exhaustive matches force every
+/// metadata decision), bridge it in the client, and allocate an xl.meta bit
+/// in rio (or record why not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ChecksumAlgorithm {
@@ -118,6 +122,84 @@ impl ChecksumAlgorithm {
             Self::Xxhash3 => XXHASH_3_NAME,
             Self::Xxhash64 => XXHASH_64_NAME,
             Self::Xxhash128 => XXHASH_128_NAME,
+        }
+    }
+
+    // Per-algorithm wire metadata. These matches are deliberately exhaustive
+    // (no `_` arm): adding a ChecksumAlgorithm variant without deciding its
+    // name, header, digest length, and checksum-type support must fail to
+    // compile rather than silently inherit a default (backlog#1844).
+
+    /// The canonical `x-amz-checksum-algorithm` wire value (uppercase), as
+    /// carried in S3 requests/responses and stored checksum maps.
+    pub fn s3_algorithm_name(&self) -> &'static str {
+        match self {
+            Self::Crc32 => "CRC32",
+            Self::Crc32c => "CRC32C",
+            Self::Crc64Nvme => "CRC64NVME",
+            Self::Sha1 => "SHA1",
+            Self::Sha256 => "SHA256",
+            Self::Sha512 => "SHA512",
+            Self::Xxhash3 => "XXHASH3",
+            Self::Xxhash64 => "XXHASH64",
+            Self::Xxhash128 => "XXHASH128",
+        }
+    }
+
+    /// The `x-amz-checksum-*` HTTP header that carries this algorithm's
+    /// base64-encoded digest.
+    pub fn http_header_name(&self) -> &'static str {
+        match self {
+            Self::Crc32 => http::CRC_32_HEADER_NAME,
+            Self::Crc32c => http::CRC_32_C_HEADER_NAME,
+            Self::Crc64Nvme => http::CRC_64_NVME_HEADER_NAME,
+            Self::Sha1 => http::SHA_1_HEADER_NAME,
+            Self::Sha256 => http::SHA_256_HEADER_NAME,
+            Self::Sha512 => http::SHA_512_HEADER_NAME,
+            Self::Xxhash3 => http::XXHASH_3_HEADER_NAME,
+            Self::Xxhash64 => http::XXHASH_64_HEADER_NAME,
+            Self::Xxhash128 => http::XXHASH_128_HEADER_NAME,
+        }
+    }
+
+    /// Raw (unencoded) digest length in bytes.
+    pub fn raw_len(&self) -> usize {
+        match self {
+            Self::Crc32 | Self::Crc32c => 4,
+            Self::Crc64Nvme => 8,
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+            Self::Sha512 => 64,
+            Self::Xxhash3 | Self::Xxhash64 => 8,
+            Self::Xxhash128 => 16,
+        }
+    }
+
+    /// Whether the algorithm supports the S3 COMPOSITE multipart checksum
+    /// type. Per the AWS registry, every algorithm does except CRC64NVME,
+    /// which is FULL_OBJECT-only.
+    pub fn supports_composite(&self) -> bool {
+        match self {
+            Self::Crc64Nvme => false,
+            Self::Crc32
+            | Self::Crc32c
+            | Self::Sha1
+            | Self::Sha256
+            | Self::Sha512
+            | Self::Xxhash3
+            | Self::Xxhash64
+            | Self::Xxhash128 => true,
+        }
+    }
+
+    /// Whether the algorithm supports the S3 FULL_OBJECT checksum type, i.e.
+    /// part digests can be linearly combined into the whole-object digest.
+    /// Only the CRC family has this property; the hash algorithms are
+    /// COMPOSITE-only.
+    pub fn supports_full_object(&self) -> bool {
+        match self {
+            Self::Crc32 | Self::Crc32c | Self::Crc64Nvme => true,
+            Self::Sha1 | Self::Sha256 | Self::Sha512 | Self::Xxhash3 | Self::Xxhash64 | Self::Xxhash128 => false,
         }
     }
 }
@@ -729,6 +811,77 @@ mod tests {
         reference.update(TEST_DATA.as_bytes());
         assert_eq!(raw.len(), 16);
         assert_eq!(&raw[..], reference.digest128().to_be_bytes().as_slice());
+    }
+
+    #[test]
+    fn test_algorithm_metadata_is_consistent_for_every_variant() {
+        use crate::Checksum;
+
+        // Cross-checks the per-algorithm metadata methods against the hasher
+        // implementations themselves, so the registry cannot drift from the
+        // code that computes digests (backlog#1844). The list must cover every
+        // variant; the metadata methods use exhaustive matches, so a new
+        // variant that is missing here still fails to compile there first.
+        let all = [
+            ChecksumAlgorithm::Crc32,
+            ChecksumAlgorithm::Crc32c,
+            ChecksumAlgorithm::Crc64Nvme,
+            ChecksumAlgorithm::Sha1,
+            ChecksumAlgorithm::Sha256,
+            ChecksumAlgorithm::Sha512,
+            ChecksumAlgorithm::Xxhash3,
+            ChecksumAlgorithm::Xxhash64,
+            ChecksumAlgorithm::Xxhash128,
+        ];
+
+        for algorithm in all {
+            // Digest length must match what the hasher actually produces.
+            let mut hasher = algorithm.into_impl();
+            hasher.update(b"metadata consistency probe");
+            assert_eq!(
+                algorithm.raw_len(),
+                Checksum::size(&*algorithm.into_impl()) as usize,
+                "{algorithm:?} raw_len() != hasher size()"
+            );
+            assert_eq!(hasher.finalize().len(), algorithm.raw_len(), "{algorithm:?} finalize length != raw_len()");
+
+            // Header name must match the hasher's own header binding.
+            assert_eq!(
+                algorithm.http_header_name(),
+                algorithm.into_impl().header_name(),
+                "{algorithm:?} http_header_name() != HttpChecksum::header_name()"
+            );
+            assert_eq!(
+                algorithm.http_header_name(),
+                format!("x-amz-checksum-{}", algorithm.as_str()),
+                "{algorithm:?} header must be x-amz-checksum-<name>"
+            );
+
+            // The uppercase wire name and the lowercase parse name must be the
+            // same word, and the wire name must parse back to the variant.
+            assert!(
+                algorithm.s3_algorithm_name().eq_ignore_ascii_case(algorithm.as_str()),
+                "{algorithm:?} s3_algorithm_name() and as_str() diverge"
+            );
+            assert_eq!(algorithm.s3_algorithm_name().parse::<ChecksumAlgorithm>().unwrap(), algorithm);
+        }
+
+        // AWS checksum-type support table: CRC64NVME is FULL_OBJECT-only, the
+        // CRC family supports FULL_OBJECT, everything else is COMPOSITE-only.
+        for algorithm in all {
+            let composite = algorithm.supports_composite();
+            let full_object = algorithm.supports_full_object();
+            assert!(composite || full_object, "{algorithm:?} supports no checksum type at all");
+            match algorithm {
+                ChecksumAlgorithm::Crc32 | ChecksumAlgorithm::Crc32c => {
+                    assert!(composite && full_object, "{algorithm:?} must support both checksum types")
+                }
+                ChecksumAlgorithm::Crc64Nvme => {
+                    assert!(!composite && full_object, "CRC64NVME must be FULL_OBJECT-only")
+                }
+                _ => assert!(composite && !full_object, "{algorithm:?} must be COMPOSITE-only"),
+            }
+        }
     }
 
     #[test]
