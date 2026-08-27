@@ -286,70 +286,10 @@ impl AuditRegistry {
 #[cfg(test)]
 mod tests {
     use super::AuditRegistry;
-    use crate::{AuditEntry, AuditError};
-    use rustfs_targets::arn::TargetID;
-    use rustfs_targets::store::{Key, Store};
-    use rustfs_targets::target::{ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta};
-    use rustfs_targets::{StoreError, Target, TargetError};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[derive(Clone)]
-    struct CloseTestTarget {
-        id: TargetID,
-        close_calls: Arc<AtomicUsize>,
-        fail_on_close: bool,
-    }
-
-    impl CloseTestTarget {
-        fn new(id: TargetID, close_calls: Arc<AtomicUsize>, fail_on_close: bool) -> Self {
-            Self {
-                id,
-                close_calls,
-                fail_on_close,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Target<AuditEntry> for CloseTestTarget {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<AuditEntry>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            self.close_calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail_on_close {
-                Err(TargetError::Unknown("close failed".to_string()))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<AuditEntry> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
-    }
+    use crate::AuditError;
+    use rustfs_targets::TargetError;
+    use rustfs_targets::target::ChannelTargetType;
+    use rustfs_targets::testkit::MockTarget;
 
     #[test]
     fn registry_registers_amqp_factory() {
@@ -361,23 +301,21 @@ mod tests {
     #[tokio::test]
     async fn close_all_returns_first_error_and_clears_targets() {
         let mut registry = AuditRegistry::new();
-        let ok_calls = Arc::new(AtomicUsize::new(0));
-        let fail_calls = Arc::new(AtomicUsize::new(0));
+        let ok = MockTarget::new("ok", "webhook");
+        let ok_observer = ok.clone();
+        let fail = MockTarget::new("fail", "webhook")
+            .with_close_failures(usize::MAX)
+            .with_close_failure_error(|| TargetError::Unknown("close failed".to_string()));
+        let fail_observer = fail.clone();
 
-        let ok_id = TargetID::new("ok".to_string(), "webhook".to_string());
-        let fail_id = TargetID::new("fail".to_string(), "webhook".to_string());
-
-        registry.add_target(ok_id.to_string(), Box::new(CloseTestTarget::new(ok_id, Arc::clone(&ok_calls), false)));
-        registry.add_target(
-            fail_id.to_string(),
-            Box::new(CloseTestTarget::new(fail_id, Arc::clone(&fail_calls), true)),
-        );
+        registry.add_target(ok.target_id().to_string(), Box::new(ok));
+        registry.add_target(fail.target_id().to_string(), Box::new(fail));
 
         let result = registry.close_all().await;
 
         assert!(matches!(result, Err(AuditError::Target(TargetError::Unknown(_)))));
-        assert_eq!(ok_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(fail_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(ok_observer.close_call_count(), 1);
+        assert_eq!(fail_observer.close_call_count(), 1);
         assert!(registry.list_targets().is_empty());
     }
 }

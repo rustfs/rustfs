@@ -591,12 +591,19 @@ struct FeatureSpec {
     default_enabled: bool,
 }
 
-fn feature_specs() -> [FeatureSpec; 7] {
-    [
+fn feature_specs() -> &'static [FeatureSpec] {
+    &[
+        FeatureSpec {
+            name: "default",
+            enabled: cfg!(feature = "default"),
+            description: "Default feature set",
+            dependencies: "ftps + webdav",
+            default_enabled: true,
+        },
         FeatureSpec {
             name: "metrics-gpu",
             enabled: cfg!(feature = "metrics-gpu"),
-            description: "Metrics GPU support",
+            description: "GPU metrics support",
             dependencies: "rustfs-obs/gpu",
             default_enabled: false,
         },
@@ -610,7 +617,7 @@ fn feature_specs() -> [FeatureSpec; 7] {
         FeatureSpec {
             name: "swift",
             enabled: cfg!(feature = "swift"),
-            description: "Swift storage backend",
+            description: "OpenStack Swift protocol support",
             dependencies: "rustfs-protocols/swift",
             default_enabled: false,
         },
@@ -620,6 +627,13 @@ fn feature_specs() -> [FeatureSpec; 7] {
             description: "WebDAV protocol support",
             dependencies: "rustfs-protocols/webdav",
             default_enabled: true,
+        },
+        FeatureSpec {
+            name: "sftp",
+            enabled: cfg!(feature = "sftp"),
+            description: "SFTP protocol support",
+            dependencies: "rustfs-protocols/sftp",
+            default_enabled: false,
         },
         FeatureSpec {
             name: "license",
@@ -636,10 +650,80 @@ fn feature_specs() -> [FeatureSpec; 7] {
             default_enabled: false,
         },
         FeatureSpec {
+            name: "tracing-chunk-debug",
+            enabled: cfg!(feature = "tracing-chunk-debug"),
+            description: "Per-chunk data-plane tracing",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
             name: "full",
             enabled: cfg!(feature = "full"),
-            description: "All features enabled",
-            dependencies: "metrics-gpu + ftps + swift + webdav",
+            description: "Full protocol and observability bundle",
+            dependencies: "metrics-gpu + ftps + swift + webdav + sftp + pyroscope",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "e2e-test-hooks",
+            enabled: cfg!(feature = "e2e-test-hooks"),
+            description: "End-to-end test hooks",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "connect-e2e-short-credentials",
+            enabled: cfg!(feature = "connect-e2e-short-credentials"),
+            description: "Short-lived Connect credentials for debug E2E builds",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "offline-enrollment-e2e-root",
+            enabled: cfg!(feature = "offline-enrollment-e2e-root"),
+            description: "Dedicated offline enrollment E2E root",
+            dependencies: "(none)",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "rio-v2",
+            enabled: cfg!(feature = "rio-v2"),
+            description: "RIO v2 storage path support",
+            dependencies: "rustfs-ecstore/rio-v2",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "pyroscope",
+            enabled: cfg!(feature = "pyroscope"),
+            description: "Pyroscope profiling support",
+            dependencies: "rustfs-obs/pyroscope",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "dial9",
+            enabled: cfg!(feature = "dial9"),
+            description: "Tokio runtime telemetry",
+            dependencies: "rustfs-obs/dial9",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "hotpath",
+            enabled: cfg!(feature = "hotpath"),
+            description: "Hotpath instrumentation",
+            dependencies: "hotpath + RustFS crate hotpath features",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "hotpath-alloc",
+            enabled: cfg!(feature = "hotpath-alloc"),
+            description: "Hotpath allocation diagnostics",
+            dependencies: "hotpath + hotpath/hotpath-alloc + RustFS crate hotpath-alloc features",
+            default_enabled: false,
+        },
+        FeatureSpec {
+            name: "hotpath-cpu",
+            enabled: cfg!(feature = "hotpath-cpu"),
+            description: "Hotpath CPU attribution",
+            dependencies: "hotpath + hotpath/hotpath-cpu + RustFS crate hotpath-cpu features",
             default_enabled: false,
         },
     ]
@@ -655,7 +739,7 @@ struct DepsInfoJson {
 
 fn collect_deps_info_json() -> DepsInfoJson {
     let features: Vec<FeatureInfoJson> = feature_specs()
-        .into_iter()
+        .iter()
         .map(|feature| FeatureInfoJson {
             name: feature.name,
             enabled: feature.enabled,
@@ -901,7 +985,7 @@ fn format_deps_info() -> String {
     output.push_str("### Feature Status\n\n");
     output.push_str("| Feature | Status | Description |\n");
     output.push_str("|---------|--------|-------------|\n");
-    for feature in &features {
+    for feature in features {
         let status = if feature.enabled { "✓" } else { "✗" };
         output.push_str(&format!("| {} | {} | {} |\n", feature.name, status, feature.description));
     }
@@ -916,7 +1000,7 @@ fn format_deps_info() -> String {
     output.push_str("\n### Feature Dependencies\n\n");
     output.push_str("| Feature | Dependencies |\n");
     output.push_str("|---------|-------------|\n");
-    for feature in &features {
+    for feature in features {
         output.push_str(&format!("| {} | {} |\n", feature.name, feature.dependencies));
     }
 
@@ -1001,10 +1085,22 @@ mod tests {
         let info = collect_deps_info_json();
         let feature_names: Vec<_> = info.features.iter().map(|feature| feature.name).collect();
 
-        assert_eq!(info.total_count, 7);
-        assert_eq!(info.features.len(), 7);
+        assert_eq!(info.total_count, 19);
+        assert_eq!(info.features.len(), 19);
+        assert!(feature_names.contains(&"default"));
         assert!(feature_names.contains(&"metrics-gpu"));
+        assert!(feature_names.contains(&"sftp"));
         assert!(feature_names.contains(&"io-scheduler-debug"));
+        assert!(feature_names.contains(&"tracing-chunk-debug"));
+        assert!(feature_names.contains(&"e2e-test-hooks"));
+        assert!(feature_names.contains(&"connect-e2e-short-credentials"));
+        assert!(feature_names.contains(&"offline-enrollment-e2e-root"));
+        assert!(feature_names.contains(&"rio-v2"));
+        assert!(feature_names.contains(&"pyroscope"));
+        assert!(feature_names.contains(&"dial9"));
+        assert!(feature_names.contains(&"hotpath"));
+        assert!(feature_names.contains(&"hotpath-alloc"));
+        assert!(feature_names.contains(&"hotpath-cpu"));
         assert!(!feature_names.contains(&"manual-test-runners"));
         assert!(!feature_names.contains(&"metrics"));
         assert!(!feature_names.contains(&"direct-io"));
@@ -1016,10 +1112,16 @@ mod tests {
 
         assert!(output.contains("| metrics-gpu |"));
         assert!(output.contains("| io-scheduler-debug |"));
+        assert!(output.contains("| tracing-chunk-debug |"));
+        assert!(output.contains("| sftp |"));
+        assert!(output.contains("| rio-v2 |"));
+        assert!(output.contains("| dial9 |"));
+        assert!(output.contains("| hotpath-cpu |"));
+        assert!(output.contains("| default | enabled by default |"));
         assert!(!output.contains("| manual-test-runners |"));
         assert!(output.contains("| ftps | enabled by default |"));
         assert!(output.contains("| webdav | enabled by default |"));
-        assert!(output.contains("| full | metrics-gpu + ftps + swift + webdav |"));
+        assert!(output.contains("| full | metrics-gpu + ftps + swift + webdav + sftp + pyroscope |"));
         assert!(!output.contains("| direct-io |"));
     }
 

@@ -26,6 +26,8 @@ pub mod runtime;
 pub mod store;
 pub mod sys;
 pub mod target;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testkit;
 
 pub use catalog::extension::{
     OPS_DIAGNOSTICS_EXTENSION_API_VERSION, OPS_PROFILER_EXTENSION_API_VERSION, S3_HOOK_EXTENSION_API_VERSION,

@@ -476,6 +476,7 @@ mod tests {
     use rustfs_targets::arn::TargetID;
     use rustfs_targets::store::{Key, QueueStore, Store};
     use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
+    use rustfs_targets::testkit::MockTarget;
     use rustfs_targets::{
         EventName, ReplayWorkerManager, StoreError, Target, TargetError, TargetPluginDescriptor, TargetPluginRegistry,
     };
@@ -487,108 +488,6 @@ mod tests {
     const BLOCKING_INIT_TARGET_TYPE: &str = "lifecycle_blocking_init";
     const RETRY_INIT_TARGET_TYPE: &str = "lifecycle_retry_init";
     const REPLAY_TARGET_TYPE: &str = "lifecycle_replay";
-
-    struct BlockingInitState {
-        close_calls: AtomicUsize,
-        init_entered: Notify,
-    }
-
-    #[derive(Clone)]
-    struct BlockingInitTarget {
-        id: TargetID,
-        state: Arc<BlockingInitState>,
-    }
-
-    #[async_trait]
-    impl Target<Event> for BlockingInitTarget {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<Event>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            self.state.close_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<Event> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        async fn init(&self) -> Result<(), TargetError> {
-            self.state.init_entered.notify_one();
-            std::future::pending::<()>().await;
-            Ok(())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
-    }
-
-    #[derive(Clone)]
-    struct RetryInitTarget {
-        fail_once: Arc<AtomicBool>,
-        id: TargetID,
-        should_fail: bool,
-    }
-
-    #[async_trait]
-    impl Target<Event> for RetryInitTarget {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<Event>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<Event> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        async fn init(&self) -> Result<(), TargetError> {
-            if self.should_fail && self.fail_once.swap(false, Ordering::AcqRel) {
-                return Err(TargetError::Initialization("forced transient init failure".to_string()));
-            }
-            Ok(())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
-    }
 
     struct ReplayState {
         active_workers: AtomicUsize,
@@ -929,28 +828,24 @@ mod tests {
     }
 
     fn blocking_init_runtime() -> (
-        Arc<BlockingInitState>,
+        Arc<Notify>,
+        MockTarget,
         NotifyLifecycleCoordinator,
         NotifyRuntimeView,
         Arc<AtomicUsize>,
         Config,
     ) {
-        let state = Arc::new(BlockingInitState {
-            close_calls: AtomicUsize::new(0),
-            init_entered: Notify::new(),
-        });
+        // One observed template feeds every factory-constructed instance, so the returned
+        // observer sees the shared init signal and close counter across generations.
+        let init_entered = Arc::new(Notify::new());
+        let template = MockTarget::new("primary", BLOCKING_INIT_TARGET_TYPE).with_blocking_init(init_entered.clone());
+        let observer = template.clone();
         let mut plugins = TargetPluginRegistry::<Event>::new();
-        let factory_state = state.clone();
         plugins.register(TargetPluginDescriptor::new(
             BLOCKING_INIT_TARGET_TYPE,
             &[ENABLE_KEY],
             |_config| Ok(()),
-            move |id, _config| {
-                Ok(Box::new(BlockingInitTarget {
-                    id: TargetID::new(id, BLOCKING_INIT_TARGET_TYPE.to_string()),
-                    state: factory_state.clone(),
-                }))
-            },
+            move |id, _config| Ok(Box::new(template.clone().with_id(&id, BLOCKING_INIT_TARGET_TYPE))),
         ));
         let config = config_with_enabled_test_target(BLOCKING_INIT_TARGET_TYPE, "primary");
         let handoff_count = Arc::new(AtomicUsize::new(0));
@@ -962,7 +857,7 @@ mod tests {
                 observer_count.fetch_add(1, Ordering::SeqCst);
             })),
         );
-        (state, coordinator, runtime_view, handoff_count, config)
+        (init_entered, observer, coordinator, runtime_view, handoff_count, config)
     }
 
     async fn recv_until_generation(receiver: &mut mpsc::UnboundedReceiver<usize>, expected: usize, context: &str) {
@@ -1001,10 +896,10 @@ mod tests {
 
     #[tokio::test]
     async fn real_runtime_disable_supersedes_target_init_and_leaves_no_runtime_state() {
-        let (state, coordinator, runtime_view, handoff_count, config) = blocking_init_runtime();
+        let (init_entered, observer, coordinator, runtime_view, handoff_count, config) = blocking_init_runtime();
 
         let enable = coordinator.set_mode(true, Some(config));
-        state.init_entered.notified().await;
+        init_entered.notified().await;
         let disable = coordinator.set_mode(false, None);
 
         enable.wait().await.expect("superseded real enable should finish");
@@ -1013,7 +908,7 @@ mod tests {
         let status = runtime_view.runtime_status_snapshot().await;
         assert_eq!(status.target_count, 0);
         assert_eq!(status.replay_worker_count, 0);
-        assert_eq!(state.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.close_call_count(), 1);
         assert_eq!(handoff_count.load(Ordering::SeqCst), 0);
         assert_eq!(coordinator.state(), NotificationRuntimeState::LiveOnly);
     }
@@ -1057,10 +952,10 @@ mod tests {
 
     #[tokio::test]
     async fn real_runtime_terminate_cancels_target_init_and_is_final() {
-        let (state, coordinator, runtime_view, handoff_count, config) = blocking_init_runtime();
+        let (init_entered, observer, coordinator, runtime_view, handoff_count, config) = blocking_init_runtime();
 
         let enable = coordinator.set_mode(true, Some(config));
-        state.init_entered.notified().await;
+        init_entered.notified().await;
         let terminate = coordinator.terminate();
 
         enable.wait().await.expect("superseded real enable should finish");
@@ -1069,7 +964,7 @@ mod tests {
         let status = runtime_view.runtime_status_snapshot().await;
         assert_eq!(status.target_count, 0);
         assert_eq!(status.replay_worker_count, 0);
-        assert_eq!(state.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.close_call_count(), 1);
         assert_eq!(handoff_count.load(Ordering::SeqCst), 0);
         assert_eq!(coordinator.state(), NotificationRuntimeState::Terminated);
         let err = coordinator
@@ -1085,18 +980,19 @@ mod tests {
 
     #[tokio::test]
     async fn partial_activation_reports_error_and_same_config_can_retry() {
-        let fail_once = Arc::new(AtomicBool::new(true));
+        // The template's single-failure init budget is shared by every clone the factory hands
+        // out, so the "bad" instance fails once in the first generation and recovers on retry.
+        let bad_template = MockTarget::new("bad", RETRY_INIT_TARGET_TYPE).with_init_failures(1);
         let mut plugins = TargetPluginRegistry::<Event>::new();
-        let factory_fail_once = fail_once.clone();
         plugins.register(TargetPluginDescriptor::new(
             RETRY_INIT_TARGET_TYPE,
             &[ENABLE_KEY],
             |_config| Ok(()),
             move |id, _config| {
-                Ok(Box::new(RetryInitTarget {
-                    should_fail: id == "bad",
-                    id: TargetID::new(id, RETRY_INIT_TARGET_TYPE.to_string()),
-                    fail_once: factory_fail_once.clone(),
+                Ok(Box::new(if id == "bad" {
+                    bad_template.clone()
+                } else {
+                    MockTarget::new(&id, RETRY_INIT_TARGET_TYPE)
                 }))
             },
         ));
