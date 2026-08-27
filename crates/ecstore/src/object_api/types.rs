@@ -1008,7 +1008,7 @@ impl ObjectInfo {
             successor_mod_time: fi.successor_mod_time,
             etag,
             inlined,
-            user_defined: Arc::new(metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            user_defined: Arc::new(metadata),
             transitioned_object,
             transition_version_state: fi.transition_version_state,
             checksum: fi.checksum.clone(),
@@ -1316,7 +1316,7 @@ impl ObjectInfo {
         if part > 0
             && let Some(checksums) = self.parts.iter().find(|p| p.number == part).and_then(|p| p.checksums.clone())
         {
-            return Ok((checksums.iter().map(|(k, v)| (k.clone(), v.clone())).collect(), true));
+            return Ok((checksums, true));
         }
 
         if let Some(data) = &self.checksum {
@@ -1812,7 +1812,7 @@ mod tests {
             storageclass::GLACIER,
         ] {
             let fi = FileInfo {
-                metadata: AHashMap::from([(AMZ_STORAGE_CLASS.to_string(), legacy_label.to_string())]),
+                metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), legacy_label.to_string())]),
                 ..Default::default()
             };
 

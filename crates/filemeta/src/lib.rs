@@ -22,12 +22,6 @@ mod replication;
 
 pub mod test_data;
 
-/// High-performance HashMap type alias using ahash instead of SipHash.
-pub type AHashMap<K, V> = ahash::AHashMap<K, V>;
-
-/// High-performance HashSet type alias using ahash.
-pub type AHashSet<K> = ahash::AHashSet<K>;
-
 pub use error::*;
 pub use fileinfo::*;
 pub use filemeta::*;
