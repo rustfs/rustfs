@@ -156,6 +156,7 @@ fn rustfs_s3_config() -> S3Config {
     let mut s3_config = S3Config::default();
     s3_config.normalize_forward_slash_path = true;
     s3_config.enable_sig_v2 = true;
+    s3_config.sig_v4_allowed_services.push("s3tables".to_string());
     s3_config
 }
 
@@ -2273,6 +2274,9 @@ mod tests {
 
         assert!(s3_config.normalize_forward_slash_path);
         assert!(s3_config.enable_sig_v2);
+        assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "s3"));
+        assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "sts"));
+        assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "s3tables"));
     }
 
     #[test]
