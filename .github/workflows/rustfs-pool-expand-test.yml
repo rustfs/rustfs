@@ -154,7 +154,7 @@ jobs:
         with:
           name: rustfs-pool-test-${{ github.run_id }}
           path: |
-            /tmp/rustfs-pool-test.log
+            /tmp/rustfs-pool-test*.log
             /tmp/rustfs-warp.*.log
           if-no-files-found: warn
 
