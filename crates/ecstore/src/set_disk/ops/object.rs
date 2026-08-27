@@ -42,12 +42,13 @@ use super::super::{
     can_try_inline_data_shards_direct, check_object_lock_delete, check_object_lock_for_deletion_with_state,
     check_object_lock_retention_update, classify_get_codec_streaming_object_class, classify_put_write_path,
     classify_storage_error, collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer, debug,
-    delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error, finish_set_disk_read_lock,
-    get_codec_streaming_reader_gate, get_object_body_cache_hook, get_raw_etag, get_small_object_direct_memory_decision,
-    get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_erasure_shard_file_offset,
-    inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found,
-    is_explicit_null_version, is_lock_optimization_enabled, issue3031_diag_enabled, join_all, known_put_object_storage_size,
-    path_join_buf, put_restore_opts, record_compression_total_memory, record_get_codec_streaming_gate_decision,
+    delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker,
+    finish_set_disk_read_lock, get_codec_streaming_reader_gate, get_object_body_cache_hook, get_raw_etag,
+    get_small_object_direct_memory_decision, get_stage_timer_if_enabled, get_str,
+    get_transitioned_object_reader_with_tier_manager, inline_erasure_shard_file_offset, inline_erasure_shard_size, insert_str,
+    is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found, is_explicit_null_version,
+    is_lock_optimization_enabled, issue3031_diag_enabled, join_all, known_put_object_storage_size, path_join_buf,
+    put_restore_opts, record_compression_total_memory, record_get_codec_streaming_gate_decision,
     record_get_direct_memory_decision, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
     record_get_object_reader_path_observation, record_get_stage_duration_if_enabled, record_lock_acquire,
     reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate, require_restore_operation_id,
@@ -6528,7 +6529,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // removal take the non-marker branch below, so the response lost
             // `DeleteMarker`/`DeleteMarkerVersionId` and the removal was
             // accounted as an object deletion (issue #6745).
-            if goi.delete_marker && dobj.version_id.is_some() && delete_file_info_version_id(goi.version_id) == version_id {
+            let removed_delete_marker =
+                goi.delete_marker && dobj.version_id.is_some() && delete_file_info_version_id(goi.version_id) == version_id;
+            // Response-side only for the null identity: a delete request marked
+            // `deleted` with `version_id == None` makes `FileMeta::delete_version`
+            // re-create the marker it just removed (the suspended-bucket
+            // "delete mints a marker" write path), so the write shape must stay
+            // untouched for explicit null-marker removals.
+            if removed_delete_marker && version_id.is_some() {
                 vr.deleted = true;
                 vr.mod_time = goi.mod_time;
             }
@@ -6547,9 +6555,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             };
 
-            if vr.deleted {
+            if vr.deleted || removed_delete_marker {
                 del_objects[i] = DeletedObject {
-                    delete_marker: vr.deleted,
+                    delete_marker: true,
                     // `vr.version_id` holds the storage identity, which is
                     // `None` for an explicit null-marker removal; report the
                     // client-facing null identity so the response can carry
@@ -6559,7 +6567,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     } else {
                         vr.version_id
                     },
-                    delete_marker_mtime: vr.mod_time,
+                    // For a null-marker removal `vr` stays undeleted (write
+                    // shape), so take the marker's mtime from the source.
+                    delete_marker_mtime: vr.mod_time.or(goi.mod_time),
                     object_name: vr.name.clone(),
                     replication_state: vr.replication_state_internal.clone(),
                     ..Default::default()
@@ -7212,6 +7222,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         obj_info.user_defined = Arc::clone(&goi.user_defined);
         obj_info.parts = Arc::clone(&goi.parts);
         obj_info.user_tags = Arc::clone(&goi.user_tags);
+        // Report delete-marker semantics for an explicit-version delete whose
+        // target was a delete marker. On versioning-suspended buckets
+        // `resolve_delete_version_state` cannot mark the write request itself
+        // (a `deleted` write with the null identity re-creates the marker), so
+        // the marker-ness is restored on the response here (issue #6745).
+        if explicit_delete_removed_marker(&opts, &goi, version_found) {
+            obj_info.delete_marker = true;
+        }
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         Ok(obj_info)
     }
