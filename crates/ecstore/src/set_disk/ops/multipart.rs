@@ -449,7 +449,7 @@ fn fence_commit_on_lock_loss(guard: Option<&ObjectLockDiagGuard>, mode: &'static
     Ok(())
 }
 
-fn multipart_bucket_incarnation_id<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> Result<Option<Uuid>> {
+fn multipart_bucket_incarnation_id(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
     let Some(value) = rustfs_utils::http::metadata_compat::get_consistent_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) else {
         if rustfs_utils::http::metadata_compat::contains_key_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) {
             return Err(Error::other("invalid multipart bucket incarnation metadata"));
@@ -463,15 +463,12 @@ fn multipart_bucket_incarnation_id<S: std::hash::BuildHasher>(metadata: &HashMap
     Ok(Some(incarnation))
 }
 
-fn multipart_bucket_incarnation_matches<S: std::hash::BuildHasher>(
-    metadata: &HashMap<String, String, S>,
-    expected: Uuid,
-) -> bool {
+fn multipart_bucket_incarnation_matches(metadata: &HashMap<String, String>, expected: Uuid) -> bool {
     matches!(multipart_bucket_incarnation_id(metadata), Ok(Some(actual)) if actual == expected)
 }
 
-fn validate_multipart_bucket_incarnation<S: std::hash::BuildHasher>(
-    metadata: &HashMap<String, String, S>,
+fn validate_multipart_bucket_incarnation(
+    metadata: &HashMap<String, String>,
     bucket: &str,
     object: &str,
     upload_id: &str,
@@ -1524,7 +1521,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 mod_time: Some(OffsetDateTime::now_utc()),
                 actual_size,
                 index: index_op,
-                checksums: if checksums.is_empty() { None } else { Some(checksums.iter().map(|(k, v)| (k.clone(), v.clone())).collect()) },
+                checksums: if checksums.is_empty() { None } else { Some(checksums) },
                 ..Default::default()
             };
 
@@ -1719,7 +1716,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             max_parts,
             part_number_marker,
             user_defined: {
-                let mut metadata: HashMap<String, String> = fi.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                let mut metadata = fi.metadata.clone();
                 strip_internal_multipart_metadata(&mut metadata);
                 metadata
             },
@@ -1978,7 +1975,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let mod_time = opts.mod_time.unwrap_or_else(OffsetDateTime::now_utc);
 
         for f in parts_metadatas.iter_mut() {
-            f.metadata = user_defined.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            f.metadata = user_defined.clone();
             f.mod_time = Some(mod_time);
             f.fresh = true;
         }
@@ -2067,7 +2064,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             upload_id: upload_id.to_owned(),
             user_defined: {
                 strip_internal_multipart_metadata(&mut fi.metadata);
-                fi.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                fi.metadata.clone()
             },
             ..Default::default()
         })

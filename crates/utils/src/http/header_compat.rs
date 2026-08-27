@@ -89,9 +89,7 @@ pub fn is_object_encryption_marker(key: &str) -> bool {
 }
 
 /// Reads the logical object size recorded by encryption metadata.
-pub fn get_object_encryption_original_size<S: std::hash::BuildHasher>(
-    metadata: &std::collections::HashMap<String, String, S>,
-) -> std::io::Result<Option<i64>> {
+pub fn get_object_encryption_original_size(metadata: &std::collections::HashMap<String, String>) -> std::io::Result<Option<i64>> {
     let actual_size = super::get_str(metadata, super::SUFFIX_ACTUAL_SIZE);
     let size = get_case_insensitive(metadata, RUSTFS_ENCRYPTION_ORIGINAL_SIZE)
         .or_else(|| get_case_insensitive(metadata, SSEC_ORIGINAL_SIZE))
@@ -105,10 +103,7 @@ pub fn get_object_encryption_original_size<S: std::hash::BuildHasher>(
         .map_err(|error| std::io::Error::other(format!("Failed to parse encryption original size: {error}")))
 }
 
-fn get_case_insensitive<'a, S: std::hash::BuildHasher>(
-    metadata: &'a std::collections::HashMap<String, String, S>,
-    key: &str,
-) -> Option<&'a str> {
+fn get_case_insensitive<'a>(metadata: &'a std::collections::HashMap<String, String>, key: &str) -> Option<&'a str> {
     metadata.get(key).map(String::as_str).or_else(|| {
         metadata
             .iter()

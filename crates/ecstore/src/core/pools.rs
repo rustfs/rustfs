@@ -5815,7 +5815,7 @@ fn decommission_remote_tiered_opts(
         versioned: version_id.is_some(),
         version_id,
         mod_time: version.mod_time,
-        user_defined: version.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        user_defined: version.metadata.clone(),
         src_pool_idx,
         data_movement: true,
         incl_free_versions: version.tier_free_version(),
@@ -11894,7 +11894,7 @@ mod tests {
         let mod_time = OffsetDateTime::now_utc();
         let version = rustfs_filemeta::FileInfo {
             mod_time: Some(mod_time),
-            metadata: AHashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            metadata: HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
             ..Default::default()
         };
 
