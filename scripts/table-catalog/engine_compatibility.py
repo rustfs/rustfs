@@ -53,7 +53,7 @@ LIVE_EVIDENCE_ALLOWED_CLAIMS = OrderedDict(
         ("PyIceberg", ["automated-smoke"]),
         ("Spark Iceberg REST catalog", ["manual-live-verified"]),
         ("Trino Iceberg REST catalog", ["manual-live-read-verified"]),
-        ("DuckDB Iceberg", ["manual-live-read-verified"]),
+        ("DuckDB Iceberg", ["manual-live-read-verified", "automated-rest-catalog-smoke"]),
         ("Databend", ["manual-live-s3-stage-verified"]),
         ("Snowflake Open Catalog / Iceberg integrations", ["reference-only"]),
     ]
@@ -155,13 +155,15 @@ def engine_compatibility_matrix() -> list[dict[str, Any]]:
         },
         {
             "client": "DuckDB Iceberg",
-            "status": "manual-live-harness",
-            "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
+            "status": "automated-smoke",
+            "entrypoint": "scripts/table-catalog/duckdb_smoke.py",
             "scenarios": [
-                scenario("metadata-read", "manual-live-probe", "read a supplied Iceberg metadata location through DuckDB iceberg_scan"),
-                scenario("catalog-attach", "generated-harness", "attach RustFS as a generic signed Iceberg REST catalog"),
-                scenario("read-table", "manual-live-probe", "read an existing table through the attached catalog"),
-                scenario("write-table", "manual-validation-required", "generated SQL does not promote DuckDB write compatibility"),
+                scenario("metadata-read", "automated", "read the final metadata location through DuckDB iceberg_scan"),
+                scenario("catalog-attach", "automated", "attach `/iceberg` with s3 signing and `/_iceberg` with s3tables signing"),
+                scenario("read-table", "automated", "read a PyIceberg-created table through the attached catalog"),
+                scenario("write-table", "automated", "exercise single-table DDL, DML, schema evolution, snapshots, and PyIceberg cross-read"),
+                scenario("unsupported-boundaries", "automated", "verify staged create, purge, and format v3 fail closed"),
+                scenario("multi-table-mode", "automated", "verify DuckDB can avoid the multi-table commit endpoint without claiming cross-table atomicity"),
             ],
         },
         {
@@ -682,11 +684,11 @@ def live_conformance_evidence(
                     OrderedDict(
                         [
                             ("client", "DuckDB Iceberg"),
-                            ("scenario", "iceberg-scan-current-metadata-location"),
+                            ("scenario", "rest-catalog-single-table-read-write-cross-engine-negative-boundaries"),
                             ("expected_status", "pass"),
                             ("expected_row_count", 2),
-                            ("claim_after_pass", "manual-live-read-verified"),
-                            ("write_claim_after_pass", "not-claimed"),
+                            ("claim_after_pass", "automated-rest-catalog-smoke"),
+                            ("write_claim_after_pass", "single-table-automated-smoke"),
                         ]
                     ),
                     OrderedDict(
@@ -712,9 +714,9 @@ def live_conformance_evidence(
             (
                 "promotion_rules",
                 [
-                    "Keep PyIceberg as the only automated claim unless the run is executed by CI or a repeatable operator job.",
+                    "Keep PyIceberg and DuckDB automated claims tied to their repeatable smoke entrypoints and recorded client versions.",
                     "Promote Spark only to manual-live-verified when the exact RustFS build, Spark version, Iceberg version, SQL output, and row_count are recorded.",
-                    "Do not promote Trino or DuckDB write compatibility from read probes; write compatibility remains not-claimed.",
+                    "Keep Trino write compatibility not-claimed after its read probe and do not broaden DuckDB beyond the automated single-table scenarios.",
                     "Do not promote Snowflake or vendor catalog interoperability from a generated template without a repeatable live run.",
                     "Treat manual-live failures as compatibility findings and keep the previous public claim boundary.",
                 ],
@@ -1624,7 +1626,7 @@ def live_conformance_harness(
                     OrderedDict(
                         [
                             ("name", "DuckDB Iceberg"),
-                            ("status", "manual-live-harness"),
+                            ("status", "automated-smoke"),
                             ("version", duckdb_version),
                             ("metadata_location", metadata_location),
                             ("sql_file", "/tmp/rustfs-s3tables-duckdb-read.sql"),
@@ -1641,8 +1643,8 @@ def live_conformance_harness(
                                 "rest_catalog_expected",
                                 "generic Iceberg REST ATTACH returns row_count=2 for an existing RustFS table",
                             ),
-                            ("rest_catalog_write_compatibility", "manual-live-validation-required"),
-                            ("write_compatibility", "not-claimed"),
+                            ("rest_catalog_write_compatibility", "single-table-automated-smoke"),
+                            ("write_compatibility", "single-table-automated-smoke"),
                         ]
                     ),
                     OrderedDict(
