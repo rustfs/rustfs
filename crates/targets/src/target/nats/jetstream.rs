@@ -333,18 +333,15 @@ pub(crate) fn retry_lifetime(ack_timeout: Duration) -> Duration {
 mod tests {
     use super::*;
     use crate::Target;
-    use crate::arn::TargetID;
     use crate::store::{FailedEventStore, QueueStore};
     use crate::target::TargetType;
     use crate::target::nats::test_support::*;
     use crate::target::nats::validation::STREAM_VALIDATION_FAILED_DETAIL;
-    use crate::target::test_support::{
-        MoveTestTarget, failed_store_dir, move_test_target, move_test_target_with_store, sample_queued,
-    };
+    use crate::target::test_support::{failed_store_dir, move_test_target, move_test_target_with_store, sample_queued};
     use crate::target::{build_target_tls_fingerprint, persist_queued_payload_to_store};
+    use crate::testkit::MockTarget;
     use async_nats::jetstream::context::PublishError;
     use rustfs_config::NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS;
-    use std::sync::atomic::AtomicU64;
     use uuid::Uuid;
 
     #[test]
@@ -1210,12 +1207,11 @@ mod tests {
         let store = Arc::new(QueueStore::<QueuedPayload>::new_with_compression(&dir, 8, ".test", false));
         store.open().unwrap();
 
-        let failed = Arc::new(AtomicU64::new(0));
-        let target: Arc<dyn Target<String> + Send + Sync> = Arc::new(MoveTestTarget {
-            id: TargetID::new("target-a".to_string(), "nats".to_string()),
-            store: Some(store.clone()),
-            failed: failed.clone(),
-        });
+        let mock = MockTarget::new("target-a", "nats")
+            .with_store(store.clone())
+            .with_failed_store(store.clone());
+        let observer = mock.clone();
+        let target: Arc<dyn Target<String> + Send + Sync> = Arc::new(mock);
 
         let key = store.put_raw(&sample_queued("minted-id").encode().unwrap()).unwrap();
         let error = TargetError::JetStreamPublish {
@@ -1225,11 +1221,11 @@ mod tests {
         move_entry_to_failed_store(&*store, &*store, &target.id(), &key, &error, 0)
             .await
             .unwrap();
-        assert_eq!(failed.load(Ordering::Relaxed), 0, "the move itself does not count the failure");
+        assert_eq!(observer.final_failure_count(), 0, "the move itself does not count the failure");
 
         // The replay worker follows every move with one hook emit that records the failure.
         target.record_final_failure();
-        assert_eq!(failed.load(Ordering::Relaxed), 1, "one failed delivery counts exactly once");
+        assert_eq!(observer.final_failure_count(), 1, "one failed delivery counts exactly once");
 
         let _ = store.delete();
     }

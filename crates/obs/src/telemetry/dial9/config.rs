@@ -76,7 +76,7 @@ pub struct Dial9Config {
     /// Directory where trace files are written
     pub output_dir: String,
 
-    /// Prefix for trace file names
+    /// Trace family name under the output directory
     pub file_prefix: String,
 
     /// Maximum size of each trace file in bytes
@@ -158,7 +158,7 @@ impl Dial9Config {
         }
     }
 
-    /// Get the base path for trace files.
+    /// Get the trace family directory for rotating trace segments.
     pub fn base_path(&self) -> PathBuf {
         PathBuf::from(&self.output_dir).join(&self.file_prefix)
     }

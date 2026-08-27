@@ -34,6 +34,9 @@ pub(crate) mod retry;
 pub(crate) mod state;
 pub(crate) mod transport;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) use self::hooks::*;
 pub(crate) use self::repair::*;
 pub(crate) use self::retry::*;

@@ -965,17 +965,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{HEALTH_PROBE_CONCURRENCY, TargetRuntimeManager, health_snapshots_for_targets};
-    use crate::PluginEvent;
-    use crate::StoreError;
-    use crate::arn::TargetID;
-    use crate::store::{Key, Store};
-    use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
-    use crate::{SharedTarget, Target, TargetError};
-    use async_trait::async_trait;
+    use crate::SharedTarget;
+    use crate::store::Key;
+    use crate::testkit::MockTarget;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
-    use tokio::sync::{Notify, Semaphore};
 
     #[tokio::test(start_paused = true)]
     async fn seed_interval_start_backdates_by_one_interval() {
@@ -1037,108 +1032,11 @@ mod tests {
         );
     }
 
-    #[derive(Clone)]
-    struct TestTarget {
-        id: TargetID,
-        block_on_close: Arc<AtomicBool>,
-        close_gate: Arc<Semaphore>,
-        close_calls: Arc<AtomicUsize>,
-        enabled: bool,
-        health_delay: Duration,
-        health_drops: Arc<AtomicUsize>,
-        health_started: Arc<Notify>,
-        close_started: Arc<Notify>,
-    }
-
-    struct HealthDropGuard(Arc<AtomicUsize>);
-
-    impl Drop for HealthDropGuard {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    impl TestTarget {
-        fn new(id: &str, name: &str) -> Self {
-            Self {
-                id: TargetID::new(id.to_string(), name.to_string()),
-                block_on_close: Arc::new(AtomicBool::new(false)),
-                close_gate: Arc::new(Semaphore::new(0)),
-                close_calls: Arc::new(AtomicUsize::new(0)),
-                enabled: true,
-                health_delay: Duration::ZERO,
-                health_drops: Arc::new(AtomicUsize::new(0)),
-                health_started: Arc::new(Notify::new()),
-                close_started: Arc::new(Notify::new()),
-            }
-        }
-
-        fn with_health_delay(id: &str, delay: Duration) -> Self {
-            Self {
-                health_delay: delay,
-                ..Self::new(id, "webhook")
-            }
-        }
-
-        fn disabled(id: &str) -> Self {
-            Self {
-                enabled: false,
-                ..Self::new(id, "webhook")
-            }
-        }
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for TestTarget
-    where
-        E: PluginEvent,
-    {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            self.health_started.notify_one();
-            let _drop_guard = HealthDropGuard(Arc::clone(&self.health_drops));
-            tokio::time::sleep(self.health_delay).await;
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            self.close_calls.fetch_add(1, Ordering::SeqCst);
-            self.close_started.notify_one();
-            if self.block_on_close.load(Ordering::SeqCst) {
-                let _permit = self.close_gate.acquire().await.expect("close gate should remain open");
-            }
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        fn is_enabled(&self) -> bool {
-            self.enabled
-        }
-    }
-
     #[tokio::test]
     async fn runtime_manager_removes_and_closes_target() {
         let mut manager = TargetRuntimeManager::<String>::new();
-        let target = TestTarget::new("primary", "webhook");
-        let close_calls = Arc::clone(&target.close_calls);
+        let target = MockTarget::new("primary", "webhook");
+        let observer = target.clone();
 
         manager.add_boxed(Box::new(target));
         assert_eq!(manager.len(), 1);
@@ -1146,14 +1044,14 @@ mod tests {
         let removed = manager.remove_and_close("primary:webhook").await;
         assert!(removed.is_some());
         assert_eq!(manager.len(), 0);
-        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.close_call_count(), 1);
     }
 
     #[tokio::test(start_paused = true)]
     async fn runtime_manager_starts_all_target_closes_before_waiting_for_completion() {
         let mut manager = TargetRuntimeManager::<String>::new();
-        let first = TestTarget::new("first", "webhook");
-        let second = TestTarget::new("second", "webhook");
+        let first = MockTarget::new("first", "webhook");
+        let second = MockTarget::new("second", "webhook");
         let first_observer = first.clone();
         let second_observer = second.clone();
         manager.add_boxed(Box::new(first));
@@ -1164,34 +1062,34 @@ mod tests {
             .into_iter()
             .next()
             .expect("two targets should have a first close key");
-        let (blocked, unblocked) = if first_close_key == first_observer.id.to_string() {
+        let (blocked, unblocked) = if first_close_key == first_observer.target_id().to_string() {
             (first_observer, second_observer)
         } else {
             (second_observer, first_observer)
         };
-        blocked.block_on_close.store(true, Ordering::SeqCst);
+        blocked.set_block_on_close(true);
 
         let close_task = tokio::spawn(async move { manager.clear_and_close().await });
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), blocked.close_started.notified())
+        tokio::time::timeout(std::time::Duration::from_secs(1), blocked.close_started().notified())
             .await
             .expect("the first target close should start");
-        tokio::time::timeout(std::time::Duration::from_secs(1), unblocked.close_started.notified())
+        tokio::time::timeout(std::time::Duration::from_secs(1), unblocked.close_started().notified())
             .await
             .expect("a blocked first close must not prevent the second close from starting");
         assert!(!close_task.is_finished(), "clear_and_close must still await the blocked target");
 
-        blocked.close_gate.add_permits(1);
+        blocked.close_gate().add_permits(1);
         let errors = close_task.await.expect("clear_and_close task should join");
         assert!(errors.is_empty());
-        assert_eq!(blocked.close_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(unblocked.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(blocked.close_call_count(), 1);
+        assert_eq!(unblocked.close_call_count(), 1);
     }
 
     #[test]
     fn runtime_manager_snapshots_targets() {
         let mut manager = TargetRuntimeManager::<String>::new();
-        manager.add_boxed(Box::new(TestTarget::new("primary", "webhook")));
+        manager.add_boxed(Box::new(MockTarget::new("primary", "webhook")));
 
         let snapshots = manager.snapshots();
         assert_eq!(snapshots.len(), 1);
@@ -1202,7 +1100,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn health_snapshot_allows_a_four_second_probe() {
         let mut manager = TargetRuntimeManager::<String>::new();
-        manager.add_boxed(Box::new(TestTarget::with_health_delay("slow", Duration::from_secs(4))));
+        manager.add_boxed(Box::new(MockTarget::new("slow", "webhook").with_health_delay(Duration::from_secs(4))));
 
         let snapshots = manager.health_snapshots().await;
 
@@ -1214,7 +1112,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn health_snapshot_times_out_after_five_seconds() {
         let mut manager = TargetRuntimeManager::<String>::new();
-        manager.add_boxed(Box::new(TestTarget::with_health_delay("stalled", Duration::from_secs(6))));
+        manager.add_boxed(Box::new(MockTarget::new("stalled", "webhook").with_health_delay(Duration::from_secs(6))));
 
         let snapshots = manager.health_snapshots().await;
 
@@ -1227,10 +1125,9 @@ mod tests {
     async fn health_collection_deadline_does_not_scale_with_target_count() {
         let mut manager = TargetRuntimeManager::<String>::new();
         for index in 0..24 {
-            manager.add_boxed(Box::new(TestTarget::with_health_delay(
-                &format!("stalled-{index}"),
-                Duration::from_secs(30),
-            )));
+            manager.add_boxed(Box::new(
+                MockTarget::new(&format!("stalled-{index}"), "webhook").with_health_delay(Duration::from_secs(30)),
+            ));
         }
         let started = tokio::time::Instant::now();
 
@@ -1263,11 +1160,11 @@ mod tests {
     async fn disabled_target_does_not_wait_for_probe_capacity() {
         let mut targets: Vec<SharedTarget<String>> = (0..HEALTH_PROBE_CONCURRENCY)
             .map(|index| {
-                Arc::new(TestTarget::with_health_delay(&format!("stalled-{index}"), Duration::from_secs(30)))
+                Arc::new(MockTarget::new(&format!("stalled-{index}"), "webhook").with_health_delay(Duration::from_secs(30)))
                     as SharedTarget<String>
             })
             .collect();
-        targets.push(Arc::new(TestTarget::disabled("disabled")));
+        targets.push(Arc::new(MockTarget::new("disabled", "webhook").disabled()));
 
         let snapshots = health_snapshots_for_targets(targets).await;
         let disabled = snapshots
@@ -1281,20 +1178,19 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_health_collection_drops_in_flight_probe() {
-        let target = TestTarget::with_health_delay("slow", Duration::from_secs(30));
-        let health_drops = Arc::clone(&target.health_drops);
-        let health_started = Arc::clone(&target.health_started);
+        let target = MockTarget::new("slow", "webhook").with_health_delay(Duration::from_secs(30));
+        let observer = target.clone();
         let targets: Vec<SharedTarget<String>> = vec![Arc::new(target)];
         let collector = tokio::spawn(health_snapshots_for_targets(targets));
 
-        tokio::time::timeout(Duration::from_secs(1), health_started.notified())
+        tokio::time::timeout(Duration::from_secs(1), observer.health_started().notified())
             .await
             .expect("health probe should start");
         collector.abort();
         let join_error = collector.await.expect_err("health collector should be cancelled");
 
         assert!(join_error.is_cancelled());
-        assert_eq!(health_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.health_drop_count(), 1);
     }
 
     #[tokio::test]

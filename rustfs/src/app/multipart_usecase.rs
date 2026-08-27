@@ -78,6 +78,7 @@ use crate::app::object_usecase::{
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
+use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::table_catalog;
@@ -397,6 +398,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        reject_presigned_put_max_content_length_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?;
         record_s3_op(S3Operation::AbortMultipartUpload);
         let mut opts = ObjectOptions::default();
         apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
@@ -438,6 +444,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        reject_presigned_put_max_content_length_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?;
         let mut helper = OperationHelper::new(
             &req,
             EventName::ObjectCreatedCompleteMultipartUpload,
@@ -741,6 +752,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        reject_presigned_put_max_content_length_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?;
         let helper =
             OperationHelper::new(&req, EventName::ObjectCreatedCreateMultipartUpload, S3Operation::CreateMultipartUpload)
                 .suppress_event();
@@ -962,6 +978,11 @@ impl DefaultMultipartUsecase {
     #[instrument(level = "debug", skip(self, req))]
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        reject_presigned_put_max_content_length_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?;
         let mut opts = ObjectOptions::default();
         apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
         let input = req.input;
@@ -1229,6 +1250,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        reject_presigned_put_max_content_length_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?;
         let mut opts = ObjectOptions::default();
         apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
         let ListMultipartUploadsInput {
@@ -1276,6 +1302,11 @@ impl DefaultMultipartUsecase {
     }
 
     pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+        reject_presigned_put_max_content_length_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?;
         let mut opts = ObjectOptions::default();
         apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
         let ListPartsInput {
@@ -1307,6 +1338,11 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        reject_presigned_put_max_content_length_for_other_operation(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?;
         // Captured before `req.input` is destructured below.
         let copy_principal = SseKmsPrincipal::from_request(&req);
         let source_bucket = match &req.input.copy_source {

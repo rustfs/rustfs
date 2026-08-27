@@ -26,6 +26,7 @@ use crate::server::{
     build_health_response_parts, collect_probe_readiness, has_path_prefix, is_admin_path, is_table_catalog_path,
     kms_probe_staleness_limit, kms_ready_from_probe,
 };
+use crate::shared_types::ReadinessDegradedReason;
 use crate::storage_api::server::layer::apply_cors_headers;
 use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 use bytes::{Bytes, BytesMut};
@@ -36,6 +37,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use pin_project_lite::pin_project;
 use quick_xml::events::Event;
+use rustfs_common::GlobalReadiness;
 use rustfs_obs::HTTP_SERVER_LOG_TARGET;
 #[cfg(feature = "swift")]
 use rustfs_protocols::swift::SwiftRouter;
@@ -1243,11 +1245,12 @@ where
 #[derive(Clone)]
 pub struct PublicHealthEndpointLayer {
     server_ctx: Arc<crate::runtime_sources::ServerContextSlot>,
+    readiness: Arc<GlobalReadiness>,
 }
 
 impl PublicHealthEndpointLayer {
-    pub fn new(server_ctx: Arc<crate::runtime_sources::ServerContextSlot>) -> Self {
-        Self { server_ctx }
+    pub fn new(server_ctx: Arc<crate::runtime_sources::ServerContextSlot>, readiness: Arc<GlobalReadiness>) -> Self {
+        Self { server_ctx, readiness }
     }
 }
 
@@ -1258,6 +1261,7 @@ impl<S> Layer<S> for PublicHealthEndpointLayer {
         PublicHealthEndpointService {
             inner,
             server_ctx: Arc::clone(&self.server_ctx),
+            readiness: Arc::clone(&self.readiness),
         }
     }
 }
@@ -1266,6 +1270,7 @@ impl<S> Layer<S> for PublicHealthEndpointLayer {
 pub struct PublicHealthEndpointService<S> {
     inner: S,
     server_ctx: Arc<crate::runtime_sources::ServerContextSlot>,
+    readiness: Arc<GlobalReadiness>,
 }
 
 fn health_endpoint_enabled() -> bool {
@@ -1334,6 +1339,7 @@ async fn build_public_health_http_response<RestBody, GrpcBody>(
     method: Method,
     path: String,
     object_traffic_health: Option<Arc<ObjectTrafficHealth>>,
+    readiness: &GlobalReadiness,
 ) -> Response<HybridBody<RestBody, GrpcBody>>
 where
     RestBody: From<Bytes>,
@@ -1358,7 +1364,15 @@ where
             .expect("failed to build health busy response");
     }
 
-    let readiness_report = collect_probe_readiness(probe, object_traffic_health.as_deref()).await;
+    let mut readiness_report = collect_probe_readiness(probe, object_traffic_health.as_deref()).await;
+    if probe == HealthProbe::Readiness
+        && !readiness.is_ready()
+        && let Some(report) = readiness_report.as_mut()
+    {
+        report
+            .degraded_reasons
+            .push(ReadinessDegradedReason::StartupFinalizationPending);
+    }
     let kms_ready = if probe == HealthProbe::Readiness && health_compat_kms_ready_check_enabled() {
         Some(health_kms_ready().await)
     } else {
@@ -1408,7 +1422,10 @@ where
                 .server_ctx
                 .installed_app_context()
                 .map(|context| context.object_traffic_health());
-            return Box::pin(async move { Ok(build_public_health_http_response(method, path, object_traffic_health).await) });
+            let readiness = Arc::clone(&self.readiness);
+            return Box::pin(async move {
+                Ok(build_public_health_http_response(method, path, object_traffic_health, readiness.as_ref()).await)
+            });
         }
 
         let mut inner = self.inner.clone();
@@ -2210,14 +2227,25 @@ mod tests {
     use tracing_subscriber::{Registry, fmt::MakeWriter, layer::SubscriberExt};
 
     fn public_health_layer() -> PublicHealthEndpointLayer {
-        PublicHealthEndpointLayer::new(crate::runtime_sources::ServerContextSlot::new())
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        PublicHealthEndpointLayer::new(crate::runtime_sources::ServerContextSlot::new(), readiness)
     }
 
     async fn public_health_layer_with_tracker(object_traffic_health: Arc<ObjectTrafficHealth>) -> PublicHealthEndpointLayer {
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        public_health_layer_with_tracker_and_readiness(object_traffic_health, readiness).await
+    }
+
+    async fn public_health_layer_with_tracker_and_readiness(
+        object_traffic_health: Arc<ObjectTrafficHealth>,
+        readiness: Arc<GlobalReadiness>,
+    ) -> PublicHealthEndpointLayer {
         let app_context = crate::app::gating_test_env::app_context_with_object_traffic_health(object_traffic_health).await;
         let server_ctx = crate::runtime_sources::ServerContextSlot::new();
         assert!(server_ctx.install(app_context));
-        PublicHealthEndpointLayer::new(server_ctx)
+        PublicHealthEndpointLayer::new(server_ctx, readiness)
     }
 
     #[derive(Clone, Debug)]
@@ -2984,6 +3012,82 @@ mod tests {
             let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
             assert!(body.is_empty());
         })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_readiness_waits_for_s3_admission_publication() {
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("false")),
+            ],
+            async {
+                let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
+                let readiness = Arc::new(GlobalReadiness::new());
+                let inner = CountingHybridService::default();
+                let calls = inner.calls();
+                let mut service = public_health_layer_with_tracker_and_readiness(object_traffic_health, Arc::clone(&readiness))
+                    .await
+                    .layer(inner);
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("readiness request before admission publication"),
+                    )
+                    .await
+                    .expect("readiness response before admission publication");
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .expect("readiness body before admission publication")
+                    .to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(&body).expect("readiness JSON");
+                assert_eq!(payload["ready"], false);
+                assert_eq!(payload["details"]["storage"]["ready"], true);
+                assert_eq!(payload["details"]["iam"]["ready"], true);
+                assert_eq!(payload["details"]["lock"]["ready"], true);
+                assert_eq!(payload["degradedReasons"], serde_json::json!(["startup_finalization_pending"]));
+
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(HEALTH_COMPAT_LIVE_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("liveness request before admission publication"),
+                    )
+                    .await
+                    .expect("liveness response before admission publication");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = BodyExt::collect(response.into_body())
+                    .await
+                    .expect("liveness body before admission publication")
+                    .to_bytes();
+                let payload: serde_json::Value = serde_json::from_slice(&body).expect("liveness JSON");
+                assert_eq!(payload["status"], "ok");
+                assert!(payload.get("ready").is_none());
+
+                readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+                let response = service
+                    .call(
+                        Request::builder()
+                            .method(Method::HEAD)
+                            .uri(MINIO_HEALTH_READY_PATH)
+                            .body(Full::<Bytes>::from(Bytes::new()))
+                            .expect("readiness request after admission publication"),
+                    )
+                    .await
+                    .expect("readiness response after admission publication");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            },
+        )
         .await;
     }
 

@@ -17,6 +17,23 @@ use crate::storage_api::error::{QuotaError, StorageError};
 use rustfs_kms::KmsUnavailableError;
 use s3s::{S3Error, S3ErrorCode};
 
+/// Marks a request body that exceeded a presigned upload size capability.
+///
+/// This marker must survive the body-reader and storage layers so the client
+/// receives `EntityTooLarge` instead of a generic internal error.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UploadLimitExceeded {
+    pub limit: u64,
+}
+
+impl std::fmt::Display for UploadLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upload exceeds the maximum content length of {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for UploadLimitExceeded {}
+
 #[derive(Debug)]
 pub struct ApiError {
     pub code: S3ErrorCode,
@@ -275,6 +292,17 @@ impl From<StorageError> for ApiError {
         }
 
         if let StorageError::Io(ref io_err) = err
+            && let Some(inner) = io_err.get_ref()
+            && error_chain_has_type::<UploadLimitExceeded>(inner)
+        {
+            return ApiError {
+                code: S3ErrorCode::EntityTooLarge,
+                message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+                source: Some(Box::new(err)),
+            };
+        }
+
+        if let StorageError::Io(ref io_err) = err
             && io_err
                 .get_ref()
                 .and_then(|inner| inner.downcast_ref::<KmsUnavailableError>())
@@ -396,6 +424,13 @@ impl From<std::io::Error> for ApiError {
                 return ApiError {
                     code: S3ErrorCode::BadDigest,
                     message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                    source: Some(Box::new(err)),
+                };
+            }
+            if error_chain_has_type::<UploadLimitExceeded>(inner) {
+                return ApiError {
+                    code: S3ErrorCode::EntityTooLarge,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
                     source: Some(Box::new(err)),
                 };
             }
@@ -813,6 +848,16 @@ mod tests {
         assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
         assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
         assert!(api_error.source.is_some());
+    }
+
+    #[test]
+    fn upload_limit_marker_maps_to_entity_too_large_across_io_boundaries() {
+        let direct: ApiError = IoError::other(UploadLimitExceeded { limit: 5 }).into();
+        assert_eq!(direct.code, S3ErrorCode::EntityTooLarge);
+
+        let storage: ApiError = StorageError::Io(IoError::other(IoError::other(UploadLimitExceeded { limit: 5 }))).into();
+        assert_eq!(storage.code, S3ErrorCode::EntityTooLarge);
+        assert_eq!(storage.message, ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge));
     }
 
     #[test]

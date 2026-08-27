@@ -87,7 +87,9 @@ fn valid_config() -> PresigningConfig {
 }
 
 /// Flip bytes inside the `X-Amz-Signature=` query value without changing its
-/// length, producing a structurally valid but incorrect signature.
+/// length, producing a structurally valid but incorrect signature. Every hex
+/// digit is replaced by its complement (15 - v), which has no fixed point, so
+/// the tamper changes the value no matter which digits the signature contains.
 fn tamper_signature(uri: &str) -> String {
     let marker = "X-Amz-Signature=";
     let idx = uri.find(marker).expect("presigned uri must carry X-Amz-Signature") + marker.len();
@@ -96,10 +98,9 @@ fn tamper_signature(uri: &str) -> String {
     let (sig, tail) = rest.split_at(end);
     let tampered: String = sig
         .chars()
-        .map(|c| match c {
-            '0' => 'f',
-            'a' => '0',
-            other => other,
+        .map(|c| {
+            let v = c.to_digit(16).expect("X-Amz-Signature value must be hex");
+            char::from_digit(15 - v, 16).expect("complement of a hex digit is a hex digit")
         })
         .collect();
     assert_ne!(sig, tampered, "tamper must actually change the signature hex");

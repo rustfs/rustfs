@@ -2793,12 +2793,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVER_CONFIG_LOCK, ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, config_task_join_error,
-        configs_semantically_equal, decode_server_config_blob, encode_server_config_blob, is_standard_object_server_config,
-        lookup_configs, new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata,
-        read_config_preserve_empty, read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot,
-        save_server_config, save_server_config_snapshot, save_server_config_snapshot_with_generation,
-        server_config_transaction_lock_path, should_warn_ignored_scalar_section, storage_class_kvs_mut,
+        SERVER_CONFIG_LOCK, ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, build_scalar_config_object,
+        config_task_join_error, configs_semantically_equal, decode_server_config_blob, encode_server_config_blob,
+        heal_config_descriptor, is_standard_object_server_config, lookup_configs, new_and_save_server_config, read_config,
+        read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, read_config_with_metadata,
+        read_config_without_migrate, read_server_config_snapshot, save_server_config, save_server_config_snapshot,
+        save_server_config_snapshot_with_generation, server_config_transaction_lock_path, should_warn_ignored_scalar_section,
+        storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
     use crate::disk::endpoint::Endpoint;
@@ -3541,6 +3542,31 @@ mod tests {
         cfg
     }
 
+    /// `Config::new()` (and every decode built on it) reads the process-global
+    /// `rustfs_config::server_config::DEFAULT_KVS` OnceLock at call time, and
+    /// other tests in this binary register it via `crate::config::init()`
+    /// mid-run. Equality assertions must therefore normalize both sides with
+    /// one snapshot taken after both configs exist, never against a later
+    /// `Config::new()`.
+    fn default_kvs_snapshot() -> Option<&'static std::collections::HashMap<String, KVS>> {
+        rustfs_config::server_config::DEFAULT_KVS.get()
+    }
+
+    /// Fills the default sections `cfg` is missing from an explicit
+    /// [`default_kvs_snapshot`], mirroring `Config::set_defaults`.
+    fn filled_with_default_kvs(mut cfg: Config, snapshot: Option<&std::collections::HashMap<String, KVS>>) -> Config {
+        if let Some(defaults) = snapshot {
+            for (sub_sys, kvs) in defaults {
+                cfg.0
+                    .entry(sub_sys.clone())
+                    .or_default()
+                    .entry(DEFAULT_DELIMITER.to_string())
+                    .or_insert_with(|| kvs.clone());
+            }
+        }
+        cfg
+    }
+
     #[test]
     fn test_external_scanner_config_decodes_with_defaults() {
         let cfg =
@@ -3630,7 +3656,9 @@ mod tests {
         }"#;
 
         let cfg = decode_server_config_blob(seed).expect("root heal null should mean no persisted override");
-        assert!(cfg.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER).is_none());
+        // The heal section may hold registered defaults, so assert on the
+        // semantic diff instead of the section's presence.
+        assert!(build_scalar_config_object(&cfg, heal_config_descriptor()).is_empty());
         assert!(!is_standard_object_server_config(seed));
 
         let encoded = encode_server_config_blob(&cfg, Some(seed)).expect("legacy seed should canonicalize on an authorized save");
@@ -3665,7 +3693,12 @@ mod tests {
             let input = format!(r#"{{"version":"33","storageclass":{{"standard":"","rrs":""}},{section}}}"#);
             let cfg = decode_server_config_blob(input.as_bytes())
                 .unwrap_or_else(|err| panic!("legacy scalar section {section} should be ignored, got: {err}"));
-            assert_eq!(cfg, base, "ignored section {section} must contribute no overrides");
+            let snapshot = default_kvs_snapshot();
+            assert_eq!(
+                filled_with_default_kvs(cfg.clone(), snapshot),
+                filled_with_default_kvs(base.clone(), snapshot),
+                "ignored section {section} must contribute no overrides"
+            );
             assert!(
                 !is_standard_object_server_config(input.as_bytes()),
                 "seed with {section} must not count as standard so a save rewrites it"
@@ -3743,12 +3776,19 @@ mod tests {
     fn valid_heal_object_and_kvs_array_shapes_remain_accepted() {
         let empty_object = br#"{"version":"33","storageclass":{"standard":"","rrs":""},"heal":{}}"#;
         let cfg = decode_server_config_blob(empty_object).expect("empty heal object should decode as no override");
-        assert!(cfg.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER).is_none());
+        // The heal section may hold registered defaults, so assert on the
+        // semantic diff instead of the section's presence.
+        assert!(build_scalar_config_object(&cfg, heal_config_descriptor()).is_empty());
 
         let kvs_array =
             br#"{"version":"33","storageclass":{"standard":"","rrs":""},"heal":[{"key":"bitrot_cycle","value":"off"}]}"#;
         let cfg = decode_server_config_blob(kvs_array).expect("heal KVS array should decode");
-        assert!(cfg.get_value(HEAL_SUB_SYS, DEFAULT_DELIMITER).is_some());
+        assert_eq!(
+            build_scalar_config_object(&cfg, heal_config_descriptor())
+                .get(HEAL_BITROT_CYCLE)
+                .and_then(Value::as_str),
+            Some("off")
+        );
     }
 
     #[test]
@@ -4900,8 +4940,12 @@ mod tests {
     fn test_fallback_returns_default_config_when_recovery_enabled() {
         let cfg = fallback_server_config_after_corruption(corrupt_config_error(), "config/config.json", true)
             .expect("recovery enabled must fall back to the default config");
+        let snapshot = default_kvs_snapshot();
         assert!(
-            configs_semantically_equal(&cfg, &Config::new()),
+            configs_semantically_equal(
+                &filled_with_default_kvs(cfg, snapshot),
+                &filled_with_default_kvs(Config(std::collections::HashMap::new()), snapshot)
+            ),
             "fallback config should be the default server config"
         );
     }
@@ -5220,7 +5264,7 @@ mod tests {
     #[tokio::test]
     async fn server_config_snapshot_serializes_read_modify_write_transactions() {
         let baseline = encode_server_config_blob(&Config::new(), None).expect("baseline config should encode");
-        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(baseline), None));
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(baseline.clone()), None));
         let first = read_server_config_snapshot(store.clone())
             .await
             .expect("first config snapshot");
@@ -5234,7 +5278,11 @@ mod tests {
             .await
             .expect("second transaction should acquire after the first snapshot is dropped")
             .expect("second config snapshot");
-        assert!(configs_semantically_equal(&second.config, &Config::new()));
+        // Compare raw bytes against the baseline blob rather than a fresh
+        // Config::new(): the process-global DEFAULT_KVS can be registered by a
+        // sibling test mid-run, which would make a Config::new() evaluated here
+        // diverge from the baseline encoded above.
+        assert_eq!(second.raw.as_deref(), Some(baseline.as_slice()));
     }
 
     #[tokio::test]
@@ -5514,8 +5562,12 @@ mod tests {
             .expect("unrecoverable corruption should fall back to the default config");
 
         assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should be attempted before falling back");
+        let snapshot = default_kvs_snapshot();
         assert!(
-            configs_semantically_equal(&cfg, &Config::new()),
+            configs_semantically_equal(
+                &filled_with_default_kvs(cfg, snapshot),
+                &filled_with_default_kvs(Config(std::collections::HashMap::new()), snapshot)
+            ),
             "fallback config should be the default server config"
         );
     }

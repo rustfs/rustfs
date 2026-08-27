@@ -22,11 +22,11 @@ use super::meta::{
     is_rebalance_in_progress, is_rebalance_meta_replaceable_for_new_id, is_rebalance_stopped_terminal_event,
     mark_rebalance_bucket_done, merge_rebalance_bucket_lists, merge_rebalance_meta, next_rebal_bucket_from_stat,
     percent_free_ratio, rebalance_goal_reached, rebalance_meta_load_no_data_error, rebalance_meta_load_unknown_format_error,
-    rebalance_meta_load_unknown_version_error, record_rebalance_cleanup_warning_in_meta, remove_rebalanced_buckets_from_queue,
-    resolve_next_rebalance_bucket, resolve_rebalance_participants, should_accept_rebalance_stats_update,
-    should_ignore_rebalance_data_usage_cache, should_pool_participate, should_preserve_rebalance_stopped_state,
-    should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state, take_bucket_from_rebalance_queue,
-    validate_init_rebalance_state, validate_start_rebalance_state,
+    rebalance_meta_load_unknown_version_error, rebalance_requires_worker_activation, record_rebalance_cleanup_warning_in_meta,
+    remove_rebalanced_buckets_from_queue, resolve_next_rebalance_bucket, resolve_rebalance_participants,
+    should_accept_rebalance_stats_update, should_ignore_rebalance_data_usage_cache, should_pool_participate,
+    should_preserve_rebalance_stopped_state, should_skip_start_rebalance, stop_rebalance_meta_snapshot, stop_rebalance_state,
+    take_bucket_from_rebalance_queue, validate_init_rebalance_state, validate_start_rebalance_state,
 };
 use super::migration::{
     MigrationBackend, MigrationVersionResult, migrate_entry_version, migrate_entry_version_with_retry_wait,
@@ -3384,6 +3384,52 @@ fn test_is_rebalance_in_progress_only_started_participants() {
     };
 
     assert!(is_rebalance_in_progress(&meta));
+}
+
+#[test]
+fn test_rebalance_requires_worker_activation_only_for_active_non_stopped_metadata() {
+    let now = OffsetDateTime::now_utc();
+    let active = RebalanceMeta {
+        pool_stats: vec![RebalanceStats {
+            participating: true,
+            info: RebalanceInfo {
+                status: RebalStatus::Started,
+                ..Default::default()
+            },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let stopped_active = RebalanceMeta {
+        stopped_at: Some(now),
+        pool_stats: active.pool_stats.clone(),
+        ..Default::default()
+    };
+
+    assert!(rebalance_requires_worker_activation(&active));
+    for status in [
+        RebalStatus::Completed,
+        RebalStatus::Stopped,
+        RebalStatus::Failed,
+        RebalStatus::None,
+    ] {
+        let terminal = RebalanceMeta {
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            !rebalance_requires_worker_activation(&terminal),
+            "terminal status {status:?} must not resume"
+        );
+    }
+    assert!(!rebalance_requires_worker_activation(&stopped_active));
 }
 
 #[test]

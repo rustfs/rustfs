@@ -7023,6 +7023,29 @@ mod tests {
         body
     }
 
+    // An erasure-coded write returns once write-quorum disks commit, so a
+    // lagging disk can legally still be missing its xl.meta when the write
+    // call returns. Fixtures that iterate every disk of the owning pool must
+    // wait for full materialization first, or they race the trailing disk
+    // writes under CI load (issue #6703). Bounded so a genuinely failed disk
+    // write still surfaces as a test failure instead of a hang.
+    async fn wait_for_object_on_every_disk(disk_paths: &[std::path::PathBuf], bucket: &str, object: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if disk_paths
+                .iter()
+                .all(|path| path.join(bucket).join(object).join("xl.meta").is_file())
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "object {bucket}/{object} must materialize xl.meta on every pool disk within the readiness window"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     // Deletes the given part files from every version data dir present on the
     // disks, simulating rebalance removing the object data while xl.meta stays
     // readable. Returns the number of version dirs visited and files removed.
@@ -7172,6 +7195,7 @@ mod tests {
                     .any(|path| path.join(&bucket).join(object).join("xl.meta").is_file())
             })
             .expect("multipart object must be placed in one source pool");
+        wait_for_object_on_every_disk(&pool_disk_paths[upload_pool], &bucket, object).await;
         if upload_pool != 0 {
             let mut normalized_disks = 0;
             for (source_disk, target_disk) in pool_disk_paths[upload_pool].iter().zip(&pool_disk_paths[0]) {
@@ -7218,6 +7242,12 @@ mod tests {
         let mut staged_targets = Vec::with_capacity(pool_disk_paths[target_pool].len());
         for (source_disk, target_disk) in pool_disk_paths[source_pool].iter().zip(&pool_disk_paths[target_pool]) {
             let source_dir = source_disk.join(&bucket).join(object);
+            // The same write-quorum minority gap tolerated above (#6701) can
+            // leave a lagging source-pool disk without the object; skip it and
+            // stage the replicas that exist — the reader tolerates the gap.
+            if !source_dir.join("xl.meta").is_file() {
+                continue;
+            }
             let target_dir = target_disk.join(&bucket).join(object);
             let staging_dir = temp_dir.path().join(format!("resume-relocate-{}", Uuid::new_v4()));
             std::fs::create_dir_all(&staging_dir).expect("create relocated target staging directory");
@@ -7234,15 +7264,18 @@ mod tests {
                 }
             }
             std::fs::copy(source_dir.join("xl.meta"), staging_dir.join("xl.meta")).expect("stage relocated object metadata");
-            staged_targets.push((staging_dir, target_dir));
+            staged_targets.push((staging_dir, target_dir, source_dir.join("xl.meta")));
         }
+        assert!(
+            staged_targets.len() > pool_disk_paths[source_pool].len() / 2,
+            "a write-quorum majority of the source pool's disks must hold the object to stage the relocation"
+        );
         let (version_dirs, deleted) = delete_object_part_shards(&pool_disk_paths[source_pool], &bucket, object, &[2, 3]);
         assert!(version_dirs > 0, "the source pool must have at least one version data directory");
         assert_eq!(deleted, version_dirs * 2);
 
-        for ((staging_dir, target_dir), source_disk) in staged_targets.into_iter().zip(&pool_disk_paths[source_pool]) {
+        for (staging_dir, target_dir, source_meta) in staged_targets {
             std::fs::rename(staging_dir, target_dir).expect("publish relocated target object");
-            let source_meta = source_disk.join(&bucket).join(object).join("xl.meta");
             std::fs::remove_file(source_meta).expect("remove relocated source object metadata");
         }
         store

@@ -37,6 +37,7 @@ checked_files=(
   "rustfs/src/site_replication/retry.rs"
   "rustfs/src/site_replication/repair.rs"
   "rustfs/src/site_replication/hooks.rs"
+  "rustfs/src/site_replication/tests.rs"
   "rustfs/src/admin/handlers/group.rs"
   "rustfs/src/admin/handlers/quota.rs"
   "rustfs/src/admin/handlers/rebalance.rs"

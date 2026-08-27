@@ -259,8 +259,8 @@ enumset = "1.1.14"
 faster-hex = "0.10.0"
 flate2 = "1.1.9"
 glob = "0.3.4"
-google-cloud-storage = "1.17.0"
-google-cloud-auth = "1.15.0"
+google-cloud-storage = "1.18.0"
+google-cloud-auth = "1.16.0"
 hashbrown = { version = "0.17.1" }
 # Base32 for RFC 6238 TOTP shared secrets (RFC 4648 unpadded, the alphabet
 # every authenticator app expects). Already in the graph transitively.
@@ -304,7 +304,7 @@ rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { git = "https://github.com/rustfs/s3s.git", rev = "f4dedc905ec621fa85a4686df6304190b55375f6", version = "0.15.0", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s.git", rev = "0f6f83d98b37fd9edcaa3be573db4aa8f568e088", version = "0.15.0", features = ["minio"] }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.3"
@@ -327,7 +327,7 @@ tracing-subscriber = { version = "0.3.23" }
 transform-stream = "0.3.1"
 url = "2.5.8"
 urlencoding = "2.1.3"
-uuid = { version = "1.25.0" }
+uuid = { version = "1.26.0" }
 vaultrs = { version = "0.8.0" }
 tar = "0.4.46"
 walkdir = "2.5.0"
@@ -341,7 +341,7 @@ zstd = "0.13.3"
 # Observability and Metrics
 metrics = "0.24.6"
 metrics-util = "0.20"
-dial9-tokio-telemetry = "0.3"
+dial9-tokio-telemetry = "0.5.0"
 opentelemetry = { version = "0.32.0" }
 opentelemetry-appender-tracing = { version = "0.32.0" }
 opentelemetry-otlp = { version = "0.32.0" }

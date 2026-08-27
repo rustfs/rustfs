@@ -5,3 +5,4 @@ self-hosted-runner:
     - sm-standard-2
     - sm-standard-4
     - dind-sm-standard-2
+    - smoke-testing

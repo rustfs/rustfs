@@ -67,7 +67,7 @@ tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "time",
 tracing = { workspace = true, features = ["std", "attributes"] }
 
 [dev-dependencies]
-async-trait = { workspace = true }
+rustfs-targets = { workspace = true, features = ["test-support"] }
 temp-env = { workspace = true }
 url = { workspace = true }
 

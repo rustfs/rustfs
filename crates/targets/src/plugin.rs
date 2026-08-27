@@ -421,60 +421,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{TargetPluginDescriptor, TargetPluginRegistry};
-    use crate::PluginEvent;
+    use crate::TargetError;
     use crate::runtime::adapter::BuiltinPluginRuntimeAdapter;
-    use crate::store::{Key, Store};
-    use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
-    use crate::{StoreError, Target, TargetError};
-    use async_trait::async_trait;
+    use crate::testkit::MockTarget;
     use rustfs_config::ENABLE_KEY;
     use rustfs_config::server_config::{Config, KVS};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
-
-    #[derive(Clone)]
-    struct TestTarget {
-        id: crate::arn::TargetID,
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for TestTarget
-    where
-        E: PluginEvent,
-    {
-        fn id(&self) -> crate::arn::TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
-    }
 
     fn builtin_adapter() -> BuiltinPluginRuntimeAdapter<String> {
         BuiltinPluginRuntimeAdapter::new(
@@ -494,11 +448,7 @@ mod tests {
             "test",
             &[ENABLE_KEY, "endpoint"],
             |_config| Ok(()),
-            |id, _config| {
-                Ok(Box::new(TestTarget {
-                    id: crate::arn::TargetID::new(id, "test".to_string()),
-                }))
-            },
+            |id, _config| Ok(Box::new(MockTarget::new(&id, "test"))),
         ));
 
         let mut cfg = Config(HashMap::new());
@@ -532,11 +482,7 @@ mod tests {
                 target_type,
                 &[ENABLE_KEY, "endpoint"],
                 |_config| Ok(()),
-                move |id, _config| {
-                    Ok(Box::new(TestTarget {
-                        id: crate::arn::TargetID::new(id, target_type.to_string()),
-                    }))
-                },
+                move |id, _config| Ok(Box::new(MockTarget::new(&id, target_type))),
             ));
         }
 

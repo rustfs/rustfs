@@ -49,13 +49,13 @@
 //!
 //! # Known observability gap
 //!
-//! `dial9`'s `RotatingWriter` stops accepting writes (its internal `Finished`
-//! state) when the output directory disappears or a segment cannot be sealed,
-//! and it exposes no way to observe that from outside. `TelemetryGuard::is_enabled`
-//! reports how the session was *built*, not whether it is still writing. There
-//! is therefore no `writer_healthy` metric: it could only ever be hard-coded to
-//! `1`. Watch `rustfs_dial9_disk_usage_bytes` — a session that is recording but
-//! whose disk usage stops growing has most likely hit this state.
+//! `dial9`'s `DiskBuffer` stops accepting writes when the output directory
+//! disappears or a segment cannot be sealed, and it exposes no way to observe
+//! that from outside. `Dial9Handle::is_enabled` reports whether the recorder is
+//! connected and unpaused, not whether the disk writer is still making progress.
+//! There is therefore no `writer_healthy` metric: it could only ever be
+//! hard-coded to `1`. Watch `rustfs_dial9_disk_usage_bytes` — a session that is
+//! recording but whose disk usage stops growing has most likely hit this state.
 //! Reported upstream as dial9-rs/dial9#658.
 
 mod config;
