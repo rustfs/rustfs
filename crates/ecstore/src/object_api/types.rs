@@ -1829,7 +1829,7 @@ mod tests {
     #[test]
     fn from_file_info_preserves_transitioned_tier_storage_class() {
         let fi = FileInfo {
-            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            metadata: AHashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
             transition_tier: "WARM-TIER".to_string(),
             transition_status: TRANSITION_COMPLETE.to_string(),
             ..Default::default()
@@ -1844,7 +1844,7 @@ mod tests {
     #[test]
     fn from_file_info_ignores_a_tier_name_without_a_completed_transition() {
         let fi = FileInfo {
-            metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
+            metadata: AHashMap::from([(AMZ_STORAGE_CLASS.to_string(), storageclass::STANDARD_IA.to_string())]),
             transition_tier: "WARM-TIER".to_string(),
             ..Default::default()
         };

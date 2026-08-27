@@ -596,12 +596,12 @@ mod tests {
         let mut metadata = HashMap::new();
         insert_str(&mut metadata, &suffix, "target-version".to_string());
 
-        let (versions, corrupt) = target_delete_marker_versions(&metadata);
+        let (versions, corrupt): (HashMap<String, String>, bool) = target_delete_marker_versions(&metadata);
         assert_eq!(versions.get(arn).map(String::as_str), Some("target-version"));
         assert!(!corrupt);
 
         metadata.insert(format!("{MINIO_INTERNAL_PREFIX}{suffix}"), "other-version".to_string());
-        let (versions, corrupt) = target_delete_marker_versions(&metadata);
+        let (versions, corrupt): (HashMap<String, String>, bool) = target_delete_marker_versions(&metadata);
         assert!(versions.is_empty());
         assert!(corrupt);
     }
@@ -617,7 +617,7 @@ mod tests {
             })
             .collect();
 
-        let (versions, corrupt) = target_delete_marker_versions(&metadata);
+        let (versions, corrupt): (HashMap<String, String>, bool) = target_delete_marker_versions(&metadata);
 
         assert_eq!(versions.len(), 1_000);
         assert!(corrupt);

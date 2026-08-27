@@ -2256,7 +2256,7 @@ mod tests {
         let object_info = ObjectInfo {
             parts: Arc::new(vec![ObjectPartInfo {
                 number: 2,
-                checksums: Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "crc32c-value".to_string())])),
+                checksums: Some(AHashMap::from([(ChecksumType::CRC32C.to_string(), "crc32c-value".to_string())])),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -2284,7 +2284,7 @@ mod tests {
     fn test_data_movement_part_checksum_writer_requires_fleet_confirmation() {
         let object_info = ObjectInfo {
             parts: Arc::new(vec![ObjectPartInfo {
-                checksums: Some(HashMap::from([("CRC32C".to_string(), "AAAAAA==".to_string())])),
+                checksums: Some(AHashMap::from([("CRC32C".to_string(), "AAAAAA==".to_string())])),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -2305,7 +2305,7 @@ mod tests {
 
         let empty = ObjectInfo {
             parts: Arc::new(vec![ObjectPartInfo {
-                checksums: Some(HashMap::new()),
+                checksums: Some(AHashMap::new()),
                 ..Default::default()
             }]),
             ..Default::default()
@@ -2347,7 +2347,7 @@ mod tests {
         let mut invalid = FileInfo {
             parts: vec![ObjectPartInfo {
                 number: 1,
-                checksums: Some(HashMap::from([("CRC32C".to_string(), "not-base64".to_string())])),
+                checksums: Some(AHashMap::from([("CRC32C".to_string(), "not-base64".to_string())])),
                 ..Default::default()
             }],
             ..Default::default()
@@ -2502,7 +2502,7 @@ mod tests {
             etag: "part-etag".to_string(),
             size: 128,
             actual_size: 128,
-            checksums: Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum".to_string())])),
+            checksums: Some(AHashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum".to_string())])),
             ..Default::default()
         };
         let info = ObjectInfo {
@@ -2739,12 +2739,12 @@ mod tests {
             parts: Arc::new(vec![
                 ObjectPartInfo {
                     number: 1,
-                    checksums: Some(HashMap::from([("CRC32C".to_string(), "AAAAAA==".to_string())])),
+                    checksums: Some(AHashMap::from([("CRC32C".to_string(), "AAAAAA==".to_string())])),
                     ..Default::default()
                 },
                 ObjectPartInfo {
                     number: 2,
-                    checksums: Some(HashMap::from([("CRC32C".to_string(), "BBBBBB==".to_string())])),
+                    checksums: Some(AHashMap::from([("CRC32C".to_string(), "BBBBBB==".to_string())])),
                     ..Default::default()
                 },
             ]),
@@ -2948,7 +2948,7 @@ mod tests {
             actual_size: 128,
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
             index: Some(Bytes::from_static(&[1, 2, 3])),
-            checksums: Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum".to_string())])),
+            checksums: Some(AHashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum".to_string())])),
             ..Default::default()
         };
 
@@ -3490,7 +3490,7 @@ mod tests {
             etag: "second-part-etag".to_string(),
             size: 64,
             actual_size: 64,
-            checksums: Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "second-part-checksum".to_string())])),
+            checksums: Some(AHashMap::from([(ChecksumType::CRC32C.to_string(), "second-part-checksum".to_string())])),
             ..Default::default()
         });
         source.parts = Arc::new(source_parts);

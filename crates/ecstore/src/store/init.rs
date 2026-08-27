@@ -6156,7 +6156,7 @@ mod tests {
             data_dir: Some(uuid::Uuid::new_v4()),
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
             size: 1,
-            metadata: HashMap::new(),
+            metadata: AHashMap::new(),
             ..Default::default()
         };
         let err = store
