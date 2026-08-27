@@ -2110,9 +2110,18 @@ fn build_list_versions_next_marker(
     cache_id: Option<&str>,
 ) -> (Option<String>, Option<String>) {
     if let Some(last) = objects.last() {
+        // A null version carries the synthesized `Some(Uuid::nil())` identity
+        // here; advertise it as the literal `null` marker so a resumed listing
+        // parses it back to `VersionMarker::Null` instead of a nil UUID that
+        // `find_version_index` can never match (issue #6745).
         (
             Some(append_list_cache_id_to_marker(last.name.clone(), cache_id)),
-            Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+            Some(
+                last.version_id
+                    .filter(|v| !v.is_nil())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "null".to_string()),
+            ),
         )
     } else if let Some(last_prefix) = prefixes.last() {
         (Some(append_list_cache_id_to_marker(last_prefix.clone(), cache_id)), None)
@@ -7757,6 +7766,31 @@ mod test {
             }
         }
         out
+    }
+
+    // A truncated versions listing ending on a null version must advertise the
+    // literal `null` continuation marker: a nil UUID parses to
+    // `VersionMarker::Version(nil)`, which no stored version matches, so the
+    // resumed page would replay every version (issue #6745).
+    #[test]
+    fn build_list_versions_next_marker_reports_null_for_nil_version_id() {
+        let null_version = ObjectInfo {
+            name: "obj-a".to_owned(),
+            version_id: Some(uuid::Uuid::nil()),
+            ..Default::default()
+        };
+        let real_version = ObjectInfo {
+            name: "obj-b".to_owned(),
+            version_id: Some(uuid::Uuid::from_u128(7)),
+            ..Default::default()
+        };
+
+        let (next_marker, next_version_idmarker) = super::build_list_versions_next_marker(&[null_version], &[], None);
+        assert_eq!(next_marker.as_deref(), Some("obj-a"));
+        assert_eq!(next_version_idmarker.as_deref(), Some("null"));
+
+        let (_, next_version_idmarker) = super::build_list_versions_next_marker(&[real_version], &[], None);
+        assert_eq!(next_version_idmarker.as_deref(), Some(uuid::Uuid::from_u128(7).to_string().as_str()));
     }
 
     // ECA-03 / #944: a page whose raw keys fully collapse into fewer than max_keys

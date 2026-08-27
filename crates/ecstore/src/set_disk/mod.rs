@@ -4822,6 +4822,16 @@ fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_
     let mut delete_marker = opts.versioned;
 
     if opts.version_id.is_some() {
+        // With an explicit version id, `delete_marker` reports whether the
+        // targeted version is a delete marker, not whether this delete would
+        // create one. Seeding it from `opts.versioned` alone left it false on
+        // versioning-suspended buckets, so removing a null delete marker
+        // answered `x-amz-delete-marker: false` (issue #6745). The clearing
+        // clauses below still apply for purge/replica shapes.
+        if version_found && goi.delete_marker {
+            delete_marker = true;
+        }
+
         // Decommission/rebalance may recreate a delete marker on a new pool before that
         // exact version exists there, so we must still treat it as a mark-delete write.
         let data_movement_missing_delete_marker = opts.data_movement && opts.delete_marker && !version_found;
@@ -7035,6 +7045,32 @@ mod tests {
         assert!(
             !delete_marker,
             "replica purge of an existing delete marker version must remove that version, not preserve delete-marker semantics"
+        );
+    }
+
+    #[test]
+    fn resolve_delete_version_state_reports_marker_removal_on_suspended_bucket() {
+        // Removing a null delete marker by explicit version id on a
+        // versioning-suspended bucket: the targeted version is a delete
+        // marker, so the response must say so even though `opts.versioned`
+        // is false (issue #6745).
+        let opts = ObjectOptions {
+            version_suspended: true,
+            version_id: Some(Uuid::nil().to_string()),
+            ..Default::default()
+        };
+        let current = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &current, true);
+
+        assert!(!mark_delete);
+        assert!(
+            delete_marker,
+            "deleting a delete marker by version id must report delete-marker semantics"
         );
     }
 

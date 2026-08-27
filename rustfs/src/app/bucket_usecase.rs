@@ -936,8 +936,13 @@ fn build_list_object_versions_metadata_output(
         .filter(|object| !object.name.is_empty())
         .map(|object| {
             let object_name = encode_list_versions_value(&object.name, encoding_type);
+            // A null version surfaces as `Some(Uuid::nil())` on the
+            // client-facing `ObjectInfo`; AWS advertises it as the literal
+            // string `null`, and a nil UUID must never reach the wire
+            // (issue #6745).
             let version_id = object
                 .version_id
+                .filter(|version| !version.is_nil())
                 .map(|version| version.to_string())
                 .unwrap_or_else(|| "null".to_string());
             let permission = permissions.get(&object.name).copied().unwrap_or_default();
@@ -4159,7 +4164,9 @@ mod tests {
         match &output.entries[0] {
             ListObjectVersionMetadataEntry::Version(version, extension) => {
                 assert_eq!(version.key.as_deref(), Some("obj-a"));
-                assert_eq!(version.version_id.as_deref(), Some(Uuid::nil().to_string().as_str()));
+                // A null version's synthesized nil UUID must surface as the
+                // literal `null`, never as `00000000-…` (issue #6745).
+                assert_eq!(version.version_id.as_deref(), Some("null"));
                 assert_eq!(extension.user_tags.as_deref(), Some("env=prod"));
                 assert_eq!(extension.internal, Some(ObjectInternalInfo { k: 4, m: 2 }));
                 assert_eq!(

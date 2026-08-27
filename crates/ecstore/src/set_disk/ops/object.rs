@@ -6521,7 +6521,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
 
-            if goi.delete_marker && dobj.version_id.is_some() && goi.version_id == version_id {
+            // Same normalization as `explicit_delete_marker` above: `goi.version_id`
+            // is the client-facing identity (`Some(Uuid::nil())` for a null
+            // version) while `version_id` is the storage identity (`None` for an
+            // explicit null). Comparing them raw made a null delete marker's
+            // removal take the non-marker branch below, so the response lost
+            // `DeleteMarker`/`DeleteMarkerVersionId` and the removal was
+            // accounted as an object deletion (issue #6745).
+            if goi.delete_marker && dobj.version_id.is_some() && delete_file_info_version_id(goi.version_id) == version_id {
                 vr.deleted = true;
                 vr.mod_time = goi.mod_time;
             }
@@ -6543,7 +6550,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if vr.deleted {
                 del_objects[i] = DeletedObject {
                     delete_marker: vr.deleted,
-                    delete_marker_version_id: vr.version_id,
+                    // `vr.version_id` holds the storage identity, which is
+                    // `None` for an explicit null-marker removal; report the
+                    // client-facing null identity so the response can carry
+                    // `DeleteMarkerVersionId` for the marker that was removed.
+                    delete_marker_version_id: if explicit_null_version {
+                        Some(Uuid::nil())
+                    } else {
+                        vr.version_id
+                    },
                     delete_marker_mtime: vr.mod_time,
                     object_name: vr.name.clone(),
                     replication_state: vr.replication_state_internal.clone(),
