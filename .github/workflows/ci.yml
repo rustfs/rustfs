@@ -497,7 +497,10 @@ jobs:
           # job's 90-minute budget before any test starts.
           CARGO_BUILD_JOBS: "2"
         run: |
-          cargo nextest run -p rustfs -p rustfs-ecstore --features rio-v2
+          # --profile ci so the quarantine list (and its junit flaky markers)
+          # covers this leg too; the default profile is the local no-retry
+          # profile and silently ignored quarantined flakes here (rustfs#6703).
+          cargo nextest run --profile ci -p rustfs -p rustfs-ecstore --features rio-v2
           cargo test -p rustfs --doc --features rio-v2
 
   connect-short-credential-boundary:
@@ -607,7 +610,10 @@ jobs:
           # main nextest lane; Clippy is metadata-only and needs no such limit.
           CARGO_BUILD_JOBS: "2"
         run: |
-          cargo nextest run -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
+          # --profile ci so the quarantine list (and its junit flaky markers)
+          # covers this leg too; the default profile is the local no-retry
+          # profile and silently ignored quarantined flakes here (rustfs#6703).
+          cargo nextest run --profile ci -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
 
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary

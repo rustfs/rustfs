@@ -196,15 +196,23 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget)'
 retries = 2
 
-# QUARANTINE: OPEN rustfs#6703 — the relocated-pool GET resume test stages its
-# fixture by copying xl.meta from every source-pool disk, but an EC write only
-# guarantees quorum-many disks have materialized; a lagging disk under CI load
-# panics the staging copy with NotFound (failed on a zero-overlap s3-client PR).
-# Subsumes the previous serialization-only ci entry for this test: the
-# test-group is re-declared here per the header rule above.
+# Serialize the relocated-pool GET resume regression under the ci profile too
+# (see the matching default-profile override near the top). No longer a
+# quarantine: the fixture race (rustfs#6701/rustfs#6703) was fixed by #6707,
+# which made the staging tolerate quorum-tolerated disk gaps; only the 8-disk
+# cross-disk-IO serialization remains.
 [[profile.ci.overrides]]
 filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
 test-group = 'ecstore-serial-flaky'
+
+# QUARANTINE: OPEN rustfs#6711 — the multipart fencing test's epoch helper
+# reads xl.meta back from EVERY disk, but a multipart commit only guarantees
+# quorum-many disks have persisted; a lagging disk under CI load panics the
+# read-back with "file not found" (observed on the rio-v2 leg of a
+# nextest-config-only PR; same all-disk-materialization assumption as the
+# relocated-pool fixture fixed by #6707).
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(object_transaction_fencing_persists_epoch_on_multipart_commit)'
 retries = 2
 
 # Serialize the 4-disk reliability / degraded-read e2e tests under the ci
