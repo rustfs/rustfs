@@ -60,6 +60,7 @@ use crate::storage_api_contracts::{
     object::{EcstoreObjectIO, HTTPPreconditions, ObjectIO as _, ObjectOperations as _},
 };
 use crate::{core::sets::Sets, store::ECStore};
+use ahash::AHashMap;
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use futures::{
     StreamExt,
