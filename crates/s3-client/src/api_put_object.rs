@@ -24,6 +24,7 @@ use std::{collections::HashMap, sync::Arc};
 use time::{Duration, OffsetDateTime, macros::format_description};
 use tracing::{error, info, warn};
 
+use rustfs_utils::http::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header};
 use s3s::dto::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode, ReplicationStatus};
 use s3s::header::{
     X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_REPLICATION_STATUS,
@@ -40,7 +41,6 @@ use crate::{
     constants::{ISO8601_DATEFORMAT, MAX_MULTIPART_PUT_OBJECT_SIZE, MIN_PART_SIZE},
     credentials::SignatureType,
     transition_api::{ReaderImpl, TransitionClient, UploadInfo},
-    utils::{is_amz_header, is_minio_header, is_rustfs_header, is_standard_header, is_storageclass_header},
 };
 
 #[derive(Debug, Clone)]
