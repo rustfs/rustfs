@@ -139,7 +139,7 @@ fn remove_capped_multipart_staging_semaphore(upload_id_path: &str) {
     }
 }
 
-fn multipart_size_limit_from_metadata(metadata: &HashMap<String, String>) -> Result<Option<u64>> {
+fn multipart_size_limit_from_metadata<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> Result<Option<u64>> {
     if !contains_key_str(metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE) {
         return Ok(None);
     }
