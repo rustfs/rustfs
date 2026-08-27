@@ -74,7 +74,7 @@ hotpath-cpu = [
 # Tokio runtime-level telemetry. Requires a `--cfg tokio_unstable` build; the
 # build script fails the compile when that flag is missing. Off by default so
 # ordinary builds neither pay for nor depend on Tokio's unstable API.
-dial9 = ["dep:dial9-tokio-telemetry"]
+dial9 = ["dep:dial9-tokio-telemetry", "dial9-tokio-telemetry/process-resource"]
 #
 # NOTE: there is deliberately no `dial9-taskdump` feature. dial9 only captures a
 # task dump for futures it wrapped itself, i.e. those spawned via

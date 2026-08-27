@@ -27,6 +27,9 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Segment filename stem used by `dial9` rotating disk buffers.
+const DIAL9_SEGMENT_STEM: &str = "trace";
+
 /// Point-in-time view of dial9 runtime state.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Dial9RuntimeSnapshot {
@@ -66,8 +69,8 @@ impl Dial9RuntimeState {
 
     pub(super) fn record_config(&self, config: &Dial9Config) {
         *self.trace_dir.write().expect("dial9 trace_dir lock should not be poisoned") = Some(TraceLocation {
-            output_dir: PathBuf::from(&config.output_dir),
-            file_prefix: config.file_prefix.clone(),
+            output_dir: config.base_path(),
+            file_prefix: DIAL9_SEGMENT_STEM.to_string(),
         });
         if !config.enabled {
             self.active_sessions.store(0, Ordering::Relaxed);
@@ -168,11 +171,11 @@ mod tests {
     #[test]
     fn measure_disk_usage_sums_only_matching_prefix() {
         let dir = tempdir().expect("create temp dir");
-        std::fs::write(dir.path().join("rustfs-tokio.0.bin"), vec![0_u8; 128]).expect("write segment");
-        std::fs::write(dir.path().join("rustfs-tokio.1.bin"), vec![0_u8; 64]).expect("write segment");
+        std::fs::write(dir.path().join("trace.0.bin"), vec![0_u8; 128]).expect("write segment");
+        std::fs::write(dir.path().join("trace.1.bin"), vec![0_u8; 64]).expect("write segment");
         std::fs::write(dir.path().join("unrelated.log"), vec![0_u8; 4096]).expect("write unrelated");
 
-        assert_eq!(measure_disk_usage_bytes(dir.path(), "rustfs-tokio"), 192);
+        assert_eq!(measure_disk_usage_bytes(dir.path(), DIAL9_SEGMENT_STEM), 192);
     }
 
     #[test]
