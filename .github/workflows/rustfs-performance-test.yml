@@ -69,7 +69,9 @@ defaults:
 env:
   RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
   RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
-  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+  # Performance test uses its own node list (4 nodes); the shared
+  # RUSTFS_NODES secret is used by the 3-node pool-expansion / heal tests.
+  RUSTFS_NODES: ${{ secrets.RUSTFS_PERF_NODES || vars.RUSTFS_PERF_NODES || 'vm000 vm001 vm002 vm003' }}
   RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
   # Package used by the nightly run (workflow_dispatch inputs are empty for
   # workflow_run events), i.e. the latest nightly deb published by nightly-gnu.yml.
