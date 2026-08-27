@@ -25,15 +25,17 @@ All status checks talk to the RustFS admin API directly (SigV4-signed,
 5. Starts cluster heal: `POST /rustfs/admin/v3/heal/` with body
    `{"recursive":true}` (retried, returns a `clientToken`).
 6. Monitors the heal task via `POST /rustfs/admin/v3/heal/?clientToken=<token>`
-   until the summary is a terminal success (`finished`/`completed`),
-   `objects_failed == 0`, **and** the outage node's disk usage reaches the
-   target: at least 90% of the least-used surviving node (an absolute
-   `HEAL_TARGET_GB` floor may override; default 0 = relative only).
-7. Result analysis: heal stats (scanned/healed/failed), per-node disk usage,
+   until the server verdict is a terminal success (`finished`/`completed`) with
+   `objects_failed == 0`.
+7. Result analysis: heal stats (scanned/healed/failed), an **S3 read-back
+   verification** of the written objects (list the test bucket and GET a
+   sample — every read must succeed), per-node disk usage (observability),
    pass/fail verdict.
 
-Success requires **both** the heal API completion (the server's scan/repair
-verdict) and the outage node's disk reaching the target.
+Success is the server's own scan/repair verdict (heal finished, 0 failed)
+**plus** an end-to-end data read-back; per-node disk usage is logged as
+observability, not a pass gate (EC distributes different shards per node, so a
+fixed per-node GB target is not a meaningful invariant).
 
 ## Self-hosted runner prerequisites
 
@@ -67,7 +69,6 @@ Same repository secrets/variables as the pool expansion workflow:
 | `package_url`    | nightly | Direct `.deb` URL; empty = latest nightly |
 | `stop_node_gb`   | `15`    | Stop outage node at N GiB on survivors    |
 | `warp_stop_gb`   | `40`    | Stop warp at N GiB on survivors           |
-| `heal_target_gb` | `0`     | Absolute GiB floor; 0 = relative (≥90% of the least-used surviving node) |
 | `cleanup_before` | `true`  | Reset nodes before the test               |
 | `cleanup_after`  | `true`  | Reset nodes after the test                |
 
