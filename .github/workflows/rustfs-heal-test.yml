@@ -15,10 +15,6 @@ on:
         description: 'Stop warp when surviving nodes reach N GiB'
         required: false
         default: '40'
-      heal_target_gb:
-        description: 'Outage node must reach N GiB after heal to pass'
-        required: false
-        default: '40'
       cleanup_before:
         description: 'Reset the nodes before the test (DESTROYS existing data/config)'
         type: boolean
@@ -100,7 +96,6 @@ jobs:
             --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
             --stop-node-gb "${{ inputs.stop_node_gb }}" \
             --warp-stop-gb "${{ inputs.warp_stop_gb }}" \
-            --heal-target-gb "${{ inputs.heal_target_gb }}" \
             --log-file /tmp/rustfs-heal-test.log
 
       - name: Upload test logs

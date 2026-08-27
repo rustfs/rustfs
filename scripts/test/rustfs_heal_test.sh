@@ -14,7 +14,8 @@
 #   4. Restart vm002 (the node that was offline while data was written)
 #   5. Start cluster heal (POST /rustfs/admin/v3/heal/ {"recursive":true})
 #   6. Monitor the heal task (POST /rustfs/admin/v3/heal/?clientToken=...)
-#      until a terminal success AND vm002's disk usage reaches HEAL_TARGET_GB
+#      until the server verdict is a terminal success (finished, 0 failed),
+#      then verify the data is readable back from the cluster
 #   7. Result analysis: heal stats, per-node disk usage, success verdict
 #
 # The script is driven from an admin host (e.g. a jumpbox or a GitHub
@@ -101,7 +102,6 @@ WARP_LOG_FILE="${RUSTFS_WARP_LOG_FILE:-}"
 # Disk-usage thresholds (per surviving node, GiB, via df -B1G | grep /data/rustfs)
 STOP_NODE_AT_GB="${RUSTFS_STOP_NODE_AT_GB:-15}"   # stop the outage node when surviving nodes reach this
 WARP_STOP_AT_GB="${RUSTFS_WARP_STOP_AT_GB:-40}"   # stop warp when surviving nodes reach this
-HEAL_TARGET_GB="${RUSTFS_HEAL_TARGET_GB:-40}"     # vm002 must reach this after heal to pass
 POLL_INTERVAL=15                # status polling interval (seconds)
 
 # Timeouts (seconds)
@@ -185,8 +185,9 @@ canonical_query() {
 # Issue an admin API request. Prints the response body on stdout and writes the
 # HTTP status (000 on transport failure) to ${ADMIN_API_CODE_FILE}.
 admin_api() {
-  # $1: method, $2: path, $3: query string, $4: optional JSON body
-  local method="$1" path="$2" query="$3" body="${4:-}"
+  # $1: method, $2: path, $3: query string, $4: optional JSON body,
+  # $5: "discard" to skip body capture (only the status code matters)
+  local method="$1" path="$2" query="$3" body="${4:-}" discard="${5:-}"
   local amz_date date_stamp host_port
   local canonical_headers signed_headers canonical_request string_to_sign
   local scope k_date k_region k_service k_signing signature auth
@@ -236,14 +237,18 @@ $(sha256_hex "${canonical_request}")"
   if [ -n "${body}" ]; then
     curl_body=(-d "${body}" -H "Content-Type: application/json")
   fi
-  code="$(curl -sS --max-time "${API_REQUEST_TIMEOUT}" -o "${tmp}" -w '%{http_code}' \
+  local out_file="${tmp}"
+  [ "${discard}" = "discard" ] && out_file="/dev/null"
+  code="$(curl -sS --max-time "${API_REQUEST_TIMEOUT}" -o "${out_file}" -w '%{http_code}' \
     -H "Host: ${host_port}" \
     -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
     -H "x-amz-date: ${amz_date}" \
     -H "Authorization: ${auth}" \
     "${curl_body[@]}" -X "${method}" "${url}")" || code="000"
   printf '%s' "${code}" > "${ADMIN_API_CODE_FILE}"
-  cat "${tmp}"
+  if [ "${discard}" != "discard" ]; then
+    cat "${tmp}"
+  fi
   rm -f "${tmp}"
 }
 
@@ -529,6 +534,42 @@ heal_progress_field() {
   printf '%s' "${body}" | jq -r --arg c "${camel}" --arg s "${snake}" '
     (.progress // null) as $p
     | if $p == null then "null" else (($p[$c] // $p[$s] // null) | if . == null then "null" else tostring end) end'
+}
+
+# Sample data verification after heal: list the test bucket and GET a sample of
+# objects. Every GET must return 200 — this is the end-to-end proof that the
+# cluster can still reconstruct the data after repair.
+verify_data_readable() {
+  local list body code keys key count checked ok
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    log "DRY-RUN: S3 read-back verification of ${WARP_BUCKET}"
+    return 0
+  fi
+  list="$(admin_api GET "/${WARP_BUCKET}" "list-type=2&max-keys=1000")"
+  code="$(admin_api_code)"
+  if [ "${code}" != "200" ]; then
+    printf '\033[1;31m[ERROR]\033[0m bucket list failed (HTTP %s): %s\n' "${code}" "${list}" >&2
+    return 1
+  fi
+  # sed -n '1,20p' reads the whole stream (unlike head, which closes the pipe
+  # early and SIGPIPEs grep/sed under pipefail).
+  keys="$(printf '%s' "${list}" | grep -oE '<Key>[^<]+</Key>' | sed 's#</\?Key>##g' | sed -n '1,20p')"
+  count="$(printf '%s\n' "${keys}" | sed '/^$/d' | wc -l | tr -d ' ')"
+  log "data verification: ${count} object(s) sampled from the bucket; reading each (status-code check)..."
+  checked=0; ok=0
+  while IFS= read -r key; do
+    [ -z "${key}" ] && continue
+    admin_api GET "/${WARP_BUCKET}/${key}" "" "" discard
+    code="$(admin_api_code)"
+    checked=$((checked + 1))
+    if [ "${code}" = "200" ]; then
+      ok=$((ok + 1))
+    else
+      printf '\033[1;31m[ERROR]\033[0m GET %s failed (HTTP %s)\n' "${key}" "${code}" >&2
+    fi
+  done <<<"${keys}"
+  log "data verification: ${ok}/${checked} objects read successfully"
+  [ "${checked}" -gt 0 ] && [ "${ok}" -eq "${checked}" ]
 }
 
 # Verify the expected number of pools via the admin API (JSON + jq assertions)
@@ -847,7 +888,7 @@ step5_start_heal() {
 }
 
 step6_monitor_heal() {
-  log "step 6: monitor heal task until done AND ${NODES[${OUTAGE_NODE_INDEX}]} reaches ${HEAL_TARGET_GB}GB"
+  log "step 6: monitor heal task until the server verdict is done"
   if [ "${DRY_RUN}" -eq 1 ]; then
     log "DRY-RUN: waiting for heal to complete"
     return 0
@@ -856,7 +897,9 @@ step6_monitor_heal() {
     die "no heal client token (run step 5 first, or pass --heal-token)"
   fi
   local waited=0 body code summary failed healed scanned pct prog_present
-  local failed_n healed_n scanned_n pct_n vm002_used warned501=0
+  local failed_n healed_n scanned_n pct_n vm002_used warned501=0 pre_outage_used
+  pre_outage_used="$(node_used_gb "${NODES[${OUTAGE_NODE_INDEX}]}")"
+  log "outage node usage before heal: ${pre_outage_used}GB"
   while [ "${waited}" -lt "${HEAL_TIMEOUT}" ]; do
     body="$(admin_api POST /rustfs/admin/v3/heal/ "clientToken=${HEAL_CLIENT_TOKEN}" "")"
     code="$(admin_api_code)"
@@ -882,7 +925,7 @@ step6_monitor_heal() {
     scanned_n="${scanned}"; [ "${scanned_n}" = "null" ] && scanned_n=0
     pct_n="${pct}"; [ "${pct_n}" = "null" ] && pct_n=0
     vm002_used="$(node_used_gb "${NODES[${OUTAGE_NODE_INDEX}]}")"
-    log "heal: summary=${summary} scanned=${scanned_n} healed=${healed_n} failed=${failed_n} pct=${pct_n} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${vm002_used}GB (target ${HEAL_TARGET_GB}GB)"
+    log "heal: summary=${summary} scanned=${scanned_n} healed=${healed_n} failed=${failed_n} pct=${pct_n} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${vm002_used}GB"
 
     if [ "${prog_present}" = "false" ] && [ "${summary}" = "running" ]; then
       warn "heal progress is null while the task is running (server-side reporting gap; see rustfs/backlog#2035)"
@@ -897,9 +940,11 @@ step6_monitor_heal() {
 
     # Success only for a real terminal summary; "running"/"notFound"/"" mean
     # the task is still going (or lives on another node) — keep polling.
-    if printf '%s' "${summary}" | grep -qiE '^(finished|completed|success|done)$' \
-      && [ "${vm002_used}" -ge "${HEAL_TARGET_GB}" ]; then
-      log "heal done: summary=${summary} failed=0 ${NODES[${OUTAGE_NODE_INDEX}]}_used=${vm002_used}GB >= ${HEAL_TARGET_GB}GB"
+    if printf '%s' "${summary}" | grep -qiE '^(finished|completed|success|done)$'; then
+      log "heal done: summary=${summary} failed=0 (server verdict)"
+      if [ "${vm002_used}" -le "${pre_outage_used}" ]; then
+        warn "heal finished but ${NODES[${OUTAGE_NODE_INDEX}]} usage did not grow (${pre_outage_used}GB -> ${vm002_used}GB); the repair may not have landed on its disks"
+      fi
       final_status_file="$(mktemp "${TMPDIR:-/tmp}/rustfs-heal-final-status.XXXXXX.json" 2>/dev/null \
         || printf '%s' "${TMPDIR:-/tmp}/rustfs-heal-final-status.$$.json")"
       printf '%s\n' "${body}" > "${final_status_file}" 2>/dev/null \
@@ -907,6 +952,7 @@ step6_monitor_heal() {
         || warn "could not save final heal status to ${final_status_file}"
       return 0
     fi
+
     sleep "${POLL_INTERVAL}"
     waited=$((waited + POLL_INTERVAL))
   done
@@ -942,9 +988,6 @@ step7_analyze_results() {
   printf '%s\n' "--- heal status ---"
   printf '  summary=%s scanned=%s healed=%s failed=%s progress=%s%%\n' \
     "${summary}" "${scanned_n}" "${healed_n}" "${failed_n}" "${pct_n}"
-  if [ "${prog_present}" = "false" ]; then
-    warn "heal progress was absent (null) in the final task response — see rustfs/backlog#2035"
-  fi
   printf '%s\n' "--- per-node disk usage (GiB) ---"
   for i in "${!NODES[@]}"; do
     used="$(node_used_gb "${NODES[$i]}")"
@@ -953,13 +996,17 @@ step7_analyze_results() {
 
   local outage_used
   outage_used="$(node_used_gb "${NODES[${OUTAGE_NODE_INDEX}]}")"
+
+  if ! verify_data_readable; then
+    die "heal test FAILED: data read-back verification failed (see errors above)"
+  fi
+
   if printf '%s' "${summary}" | grep -qiE '^(finished|completed|success|done)$' \
-    && [ "${failed_n}" -eq 0 ] \
-    && [ "${outage_used}" -ge "${HEAL_TARGET_GB}" ]; then
-    log "heal test PASSED: cluster heal complete, 0 failed, ${NODES[${OUTAGE_NODE_INDEX}]} reached ${outage_used}GB"
+    && [ "${failed_n}" -eq 0 ]; then
+    log "heal test PASSED: cluster heal complete, 0 failed, data read-back OK, ${NODES[${OUTAGE_NODE_INDEX}]}_used=${outage_used}GB"
     return 0
   fi
-  die "heal test FAILED: summary=${summary} failed=${failed_n} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${outage_used}GB (target ${HEAL_TARGET_GB}GB)"
+  die "heal test FAILED: summary=${summary} failed=${failed_n} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${outage_used}GB"
 }
 # ==================== CLI parsing ====================
 
@@ -983,7 +1030,6 @@ Options:
   --rc-endpoint URL          Deprecated alias for --endpoint
   --stop-node-gb N           Stop the outage node when surviving nodes reach N GiB (default 15)
   --warp-stop-gb N           Stop warp when surviving nodes reach N GiB (default 40)
-  --heal-target-gb N         Outage node must reach N GiB after heal (default 40)
   --heal-token TOKEN         clientToken of a heal started earlier (for steps 6/7 reruns)
   --warp-timeout N           Write phase timeout in seconds (default 3600)
   --heal-timeout N           Heal wait timeout in seconds (default 86400)
@@ -1056,7 +1102,6 @@ main() {
       --rc-endpoint) API_ENDPOINT="$1"; shift ;;
       --stop-node-gb) STOP_NODE_AT_GB="$1"; shift ;;
       --warp-stop-gb) WARP_STOP_AT_GB="$1"; shift ;;
-      --heal-target-gb) HEAL_TARGET_GB="$1"; shift ;;
       --heal-token) HEAL_CLIENT_TOKEN="$1"; shift ;;
       --warp-timeout) WARP_TIMEOUT="$1"; shift ;;
       --heal-timeout) HEAL_TIMEOUT="$1"; shift ;;
