@@ -178,6 +178,76 @@ pub trait WorkloadAdmissionSnapshotProvider {
     fn workload_admission_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot;
 }
 
+/// Foreground workload pressure observed against a configured utilization threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundPressure {
+    /// Foreground workload class whose utilization reached its threshold.
+    pub class: WorkloadClass,
+    /// Observed utilization percentage for the class.
+    pub usage_pct: usize,
+    /// Configured threshold percentage that the observed utilization reached.
+    pub threshold_pct: usize,
+}
+
+impl ForegroundPressure {
+    /// Return a stable reason label for logs and metrics.
+    pub const fn reason(self) -> &'static str {
+        match self.class {
+            WorkloadClass::ForegroundRead => "foreground_read_pressure",
+            WorkloadClass::ForegroundWrite => "foreground_write_pressure",
+            _ => "foreground_pressure",
+        }
+    }
+}
+
+/// Return the strongest foreground pressure in `snapshot`, if any.
+///
+/// A zero threshold disables its class. `Saturated` counts as full utilization
+/// regardless of the reported limit; otherwise a class contributes only when it
+/// reports a non-zero limit, with a missing active count read as zero. When both
+/// classes are above their threshold the higher utilization wins.
+///
+/// Callers own the enable switch: this function evaluates thresholds only.
+pub fn foreground_pressure(
+    snapshot: &WorkloadAdmissionRegistrySnapshot,
+    read_threshold_pct: usize,
+    write_threshold_pct: usize,
+) -> Option<ForegroundPressure> {
+    [
+        (WorkloadClass::ForegroundRead, read_threshold_pct),
+        (WorkloadClass::ForegroundWrite, write_threshold_pct),
+    ]
+    .into_iter()
+    .filter_map(|(class, threshold_pct)| {
+        if threshold_pct == 0 {
+            return None;
+        }
+
+        let entry = snapshot.get(class)?;
+        let usage_pct = if matches!(entry.state, AdmissionState::Saturated) {
+            100
+        } else {
+            let limit = entry.limit?;
+            if limit == 0 {
+                return None;
+            }
+            entry
+                .active
+                .unwrap_or(0)
+                .saturating_mul(100)
+                .checked_div(limit)
+                .unwrap_or(100)
+        };
+
+        (usage_pct >= threshold_pct).then_some(ForegroundPressure {
+            class,
+            usage_pct,
+            threshold_pct,
+        })
+    })
+    .max_by_key(|pressure| pressure.usage_pct)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +383,206 @@ mod tests {
             .expect_err("unknown workload admission fields must be rejected");
 
         assert!(err.to_string().contains("unexpected"));
+    }
+
+    fn counted(
+        class: WorkloadClass,
+        state: AdmissionState,
+        active: Option<usize>,
+        limit: Option<usize>,
+    ) -> WorkloadAdmissionSnapshot {
+        WorkloadAdmissionSnapshot::new(class, state).with_counts(active, None, limit)
+    }
+
+    fn registry(entries: Vec<WorkloadAdmissionSnapshot>) -> WorkloadAdmissionRegistrySnapshot {
+        WorkloadAdmissionRegistrySnapshot::new(entries)
+    }
+
+    #[test]
+    fn foreground_pressure_reason_labels_cover_non_foreground_classes() {
+        let read = ForegroundPressure {
+            class: WorkloadClass::ForegroundRead,
+            usage_pct: 90,
+            threshold_pct: 80,
+        };
+        let write = ForegroundPressure {
+            class: WorkloadClass::ForegroundWrite,
+            usage_pct: 90,
+            threshold_pct: 80,
+        };
+        let repair = ForegroundPressure {
+            class: WorkloadClass::Repair,
+            usage_pct: 90,
+            threshold_pct: 80,
+        };
+
+        assert_eq!(read.reason(), "foreground_read_pressure");
+        assert_eq!(write.reason(), "foreground_write_pressure");
+        assert_eq!(repair.reason(), "foreground_pressure");
+    }
+
+    #[test]
+    fn foreground_pressure_is_disabled_when_both_thresholds_are_zero() {
+        let snapshot = registry(vec![
+            counted(WorkloadClass::ForegroundRead, AdmissionState::Saturated, Some(8), Some(8)),
+            counted(WorkloadClass::ForegroundWrite, AdmissionState::Saturated, Some(8), Some(8)),
+        ]);
+
+        assert_eq!(foreground_pressure(&snapshot, 0, 0), None);
+    }
+
+    #[test]
+    fn foreground_pressure_skips_only_the_class_whose_threshold_is_zero() {
+        let snapshot = registry(vec![
+            counted(WorkloadClass::ForegroundRead, AdmissionState::Open, Some(10), Some(10)),
+            counted(WorkloadClass::ForegroundWrite, AdmissionState::Open, Some(9), Some(10)),
+        ]);
+
+        assert_eq!(
+            foreground_pressure(&snapshot, 0, 80),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundWrite,
+                usage_pct: 90,
+                threshold_pct: 80,
+            })
+        );
+        assert_eq!(
+            foreground_pressure(&snapshot, 80, 0),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundRead,
+                usage_pct: 100,
+                threshold_pct: 80,
+            })
+        );
+    }
+
+    #[test]
+    fn foreground_pressure_ignores_missing_entries() {
+        let snapshot = registry(vec![counted(WorkloadClass::Scanner, AdmissionState::Saturated, Some(8), Some(8))]);
+
+        assert_eq!(foreground_pressure(&snapshot, 1, 1), None);
+    }
+
+    #[test]
+    fn foreground_pressure_ignores_missing_and_zero_limits() {
+        let missing_limit = registry(vec![counted(
+            WorkloadClass::ForegroundRead,
+            AdmissionState::Throttled,
+            Some(8),
+            None,
+        )]);
+        let zero_limit = registry(vec![counted(
+            WorkloadClass::ForegroundWrite,
+            AdmissionState::Throttled,
+            Some(8),
+            Some(0),
+        )]);
+
+        assert_eq!(foreground_pressure(&missing_limit, 1, 1), None);
+        assert_eq!(foreground_pressure(&zero_limit, 1, 1), None);
+    }
+
+    #[test]
+    fn foreground_pressure_treats_saturated_as_full_without_reading_limit() {
+        let snapshot = registry(vec![
+            counted(WorkloadClass::ForegroundRead, AdmissionState::Saturated, None, None),
+            counted(WorkloadClass::ForegroundWrite, AdmissionState::Saturated, Some(0), Some(0)),
+        ]);
+
+        assert_eq!(
+            foreground_pressure(&snapshot, 100, 0),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundRead,
+                usage_pct: 100,
+                threshold_pct: 100,
+            })
+        );
+        assert_eq!(
+            foreground_pressure(&snapshot, 0, 100),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundWrite,
+                usage_pct: 100,
+                threshold_pct: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn foreground_pressure_reads_missing_active_as_zero() {
+        let snapshot = registry(vec![counted(WorkloadClass::ForegroundRead, AdmissionState::Open, None, Some(8))]);
+
+        assert_eq!(foreground_pressure(&snapshot, 1, 1), None);
+    }
+
+    #[test]
+    fn foreground_pressure_returns_the_higher_utilization_when_both_classes_exceed() {
+        let read_higher = registry(vec![
+            counted(WorkloadClass::ForegroundRead, AdmissionState::Open, Some(19), Some(20)),
+            counted(WorkloadClass::ForegroundWrite, AdmissionState::Open, Some(17), Some(20)),
+        ]);
+        let write_higher = registry(vec![
+            counted(WorkloadClass::ForegroundRead, AdmissionState::Open, Some(17), Some(20)),
+            counted(WorkloadClass::ForegroundWrite, AdmissionState::Open, Some(19), Some(20)),
+        ]);
+
+        assert_eq!(
+            foreground_pressure(&read_higher, 80, 80),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundRead,
+                usage_pct: 95,
+                threshold_pct: 80,
+            })
+        );
+        assert_eq!(
+            foreground_pressure(&write_higher, 80, 80),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundWrite,
+                usage_pct: 95,
+                threshold_pct: 80,
+            })
+        );
+    }
+
+    #[test]
+    fn foreground_pressure_breaks_utilization_ties_toward_the_write_class() {
+        let snapshot = registry(vec![
+            counted(WorkloadClass::ForegroundRead, AdmissionState::Open, Some(18), Some(20)),
+            counted(WorkloadClass::ForegroundWrite, AdmissionState::Open, Some(18), Some(20)),
+        ]);
+
+        assert_eq!(
+            foreground_pressure(&snapshot, 80, 80),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundWrite,
+                usage_pct: 90,
+                threshold_pct: 80,
+            })
+        );
+    }
+
+    #[test]
+    fn foreground_pressure_triggers_exactly_at_the_threshold_and_not_below() {
+        let at_threshold = registry(vec![counted(
+            WorkloadClass::ForegroundRead,
+            AdmissionState::Open,
+            Some(8),
+            Some(10),
+        )]);
+        let below_threshold = registry(vec![counted(
+            WorkloadClass::ForegroundRead,
+            AdmissionState::Open,
+            Some(7),
+            Some(10),
+        )]);
+
+        assert_eq!(
+            foreground_pressure(&at_threshold, 80, 80),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundRead,
+                usage_pct: 80,
+                threshold_pct: 80,
+            })
+        );
+        assert_eq!(foreground_pressure(&below_threshold, 80, 80), None);
     }
 }
