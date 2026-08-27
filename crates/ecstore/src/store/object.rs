@@ -490,7 +490,7 @@ fn decommission_mutation_fence_for_test(
         .map(|hook| hook.fence.clone())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 struct DecommissionFreeVersionSourceRaceState {
     bucket: String,
     object: String,
@@ -498,17 +498,17 @@ struct DecommissionFreeVersionSourceRaceState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) struct DecommissionFreeVersionSourceRaceBarrier {
     state: Arc<DecommissionFreeVersionSourceRaceState>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 static DECOMMISSION_FREE_VERSION_SOURCE_RACE_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<Arc<DecommissionFreeVersionSourceRaceState>>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl DecommissionFreeVersionSourceRaceBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(DecommissionFreeVersionSourceRaceState {
@@ -537,7 +537,7 @@ impl DecommissionFreeVersionSourceRaceBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl Drop for DecommissionFreeVersionSourceRaceBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -551,7 +551,7 @@ impl Drop for DecommissionFreeVersionSourceRaceBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 async fn pause_decommission_free_version_before_source_lock(bucket: &str, object: &str) {
     let state = DECOMMISSION_FREE_VERSION_SOURCE_RACE_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -2385,7 +2385,7 @@ impl ECStore {
                 &object,
             )?
         };
-        #[cfg(test)]
+        #[cfg(all(test, feature = "test-util"))]
         if is_free_version {
             pause_decommission_free_version_before_source_lock(bucket, logical_object).await;
         }

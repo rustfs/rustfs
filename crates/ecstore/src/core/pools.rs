@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::bucket::replication::replication_state_from_filemeta;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 use crate::bucket::utils::is_meta_bucketname;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
@@ -8503,7 +8503,7 @@ impl ECStore {
         .await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn decommission_entry_for_test_with_bucket_incarnation(
         self: &Arc<Self>,
         idx: usize,
@@ -8671,7 +8671,7 @@ impl ECStore {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn decommission_pool_for_test(
         self: &Arc<Self>,
         rx: CancellationToken,
@@ -9587,7 +9587,7 @@ impl ECStore {
         Ok(receipt_paths)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     async fn persist_decommission_durable_ilm_manifest(&self, source_pool_idx: usize) -> Result<()> {
         let run_token = self.durable_ilm_receipt_run_token(source_pool_idx).await?;
         self.persist_decommission_durable_ilm_manifest_for_run(source_pool_idx, &run_token)
@@ -9705,7 +9705,7 @@ impl ECStore {
         Ok(receipts)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     async fn persist_decommission_durable_ilm_receipt(
         &self,
         source_pool_idx: usize,
@@ -10309,7 +10309,7 @@ impl ECStore {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     async fn verify_and_cleanup_decommissioned_durable_ilm_record(
         &self,
         source_pool_idx: usize,
@@ -10381,7 +10381,7 @@ impl ECStore {
         resolve_decommission_entry_cleanup_delete_result(cleanup_result, RUSTFS_META_BUCKET, path)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
         &self,
         source_pool_idx: usize,
@@ -10392,12 +10392,12 @@ impl ECStore {
             .await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn decommission_durable_ilm_receipt_count_for_test(&self, source_pool_idx: usize) -> Result<usize> {
         Ok(self.list_decommission_durable_ilm_receipts(source_pool_idx).await?.len())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn decommission_durable_ilm_receipt_paths_for_test(
         &self,
         source_pool_idx: usize,
@@ -10405,7 +10405,7 @@ impl ECStore {
         self.list_decommission_durable_ilm_receipts(source_pool_idx).await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn persist_decommission_durable_ilm_receipt_for_test(
         &self,
         source_pool_idx: usize,
@@ -10424,12 +10424,12 @@ impl ECStore {
         Ok(decommission_durable_ilm_receipt_path(&run_token, source_path, record.id_kind, &record.id))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn persist_decommission_durable_ilm_manifest_for_test(&self, source_pool_idx: usize) -> Result<()> {
         self.persist_decommission_durable_ilm_manifest(source_pool_idx).await
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn cleanup_decommission_durable_ilm_receipts_for_test(&self, source_pool_idx: usize) -> Result<()> {
         self.cleanup_decommission_durable_ilm_receipts(source_pool_idx).await
     }
@@ -10782,7 +10782,7 @@ impl ECStore {
         self.ensure_decommission_multipart_uploads_drained(idx, pool.as_ref(), &buckets)
             .await
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn check_after_decommission_for_test(self: &Arc<Self>, idx: usize) -> Result<()> {
         let generation = self.active_decommission_generation(idx).await?;
         self.check_after_decommission(idx, &CancellationToken::new(), generation)
