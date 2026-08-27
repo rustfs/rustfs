@@ -17,6 +17,71 @@
 use super::*;
 
 use crate::auth::{VerifiedPresignedRequest, reject_presigned_put_max_content_length_for_other_operation};
+use crate::error::ServerSideSourceReadError;
+
+struct CopySourceReadStream<R> {
+    inner: R,
+    remaining: i64,
+}
+
+impl<R> CopySourceReadStream<R> {
+    fn new(inner: R, expected_size: i64) -> Self {
+        Self {
+            inner,
+            remaining: expected_size.max(0),
+        }
+    }
+}
+
+fn copy_source_read_stream<R>(inner: R, expected_size: i64) -> CopySourceReadStream<R> {
+    CopySourceReadStream::new(inner, expected_size)
+}
+
+fn copy_source_read_error(source: std::io::Error) -> std::io::Error {
+    let kind = source.kind();
+    std::io::Error::new(kind, ServerSideSourceReadError::new("CopyObject", source))
+}
+
+fn copy_source_incomplete_body_error(remaining: i64) -> std::io::Error {
+    copy_source_read_error(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        rustfs_rio::IncompleteBody { remaining },
+    ))
+}
+
+impl<R> AsyncRead for CopySourceReadStream<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(err)) => Poll::Ready(Err(copy_source_read_error(err))),
+            Poll::Ready(Ok(())) => {
+                let read = buf.filled().len() - before;
+                if read == 0 {
+                    if this.remaining > 0 {
+                        return Poll::Ready(Err(copy_source_incomplete_body_error(this.remaining)));
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+
+                let read = match i64::try_from(read) {
+                    Ok(read) => read,
+                    Err(_) => {
+                        return Poll::Ready(Err(copy_source_read_error(std::io::Error::other(
+                            "copy source read count exceeds i64::MAX",
+                        ))));
+                    }
+                };
+                this.remaining = this.remaining.saturating_sub(read);
+                Poll::Ready(Ok(()))
+            }
+        }
+    }
+}
 
 fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err: rustfs_lock::LockError) -> StorageError {
     match err {
@@ -580,11 +645,13 @@ impl DefaultObjectUsecase {
         let mut write_plan = WritePlan::new();
         let mut reader = if should_compress {
             let algorithm = CompressionAlgorithm::default();
-            let hrd = HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?;
+            let hrd = HashReader::from_stream(copy_source_read_stream(gr.stream, length), length, actual_size, None, None, false)
+                .map_err(ApiError::from)?;
             write_plan = write_plan.with_compression(algorithm);
             hrd
         } else {
-            HashReader::from_stream(gr.stream, length, actual_size, None, None, false).map_err(ApiError::from)?
+            HashReader::from_stream(copy_source_read_stream(gr.stream, length), length, actual_size, None, None, false)
+                .map_err(ApiError::from)?
         };
 
         // Give the destination object a checksum so CopyObject returns it and a later checksum-mode
@@ -835,6 +902,7 @@ mod tests {
     use http::{HeaderValue, Method};
     use s3s::dto::{ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule};
     use std::sync::Arc;
+    use tokio::io::AsyncReadExt;
 
     // A malformed bucket-default algorithm reaches this resolution only through
     // corrupt or hand-edited bucket metadata (PutBucketEncryption validates the
@@ -874,6 +942,23 @@ mod tests {
             };
             assert_eq!(bucket_default_write_sse(&sse).as_str(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn copy_source_read_stream_maps_short_eof_to_service_unavailable() {
+        let source = std::io::Cursor::new(b"abc".to_vec());
+        let mut reader = HashReader::from_stream(copy_source_read_stream(source, 4), 4, 4, None, None, false)
+            .expect("copy source hash reader should build");
+
+        let mut output = Vec::new();
+        let err = reader
+            .read_to_end(&mut output)
+            .await
+            .expect_err("short copy source must fail before destination write succeeds");
+        let api_error = ApiError::from(err);
+
+        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
+        assert_ne!(api_error.code, S3ErrorCode::IncompleteBody);
     }
 
     #[tokio::test]
