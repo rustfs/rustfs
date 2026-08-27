@@ -580,6 +580,235 @@ pub(crate) fn site_replication_peer_url(connection: &PeerConnection, wire_path: 
         .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid site replication peer path: {e}")))
 }
 
+/// One peer admin request, collapsing the formerly-duplicated PUT/GET
+/// dispatch bodies (backlog#1840 PR2): wire-path mapping, URL/authority
+/// derivation, payload wire-encoding, SigV4 signing, transport-error
+/// classification, and the response read live here once. The option axes are
+/// the method, an optional pre-resolved client, the service-account secret
+/// candidates, and the retry-event bookkeeping; the `send_peer_admin_*`
+/// names below remain as thin compatibility wrappers.
+pub(crate) struct PeerAdminRequest<'a> {
+    connection: &'a PeerConnection,
+    path: &'a str,
+    access_key: &'a str,
+    method: Method,
+    client: Option<&'a reqwest::Client>,
+}
+
+impl<'a> PeerAdminRequest<'a> {
+    pub(crate) fn put(connection: &'a PeerConnection, path: &'a str, access_key: &'a str) -> Self {
+        Self {
+            connection,
+            path,
+            access_key,
+            method: Method::PUT,
+            client: None,
+        }
+    }
+
+    pub(crate) fn get(connection: &'a PeerConnection, path: &'a str, access_key: &'a str) -> Self {
+        Self {
+            method: Method::GET,
+            ..Self::put(connection, path, access_key)
+        }
+    }
+
+    pub(crate) fn with_client(mut self, client: &'a reqwest::Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    async fn resolved_client(&self) -> S3Result<reqwest::Client> {
+        match self.client {
+            Some(client) => Ok(client.clone()),
+            None => site_replication_client_for(self.connection).await,
+        }
+    }
+
+    /// Send and return the raw status/body without a success check. `body` is
+    /// the JSON payload of a `PUT` (serialized and wire-encoded here, which
+    /// is where the peer-join encryption applies); `None` sends a bodiless
+    /// request (the `GET` flavor).
+    pub(crate) async fn send_raw<T: Serialize>(&self, secret_key: &str, body: Option<&T>) -> S3Result<(StatusCode, Vec<u8>)> {
+        let client = self.resolved_client().await?;
+        let path = site_replication_peer_wire_path(self.path);
+        let url = site_replication_peer_url(self.connection, &path)?;
+        let uri = url
+            .as_str()
+            .parse::<Uri>()
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {e}")))?;
+        let authority = uri
+            .authority()
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "peer endpoint missing authority".to_string()))?
+            .to_string();
+        let payload = body
+            .map(|body| {
+                let payload = serde_json::to_vec(body).map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("serialize peer request failed: {e}"))
+                })?;
+                site_replication_peer_payload(&path, secret_key, payload)
+            })
+            .transpose()?;
+
+        let mut request = http::Request::builder()
+            .method(self.method.clone())
+            .uri(uri)
+            .header(HOST, authority)
+            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+        if let Some((_, content_type)) = &payload {
+            request = request.header(CONTENT_TYPE, *content_type);
+        }
+        let signed = sign_v4(
+            request
+                .body(Body::empty())
+                .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build peer request failed: {e}")))?,
+            payload.as_ref().map(|(payload, _)| payload.len() as i64).unwrap_or(0),
+            self.access_key,
+            secret_key,
+            "",
+            current_region()
+                .map(|region| region.to_string())
+                .as_deref()
+                .unwrap_or("us-east-1"),
+        );
+
+        let mut req = client.request(self.method.clone(), url.clone());
+        for (name, value) in signed.headers() {
+            req = req.header(name, value);
+        }
+        if let Some((payload, _)) = payload {
+            req = req.body(payload);
+        }
+
+        let response = req.send().await.map_err(|e| {
+            let classify = if e.is_timeout() {
+                "timeout"
+            } else if e.is_connect() && e.to_string().to_ascii_lowercase().contains("dns") {
+                "dns resolution"
+            } else if e.to_string().to_ascii_lowercase().contains("certificate")
+                || e.to_string().to_ascii_lowercase().contains("tls")
+            {
+                "tls handshake"
+            } else if e.is_connect() {
+                "connect"
+            } else {
+                "request"
+            };
+            S3Error::with_message(S3ErrorCode::InternalError, format!("peer request to {url} failed ({classify}): {e}"))
+        })?;
+
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("read peer response failed: {e}")))?;
+
+        Ok((status, body.to_vec()))
+    }
+
+    /// `PUT` with the success check and error shape of
+    /// [`send_peer_admin_request`].
+    pub(crate) async fn send<T: Serialize>(&self, secret_key: &str, body: &T) -> S3Result<Vec<u8>> {
+        let (status, body) = self.send_raw(secret_key, Some(body)).await?;
+        if status.is_success() {
+            return Ok(body);
+        }
+
+        let detail = String::from_utf8_lossy(&body).into_owned();
+        Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!(
+                "peer request to {}{} failed with {status}: {detail}",
+                self.connection.endpoint(),
+                self.path
+            ),
+        ))
+    }
+
+    /// Bodiless `GET` with the success check and error shape of
+    /// [`send_peer_admin_get_request`].
+    pub(crate) async fn send_get(&self, secret_key: &str) -> S3Result<Vec<u8>> {
+        let (status, body) = self.send_raw::<()>(secret_key, None).await?;
+        if !status.is_success() {
+            let url = site_replication_peer_url(self.connection, &site_replication_peer_wire_path(self.path))?;
+            let detail = String::from_utf8_lossy(&body).into_owned();
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("peer request to {url} failed with {status}: {detail}"),
+            ));
+        }
+
+        Ok(body)
+    }
+
+    /// Try each distinct non-empty service-account secret until one is
+    /// accepted; stop early on an error that cannot be a secret mismatch.
+    pub(crate) async fn send_with_secret_candidates<T: Serialize>(
+        &self,
+        secret_candidates: &[String],
+        body: &T,
+    ) -> S3Result<Vec<u8>> {
+        let client = self.resolved_client().await?;
+        let request = PeerAdminRequest {
+            connection: self.connection,
+            path: self.path,
+            access_key: self.access_key,
+            method: self.method.clone(),
+            client: Some(&client),
+        };
+        let mut tried = HashSet::new();
+        let mut errors = Vec::new();
+
+        for secret_key in secret_candidates.iter().filter(|secret_key| !secret_key.is_empty()) {
+            if !tried.insert(secret_key.as_str()) {
+                continue;
+            }
+
+            match request.send(secret_key, body).await {
+                Ok(body) => return Ok(body),
+                Err(err) => {
+                    let detail = format!("{err}");
+                    let may_retry_with_next_secret = peer_error_may_be_secret_mismatch(&detail);
+                    errors.push(summarize_peer_error_detail(&detail));
+                    if !may_retry_with_next_secret {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(S3Error::with_message(
+            S3ErrorCode::InternalError,
+            format!(
+                "peer request to {}{} failed with all service-account secrets: {}",
+                self.connection.endpoint(),
+                self.path,
+                errors.join("; ")
+            ),
+        ))
+    }
+
+    /// [`Self::send`] plus the retry-queue bookkeeping: a success settles the
+    /// peer/path's queued event, a failure enqueues one.
+    pub(crate) async fn send_with_retry_event<T: Serialize>(
+        &self,
+        peer: &PeerInfo,
+        secret_key: &str,
+        body: &T,
+    ) -> S3Result<Vec<u8>> {
+        match self.send(secret_key, body).await {
+            Ok(body) => {
+                dequeue_site_replication_retry_event(peer, self.path).await;
+                Ok(body)
+            }
+            Err(err) => {
+                enqueue_site_replication_retry_event(peer, self.path, &err).await;
+                Err(err)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn send_peer_admin_request_raw<T: Serialize>(
     connection: &PeerConnection,
@@ -588,8 +817,9 @@ pub(crate) async fn send_peer_admin_request_raw<T: Serialize>(
     secret_key: &str,
     body: &T,
 ) -> S3Result<(StatusCode, Vec<u8>)> {
-    let client = site_replication_client_for(connection).await?;
-    send_peer_admin_request_raw_with_client(&client, connection, path, access_key, secret_key, body).await
+    PeerAdminRequest::put(connection, path, access_key)
+        .send_raw(secret_key, Some(body))
+        .await
 }
 
 pub(crate) async fn send_peer_admin_request_raw_with_client<T: Serialize>(
@@ -600,67 +830,10 @@ pub(crate) async fn send_peer_admin_request_raw_with_client<T: Serialize>(
     secret_key: &str,
     body: &T,
 ) -> S3Result<(StatusCode, Vec<u8>)> {
-    let path = site_replication_peer_wire_path(path);
-    let url = site_replication_peer_url(connection, &path)?;
-    let uri = url
-        .as_str()
-        .parse::<Uri>()
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {e}")))?;
-    let authority = uri
-        .authority()
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "peer endpoint missing authority".to_string()))?
-        .to_string();
-    let payload = serde_json::to_vec(body)
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize peer request failed: {e}")))?;
-    let (payload, content_type) = site_replication_peer_payload(&path, secret_key, payload)?;
-
-    let signed = sign_v4(
-        http::Request::builder()
-            .method(Method::PUT)
-            .uri(uri)
-            .header(HOST, authority)
-            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD)
-            .header(CONTENT_TYPE, content_type)
-            .body(Body::empty())
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build peer request failed: {e}")))?,
-        payload.len() as i64,
-        access_key,
-        secret_key,
-        "",
-        current_region()
-            .map(|region| region.to_string())
-            .as_deref()
-            .unwrap_or("us-east-1"),
-    );
-
-    let mut req = client.request(reqwest::Method::PUT, url.clone());
-    for (name, value) in signed.headers() {
-        req = req.header(name, value);
-    }
-
-    let response = req.body(payload).send().await.map_err(|e| {
-        let classify = if e.is_timeout() {
-            "timeout"
-        } else if e.is_connect() && e.to_string().to_ascii_lowercase().contains("dns") {
-            "dns resolution"
-        } else if e.to_string().to_ascii_lowercase().contains("certificate") || e.to_string().to_ascii_lowercase().contains("tls")
-        {
-            "tls handshake"
-        } else if e.is_connect() {
-            "connect"
-        } else {
-            "request"
-        };
-        S3Error::with_message(S3ErrorCode::InternalError, format!("peer request to {url} failed ({classify}): {e}"))
-    })?;
-
-    let status = response.status();
-    let body = response
-        .bytes()
+    PeerAdminRequest::put(connection, path, access_key)
+        .with_client(client)
+        .send_raw(secret_key, Some(body))
         .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("read peer response failed: {e}")))?;
-
-    Ok((status, body.to_vec()))
 }
 
 pub(crate) async fn send_peer_admin_request<T: Serialize>(
@@ -670,8 +843,9 @@ pub(crate) async fn send_peer_admin_request<T: Serialize>(
     secret_key: &str,
     body: &T,
 ) -> S3Result<Vec<u8>> {
-    let client = site_replication_client_for(connection).await?;
-    send_peer_admin_request_with_client(&client, connection, path, access_key, secret_key, body).await
+    PeerAdminRequest::put(connection, path, access_key)
+        .send(secret_key, body)
+        .await
 }
 
 pub(crate) async fn send_peer_admin_request_with_client<T: Serialize>(
@@ -682,16 +856,10 @@ pub(crate) async fn send_peer_admin_request_with_client<T: Serialize>(
     secret_key: &str,
     body: &T,
 ) -> S3Result<Vec<u8>> {
-    let (status, body) = send_peer_admin_request_raw_with_client(client, connection, path, access_key, secret_key, body).await?;
-    if status.is_success() {
-        return Ok(body);
-    }
-
-    let detail = String::from_utf8_lossy(&body).into_owned();
-    Err(S3Error::with_message(
-        S3ErrorCode::InternalError,
-        format!("peer request to {}{path} failed with {status}: {detail}", connection.endpoint()),
-    ))
+    PeerAdminRequest::put(connection, path, access_key)
+        .with_client(client)
+        .send(secret_key, body)
+        .await
 }
 
 pub(crate) async fn send_peer_admin_request_with_secret_candidates<T: Serialize>(
@@ -701,36 +869,9 @@ pub(crate) async fn send_peer_admin_request_with_secret_candidates<T: Serialize>
     secret_candidates: &[String],
     body: &T,
 ) -> S3Result<Vec<u8>> {
-    let client = site_replication_client_for(connection).await?;
-    let mut tried = HashSet::new();
-    let mut errors = Vec::new();
-
-    for secret_key in secret_candidates.iter().filter(|secret_key| !secret_key.is_empty()) {
-        if !tried.insert(secret_key.as_str()) {
-            continue;
-        }
-
-        match send_peer_admin_request_with_client(&client, connection, path, access_key, secret_key, body).await {
-            Ok(body) => return Ok(body),
-            Err(err) => {
-                let detail = format!("{err}");
-                let may_retry_with_next_secret = peer_error_may_be_secret_mismatch(&detail);
-                errors.push(summarize_peer_error_detail(&detail));
-                if !may_retry_with_next_secret {
-                    break;
-                }
-            }
-        }
-    }
-
-    Err(S3Error::with_message(
-        S3ErrorCode::InternalError,
-        format!(
-            "peer request to {}{path} failed with all service-account secrets: {}",
-            connection.endpoint(),
-            errors.join("; ")
-        ),
-    ))
+    PeerAdminRequest::put(connection, path, access_key)
+        .send_with_secret_candidates(secret_candidates, body)
+        .await
 }
 
 pub(crate) fn peer_error_may_be_secret_mismatch(detail: &str) -> bool {
@@ -748,8 +889,7 @@ pub(crate) async fn send_peer_admin_get_request(
     access_key: &str,
     secret_key: &str,
 ) -> S3Result<Vec<u8>> {
-    let client = site_replication_client_for(connection).await?;
-    send_peer_admin_get_request_with_client(&client, connection, path, access_key, secret_key).await
+    PeerAdminRequest::get(connection, path, access_key).send_get(secret_key).await
 }
 
 pub(crate) async fn send_peer_admin_get_request_with_client(
@@ -759,71 +899,10 @@ pub(crate) async fn send_peer_admin_get_request_with_client(
     access_key: &str,
     secret_key: &str,
 ) -> S3Result<Vec<u8>> {
-    let path = site_replication_peer_wire_path(path);
-    let url = site_replication_peer_url(connection, &path)?;
-    let uri = url
-        .as_str()
-        .parse::<Uri>()
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid peer endpoint: {e}")))?;
-    let authority = uri
-        .authority()
-        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "peer endpoint missing authority".to_string()))?
-        .to_string();
-
-    let signed = sign_v4(
-        http::Request::builder()
-            .method(Method::GET)
-            .uri(uri)
-            .header(HOST, authority)
-            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD)
-            .body(Body::empty())
-            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("build peer request failed: {e}")))?,
-        0,
-        access_key,
-        secret_key,
-        "",
-        current_region()
-            .map(|region| region.to_string())
-            .as_deref()
-            .unwrap_or("us-east-1"),
-    );
-
-    let mut req = client.request(reqwest::Method::GET, url.clone());
-    for (name, value) in signed.headers() {
-        req = req.header(name, value);
-    }
-
-    let response = req.send().await.map_err(|e| {
-        let classify = if e.is_timeout() {
-            "timeout"
-        } else if e.is_connect() && e.to_string().to_ascii_lowercase().contains("dns") {
-            "dns resolution"
-        } else if e.to_string().to_ascii_lowercase().contains("certificate") || e.to_string().to_ascii_lowercase().contains("tls")
-        {
-            "tls handshake"
-        } else if e.is_connect() {
-            "connect"
-        } else {
-            "request"
-        };
-        S3Error::with_message(S3ErrorCode::InternalError, format!("peer request to {url} failed ({classify}): {e}"))
-    })?;
-
-    let status = response.status();
-    let body = response
-        .bytes()
+    PeerAdminRequest::get(connection, path, access_key)
+        .with_client(client)
+        .send_get(secret_key)
         .await
-        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("read peer response failed: {e}")))?;
-
-    if !status.is_success() {
-        let detail = String::from_utf8_lossy(&body).into_owned();
-        return Err(S3Error::with_message(
-            S3ErrorCode::InternalError,
-            format!("peer request to {url} failed with {status}: {detail}"),
-        ));
-    }
-
-    Ok(body.to_vec())
 }
 
 pub(crate) async fn runtime_site_replication_targets() -> S3Result<Option<SiteReplicationRuntime>> {
@@ -909,17 +988,10 @@ pub(crate) async fn send_peer_admin_request_with_retry_event_transport<T: Serial
     secret_key: &str,
     body: &T,
 ) -> S3Result<Vec<u8>> {
-    match send_peer_admin_request_with_client(&transport.client, &transport.connection, path, access_key, secret_key, body).await
-    {
-        Ok(body) => {
-            dequeue_site_replication_retry_event(peer, path).await;
-            Ok(body)
-        }
-        Err(err) => {
-            enqueue_site_replication_retry_event(peer, path, &err).await;
-            Err(err)
-        }
-    }
+    PeerAdminRequest::put(&transport.connection, path, access_key)
+        .with_client(&transport.client)
+        .send_with_retry_event(peer, secret_key, body)
+        .await
 }
 
 pub(crate) fn parse_endpoint_refresh_status(peer: &PeerInfo, body: &[u8]) -> S3Result<()> {
