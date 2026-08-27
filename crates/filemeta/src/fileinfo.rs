@@ -1457,7 +1457,7 @@ pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     Err(Error::other(ERR_RESTORE_HDR_MALFORMED))
 }
 
-pub fn is_restored_object_on_disk<S: std::hash::BuildHasher>(meta: &HashMap<String, String, S>) -> bool {
+pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
     if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str())
         && let Ok(restore_status) = parse_restore_obj_status(restore_hdr)
     {
@@ -2135,10 +2135,7 @@ mod tests {
             -1_000_000i64..=1_000_000i64,
             optional_timestamp_strategy(),
             proptest::option::of(bytes_strategy(16)),
-            proptest::option::of(
-                hash_map(small_string_strategy(), small_string_strategy(), 0..=3)
-                    .prop_map(|m| m.into_iter().collect::<HashMap<String, String>>()),
-            ),
+            proptest::option::of(hash_map(small_string_strategy(), small_string_strategy(), 0..=3)),
             proptest::option::of(small_string_strategy()),
         )
             .prop_map(|(etag, number, size, actual_size, mod_time, index, checksums, error)| ObjectPartInfo {
@@ -2173,8 +2170,7 @@ mod tests {
                 -1_000_000i64..=1_000_000i64,
                 proptest::option::of(any::<u32>()),
                 proptest::option::of(any::<u64>()),
-                hash_map(small_string_strategy(), small_string_strategy(), 0..=4)
-                    .prop_map(|m| m.into_iter().collect::<HashMap<String, String>>()),
+                hash_map(small_string_strategy(), small_string_strategy(), 0..=4),
                 vec(object_part_info_strategy(), 0..=3),
                 erasure_info_strategy(),
                 any::<bool>(),

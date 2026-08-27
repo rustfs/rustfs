@@ -2915,9 +2915,9 @@ async fn stale_upload_current_size(set: &Arc<SetDisks>, metadata: &HashMap<Strin
     stale_upload_current_size_with_opts(set, metadata, upload_dir, false).await
 }
 
-async fn stale_upload_current_size_with_opts<S: std::hash::BuildHasher>(
+async fn stale_upload_current_size_with_opts(
     set: &Arc<SetDisks>,
-    metadata: &HashMap<String, String, S>,
+    metadata: &HashMap<String, String>,
     upload_dir: &str,
     no_lock: bool,
 ) -> Option<usize> {
@@ -2950,9 +2950,9 @@ async fn stale_upload_current_size_with_opts<S: std::hash::BuildHasher>(
     )
 }
 
-async fn stale_upload_lifecycle_due<S: std::hash::BuildHasher>(
+async fn stale_upload_lifecycle_due(
     set: &Arc<SetDisks>,
-    metadata: &HashMap<String, String, S>,
+    metadata: &HashMap<String, String>,
     initiated: OffsetDateTime,
     upload_dir: &str,
     no_lock: bool,
@@ -2978,7 +2978,7 @@ async fn stale_upload_lifecycle_due<S: std::hash::BuildHasher>(
             .unwrap_or_default(),
         is_latest: true,
         delete_marker: false,
-        user_defined: metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        user_defined: metadata.clone(),
         ..Default::default()
     };
 

@@ -2861,7 +2861,7 @@ impl From<FileInfo> for MetaObject {
     }
 }
 
-fn get_internal_replication_state<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> Option<ReplicationState> {
+fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<ReplicationState> {
     let mut rs = ReplicationState::default();
     let mut has = false;
 
@@ -2942,7 +2942,7 @@ impl MetaDeleteMarker {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, _all_parts: bool) -> Result<FileInfo> {
-        let metadata: HashMap<String, String> = self
+        let metadata = self
             .meta_sys
             .clone()
             .into_iter()
