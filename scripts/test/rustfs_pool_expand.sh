@@ -330,7 +330,41 @@ wait_service_active() {
     sleep 5
     waited=$((waited + 5))
   done
+  diagnose_node_start_failure "${node}"
   die "${node}: timed out waiting for ${RUSTFS_SERVICE} (${SERVICE_TIMEOUT}s)"
+}
+
+# Known server-side issues the test can hit. Format:
+#   "<error signature>|<tracking>|<hint>"
+KNOWN_SERVER_ISSUES=(
+  "pool activation requires a live fleet capability proof|rustfs/backlog#2031|multi-pool cold start with rebalance metadata fails on nightly builds; server fix pending, no script workaround"
+)
+
+# Print a hint when $1 matches a known server-side issue signature.
+hint_server_issue() {
+  local text="$1" entry sig tracking hint
+  for entry in "${KNOWN_SERVER_ISSUES[@]}"; do
+    sig="${entry%%|*}"
+    tracking="${entry#*|}"
+    hint="${tracking#*|}"
+    tracking="${tracking%%|*}"
+    if printf '%s' "${text}" | grep -qiF "${sig}"; then
+      printf '\033[1;33m[KNOWN SERVER ISSUE]\033[0m %s (%s): %s\n' "${sig}" "${tracking}" "${hint}" >&2
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Fetch the journal tail from a node whose service failed to start and
+# annotate known server-side issues.
+diagnose_node_start_failure() {
+  local node="$1" journal
+  journal="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" \
+    "SUDO=\"\"; [ \"\$(id -u)\" -ne 0 ] && SUDO=\"sudo -n\"; \${SUDO} journalctl -u ${RUSTFS_SERVICE} --no-pager -n 60 2>/dev/null || true")"
+  printf '%s\n' "--- ${node}: ${RUSTFS_SERVICE} journal (last 60 lines) ---" >&2
+  printf '%s\n' "${journal}" >&2
+  hint_server_issue "${journal}" || true
 }
 
 # Generate the /etc/default/rustfs content
@@ -411,9 +445,13 @@ service_action() {
   local action="$1" node="$2"
   log "${node}: systemctl ${action} ${RUSTFS_SERVICE}"
   if [ "${DRY_RUN}" -eq 1 ]; then return 0; fi
-  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" \
-    "if [ \"\$(id -u)\" -ne 0 ]; then sudo -n systemctl ${action} ${RUSTFS_SERVICE}; else systemctl ${action} ${RUSTFS_SERVICE}; fi" \
-    || die "${node}: systemctl ${action} failed"
+  if ! ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" \
+      "if [ \"\$(id -u)\" -ne 0 ]; then sudo -n systemctl ${action} ${RUSTFS_SERVICE}; else systemctl ${action} ${RUSTFS_SERVICE}; fi"; then
+    if [ "${action}" = "start" ]; then
+      diagnose_node_start_failure "${node}"
+    fi
+    die "${node}: systemctl ${action} failed"
+  fi
 }
 
 service_action_all() {
@@ -607,6 +645,7 @@ start_rebalance_with_retry() {
     fi
     warn "rebalance start attempt ${attempt}/${attempts} failed (HTTP ${code}): ${body}"
     if [ "${attempt}" -ge "${attempts}" ]; then
+      hint_server_issue "${body}" || true
       die "rebalance start failed after ${attempts} attempts (see last error above)"
     fi
     attempt=$((attempt + 1))
@@ -949,6 +988,7 @@ step9_decommission() {
       break
     fi
     if [ "${attempt}" -ge "${DECOMMISSION_RETRIES}" ]; then
+      warn "if the source bucket has many objects and the tested version is 1.0.0-rc.3, this is the known metacache-listing decommission bug; remove the test bucket (rc rb --force rustfs/${WARP_BUCKET}) or lower --storage-threshold, then re-run step 9"
       die "pool ${DECOMMISSION_POOL_ID} still failed after ${attempt} attempts; investigate manually (POST ${API_ENDPOINT}/rustfs/admin/v3/pools/clear?by-id=true&pool=${DECOMMISSION_POOL_ID} to reset)"
     fi
     warn "attempt ${attempt} failed; clearing metadata and retrying in ${DECOMMISSION_RETRY_DELAY}s"
