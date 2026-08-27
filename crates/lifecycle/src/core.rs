@@ -1568,6 +1568,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn abort_incomplete_multipart_upload_due_accepts_zero_days() {
         let initiated = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1628,6 +1629,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn predict_expiration_selects_closest_expiry_for_put_object() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1874,6 +1876,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn empty_transition_vectors_are_not_active_or_due() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -1939,6 +1942,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_keeps_latest_object_before_days_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -1972,6 +1976,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_transitions_latest_object_after_days_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2009,6 +2014,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_transitions_latest_object_after_date_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let transition_date = base_time - Duration::days(1);
@@ -2048,6 +2054,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_selects_earliest_due_among_multiple_past_due_events() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         // Two enabled rules both yield a past-due DeleteAction and a third yields a
@@ -2161,6 +2168,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_expires_noncurrent_version_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2198,6 +2206,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_skips_noncurrent_expiration_without_successor() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("valid fixed test timestamp");
         let lc = BucketLifecycleConfiguration {
@@ -2233,6 +2242,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_missing_successor_does_not_skip_noncurrent_transition() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("valid fixed test timestamp");
         let lc = BucketLifecycleConfiguration {
@@ -2275,6 +2285,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_noncurrent_expiration_one_day_respects_due_boundary() {
         let successor_time = datetime!(2025-06-15 12:00:00 UTC);
         let due = expected_expiry_time(successor_time, 1);
@@ -2316,6 +2327,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_expires_noncurrent_version_immediately_when_zero_days() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2353,6 +2365,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_transitions_noncurrent_version_after_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2428,6 +2441,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn evaluator_honors_newer_noncurrent_versions_retention_count() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = Arc::new(BucketLifecycleConfiguration {
@@ -2716,6 +2730,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn expired_object_delete_marker_ignores_marker_with_noncurrent_versions_present() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2792,6 +2807,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn expired_object_delete_marker_deletes_only_delete_marker_immediately() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2869,6 +2885,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn expiration_days_deletes_only_expired_delete_marker_when_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -2919,6 +2936,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn expiration_days_uses_earliest_due_rule_for_expired_delete_marker() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let make_rule = |id: &str, days| LifecycleRule {
@@ -3249,6 +3267,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn del_marker_expiration_deletes_marker_and_older_versions_when_due() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("fixed timestamp should be valid");
         let lc = BucketLifecycleConfiguration {
@@ -3288,6 +3307,7 @@ mod tests {
     // --- TASK-003 tests: Round up to next UTC processing boundary ---
 
     #[test]
+    #[serial]
     fn expected_expiry_time_rounds_up_to_next_midnight_utc() {
         with_default_ilm_process_time(|| {
             // Object created at 2025-01-15T10:30:45Z, expire in 30 days
@@ -3303,6 +3323,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_immediate_expiry_returns_epoch() {
         with_default_ilm_process_time(|| {
             let mod_time = datetime!(2025-06-01 12:00:00 UTC);
@@ -3312,6 +3333,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_preserves_exact_midnight_boundary() {
         with_default_ilm_process_time(|| {
             let mod_time = datetime!(2025-03-01 00:00:00 UTC);
@@ -3321,6 +3343,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_rounds_end_of_day_to_following_midnight() {
         with_default_ilm_process_time(|| {
             let mod_time = datetime!(2025-06-15 23:59:59 UTC);
@@ -3330,6 +3353,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_uses_canonical_process_time_boundary() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
 
@@ -3342,6 +3366,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_uses_deprecated_process_time_alias() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
 
@@ -3354,6 +3379,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn expected_expiry_time_uses_default_boundary_when_process_time_is_zero_or_invalid() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
 
@@ -3376,6 +3402,7 @@ mod tests {
 
     // (a) Default path (env unset) is byte-identical: one day == 86400s.
     #[test]
+    #[serial]
     fn ilm_day_secs_defaults_to_86400_when_unset() {
         temp_env::with_var_unset(ENV_ILM_DEBUG_DAY_SECS, || {
             assert_eq!(ilm_day_secs(), DEFAULT_ILM_DAY_SECS);
@@ -3404,6 +3431,7 @@ mod tests {
 
     // (b) End-to-end env read scales the day length.
     #[test]
+    #[serial]
     fn ilm_day_secs_scales_when_env_set() {
         temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("2"), || {
             assert_eq!(ilm_day_secs(), 2);
@@ -3412,6 +3440,7 @@ mod tests {
 
     // (c) Invalid env value falls back to 86400.
     #[test]
+    #[serial]
     fn ilm_day_secs_falls_back_on_invalid_env() {
         temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("bogus"), || {
             assert_eq!(ilm_day_secs(), DEFAULT_ILM_DAY_SECS);
@@ -3424,6 +3453,7 @@ mod tests {
     // Deadline math scales: with a 1s day and PROCESS_TIME unset, a Days=1 rule is
     // due 1s after mod_time (rounded up to the next 1s boundary => same instant).
     #[test]
+    #[serial]
     fn expected_expiry_time_scales_with_debug_day_secs() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
         temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("1"), || {
@@ -3439,6 +3469,7 @@ mod tests {
 
     // days == 0 still yields the immediate-expiry sentinel regardless of the switch.
     #[test]
+    #[serial]
     fn expected_expiry_time_zero_days_ignores_debug_day_secs() {
         let mod_time = datetime!(2025-06-01 12:00:00 UTC);
         temp_env::with_var(ENV_ILM_DEBUG_DAY_SECS, Some("2"), || {
@@ -3449,6 +3480,7 @@ mod tests {
     // (③) Interaction with an explicit RUSTFS_ILM_PROCESS_TIME: the deadline offset
     // uses the accelerated day length, but the rounding boundary honors PROCESS_TIME.
     #[test]
+    #[serial]
     fn expected_expiry_time_debug_day_secs_respects_explicit_process_time() {
         let mod_time = datetime!(2025-01-15 10:30:00 UTC);
         // day == 10s, but round up to the next 60s (PROCESS_TIME) boundary.
@@ -3465,6 +3497,7 @@ mod tests {
 
     // (③) With the switch unset, an explicit PROCESS_TIME behaves exactly as before.
     #[test]
+    #[serial]
     fn expected_expiry_time_unset_debug_day_secs_matches_legacy_process_time() {
         let mod_time = datetime!(2025-01-15 10:30:45 UTC);
         temp_env::with_var_unset(ENV_ILM_DEBUG_DAY_SECS, || {
@@ -3492,6 +3525,7 @@ mod tests {
 
     // The abort-incomplete-multipart deadline path also scales through the switch.
     #[test]
+    #[serial]
     fn abort_incomplete_multipart_due_scales_with_debug_day_secs() {
         use s3s::dto::AbortIncompleteMultipartUpload;
         let initiated = datetime!(2025-01-15 10:30:45 UTC);
@@ -3536,6 +3570,7 @@ mod tests {
     // (⑤ evaluator seam) A Days=1 rule fires under RUSTFS_ILM_DEBUG_DAY_SECS=1 once
     // `now` advances a few seconds past a mod_time only ~seconds in the past.
     #[test]
+    #[serial]
     fn eval_inner_expires_days_one_rule_under_debug_day_secs() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,
@@ -3584,6 +3619,7 @@ mod tests {
 
     // Absolute Date-based rules must NOT scale with the switch (regression guard).
     #[test]
+    #[serial]
     fn eval_inner_date_rule_ignores_debug_day_secs() {
         let expiry_date = datetime!(2025-06-01 00:00:00 UTC);
         let lc = BucketLifecycleConfiguration {
@@ -3866,6 +3902,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_triggers_delete_all_versions_when_expired_object_all_versions_set() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -3904,6 +3941,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn expired_object_all_versions_does_not_apply_to_current_delete_marker() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).expect("fixed timestamp should be valid");
         let lc = BucketLifecycleConfiguration {
@@ -3933,6 +3971,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn eval_inner_uses_delete_action_when_all_versions_not_set() {
         let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let lc = BucketLifecycleConfiguration {
@@ -4051,6 +4090,7 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
         use s3s::dto::{NoncurrentVersionExpiration, Tag};
+        use serial_test::serial;
 
         const DAY_SECS: i64 = 86400;
 
@@ -4281,6 +4321,7 @@ mod tests {
             /// combination, and must be deterministic: the same input
             /// evaluated twice yields an identical event.
             #[test]
+            #[serial]
             fn eval_inner_never_panics_and_is_deterministic(
                 rules in prop::collection::vec(arb_rule(), 0..4),
                 obj in arb_object_opts(),
@@ -4420,6 +4461,7 @@ mod tests {
             /// candidate set — earliest due wins, ties prefer delete-class —
             /// and must be `NoneAction` exactly when that set is empty.
             #[test]
+            #[serial]
             fn eval_inner_winner_matches_selection_oracle(
                 rules in prop::collection::vec(arb_selection_rule(), 0..5),
                 mod_off in 0i64..(2 * DAY_SECS),
@@ -4473,6 +4515,7 @@ mod tests {
             /// non-decreasing in `days` (days == 0 maps to UNIX_EPOCH, below
             /// any post-1970 deadline).
             #[test]
+            #[serial]
             fn expected_expiry_time_is_monotonic_in_days(
                 mod_off in 0i64..(3650 * DAY_SECS),
                 d1 in 0i32..2000,
@@ -4494,6 +4537,7 @@ mod tests {
             /// to the next whole-day boundary: the result is day-aligned, not
             /// before `mod_time + days`, and less than one boundary beyond it.
             #[test]
+            #[serial]
             fn expected_expiry_time_lands_on_default_day_boundary(
                 mod_off in 0i64..(3650 * DAY_SECS),
                 days in 1i32..2000,
@@ -4511,6 +4555,7 @@ mod tests {
             /// to that boundary instead: aligned to it, never early, and less
             /// than one boundary late.
             #[test]
+            #[serial]
             fn expected_expiry_time_lands_on_explicit_process_boundary(
                 mod_off in 0i64..(365 * DAY_SECS),
                 days in 1i32..400,
