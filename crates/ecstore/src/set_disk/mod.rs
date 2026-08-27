@@ -4817,6 +4817,28 @@ fn should_force_delete_marker_for_missing_version(opts: &ObjectOptions) -> bool 
     opts.delete_marker || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.data_movement)
 }
 
+/// Whether a plain client delete addressed to an explicit version removed an
+/// existing delete marker, so the response must carry delete-marker semantics
+/// (`x-amz-delete-marker: true` / `DeleteMarker` in `DeleteObjects` entries).
+///
+/// This is a response-side classification only. It must never feed the
+/// storage write shape: a delete request marked `deleted` with the null
+/// identity makes `FileMeta::delete_version` re-create the marker it just
+/// removed (that is the suspended-bucket "delete mints a marker" write
+/// path), which is why `resolve_delete_version_state` cannot simply report
+/// `delete_marker` for suspended buckets (issue #6745).
+///
+/// Purge/replica replication shapes are excluded, mirroring the clauses in
+/// `resolve_delete_version_state` that clear `delete_marker` for them.
+fn explicit_delete_removed_marker(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> bool {
+    opts.version_id.is_some()
+        && version_found
+        && goi.delete_marker
+        && goi.version_purge_status.is_empty()
+        && opts.version_purge_status().is_empty()
+        && opts.delete_marker_replication_status().is_empty()
+}
+
 fn resolve_delete_version_state(opts: &ObjectOptions, goi: &ObjectInfo, version_found: bool) -> (bool, bool) {
     let mut mark_delete = goi.version_id.is_some() || ((opts.versioned || opts.version_suspended) && opts.version_id.is_none());
     let mut delete_marker = opts.versioned;
@@ -7035,6 +7057,85 @@ mod tests {
         assert!(
             !delete_marker,
             "replica purge of an existing delete marker version must remove that version, not preserve delete-marker semantics"
+        );
+    }
+
+    #[test]
+    fn resolve_delete_version_state_keeps_null_marker_removal_write_shape_undeleted() {
+        // Removing a null delete marker by explicit version id on a
+        // versioning-suspended bucket must NOT mark the write request
+        // `deleted`: `FileMeta::delete_version` re-creates a marker for
+        // `deleted` requests carrying the null identity (the suspended-bucket
+        // "delete mints a marker" path), which would resurrect the marker
+        // being removed. The response-side marker semantics come from
+        // `explicit_delete_removed_marker` instead (issue #6745).
+        let opts = ObjectOptions {
+            version_suspended: true,
+            version_id: Some(Uuid::nil().to_string()),
+            ..Default::default()
+        };
+        let current = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        let (mark_delete, delete_marker) = resolve_delete_version_state(&opts, &current, true);
+
+        assert!(!mark_delete);
+        assert!(!delete_marker, "the storage write for a null-marker removal must stay undeleted");
+        assert!(
+            explicit_delete_removed_marker(&opts, &current, true),
+            "the response must still report delete-marker semantics"
+        );
+    }
+
+    #[test]
+    fn explicit_delete_removed_marker_is_limited_to_plain_marker_removals() {
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let marker = ObjectInfo {
+            version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert!(explicit_delete_removed_marker(&opts, &marker, true));
+        assert!(
+            !explicit_delete_removed_marker(&opts, &marker, false),
+            "missing versions are not marker removals"
+        );
+
+        let data_version = ObjectInfo {
+            version_id: marker.version_id,
+            delete_marker: false,
+            ..Default::default()
+        };
+        assert!(!explicit_delete_removed_marker(&opts, &data_version, true));
+
+        let versionless = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        assert!(
+            !explicit_delete_removed_marker(&versionless, &marker, true),
+            "marker creation (no version in the request) is not a removal"
+        );
+
+        let replica_purge = ObjectOptions {
+            versioned: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            delete_replication: Some(ReplicationState {
+                replica_status: ReplicationStatusType::Replica,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !explicit_delete_removed_marker(&replica_purge, &marker, true),
+            "replication purge shapes keep their existing response semantics"
         );
     }
 

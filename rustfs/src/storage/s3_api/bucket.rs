@@ -26,6 +26,7 @@ use s3s::dto::{
 use s3s::{S3Error, S3ErrorCode};
 use tracing::debug;
 use urlencoding::encode;
+use uuid::Uuid;
 
 use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
 
@@ -198,6 +199,16 @@ pub(crate) fn parse_list_objects_v2_params(
     })
 }
 
+/// A null version surfaces as `Some(Uuid::nil())` on the client-facing
+/// `ObjectInfo`; AWS advertises it as the literal string `null`, and a nil
+/// UUID must never reach the wire (issue #6745).
+fn list_versions_response_version_id(version_id: Option<Uuid>) -> String {
+    version_id
+        .filter(|id| !id.is_nil())
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
 pub(crate) fn build_list_object_versions_output(
     object_infos: ListObjectVersionsInfo,
     bucket: String,
@@ -213,7 +224,7 @@ pub(crate) fn build_list_object_versions_output(
             key: Some(encode_output_value(&v.name)),
             last_modified: v.mod_time.map(Timestamp::from),
             size: Some(v.size),
-            version_id: Some(v.version_id.map(|id| id.to_string()).unwrap_or_else(|| "null".to_string())),
+            version_id: Some(list_versions_response_version_id(v.version_id)),
             is_latest: Some(v.is_latest),
             e_tag: v.etag.clone().map(|etag| to_s3s_etag(&etag)),
             storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
@@ -227,7 +238,7 @@ pub(crate) fn build_list_object_versions_output(
         .filter(|o| o.delete_marker)
         .map(|o| DeleteMarkerEntry {
             key: Some(encode_output_value(&o.name)),
-            version_id: Some(o.version_id.map(|id| id.to_string()).unwrap_or_else(|| "null".to_string())),
+            version_id: Some(list_versions_response_version_id(o.version_id)),
             is_latest: Some(o.is_latest),
             last_modified: o.mod_time.map(Timestamp::from),
             ..Default::default()
@@ -941,6 +952,13 @@ mod tests {
                     ..Default::default()
                 },
                 ObjectInfo {
+                    name: "obj-null-delete-marker".to_string(),
+                    delete_marker: true,
+                    version_id: Some(Uuid::nil()),
+                    is_latest: true,
+                    ..Default::default()
+                },
+                ObjectInfo {
                     name: String::new(),
                     delete_marker: false,
                     ..Default::default()
@@ -975,12 +993,16 @@ mod tests {
         let versions = output.versions.unwrap_or_default();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].key, Some("obj-a".to_string()));
-        assert_eq!(versions[0].version_id, Some(Uuid::nil().to_string()));
+        // A null version's synthesized nil UUID must surface as the literal
+        // `null`, never as `00000000-…` (issue #6745).
+        assert_eq!(versions[0].version_id, Some("null".to_string()));
 
         let delete_markers = output.delete_markers.unwrap_or_default();
-        assert_eq!(delete_markers.len(), 1);
+        assert_eq!(delete_markers.len(), 2);
         assert_eq!(delete_markers[0].key, Some("obj-delete-marker".to_string()));
         assert_eq!(delete_markers[0].version_id, Some("null".to_string()));
+        assert_eq!(delete_markers[1].key, Some("obj-null-delete-marker".to_string()));
+        assert_eq!(delete_markers[1].version_id, Some("null".to_string()));
 
         let prefixes = output.common_prefixes.unwrap_or_default();
         assert_eq!(

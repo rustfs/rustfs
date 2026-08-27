@@ -167,7 +167,15 @@ impl VersionMarker {
         if marker == NULL_VERSION_MARKER {
             Ok(Self::Null)
         } else {
-            Ok(Self::Version(Uuid::parse_str(marker)?))
+            let version = Uuid::parse_str(marker)?;
+            // Older releases advertised the null version as a nil UUID
+            // (issue #6745); a stored null version has no UUID, so resuming
+            // by `Version(nil)` could never match. Fold it into `Null`.
+            if version.is_nil() {
+                Ok(Self::Null)
+            } else {
+                Ok(Self::Version(version))
+            }
         }
     }
 }
@@ -713,6 +721,19 @@ fn is_modified_since(mod_time: &OffsetDateTime, given_time: &OffsetDateTime) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_marker_parse_folds_null_and_nil_uuid_into_null() {
+        assert_eq!(VersionMarker::parse("null"), Ok(VersionMarker::Null));
+        // Older releases advertised the null version as a nil UUID
+        // (issue #6745); it must resume as the null marker, not a UUID no
+        // stored version carries.
+        assert_eq!(VersionMarker::parse(Uuid::nil().to_string()), Ok(VersionMarker::Null));
+
+        let version = Uuid::from_u128(7);
+        assert_eq!(VersionMarker::parse(version.to_string()), Ok(VersionMarker::Version(version)));
+        assert!(VersionMarker::parse("not-a-version").is_err());
+    }
 
     #[test]
     fn http_preconditions_ignore_empty_etag_headers() {

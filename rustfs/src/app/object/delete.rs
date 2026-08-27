@@ -327,6 +327,27 @@ fn delete_response_version_id(version_id: Option<Uuid>, synthetic_version_id: bo
     }
 }
 
+/// Version identity for a `DeleteObjects` `<Deleted>` entry (and its
+/// notification). A delete marker removed by version id carries no storage
+/// `version_id` on the committed result, so fall back to the identity the
+/// request addressed — clients correlate response entries against what they
+/// sent (issue #6745). Marker creation keeps `None`: its request carried no
+/// version id.
+fn delete_entry_response_version_id(
+    committed_version_id: Option<Uuid>,
+    committed_delete_marker: bool,
+    requested_version_id: Option<Uuid>,
+    synthetic_version_id: bool,
+) -> Option<String> {
+    delete_response_version_id(committed_version_id, synthetic_version_id).or_else(|| {
+        if committed_delete_marker {
+            delete_response_version_id(requested_version_id, synthetic_version_id)
+        } else {
+            None
+        }
+    })
+}
+
 fn reduce_delete_objects_result<'a>(
     object: &ObjectToDelete,
     deleted: &'a StorageDeletedObject,
@@ -395,6 +416,11 @@ impl DefaultObjectUsecase {
             delete_object: Option<StorageDeletedObject>,
             error: Option<s3s::dto::Error>,
             synthetic_version_id: bool,
+            // The version identity the request addressed, before any
+            // synthetic-directory synthesis. `None` means the request carried
+            // no version id, i.e. a committed delete marker was created, not
+            // removed (issue #6745).
+            requested_version_id: Option<Uuid>,
         }
 
         let mut delete_results = vec![DeleteResult::default(); delete.objects.len()];
@@ -481,6 +507,7 @@ impl DefaultObjectUsecase {
                 ..Default::default()
             };
             delete_results[idx].synthetic_version_id = synthetic_version_id;
+            delete_results[idx].requested_version_id = version_uuid;
 
             authorized_deletes.push(AuthorizedDelete { idx, object });
         }
@@ -648,10 +675,16 @@ impl DefaultObjectUsecase {
                     let creates_delete_marker = object_to_delete[i].version_id.is_none() && versioned && !version_suspended;
                     let committed_delete_marker = dobjs[i].delete_marker;
                     let delete_accounting = accounting.get(i).and_then(Option::as_ref);
+                    // `requested_version_id` distinguishes marker creation
+                    // (no version in the request) from marker removal by
+                    // version id; an explicit null-version request maps to
+                    // `Some(Uuid::nil())`, which `delete_request_targets_current`
+                    // would treat as versionless and mis-record a marker
+                    // removal as a marker creation (issue #6745).
                     let update = delete_memory_update(
                         creates_delete_marker,
                         committed_delete_marker,
-                        delete_request_targets_current(object_to_delete[i].version_id),
+                        delete_results[didx].requested_version_id.is_none(),
                         delete_accounting.and_then(|value| value.size),
                         delete_accounting.is_some_and(|value| value.removed_current_object),
                     );
@@ -673,7 +706,12 @@ impl DefaultObjectUsecase {
                     result.synthetic_version_id,
                 ),
                 key: Some(object.object_name.clone()),
-                version_id: delete_response_version_id(object.version_id, result.synthetic_version_id),
+                version_id: delete_entry_response_version_id(
+                    object.version_id,
+                    object.delete_marker,
+                    result.requested_version_id,
+                    result.synthetic_version_id,
+                ),
             })
             .collect();
         let deleted_cache_keys = delete_results
@@ -732,7 +770,10 @@ impl DefaultObjectUsecase {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
-                    let event_name = delete_event_name_for_marker(dobj.delete_marker);
+                    // `DeleteMarkerCreated` is a creation event; a delete
+                    // marker removed by an explicit version id is a plain
+                    // versioned delete (issue #6745).
+                    let event_name = delete_event_name_for_marker(dobj.delete_marker && res.requested_version_id.is_none());
                     let event_args = EventArgsBuilder::new(
                         event_name,
                         notify_bucket.clone(),
@@ -742,7 +783,15 @@ impl DefaultObjectUsecase {
                             ..Default::default()
                         }),
                     )
-                    .version_id(delete_response_version_id(dobj.version_id, res.synthetic_version_id).unwrap_or_default())
+                    .version_id(
+                        delete_entry_response_version_id(
+                            dobj.version_id,
+                            dobj.delete_marker,
+                            res.requested_version_id,
+                            res.synthetic_version_id,
+                        )
+                        .unwrap_or_default(),
+                    )
                     .req_params(req_params.clone())
                     .resp_elements(resp_elements.clone())
                     .host(get_request_host(&req_headers))
@@ -1082,7 +1131,9 @@ impl DefaultObjectUsecase {
             ..Default::default()
         };
 
-        let event_name = delete_event_name_for_marker(delete_marker);
+        // `DeleteMarkerCreated` is a creation event; a delete marker removed
+        // by an explicit version id is a plain versioned delete (issue #6745).
+        let event_name = delete_event_name_for_marker(delete_marker && version_id_clone.is_none());
 
         helper = helper.event_name(event_name);
         helper = helper.object(obj_info).version_id(response_version_id.unwrap_or_default());
@@ -1116,6 +1167,32 @@ mod tests {
         assert_eq!(delete_response_version_id(Some(Uuid::nil()), false), Some("null".to_string()));
         assert_eq!(delete_response_version_id(Some(Uuid::nil()), true), None);
         assert_eq!(delete_response_version_id(None, false), None);
+    }
+
+    #[test]
+    fn delete_entry_response_version_id_echoes_requested_identity_for_marker_removal() {
+        let version_id = Uuid::new_v4();
+
+        // Marker removed by explicit null version id: echo `null`.
+        assert_eq!(
+            delete_entry_response_version_id(None, true, Some(Uuid::nil()), false),
+            Some("null".to_string())
+        );
+        // Marker removed by a real version id: echo that id.
+        assert_eq!(
+            delete_entry_response_version_id(None, true, Some(version_id), false),
+            Some(version_id.to_string())
+        );
+        // Marker creation (no version in the request): no version identity.
+        assert_eq!(delete_entry_response_version_id(None, true, None, false), None);
+        // Non-marker deletes keep the committed identity and never fall back.
+        assert_eq!(
+            delete_entry_response_version_id(Some(version_id), false, Some(Uuid::nil()), false),
+            Some(version_id.to_string())
+        );
+        assert_eq!(delete_entry_response_version_id(None, false, Some(version_id), false), None);
+        // Synthetic directory deletes stay without a version identity.
+        assert_eq!(delete_entry_response_version_id(None, true, Some(Uuid::nil()), true), None);
     }
 
     #[tokio::test]

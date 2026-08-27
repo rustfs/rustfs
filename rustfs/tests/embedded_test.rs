@@ -21,6 +21,7 @@
 
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration};
 use aws_sdk_s3::{Client, Config};
 use rustfs::embedded::{RustFSServerBuilder, find_available_port};
 
@@ -115,6 +116,136 @@ async fn test_embedded_server_basic_s3_operations_body() {
         .send()
         .await
         .expect("delete bucket");
+
+    server.shutdown().await;
+}
+
+// Regression test for issue #6745: on a versioning-suspended bucket, a null
+// delete marker's version identity must round-trip as the literal `null`
+// through ListObjectVersions, DeleteObject, and DeleteObjects, and removing
+// the marker by version id must carry the delete-marker flags.
+#[test]
+fn test_null_version_delete_marker_round_trip() {
+    common::run_embedded_test(test_null_version_delete_marker_round_trip_body);
+}
+
+async fn test_null_version_delete_marker_round_trip_body() {
+    let port = match find_available_port() {
+        Ok(port) => port,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(err) => panic!("find free port: {err}"),
+    };
+    let server = RustFSServerBuilder::new()
+        .address(format!("127.0.0.1:{port}"))
+        .access_key("testaccesskey")
+        .secret_key("testsecretkey")
+        .build()
+        .await
+        .expect("start embedded server");
+    let client = s3_client(&server.endpoint(), server.access_key(), server.secret_key());
+
+    let bucket = "null-marker-bucket";
+    client.create_bucket().bucket(bucket).send().await.expect("create bucket");
+    for status in [BucketVersioningStatus::Enabled, BucketVersioningStatus::Suspended] {
+        client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(VersioningConfiguration::builder().status(status).build())
+            .send()
+            .await
+            .expect("set bucket versioning state");
+    }
+
+    // A versionless DELETE on the suspended bucket mints a null delete marker
+    // and must report it as version `null`.
+    for key in ["doc/f1.txt", "doc/f2.txt"] {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"null-version payload"))
+            .send()
+            .await
+            .expect("put object");
+        let deleted = client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("delete object without version id");
+        assert_eq!(deleted.delete_marker(), Some(true), "suspended-bucket delete should mint a marker");
+        assert_eq!(deleted.version_id(), Some("null"), "the minted marker is the null version");
+    }
+
+    // The markers must be listed under the literal `null`, never a nil UUID.
+    let listed = client
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("list object versions");
+    assert!(listed.versions().is_empty(), "the null versions were replaced by markers");
+    let markers = listed.delete_markers();
+    assert_eq!(markers.len(), 2);
+    for marker in markers {
+        assert_eq!(marker.version_id(), Some("null"), "listing must advertise the null version as `null`");
+    }
+
+    // Removing one marker by its listed version id over DeleteObject must
+    // acknowledge the marker identity on the wire.
+    let removed = client
+        .delete_object()
+        .bucket(bucket)
+        .key("doc/f1.txt")
+        .version_id("null")
+        .send()
+        .await
+        .expect("delete marker by null version id");
+    assert_eq!(
+        removed.delete_marker(),
+        Some(true),
+        "x-amz-delete-marker must be true for a marker removal"
+    );
+    assert_eq!(removed.version_id(), Some("null"));
+
+    // Removing the other via DeleteObjects must produce an entry a client can
+    // correlate with its request: same key, version `null`, marker flags set.
+    let delete = Delete::builder()
+        .objects(
+            ObjectIdentifier::builder()
+                .key("doc/f2.txt")
+                .version_id("null")
+                .build()
+                .expect("object identifier"),
+        )
+        .build()
+        .expect("delete payload");
+    let batch = client
+        .delete_objects()
+        .bucket(bucket)
+        .delete(delete)
+        .send()
+        .await
+        .expect("delete objects by null version id");
+    assert!(batch.errors().is_empty(), "batch delete reported errors: {:?}", batch.errors());
+    let entries = batch.deleted();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key(), Some("doc/f2.txt"));
+    assert_eq!(entries[0].version_id(), Some("null"), "the entry must echo the requested identity");
+    assert_eq!(entries[0].delete_marker(), Some(true));
+    assert_eq!(entries[0].delete_marker_version_id(), Some("null"));
+
+    // With identity round-tripping, one pass leaves the bucket truly empty
+    // and deletable.
+    let after = client
+        .list_object_versions()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("list versions after cleanup");
+    assert!(after.versions().is_empty() && after.delete_markers().is_empty());
+    client.delete_bucket().bucket(bucket).send().await.expect("delete bucket");
 
     server.shutdown().await;
 }
