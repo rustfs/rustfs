@@ -575,18 +575,12 @@ impl SetDisks {
         meta.metadata.keys().any(|name| http::is_object_encryption_marker(name))
     }
 
-    fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
-        value
-            .get(..prefix.len())
-            .is_some_and(|value_prefix| value_prefix.eq_ignore_ascii_case(prefix))
-    }
-
     fn internal_metadata_suffix(name: &str) -> Option<&str> {
         name.get(http::RUSTFS_INTERNAL_PREFIX.len()..)
-            .filter(|_| Self::starts_with_ignore_ascii_case(name, http::RUSTFS_INTERNAL_PREFIX))
+            .filter(|_| http::starts_with_ignore_ascii_case(name, http::RUSTFS_INTERNAL_PREFIX))
             .or_else(|| {
                 name.get(http::MINIO_INTERNAL_PREFIX.len()..)
-                    .filter(|_| Self::starts_with_ignore_ascii_case(name, http::MINIO_INTERNAL_PREFIX))
+                    .filter(|_| http::starts_with_ignore_ascii_case(name, http::MINIO_INTERNAL_PREFIX))
             })
     }
 
@@ -604,9 +598,9 @@ impl SetDisks {
             || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_STATUS)
             || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_TIMESTAMP)
             || suffix.eq_ignore_ascii_case(http::SUFFIX_PURGESTATUS)
-            || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_RESET_ARN_PREFIX)
+            || http::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_RESET_ARN_PREFIX)
             // Raw compatibility keys are normalized and hashed separately below.
-            || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
+            || http::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
     }
 
     fn update_hash_quorum_metadata_map(hasher: &mut Sha256, entries: &HashMap<String, String>) {
@@ -1588,6 +1582,41 @@ mod tests {
             SetDisks::file_info_quorum_hash(&dual_prefixed),
             "compatible prefixes carrying the same mapping must share one identity"
         );
+    }
+
+    /// Guards the switch to `rustfs_utils::http::starts_with_ignore_ascii_case`:
+    /// internal prefixes must keep matching case-insensitively, and keys shorter
+    /// than the prefix must keep being rejected. Misclassifying either way leaks
+    /// internal metadata into the quorum hash (or drops it out of it).
+    #[test]
+    fn internal_metadata_suffix_is_prefix_case_insensitive_and_rejects_short_keys() {
+        assert_eq!(
+            SetDisks::internal_metadata_suffix("X-RustFS-Internal-Replica-Status"),
+            Some("Replica-Status"),
+            "mixed-case RustFS prefix must match and preserve the suffix casing"
+        );
+        assert_eq!(
+            SetDisks::internal_metadata_suffix("X-MINIO-INTERNAL-replica-status"),
+            Some("replica-status"),
+            "mixed-case MinIO prefix must match"
+        );
+        assert_eq!(SetDisks::internal_metadata_suffix(http::RUSTFS_INTERNAL_PREFIX), Some(""));
+
+        // Keys shorter than either prefix, and non-internal keys, stay unmatched.
+        assert_eq!(SetDisks::internal_metadata_suffix(""), None);
+        assert_eq!(SetDisks::internal_metadata_suffix("x-rustfs-interna"), None);
+        assert_eq!(SetDisks::internal_metadata_suffix("x-minio-interna"), None);
+        assert_eq!(SetDisks::internal_metadata_suffix("x-amz-meta-custom"), None);
+
+        // The suffix-prefix comparisons behind the classifier follow the same rules.
+        assert!(SetDisks::is_replication_quorum_metadata_key(
+            "X-RustFS-Internal-Replication-Reset-arn:rustfs:replication::target:bucket"
+        ));
+        assert!(SetDisks::is_replication_quorum_metadata_key(
+            "X-Minio-Internal-Replication-Delete-Marker-Version-arn:rustfs:replication::target:bucket"
+        ));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-interna"));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-internal-replication-res"));
     }
 
     /// rustfs#5801: parity counts outside [0, total_shards] come from corrupt
