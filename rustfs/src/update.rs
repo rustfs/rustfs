@@ -59,8 +59,6 @@ pub struct UpdateCheckResult {
 
 /// Version checker
 pub struct VersionChecker {
-    /// HTTP client
-    client: reqwest::Client,
     /// Version server URL
     version_url: String,
     /// Request timeout
@@ -76,14 +74,7 @@ impl Default for VersionChecker {
 impl VersionChecker {
     /// Create a new version checker
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent(format!("RustFS/{}", get_current_version()))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
         Self {
-            client,
             version_url: "https://version.rustfs.com/latest.json".to_string(),
             timeout: Duration::from_secs(10),
         }
@@ -91,14 +82,7 @@ impl VersionChecker {
 
     /// Create version checker with custom configuration
     pub fn with_config(url: String, timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(format!("RustFS/{}", get_current_version()))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
         Self {
-            client,
             version_url: url,
             timeout,
         }
@@ -108,9 +92,13 @@ impl VersionChecker {
     pub async fn check_for_updates(&self) -> Result<UpdateCheckResult, UpdateCheckError> {
         let current_version = get_current_version();
         debug!("Checking for updates, current version: {}", current_version);
+        let client = reqwest::Client::builder()
+            .timeout(self.timeout)
+            .user_agent(format!("RustFS/{current_version}"))
+            .build()?;
 
         // Send HTTP GET request to get latest version information
-        let response = self.client.get(&self.version_url).timeout(self.timeout).send().await?;
+        let response = client.get(&self.version_url).timeout(self.timeout).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -181,6 +169,32 @@ pub async fn check_updates_with_url(url: String) -> Result<UpdateCheckResult, Up
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn version_checker_construction_does_not_require_system_roots() {
+        #[cfg(target_os = "linux")]
+        {
+            let temp = tempfile::tempdir().expect("temporary certificate directory");
+            let cert_file = temp.path().join("empty.pem");
+            std::fs::write(&cert_file, []).expect("empty certificate file");
+            let cert_file = cert_file.to_string_lossy().into_owned();
+            let result =
+                temp_env::async_with_vars([("SSL_CERT_FILE", Some(cert_file.as_str())), ("SSL_CERT_DIR", Some(""))], async {
+                    let checker = VersionChecker::new();
+                    checker.check_for_updates().await
+                })
+                .await;
+            assert!(matches!(result, Err(UpdateCheckError::HttpError(_))));
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let checker = VersionChecker::new();
+            assert_eq!(checker.version_url, "https://version.rustfs.com/latest.json");
+            assert_eq!(checker.timeout, Duration::from_secs(10));
+        }
+    }
 
     #[tokio::test]
     async fn test_get_current_version() {
