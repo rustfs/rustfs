@@ -337,7 +337,7 @@ wait_service_active() {
 # Known server-side issues the test can hit. Format:
 #   "<error signature>|<tracking>|<hint>"
 KNOWN_SERVER_ISSUES=(
-  "pool activation requires a live fleet capability proof|rustfs/backlog#2031|multi-pool cold start with rebalance metadata fails on nightly builds; server fix pending, no script workaround"
+  "pool activation requires a live fleet capability proof|rustfs/backlog#2031|server-side cold-start recovery is covered by this PR; if this appears, collect node journals and treat it as a regression"
 )
 
 # Print a hint when $1 matches a known server-side issue signature.
@@ -360,8 +360,10 @@ hint_server_issue() {
 # annotate known server-side issues.
 diagnose_node_start_failure() {
   local node="$1" journal
-  journal="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" \
-    "SUDO=\"\"; [ \"\$(id -u)\" -ne 0 ] && SUDO=\"sudo -n\"; \${SUDO} journalctl -u ${RUSTFS_SERVICE} --no-pager -n 60 2>/dev/null || true")"
+  if ! journal="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" \
+    "SUDO=\"\"; [ \"\$(id -u)\" -ne 0 ] && SUDO=\"sudo -n\"; \${SUDO} journalctl -u ${RUSTFS_SERVICE} --no-pager -n 60 2>/dev/null || true")"; then
+    journal="unable to collect journal (SSH command failed)"
+  fi
   printf '%s\n' "--- ${node}: ${RUSTFS_SERVICE} journal (last 60 lines) ---" >&2
   printf '%s\n' "${journal}" >&2
   hint_server_issue "${journal}" || true

@@ -96,6 +96,8 @@ const LOG_SUBSYSTEM_POOLS: &str = "pools";
 const EVENT_DECOMMISSION_STATE: &str = "decommission_state";
 const EVENT_DECOMMISSION_BUCKET: &str = "decommission_bucket";
 const EVENT_DECOMMISSION_ENTRY: &str = "decommission_entry";
+const POOL_ACTIVATION_FLEET_PROOF_REQUIRED: &str = "pool activation requires a live fleet capability proof";
+const POOL_ACTIVATION_FLEET_PROOF_EXPIRED: &str = "pool activation fleet capability proof expired before commit";
 const DECOMMISSION_STAGE_MIGRATE_OBJECT: &str = "migrate_object";
 const DECOMMISSION_STAGE_CLEANUP_PREFLIGHT: &str = "cleanup_preflight";
 const DECOMMISSION_STAGE_SOURCE_CLEANUP: &str = "source_cleanup";
@@ -1832,6 +1834,13 @@ pub(crate) struct PoolRebalanceActivationFence {
 }
 
 impl PoolRebalanceActivationFence {
+    pub(crate) fn set_fleet_proof(
+        &mut self,
+        fleet_proof: Option<crate::services::notification_sys::CrossPoolFenceFleetProofToken>,
+    ) {
+        self.fleet_proof = fleet_proof;
+    }
+
     pub(crate) fn ensure_held(&self) -> Result<()> {
         #[cfg(test)]
         let forced_lost = self.forced_lost.load(Ordering::Acquire);
@@ -1845,7 +1854,7 @@ impl PoolRebalanceActivationFence {
             .as_ref()
             .is_some_and(|proof| !crate::services::notification_sys::cross_pool_fence_fleet_proof_matches(proof))
         {
-            return Err(Error::other("pool activation fleet capability proof expired before commit"));
+            return Err(Error::other(POOL_ACTIVATION_FLEET_PROOF_EXPIRED));
         }
 
         Ok(())
@@ -1901,7 +1910,17 @@ pub(crate) async fn acquire_pool_activation_fleet_proof(
     }
     crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof()
         .map(Some)
-        .ok_or_else(|| Error::other("pool activation requires a live fleet capability proof"))
+        .ok_or_else(|| Error::other(POOL_ACTIVATION_FLEET_PROOF_REQUIRED))
+}
+
+pub(crate) fn is_pool_activation_fleet_proof_error(err: &Error) -> bool {
+    // Save-stage helpers add context by formatting the original error, so the
+    // marker may be nested in the display string. Restrict matching to the
+    // `Error::other` I/O shape used by this activation path.
+    matches!(err, Error::Io(io_error) if io_error.kind() == std::io::ErrorKind::Other && {
+        let message = io_error.to_string();
+        message.contains(POOL_ACTIVATION_FLEET_PROOF_REQUIRED) || message.contains(POOL_ACTIVATION_FLEET_PROOF_EXPIRED)
+    })
 }
 
 #[cfg(test)]
@@ -10827,6 +10846,15 @@ mod tests {
     use super::*;
     use crate::bucket::replication::{ReplicationState, ReplicationStatusType};
     use serde::Serialize;
+
+    #[test]
+    fn pool_activation_fleet_proof_error_classifier_matches_only_retryable_proof_failures() {
+        assert!(is_pool_activation_fleet_proof_error(&Error::other(POOL_ACTIVATION_FLEET_PROOF_REQUIRED)));
+        assert!(is_pool_activation_fleet_proof_error(&Error::other(POOL_ACTIVATION_FLEET_PROOF_EXPIRED)));
+        let wrapped = format!("rebalance meta save failed during start_rebalance: {POOL_ACTIVATION_FLEET_PROOF_EXPIRED}");
+        assert!(is_pool_activation_fleet_proof_error(&Error::other(wrapped)));
+        assert!(!is_pool_activation_fleet_proof_error(&Error::ConfigNotFound));
+    }
 
     #[tokio::test]
     #[serial_test::serial]

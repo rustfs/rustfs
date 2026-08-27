@@ -91,7 +91,7 @@ jobs:
 
       - name: Install RustFS package & start first pool
         run: |
-          ARGS=(--steps 1,2,3 -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          ARGS=(--steps "1,2,3" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
           if [ -n "${{ inputs.package_url }}" ]; then
             ARGS+=(--package-url "${{ inputs.package_url }}")
           elif [ -n "${{ inputs.rustfs_version }}" ]; then

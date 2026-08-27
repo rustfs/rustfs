@@ -214,6 +214,14 @@ pub(super) fn is_rebalance_in_progress(meta: &RebalanceMeta) -> bool {
     meta.pool_stats.iter().any(is_rebalance_pool_active)
 }
 
+/// Persisted rebalance metadata requires worker activation only while it has
+/// not reached a durable terminal marker and at least one pool is still marked
+/// active. Merely finding `rebalance.bin` is not evidence that admission is
+/// required: terminal metadata is retained for status reporting.
+pub(crate) fn rebalance_requires_worker_activation(meta: &RebalanceMeta) -> bool {
+    meta.stopped_at.is_none() && is_rebalance_in_progress(meta)
+}
+
 pub(crate) fn is_rebalance_conflicting_with_decommission(meta: &RebalanceMeta) -> bool {
     is_rebalance_in_progress(meta)
 }

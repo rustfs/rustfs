@@ -570,10 +570,13 @@ impl ECStore {
     where
         S: EcstoreObjectIO + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>,
     {
-        let fleet_proof = acquire_pool_activation_fleet_proof(&self.ctx).await?;
+        // Lock order: pool_meta_save_gate -> pool.bin -> rebalance.bin.
         let mut pool_meta_guard = self.pool_meta_save_gate.lock().await;
         pool_meta_guard.ensure_write_safe("rebalance worker activation")?;
-        let activation_fence = acquire_pool_rebalance_activation_locks(pool.clone(), fleet_proof).await?;
+        // Classify the durable rebalance record while holding both namespace
+        // fences. A terminal record is a no-op and must not depend on the
+        // notification subsystem having published a fleet proof yet.
+        let mut activation_fence = acquire_pool_rebalance_activation_locks(pool.clone(), None).await?;
         let pool_meta = self
             .load_runtime_pool_meta_under_activation_fence(&mut pool_meta_guard, &activation_fence, "rebalance worker activation")
             .await?;
@@ -597,9 +600,16 @@ impl ECStore {
         }
 
         activation_fence.ensure_held()?;
-        if !is_rebalance_conflicting_with_decommission(&persisted) {
+        if !crate::services::rebalance::rebalance_requires_worker_activation(&persisted) {
             return Ok(RebalanceWorkerActivationFence::NotStartedTerminal);
         }
+
+        // Active worker admission still requires the fail-closed fleet proof.
+        // Attach it immediately before the final fence validation so expiry or
+        // topology changes are checked again at every later commit boundary.
+        let fleet_proof = acquire_pool_activation_fleet_proof(&self.ctx).await?;
+        activation_fence.set_fleet_proof(fleet_proof);
+        activation_fence.ensure_held()?;
 
         Ok(RebalanceWorkerActivationFence::Ready(Box::new(activation_fence)))
     }
@@ -1474,6 +1484,64 @@ mod tests {
             .await
             .expect_err("worker validation must latch the shared runtime gate");
         assert_activation_locks_released(&store).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebalance_worker_skips_terminal_metadata_without_fleet_proof() {
+        let rebalance_id = "terminal-metadata-without-proof";
+        let completed = RebalanceMeta {
+            id: rebalance_id.to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(Some(completed)).await;
+        let _proof_guard = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
+
+        let activation = store
+            .fence_rebalance_worker_activation(store.pools[0].clone(), rebalance_id)
+            .await
+            .expect("terminal metadata should not require a fleet proof");
+        assert!(matches!(activation, RebalanceWorkerActivationFence::NotStartedTerminal));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rebalance_worker_still_requires_fleet_proof_for_active_metadata() {
+        let rebalance_id = "active-metadata-without-proof";
+        let active = RebalanceMeta {
+            id: rebalance_id.to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(Some(active)).await;
+        let _proof_guard = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
+
+        let err = match store
+            .fence_rebalance_worker_activation(store.pools[0].clone(), rebalance_id)
+            .await
+        {
+            Ok(_) => panic!("active metadata must not be admitted without a fleet proof"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("pool activation requires a live fleet capability proof")
+        );
     }
 
     #[tokio::test]
