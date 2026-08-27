@@ -53,12 +53,16 @@ const EVENT_SESSION_TOKEN_EXTRACTION: &str = "session_token_extraction";
 
 /// RustFS-specific query capability for a single presigned PutObject request.
 pub(crate) const RUSTFS_MAX_CONTENT_LENGTH_QUERY: &str = "x-rustfs-max-content-length";
+pub(crate) const RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY: &str = "x-rustfs-max-total-object-size";
 
 /// Inserted by the S3 access boundary after the upstream verifier accepts a
 /// request as SigV4 presigned. Downstream capability parsing must require this
 /// marker instead of treating query syntax as proof of authentication.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct VerifiedPresignedRequest;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VerifiedSigV4Request;
 
 /// Performs constant-time string comparison to prevent timing attacks.
 ///
@@ -1111,6 +1115,92 @@ pub(crate) fn reject_presigned_put_max_content_length_for_other_operation(
     Ok(())
 }
 
+/// Parse the V2 multipart total-size capability after SigV4 authentication.
+/// Header-authenticated CreateMultipartUpload requests are accepted because the
+/// custom query is covered by the SigV4 canonical request; later multipart
+/// operations read the immutable value from the upload session metadata.
+pub(crate) fn parse_presigned_multipart_max_total_object_size(
+    header: &HeaderMap,
+    query: Option<&str>,
+    verified_sigv4: bool,
+) -> S3Result<Option<u64>> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+
+    let mut value = None;
+    let mut decoded_query = Vec::new();
+    for (name, candidate) in form_urlencoded::parse(query.as_bytes()) {
+        decoded_query.push((name.to_string(), candidate.to_string()));
+        if name == RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY {
+            if value.is_some() {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must appear exactly once"),
+                ));
+            }
+            value = Some(candidate.into_owned());
+        } else if name.eq_ignore_ascii_case(RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("query parameter name must be exactly {RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY}"),
+            ));
+        }
+    }
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let auth_type = get_request_auth_type_with_query(header, Some(query));
+    let is_presigned = matches!(auth_type, AuthType::Presigned);
+    let is_header_signed = matches!(auth_type, AuthType::Signed);
+    let complete_presigned_query = [
+        ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+        ("x-amz-date", ""),
+        ("x-amz-expires", ""),
+        ("x-amz-signedheaders", ""),
+        ("x-amz-credential", ""),
+        ("x-amz-signature", ""),
+    ]
+    .into_iter()
+    .all(|(name, expected)| {
+        decoded_query
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .is_some_and(|(_, candidate)| !candidate.is_empty() && (expected.is_empty() || candidate == expected))
+    });
+
+    let authenticated = verified_sigv4 && (is_header_signed || (is_presigned && complete_presigned_query));
+    if !authenticated {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} requires a verified SigV4 request"),
+        ));
+    }
+
+    value.parse::<u64>().map(Some).map_err(|_| {
+        S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must be a non-negative 64-bit integer"),
+        )
+    })
+}
+
+pub(crate) fn reject_presigned_multipart_max_total_object_size_for_other_operation(
+    header: &HeaderMap,
+    query: Option<&str>,
+    verified_sigv4: bool,
+) -> S3Result<()> {
+    if parse_presigned_multipart_max_total_object_size(header, query, verified_sigv4)?.is_some() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1814,6 +1904,52 @@ mod tests {
             let error = parse_presigned_put_max_content_length(&headers, Some(query), true).unwrap_err();
             assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
         }
+    }
+
+    #[test]
+    fn multipart_max_total_object_size_requires_signed_create_request() {
+        let headers = HeaderMap::new();
+        let signed_prefix = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+        let query = format!("{signed_prefix}&x-rustfs-max-total-object-size=104857600");
+
+        assert_eq!(
+            parse_presigned_multipart_max_total_object_size(&headers, Some(&query), true).unwrap(),
+            Some(104_857_600)
+        );
+        assert_eq!(
+            reject_presigned_multipart_max_total_object_size_for_other_operation(&headers, Some(&query), true)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn multipart_max_total_object_size_rejects_tampering_and_invalid_values() {
+        let headers = HeaderMap::new();
+        let signed_prefix = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+        for query in [
+            "x-rustfs-max-total-object-size=1",
+            "X-RustFS-Max-Total-Object-Size=1",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=1&x-rustfs-max-total-object-size=2",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=-1",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_presigned_multipart_max_total_object_size(&headers, Some(query), true)
+                    .unwrap_err()
+                    .code(),
+                &S3ErrorCode::InvalidRequest
+            );
+        }
+
+        let forged = format!("{signed_prefix}&x-rustfs-max-total-object-size=1");
+        assert_eq!(
+            parse_presigned_multipart_max_total_object_size(&headers, Some(&forged), false)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
     }
 
     #[test]
