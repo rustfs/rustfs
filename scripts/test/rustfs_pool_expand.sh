@@ -80,6 +80,7 @@ VOLUMES_AFTER_DECOMMISSION="http://rustfs-node2:9000/data/rustfs{1...4}/mnmd htt
 # RustFS service configuration (written to /etc/default/rustfs)
 RUSTFS_CONFIG_FILE="/etc/default/rustfs"
 RUSTFS_SERVICE="rustfs"
+RUSTFS_PACKAGE_NAME="rustfs"
 RUSTFS_USER="rustfs"
 RUSTFS_ADDRESS=":9000"
 RUSTFS_CONSOLE_ADDRESS=":9001"
@@ -715,24 +716,35 @@ preflight() {
   log "preflight OK"
 }
 
-# Reset the test environment: stop services, remove data dirs and config on all nodes.
-# Intended for CI so every run starts from a clean slate. Destructive!
+# Reset the test environment: purge the rustfs package (if installed) and
+# recreate the data directories on all nodes. Intended for CI so every run
+# starts from a clean slate. Destructive!
 step0_reset() {
-  log "reset: stop services and remove data dirs + config on all nodes"
-  confirm "This DESTROYS all RustFS data and config on ${NODES[*]} (irreversible). Continue?"
-  local -a dirs
-  dirs=()
-  while IFS= read -r d; do dirs+=("${d}"); done < <(volume_dirs "${VOLUMES_3}" | sort -u)
+  log "reset: purge rustfs package and recreate data dirs on all nodes"
+  confirm "This DESTROYS the RustFS install and ALL data on ${NODES[*]} (irreversible). Continue?"
   for node in "${NODES[@]}"; do
     {
       printf 'set -euo pipefail\n'
       printf 'SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"\n'
+      # Stop the service if it is still running, then purge the package
+      # (skipped when rustfs is not installed).
       printf '${SUDO} systemctl stop %s 2>/dev/null || true\n' "${RUSTFS_SERVICE}"
-      printf '${SUDO} systemctl reset-failed %s 2>/dev/null || true\n' "${RUSTFS_SERVICE}"
-      for d in "${dirs[@]}"; do
-        printf '${SUDO} rm -rf %s\n' "${d}"
-      done
-      printf '${SUDO} rm -f %s\n' "${RUSTFS_CONFIG_FILE}"
+      printf 'if ${SUDO} dpkg -l %s 2>/dev/null | grep -q "^ii"; then\n' "${RUSTFS_PACKAGE_NAME}"
+      printf '  ${SUDO} dpkg -P %s\n' "${RUSTFS_PACKAGE_NAME}"
+      printf '  echo "purged %s"\n' "${RUSTFS_PACKAGE_NAME}"
+      printf 'else\n'
+      printf '  echo "%s not installed, skip purge"\n' "${RUSTFS_PACKAGE_NAME}"
+      printf 'fi\n'
+      # Ensure the service user exists (created by the package postinst on
+      # install; a purge keeps it, but a never-installed node needs it for chown).
+      printf 'id -u %s >/dev/null 2>&1 || ${SUDO} useradd -r -s /bin/false -d /opt/%s %s\n' \
+        "${RUSTFS_USER}" "${RUSTFS_USER}" "${RUSTFS_USER}"
+      # Recreate the volume directories with the service user as owner.
+      printf 'for i in 1 2 3 4; do\n'
+      printf '  ${SUDO} rm -rf /data/rustfs${i}/mnmd\n'
+      printf '  ${SUDO} mkdir -p /data/rustfs${i}/mnmd\n'
+      printf '  ${SUDO} chown -R %s:%s /data/rustfs${i}/mnmd\n' "${RUSTFS_USER}" "${RUSTFS_USER}"
+      printf 'done\n'
     } | run_remote "${node}"
   done
   log "reset complete"
