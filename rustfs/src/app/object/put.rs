@@ -962,7 +962,7 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_stage_duration_from("app_bucket_validate", bucket_validate_stage_start);
 
         let put_admission = match get_concurrency_manager()
-            .admit_put_object()
+            .admit_put_object(size)
             .await
             .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
         {
