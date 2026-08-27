@@ -3695,11 +3695,17 @@ mod tests {
 
     async fn object_transaction_epochs(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<Option<Uuid>> {
         let mut epochs = Vec::with_capacity(disks.len());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         for (disk_index, disk) in disks.iter().enumerate() {
-            let file_info = disk
-                .read_version("", bucket, object, "", &ReadOptions::default())
-                .await
-                .unwrap_or_else(|err| panic!("disk {disk_index} should persist object metadata: {err}"));
+            let file_info = loop {
+                match disk.read_version("", bucket, object, "", &ReadOptions::default()).await {
+                    Ok(file_info) => break file_info,
+                    Err(DiskError::FileNotFound) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(err) => panic!("disk {disk_index} should persist object metadata: {err}"),
+                }
+            };
             epochs.push(
                 file_info
                     .object_transaction_epoch()
@@ -3762,22 +3768,34 @@ mod tests {
         let (upload_id, parts) =
             stage_upload_with_create_opts(&set_disks, bucket, object, b"multipart fenced epoch", &ObjectOptions::default()).await;
 
-        temp_env::async_with_vars(
+        let epochs = temp_env::async_with_vars(
             [
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true")),
             ],
             async {
+                let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
                 set_disks
                     .clone()
                     .complete_multipart_upload(bucket, object, &upload_id, parts.clone(), &ObjectOptions::default())
                     .await
                     .expect("fenced multipart completion should commit with a live proof");
+
+                tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                    .await
+                    .expect("multipart completion should leave one rename tail in flight after quorum ACK");
+                let disks = disk_stores.clone();
+                let mut epochs = tokio::spawn(async move { object_transaction_epochs(&disks, bucket, object).await });
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut epochs).await.is_err(),
+                    "epoch read-back should wait for the lagging rename tail"
+                );
+                rename_barrier.release();
+                epochs.await.expect("epoch read-back should finish after the rename tail")
             },
         )
         .await;
-
-        let epochs = object_transaction_epochs(&disk_stores, bucket, object).await;
         let first = epochs[0].expect("fenced multipart completion should persist an epoch");
         assert!(!first.is_nil());
         assert!(epochs.into_iter().all(|epoch| epoch == Some(first)));
