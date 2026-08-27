@@ -1877,7 +1877,7 @@ mod tests {
             mod_time: Some(OffsetDateTime::UNIX_EPOCH),
             data_dir: Some(Uuid::from_u128(100)),
             checksum: Some(Bytes::from_static(b"object-checksum")),
-            metadata: AHashMap::from([
+            metadata: HashMap::from([
                 ("etag".to_string(), "etag-value".to_string()),
                 ("x-amz-meta-key".to_string(), metadata_value.to_string()),
             ]),
@@ -1887,7 +1887,7 @@ mod tests {
                 size: 128,
                 actual_size: 128,
                 mod_time: Some(OffsetDateTime::UNIX_EPOCH),
-                checksums: Some(AHashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum".to_string())])),
+                checksums: Some(HashMap::from([(ChecksumType::CRC32C.to_string(), "part-checksum".to_string())])),
                 ..Default::default()
             }],
             ..Default::default()

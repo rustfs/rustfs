@@ -218,9 +218,6 @@ faster-hex = { workspace = true }
 ratelimit = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
 
-# High-performance hashing
-ahash = { workspace = true, features = ["serde"] }
-
 # Observability and Metrics
 metrics = { workspace = true }
 

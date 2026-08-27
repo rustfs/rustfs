@@ -69,7 +69,6 @@ use crate::storage_api_contracts::{
     range::HTTPRangeSpec,
 };
 use crate::store::ECStore;
-use ahash::AHashMap;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use http::HeaderMap;
 use rand::RngExt as _;
@@ -2871,7 +2870,7 @@ fn spawn_transition_transaction_recovery_once(api: Arc<ECStore>) {
 struct StaleMultipartUploadCandidate {
     path: String,
     initiated: OffsetDateTime,
-    metadata: Option<AHashMap<String, String>>,
+    metadata: Option<HashMap<String, String>>,
 }
 
 fn parse_stale_uploads_duration(env_key: &str, default: StdDuration) -> StdDuration {
@@ -11617,7 +11616,7 @@ mod tests {
         // Persist the durable backend identity on the transitioned version so the
         // recovered free version carries it (matching a registered mock tier);
         // free-version remote cleanup fails closed without it.
-        let mut transitioned_metadata = AHashMap::new();
+        let mut transitioned_metadata = HashMap::new();
         if let Some(identity) = backend_identity {
             rustfs_utils::http::metadata_compat::insert_str(
                 &mut transitioned_metadata,
@@ -12354,7 +12353,7 @@ mod tests {
             StaleMultipartUploadCandidate {
                 path: "sha/upload".to_string(),
                 initiated: OffsetDateTime::UNIX_EPOCH,
-                metadata: Some(AHashMap::from([("k".to_string(), "v".to_string())])),
+                metadata: Some(HashMap::from([("k".to_string(), "v".to_string())])),
             },
         );
 

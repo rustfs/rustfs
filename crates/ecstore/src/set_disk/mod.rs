@@ -8802,7 +8802,7 @@ mod tests {
     #[test]
     fn test_list_object_etags() {
         // Test extracting etags from file info metadata
-        let mut metadata = AHashMap::new();
+        let mut metadata = HashMap::new();
         metadata.insert("etag".to_string(), "test-etag".to_string());
 
         let file_info = FileInfo {

@@ -4780,7 +4780,7 @@ mod tests {
                 purge_targets: version_purge_statuses_map("arn:minio:replication:target=PENDING;"),
                 ..Default::default()
             })),
-            metadata: AHashMap::from([
+            metadata: HashMap::from([
                 ("etag".to_string(), "etag-value".to_string()),
                 ("x-amz-meta-key".to_string(), "metadata-value".to_string()),
                 (rustfs_utils::http::AMZ_OBJECT_TAGGING.to_string(), "tag=value".to_string()),
@@ -4864,7 +4864,7 @@ mod tests {
         source.parts = vec![rustfs_filemeta::ObjectPartInfo {
             number: 1,
             mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND),
-            checksums: Some(AHashMap::from([("CRC32C".to_string(), "AAAAAA==".to_string())])),
+            checksums: Some(HashMap::from([("CRC32C".to_string(), "AAAAAA==".to_string())])),
             ..Default::default()
         }];
         rustfs_utils::http::insert_str(
