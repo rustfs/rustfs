@@ -56,10 +56,10 @@ on:
 permissions:
   contents: read
 
-# The performance test mutates the same shared test environment as the pool
-# expansion and heal tests, so it joins the same concurrency group.
+# Dedicated pf-testing runner/environment: own concurrency group so perf runs
+# never block (or are blocked by) the pool-expansion / heal tests.
 concurrency:
-  group: rustfs-pool-expansion-test
+  group: rustfs-performance-test
   cancel-in-progress: false
 
 defaults:
@@ -81,7 +81,7 @@ env:
 
 jobs:
   performance-test:
-    runs-on: smoke-testing
+    runs-on: pf-testing
     timeout-minutes: 900
     # Run on manual dispatch, or when the nightly build completed successfully.
     # Skipped when nightly failed.
