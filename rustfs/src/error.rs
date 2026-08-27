@@ -34,6 +34,32 @@ impl std::fmt::Display for UploadLimitExceeded {
 
 impl std::error::Error for UploadLimitExceeded {}
 
+/// Marks a server-side object/source reader failure that must not be reported as
+/// a malformed client request body.
+#[derive(Debug)]
+pub(crate) struct ServerSideSourceReadError {
+    operation: &'static str,
+    source: std::io::Error,
+}
+
+impl ServerSideSourceReadError {
+    pub(crate) const fn new(operation: &'static str, source: std::io::Error) -> Self {
+        Self { operation, source }
+    }
+}
+
+impl std::fmt::Display for ServerSideSourceReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} source read failed: {}", self.operation, self.source)
+    }
+}
+
+impl std::error::Error for ServerSideSourceReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     pub code: S3ErrorCode,
@@ -303,6 +329,17 @@ impl From<StorageError> for ApiError {
         }
 
         if let StorageError::Io(ref io_err) = err
+            && let Some(inner) = io_err.get_ref()
+            && error_chain_has_type::<ServerSideSourceReadError>(inner)
+        {
+            return ApiError {
+                code: S3ErrorCode::ServiceUnavailable,
+                message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+                source: Some(Box::new(err)),
+            };
+        }
+
+        if let StorageError::Io(ref io_err) = err
             && io_err
                 .get_ref()
                 .and_then(|inner| inner.downcast_ref::<KmsUnavailableError>())
@@ -340,15 +377,15 @@ impl From<StorageError> for ApiError {
             StorageError::ObjectNameInvalid(_, _) => S3ErrorCode::InvalidArgument,
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
-            StorageError::SlowDown
-            | StorageError::FaultyDisk
+            StorageError::SlowDown => S3ErrorCode::SlowDown,
+            StorageError::FaultyDisk
             | StorageError::FaultyRemoteDisk
             | StorageError::DiskNotFound
-            | StorageError::TooManyOpenFiles => S3ErrorCode::SlowDown,
+            | StorageError::TooManyOpenFiles => S3ErrorCode::ServiceUnavailable,
             StorageError::ErasureReadQuorum
             | StorageError::InsufficientReadQuorum(_, _)
             | StorageError::ErasureWriteQuorum
-            | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::SlowDown,
+            | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::ServiceUnavailable,
             StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             StorageError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
             StorageError::Lock(_) => S3ErrorCode::ServiceUnavailable,
@@ -432,6 +469,13 @@ impl From<std::io::Error> for ApiError {
                 return ApiError {
                     code: S3ErrorCode::EntityTooLarge,
                     message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+                    source: Some(Box::new(err)),
+                };
+            }
+            if error_chain_has_type::<ServerSideSourceReadError>(inner) {
+                return ApiError {
+                    code: S3ErrorCode::ServiceUnavailable,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
                     source: Some(Box::new(err)),
                 };
             }
@@ -614,6 +658,22 @@ mod tests {
     }
 
     #[test]
+    fn server_side_source_read_error_maps_to_service_unavailable_before_incomplete_body() {
+        let short_source = IoError::new(ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining: 17 });
+        let marker = ServerSideSourceReadError::new("CopyObject", short_source);
+
+        let api_error = ApiError::from(IoError::new(ErrorKind::UnexpectedEof, marker));
+        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
+        assert_ne!(api_error.code, S3ErrorCode::IncompleteBody);
+
+        let short_source = IoError::new(ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining: 17 });
+        let marker = ServerSideSourceReadError::new("CopyObject", short_source);
+        let api_error = ApiError::from(StorageError::Io(IoError::new(ErrorKind::UnexpectedEof, marker)));
+        assert_eq!(api_error.code, S3ErrorCode::ServiceUnavailable);
+        assert_ne!(api_error.code, S3ErrorCode::IncompleteBody);
+    }
+
+    #[test]
     fn test_api_error_surfaces_invalid_argument_reason() {
         let err = StorageError::InvalidArgument(
             "bucket".into(),
@@ -785,14 +845,20 @@ mod tests {
             (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
-            (StorageError::FaultyDisk, S3ErrorCode::SlowDown),
-            (StorageError::FaultyRemoteDisk, S3ErrorCode::SlowDown),
-            (StorageError::DiskNotFound, S3ErrorCode::SlowDown),
-            (StorageError::TooManyOpenFiles, S3ErrorCode::SlowDown),
-            (StorageError::ErasureReadQuorum, S3ErrorCode::SlowDown),
-            (StorageError::InsufficientReadQuorum("test".into(), "test".into()), S3ErrorCode::SlowDown),
-            (StorageError::ErasureWriteQuorum, S3ErrorCode::SlowDown),
-            (StorageError::InsufficientWriteQuorum("test".into(), "test".into()), S3ErrorCode::SlowDown),
+            (StorageError::FaultyDisk, S3ErrorCode::ServiceUnavailable),
+            (StorageError::FaultyRemoteDisk, S3ErrorCode::ServiceUnavailable),
+            (StorageError::DiskNotFound, S3ErrorCode::ServiceUnavailable),
+            (StorageError::TooManyOpenFiles, S3ErrorCode::ServiceUnavailable),
+            (StorageError::ErasureReadQuorum, S3ErrorCode::ServiceUnavailable),
+            (
+                StorageError::InsufficientReadQuorum("test".into(), "test".into()),
+                S3ErrorCode::ServiceUnavailable,
+            ),
+            (StorageError::ErasureWriteQuorum, S3ErrorCode::ServiceUnavailable),
+            (
+                StorageError::InsufficientWriteQuorum("test".into(), "test".into()),
+                S3ErrorCode::ServiceUnavailable,
+            ),
             (
                 StorageError::NamespaceLockQuorumUnavailable {
                     mode: "write",
