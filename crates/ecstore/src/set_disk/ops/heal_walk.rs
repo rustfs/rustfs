@@ -22,8 +22,14 @@
 //! every `(object, version)` present on ANY disk, feeding each to the existing
 //! per-version `SetDisks::heal_object`.
 
-use super::super::*;
+use super::super::{
+    Arc, CancellationToken, DiskError, ListPathRawOptions, MetaCacheEntries, MetaCacheEntry, SetDisks, debug, disk, list_path_raw,
+};
+#[cfg(test)]
+use crate::disk::DiskAPI;
 use crate::object_api::ObjectInfo;
+#[cfg(test)]
+use rustfs_filemeta::FileMeta;
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

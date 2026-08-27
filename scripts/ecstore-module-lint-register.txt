@@ -110,4 +110,3 @@ crates/ecstore/src/services/tier/warm_backend_s3.rs|unused_variables
 crates/ecstore/src/services/tier/warm_backend_tencent.rs|clippy::all
 crates/ecstore/src/services/tier/warm_backend_tencent.rs|unused_must_use
 crates/ecstore/src/services/tier/warm_backend_tencent.rs|unused_variables
-crates/ecstore/src/set_disk/mod.rs|unused_variables

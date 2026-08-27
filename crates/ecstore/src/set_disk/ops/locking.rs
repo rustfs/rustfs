@@ -19,9 +19,19 @@
 //! here; the contract stays implemented `for SetDisks`, so its associated-type
 //! bounds are unchanged and helper access is via inherent calls.
 
-use super::super::*;
+use super::super::{
+    Arc, DiskError, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, Endpoint, Error, FormatV3, HealChannelPriority, LockResult,
+    NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks, StorageError, debug, disk, info, load_format_erasure,
+    send_heal_disk, warn,
+};
+use crate::disk::DiskAPI;
 use crate::disk::health_state::DriveMembershipSnapshot;
+#[cfg(test)]
+use crate::disk::new_disk;
 use crate::runtime::sources as runtime_sources;
+use rand::prelude::SliceRandom;
+#[cfg(test)]
+use uuid::Uuid;
 
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {

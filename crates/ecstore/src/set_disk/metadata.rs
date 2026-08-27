@@ -12,8 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::{
+    Bytes, DATA_MOVEMENT_MULTIPART_PREFIX, DiskError, DiskStore, FileInfo, HashMap, HashSet, OBJECT_OP_IGNORED_ERRS, ObjProps,
+    OffsetDateTime, SetDisks, Sha256, TRANSITION_COMPLETE, Uuid, debug, disk, error, file_info_is_valid_for_metadata, hex,
+    reduce_read_quorum_errs, warn,
+};
+#[cfg(test)]
+use crate::disk::DiskOption;
+#[cfg(test)]
+use crate::disk::endpoint::Endpoint;
+#[cfg(test)]
+use crate::disk::new_disk;
 use rustfs_utils::http;
+use sha2::Digest;
 
 #[derive(Clone, Copy)]
 struct FileInfoIdentityGroup {

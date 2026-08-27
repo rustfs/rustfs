@@ -22,7 +22,11 @@
 //! runtime behavior is unchanged.
 
 use super::super::ctx::SetDisksCtx;
-use super::super::*;
+use super::super::{
+    Arc, CancellationToken, DeleteOptions, DiskError, DiskStore, Error, ListObjectVersionsInfo, ListObjectsV2Info,
+    OBJECT_OP_IGNORED_ERRS, ObjectInfoOrErr, Result, Sender, SetDisks, WalkOptions, debug, join_all, reduce_write_quorum_errs,
+};
+use crate::disk::DiskAPI;
 
 impl SetDisks {
     #[tracing::instrument(skip(self))]

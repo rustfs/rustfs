@@ -19,7 +19,12 @@
 //! `for SetDisks`, so its associated-type bounds are unchanged and runtime
 //! behavior is the same.
 
-use super::super::*;
+use super::super::{
+    BUCKET_OP_IGNORED_ERRS, BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, DiskError, Error, HashMap,
+    MakeBucketOptions, Result, SetDisks, is_reserved_or_invalid_bucket, join_all, reduce_write_quorum_errs,
+};
+use crate::api::bucket::metadata_sys;
+use crate::disk::DiskAPI;
 
 impl SetDisks {
     pub(crate) async fn list_bucket_for_scanner(&self, _opts: &BucketOptions) -> Result<(Vec<BucketInfo>, bool)> {

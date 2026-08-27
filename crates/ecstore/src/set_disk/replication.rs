@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::{
+    Error, FileInfo, NamespaceLockFence, ObjectInfo, ObjectOptions, OffsetDateTime, Result, SetDisks, StorageError,
+    UpdateMetadataOpts, Uuid, X_AMZ_RESTORE, get_raw_etag, restore_operation_id_from_metadata,
+};
 use crate::bucket::lifecycle::lifecycle;
 use rustfs_filemeta::RestoreStatusOps;
 use rustfs_utils::http::headers::{AMZ_RESTORE_EXPIRY_DAYS, AMZ_RESTORE_REQUEST_DATE};
 use s3s::dto::{RestoreStatus, Timestamp};
+#[cfg(all(test, feature = "test-util"))]
+use std::sync::Arc;
 
 #[cfg(all(test, feature = "test-util"))]
 struct RestoreFinalizeBarrierState {

@@ -12,7 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::{
+    Arc, Bytes, DiskError, DiskStore, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason, GetObjectFileInfo,
+    GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration, GetObjectMetadataCacheKey, GetObjectReadPolicy, HashAlgorithm,
+    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET,
+    ReadOptions, Result, SetDisks, StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
+    build_inline_bitrot_readers_from_refs, collect_inline_data_shard_fileinfos_by_index, debug, error,
+    get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
+    is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
+    reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
+};
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
     GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT, GET_METADATA_CACHE_DECISION_SKIP,
@@ -22,43 +31,152 @@ use crate::diagnostics::get::{
     GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_CHECKSUMS, GET_METADATA_CACHE_REASON_PART_NUMBER,
     GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
     GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID, GET_METADATA_CACHE_REASON_VERSION_SUSPENDED,
-    GET_METADATA_CACHE_REASON_VERSIONED, GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA,
-    GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER, GET_METADATA_EARLY_STOP_REASON_ERROR,
-    GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM, GET_METADATA_EARLY_STOP_REASON_NOT_FOUND,
-    GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM,
-    GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND,
-    GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR,
-    GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
-    GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_DIRECT_MEMORY,
-    GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
-    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
-    GET_STAGE_READER_SETUP_DROP_PENDING, GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM,
-    GET_STAGE_READER_TASK_BITROT_READER_INIT, GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION,
-    GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, mark_get_object_downstream_closed,
-    record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
+    GET_METADATA_CACHE_REASON_VERSIONED, GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_INTERNAL_META,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_METADATA_CACHE_LOOKUP,
+    GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GET_STAGE_READER_TASK_BITROT_READER_INIT,
+    GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION, GetObjectFailureReason, classify_disk_error,
+    get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::erasure::coding::BitrotReader;
-use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics, create_deferred_bitrot_reader,
-    object_mmap_read_enabled,
-};
+use crate::disk::DiskAPI;
+use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled};
+use crate::set_disk::coding;
+use crate::set_disk::runtime_sources;
 use crate::set_disk::shard_source::ShardReadCost;
-use futures::stream::{FuturesUnordered, StreamExt};
-use metrics::counter;
 use std::{
-    collections::{HashMap, VecDeque},
     future::Future,
     io::IoSlice,
     pin::Pin,
-    sync::OnceLock,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::RwLock;
-use tokio::task::JoinSet;
 
+#[cfg(test)]
+use super::DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES;
+#[cfg(test)]
+use super::DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES;
+#[cfg(test)]
+use super::GET_OBJECT_METADATA_CACHE_TTL;
+#[cfg(test)]
+use super::GetCodecStreamingConfig;
+#[cfg(test)]
+use super::GetCodecStreamingDecision;
+#[cfg(test)]
+use super::GetCodecStreamingEngine;
+#[cfg(test)]
+use super::GetCodecStreamingGate;
+#[cfg(test)]
+use super::GetCodecStreamingObjectClass;
+#[cfg(test)]
+use super::GetCodecStreamingRollout;
+#[cfg(test)]
+use super::classify_get_codec_streaming_object_class;
 use super::core::io_primitives::*;
+#[cfg(test)]
+use super::get_codec_streaming_config_cached_core;
+#[cfg(test)]
+use super::get_codec_streaming_engine;
+#[cfg(test)]
+use super::get_codec_streaming_reader_gate;
+#[cfg(test)]
+use super::get_object_metadata_cache_max_entries;
+#[cfg(test)]
+use super::is_get_metadata_data_read_early_stop_enabled;
+#[cfg(test)]
+use super::is_get_metadata_early_stop_bounded_fanout_enabled;
+#[cfg(test)]
+use super::is_get_metadata_early_stop_enabled;
+#[cfg(test)]
+use super::is_version_early_stop_enabled;
+#[cfg(test)]
+use super::load_get_codec_streaming_config;
+#[cfg(test)]
+use super::with_get_object_read_policy;
+#[cfg(test)]
+use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+#[cfg(test)]
+use crate::diagnostics::get::GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE;
+#[cfg(test)]
+use crate::diagnostics::get::GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE;
+#[cfg(test)]
+use crate::diagnostics::get::{
+    GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
+    GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
+    GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
+    GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM,
+    GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND,
+    GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
+    GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND,
+};
+#[cfg(test)]
+use crate::disk::ReadMultipleResp;
+#[cfg(test)]
+use crate::disk::format::FormatV3;
+#[cfg(test)]
+use crate::erasure::codec::bridge::CodecStreamingDecodeEngine;
+#[cfg(test)]
+use crate::erasure::codec::bridge::GET_CODEC_STREAMING_ENGINE_RUSTFS;
+#[cfg(test)]
+use crate::object_api::PutObjReader;
+#[cfg(test)]
+use crate::storage_api_contracts::object::ObjectIO;
+#[cfg(test)]
+use crate::storage_api_contracts::range::HTTPRangeSpec;
+#[cfg(test)]
+use rustfs_filemeta::ObjectPartInfo;
+#[cfg(test)]
+use rustfs_heal_contracts::heal_channel::HealAdmissionResult;
+#[cfg(test)]
+use rustfs_heal_contracts::heal_channel::HealChannelPriority;
+#[cfg(test)]
+use rustfs_utils::http::SUFFIX_COMPRESSION;
+#[cfg(test)]
+use rustfs_utils::http::insert_str;
+#[cfg(test)]
+use time::OffsetDateTime;
+#[cfg(test)]
+use tokio::sync::RwLock;
+#[cfg(test)]
+use tokio::time::timeout;
+#[cfg(test)]
+use uuid::Uuid;
 
 pub(super) struct GetObjectDownstreamWriter<W> {
     inner: W,

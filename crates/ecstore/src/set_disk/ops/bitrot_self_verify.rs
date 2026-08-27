@@ -12,7 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::*;
+use super::super::{
+    Cursor, DiskStore, EVENT_SET_DISK_WRITE, Error, FileInfo, HashAlgorithm, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK,
+    Result, join_all, warn,
+};
+use crate::disk::DiskAPI;
+#[cfg(test)]
+use crate::disk::RUSTFS_META_TMP_BUCKET;
+use crate::set_disk::coding;
+#[cfg(test)]
+use bytes::Bytes;
 
 /// Null out any disk whose shard writer failed (or was never created) so its
 /// truncated/absent shard is not committed by the final rename, and return the
@@ -132,7 +141,6 @@ pub(in crate::set_disk::ops) async fn verify_written_bitrot_shards(
 mod tests {
     use super::super::object::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity;
     use super::*;
-    use crate::disk::DiskAPI as _;
 
     async fn encode_streaming_shard(data: &[u8], shard_size: usize) -> Bytes {
         let mut writer = coding::BitrotWriter::new(Cursor::new(Vec::new()), shard_size, HashAlgorithm::HighwayHash256S);
