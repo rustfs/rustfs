@@ -25,7 +25,7 @@ use rustfs_utils::http::{
     SUFFIX_TAGGING_TIMESTAMP, get_header,
     header_compat::{MINIO_ENCRYPTION_PREFIX, RUSTFS_ENCRYPTION_PREFIX},
     insert_header_map, insert_str,
-    metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
+    metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, starts_with_ignore_ascii_case},
 };
 use rustfs_utils::http::{
     AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
@@ -815,12 +815,6 @@ pub fn extract_metadata_from_mime_with_object_name(
     }
 }
 
-fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
-    value
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-}
-
 fn should_skip_object_metadata_key(key: &str, value: &str, excluded_headers: &[&str]) -> bool {
     const X_AMZ_PREFIX: &str = "x-amz-";
 
@@ -1137,16 +1131,16 @@ mod tests {
         del_opts_with_versioning, detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
         extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
         get_complete_multipart_upload_opts_with_replication_authorization, get_default_opts, get_opts,
-        has_replication_retention_update, namespace_reserved_user_metadata, parse_copy_source_range, put_opts,
-        put_opts_from_headers, put_opts_from_headers_with_replication_authorization, put_opts_with_replication_authorization,
-        validate_archive_content_encoding,
+        has_replication_retention_update, is_reserved_user_metadata_key, namespace_reserved_user_metadata,
+        parse_copy_source_range, put_opts, put_opts_from_headers, put_opts_from_headers_with_replication_authorization,
+        put_opts_with_replication_authorization, should_skip_object_metadata_key, validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
     use rustfs_utils::http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
         SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
-        SUFFIX_SOURCE_VERSION_ID, insert_header,
+        SUFFIX_SOURCE_VERSION_ID, header_compat::RUSTFS_ENCRYPTION_PREFIX, insert_header,
     };
     use s3s::S3ErrorCode;
     use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
@@ -2274,6 +2268,57 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered.get("custom-key"), Some(&"custom-value".to_string()));
+    }
+
+    /// Guards the switch to `rustfs_utils::http::starts_with_ignore_ascii_case`:
+    /// a mixed-case internal key must still be classified as internal (never passed
+    /// through as user metadata), and a key shorter than the prefix must still fall
+    /// through to the user-metadata path instead of being swallowed as internal.
+    #[test]
+    fn test_internal_prefix_matching_is_case_insensitive_and_length_aware() {
+        const NO_EXCLUSIONS: &[&str] = &[];
+
+        for key in [
+            "X-RustFS-Internal-Healing",
+            "x-rustfs-internal-healing",
+            "X-MINIO-INTERNAL-compression",
+            "X-RustFS-Encryption-Algorithm",
+            "X-Minio-Encryption-Iv",
+            "X-Amz-Storage-Class",
+        ] {
+            assert!(
+                should_skip_object_metadata_key(key, "value", NO_EXCLUSIONS),
+                "{key} must be classified as internal/reserved regardless of casing"
+            );
+            assert!(is_reserved_user_metadata_key(key), "{key} must stay reserved on the write side");
+        }
+
+        // Shorter than every internal prefix, so nothing may match: these are plain
+        // user metadata keys and must survive. The encryption-prefix case is sliced
+        // from the real constant (rather than a hand-typed truncation) so it doesn't
+        // spell out a dictionary word fragment that trips the typo checker.
+        let short_encryption_prefix = &RUSTFS_ENCRYPTION_PREFIX[..RUSTFS_ENCRYPTION_PREFIX.len() - 2];
+        for key in [
+            "",
+            "x",
+            "x-rustfs-interna",
+            "x-minio-interna",
+            short_encryption_prefix,
+            "x-am",
+        ] {
+            assert!(
+                !should_skip_object_metadata_key(key, "value", NO_EXCLUSIONS),
+                "{key:?} is shorter than any internal prefix and must not be skipped"
+            );
+            assert!(!is_reserved_user_metadata_key(key), "{key:?} must not be treated as reserved");
+        }
+
+        let metadata = HashMap::from([
+            ("X-RustFS-Internal-Healing".to_string(), "true".to_string()),
+            ("x-rustfs-interna".to_string(), "user-value".to_string()),
+        ]);
+        let filtered = filter_object_metadata(&metadata).expect("user metadata should remain");
+        assert_eq!(filtered, HashMap::from([("x-rustfs-interna".to_string(), "user-value".to_string())]));
     }
 
     #[test]
