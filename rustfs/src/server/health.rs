@@ -321,13 +321,15 @@ pub(crate) fn build_health_response_parts(
             ),
         };
 
-    let object_traffic_stalled = degraded_reasons.iter().any(|reason| {
+    let readiness_overlay_degraded = degraded_reasons.iter().any(|reason| {
         matches!(
             reason,
-            ReadinessDegradedReason::ObjectReadStalled | ReadinessDegradedReason::ObjectWriteStalled
+            ReadinessDegradedReason::ObjectReadStalled
+                | ReadinessDegradedReason::ObjectWriteStalled
+                | ReadinessDegradedReason::StartupFinalizationPending
         )
     });
-    if probe == HealthProbe::Readiness && (object_traffic_stalled || matches!(kms_ready, Some(false))) {
+    if probe == HealthProbe::Readiness && (readiness_overlay_degraded || matches!(kms_ready, Some(false))) {
         health = HealthCheckState {
             status_code: StatusCode::SERVICE_UNAVAILABLE,
             status: "degraded",

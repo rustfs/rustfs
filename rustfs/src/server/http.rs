@@ -1677,7 +1677,10 @@ fn process_connection(
                 .option_layer(if is_console { Some(RedirectLayer) } else { None })
                 .layer(BodylessStatusFixLayer)
                 .layer(HeadRequestBodyFixLayer)
-                .layer(PublicHealthEndpointLayer::new(Arc::clone(&server_ctx)))
+                .layer(PublicHealthEndpointLayer::new(
+                    Arc::clone(&server_ctx),
+                    Arc::clone(&readiness),
+                ))
                 .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
                 .layer(DoubleSlashListBucketsCompatLayer)
                 .service(service)
