@@ -10814,7 +10814,6 @@ dependencies = [
 name = "rustfs-utils"
 version = "1.0.0-rc.4"
 dependencies = [
- "ahash",
  "base64-simd",
  "blake2",
  "brotli",
