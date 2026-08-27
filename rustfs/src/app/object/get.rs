@@ -7173,12 +7173,25 @@ mod tests {
             })
             .expect("multipart object must be placed in one source pool");
         if upload_pool != 0 {
+            let mut normalized_disks = 0;
             for (source_disk, target_disk) in pool_disk_paths[upload_pool].iter().zip(&pool_disk_paths[0]) {
                 let source_object = source_disk.join(&bucket).join(object);
+                // The multipart commit succeeds on write quorum, so under suite
+                // IO load a lagging disk of the erasure set can legitimately
+                // hold no object directory (#6701). Normalize the disks that
+                // do hold it; the reader tolerates the same minority gap.
+                if !source_object.exists() {
+                    continue;
+                }
                 let target_bucket = target_disk.join(&bucket);
                 std::fs::create_dir_all(&target_bucket).expect("create normalized target bucket directory");
                 std::fs::rename(source_object, target_bucket.join(object)).expect("normalize the test object into the old pool");
+                normalized_disks += 1;
             }
+            assert!(
+                normalized_disks > pool_disk_paths[upload_pool].len() / 2,
+                "a write-quorum majority of the upload pool's disks must hold the multipart object to normalize"
+            );
         }
         let source_pool = 0;
         let target_pool = 1;
