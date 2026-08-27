@@ -5220,7 +5220,7 @@ mod tests {
     #[tokio::test]
     async fn server_config_snapshot_serializes_read_modify_write_transactions() {
         let baseline = encode_server_config_blob(&Config::new(), None).expect("baseline config should encode");
-        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(baseline), None));
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(baseline.clone()), None));
         let first = read_server_config_snapshot(store.clone())
             .await
             .expect("first config snapshot");
@@ -5234,7 +5234,11 @@ mod tests {
             .await
             .expect("second transaction should acquire after the first snapshot is dropped")
             .expect("second config snapshot");
-        assert!(configs_semantically_equal(&second.config, &Config::new()));
+        // Compare raw bytes against the baseline blob rather than a fresh
+        // Config::new(): the process-global DEFAULT_KVS can be registered by a
+        // sibling test mid-run, which would make a Config::new() evaluated here
+        // diverge from the baseline encoded above.
+        assert_eq!(second.raw.as_deref(), Some(baseline.as_slice()));
     }
 
     #[tokio::test]
