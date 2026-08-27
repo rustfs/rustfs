@@ -190,7 +190,9 @@ use tracing::error;
 use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 
-pub(super) fn restore_operation_id_from_metadata<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> Result<Option<Uuid>> {
+pub(super) fn restore_operation_id_from_metadata<S: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, S>,
+) -> Result<Option<Uuid>> {
     let Some(value) = rustfs_utils::http::metadata_compat::get_consistent_str(metadata, SUFFIX_RESTORE_OPERATION_ID) else {
         if rustfs_utils::http::metadata_compat::contains_key_str(metadata, SUFFIX_RESTORE_OPERATION_ID) {
             return Err(Error::other("invalid restore operation id metadata".to_string()));
@@ -204,14 +206,19 @@ pub(super) fn restore_operation_id_from_metadata<S: std::hash::BuildHasher>(meta
     Ok(Some(id))
 }
 
-pub(super) fn require_restore_operation_id<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>, expected: Uuid) -> Result<()> {
+pub(super) fn require_restore_operation_id<S: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, S>,
+    expected: Uuid,
+) -> Result<()> {
     match restore_operation_id_from_metadata(metadata)? {
         Some(actual) if actual == expected => Ok(()),
         _ => Err(Error::other("restore operation id changed before copy-back".to_string())),
     }
 }
 
-pub(super) fn restore_commit_operation_id_from_metadata<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> Result<Option<Uuid>> {
+pub(super) fn restore_commit_operation_id_from_metadata<S: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, S>,
+) -> Result<Option<Uuid>> {
     if !metadata.contains_key(X_AMZ_RESTORE.as_str()) {
         return Ok(None);
     }

@@ -635,7 +635,10 @@ impl SetDisks {
     /// so the dual internal prefixes carrying the same mapping share one
     /// identity, while a genuine disagreement between disks still changes the
     /// hash and surfaces as a quorum difference.
-    fn update_hash_target_delete_marker_versions<S: std::hash::BuildHasher>(hasher: &mut Sha256, metadata: &HashMap<String, String, S>) {
+    fn update_hash_target_delete_marker_versions<S: std::hash::BuildHasher>(
+        hasher: &mut Sha256,
+        metadata: &HashMap<String, String, S>,
+    ) {
         let (versions, corrupt) = http::target_delete_marker_versions(metadata);
         hasher.update([u8::from(corrupt)]);
         let mut versions = versions.iter().collect::<Vec<_>>();

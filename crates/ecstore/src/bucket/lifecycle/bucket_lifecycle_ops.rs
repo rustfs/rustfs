@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ahash::AHashMap;
 use super::{metadata_boundary, object_lock_boundary, runtime_boundary as runtime_sources};
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{
     LcAuditEvent, LcEventSrc, emit_non_transitioned_expiration_event, emit_transition_complete_event,
@@ -70,6 +69,7 @@ use crate::storage_api_contracts::{
     range::HTTPRangeSpec,
 };
 use crate::store::ECStore;
+use ahash::AHashMap;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use http::HeaderMap;
 use rand::RngExt as _;

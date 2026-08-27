@@ -379,7 +379,10 @@ fn multipart_bucket_incarnation_id<S: std::hash::BuildHasher>(metadata: &HashMap
     Ok(Some(incarnation))
 }
 
-fn multipart_bucket_incarnation_matches<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>, expected: Uuid) -> bool {
+fn multipart_bucket_incarnation_matches<S: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, S>,
+    expected: Uuid,
+) -> bool {
     matches!(multipart_bucket_incarnation_id(metadata), Ok(Some(actual)) if actual == expected)
 }
 

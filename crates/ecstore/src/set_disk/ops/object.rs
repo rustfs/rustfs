@@ -19,7 +19,6 @@
 //! bounds are unchanged, and the impls reach shared primitives through the
 //! SetDisks core (io_primitives) via inherent calls.
 
-use ahash::AHashMap;
 #[cfg(test)]
 use super::super::MetadataCacheInvalidationProbe;
 use super::super::{
@@ -73,6 +72,7 @@ use crate::set_disk::runtime_sources;
 use crate::storage_api_contracts::multipart::MultipartOperations;
 use crate::storage_api_contracts::object::ObjectIO;
 use crate::storage_api_contracts::object::ObjectOperations;
+use ahash::AHashMap;
 use rustfs_lock::LockManager;
 use rustfs_rio::EtagResolvable;
 use rustfs_rio::HashReaderMut;
@@ -6052,7 +6052,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         } else {
             None
         };
-        let mut replacement_metadata: AHashMap<String, String> = (*src_info.user_defined).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let mut replacement_metadata: AHashMap<String, String> =
+            (*src_info.user_defined).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         if let Some(part_checksums) = preserved_part_checksums {
             rustfs_utils::http::insert_str(&mut replacement_metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, part_checksums);
         }

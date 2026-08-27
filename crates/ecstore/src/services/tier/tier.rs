@@ -1454,7 +1454,9 @@ fn tier_backend_identity(config: &TierConfig) -> io::Result<TierDestinationId> {
     encode_tier_backend_identity(tier_type, endpoint, bucket, prefix, region, routing_account)
 }
 
-pub(crate) fn tier_destination_id_from_metadata<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> io::Result<Option<TierDestinationId>> {
+pub(crate) fn tier_destination_id_from_metadata<S: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, S>,
+) -> io::Result<Option<TierDestinationId>> {
     let Some(encoded) = rustfs_utils::http::metadata_compat::get_consistent_str(
         metadata,
         rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,

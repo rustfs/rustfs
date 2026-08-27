@@ -202,7 +202,10 @@ pub fn get_str<S: std::hash::BuildHasher>(map: &HashMap<String, String, S>, suff
         .map(|(_, value)| value.clone())
 }
 
-fn get_consistent_value<'a, V: AsRef<[u8]>, S: std::hash::BuildHasher>(map: &'a HashMap<String, V, S>, suffix: &str) -> Option<&'a V> {
+fn get_consistent_value<'a, V: AsRef<[u8]>, S: std::hash::BuildHasher>(
+    map: &'a HashMap<String, V, S>,
+    suffix: &str,
+) -> Option<&'a V> {
     let (rustfs_key, minio_key) = both_keys(suffix);
     let mut value = None;
     for (key, candidate) in map {
@@ -285,7 +288,9 @@ pub fn strip_internal_prefix_preserving_case(key: &str) -> Option<&str> {
 
 /// Reads the bounded per-target delete-marker version map in one metadata scan.
 /// The boolean is set when matching metadata is malformed or compatibility keys disagree.
-pub fn target_delete_marker_versions<S: std::hash::BuildHasher>(map: &HashMap<String, String, S>) -> (HashMap<String, String>, bool) {
+pub fn target_delete_marker_versions<S: std::hash::BuildHasher>(
+    map: &HashMap<String, String, S>,
+) -> (HashMap<String, String>, bool) {
     const MAX_ENTRIES: usize = 1_000;
     const MAX_ARN_LEN: usize = 1_024;
     const MAX_VERSION_ID_LEN: usize = 1_024;

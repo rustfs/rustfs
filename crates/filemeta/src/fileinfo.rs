@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{Error, ReplicationState, ReplicationStatusType, Result, TRANSITION_COMPLETE, VersionPurgeStatusType};
+use ahash::AHashMap;
 use bytes::Bytes;
 use rmp_serde::Serializer;
 use rustfs_utils::HashAlgorithm;
@@ -22,7 +23,6 @@ use rustfs_utils::http::{
     contains_key_str, get_consistent_str, get_str, has_internal_suffix, insert_str, is_encryption_metadata_key,
     starts_with_ignore_ascii_case,
 };
-use ahash::AHashMap;
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
 use serde::de::{self, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
@@ -2136,7 +2136,10 @@ mod tests {
             -1_000_000i64..=1_000_000i64,
             optional_timestamp_strategy(),
             proptest::option::of(bytes_strategy(16)),
-            proptest::option::of(hash_map(small_string_strategy(), small_string_strategy(), 0..=3).prop_map(|m| m.into_iter().collect::<AHashMap<String, String>>())),
+            proptest::option::of(
+                hash_map(small_string_strategy(), small_string_strategy(), 0..=3)
+                    .prop_map(|m| m.into_iter().collect::<AHashMap<String, String>>()),
+            ),
             proptest::option::of(small_string_strategy()),
         )
             .prop_map(|(etag, number, size, actual_size, mod_time, index, checksums, error)| ObjectPartInfo {
@@ -2171,7 +2174,8 @@ mod tests {
                 -1_000_000i64..=1_000_000i64,
                 proptest::option::of(any::<u32>()),
                 proptest::option::of(any::<u64>()),
-                hash_map(small_string_strategy(), small_string_strategy(), 0..=4).prop_map(|m| m.into_iter().collect::<AHashMap<String, String>>()),
+                hash_map(small_string_strategy(), small_string_strategy(), 0..=4)
+                    .prop_map(|m| m.into_iter().collect::<AHashMap<String, String>>()),
                 vec(object_part_info_strategy(), 0..=3),
                 erasure_info_strategy(),
                 any::<bool>(),
