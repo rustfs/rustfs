@@ -68,7 +68,6 @@ tracing = { workspace = true, features = ["std", "attributes"] }
 
 [dev-dependencies]
 rustfs-targets = { workspace = true, features = ["test-support"] }
-async-trait = { workspace = true }
 temp-env = { workspace = true }
 url = { workspace = true }
 
