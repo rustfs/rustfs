@@ -21,6 +21,7 @@ mod notify;
 mod oidc;
 mod scanner;
 pub mod storageclass;
+mod target_defaults;
 
 use crate::error::Result;
 use crate::store::ECStore;
