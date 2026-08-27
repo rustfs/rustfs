@@ -93,6 +93,9 @@ WARP_BUCKET="test-10mb"
 WARP_OBJ_SIZE="100MiB"
 WARP_CONCURRENT=32
 WARP_DURATION="5m"
+# Warp log path; empty = auto-created unique temp file (the runner user may
+# not be able to write a shared /tmp path owned by another user).
+WARP_LOG_FILE="${RUSTFS_WARP_LOG_FILE:-}"
 STORAGE_THRESHOLD=85            # stop writing when usage reaches N% (note suggests 80-85)
 POLL_INTERVAL=30                # status polling interval (seconds)
 
@@ -102,6 +105,8 @@ DECOMMISSION_TIMEOUT=86400
 SERVICE_TIMEOUT=300
 DECOMMISSION_RETRIES=3          # auto clear+retry attempts after a failed decommission
 DECOMMISSION_RETRY_DELAY=30     # delay between retries (seconds)
+REBALANCE_START_RETRIES=6       # rebalance start retries (fleet proof may take ~10-20s after a topology change)
+REBALANCE_START_RETRY_DELAY=20  # delay between rebalance start retries (seconds)
 
 # Pool to decommission (zero-based; 0 in the note)
 DECOMMISSION_POOL_ID=0
@@ -587,6 +592,28 @@ wait_rebalance() {
   die "timed out waiting for rebalance (${REBALANCE_TIMEOUT}s)"
 }
 
+# Start rebalance via the admin API. Nightly builds gate rebalance activation
+# on a live cross-pool fence fleet capability proof that is re-established
+# shortly after a pool joins, so retry a few times before failing.
+start_rebalance_with_retry() {
+  local attempts="${REBALANCE_START_RETRIES}" delay="${REBALANCE_START_RETRY_DELAY}" attempt=1 body code id
+  while :; do
+    body="$(admin_api POST /rustfs/admin/v3/rebalance/start "")"
+    code="$(admin_api_code)"
+    if [ "${code}" = "200" ]; then
+      id="$(printf '%s' "${body}" | jq -r '.id // empty')"
+      log "rebalance started: id=${id}"
+      return 0
+    fi
+    warn "rebalance start attempt ${attempt}/${attempts} failed (HTTP ${code}): ${body}"
+    if [ "${attempt}" -ge "${attempts}" ]; then
+      die "rebalance start failed after ${attempts} attempts (see last error above)"
+    fi
+    attempt=$((attempt + 1))
+    sleep "${delay}"
+  done
+}
+
 # Print a detailed decommission failure/progress report for one pool
 print_decommission_detail() {
   local body="$1" pool_id="$2" label="$3"
@@ -817,16 +844,18 @@ step4_write_data() {
       log "DRY-RUN: monitoring storage usage until ${STORAGE_THRESHOLD}%"
       return 0
     fi
-    log "starting warp writes (background)..."
+    local warp_log warp_pid
+    warp_log="${WARP_LOG_FILE:-$(mktemp "${TMPDIR:-/tmp}/rustfs-warp.XXXXXX.log")}"
+    log "starting warp writes (background), log: ${warp_log}"
     warp put --host "${API_ENDPOINT#http://}" \
       --bucket "${WARP_BUCKET}" \
       --access-key "${ACCESS_KEY}" \
       --secret-key "${SECRET_KEY}" \
       --obj.size "${WARP_OBJ_SIZE}" \
       --concurrent "${WARP_CONCURRENT}" \
-      --noprefix --duration "${WARP_DURATION}" --noclear >/tmp/rustfs-warp.log 2>&1 &
-    local warp_pid=$!
-    log "warp PID=${warp_pid}, log /tmp/rustfs-warp.log"
+      --noprefix --duration "${WARP_DURATION}" --noclear >"${warp_log}" 2>&1 &
+    warp_pid=$!
+    log "warp PID=${warp_pid}"
     trap 'kill "${warp_pid:-}" 2>/dev/null || true' EXIT
     monitor_storage "${STORAGE_THRESHOLD}" "${warp_pid}"
     kill "${warp_pid}" 2>/dev/null || true
@@ -866,12 +895,8 @@ step5_expand_pool2() {
 step6_rebalance() {
   log "step 6: start data rebalance (admin API)"
   confirm "About to start rebalance (POST ${API_ENDPOINT}/rustfs/admin/v3/rebalance/start). Continue?"
-  local body id
   if [ "${DRY_RUN}" -eq 0 ]; then
-    body="$(admin_api POST /rustfs/admin/v3/rebalance/start "")"
-    [ "$(admin_api_code)" = "200" ] || die "rebalance start failed (HTTP $(admin_api_code)): ${body}"
-    id="$(printf '%s' "${body}" | jq -r '.id // empty')"
-    log "rebalance started: id=${id}"
+    start_rebalance_with_retry
   fi
   wait_rebalance
 }
@@ -894,12 +919,8 @@ step7_expand_pool3() {
 step8_rebalance() {
   log "step 8: start data rebalance (admin API)"
   confirm "About to start rebalance (POST ${API_ENDPOINT}/rustfs/admin/v3/rebalance/start). Continue?"
-  local body id
   if [ "${DRY_RUN}" -eq 0 ]; then
-    body="$(admin_api POST /rustfs/admin/v3/rebalance/start "")"
-    [ "$(admin_api_code)" = "200" ] || die "rebalance start failed (HTTP $(admin_api_code)): ${body}"
-    id="$(printf '%s' "${body}" | jq -r '.id // empty')"
-    log "rebalance started: id=${id}"
+    start_rebalance_with_retry
   fi
   wait_rebalance
 }
