@@ -36,6 +36,8 @@ use crate::services::tier::{
 };
 use bytes::Bytes;
 use http::StatusCode;
+use rustfs_s3_client::credentials::{Credentials, SignatureType, Static, Value};
+use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore};
 use rustfs_s3_client::{
     admin_handler_utils::AdminError,
     api_put_object::{AdvancedPutOptions, PutObjectOptions},
@@ -50,6 +52,7 @@ use s3s::header::{
     X_AMZ_STORAGE_CLASS,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
 use tracing::{info, warn};
@@ -57,6 +60,11 @@ use tracing::{info, warn};
 pub type WarmBackendImpl = Box<dyn WarmBackend + Send + Sync + 'static>;
 
 const PROBE_OBJECT: &str = "probeobject";
+
+/// Largest object the S3-compatible warm backends accept for a multipart put.
+pub(crate) const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
+/// Part-count ceiling S3-compatible services impose on a multipart upload.
+pub(crate) const MAX_PARTS_COUNT: i64 = 10000;
 
 #[derive(Default)]
 pub struct WarmBackendGetOpts {
@@ -220,6 +228,118 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
 
     opts.user_metadata = metadata;
     opts
+}
+
+/// Connection parameters every S3-compatible warm backend provider supplies.
+///
+/// The Aliyun, Azure, Huaweicloud, Tencent, MinIO, R2, and RustFS backends all
+/// wrap [`WarmBackendS3`] around a statically-credentialed [`TransitionClient`]
+/// built from exactly these values. `bucket_lookup` is a parameter rather than a
+/// constant because the providers split into two families: Aliyun, Azure,
+/// Huaweicloud, and Tencent pin [`BucketLookupType::BucketLookupDNS`], while
+/// MinIO, R2, and RustFS leave it at [`BucketLookupType::BucketLookupAuto`].
+pub(crate) struct S3CompatibleWarmBackendParams<'a> {
+    pub endpoint: &'a str,
+    pub access_key: &'a str,
+    pub secret_key: &'a str,
+    pub bucket: &'a str,
+    pub prefix: &'a str,
+    pub region: &'a str,
+    pub bucket_lookup: BucketLookupType,
+    /// Tag handed to [`TransitionClient::new`] so per-provider client behavior
+    /// and metrics stay attributable.
+    pub provider_tag: &'a str,
+}
+
+/// Build the [`WarmBackendS3`] shared by the S3-compatible warm backend providers.
+///
+/// Credential, bucket, and endpoint validation run in this order because the
+/// existing provider constructors report the first failure they hit, and their
+/// error texts are user-visible through the tier admin API.
+#[allow(
+    dead_code,
+    reason = "expand step of the shared warm-backend extraction; the per-provider migrate step adds the production callers (backlog#2040)"
+)]
+pub(crate) async fn new_s3_compatible_warm_backend(
+    params: S3CompatibleWarmBackendParams<'_>,
+) -> Result<WarmBackendS3, std::io::Error> {
+    if params.access_key.is_empty() || params.secret_key.is_empty() {
+        return Err(std::io::Error::other("both access and secret keys are required"));
+    }
+
+    if params.bucket.is_empty() {
+        return Err(std::io::Error::other("no bucket name was provided"));
+    }
+
+    let u = match url::Url::parse(params.endpoint) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(std::io::Error::other(e.to_string()));
+        }
+    };
+
+    let creds = Credentials::new(Static(Value {
+        access_key_id: params.access_key.to_string(),
+        secret_access_key: params.secret_key.to_string(),
+        session_token: "".to_string(),
+        signer_type: SignatureType::SignatureV4,
+        ..Default::default()
+    }));
+    let opts = Options {
+        creds,
+        secure: u.scheme() == "https",
+        trailing_headers: true,
+        region: params.region.to_string(),
+        bucket_lookup: params.bucket_lookup,
+        ..Default::default()
+    };
+    let scheme = u.scheme();
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let host = u
+        .host_str()
+        .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+    let client =
+        TransitionClient::new(&format!("{}:{}", host, u.port().unwrap_or(default_port)), opts, params.provider_tag).await?;
+
+    let client = Arc::new(client);
+    let core = TransitionCore(Arc::clone(&client));
+    Ok(WarmBackendS3 {
+        client,
+        core,
+        bucket: params.bucket.to_string(),
+        prefix: params.prefix.strip_suffix("/").unwrap_or(params.prefix).to_owned(),
+        storage_class: "".to_string(),
+    })
+}
+
+/// Round the multipart part size up to a whole multiple of `min_part_size` that
+/// keeps the upload within [`MAX_PARTS_COUNT`] parts.
+///
+/// `object_size == -1` means "length unknown", so the caller is charged the
+/// worst case of a full [`MAX_MULTIPART_PUT_OBJECT_SIZE`] object.
+#[allow(
+    dead_code,
+    reason = "expand step of the shared warm-backend extraction; the per-provider migrate step adds the production callers (backlog#2040)"
+)]
+pub(crate) fn optimal_part_size(object_size: i64, min_part_size: i64) -> Result<i64, std::io::Error> {
+    let mut object_size = object_size;
+    if object_size == -1 {
+        object_size = MAX_MULTIPART_PUT_OBJECT_SIZE;
+    }
+
+    if object_size > MAX_MULTIPART_PUT_OBJECT_SIZE {
+        return Err(std::io::Error::other("entity too large"));
+    }
+
+    let configured_part_size = min_part_size;
+    let mut part_size_flt = object_size as f64 / MAX_PARTS_COUNT as f64;
+    part_size_flt = (part_size_flt / configured_part_size as f64).ceil() * configured_part_size as f64;
+
+    let part_size = part_size_flt as i64;
+    if part_size == 0 {
+        return Ok(min_part_size);
+    }
+    Ok(part_size)
 }
 
 pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), AdminError> {
@@ -801,6 +921,181 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+    }
+
+    /// Every S3-compatible provider file pins this same floor today.
+    const PROVIDER_MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
+
+    fn s3_compatible_params(endpoint: &str) -> S3CompatibleWarmBackendParams<'_> {
+        S3CompatibleWarmBackendParams {
+            endpoint,
+            access_key: "access",
+            secret_key: "secret",
+            bucket: "tier-bucket",
+            prefix: "archive",
+            region: "us-east-1",
+            bucket_lookup: BucketLookupType::BucketLookupDNS,
+            provider_tag: "aliyun",
+        }
+    }
+
+    /// `WarmBackendS3` has no `Debug`, so `Result::expect_err` is unavailable.
+    async fn init_error(params: S3CompatibleWarmBackendParams<'_>, must_fail_because: &str) -> std::io::Error {
+        match new_s3_compatible_warm_backend(params).await {
+            Ok(_) => panic!("{must_fail_because}"),
+            Err(err) => err,
+        }
+    }
+
+    #[tokio::test]
+    async fn s3_compatible_backend_rejects_missing_credentials_before_parsing_the_endpoint() {
+        let mut params = s3_compatible_params("://not-a-url");
+        params.access_key = "";
+        let err = init_error(params, "an empty access key must be rejected").await;
+        assert_eq!(err.to_string(), "both access and secret keys are required");
+
+        let mut params = s3_compatible_params("://not-a-url");
+        params.secret_key = "";
+        let err = init_error(params, "an empty secret key must be rejected").await;
+        assert_eq!(err.to_string(), "both access and secret keys are required");
+    }
+
+    #[tokio::test]
+    async fn s3_compatible_backend_rejects_an_empty_bucket_before_parsing_the_endpoint() {
+        let mut params = s3_compatible_params("://not-a-url");
+        params.bucket = "";
+
+        let err = init_error(params, "an empty bucket must be rejected").await;
+
+        assert_eq!(err.to_string(), "no bucket name was provided");
+    }
+
+    #[tokio::test]
+    async fn s3_compatible_backend_rejects_an_unparsable_endpoint() {
+        let err = init_error(s3_compatible_params("://not-a-url"), "an endpoint that is not a URL must be rejected").await;
+
+        assert_eq!(err.to_string(), url::ParseError::RelativeUrlWithoutBase.to_string());
+    }
+
+    #[tokio::test]
+    async fn s3_compatible_backend_rejects_an_endpoint_without_a_host() {
+        let err = init_error(s3_compatible_params("rustfs://"), "an endpoint without a host must be rejected").await;
+
+        assert_eq!(err.to_string(), "Invalid endpoint URL: missing host");
+    }
+
+    #[tokio::test]
+    async fn s3_compatible_backend_carries_provider_options_to_the_transition_client() {
+        let backend = new_s3_compatible_warm_backend(s3_compatible_params("http://tier.example.com:9000"))
+            .await
+            .expect("a well-formed S3-compatible tier config should initialize offline");
+
+        assert_eq!(backend.bucket, "tier-bucket");
+        assert_eq!(backend.prefix, "archive");
+        assert_eq!(backend.storage_class, "");
+        assert!(!backend.client.secure);
+        assert_eq!(backend.client.endpoint_url.scheme(), "http");
+        assert_eq!(backend.client.endpoint_url.host_str(), Some("tier.example.com"));
+        assert_eq!(backend.client.endpoint_url.port(), Some(9000));
+        assert_eq!(backend.client.region, "us-east-1");
+        assert_eq!(backend.client.lookup, BucketLookupType::BucketLookupDNS);
+        // The provider constructors all request `trailing_headers: true`, but
+        // `TransitionClient` gates the feature on an explicitly overridden SigV4
+        // signer, which none of them set. Pin the resulting `false` so migrating
+        // a provider onto this constructor cannot silently flip wire behavior.
+        assert!(!backend.client.trailing_header_support);
+        assert_eq!(backend.client.tier_type, "aliyun");
+    }
+
+    #[tokio::test]
+    async fn s3_compatible_backend_derives_tls_and_the_default_port_from_the_scheme() {
+        let secure = new_s3_compatible_warm_backend(s3_compatible_params("https://tier.example.com"))
+            .await
+            .expect("an https endpoint should initialize offline");
+        assert!(secure.client.secure);
+        assert_eq!(secure.client.endpoint_url.scheme(), "https");
+        assert_eq!(secure.client.endpoint_url.port_or_known_default(), Some(443));
+
+        let insecure = new_s3_compatible_warm_backend(s3_compatible_params("http://tier.example.com"))
+            .await
+            .expect("an http endpoint should initialize offline");
+        assert!(!insecure.client.secure);
+        assert_eq!(insecure.client.endpoint_url.scheme(), "http");
+        assert_eq!(insecure.client.endpoint_url.port_or_known_default(), Some(80));
+    }
+
+    #[tokio::test]
+    async fn s3_compatible_backend_strips_only_a_trailing_prefix_separator() {
+        let mut params = s3_compatible_params("http://tier.example.com:9000");
+        params.prefix = "archive/";
+        let trimmed = new_s3_compatible_warm_backend(params)
+            .await
+            .expect("a prefix with a trailing separator should initialize offline");
+        assert_eq!(trimmed.prefix, "archive");
+
+        let mut params = s3_compatible_params("http://tier.example.com:9000");
+        params.prefix = "archive/nested";
+        let untouched = new_s3_compatible_warm_backend(params)
+            .await
+            .expect("a nested prefix should initialize offline");
+        assert_eq!(untouched.prefix, "archive/nested");
+
+        let mut params = s3_compatible_params("http://tier.example.com:9000");
+        params.prefix = "";
+        let empty = new_s3_compatible_warm_backend(params)
+            .await
+            .expect("an empty prefix should initialize offline");
+        assert_eq!(empty.prefix, "");
+    }
+
+    #[tokio::test]
+    async fn s3_compatible_backend_honors_the_auto_bucket_lookup_family() {
+        let mut params = s3_compatible_params("http://tier.example.com:9000");
+        params.bucket_lookup = BucketLookupType::BucketLookupAuto;
+        params.provider_tag = "minio";
+
+        let backend = new_s3_compatible_warm_backend(params)
+            .await
+            .expect("the auto-lookup provider family should initialize offline");
+
+        assert_eq!(backend.client.lookup, BucketLookupType::BucketLookupAuto);
+        assert_eq!(backend.client.tier_type, "minio");
+    }
+
+    #[test]
+    fn optimal_part_size_charges_an_unknown_length_the_multipart_ceiling() {
+        let unknown = optimal_part_size(-1, PROVIDER_MIN_PART_SIZE).expect("an unknown length must be accepted");
+        let ceiling =
+            optimal_part_size(MAX_MULTIPART_PUT_OBJECT_SIZE, PROVIDER_MIN_PART_SIZE).expect("the exact ceiling must be accepted");
+
+        assert_eq!(unknown, ceiling);
+        assert_eq!(unknown, 5 * PROVIDER_MIN_PART_SIZE);
+        assert!(unknown * MAX_PARTS_COUNT >= MAX_MULTIPART_PUT_OBJECT_SIZE);
+    }
+
+    #[test]
+    fn optimal_part_size_rejects_an_object_above_the_multipart_ceiling() {
+        let err = optimal_part_size(MAX_MULTIPART_PUT_OBJECT_SIZE + 1, PROVIDER_MIN_PART_SIZE)
+            .expect_err("an object past the multipart ceiling must fail closed");
+
+        assert_eq!(err.to_string(), "entity too large");
+    }
+
+    #[test]
+    fn optimal_part_size_never_returns_less_than_one_part() {
+        assert_eq!(
+            optimal_part_size(0, PROVIDER_MIN_PART_SIZE).expect("a zero-length object must be accepted"),
+            PROVIDER_MIN_PART_SIZE
+        );
+        assert_eq!(
+            optimal_part_size(1024, PROVIDER_MIN_PART_SIZE).expect("a tiny object must be accepted"),
+            PROVIDER_MIN_PART_SIZE
+        );
+        assert_eq!(
+            optimal_part_size(PROVIDER_MIN_PART_SIZE, PROVIDER_MIN_PART_SIZE)
+                .expect("an object of exactly one part must be accepted"),
+            PROVIDER_MIN_PART_SIZE
+        );
     }
 
     #[test]
