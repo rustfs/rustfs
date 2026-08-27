@@ -32,6 +32,7 @@ use rustfs_s3_client::{
     credentials::{Credentials, SignatureType, Static, Value},
     transition_api::{BucketLookupType, Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
+use rustfs_utils::egress::validate_outbound_url;
 use tracing::warn;
 
 const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
@@ -57,6 +58,7 @@ impl WarmBackendAliyun {
                 return Err(std::io::Error::other(e.to_string()));
             }
         };
+        validate_outbound_url(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
 
         let creds = Credentials::new(Static(Value {
             access_key_id: conf.access_key.clone(),
@@ -150,4 +152,27 @@ fn optimal_part_size(object_size: i64) -> Result<i64, std::io::Error> {
         return Ok(MIN_PART_SIZE);
     }
     Ok(part_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::tier::tier_config::TierAliyun;
+
+    #[tokio::test]
+    async fn new_rejects_loopback_endpoint_before_network_setup() {
+        let conf = TierAliyun {
+            endpoint: "https://127.0.0.1:9000".to_string(),
+            bucket: "tier-bucket".to_string(),
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        };
+
+        match WarmBackendAliyun::new(&conf, "tier").await {
+            Ok(_) => panic!("loopback endpoint should be rejected"),
+            Err(err) => assert!(err.to_string().contains("not allowed")),
+        }
+    }
 }

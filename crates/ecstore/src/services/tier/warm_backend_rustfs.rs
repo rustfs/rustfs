@@ -32,6 +32,7 @@ use rustfs_s3_client::{
     credentials::{Credentials, SignatureType, Static, Value},
     transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
+use rustfs_utils::egress::validate_outbound_url;
 
 const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
 const MAX_PARTS_COUNT: i64 = 10000;
@@ -54,6 +55,7 @@ impl WarmBackendRustFS {
             Ok(u) => u,
             Err(e) => return Err(std::io::Error::other(e)),
         };
+        validate_outbound_url(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
 
         let creds = Credentials::new(Static(Value {
             access_key_id: conf.access_key.clone(),
@@ -195,5 +197,15 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("host"), "expected host validation error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn new_rejects_loopback_endpoint_before_network_setup() {
+        let conf = rustfs_tier("https://127.0.0.1:9000");
+
+        match WarmBackendRustFS::new(&conf, "tier").await {
+            Ok(_) => panic!("loopback endpoint should be rejected"),
+            Err(err) => assert!(err.to_string().contains("not allowed")),
+        }
     }
 }
