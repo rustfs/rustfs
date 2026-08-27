@@ -264,9 +264,9 @@ pub(crate) mod site_replication {
             LifecycleRule, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule,
             ReplicationRuleStatus, SourceSelectionCriteria, VersioningConfiguration,
         };
-        pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
         #[cfg(test)]
         pub(crate) use s3s::dto::{ExpirationStatus, LifecycleExpiration, Timestamp, Transition, TransitionStorageClass};
+        pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
     }
 }
 

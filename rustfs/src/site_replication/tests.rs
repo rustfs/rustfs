@@ -21,10 +21,10 @@
 use super::*;
 
 use super::identity::site_identity_key;
+use crate::storage_api::site_replication::merge_incoming_replication_config;
 use crate::storage_api::site_replication::s3::{
     ExpirationStatus, LifecycleExpiration, Timestamp, Transition, TransitionStorageClass,
 };
-use crate::storage_api::site_replication::merge_incoming_replication_config;
 use crate::storage_api::site_replication::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_madmin::{BucketBandwidth, SiteReplicationInfo};
 use serial_test::serial;
