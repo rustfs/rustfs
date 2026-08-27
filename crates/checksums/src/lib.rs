@@ -49,10 +49,14 @@ pub const MD5_NAME: &str = "md5";
 /// (crates/s3-client/src/checksum.rs) delegates all per-algorithm dispatch
 /// here through its `algorithm()` bridge. The on-disk xl.meta bitset remains
 /// deliberately separate in `rustfs_rio::ChecksumType`
-/// (crates/rio/src/checksum.rs, varint bits are append-only). When adding an
-/// algorithm: add the variant here (the exhaustive matches force every
-/// metadata decision), bridge it in the client, and allocate an xl.meta bit
-/// in rio (or record why not).
+/// (crates/rio/src/checksum.rs, varint bits are append-only), and rio also
+/// keeps its own hot-path hasher shells — equivalence with this crate's
+/// hashers is enforced by both test suites pinning the same official
+/// known-answer vectors (backlog#1844 PR3 verdict, recorded on
+/// `rustfs_rio::ChecksumType`). When adding an algorithm: add the variant
+/// here (the exhaustive matches force every metadata decision), bridge it in
+/// the client, and allocate an xl.meta bit + hasher + shared vector in rio
+/// (or record why not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum ChecksumAlgorithm {
