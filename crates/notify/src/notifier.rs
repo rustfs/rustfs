@@ -610,18 +610,10 @@ impl TargetList {
 mod tests {
     use super::*;
     use crate::{rule_engine::NotifyRuleEngine, rules::RulesMap};
-    use async_trait::async_trait;
     use rustfs_s3_types::EventName;
-    use rustfs_targets::StoreError;
-    use rustfs_targets::{
-        ReplayWorkerManager, TargetError,
-        store::{Key, QueueStore, Store},
-        target::{EntityTarget, QueuedPayload, QueuedPayloadMeta},
-    };
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use rustfs_targets::testkit::MockTarget;
+    use rustfs_targets::{ReplayWorkerManager, store::QueueStore};
+    use std::sync::Arc;
     use tokio::sync::Notify;
 
     #[tokio::test]
@@ -680,105 +672,6 @@ mod tests {
         assert!(suffix_targets.is_empty());
     }
 
-    #[derive(Clone)]
-    struct TestTarget {
-        block_first_save: Option<(Arc<Notify>, Arc<Notify>)>,
-        close_calls: Arc<AtomicUsize>,
-        close_entered: Option<Arc<Notify>>,
-        id: TargetID,
-        enabled: bool,
-        save_calls: Arc<AtomicUsize>,
-        selected_calls: Arc<AtomicUsize>,
-        store: Option<QueueStore<QueuedPayload>>,
-    }
-
-    impl TestTarget {
-        fn new(id: &str, name: &str, enabled: bool) -> Self {
-            Self {
-                block_first_save: None,
-                close_calls: Arc::new(AtomicUsize::new(0)),
-                close_entered: None,
-                id: TargetID::new(id.to_string(), name.to_string()),
-                enabled,
-                save_calls: Arc::new(AtomicUsize::new(0)),
-                selected_calls: Arc::new(AtomicUsize::new(0)),
-                store: None,
-            }
-        }
-
-        fn with_blocked_first_save(mut self, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
-            self.block_first_save = Some((entered, release));
-            self
-        }
-
-        fn with_store(mut self, store: QueueStore<QueuedPayload>) -> Self {
-            self.store = Some(store);
-            self
-        }
-
-        fn with_close_observer(mut self, close_entered: Arc<Notify>) -> Self {
-            self.close_entered = Some(close_entered);
-            self
-        }
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for TestTarget
-    where
-        E: rustfs_targets::PluginEvent,
-    {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(self.enabled)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            let call = self.save_calls.fetch_add(1, Ordering::SeqCst);
-            if call == 0
-                && let Some((entered, release)) = &self.block_first_save
-            {
-                entered.notify_one();
-                release.notified().await;
-            }
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            self.close_calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(close_entered) = &self.close_entered {
-                close_entered.notify_one();
-            }
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            self.store
-                .as_ref()
-                .map(|store| store as &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync))
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            let cloned = self.clone();
-            Box::new(cloned)
-        }
-
-        async fn init(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn is_enabled(&self) -> bool {
-            self.selected_calls.fetch_add(1, Ordering::SeqCst);
-            self.enabled
-        }
-    }
-
     #[tokio::test]
     async fn lifecycle_pause_drains_entered_deferred_dispatch_and_blocks_new_dispatch() {
         let metrics = Arc::new(NotificationMetrics::new());
@@ -787,12 +680,12 @@ mod tests {
         let save_entered = Arc::new(Notify::new());
         let save_release = Arc::new(Notify::new());
         let queue_dir = tempfile::tempdir().expect("queue tempdir should be created");
-        let target = TestTarget::new("gated-target", "webhook", true)
-            .with_blocked_first_save(save_entered.clone(), save_release.clone())
-            .with_store(QueueStore::new(queue_dir.path(), 16, ".event"));
+        let target = MockTarget::new("gated-target", "webhook")
+            .with_first_save_gate(save_entered.clone(), save_release.clone())
+            .with_store(Arc::new(QueueStore::new(queue_dir.path(), 16, ".event")));
 
         let mut rules_map = RulesMap::new();
-        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.target_id());
         rule_engine.set_bucket_rules("bucket", rules_map).await;
         notifier
             .target_list()
@@ -817,7 +710,7 @@ mod tests {
             }
         });
         save_entered.notified().await;
-        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.save_call_count(), 1);
 
         let mut pause = Box::pin(facade.pause_dispatch());
         tokio::select! {
@@ -830,7 +723,7 @@ mod tests {
         first_dispatch.await.expect("first dispatch task should finish");
         let pause_guard = pause.await;
 
-        let replacement = TestTarget::new("gated-target", "webhook", true);
+        let replacement = MockTarget::new("gated-target", "webhook");
         {
             let target_list = notifier.target_list();
             let mut target_list = target_list.write().await;
@@ -848,19 +741,19 @@ mod tests {
             _ = std::future::ready(()) => {}
         }
         assert_eq!(
-            replacement.selected_calls.load(Ordering::SeqCst),
+            replacement.enabled_call_count(),
             0,
             "a paused dispatch must not select a target from the replacement generation early"
         );
-        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(replacement.save_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(target.save_call_count(), 1);
+        assert_eq!(replacement.save_call_count(), 0);
 
         drop(pause_guard);
         second_dispatch.await;
-        assert_eq!(target.selected_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(replacement.selected_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(replacement.save_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.enabled_call_count(), 1);
+        assert_eq!(target.save_call_count(), 1);
+        assert_eq!(replacement.enabled_call_count(), 1);
+        assert_eq!(replacement.save_call_count(), 1);
     }
 
     #[tokio::test]
@@ -870,11 +763,10 @@ mod tests {
         let notifier = Arc::new(EventNotifier::new(metrics.clone(), rule_engine.clone()));
         let save_entered = Arc::new(Notify::new());
         let save_release = Arc::new(Notify::new());
-        let target =
-            TestTarget::new("direct-target", "webhook", true).with_blocked_first_save(save_entered.clone(), save_release.clone());
+        let target = MockTarget::new("direct-target", "webhook").with_first_save_gate(save_entered.clone(), save_release.clone());
 
         let mut rules_map = RulesMap::new();
-        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.target_id());
         rule_engine.set_bucket_rules("bucket", rules_map).await;
         notifier
             .target_list()
@@ -921,13 +813,11 @@ mod tests {
         });
         let first_entered = Arc::new(Notify::new());
         let first_release = Arc::new(Notify::new());
-        let close_entered = Arc::new(Notify::new());
-        let target = TestTarget::new("direct-target", "webhook", true)
-            .with_blocked_first_save(first_entered.clone(), first_release.clone())
-            .with_close_observer(close_entered);
+        let target =
+            MockTarget::new("direct-target", "webhook").with_first_save_gate(first_entered.clone(), first_release.clone());
 
         let mut rules_map = RulesMap::new();
-        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.target_id());
         rule_engine.set_bucket_rules("bucket", rules_map).await;
         notifier
             .target_list()
@@ -964,7 +854,7 @@ mod tests {
             }
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while target.selected_calls.load(Ordering::SeqCst) != 2 {
+            while target.enabled_call_count() != 2 {
                 tokio::task::yield_now().await;
             }
         })
@@ -978,14 +868,14 @@ mod tests {
             result = &mut replace => panic!("replacement closed a generation with selected direct sends: {result:?}"),
             _ = std::future::ready(()) => {}
         }
-        assert_eq!(target.close_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(target.close_call_count(), 0);
 
         first_release.notify_one();
         first.await.expect("first direct dispatch should finish");
         second.await.expect("permit-waiting direct dispatch should be cancelled");
         replace.await.expect("replacement should close after direct leases drain");
-        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(target.close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.save_call_count(), 1);
+        assert_eq!(target.close_call_count(), 1);
         assert_eq!(metrics.processing_count(), 0);
         assert_eq!(metrics.processed_count(), 1);
         assert_eq!(metrics.skipped_count(), 1);
@@ -999,12 +889,12 @@ mod tests {
         let save_entered = Arc::new(Notify::new());
         let save_release = Arc::new(Notify::new());
         let queue_dir = tempfile::tempdir().expect("queue tempdir should be created");
-        let target = TestTarget::new("deferred", "webhook", true)
-            .with_blocked_first_save(save_entered.clone(), save_release.clone())
-            .with_store(QueueStore::new(queue_dir.path(), 16, ".event"));
+        let target = MockTarget::new("deferred", "webhook")
+            .with_first_save_gate(save_entered.clone(), save_release.clone())
+            .with_store(Arc::new(QueueStore::new(queue_dir.path(), 16, ".event")));
 
         let mut rules_map = RulesMap::new();
-        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.target_id());
         rule_engine.set_bucket_rules("bucket", rules_map).await;
         notifier
             .target_list()
@@ -1060,10 +950,10 @@ mod tests {
         let mut targets = Vec::new();
         let mut rules_map = RulesMap::new();
         for index in 0..TARGETS {
-            let target = TestTarget::new(&format!("deferred-{index}"), "webhook", true)
-                .with_blocked_first_save(entered.clone(), release.clone())
-                .with_store(QueueStore::new(queue_dir.path().join(index.to_string()), 16, ".event"));
-            rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+            let target = MockTarget::new(&format!("deferred-{index}"), "webhook")
+                .with_first_save_gate(entered.clone(), release.clone())
+                .with_store(Arc::new(QueueStore::new(queue_dir.path().join(index.to_string()), 16, ".event")));
+            rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.target_id());
             notifier
                 .target_list()
                 .write()
@@ -1082,12 +972,7 @@ mod tests {
                     .await;
             }
         });
-        let total_calls = || {
-            targets
-                .iter()
-                .map(|target| target.save_calls.load(Ordering::SeqCst))
-                .sum::<usize>()
-        };
+        let total_calls = || targets.iter().map(|target| target.save_call_count()).sum::<usize>();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while total_calls() != LIMIT {
                 tokio::task::yield_now().await;
@@ -1122,20 +1007,19 @@ mod tests {
         });
         let direct_entered = Arc::new(Notify::new());
         let direct_release = Arc::new(Notify::new());
-        let direct =
-            TestTarget::new("direct", "webhook", true).with_blocked_first_save(direct_entered.clone(), direct_release.clone());
+        let direct = MockTarget::new("direct", "webhook").with_first_save_gate(direct_entered.clone(), direct_release.clone());
         let deferred_entered = Arc::new(Notify::new());
         let deferred_release = Arc::new(Notify::new());
         let queue_dir = tempfile::tempdir().expect("queue tempdir should be created");
-        let deferred = TestTarget::new("deferred", "webhook", true)
-            .with_blocked_first_save(deferred_entered.clone(), deferred_release.clone())
-            .with_store(QueueStore::new(queue_dir.path(), 16, ".event"));
+        let deferred = MockTarget::new("deferred", "webhook")
+            .with_first_save_gate(deferred_entered.clone(), deferred_release.clone())
+            .with_store(Arc::new(QueueStore::new(queue_dir.path(), 16, ".event")));
 
         let mut direct_rules = RulesMap::new();
-        direct_rules.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), direct.id.clone());
+        direct_rules.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), direct.target_id());
         rule_engine.set_bucket_rules("direct-bucket", direct_rules).await;
         let mut deferred_rules = RulesMap::new();
-        deferred_rules.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), deferred.id.clone());
+        deferred_rules.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), deferred.target_id());
         rule_engine.set_bucket_rules("deferred-bucket", deferred_rules).await;
         {
             let target_list = notifier.target_list();
@@ -1198,12 +1082,12 @@ mod tests {
         let rule_engine = NotifyRuleEngine::new();
         let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), rule_engine.clone());
 
-        let enabled_target = TestTarget::new("enabled-target", "webhook", true);
-        let disabled_target = TestTarget::new("disabled-target", "webhook", false);
+        let enabled_target = MockTarget::new("enabled-target", "webhook");
+        let disabled_target = MockTarget::new("disabled-target", "webhook").disabled();
 
         let mut rules_map = RulesMap::new();
-        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), enabled_target.id.clone());
-        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), disabled_target.id.clone());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), enabled_target.target_id());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), disabled_target.target_id());
 
         rule_engine.set_bucket_rules("bucket", rules_map).await;
         notifier
@@ -1222,17 +1106,17 @@ mod tests {
         let event = Arc::new(Event::new_test_event("bucket", "object", EventName::ObjectCreatedPut));
         notifier.send(event).await;
 
-        assert_eq!(enabled_target.save_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(disabled_target.save_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(enabled_target.save_call_count(), 1);
+        assert_eq!(disabled_target.save_call_count(), 0);
     }
 
     #[tokio::test]
     async fn send_event_respects_prefix_suffix_filters() {
         let rule_engine = NotifyRuleEngine::new();
         let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), rule_engine.clone());
-        let target = TestTarget::new("filtered-target", "webhook", true);
+        let target = MockTarget::new("filtered-target", "webhook");
         let mut rules_map = RulesMap::new();
-        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), target.id.clone());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "uploads/*.csv".to_string(), target.target_id());
 
         rule_engine.set_bucket_rules("bucket", rules_map).await;
         notifier.target_list().write().await.add(Arc::new(target.clone())).unwrap();
@@ -1248,7 +1132,7 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(target.save_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(target.save_call_count(), 0);
 
         notifier
             .send(Arc::new(Event::new_test_event(
@@ -1258,72 +1142,18 @@ mod tests {
             )))
             .await;
 
-        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.save_call_count(), 1);
     }
 
-    /// A store-backed (deferred) target. `save` only enqueues to the store, so
-    /// the actual delivery happens later in the replay worker.
-    #[derive(Clone)]
-    struct DeferredTestTarget {
-        id: TargetID,
-        save_calls: Arc<AtomicUsize>,
-        store: QueueStore<QueuedPayload>,
-    }
-
-    impl DeferredTestTarget {
-        fn new(id: &str, name: &str) -> Self {
-            Self {
-                id: TargetID::new(id.to_string(), name.to_string()),
-                save_calls: Arc::new(AtomicUsize::new(0)),
-                // The store is never actually written to here: `save` below only bumps a
-                // counter. It just has to exist so the notifier treats this target as
-                // store-backed (deferred delivery), exercising the deferred counting path.
-                store: QueueStore::new(std::env::temp_dir().join("rustfs-notify-979-noop-store"), 0, ""),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for DeferredTestTarget
-    where
-        E: rustfs_targets::PluginEvent,
-    {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            self.save_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            Some(&self.store)
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        async fn init(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
+    /// Builds a store-backed (deferred) mock target. `save` only bumps the mock's counter, so the
+    /// attached store is never written to: it just has to exist so the notifier treats the target
+    /// as store-backed (deferred delivery), exercising the deferred counting path.
+    fn deferred_test_target(id: &str, name: &str) -> MockTarget {
+        MockTarget::new(id, name).with_store(Arc::new(QueueStore::new(
+            std::env::temp_dir().join("rustfs-notify-979-noop-store"),
+            0,
+            "",
+        )))
     }
 
     /// Regression test for backlog#979 (a): dispatching to a store-backed
@@ -1338,9 +1168,9 @@ mod tests {
         let rule_engine = NotifyRuleEngine::new();
         let notifier = EventNotifier::new(metrics.clone(), rule_engine.clone());
 
-        let target = DeferredTestTarget::new("deferred-target", "webhook");
+        let target = deferred_test_target("deferred-target", "webhook");
         let mut rules_map = RulesMap::new();
-        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.id.clone());
+        rules_map.add_rule_config(&[EventName::ObjectCreatedPut], "*".to_string(), target.target_id());
         rule_engine.set_bucket_rules("bucket", rules_map).await;
         notifier.target_list().write().await.add(Arc::new(target.clone())).unwrap();
 
@@ -1349,7 +1179,7 @@ mod tests {
             .send(Arc::new(Event::new_test_event("bucket", "object", EventName::ObjectCreatedPut)))
             .await;
 
-        assert_eq!(target.save_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(target.save_call_count(), 1);
         assert_eq!(
             metrics.processing_count(),
             1,
@@ -1394,87 +1224,20 @@ mod tests {
         let rule_engine = NotifyRuleEngine::new();
         let notifier = EventNotifier::new(Arc::new(NotificationMetrics::new()), rule_engine);
 
-        let old_target = ClosableTestTarget::new("old", "webhook");
+        let old_target = MockTarget::new("old", "webhook");
         notifier
             .init_bucket_targets_shared(vec![Arc::new(old_target.clone()) as SharedTarget<Event>])
             .await
             .expect("initial install should succeed");
-        assert_eq!(old_target.close_calls.load(Ordering::SeqCst), 0, "target must not close on first install");
+        assert_eq!(old_target.close_call_count(), 0, "target must not close on first install");
 
-        let new_target = ClosableTestTarget::new("new", "webhook");
+        let new_target = MockTarget::new("new", "webhook");
         notifier
             .init_bucket_targets_shared(vec![Arc::new(new_target.clone()) as SharedTarget<Event>])
             .await
             .expect("replacement install should succeed");
 
-        assert_eq!(
-            old_target.close_calls.load(Ordering::SeqCst),
-            1,
-            "the replaced target must be closed exactly once"
-        );
-        assert_eq!(
-            new_target.close_calls.load(Ordering::SeqCst),
-            0,
-            "the freshly installed target must stay open"
-        );
-    }
-
-    /// A target that records `close()` invocations, for lifecycle assertions.
-    #[derive(Clone)]
-    struct ClosableTestTarget {
-        id: TargetID,
-        close_calls: Arc<AtomicUsize>,
-    }
-
-    impl ClosableTestTarget {
-        fn new(id: &str, name: &str) -> Self {
-            Self {
-                id: TargetID::new(id.to_string(), name.to_string()),
-                close_calls: Arc::new(AtomicUsize::new(0)),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for ClosableTestTarget
-    where
-        E: rustfs_targets::PluginEvent,
-    {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            self.close_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        async fn init(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
+        assert_eq!(old_target.close_call_count(), 1, "the replaced target must be closed exactly once");
+        assert_eq!(new_target.close_call_count(), 0, "the freshly installed target must stay open");
     }
 }

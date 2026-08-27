@@ -23,7 +23,7 @@
 use crate::arn::TargetID;
 use crate::plugin::PluginEvent;
 use crate::store::{FailedEventStore, Key, Store};
-use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
+use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliverySnapshot};
 use crate::{StoreError, Target, TargetError};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -33,6 +33,10 @@ use tokio::sync::{Notify, Semaphore};
 
 /// The queued-payload store handle a [`MockTarget`] serves from its [`Target::store`] accessor.
 pub type SharedQueuedStore = Arc<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>;
+
+/// Builds the error a failing mock operation returns, so a test that pins an error variant can
+/// shape the failure instead of matching the mock's default.
+pub type ErrorFactory = Arc<dyn Fn() -> TargetError + Send + Sync>;
 
 /// Increments its counter when dropped, however the owning future ends, so a test that holds the
 /// probe open past its caller's deadline can prove the cancelled health future was actually
@@ -67,7 +71,11 @@ pub struct MockTarget {
     active: Option<bool>,
     health_delay: Duration,
     health_started: Arc<Notify>,
+    /// When set, `is_active` waits on this handle (after notifying `health_started`) before
+    /// answering, so a test can hold a probe in flight and release it on demand.
+    health_gate: Option<Arc<Notify>>,
     health_drops: Arc<AtomicUsize>,
+    enabled_calls: Arc<AtomicUsize>,
     init_calls: Arc<AtomicUsize>,
     init_failures_remaining: Arc<AtomicUsize>,
     /// When set, `init` notifies the handle on entry and then never returns.
@@ -76,9 +84,15 @@ pub struct MockTarget {
     close_started: Arc<Notify>,
     block_on_close: Arc<AtomicBool>,
     close_gate: Arc<Semaphore>,
+    close_failures_remaining: Arc<AtomicUsize>,
+    close_failure_error: Option<ErrorFactory>,
     save_calls: Arc<AtomicUsize>,
     save_failures_remaining: Arc<AtomicUsize>,
+    /// When set, the first `save` (counted across all clones) notifies the first handle and then
+    /// waits on the second before returning; later saves pass straight through.
+    first_save_gate: Option<(Arc<Notify>, Arc<Notify>)>,
     final_failures: Arc<AtomicU64>,
+    delivery_snapshot: Option<TargetDeliverySnapshot>,
     store: Option<SharedQueuedStore>,
     failed_store: Option<Arc<dyn FailedEventStore>>,
 }
@@ -92,7 +106,9 @@ impl MockTarget {
             active: None,
             health_delay: Duration::ZERO,
             health_started: Arc::new(Notify::new()),
+            health_gate: None,
             health_drops: Arc::new(AtomicUsize::new(0)),
+            enabled_calls: Arc::new(AtomicUsize::new(0)),
             init_calls: Arc::new(AtomicUsize::new(0)),
             init_failures_remaining: Arc::new(AtomicUsize::new(0)),
             blocking_init: None,
@@ -100,12 +116,24 @@ impl MockTarget {
             close_started: Arc::new(Notify::new()),
             block_on_close: Arc::new(AtomicBool::new(false)),
             close_gate: Arc::new(Semaphore::new(0)),
+            close_failures_remaining: Arc::new(AtomicUsize::new(0)),
+            close_failure_error: None,
             save_calls: Arc::new(AtomicUsize::new(0)),
             save_failures_remaining: Arc::new(AtomicUsize::new(0)),
+            first_save_gate: None,
             final_failures: Arc::new(AtomicU64::new(0)),
+            delivery_snapshot: None,
             store: None,
             failed_store: None,
         }
+    }
+
+    /// Replaces the mock's identity while keeping every shared counter and gate, so a plugin
+    /// factory can clone one observed template per constructed instance and bind the instance id
+    /// the registry hands it.
+    pub fn with_id(mut self, id: &str, name: &str) -> Self {
+        self.id = TargetID::new(id.to_string(), name.to_string());
+        self
     }
 
     /// Marks the target disabled: `is_enabled` returns false and `health` short-circuits.
@@ -127,6 +155,13 @@ impl MockTarget {
         self
     }
 
+    /// Makes `is_active` wait on `release` after notifying [`Self::health_started`], so a test
+    /// can hold a probe in flight and release it on demand. Independent of the health delay.
+    pub fn with_health_gate(mut self, release: Arc<Notify>) -> Self {
+        self.health_gate = Some(release);
+        self
+    }
+
     /// Fails the first `failures` `init` calls with [`TargetError::Initialization`], then
     /// succeeds. Pass `usize::MAX` for a target whose init always fails.
     pub fn with_init_failures(mut self, failures: usize) -> Self {
@@ -142,8 +177,39 @@ impl MockTarget {
     }
 
     /// Fails the first `failures` `save` calls with [`TargetError::Request`], then succeeds.
+    /// Pass `usize::MAX` for a target whose save always fails.
     pub fn with_save_failures(mut self, failures: usize) -> Self {
         self.save_failures_remaining = Arc::new(AtomicUsize::new(failures));
+        self
+    }
+
+    /// Gates the first `save` (counted across all clones): it notifies `entered` and then waits on
+    /// `release` before returning. Later saves pass straight through. Several mocks may share one
+    /// `entered`/`release` pair to gate their first saves collectively.
+    pub fn with_first_save_gate(mut self, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
+        self.first_save_gate = Some((entered, release));
+        self
+    }
+
+    /// Fails the first `failures` `close` calls with [`TargetError::Storage`] (or the error shaped
+    /// by [`Self::with_close_failure_error`]), then succeeds. Pass `usize::MAX` for a target whose
+    /// close always fails. Counting, [`Self::close_started`], and the close gate still run before
+    /// the failure fires.
+    pub fn with_close_failures(mut self, failures: usize) -> Self {
+        self.close_failures_remaining = Arc::new(AtomicUsize::new(failures));
+        self
+    }
+
+    /// Shapes the error a failing `close` returns, for tests that pin the error variant.
+    pub fn with_close_failure_error(mut self, factory: impl Fn() -> TargetError + Send + Sync + 'static) -> Self {
+        self.close_failure_error = Some(Arc::new(factory));
+        self
+    }
+
+    /// Serves a fixed snapshot from `delivery_snapshot()` instead of deriving one from the
+    /// attached stores.
+    pub fn with_delivery_snapshot(mut self, snapshot: TargetDeliverySnapshot) -> Self {
+        self.delivery_snapshot = Some(snapshot);
         self
     }
 
@@ -203,6 +269,12 @@ impl MockTarget {
         self.save_calls.load(Ordering::SeqCst)
     }
 
+    /// How many times `is_enabled` was called across all clones, so a test can assert whether a
+    /// dispatcher consulted (selected) this target at all.
+    pub fn enabled_call_count(&self) -> usize {
+        self.enabled_calls.load(Ordering::SeqCst)
+    }
+
     /// How many `is_active` futures finished or were dropped mid-flight across all clones.
     pub fn health_drop_count(&self) -> usize {
         self.health_drops.load(Ordering::SeqCst)
@@ -225,14 +297,24 @@ where
 
     async fn is_active(&self) -> Result<bool, TargetError> {
         self.health_started.notify_one();
-        // Held across the delay so an aborted probe future is observable via health_drop_count.
+        // Held across the gate and delay so an aborted probe future is observable via
+        // health_drop_count.
         let _drop_guard = HealthDropGuard(Arc::clone(&self.health_drops));
+        if let Some(release) = &self.health_gate {
+            release.notified().await;
+        }
         tokio::time::sleep(self.health_delay).await;
         Ok(self.active.unwrap_or(self.enabled))
     }
 
     async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-        self.save_calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.save_calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0
+            && let Some((entered, release)) = &self.first_save_gate
+        {
+            entered.notify_one();
+            release.notified().await;
+        }
         if consume_failure_budget(&self.save_failures_remaining) {
             return Err(TargetError::Request("forced save failure".to_string()));
         }
@@ -248,6 +330,12 @@ where
         self.close_started.notify_one();
         if self.block_on_close.load(Ordering::SeqCst) {
             let _permit = self.close_gate.acquire().await.expect("close gate should remain open");
+        }
+        if consume_failure_budget(&self.close_failures_remaining) {
+            return Err(match &self.close_failure_error {
+                Some(factory) => factory(),
+                None => TargetError::Storage("forced close failure".to_string()),
+            });
         }
         Ok(())
     }
@@ -277,7 +365,24 @@ where
     }
 
     fn is_enabled(&self) -> bool {
+        self.enabled_calls.fetch_add(1, Ordering::SeqCst);
         self.enabled
+    }
+
+    fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
+        // The fixed snapshot wins when configured; otherwise mirror the trait's default impl,
+        // deriving the depths from the attached stores.
+        match &self.delivery_snapshot {
+            Some(snapshot) => snapshot.clone(),
+            None => TargetDeliverySnapshot {
+                failed_store_length: self
+                    .failed_store
+                    .as_deref()
+                    .map_or(0, |failed_store| failed_store.failed_len() as u64),
+                queue_length: self.store.as_deref().map_or(0, |store| store.len() as u64),
+                ..TargetDeliverySnapshot::default()
+            },
+        }
     }
 
     fn record_final_failure(&self) {
@@ -371,6 +476,103 @@ mod tests {
 
         assert!(handle.is_enabled());
         assert!(!handle.is_active().await.expect("the probe itself succeeds"));
+        assert_eq!(target.enabled_call_count(), 1, "every is_enabled call is counted");
+    }
+
+    #[tokio::test]
+    async fn with_id_renames_but_keeps_the_shared_state() {
+        let template = MockTarget::new("template", "webhook");
+        let renamed = template.clone().with_id("instance", "webhook");
+        assert_eq!(renamed.target_id().to_string(), "instance:webhook");
+
+        let handle: &dyn Target<String> = &renamed;
+        handle.close().await.expect("close succeeds");
+        assert_eq!(template.close_call_count(), 1, "a renamed clone still feeds the template's counters");
+    }
+
+    #[tokio::test]
+    async fn first_save_gate_blocks_only_the_first_save() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let target = MockTarget::new("primary", "webhook").with_first_save_gate(entered.clone(), release.clone());
+        let observer = target.clone();
+
+        let gated: Arc<dyn Target<String> + Send + Sync> = Arc::new(target);
+        let first = tokio::spawn({
+            let gated = Arc::clone(&gated);
+            async move { gated.save(sample_event()).await }
+        });
+        entered.notified().await;
+        assert_eq!(observer.save_call_count(), 1, "the gated save is counted before it parks");
+
+        gated
+            .save(sample_event())
+            .await
+            .expect("a later save passes straight through");
+        release.notify_one();
+        first
+            .await
+            .expect("the gated save task should join")
+            .expect("the gated save succeeds after release");
+        assert_eq!(observer.save_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn health_gate_holds_the_probe_until_released() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let target = MockTarget::new("primary", "webhook").with_health_gate(release.clone());
+        let started = target.health_started();
+
+        let probing: Arc<dyn Target<String> + Send + Sync> = Arc::new(target);
+        let probe = tokio::spawn(async move { probing.is_active().await });
+        started.notified().await;
+        assert!(!probe.is_finished(), "the probe must stay in flight until released");
+
+        release.notify_one();
+        assert!(
+            probe
+                .await
+                .expect("the probe task should join")
+                .expect("the released probe succeeds"),
+            "the released probe reports the configured reachability"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_failure_budget_uses_the_configured_error_shape() {
+        let target = MockTarget::new("primary", "webhook").with_close_failures(1);
+        let handle: &dyn Target<String> = &target;
+        assert!(
+            matches!(handle.close().await, Err(crate::TargetError::Storage(_))),
+            "the default close failure is storage-flavored"
+        );
+        handle.close().await.expect("the failure budget is spent, so close succeeds");
+        assert_eq!(target.close_call_count(), 2);
+
+        let pinned = MockTarget::new("primary", "webhook")
+            .with_close_failures(usize::MAX)
+            .with_close_failure_error(|| crate::TargetError::Unknown("close failed".to_string()));
+        let pinned_handle: &dyn Target<String> = &pinned;
+        assert!(matches!(pinned_handle.close().await, Err(crate::TargetError::Unknown(_))));
+    }
+
+    #[tokio::test]
+    async fn delivery_snapshot_override_replaces_the_derived_snapshot() {
+        use crate::target::TargetDeliverySnapshot;
+
+        let plain = MockTarget::new("primary", "webhook");
+        let plain_handle: &dyn Target<String> = &plain;
+        assert_eq!(plain_handle.delivery_snapshot(), TargetDeliverySnapshot::default());
+
+        let fixed = TargetDeliverySnapshot {
+            failed_messages: 1,
+            failed_store_length: 7,
+            queue_length: 0,
+            total_messages: 3,
+        };
+        let target = MockTarget::new("primary", "webhook").with_delivery_snapshot(fixed.clone());
+        let handle: &dyn Target<String> = &target;
+        assert_eq!(handle.delivery_snapshot(), fixed);
     }
 
     // Leak-guard contract, part two: the `test-support` feature must never ship by default and
