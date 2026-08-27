@@ -58,6 +58,9 @@ mod copy_object_version_restore_sse_test;
 mod configured_roundtrip_test;
 
 #[cfg(test)]
+mod kms_anonymous_enforcement_test;
+
+#[cfg(test)]
 mod kms_authorization_negative_matrix_test;
 
 #[cfg(test)]

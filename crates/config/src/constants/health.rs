@@ -40,6 +40,14 @@ pub const HEALTH_OBJECT_PROGRESS_LOCK_MARGIN_MS: u64 = 5_000;
 pub const ENV_HEALTH_CLUSTER_TIMEOUT_MS: &str = "RUSTFS_HEALTH_CLUSTER_TIMEOUT_MS";
 pub const DEFAULT_HEALTH_CLUSTER_TIMEOUT_MS: u64 = 2000;
 
+/// Timeout for one remote lock-client online check used by readiness (milliseconds).
+///
+/// This is intentionally shorter than the generic lock RPC timeout so
+/// `/health/ready` can report degradation instead of riding a dead peer's
+/// connect or HTTP/2 keepalive budget.
+pub const ENV_HEALTH_LOCK_ONLINE_TIMEOUT_MS: &str = "RUSTFS_HEALTH_LOCK_ONLINE_TIMEOUT_MS";
+pub const DEFAULT_HEALTH_LOCK_ONLINE_TIMEOUT_MS: u64 = 1000;
+
 /// Maximum time to wait for local node runtime readiness (storage / IAM / lock
 /// quorum) during startup before failing fast (seconds).
 ///

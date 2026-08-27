@@ -84,11 +84,13 @@ use rustfs_rio::TryGetIndex;
 use rustfs_utils::http::SSEC_ALGORITHM_HEADER;
 #[cfg(test)]
 use rustfs_utils::http::SUFFIX_COMPRESSION;
+use rustfs_utils::http::{SUFFIX_MAX_TOTAL_OBJECT_SIZE, get_consistent_str};
 use std::future::Future;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 #[cfg(any(test, feature = "test-util"))]
 use std::time::Duration;
 #[cfg(test)]
@@ -96,6 +98,83 @@ use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
 
 const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
+
+static CAPPED_MULTIPART_STAGING: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> = OnceLock::new();
+
+struct CappedMultipartStagingGuard {
+    upload_id_path: String,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Drop for CappedMultipartStagingGuard {
+    fn drop(&mut self) {
+        // Release the permit before checking the Arc count so a concurrent
+        // Abort/Complete cleanup can remove the now-unused map entry.
+        self.permit.take();
+        remove_capped_multipart_staging_semaphore(&self.upload_id_path);
+    }
+}
+
+fn capped_multipart_staging_semaphore(upload_id_path: &str) -> Arc<tokio::sync::Semaphore> {
+    CAPPED_MULTIPART_STAGING
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("capped multipart staging semaphore map should not be poisoned")
+        .entry(upload_id_path.to_owned())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+fn remove_capped_multipart_staging_semaphore(upload_id_path: &str) {
+    if let Some(map) = CAPPED_MULTIPART_STAGING.get() {
+        let mut map = map
+            .lock()
+            .expect("capped multipart staging semaphore map should not be poisoned");
+        let removable = map
+            .get(upload_id_path)
+            .is_some_and(|semaphore| Arc::strong_count(semaphore) == 1);
+        if removable {
+            map.remove(upload_id_path);
+        }
+    }
+}
+
+fn multipart_size_limit_from_metadata(metadata: &HashMap<String, String>) -> Result<Option<u64>> {
+    if !contains_key_str(metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE) {
+        return Ok(None);
+    }
+
+    let Some(value) = get_consistent_str(metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE) else {
+        return Err(Error::InvalidArgument(
+            "multipart upload".to_string(),
+            SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
+            "missing or conflicting internal size limit".to_string(),
+        ));
+    };
+
+    let limit = value.parse::<u64>().map_err(|_| {
+        Error::InvalidArgument(
+            "multipart upload".to_string(),
+            SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
+            "invalid internal size limit".to_string(),
+        )
+    })?;
+    Ok(Some(limit))
+}
+
+fn admitted_multipart_size(current: u64, candidate: u64, limit: u64) -> Result<u64> {
+    let total = current.checked_add(candidate).ok_or_else(|| {
+        Error::InvalidArgument(
+            "multipart upload".to_string(),
+            SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
+            "logical size overflow".to_string(),
+        )
+    })?;
+    if total > limit {
+        return Err(Error::EntityTooLarge(total, limit));
+    }
+    Ok(total)
+}
 
 pub(crate) struct StaleMultipartCleanupGuard {
     file_info: FileInfo,
@@ -115,8 +194,13 @@ impl StaleMultipartCleanupGuard {
 
     pub(crate) async fn delete(self, set: &SetDisks) -> Result<()> {
         fence_commit_on_lock_loss(Some(&self.lock_guard), "stale_multipart_cleanup", &self.upload_path)?;
-        set.delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &self.upload_path, self.write_quorum)
-            .await
+        let result = set
+            .delete_all_with_quorum(RUSTFS_META_MULTIPART_BUCKET, &self.upload_path, self.write_quorum)
+            .await;
+        if result.is_ok() {
+            remove_capped_multipart_staging_semaphore(&self.upload_path);
+        }
+        result
     }
 }
 
@@ -638,6 +722,61 @@ async fn multipart_upload_paths_on_disk(disk: DiskStore, bucket: &str) -> disk::
 }
 
 impl SetDisks {
+    async fn current_multipart_logical_size(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        upload_id_path: &str,
+        fi: &FileInfo,
+        replacing_part: usize,
+    ) -> Result<u64> {
+        let online_disks = self.get_disks_internal().await;
+        let read_quorum = fi.read_quorum(self.default_read_quorum());
+        let part_path = format!(
+            "{}{}",
+            path_join_buf(&[
+                upload_id_path,
+                fi.data_dir.map(|v| v.to_string()).unwrap_or_default().as_str(),
+            ]),
+            SLASH_SEPARATOR
+        );
+        let part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum).await {
+            Ok(parts) => parts,
+            Err(DiskError::FileNotFound) => return Ok(0),
+            Err(err) => return Err(to_object_err(err.into(), vec![bucket, object, upload_id])),
+        };
+        if part_numbers.is_empty() {
+            return Ok(0);
+        }
+        let part_meta_paths = part_numbers
+            .iter()
+            .map(|number| format!("{part_path}part.{number}.meta"))
+            .collect::<Vec<_>>();
+        let existing_parts =
+            Self::read_parts(&online_disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum)
+                .await
+                .map_err(|err| to_object_err(err.into(), vec![bucket, object, upload_id]))?;
+
+        existing_parts.into_iter().try_fold(0_u64, |total, part| {
+            if part.error.is_some() || part.number == replacing_part {
+                return if part.error.is_some() {
+                    Err(Error::PartMissingOrCorrupt)
+                } else {
+                    Ok(total)
+                };
+            }
+            let part_size = u64::try_from(part.actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+            total.checked_add(part_size).ok_or_else(|| {
+                Error::InvalidArgument(
+                    "multipart upload".to_string(),
+                    SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
+                    "logical size overflow".to_string(),
+                )
+            })
+        })
+    }
+
     async fn discover_multipart_upload_paths(
         &self,
         orig_bucket: &str,
@@ -1133,9 +1272,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         crate::hp_guard!("SetDisks::put_object_part");
         let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, opts.data_movement);
 
-        let (fi, _) = self
+        let (fi, _) = match self
             .check_upload_id_exists_with_opts(bucket, object, upload_id, true, opts)
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(err @ Error::InvalidUploadID(..)) => {
+                remove_capped_multipart_staging_semaphore(&upload_id_path);
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
+        let multipart_size_limit = multipart_size_limit_from_metadata(&fi.metadata)?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
@@ -1168,6 +1316,44 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let part_suffix = format!("part.{part_id}");
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
+        let part_path = format!("{}/{}/{}", upload_id_path, fi.data_dir.unwrap_or_default(), part_suffix);
+        let part_lock_path = format!("{upload_id_path}/{part_suffix}");
+
+        // Keep at most one capped part staging locally per upload. The
+        // distributed lock below is held only for the durable admission check;
+        // it is reacquired for the short final rename, so Complete/Abort are
+        // not blocked behind a slow body upload.
+        let _capped_staging_guard = if multipart_size_limit.is_some() {
+            Some(CappedMultipartStagingGuard {
+                upload_id_path: upload_id_path.clone(),
+                permit: Some(
+                    capped_multipart_staging_semaphore(&upload_id_path)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::other("capped multipart staging semaphore closed"))?,
+                ),
+            })
+        } else {
+            None
+        };
+
+        if let Some(limit) = multipart_size_limit {
+            let admission_guard = self
+                .acquire_write_lock_diag("put_object_part_admission", RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
+                .await?;
+            let declared_size = if data.size() >= 0 {
+                u64::try_from(data.size()).map_err(|_| Error::PartMissingOrCorrupt)?
+            } else if data.actual_size() >= 0 {
+                u64::try_from(data.actual_size()).map_err(|_| Error::PartMissingOrCorrupt)?
+            } else {
+                return Err(Error::PartMissingOrCorrupt);
+            };
+            let current_size = self
+                .current_multipart_logical_size(bucket, object, upload_id, &upload_id_path, &fi, part_id)
+                .await?;
+            admitted_multipart_size(current_size, declared_size, limit)?;
+            drop(admission_guard);
+        }
 
         let result: Result<PartInfo> = async {
             let erasure =
@@ -1368,30 +1554,21 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .await?;
             }
 
-            let part_path = format!("{}/{}/{}", upload_id_path, fi.data_dir.unwrap_or_default(), part_suffix);
-            let part_lock_path = format!("{upload_id_path}/{part_suffix}");
-
             #[cfg(test)]
             pause_multipart_commit(bucket, object, MultipartCommitPause::PutPartBeforeLockAcquire).await;
-            // Serialize only same-part commits (rename_part), not the whole upload.
-            // Each concurrent stream writes to its own unique temp dir (see
-            // `tmp_part` above), so the encode/stream phase never conflicts and must
-            // stay lock-free — holding a lock across it would serialize slow
-            // re-transmits of the same part and defeat the S3 "last finisher wins"
-            // semantics. The mixed-generation hazard is confined to rename_part,
-            // where two temp parts are moved cross-disk onto the SAME final
-            // part_path: interleaving there can leave shards from two generations,
-            // each individually bitrot-valid, that only surface as silent corruption
-            // at read time (backlog#853). A write lock scoped to this part number
-            // makes each same-part commit atomic across disks, so the last committer
-            // wins consistently, while different part numbers commit onto disjoint
-            // part paths and stay concurrent (issue#5961 — an uploadId-wide write
-            // lock serialized them into 503 lock-acquire timeouts). The shared
-            // uploadId read lock keeps completion/abort (which take the uploadId
-            // write lock) from racing any in-flight part commit; a guarded
-            // completion takes the object lock before the upload lock to preserve
-            // global ordering.
-            let (_upload_commit_guard, _part_commit_guard) = if opts.no_lock {
+            // Capped uploads reacquire the upload-wide write lock for the
+            // final durable check and rename. Uncapped uploads retain the
+            // concurrent encode path and only serialize the final same-part
+            // rename; completion/abort use the upload-wide write lock.
+            let (_upload_commit_guard, _part_commit_guard) = if multipart_size_limit.is_some() {
+                let upload_guard = self
+                    .acquire_write_lock_diag("put_object_part_commit", RUSTFS_META_MULTIPART_BUCKET, &upload_id_path)
+                    .await?;
+                let part_guard = self
+                    .acquire_write_lock_diag("put_object_part_commit", RUSTFS_META_MULTIPART_BUCKET, &part_lock_path)
+                    .await?;
+                (Some(upload_guard), Some(part_guard))
+            } else if opts.no_lock {
                 (None, None)
             } else {
                 let upload_guard = self
@@ -1403,8 +1580,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 (Some(upload_guard), Some(part_guard))
             };
             let (commit_fi, _) = self
-                .check_upload_id_exists_with_opts(bucket, object, upload_id, false, opts)
+                .check_upload_id_exists_with_opts(bucket, object, upload_id, multipart_size_limit.is_some(), opts)
                 .await?;
+            let commit_size_limit = multipart_size_limit_from_metadata(&commit_fi.metadata)?;
+            if commit_size_limit != multipart_size_limit {
+                return Err(Error::InvalidArgument(
+                    "multipart upload".to_string(),
+                    SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
+                    "size limit metadata changed or is missing".to_string(),
+                ));
+            }
             ensure_data_movement_upload_access(&commit_fi, bucket, object, upload_id, opts)?;
             ensure_multipart_bucket_incarnation(
                 &self.ctx,
@@ -1433,6 +1618,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 });
             }
             ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
+
+            if let Some(limit) = commit_size_limit {
+                let current_size = self
+                    .current_multipart_logical_size(bucket, object, upload_id, &upload_id_path, &commit_fi, part_id)
+                    .await?;
+                let candidate_size = u64::try_from(actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                admitted_multipart_size(current_size, candidate_size, limit)?;
+            }
 
             let _ = self
                 .rename_part(
@@ -1894,12 +2087,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         let upload_id_path = Self::get_multipart_upload_dir(bucket, object, upload_id, opts.data_movement);
 
-        self.delete_all_with_quorum(
-            RUSTFS_META_MULTIPART_BUCKET,
-            &upload_id_path,
-            fi.write_quorum(self.default_write_quorum()),
-        )
-        .await
+        let result = self
+            .delete_all_with_quorum(
+                RUSTFS_META_MULTIPART_BUCKET,
+                &upload_id_path,
+                fi.write_quorum(self.default_write_quorum()),
+            )
+            .await;
+        if result.is_ok() {
+            remove_capped_multipart_staging_semaphore(&upload_id_path);
+        }
+        result
     }
     // complete_multipart_upload finished
     #[tracing::instrument(skip(self))]
@@ -2017,6 +2215,27 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         if object_parts.len() != uploaded_parts.len() {
             return Err(Error::other("part result number err"));
+        }
+
+        if let Some(limit) = multipart_size_limit_from_metadata(&fi.metadata)? {
+            let mut total = 0_u64;
+            for part in &object_parts {
+                if part.error.is_some() {
+                    return Err(Error::PartMissingOrCorrupt);
+                }
+                let part_size = u64::try_from(part.actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
+                total = total.checked_add(part_size).ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "multipart upload".to_string(),
+                        SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
+                        "logical size overflow".to_string(),
+                    )
+                })?;
+            }
+            if total > limit {
+                return Err(Error::EntityTooLarge(total, limit));
+            }
+            rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE);
         }
 
         let mut checksum_type = rustfs_rio::ChecksumType::NONE;
@@ -3027,13 +3246,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             Ok(ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned))
         };
 
-        if detach_commit_owner {
+        let result = if detach_commit_owner {
             tokio::spawn(commit)
                 .await
                 .map_err(|err| Error::other(format!("complete_multipart_upload commit task failed: {err}")))?
         } else {
             commit.await
+        };
+        if result.is_ok() {
+            remove_capped_multipart_staging_semaphore(&upload_id_path);
         }
+        result
     }
 }
 
@@ -3097,6 +3320,34 @@ mod tests {
         let mut nil_metadata = HashMap::new();
         insert_str(&mut nil_metadata, SUFFIX_BUCKET_INCARNATION_ID, Uuid::nil().to_string());
         assert!(multipart_bucket_incarnation_id(&nil_metadata).is_err());
+    }
+
+    #[test]
+    fn multipart_size_limit_metadata_is_dual_key_and_fail_closed() {
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, "100".to_string());
+        assert_eq!(multipart_size_limit_from_metadata(&metadata).unwrap(), Some(100));
+
+        metadata.insert("x-minio-internal-max-total-object-size".to_string(), "101".to_string());
+        assert!(multipart_size_limit_from_metadata(&metadata).is_err());
+
+        let mut invalid = HashMap::new();
+        insert_str(&mut invalid, SUFFIX_MAX_TOTAL_OBJECT_SIZE, "-1".to_string());
+        assert!(multipart_size_limit_from_metadata(&invalid).is_err());
+    }
+
+    #[test]
+    fn multipart_size_admission_handles_boundaries_and_overflow() {
+        assert_eq!(admitted_multipart_size(90, 10, 100).unwrap(), 100);
+        assert!(matches!(
+            admitted_multipart_size(90, 11, 100),
+            Err(StorageError::EntityTooLarge(101, 100))
+        ));
+        assert!(admitted_multipart_size(u64::MAX - 1, 1, u64::MAX).is_ok());
+        assert!(matches!(
+            admitted_multipart_size(u64::MAX, 1, u64::MAX),
+            Err(StorageError::InvalidArgument(_, _, _))
+        ));
     }
 
     #[test]

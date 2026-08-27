@@ -1,0 +1,126 @@
+name: RustFS Heal Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_url:
+        description: 'Direct .deb URL (nightly/R2). Defaults to the latest nightly deb.'
+        required: false
+        type: string
+      stop_node_gb:
+        description: 'Stop the outage node when surviving nodes reach N GiB'
+        required: false
+        default: '15'
+      warp_stop_gb:
+        description: 'Stop warp when surviving nodes reach N GiB'
+        required: false
+        default: '40'
+      heal_target_gb:
+        description: 'Outage node must reach N GiB after heal to pass'
+        required: false
+        default: '40'
+      cleanup_before:
+        description: 'Reset the nodes before the test (DESTROYS existing data/config)'
+        type: boolean
+        default: true
+      cleanup_after:
+        description: 'Reset the nodes after the test (DESTROYS test data/config)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Only one test at a time: both this and the pool-expansion workflow mutate
+# the same test environment, so they share one concurrency group.
+concurrency:
+  group: rustfs-pool-expansion-test
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_API_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+  RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+
+jobs:
+  heal-test:
+    runs-on: smoke-testing
+    timeout-minutes: 480
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          openssl version
+          warp --version || true
+          df -h /data | tail -1
+
+      - name: Reset test environment (before)
+        if: ${{ inputs.cleanup_before != 'false' }}
+        run: |
+          chmod +x scripts/test/rustfs_heal_test.sh
+          ./scripts/test/rustfs_heal_test.sh --reset -y
+
+      - name: Install RustFS package & start cluster
+        run: |
+          ARGS=(--steps "1,2" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./scripts/test/rustfs_heal_test.sh "${ARGS[@]}"
+
+      - name: Preflight checks
+        run: |
+          ARGS=(--preflight --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./scripts/test/rustfs_heal_test.sh "${ARGS[@]}"
+
+      - name: Run heal test (write -> outage -> heal -> verify)
+        run: |
+          ./scripts/test/rustfs_heal_test.sh \
+            --steps "3,4,5,6,7" -y \
+            --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
+            --stop-node-gb "${{ inputs.stop_node_gb }}" \
+            --warp-stop-gb "${{ inputs.warp_stop_gb }}" \
+            --heal-target-gb "${{ inputs.heal_target_gb }}" \
+            --log-file /tmp/rustfs-heal-test.log
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-heal-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-heal-test.log
+            /tmp/rustfs-warp.*.log
+          if-no-files-found: warn
+
+      - name: Reset test environment (after)
+        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        run: |
+          ./scripts/test/rustfs_heal_test.sh --reset -y
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS heal test failed"
+          echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+          echo "See the uploaded log artifact for details."

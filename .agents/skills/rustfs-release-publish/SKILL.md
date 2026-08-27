@@ -6,7 +6,7 @@ description: "Run the end-to-end RustFS console gate, version bump, preview vali
 
 This skill orchestrates a full release. It wraps `rustfs-release-version-bump` (which only edits version files and opens the PR) with a mandatory preview-tag validation loop before the final tag is published.
 
-Core design: **version files never carry a `-preview.N` suffix**. The preview suffix exists only in tag names. A preview tag creates a visible GitHub Release marked Prerelease and uploads versioned assets, but it never becomes GitHub Latest and never updates `*-latest`, `latest.json`, R2, Docker, or Helm channels. This works because the binary self-reports the git tag it was built from (`build::TAG` via shadow_rs, see `rustfs/src/config/cli.rs` `SHORT_VERSION`), and `build.yml` derives artifact names and preview classification from the tag name — Cargo.toml's version is only a no-tag fallback. Therefore the preview tag and the final tag can (and MUST) point at the exact same commit: what you validated is byte-for-byte the source that ships.
+Core design: **version files never carry a `-preview.N` suffix**. The preview suffix exists only in tag names. A preview tag creates a visible GitHub Release marked Prerelease and uploads versioned assets, but it never becomes GitHub Latest and never updates `*-latest`, `latest.json`, R2, Docker, or Helm channels. That Release is temporary: `build.yml` deletes it automatically once the final tag's Release is published, so the Releases page ends up carrying deliverables only while the `-preview.N` tags stay behind as the traceability record. This works because the binary self-reports the git tag it was built from (`build::TAG` via shadow_rs, see `rustfs/src/config/cli.rs` `SHORT_VERSION`), and `build.yml` derives artifact names and preview classification from the tag name — Cargo.toml's version is only a no-tag fallback. Therefore the preview tag and the final tag can (and MUST) point at the exact same commit: what you validated is byte-for-byte the source that ships.
 
 Pipeline shape:
 
@@ -19,6 +19,7 @@ check console main against its latest Release
   -> validate with latest rc client
   -> report preview acceptance results -> STOP for explicit human confirmation
   -> tag <target> at the SAME commit (zero delta) -> re-verify CI/release
+  -> CI deletes the <target>-preview.N Releases (tags kept)
 ```
 
 On validation failure: fix lands on main via normal PR (version files are already at `<target>`, no new bump PR), then tag `<preview-tag N+1>` at the new main commit and restart from Phase 2.
@@ -51,14 +52,16 @@ Rules:
 - Use `<target>-preview.N` for every target, e.g. `1.0.0-beta.10-preview.3` or `1.1.0-preview.1`.
 - The canonical suffix is exactly `-preview.<digits>`. `build.yml` recognizes it before alpha/beta/rc classification and routes it to the preview-only path; any other tag containing `-preview` fails closed instead of being treated as a release.
 - A preview Release MUST be published with `isPrerelease=true` and `isLatest=false`. Any `*-latest` preview asset or preview-triggered `latest.json`, R2, Docker, or Helm publication is a pipeline failure.
+- Preview Releases are cleaned up by the `cleanup-preview-releases` job after `publish-release` succeeds for the deliverable tag. It deletes every Release whose tag is exactly `<target>-preview.<digits>` and never passes `--cleanup-tag`, so the tags survive.
 
 ## Hard rules
 
 - Version files (Cargo.toml, Cargo.lock, README, flake.nix, Chart.yaml, rustfs.spec) are bumped ONCE, directly to `<target>`. Never write a `-preview.N` suffix into any version file. If `rustfs-release-version-bump` is ever asked for a `-preview` version, that is a pipeline bug — stop.
-- Preview Release assets are versioned and intentionally visible on the Releases page. Do not label them Latest or use them to update any latest distribution channel.
+- Preview Release assets are versioned and intentionally visible on the Releases page for the duration of validation. Do not label them Latest or use them to update any latest distribution channel.
+- Never delete a preview Release by hand before Phase 6 finishes — Phase 4 downloads its assets and the final Release notes are generated while it still exists. Cleanup is CI's job; only step in manually (`gh release delete "<preview-tag>" --yes`, never `--cleanup-tag`) if `cleanup-preview-releases` failed.
 - Tags have no `v` prefix. Always annotated: `git tag -a <tag> -m "Release <tag>"`.
 - The final tag MUST point at exactly `PREVIEW_HASH` — the commit the validated preview tag points at. Never tag current `main` HEAD (commits merged after validation are unvalidated), and never create an extra version-bump commit between preview and final.
-- When a previous deliverable exists, GitHub Release notes for the preview and final tags MUST use it as their shared comparison baseline: the most recently published non-preview Release before the target. Internal `-preview.N` Releases are explicitly excluded from that selection, even when they point at the same commit as the final tag. If no previous deliverable exists, omit `previous_tag_name` and record that GitHub's default baseline fallback was used.
+- When a previous deliverable exists, GitHub Release notes for the preview and final tags MUST use it as their shared comparison baseline: the most recently published non-preview Release before the target. Internal `-preview.N` Releases are explicitly excluded from that selection, even when they point at the same commit as the final tag — cleanup runs after the notes are generated, so the preview Release is still present and would otherwise be picked as the baseline. If no previous deliverable exists, omit `previous_tag_name` and record that GitHub's default baseline fallback was used.
 - Generated Release notes carry a workflow-management marker so retries can repair them. Before manually curating a generated body, remove that marker; unmarked non-placeholder notes are preserved by later workflow runs.
 - Phases run in order; a failure in any phase blocks everything after it. After the fix lands on main, restart from Phase 2 with the next preview iteration against the new `origin/main` hash — do not resume mid-pipeline against a stale hash.
 - Completing preview acceptance does not authorize the final tag. After Phases 3–5 pass, report the acceptance evidence and stop until the user explicitly confirms continuation. The original release request, an earlier confirmation, silence, or an automated follow-up does not satisfy this gate.
@@ -230,6 +233,7 @@ git push origin "<target>"
 - CI rebuilds from the same source; the only changed input is the tag name, so the binary now self-reports `<target>`.
 - Verify the final tag's complete publication path: all matrix and release jobs green; `gh release view "<target>"` shows the full versioned and `-latest` asset set plus checksums, SBOM, and provenance; Docker and Helm workflows succeed; `latest.json` points to `<target>`. A stable target must have `isPrerelease=false` and `isLatest=true`. An alpha/beta/rc target must have `isPrerelease=true`; GitHub does not permit prereleases to be Latest, but the project `latest.json` still advances to the final non-preview target.
 - Verify the final Release body contains `## What's Changed` and a Full Changelog link. When `PREVIOUS_DELIVERABLE` exists, the link MUST be `https://github.com/rustfs/rustfs/compare/<PREVIOUS_DELIVERABLE>...<target>` and the baseline MUST equal the preview Release baseline; for example, both `1.0.0-beta.12-preview.1` and `1.0.0-beta.12` compare from `1.0.0-beta.11`.
+- Verify the preview cleanup: `cleanup-preview-releases` must succeed, `gh release view "<preview-tag>"` must then report `release not found` for every preview iteration of this target, and `git rev-parse "<preview-tag>^{commit}"` must still resolve to `PREVIEW_HASH` (the tag is kept). If the job failed, delete the leftover Releases manually with `gh release delete "<preview-tag>" --yes` and report it.
 - Optionally spot-check `./rustfs --version` from a final-tag artifact — it must report `<target>`.
 
 ## Output contract
@@ -239,5 +243,5 @@ Always report:
 - Console gate result: previous/latest Console tags, whether merged changes required a release, `CONSOLE_HASH`, and Console run/Release URLs when a release was published.
 - Target version, preview tag(s) used, `PREVIEW_HASH` (which both tags point at).
 - Manual confirmation gate status (`WAITING_FOR_CONFIRMATION` or `CONFIRMED`) and its exact target, preview tag, and `PREVIEW_HASH`.
-- Per-phase result (PASS/FAIL/BLOCKED) with key evidence: preview and final Release URLs, preview `isPrerelease`/`isLatest` state, final latest-channel state, console check results, and the rc command matrix.
+- Per-phase result (PASS/FAIL/BLOCKED) with key evidence: preview and final Release URLs, preview `isPrerelease`/`isLatest` state, final latest-channel state, console check results, the rc command matrix, and the preview-Release cleanup result (deleted Releases plus surviving tags).
 - Any deviation from this pipeline and why the user approved it.

@@ -1,37 +1,40 @@
 #!/usr/bin/env bash
 #
-# rustfs-pool-expand.sh
-# RustFS multi-pool expansion & pool decommission test script
+# rustfs-heal-test.sh
+# RustFS node-outage heal test script
 #
-# Based on the Obsidian note "RustFS pool 扩容脚本". Full workflow:
+# Based on the Obsidian note "RustFS Heal 测试步骤". Full workflow:
 #   1. Download the RustFS package on all nodes
-#   2. Install the RustFS service on all nodes (dpkg -i)
-#   3. Start the first pool on node 0 and verify it
-#   4. Write data (warp) and monitor storage usage up to a threshold
-#   5. Expand to a second pool (node 0 + node 1), start rebalance
-#   6. Wait for rebalance to finish
-#   7. Expand to a third pool (all nodes), start rebalance again
-#   8. Wait for rebalance to finish
-#   9. Decommission pool 0 and wait for it to complete
+#   2. Install RustFS on all nodes (dpkg -i), write the 3x4 single-pool
+#      config, start all nodes in parallel and verify the topology via the
+#      admin API
+#   3. Write data (warp); when the surviving nodes reach STOP_NODE_AT_GB
+#      stop vm002 (simulated node outage), keep writing until the surviving
+#      nodes reach WARP_STOP_AT_GB
+#   4. Restart vm002 (the node that was offline while data was written)
+#   5. Start cluster heal (POST /rustfs/admin/v3/heal/ {"recursive":true})
+#   6. Monitor the heal task (POST /rustfs/admin/v3/heal/?clientToken=...)
+#      until a terminal success AND vm002's disk usage reaches HEAL_TARGET_GB
+#   7. Result analysis: heal stats, per-node disk usage, success verdict
 #
 # The script is driven from an admin host (e.g. a jumpbox or a GitHub
 # self-hosted runner) and operates on the target nodes over SSH.
 #
 # Usage:
-#   ./rustfs-pool-expand.sh --all                  # run all steps 1-9
-#   ./rustfs-pool-expand.sh --step 5               # run a single step
-#   ./rustfs-pool-expand.sh --steps 5,7,9          # run selected steps
-#   ./rustfs-pool-expand.sh --all --dry-run        # preview only
-#   ./rustfs-pool-expand.sh --all -y --version 1.0.0-rc.3
+#   ./rustfs-heal-test.sh --all                    # run all steps 1-7
+#   ./rustfs-heal-test.sh --step 5                 # run a single step
+#   ./rustfs-heal-test.sh --steps 3,4,5,6,7        # run selected steps
+#   ./rustfs-heal-test.sh --all --dry-run          # preview only
+#   ./rustfs-heal-test.sh --all -y --package-url <nightly deb URL>
 #
 # Notes:
 #   - SSH user defaults to azureuser (passwordless sudo on the nodes);
 #     pass --ssh-user root if your nodes accept root login.
 #   - The script talks to the RustFS admin API directly with SigV4-signed
 #     requests (no rc required). jq, openssl and curl must be installed on the
-#     admin host; warp is only needed for --with-warp.
-#   - RUSTFS_VOLUMES must keep existing pool expressions unchanged and in
-#     order when expanding.
+#     admin host; warp is needed for the data-write step.
+#   - Credentials default to rustfs@test / rustfs@test (the config written on
+#     the nodes); override via RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY.
 #
 set -Eeuo pipefail
 
@@ -68,14 +71,14 @@ SIGV4_SERVICE="s3"
 API_REQUEST_TIMEOUT=60
 # admin_api writes the HTTP status here so callers can read it after the
 # command-substitution subshell exits ($$ is identical inside the subshell).
-ADMIN_API_CODE_FILE="${TMPDIR:-/tmp}/rustfs-pool-expand-api-code.$$"
+ADMIN_API_CODE_FILE="${TMPDIR:-/tmp}/rustfs-heal-test-api-code.$$"
 
-# Complete RUSTFS_VOLUMES value per stage (one space-separated expression per pool)
-VOLUMES_1="http://rustfs-node1:9000/data/rustfs{1...4}/mnmd"
-VOLUMES_2="http://rustfs-node1:9000/data/rustfs{1...4}/mnmd http://rustfs-node2:9000/data/rustfs{1...4}/mnmd"
-VOLUMES_3="http://rustfs-node1:9000/data/rustfs{1...4}/mnmd http://rustfs-node2:9000/data/rustfs{1...4}/mnmd http://rustfs-node3:9000/data/rustfs{1...4}/mnmd"
-# Topology after decommissioning pool 0 (used by --finalize-decommission)
-VOLUMES_AFTER_DECOMMISSION="http://rustfs-node2:9000/data/rustfs{1...4}/mnmd http://rustfs-node3:9000/data/rustfs{1...4}/mnmd"
+# 3x4 topology (3 nodes x 4 disks each), same expression on every node:
+# http://rustfs-node{1...3}:9000/data/rustfs{1...4}/mnmd
+VOLUMES="http://rustfs-node{1...3}:9000/data/rustfs{1...4}/mnmd"
+
+# Node that is stopped during the write phase (index into NODES; 2 = vm002)
+OUTAGE_NODE_INDEX="${RUSTFS_OUTAGE_NODE_INDEX:-2}"
 
 # RustFS service configuration (written to /etc/default/rustfs)
 RUSTFS_CONFIG_FILE="/etc/default/rustfs"
@@ -88,39 +91,41 @@ RUSTFS_CONSOLE_ENABLE=true
 RUSTFS_OBS_LOGGER_LEVEL=error
 RUSTFS_OBS_LOG_DIRECTORY="/var/log/rustfs/"
 
-# Data writing & monitoring (step 4)
+# Data writing & monitoring (step 3)
 WARP_BUCKET="test-10mb"
 WARP_OBJ_SIZE="100MiB"
 WARP_CONCURRENT=32
-WARP_DURATION="5m"
 # Warp log path; empty = auto-created unique temp file (the runner user may
 # not be able to write a shared /tmp path owned by another user).
 WARP_LOG_FILE="${RUSTFS_WARP_LOG_FILE:-}"
-STORAGE_THRESHOLD=85            # stop writing when usage reaches N% (note suggests 80-85)
-POLL_INTERVAL=30                # status polling interval (seconds)
+# Disk-usage thresholds (per surviving node, GiB, via df -B1G | grep /data/rustfs)
+STOP_NODE_AT_GB="${RUSTFS_STOP_NODE_AT_GB:-15}"   # stop the outage node when surviving nodes reach this
+WARP_STOP_AT_GB="${RUSTFS_WARP_STOP_AT_GB:-40}"   # stop warp when surviving nodes reach this
+HEAL_TARGET_GB="${RUSTFS_HEAL_TARGET_GB:-40}"     # vm002 must reach this after heal to pass
+POLL_INTERVAL=15                # status polling interval (seconds)
 
 # Timeouts (seconds)
-REBALANCE_TIMEOUT=86400
-DECOMMISSION_TIMEOUT=86400
 SERVICE_TIMEOUT=300
-DECOMMISSION_RETRIES=3          # auto clear+retry attempts after a failed decommission
-DECOMMISSION_RETRY_DELAY=30     # delay between retries (seconds)
-REBALANCE_START_RETRIES=6       # rebalance start retries (fleet proof may take ~10-20s after a topology change)
-REBALANCE_START_RETRY_DELAY=20  # delay between rebalance start retries (seconds)
-
-# Pool to decommission (zero-based; 0 in the note)
-DECOMMISSION_POOL_ID=0
+WARP_TIMEOUT=3600               # max time waiting for the write phase thresholds
+HEAL_TIMEOUT=86400              # max time waiting for heal to complete
+HEAL_START_RETRIES=6            # heal start retries (fleet capability proof timing)
+HEAL_START_RETRY_DELAY=20       # delay between heal start retries (seconds)
+# Per-task heal timeout on the server (default is 5 minutes, far too short
+# for healing tens of GiB); written into /etc/default/rustfs.
+HEAL_TASK_TIMEOUT_SECS="${RUSTFS_HEAL_TASK_TIMEOUT_SECS:-21600}"
+# Disable the background scanner so the explicit heal is the only repair
+# mechanism (otherwise automatic repairs can mask the outage effect).
+HEAL_AUTO_HEAL_ENABLE="${RUSTFS_HEAL_AUTO_HEAL_ENABLE:-false}"
 
 # ==================== Runtime options (set by CLI) ====================
 DRY_RUN=0
 ASSUME_YES=0
-WITH_WARP=0
 SKIP_DOWNLOAD=0
-FINALIZE_DECOMMISSION=0
 PREFLIGHT=0
 RESET=0
 LOG_FILE=""
 SELECTED_STEPS=()
+HEAL_CLIENT_TOKEN=""
 
 # ==================== Helpers ====================
 
@@ -180,8 +185,8 @@ canonical_query() {
 # Issue an admin API request. Prints the response body on stdout and writes the
 # HTTP status (000 on transport failure) to ${ADMIN_API_CODE_FILE}.
 admin_api() {
-  # $1: method, $2: path, $3: query string
-  local method="$1" path="$2" query="$3"
+  # $1: method, $2: path, $3: query string, $4: optional JSON body
+  local method="$1" path="$2" query="$3" body="${4:-}"
   local amz_date date_stamp host_port
   local canonical_headers signed_headers canonical_request string_to_sign
   local scope k_date k_region k_service k_signing signature auth
@@ -227,12 +232,16 @@ $(sha256_hex "${canonical_request}")"
 
   url="http://${host_port}${path}${query:+?${query}}"
   tmp="$(mktemp)"
+  local curl_body=()
+  if [ -n "${body}" ]; then
+    curl_body=(-d "${body}" -H "Content-Type: application/json")
+  fi
   code="$(curl -sS --max-time "${API_REQUEST_TIMEOUT}" -o "${tmp}" -w '%{http_code}' \
     -H "Host: ${host_port}" \
     -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
     -H "x-amz-date: ${amz_date}" \
     -H "Authorization: ${auth}" \
-    -X "${method}" "${url}")" || code="000"
+    "${curl_body[@]}" -X "${method}" "${url}")" || code="000"
   printf '%s' "${code}" > "${ADMIN_API_CODE_FILE}"
   cat "${tmp}"
   rm -f "${tmp}"
@@ -337,7 +346,7 @@ wait_service_active() {
 # Known server-side issues the test can hit. Format:
 #   "<error signature>|<tracking>|<hint>"
 KNOWN_SERVER_ISSUES=(
-  "pool activation requires a live fleet capability proof|rustfs/backlog#2031|server-side cold-start recovery is covered by this PR; if this appears, collect node journals and treat it as a regression"
+  "pool activation requires a live fleet capability proof|rustfs/backlog#2031|multi-pool cold start with rebalance metadata fails on nightly builds; server fix pending, no script workaround"
 )
 
 # Print a hint when $1 matches a known server-side issue signature.
@@ -360,10 +369,8 @@ hint_server_issue() {
 # annotate known server-side issues.
 diagnose_node_start_failure() {
   local node="$1" journal
-  if ! journal="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" \
-    "SUDO=\"\"; [ \"\$(id -u)\" -ne 0 ] && SUDO=\"sudo -n\"; \${SUDO} journalctl -u ${RUSTFS_SERVICE} --no-pager -n 60 2>/dev/null || true")"; then
-    journal="unable to collect journal (SSH command failed)"
-  fi
+  journal="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" \
+    "SUDO=\"\"; [ \"\$(id -u)\" -ne 0 ] && SUDO=\"sudo -n\"; \${SUDO} journalctl -u ${RUSTFS_SERVICE} --no-pager -n 60 2>/dev/null || true")"
   printf '%s\n' "--- ${node}: ${RUSTFS_SERVICE} journal (last 60 lines) ---" >&2
   printf '%s\n' "${journal}" >&2
   hint_server_issue "${journal}" || true
@@ -376,6 +383,8 @@ rustfs_config_body() {
 RUSTFS_ACCESS_KEY=${ACCESS_KEY}
 RUSTFS_SECRET_KEY=${SECRET_KEY}
 RUSTFS_VOLUMES="${volumes}"
+RUSTFS_HEAL_TASK_TIMEOUT_SECS=${HEAL_TASK_TIMEOUT_SECS}
+RUSTFS_HEAL_AUTO_HEAL_ENABLE=${HEAL_AUTO_HEAL_ENABLE}
 RUSTFS_ADDRESS="${RUSTFS_ADDRESS}"
 RUSTFS_CONSOLE_ADDRESS="${RUSTFS_CONSOLE_ADDRESS}"
 RUSTFS_CONSOLE_ENABLE=${RUSTFS_CONSOLE_ENABLE}
@@ -497,44 +506,29 @@ start_and_wait_nodes() {
   done
 }
 
-# Cluster storage usage percentage from the admin API (aggregate across disks)
-storage_usage_percent() {
-  local body
+# Used disk space on a node across all /data/rustfs* mounts (GiB, via df -B1G)
+node_used_gb() {
+  local node="$1" total=0 gb
   if [ "${DRY_RUN}" -eq 1 ]; then
-    log "DRY-RUN: GET ${API_ENDPOINT}/rustfs/admin/v3/storageinfo (storage usage)"
+    log "DRY-RUN: df -B1G | grep /data/rustfs on ${node}"
     printf '0\n'
     return 0
   fi
-  body="$(admin_api GET /rustfs/admin/v3/storageinfo "")"
-  [ "$(admin_api_code)" = "200" ] || die "storageinfo API failed (HTTP $(admin_api_code))"
-  if ! printf '%s' "${body}" | jq -e '(.info.disks // .disks // []) | length' >/dev/null 2>&1; then
-    printf '\033[1;31m[ERROR]\033[0m storageinfo response unexpected (expected JSON with .info.disks or .disks):\n%s\n' "${body}" >&2
-    die "storageinfo response could not be parsed"
-  fi
-  printf '%s' "${body}" | jq -r '
-    ([.info.disks // .disks // [] | .[] | select(.state != "offline" and .totalspace > 0) | .usedspace] | add // 0) as $used
-    | ([.info.disks // .disks // [] | .[] | select(.state != "offline" and .totalspace > 0) | .totalspace] | add // 0) as $total
-    | if $total > 0 then ($used / $total * 100) else 0 end
-  '
+  while IFS= read -r gb; do
+    [ -n "${gb}" ] && total=$((total + gb))
+  done < <(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" \
+    "df -B1G | awk '/\\/data\\/rustfs/ {gsub(/[^0-9]/,\"\",\$3); print \$3+0}'" 2>/dev/null)
+  printf '%s' "${total}"
 }
 
-# Poll storage usage until it reaches the threshold
-monitor_storage() {
-  local threshold="${1:-${STORAGE_THRESHOLD}}" warp_pid="${2:-}" usage
-  log "monitoring storage usage until ${threshold}% (every ${POLL_INTERVAL}s)"
-  while :; do
-    usage="$(storage_usage_percent)"
-    [ -n "${usage}" ] || usage="0"
-    log "current storage usage: ${usage}%"
-    awk -v u="${usage}" -v t="${threshold}" 'BEGIN{exit !(u >= t)}' && break
-    if [ -n "${warp_pid}" ] && ! kill -0 "${warp_pid}" 2>/dev/null; then
-      warn "warp finished at ${usage}%, below the threshold of ${threshold}%"
-      warn "re-run step 4 to write more data; the data already written is enough to exercise the remaining steps"
-      return 0
-    fi
-    sleep "${POLL_INTERVAL}"
-  done
-  log "storage usage reached ${usage}%, stopping writes"
+# Read a heal-progress counter. The heal API serializes progress in camelCase
+# (objectsScanned / objectsHealed / objectsFailed / progressPercentage); keep a
+# snake_case fallback for older builds. Prints "null" when the field is absent.
+heal_progress_field() {
+  local body="$1" camel="$2" snake="$3"
+  printf '%s' "${body}" | jq -r --arg c "${camel}" --arg s "${snake}" '
+    (.progress // null) as $p
+    | if $p == null then "null" else (($p[$c] // $p[$s] // null) | if . == null then "null" else tostring end) end'
 }
 
 # Verify the expected number of pools via the admin API (JSON + jq assertions)
@@ -566,166 +560,6 @@ verify_pools() {
   fi
   log "pools OK: ${count} pools, all active"
   printf '%s' "${body}" | jq -r '.[] | "  pool id=\(.id) status=\(.status) decommission=\(.decommissionStatus) rebalance=\(.rebalanceStatus)"'
-}
-
-# Print a detailed rebalance failure report (never includes credentials)
-print_rebalance_failure() {
-  local body="$1" reason="$2"
-  printf '\033[1;31m[ERROR]\033[0m %s\n' "${reason}" >&2
-  printf '%s\n' "--- rebalance summary ---" >&2
-  printf '%s' "${body}" | jq -r '
-    "  rebalance id=\(.id) stoppedAt=\(.stoppedAt // "null")",
-    "  stopPropagation: pendingTerminalReload=\(.stopPropagation.pendingTerminalReload // false) failedPeers=[\(.stopPropagation.failedPeers // [] | join(", "))]",
-    (.pools[] |
-      "  pool id=\(.id) status=\(.status) stopping=\(.stopping) used=\(.used) lastError=\(.lastError // "null")"
-      + (if .progress != null then
-          " progress: objects=\(.progress.objects) bytes=\(.progress.bytes) remainingBuckets=\(.progress.remainingBuckets) bucket=\(.progress.bucket) object=\(.progress.object) elapsed=\(.progress.elapsed)s eta=\(.progress.eta)s"
-        else " progress: null" end))' >&2
-  printf '%s\n' "--- full JSON ---" >&2
-  printf '%s\n' "${body}" >&2
-}
-
-# Wait for rebalance to complete (all pools must finish, not just one)
-wait_rebalance() {
-  local waited=0 body code active failed completed total last_error remaining
-  log "waiting for rebalance to complete via admin API (timeout ${REBALANCE_TIMEOUT}s)..."
-  while [ "${waited}" -lt "${REBALANCE_TIMEOUT}" ]; do
-    if [ "${DRY_RUN}" -eq 1 ]; then
-      log "DRY-RUN: waiting for rebalance to complete"
-      return 0
-    fi
-    body="$(admin_api GET /rustfs/admin/v3/rebalance/status "")"
-    code="$(admin_api_code)"
-    if [ "${code}" != "200" ]; then
-      # 404 means rebalance metadata has not been persisted yet (e.g. right
-      # after start); keep polling. 000 is a transport error; also retry.
-      if [ "${code}" = "404" ] || [ "${code}" = "000" ]; then
-        sleep "${POLL_INTERVAL}"
-        waited=$((waited + POLL_INTERVAL))
-        continue
-      fi
-      printf '\033[1;31m[ERROR]\033[0m rebalance/status returned HTTP %s\n' "${code}" >&2
-      printf '%s\n' "${body}" >&2
-      die "rebalance/status failed"
-    fi
-    failed="$(printf '%s' "${body}" | jq '[.pools[] | select(.status == "Failed" or .status == "Stopped")] | length')"
-    last_error="$(printf '%s' "${body}" | jq '[.pools[] | select(.lastError != null)] | length')"
-    active="$(printf '%s' "${body}" | jq '[.pools[] | select(.status == "Started")] | length')"
-    completed="$(printf '%s' "${body}" | jq '[.pools[] | select(.status == "Completed")] | length')"
-    total="$(printf '%s' "${body}" | jq '.pools | length')"
-    remaining="$(printf '%s' "${body}" | jq '[.pools[] | select(.progress != null) | .progress.remainingBuckets] | add // 0')"
-    log "rebalance: completed=${completed}/${total} active=${active} remainingBuckets=${remaining}"
-    if [ "${failed}" -gt 0 ] || [ "${last_error}" -gt 0 ]; then
-      print_rebalance_failure "${body}" "rebalance entered a failure state (failed=${failed}, lastError=${last_error})"
-      die "rebalance failed (see detail above)"
-    fi
-    if [ "${active}" -eq 0 ] && [ "${completed}" -gt 0 ]; then
-      log "rebalance completed: ${completed}/${total} pools completed"
-      printf '%s' "${body}" | jq -r '.pools[] | "  pool id=\(.id) status=\(.status) stopping=\(.stopping) used=\(.used)"'
-      return 0
-    fi
-    sleep "${POLL_INTERVAL}"
-    waited=$((waited + POLL_INTERVAL))
-  done
-  body="$(admin_api GET /rustfs/admin/v3/rebalance/status "")"
-  print_rebalance_failure "${body}" "timed out waiting for rebalance (${REBALANCE_TIMEOUT}s)"
-  die "timed out waiting for rebalance (${REBALANCE_TIMEOUT}s)"
-}
-
-# Start rebalance via the admin API. Nightly builds gate rebalance activation
-# on a live cross-pool fence fleet capability proof that is re-established
-# shortly after a pool joins, so retry a few times before failing.
-start_rebalance_with_retry() {
-  local attempts="${REBALANCE_START_RETRIES}" delay="${REBALANCE_START_RETRY_DELAY}" attempt=1 body code id
-  while :; do
-    body="$(admin_api POST /rustfs/admin/v3/rebalance/start "")"
-    code="$(admin_api_code)"
-    if [ "${code}" = "200" ]; then
-      id="$(printf '%s' "${body}" | jq -r '.id // empty')"
-      log "rebalance started: id=${id}"
-      return 0
-    fi
-    warn "rebalance start attempt ${attempt}/${attempts} failed (HTTP ${code}): ${body}"
-    if [ "${attempt}" -ge "${attempts}" ]; then
-      hint_server_issue "${body}" || true
-      die "rebalance start failed after ${attempts} attempts (see last error above)"
-    fi
-    attempt=$((attempt + 1))
-    sleep "${delay}"
-  done
-}
-
-# Print a detailed decommission failure/progress report for one pool
-print_decommission_detail() {
-  local body="$1" pool_id="$2" label="$3"
-  printf '%s\n' "--- decommission detail (pool ${pool_id}) ${label} ---" >&2
-  printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '
-    .pools[] | select(.id == $id) |
-    "  pool id=\(.id) status=\(.status) poolStatus=\(.poolStatus)"
-    + (if .decommissionInfo != null then
-        " complete=\(.decommissionInfo.complete) failed=\(.decommissionInfo.failed) canceled=\(.decommissionInfo.canceled) queued=\(.decommissionInfo.queued)",
-        "  stage=\(.decommissionInfo.stage // "null") bucket=\(.decommissionInfo.bucket // "null") prefix=\(.decommissionInfo.prefix // "null") object=\(.decommissionInfo.object // "null")",
-        "  waitingReason=\(.decommissionInfo.waitingReason // "null")",
-        "  objectsDecommissioned=\(.decommissionInfo.objectsDecommissioned) objectsDecommissionedFailed=\(.decommissionInfo.objectsDecommissionedFailed)",
-        "  bytesDecommissioned=\(.decommissionInfo.bytesDecommissioned) bytesDecommissionedFailed=\(.decommissionInfo.bytesDecommissionedFailed)",
-        "  size current=\(.decommissionInfo.currentSize)/\(.decommissionInfo.totalSize)",
-        "  queuedBuckets=[\(.decommissionInfo.queuedBuckets | join(", "))]",
-        "  decommissionedBuckets=[\(.decommissionInfo.decommissionedBuckets | join(", "))]",
-        (if (.decommissionInfo.unresolvedEntries // [] | length) > 0 then
-          "  unresolvedEntries=" + ([.decommissionInfo.unresolvedEntries[] | "bucket=" + .bucket + " object=" + .object + " reason=" + .reason] | join("; "))
-         else empty end)
-      else "  decommissionInfo=null (no decommission state recorded)" end)' >&2
-  printf '%s\n' "--- full JSON ---" >&2
-  printf '%s\n' "${body}" >&2
-}
-
-# Wait for a pool decommission to complete
-wait_decommission() {
-  local pool_id="$1" waited=0 body code
-  local complete failed canceled queued objects_failed bytes_failed remaining done
-  log "waiting for pool ${pool_id} decommission to complete via admin API (timeout ${DECOMMISSION_TIMEOUT}s)..."
-  while [ "${waited}" -lt "${DECOMMISSION_TIMEOUT}" ]; do
-    if [ "${DRY_RUN}" -eq 1 ]; then
-      log "DRY-RUN: waiting for decommission to complete"
-      return 0
-    fi
-    body="$(admin_api GET /rustfs/admin/v3/decommission/status "")"
-    code="$(admin_api_code)"
-    if [ "${code}" != "200" ]; then
-      printf '\033[1;31m[ERROR]\033[0m decommission/status returned HTTP %s\n' "${code}" >&2
-      printf '%s\n' "${body}" >&2
-      die "decommission/status failed"
-    fi
-    if ! printf '%s' "${body}" | jq -e --argjson id "${pool_id}" '.pools[] | select(.id == $id)' >/dev/null 2>&1; then
-      print_decommission_detail "${body}" "${pool_id}" "pool missing"
-      die "pool ${pool_id} not found in decommission status"
-    fi
-    complete="$(printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '.pools[] | select(.id == $id) | .decommissionInfo.complete // false')"
-    failed="$(printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '.pools[] | select(.id == $id) | .decommissionInfo.failed // false')"
-    canceled="$(printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '.pools[] | select(.id == $id) | .decommissionInfo.canceled // false')"
-    queued="$(printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '.pools[] | select(.id == $id) | .decommissionInfo.queued // false')"
-    objects_failed="$(printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '.pools[] | select(.id == $id) | .decommissionInfo.objectsDecommissionedFailed // 0')"
-    bytes_failed="$(printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '.pools[] | select(.id == $id) | .decommissionInfo.bytesDecommissionedFailed // 0')"
-    remaining="$(printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '.pools[] | select(.id == $id) | (.decommissionInfo.queuedBuckets // [] | length)')"
-    done="$(printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '.pools[] | select(.id == $id) | (.decommissionInfo.decommissionedBuckets // [] | length)')"
-    if [ "${failed}" = "true" ] || [ "${canceled}" = "true" ] \
-      || [ "${objects_failed}" -gt 0 ] || [ "${bytes_failed}" -gt 0 ]; then
-      print_decommission_detail "${body}" "${pool_id}" "FAILED"
-      warn "pool ${pool_id} decommission failed/canceled (objects_failed=${objects_failed}, bytes_failed=${bytes_failed}); see detail above"
-      return 1
-    fi
-    if [ "${complete}" = "true" ]; then
-      log "pool ${pool_id} decommission completed"
-      printf '%s' "${body}" | jq -r --argjson id "${pool_id}" '.pools[] | select(.id == $id) | "  pool id=\(.id) status=\(.status) complete=\(.decommissionInfo.complete) objects=\(.decommissionInfo.objectsDecommissioned) bytes=\(.decommissionInfo.bytesDecommissioned) waitingReason=\(.decommissionInfo.waitingReason // "null")"'
-      return 0
-    fi
-    log "pool ${pool_id} decommission in progress: doneBuckets=${done} queuedBuckets=${remaining} objects_failed=${objects_failed} queued=${queued}"
-    sleep "${POLL_INTERVAL}"
-    waited=$((waited + POLL_INTERVAL))
-  done
-  body="$(admin_api GET /rustfs/admin/v3/decommission/status "")"
-  print_decommission_detail "${body}" "${pool_id}" "TIMED OUT"
-  die "timed out waiting for pool ${pool_id} decommission (${DECOMMISSION_TIMEOUT}s)"
 }
 
 # Preflight checks before running the workflow
@@ -778,9 +612,7 @@ preflight() {
         "df -h /data | tail -1 | awk '{print \"  ${node}: \" \$2 \" total, \" \$4 \" avail\"}'" || true
     done
   fi
-  if [ "${WITH_WARP}" -eq 1 ]; then
-    need_cmd warp "warp benchmark tool"
-  fi
+  need_cmd warp "warp benchmark tool"
   log "preflight OK"
 }
 
@@ -845,9 +677,9 @@ EOF
   printf '%s\n' "${script}" | run_remote_all
 }
 
-step2_install() {
-  log "step 2: install the RustFS service on all nodes"
-  confirm "About to run dpkg -i ${PACKAGE_FILE} on all nodes. Continue?"
+step2_install_and_start() {
+  log "step 2: install rustfs, write the 3x4 config, start all nodes simultaneously"
+  confirm "About to dpkg -i and start rustfs on all nodes. Continue?"
   local script
   script="$(cat <<'EOF'
 set -euo pipefail
@@ -859,174 +691,282 @@ dpkg -l rustfs | tail -n 1
 EOF
 )"
   printf '%s\n' "${script}" | run_remote_all
-}
-
-step3_start_first_pool() {
-  log "step 3: start the first pool on ${NODES[0]}"
-  write_rustfs_config "${NODES[0]}" "${VOLUMES_1}"
-  ensure_volume_dirs "${NODES[0]}" "${VOLUMES_1}"
-  service_action start "${NODES[0]}"
-  wait_service_active "${NODES[0]}"
-  log "checking service status: systemctl status ${RUSTFS_SERVICE}"
-  if [ "${DRY_RUN}" -eq 0 ]; then
-    ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODES[0]}" \
-      "systemctl status ${RUSTFS_SERVICE} --no-pager | head -n 15" || true
-  fi
+  for node in "${NODES[@]}"; do
+    write_rustfs_config "${node}" "${VOLUMES}"
+  done
+  for node in "${NODES[@]}"; do
+    ensure_volume_dirs "${node}" "${VOLUMES}"
+  done
+  start_and_wait_nodes "${NODES[@]}"
   verify_pools 1
 }
 
-step4_write_data() {
-  log "step 4: write data and monitor storage usage"
-  if [ "${WITH_WARP}" -eq 1 ]; then
-    need_cmd warp "warp benchmark tool"
-    confirm "About to run warp writes in the background (bucket=${WARP_BUCKET}, duration=${WARP_DURATION}) and monitor usage up to ${STORAGE_THRESHOLD}%. Continue?"
-    if [ "${DRY_RUN}" -eq 1 ]; then
-      log "DRY-RUN: warp put --host ${API_ENDPOINT#http://} --bucket ${WARP_BUCKET} ... (background)"
-      log "DRY-RUN: monitoring storage usage until ${STORAGE_THRESHOLD}%"
-      return 0
-    fi
-    local warp_log warp_pid
-    warp_log="${WARP_LOG_FILE:-$(mktemp "${TMPDIR:-/tmp}/rustfs-warp.XXXXXX.log")}"
-    log "starting warp writes (background), log: ${warp_log}"
-    warp put --host "${API_ENDPOINT#http://}" \
-      --bucket "${WARP_BUCKET}" \
-      --access-key "${ACCESS_KEY}" \
-      --secret-key "${SECRET_KEY}" \
-      --obj.size "${WARP_OBJ_SIZE}" \
-      --concurrent "${WARP_CONCURRENT}" \
-      --noprefix --duration "${WARP_DURATION}" --noclear >"${warp_log}" 2>&1 &
-    warp_pid=$!
-    log "warp PID=${warp_pid}"
-    trap 'kill "${warp_pid:-}" 2>/dev/null || true' EXIT
-    monitor_storage "${STORAGE_THRESHOLD}" "${warp_pid}"
-    kill "${warp_pid}" 2>/dev/null || true
-    trap - EXIT
-    wait "${warp_pid}" 2>/dev/null || true
-    log "warp stopped"
-  else
-    cat <<'NOTE'
-Write data manually (or re-run with --with-warp to automate):
-
-  warp put --host "rustfs-node1:9000" --bucket "test-10mb" \
-    --access-key "rustfs@test" --secret-key "rustfs@test" \
-    --obj.size "100MiB" --concurrent 32 --noprefix --duration 5m --noclear
-
-While writing, monitor storage usage:
-  GET ${API_ENDPOINT}/rustfs/admin/v3/storageinfo  (SigV4-signed)
-  e.g. Storage: 30.88 GiB / 1.56 TiB (1%)
-
-Stop writing once usage reaches 80%-85%, then continue.
-NOTE
-    confirm "Data has been written and usage reached 80%-85%? Continue?"
+step3_write_data_with_node_outage() {
+  log "step 3: write data with warp; stop ${NODES[${OUTAGE_NODE_INDEX}]} at ${STOP_NODE_AT_GB}GB, stop warp at ${WARP_STOP_AT_GB}GB"
+  need_cmd warp "warp benchmark tool"
+  confirm "About to run warp writes (bucket=${WARP_BUCKET}) and stop ${NODES[${OUTAGE_NODE_INDEX}]} mid-write. Continue?"
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    log "DRY-RUN: warp put + monitor node disk usage"
+    return 0
   fi
-}
 
-step5_expand_pool2() {
-  log "step 5: expand to the second pool (${NODES[0]} + ${NODES[1]})"
-  confirm "About to stop ${NODES[0]} and update its config. Continue?"
-  service_action stop "${NODES[0]}"
-  write_rustfs_config "${NODES[0]}" "${VOLUMES_2}"
-  write_rustfs_config "${NODES[1]}" "${VOLUMES_2}"
-  ensure_volume_dirs "${NODES[0]}" "${VOLUMES_2}"
-  ensure_volume_dirs "${NODES[1]}" "${VOLUMES_2}"
-  start_and_wait_nodes "${NODES[0]}" "${NODES[1]}"
-  verify_pools 2
-}
+  local warp_log warp_pid outage_node="${NODES[${OUTAGE_NODE_INDEX}]}"
+  local survived_a survived_b used_a used_b used_c waited=0 node_stopped=0 target_reached=0
 
-step6_rebalance() {
-  log "step 6: start data rebalance (admin API)"
-  confirm "About to start rebalance (POST ${API_ENDPOINT}/rustfs/admin/v3/rebalance/start). Continue?"
-  if [ "${DRY_RUN}" -eq 0 ]; then
-    start_rebalance_with_retry
+  warp_log="${WARP_LOG_FILE:-$(mktemp "${TMPDIR:-/tmp}/rustfs-warp.XXXXXX.log")}"
+  log "starting warp writes (background), log: ${warp_log}"
+  warp put --host "${API_ENDPOINT#http://}" \
+    --bucket "${WARP_BUCKET}" \
+    --access-key "${ACCESS_KEY}" \
+    --secret-key "${SECRET_KEY}" \
+    --obj.size "${WARP_OBJ_SIZE}" \
+    --concurrent "${WARP_CONCURRENT}" \
+    --noprefix --noclear >"${warp_log}" 2>&1 &
+  warp_pid=$!
+  log "warp PID=${warp_pid}"
+  trap 'kill "${warp_pid:-}" 2>/dev/null || true' EXIT
+
+  # Surviving nodes: everything except the outage node
+  survived_a="${NODES[0]}"
+  survived_b="${NODES[1]}"
+  if [ "${OUTAGE_NODE_INDEX}" = "0" ]; then
+    survived_a="${NODES[1]}"
+    survived_b="${NODES[2]}"
+  elif [ "${OUTAGE_NODE_INDEX}" = "1" ]; then
+    survived_b="${NODES[2]}"
   fi
-  wait_rebalance
-}
+  log "surviving nodes: ${survived_a} ${survived_b}; outage node: ${outage_node}"
 
-step7_expand_pool3() {
-  log "step 7: expand to the third pool (all nodes)"
-  confirm "About to stop ${NODES[0]} ${NODES[1]} and update all node configs. Continue?"
-  service_action stop "${NODES[0]}"
-  service_action stop "${NODES[1]}"
-  for node in "${NODES[@]}"; do
-    write_rustfs_config "${node}" "${VOLUMES_3}"
-  done
-  for node in "${NODES[@]}"; do
-    ensure_volume_dirs "${node}" "${VOLUMES_3}"
-  done
-  start_and_wait_nodes "${NODES[@]}"
-  verify_pools 3
-}
+  log "monitoring disk usage every ${POLL_INTERVAL}s (stop node @ ${STOP_NODE_AT_GB}GB, stop warp @ ${WARP_STOP_AT_GB}GB)"
+  while [ "${waited}" -lt "${WARP_TIMEOUT}" ]; do
+    used_a="$(node_used_gb "${survived_a}")"
+    used_b="$(node_used_gb "${survived_b}")"
+    used_c="$(node_used_gb "${outage_node}")"
+    log "used: ${survived_a}=${used_a}GB ${survived_b}=${used_b}GB ${outage_node}=${used_c}GB (node_stopped=${node_stopped})"
 
-step8_rebalance() {
-  log "step 8: start data rebalance (admin API)"
-  confirm "About to start rebalance (POST ${API_ENDPOINT}/rustfs/admin/v3/rebalance/start). Continue?"
-  if [ "${DRY_RUN}" -eq 0 ]; then
-    start_rebalance_with_retry
-  fi
-  wait_rebalance
-}
-
-step9_decommission() {
-  log "step 9: decommission pool ${DECOMMISSION_POOL_ID} (admin API)"
-  confirm "About to decommission pool ${DECOMMISSION_POOL_ID} (up to ${DECOMMISSION_RETRIES} automatic retries). Continue?"
-  local attempt=1 body
-  # If the previous decommission is in a failed/cancelled state, clear its metadata first
-  if [ "${DRY_RUN}" -eq 0 ]; then
-    body="$(admin_api POST /rustfs/admin/v3/pools/clear "by-id=true&pool=${DECOMMISSION_POOL_ID}")"
-    [ "$(admin_api_code)" = "200" ] || warn "initial decommission clear returned HTTP $(admin_api_code): ${body}"
-  fi
-  while :; do
-    log "decommission attempt ${attempt}/${DECOMMISSION_RETRIES}"
-    if [ "${DRY_RUN}" -eq 0 ]; then
-      body="$(admin_api POST /rustfs/admin/v3/pools/decommission "by-id=true&pool=${DECOMMISSION_POOL_ID}")"
-      if [ "$(admin_api_code)" != "200" ]; then
-        printf '\033[1;31m[ERROR]\033[0m decommission start returned HTTP %s\n' "$(admin_api_code)" >&2
-        printf '%s\n' "${body}" >&2
-        die "decommission start failed"
+    if [ "${node_stopped}" -eq 0 ] \
+      && [ "${used_a}" -ge "${STOP_NODE_AT_GB}" ] && [ "${used_b}" -ge "${STOP_NODE_AT_GB}" ]; then
+      log "surviving nodes reached ${STOP_NODE_AT_GB}GB; stopping ${outage_node}"
+      service_action stop "${outage_node}"
+      node_stopped=1
+      # Fail closed: the outage node must actually be down before continuing.
+      if ssh "${SSH_OPTS[@]}" "${SSH_USER}@${outage_node}" \
+          "systemctl is-active ${RUSTFS_SERVICE} 2>/dev/null" | grep -q active; then
+        die "${outage_node} is still active after systemctl stop; cannot continue the outage scenario"
       fi
-      log "decommission start accepted"
+      log "${outage_node} service is down"
     fi
-    if wait_decommission "${DECOMMISSION_POOL_ID}"; then
+
+    if [ "${used_a}" -ge "${WARP_STOP_AT_GB}" ] && [ "${used_b}" -ge "${WARP_STOP_AT_GB}" ]; then
+      log "surviving nodes reached ${WARP_STOP_AT_GB}GB; stopping warp"
+      target_reached=1
       break
     fi
-    if [ "${attempt}" -ge "${DECOMMISSION_RETRIES}" ]; then
-      warn "if the source bucket has many objects and the tested version is 1.0.0-rc.3, this is the known metacache-listing decommission bug; remove the test bucket (rc rb --force rustfs/${WARP_BUCKET}) or lower --storage-threshold, then re-run step 9"
-      die "pool ${DECOMMISSION_POOL_ID} still failed after ${attempt} attempts; investigate manually (POST ${API_ENDPOINT}/rustfs/admin/v3/pools/clear?by-id=true&pool=${DECOMMISSION_POOL_ID} to reset)"
+
+    if ! kill -0 "${warp_pid}" 2>/dev/null; then
+      die "warp exited early at ${used_a}/${used_b}GB before reaching ${WARP_STOP_AT_GB}GB (log: ${warp_log})"
+      break
     fi
-    warn "attempt ${attempt} failed; clearing metadata and retrying in ${DECOMMISSION_RETRY_DELAY}s"
-    if [ "${DRY_RUN}" -eq 0 ]; then
-      body="$(admin_api POST /rustfs/admin/v3/pools/clear "by-id=true&pool=${DECOMMISSION_POOL_ID}")"
-      [ "$(admin_api_code)" = "200" ] || warn "decommission clear failed (HTTP $(admin_api_code)): ${body}; retrying anyway"
-    fi
-    attempt=$((attempt + 1))
-    sleep "${DECOMMISSION_RETRY_DELAY}"
+
+    sleep "${POLL_INTERVAL}"
+    waited=$((waited + POLL_INTERVAL))
   done
-  if [ "${FINALIZE_DECOMMISSION}" -eq 1 ]; then
-    log "decommission done; removing pool ${DECOMMISSION_POOL_ID} from all node configs and restarting"
-    confirm "About to update all node configs (remove the decommissioned pool) and restart services. Continue?"
-    for node in "${NODES[@]}"; do
-      write_rustfs_config "${node}" "${VOLUMES_AFTER_DECOMMISSION}"
-    done
-    service_action_all restart
-    for node in "${NODES[@]}"; do
-      wait_service_active "${node}"
-    done
-    verify_pools 2
+  kill "${warp_pid}" 2>/dev/null || true
+  trap - EXIT
+  wait "${warp_pid}" 2>/dev/null || true
+  log "warp stopped (log: ${warp_log})"
+
+  if [ "${node_stopped}" -eq 0 ]; then
+    die "never reached ${STOP_NODE_AT_GB}GB on both surviving nodes within ${WARP_TIMEOUT}s; the outage node was NOT stopped — test invalid"
   fi
+  if [ "${target_reached}" -eq 0 ]; then
+    die "warp did not reach ${WARP_STOP_AT_GB}GB on the surviving nodes within ${WARP_TIMEOUT}s — test invalid"
+  fi
+  used_a="$(node_used_gb "${survived_a}")"
+  used_b="$(node_used_gb "${survived_b}")"
+  log "final used before heal: ${survived_a}=${used_a}GB ${survived_b}=${used_b}GB ${outage_node}=$(node_used_gb "${outage_node}")GB"
 }
 
+step4_restart_node() {
+  local node="${NODES[${OUTAGE_NODE_INDEX}]}"
+  log "step 4: restart ${node} after the outage"
+  confirm "About to start rustfs on ${node}. Continue?"
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    service_action start "${node}"
+    log "DRY-RUN: waiting for ${node} to become active"
+    return 0
+  fi
+  service_action start "${node}"
+  wait_service_active "${node}"
+  # Bounded readiness: wait for the admin API to report an active pool.
+  local attempts=0
+  while ! verify_pools 1 >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    if [ "${attempts}" -ge 12 ]; then
+      verify_pools 1   # final call fails loudly
+    fi
+    log "cluster not ready yet (attempt ${attempts}/12); waiting 5s"
+    sleep 5
+  done
+  log "${node} is back; cluster reports an active pool"
+}
+
+step5_start_heal() {
+  log "step 5: start cluster heal (POST /rustfs/admin/v3/heal/ {\"recursive\":true,...})"
+  confirm "About to start heal on the cluster. Continue?"
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    log "DRY-RUN: POST /rustfs/admin/v3/heal/ {\"recursive\":true,...}"
+    return 0
+  fi
+  local attempts="${HEAL_START_RETRIES}" delay="${HEAL_START_RETRY_DELAY}" attempt=1 body code
+  while :; do
+    body="$(admin_api POST /rustfs/admin/v3/heal/ "" \
+      '{"recursive":true,"dryRun":false,"remove":false,"recreate":false,"scanMode":"normal","updateParity":false,"nolock":false}')"
+    code="$(admin_api_code)"
+    if [ "${code}" = "200" ]; then
+      if [ -n "${body}" ]; then
+        HEAL_CLIENT_TOKEN="$(printf '%s' "${body}" | jq -r '.clientToken // empty')"
+        log "heal started: clientToken=${HEAL_CLIENT_TOKEN}"
+      else
+        log "heal start accepted (empty response)"
+      fi
+      return 0
+    fi
+    if [ "${code}" = "400" ] || [ "${code}" = "403" ]; then
+      printf '\033[1;31m[ERROR]\033[0m heal start rejected (HTTP %s): %s\n' "${code}" "${body}" >&2
+      die "heal start rejected (HTTP ${code}); fix the request, not the retry"
+    fi
+    warn "heal start attempt ${attempt}/${attempts} failed (HTTP ${code}): ${body}"
+    hint_server_issue "${body}" || true
+    if [ "${attempt}" -ge "${attempts}" ]; then
+      die "heal start failed after ${attempts} attempts (see last error above)"
+    fi
+    attempt=$((attempt + 1))
+    sleep "${delay}"
+  done
+}
+
+step6_monitor_heal() {
+  log "step 6: monitor heal task until done AND ${NODES[${OUTAGE_NODE_INDEX}]} reaches ${HEAL_TARGET_GB}GB"
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    log "DRY-RUN: waiting for heal to complete"
+    return 0
+  fi
+  if [ -z "${HEAL_CLIENT_TOKEN}" ]; then
+    die "no heal client token (run step 5 first, or pass --heal-token)"
+  fi
+  local waited=0 body code summary failed healed scanned pct prog_present
+  local failed_n healed_n scanned_n pct_n vm002_used warned501=0
+  while [ "${waited}" -lt "${HEAL_TIMEOUT}" ]; do
+    body="$(admin_api POST /rustfs/admin/v3/heal/ "clientToken=${HEAL_CLIENT_TOKEN}" "")"
+    code="$(admin_api_code)"
+    if [ "${code}" != "200" ]; then
+      if [ "${code}" = "501" ] && [ "${warned501}" -eq 0 ]; then
+        # background task status should work; keep polling if the cluster's
+        # background-heal aggregator is unavailable (501 on some topologies).
+        warn "heal task status returned HTTP 501 (${body}); retrying"
+        warned501=1
+      fi
+      sleep "${POLL_INTERVAL}"
+      waited=$((waited + POLL_INTERVAL))
+      continue
+    fi
+    summary="$(printf '%s' "${body}" | jq -r '.summary // "running"')"
+    prog_present="$(printf '%s' "${body}" | jq -r '.progress != null')"
+    failed="$(heal_progress_field "${body}" objectsFailed objects_failed)"
+    healed="$(heal_progress_field "${body}" objectsHealed objects_healed)"
+    scanned="$(heal_progress_field "${body}" objectsScanned objects_scanned)"
+    pct="$(heal_progress_field "${body}" progressPercentage progress_percentage)"
+    failed_n="${failed}"; [ "${failed_n}" = "null" ] && failed_n=0
+    healed_n="${healed}"; [ "${healed_n}" = "null" ] && healed_n=0
+    scanned_n="${scanned}"; [ "${scanned_n}" = "null" ] && scanned_n=0
+    pct_n="${pct}"; [ "${pct_n}" = "null" ] && pct_n=0
+    vm002_used="$(node_used_gb "${NODES[${OUTAGE_NODE_INDEX}]}")"
+    log "heal: summary=${summary} scanned=${scanned_n} healed=${healed_n} failed=${failed_n} pct=${pct_n} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${vm002_used}GB (target ${HEAL_TARGET_GB}GB)"
+
+    if [ "${prog_present}" = "false" ] && [ "${summary}" = "running" ]; then
+      warn "heal progress is null while the task is running (server-side reporting gap; see rustfs/backlog#2035)"
+    fi
+
+    if [ "${failed_n}" -gt 0 ] || printf '%s' "${summary}" | grep -qiE 'fail|error|stopped'; then
+      printf '\033[1;31m[ERROR]\033[0m heal reported failed objects (%s)\n' "${failed_n}" >&2
+      printf '%s\n' "--- full heal status JSON ---" >&2
+      printf '%s\n' "${body}" >&2
+      die "heal failed (summary=${summary}, objects_failed=${failed_n})"
+    fi
+
+    # Success only for a real terminal summary; "running"/"notFound"/"" mean
+    # the task is still going (or lives on another node) — keep polling.
+    if printf '%s' "${summary}" | grep -qiE '^(finished|completed|success|done)$' \
+      && [ "${vm002_used}" -ge "${HEAL_TARGET_GB}" ]; then
+      log "heal done: summary=${summary} failed=0 ${NODES[${OUTAGE_NODE_INDEX}]}_used=${vm002_used}GB >= ${HEAL_TARGET_GB}GB"
+      printf '%s\n' "${body}" > "${TMPDIR:-/tmp}/rustfs-heal-final-status.json"
+      return 0
+    fi
+    sleep "${POLL_INTERVAL}"
+    waited=$((waited + POLL_INTERVAL))
+  done
+  printf '\033[1;31m[ERROR]\033[0m timed out waiting for heal (${HEAL_TIMEOUT}s); final status:\n' >&2
+  printf '%s\n' "${body}" >&2
+  die "timed out waiting for heal (${HEAL_TIMEOUT}s)"
+}
+
+step7_analyze_results() {
+  log "step 7: result analysis"
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    log "DRY-RUN: analyzing heal results"
+    return 0
+  fi
+  if [ -z "${HEAL_CLIENT_TOKEN}" ]; then
+    die "no heal client token (run step 5 first, or pass --heal-token)"
+  fi
+  local body summary failed healed scanned pct prog_present
+  local failed_n healed_n scanned_n pct_n i used
+  body="$(admin_api POST /rustfs/admin/v3/heal/ "clientToken=${HEAL_CLIENT_TOKEN}" "")"
+  if [ "$(admin_api_code)" = "200" ]; then
+    summary="$(printf '%s' "${body}" | jq -r '.summary // "unknown"')"
+    prog_present="$(printf '%s' "${body}" | jq -r '.progress != null')"
+    failed="$(heal_progress_field "${body}" objectsFailed objects_failed)"
+    healed="$(heal_progress_field "${body}" objectsHealed objects_healed)"
+    scanned="$(heal_progress_field "${body}" objectsScanned objects_scanned)"
+    pct="$(heal_progress_field "${body}" progressPercentage progress_percentage)"
+    failed_n="${failed}"; [ "${failed_n}" = "null" ] && failed_n=0
+    healed_n="${healed}"; [ "${healed_n}" = "null" ] && healed_n=0
+    scanned_n="${scanned}"; [ "${scanned_n}" = "null" ] && scanned_n=0
+    pct_n="${pct}"; [ "${pct_n}" = "null" ] && pct_n=0
+  fi
+  printf '%s\n' "--- heal status ---"
+  printf '  summary=%s scanned=%s healed=%s failed=%s progress=%s%%\n' \
+    "${summary}" "${scanned_n}" "${healed_n}" "${failed_n}" "${pct_n}"
+  if [ "${prog_present}" = "false" ]; then
+    warn "heal progress was absent (null) in the final task response — see rustfs/backlog#2035"
+  fi
+  printf '%s\n' "--- per-node disk usage (GiB) ---"
+  for i in "${!NODES[@]}"; do
+    used="$(node_used_gb "${NODES[$i]}")"
+    printf '  %s: %sGB\n' "${NODES[$i]}" "${used}"
+  done
+
+  local outage_used
+  outage_used="$(node_used_gb "${NODES[${OUTAGE_NODE_INDEX}]}")"
+  if printf '%s' "${summary}" | grep -qiE '^(finished|completed|success|done)$' \
+    && [ "${failed_n}" -eq 0 ] \
+    && [ "${outage_used}" -ge "${HEAL_TARGET_GB}" ]; then
+    log "heal test PASSED: cluster heal complete, 0 failed, ${NODES[${OUTAGE_NODE_INDEX}]} reached ${outage_used}GB"
+    return 0
+  fi
+  die "heal test FAILED: summary=${summary} failed=${failed_n} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${outage_used}GB (target ${HEAL_TARGET_GB}GB)"
+}
 # ==================== CLI parsing ====================
 
 usage() {
   cat <<'USAGE'
-Usage: rustfs-pool-expand.sh [options]
+Usage: rustfs-heal-test.sh [options]
 
 Options:
-  --all                      Run the full workflow (steps 1-9)
+  --all                      Run the full workflow (steps 1-7)
   --step N                   Run a single step (repeatable)
   --steps 1,3,5-7            Run steps in order
-  --with-warp                Automate step 4 (warp writes + usage monitoring)
-  --finalize-decommission    After decommission, remove the pool from the topology and restart
   --skip-download            Skip download when the package already exists
   --version VER              RustFS release tag to test, e.g. 1.0.0-rc.3 (default from config)
   --package-url URL          Full package download URL (overrides --version)
@@ -1037,22 +977,24 @@ Options:
   --ssh-port PORT            SSH port for the nodes (default 22)
   --endpoint URL             Cluster admin API endpoint, e.g. http://10.0.0.7:9000 (default from config)
   --rc-endpoint URL          Deprecated alias for --endpoint
-  --storage-threshold N      Stop writing when usage reaches N% (default 85)
-  --warp-duration DUR        warp write duration, e.g. 5m, 20s (default 5m)
-  --rebalance-timeout N      Rebalance wait timeout in seconds (default 86400)
-  --decommission-timeout N   Decommission wait timeout in seconds (default 86400)
+  --stop-node-gb N           Stop the outage node when surviving nodes reach N GiB (default 15)
+  --warp-stop-gb N           Stop warp when surviving nodes reach N GiB (default 40)
+  --heal-target-gb N         Outage node must reach N GiB after heal (default 40)
+  --heal-token TOKEN         clientToken of a heal started earlier (for steps 6/7 reruns)
+  --warp-timeout N           Write phase timeout in seconds (default 3600)
+  --heal-timeout N           Heal wait timeout in seconds (default 86400)
   --service-timeout N        Service start wait timeout in seconds (default 300)
-  --poll-interval N          Status polling interval in seconds (default 30)
+  --poll-interval N          Status polling interval in seconds (default 15)
   --log-file FILE            Append all output to FILE
   --dry-run                  Preview commands without executing them
   -y, --yes                  Skip all confirmation prompts
   -h, --help                 Show this help
 
 Examples:
-  ./rustfs-pool-expand.sh --all
-  ./rustfs-pool-expand.sh --all --with-warp --yes --version 1.0.0-rc.3
-  ./rustfs-pool-expand.sh --step 5
-  ./rustfs-pool-expand.sh --all --dry-run
+  ./rustfs-heal-test.sh --all
+  ./rustfs-heal-test.sh --all -y --package-url https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb
+  ./rustfs-heal-test.sh --steps 5,6,7
+  ./rustfs-heal-test.sh --all --dry-run
 USAGE
 }
 
@@ -1077,14 +1019,12 @@ run_steps() {
   for step in "${SELECTED_STEPS[@]}"; do
     case "${step}" in
       1) step1_download ;;
-      2) step2_install ;;
-      3) step3_start_first_pool ;;
-      4) step4_write_data ;;
-      5) step5_expand_pool2 ;;
-      6) step6_rebalance ;;
-      7) step7_expand_pool3 ;;
-      8) step8_rebalance ;;
-      9) step9_decommission ;;
+      2) step2_install_and_start ;;
+      3) step3_write_data_with_node_outage ;;
+      4) step4_restart_node ;;
+      5) step5_start_heal ;;
+      6) step6_monitor_heal ;;
+      7) step7_analyze_results ;;
       *) die "unknown step: ${step}" ;;
     esac
     log "step ${step} completed"
@@ -1100,8 +1040,6 @@ main() {
       --all) all=1 ;;
       --step) SELECTED_STEPS+=("$1"); shift ;;
       --steps) expand_steps "$1"; shift ;;
-      --with-warp) WITH_WARP=1 ;;
-      --finalize-decommission) FINALIZE_DECOMMISSION=1 ;;
       --skip-download) SKIP_DOWNLOAD=1 ;;
       --version) RUSTFS_VERSION="$1"; shift ;;
       --package-url) PACKAGE_URL="$1"; shift ;;
@@ -1112,10 +1050,12 @@ main() {
       --ssh-port) SSH_PORT="$1"; shift ;;
       --endpoint) API_ENDPOINT="$1"; shift ;;
       --rc-endpoint) API_ENDPOINT="$1"; shift ;;
-      --storage-threshold) STORAGE_THRESHOLD="$1"; shift ;;
-      --warp-duration) WARP_DURATION="$1"; shift ;;
-      --rebalance-timeout) REBALANCE_TIMEOUT="$1"; shift ;;
-      --decommission-timeout) DECOMMISSION_TIMEOUT="$1"; shift ;;
+      --stop-node-gb) STOP_NODE_AT_GB="$1"; shift ;;
+      --warp-stop-gb) WARP_STOP_AT_GB="$1"; shift ;;
+      --heal-target-gb) HEAL_TARGET_GB="$1"; shift ;;
+      --heal-token) HEAL_CLIENT_TOKEN="$1"; shift ;;
+      --warp-timeout) WARP_TIMEOUT="$1"; shift ;;
+      --heal-timeout) HEAL_TIMEOUT="$1"; shift ;;
       --service-timeout) SERVICE_TIMEOUT="$1"; shift ;;
       --poll-interval) POLL_INTERVAL="$1"; shift ;;
       --log-file) LOG_FILE="$1"; shift ;;
@@ -1136,7 +1076,7 @@ main() {
     exit 0
   fi
   if [ "${all}" -eq 1 ]; then
-    SELECTED_STEPS=(1 2 3 4 5 6 7 8 9)
+    SELECTED_STEPS=(1 2 3 4 5 6 7)
   fi
   PACKAGE_URL="$(resolve_package_url)"
   if [ "${PREFLIGHT}" -eq 1 ]; then
@@ -1158,6 +1098,6 @@ main() {
 }
 
 # Allow sourcing the file for unit tests without running main.
-if [ "${RUSTFS_POOL_SCRIPT_SOURCE_ONLY:-0}" != "1" ]; then
+if [ "${RUSTFS_HEAL_SCRIPT_SOURCE_ONLY:-0}" != "1" ]; then
   main "$@"
 fi

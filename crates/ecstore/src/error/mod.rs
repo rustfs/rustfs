@@ -157,6 +157,8 @@ pub enum StorageError {
     InvalidPartNumber(usize),
     #[error("Your proposed upload is smaller than the minimum allowed size. Part {0} size {1} is less than minimum {2}")]
     EntityTooSmall(usize, i64, i64),
+    #[error("multipart upload size {0} exceeds the configured limit {1}")]
+    EntityTooLarge(u64, u64),
 
     // ── Erasure / Quorum ─────────────────────────────────────────────
     #[error("erasure read quorum")]
@@ -554,6 +556,7 @@ impl Clone for StorageError {
             StorageError::DecommissionNotStarted => StorageError::DecommissionNotStarted,
             StorageError::InvalidPart(a, b, c) => StorageError::InvalidPart(*a, b.clone(), c.clone()),
             StorageError::EntityTooSmall(a, b, c) => StorageError::EntityTooSmall(*a, *b, *c),
+            StorageError::EntityTooLarge(a, b) => StorageError::EntityTooLarge(*a, *b),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
             StorageError::RebalanceAlreadyRunning => StorageError::RebalanceAlreadyRunning,
@@ -673,6 +676,7 @@ impl StorageError {
             StorageError::InsufficientWriteQuorum(_, _) => StorageErrorCode::InsufficientWriteQuorum,
             StorageError::PreconditionFailed => StorageErrorCode::PreconditionFailed,
             StorageError::EntityTooSmall(_, _, _) => StorageErrorCode::EntityTooSmall,
+            StorageError::EntityTooLarge(_, _) => StorageErrorCode::EntityTooLarge,
             StorageError::InvalidRangeSpec(_) => StorageErrorCode::InvalidRangeSpec,
             StorageError::NotModified => StorageErrorCode::NotModified,
             StorageError::InvalidPartNumber(_) => StorageErrorCode::InvalidPartNumber,
@@ -795,6 +799,7 @@ impl StorageError {
             StorageErrorCode::EntityTooSmall => {
                 Some(StorageError::EntityTooSmall(Default::default(), Default::default(), Default::default()))
             }
+            StorageErrorCode::EntityTooLarge => Some(StorageError::EntityTooLarge(Default::default(), Default::default())),
             StorageErrorCode::InvalidRangeSpec => Some(StorageError::InvalidRangeSpec(Default::default())),
             StorageErrorCode::NotModified => Some(StorageError::NotModified),
             StorageErrorCode::InvalidPartNumber => Some(StorageError::InvalidPartNumber(Default::default())),

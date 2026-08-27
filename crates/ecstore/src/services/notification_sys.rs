@@ -234,6 +234,39 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
     });
 }
 
+#[cfg(test)]
+pub(crate) struct CrossPoolFenceFleetProofGuard {
+    previous_proof: Option<FleetCapabilityProof>,
+    previous_topology_conflict: bool,
+}
+
+#[cfg(test)]
+impl Drop for CrossPoolFenceFleetProofGuard {
+    fn drop(&mut self) {
+        let mut state = cross_pool_fence_fleet_proof_slot()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.proof = self.previous_proof.take();
+        state.topology_conflict = self.previous_topology_conflict;
+    }
+}
+
+/// Temporarily revoke the test proof so activation paths can exercise their
+/// fail-closed behavior without changing the process-wide topology binding.
+#[cfg(test)]
+pub(crate) fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceFleetProofGuard {
+    let mut state = cross_pool_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = CrossPoolFenceFleetProofGuard {
+        previous_proof: state.proof.clone(),
+        previous_topology_conflict: state.topology_conflict,
+    };
+    state.proof = None;
+    state.topology_conflict = true;
+    guard
+}
+
 #[cfg(any(test, feature = "test-util"))]
 pub fn rotate_cross_pool_fence_fleet_proof_for_test() -> bool {
     let mut state = cross_pool_fence_fleet_proof_slot()

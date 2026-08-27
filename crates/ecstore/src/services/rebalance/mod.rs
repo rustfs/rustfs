@@ -49,8 +49,8 @@ mod worker;
 
 #[cfg(feature = "test-util")]
 pub use entry::test_util::PausedRebalanceEntryTestFixture;
-pub(crate) use meta::is_rebalance_conflicting_with_decommission;
 pub use meta::{decode_rebalance_stop_propagation_record, encode_rebalance_stop_propagation_record};
+pub(crate) use meta::{is_rebalance_conflicting_with_decommission, rebalance_requires_worker_activation};
 pub use types::{
     DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
     RebalanceStats, RebalanceStopPropagationRecord,

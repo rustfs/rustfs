@@ -90,7 +90,7 @@ fn resolve_put_object_authoritative_size(headers: &HeaderMap, content_length: Op
 /// Returns `Duration::ZERO` when disabled (`RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT=0`),
 /// in which case [`guard_put_object_body_read_timeout`] passes the body through
 /// untouched.
-fn put_object_body_read_timeout() -> Duration {
+pub(crate) fn put_object_body_read_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(
         rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
         rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
@@ -260,7 +260,7 @@ impl ByteStream for RequestBodyReadTimeout {
 /// Wrap an incoming request body with [`RequestBodyReadTimeout`] unless the
 /// feature is disabled (`timeout == 0`), in which case the body is returned
 /// untouched. `remaining_length` is preserved via [`StreamingBlob::new`].
-fn guard_put_object_body_read_timeout(
+pub(crate) fn guard_put_object_body_read_timeout(
     body: StreamingBlob,
     bucket: &str,
     key: &str,
