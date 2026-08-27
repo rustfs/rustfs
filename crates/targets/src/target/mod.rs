@@ -960,76 +960,29 @@ pub(crate) fn ensure_rustls_provider_installed() {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
-    use crate::arn::TargetID;
-    use crate::store::{FailedEventStore, Key, QueueStore, Store};
-    use crate::{StoreError, Target, TargetError};
-    use async_trait::async_trait;
+    use super::{QueuedPayload, QueuedPayloadMeta};
+    use crate::Target;
+    use crate::store::QueueStore;
+    use crate::testkit::MockTarget;
     use rustfs_s3_types::EventName;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use uuid::Uuid;
 
-    /// A minimal target for failed-store move tests: every delivery method succeeds, the optional
-    /// store backs the store and failed-store accessors, and final failures land on a shared counter.
-    #[derive(Clone)]
-    pub(crate) struct MoveTestTarget {
-        pub(crate) id: TargetID,
-        pub(crate) store: Option<Arc<QueueStore<QueuedPayload>>>,
-        pub(crate) failed: Arc<AtomicU64>,
-    }
-
-    #[async_trait]
-    impl Target<String> for MoveTestTarget {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-        async fn save(&self, _event: Arc<EntityTarget<String>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-        async fn close(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            self.store
-                .as_deref()
-                .map(|store| store as &(dyn Store<_, Error = StoreError, Key = Key> + Send + Sync))
-        }
-        fn failed_store(&self) -> Option<&dyn FailedEventStore> {
-            self.store.as_deref().map(|store| store as &dyn FailedEventStore)
-        }
-        fn clone_dyn(&self) -> Box<dyn Target<String> + Send + Sync> {
-            Box::new(self.clone())
-        }
-        fn is_enabled(&self) -> bool {
-            true
-        }
-        fn record_final_failure(&self) {
-            self.failed.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
+    /// A minimal target for failed-store move tests: every delivery method succeeds, no store is
+    /// attached, and final failures land on the mock's shared counter.
     pub(crate) fn move_test_target() -> Arc<dyn Target<String> + Send + Sync> {
-        Arc::new(MoveTestTarget {
-            id: TargetID::new("target-a".to_string(), "nats".to_string()),
-            store: None,
-            failed: Arc::new(AtomicU64::new(0)),
-        })
+        Arc::new(MockTarget::new("target-a", "nats"))
     }
 
+    /// Like [`move_test_target`], but the given store backs both the store and failed-store
+    /// accessors, matching a target whose live queue also parks terminal failures.
     pub(crate) fn move_test_target_with_store(store: Arc<QueueStore<QueuedPayload>>) -> Arc<dyn Target<String> + Send + Sync> {
-        Arc::new(MoveTestTarget {
-            id: TargetID::new("target-a".to_string(), "nats".to_string()),
-            store: Some(store),
-            failed: Arc::new(AtomicU64::new(0)),
-        })
+        Arc::new(
+            MockTarget::new("target-a", "nats")
+                .with_store(store.clone())
+                .with_failed_store(store),
+        )
     }
 
     pub(crate) fn failed_store_dir(name: &str) -> PathBuf {
@@ -1472,47 +1425,6 @@ mod tests {
         assert!(dir.starts_with("rustfs-redis-tenant_alpha-"), "unexpected subdir: {dir}");
     }
 
-    #[derive(Clone)]
-    struct StoreBackedTarget {
-        id: TargetID,
-        store: QueueStore<QueuedPayload>,
-    }
-
-    #[async_trait]
-    impl Target<String> for StoreBackedTarget {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<String>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            Some(&self.store)
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<String> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
-    }
-
     #[tokio::test]
     async fn send_from_store_purges_missing_or_empty_entry() {
         let dir = std::env::temp_dir().join(format!("rustfs-send-from-store-{}", Uuid::new_v4()));
@@ -1541,10 +1453,10 @@ mod tests {
             .expect("event file should exist");
         std::fs::write(&event_file, b"").unwrap();
 
-        let target = StoreBackedTarget {
-            id: TargetID::new("primary".to_string(), "webhook".to_string()),
-            store: store.clone(),
-        };
+        // The default send_from_store implementation is under test here, so the mock must not
+        // override it; it only supplies the backing store.
+        let target: Box<dyn Target<String> + Send + Sync> =
+            Box::new(crate::testkit::MockTarget::new("primary", "webhook").with_store(Arc::new(store.clone())));
 
         // A NotFound/empty entry must be purged (index + file) rather than
         // silently skipped and replayed forever.
