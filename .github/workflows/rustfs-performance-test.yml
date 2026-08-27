@@ -1,0 +1,201 @@
+name: RustFS Performance Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_url:
+        description: 'Direct .deb URL (nightly/R2). Defaults to the latest nightly deb.'
+        required: false
+        type: string
+      test_method:
+        description: 'Benchmark method(s) to run (manual runs only; "all" = GET+PUT+MIXED)'
+        type: choice
+        options:
+          - all
+          - get
+          - put
+          - mixed
+        default: 'all'
+      object_size:
+        description: 'Object size(s) to test (manual runs only; "all" = all 10 sizes)'
+        type: choice
+        options:
+          - all
+          - 1KiB
+          - 4KiB
+          - 16KiB
+          - 128KiB
+          - 1MiB
+          - 4MiB
+          - 8MiB
+          - 16MiB
+          - 32MiB
+          - 64MiB
+        default: 'all'
+      warp_duration:
+        description: 'warp duration per round (e.g. 5m, 30s)'
+        required: false
+        default: '5m'
+      warp_concurrency:
+        description: 'warp concurrency'
+        required: false
+        default: '64'
+      cleanup_before:
+        description: 'Reset the nodes before the test (DESTROYS existing data/config)'
+        type: boolean
+        default: true
+      cleanup_after:
+        description: 'Reset the nodes after the test (DESTROYS test data/config)'
+        type: boolean
+        default: true
+  workflow_run:
+    # Run after the nightly build completes; the nightly deb is what the test installs.
+    workflows: ["Nightly GNU Build"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+# The performance test mutates the same shared test environment as the pool
+# expansion and heal tests, so it joins the same concurrency group.
+concurrency:
+  group: rustfs-pool-expansion-test
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+  # Package used by the nightly run (workflow_dispatch inputs are empty for
+  # workflow_run events), i.e. the latest nightly deb published by nightly-gnu.yml.
+  RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+  # Fixed benchmark result directory so later steps can read summary.md
+  RUSTFS_RESULT_DIR: /tmp/rustfs-perf-results
+  # Cross-repo token for writing to rustfs/backlog (set in repo settings)
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+jobs:
+  performance-test:
+    runs-on: smoke-testing
+    timeout-minutes: 900
+    # Run on manual dispatch, or when the nightly build completed successfully.
+    # Skipped when nightly failed.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          warp --version || true
+          df -h /data | tail -1
+
+      - name: Reset test environment (before)
+        if: ${{ inputs.cleanup_before != 'false' }}
+        run: |
+          chmod +x scripts/test/rustfs_performance_test.sh
+          ./scripts/test/rustfs_performance_test.sh --step 1 -y
+
+      - name: Install RustFS package & start cluster (4x4)
+        run: |
+          ARGS=(--steps "2,3,4" -y)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./scripts/test/rustfs_performance_test.sh "${ARGS[@]}"
+
+      - name: Preflight checks
+        run: |
+          ARGS=(--preflight)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./scripts/test/rustfs_performance_test.sh "${ARGS[@]}"
+
+      - name: Run benchmark (GET/PUT/MIXED)
+        id: benchmark
+        run: |
+          # Empty on automatic (workflow_run) runs -> full 30 rounds.
+          # Manual dispatch can restrict method(s)/size(s).
+          export WARP_METHODS="${{ inputs.test_method }}"
+          export WARP_SIZES="${{ inputs.object_size }}"
+          ./scripts/test/rustfs_performance_test.sh \
+            --step 5 -y \
+            --warp-duration "${{ inputs.warp_duration || '5m' }}" \
+            --warp-concurrency "${{ inputs.warp_concurrency || '64' }}" \
+            --log-file /tmp/rustfs-perf-test.log
+
+      - name: Analyze results
+        if: ${{ steps.benchmark.conclusion == 'success' }}
+        run: |
+          ./scripts/test/rustfs_performance_test.sh --step 6 -y
+
+      - name: Post results to backlog issue
+        if: ${{ steps.benchmark.conclusion == 'success' }}
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          RESULT_DIR: ${{ env.RUSTFS_RESULT_DIR }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping issue post"
+            exit 0
+          fi
+          SUMMARY="${RESULT_DIR}/summary.md"
+          [ -f "${SUMMARY}" ] || { echo "summary.md not found at ${SUMMARY}"; exit 1; }
+          DATE="$(date -u +%Y-%m-%d)"
+          {
+            echo "## RustFS nightly build performance testing report"
+            echo ""
+            echo "- **日期**: ${DATE}"
+            echo "- **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- **触发方式**: ${{ github.event_name }}"
+            echo ""
+            cat "${SUMMARY}"
+          } > /tmp/rustfs-perf-issue-body.md
+          TITLE="RustFS nightly build performance testing report"
+          EXISTING="$(gh issue list --repo rustfs/backlog \
+            --search "in:title \"${TITLE}\"" --state all --limit 5 \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "${EXISTING}" ]; then
+            gh issue comment "${EXISTING}" --repo rustfs/backlog --body-file /tmp/rustfs-perf-issue-body.md
+            echo "commented on existing issue #${EXISTING}"
+          else
+            gh issue create --repo rustfs/backlog --title "${TITLE}" --body-file /tmp/rustfs-perf-issue-body.md
+          fi
+
+      - name: Upload test logs & results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-perf-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-perf-test*.log
+            /tmp/rustfs-perf-results/**
+          if-no-files-found: warn
+
+      - name: Reset test environment (after)
+        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        run: |
+          ./scripts/test/rustfs_performance_test.sh --step 7 -y
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS performance test failed"
+          echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+          echo "See the uploaded log artifact for details."
