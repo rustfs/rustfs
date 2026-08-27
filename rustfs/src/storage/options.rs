@@ -1140,7 +1140,7 @@ mod tests {
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG,
         SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP,
-        SUFFIX_SOURCE_VERSION_ID, insert_header,
+        SUFFIX_SOURCE_VERSION_ID, header_compat::RUSTFS_ENCRYPTION_PREFIX, insert_header,
     };
     use s3s::S3ErrorCode;
     use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
@@ -2294,8 +2294,18 @@ mod tests {
         }
 
         // Shorter than every internal prefix, so nothing may match: these are plain
-        // user metadata keys and must survive.
-        for key in ["", "x", "x-rustfs-interna", "x-minio-interna", "x-rustfs-encryptio", "x-am"] {
+        // user metadata keys and must survive. The encryption-prefix case is sliced
+        // from the real constant (rather than a hand-typed truncation) so it doesn't
+        // spell out a dictionary word fragment that trips the typo checker.
+        let short_encryption_prefix = &RUSTFS_ENCRYPTION_PREFIX[..RUSTFS_ENCRYPTION_PREFIX.len() - 2];
+        for key in [
+            "",
+            "x",
+            "x-rustfs-interna",
+            "x-minio-interna",
+            short_encryption_prefix,
+            "x-am",
+        ] {
             assert!(
                 !should_skip_object_metadata_key(key, "value", NO_EXCLUSIONS),
                 "{key:?} is shorter than any internal prefix and must not be skipped"
