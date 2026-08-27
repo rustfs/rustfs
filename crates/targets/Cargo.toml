@@ -13,6 +13,9 @@ documentation = "https://docs.rs/rustfs-targets/latest/rustfs_targets/"
 
 [features]
 default = []
+# Exposes the builder-style `testkit::MockTarget` to downstream test suites. Never enable this
+# from a production `[dependencies]` entry; in-crate unit tests get the module via cfg(test).
+test-support = []
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",

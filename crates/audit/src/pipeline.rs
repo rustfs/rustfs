@@ -564,88 +564,21 @@ impl AuditRuntimeFacade {
 mod tests {
     use super::AuditPipeline;
     use crate::{AuditEntry, AuditError, AuditRegistry};
-    use async_trait::async_trait;
-    use rustfs_targets::arn::TargetID;
-    use rustfs_targets::store::{Key, Store};
-    use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
-    use rustfs_targets::{StoreError, Target, TargetError};
+    use rustfs_targets::testkit::MockTarget;
     use std::sync::Arc;
     use tokio::sync::{Mutex, Notify};
 
-    /// Mock target whose `save()` outcome is fixed at construction so tests can
-    /// force full-success / full-failure / partial-failure fan-outs.
-    #[derive(Clone)]
-    struct MockTarget {
-        id: TargetID,
-        fail: bool,
-        health_gate: Option<(Arc<Notify>, Arc<Notify>)>,
-    }
-
-    impl MockTarget {
-        fn new(id: &str, fail: bool) -> Self {
-            Self {
-                id: TargetID::new(id.to_string(), "webhook".to_string()),
-                fail,
-                health_gate: None,
-            }
-        }
-
-        fn with_health_gate(mut self, started: Arc<Notify>, release: Arc<Notify>) -> Self {
-            self.health_gate = Some((started, release));
-            self
-        }
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for MockTarget
-    where
-        E: rustfs_targets::PluginEvent,
-    {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            if let Some((started, release)) = &self.health_gate {
-                started.notify_one();
-                release.notified().await;
-            }
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            if self.fail {
-                Err(TargetError::Configuration("forced save failure".to_string()))
-            } else {
-                Ok(())
-            }
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
+    /// Builds a mock target whose `save()` outcome is fixed at construction so tests can force
+    /// full-success / full-failure / partial-failure fan-outs.
+    fn mock_target(id: &str, fail: bool) -> MockTarget {
+        let target = MockTarget::new(id, "webhook");
+        if fail { target.with_save_failures(usize::MAX) } else { target }
     }
 
     fn pipeline_with(targets: Vec<MockTarget>) -> AuditPipeline {
         let mut registry = AuditRegistry::new();
         for target in targets {
-            registry.add_target(target.id.to_string(), Box::new(target));
+            registry.add_target(target.target_id().to_string(), Box::new(target));
         }
         AuditPipeline::new(Arc::new(Mutex::new(registry)))
     }
@@ -658,7 +591,7 @@ mod tests {
     // dispatch must return Err rather than swallowing the failures as Ok.
     #[tokio::test]
     async fn dispatch_returns_err_when_all_targets_fail() {
-        let pipeline = pipeline_with(vec![MockTarget::new("a:webhook", true), MockTarget::new("b:webhook", true)]);
+        let pipeline = pipeline_with(vec![mock_target("a:webhook", true), mock_target("b:webhook", true)]);
         let result = pipeline.dispatch(entry()).await;
         assert!(matches!(result, Err(AuditError::Target(_))), "expected Err, got {result:?}");
     }
@@ -667,13 +600,13 @@ mod tests {
     // so dispatch reports success (degradation is logged, not propagated).
     #[tokio::test]
     async fn dispatch_returns_ok_on_partial_failure() {
-        let pipeline = pipeline_with(vec![MockTarget::new("ok:webhook", false), MockTarget::new("bad:webhook", true)]);
+        let pipeline = pipeline_with(vec![mock_target("ok:webhook", false), mock_target("bad:webhook", true)]);
         pipeline.dispatch(entry()).await.expect("partial success should return Ok");
     }
 
     #[tokio::test]
     async fn dispatch_returns_ok_when_all_targets_succeed() {
-        let pipeline = pipeline_with(vec![MockTarget::new("a:webhook", false), MockTarget::new("b:webhook", false)]);
+        let pipeline = pipeline_with(vec![mock_target("a:webhook", false), mock_target("b:webhook", false)]);
         pipeline.dispatch(entry()).await.expect("all-success should return Ok");
     }
 
@@ -686,9 +619,10 @@ mod tests {
 
     #[tokio::test]
     async fn health_probe_does_not_hold_the_registry_lock() {
-        let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let pipeline = pipeline_with(vec![MockTarget::new("blocked", false).with_health_gate(started.clone(), release.clone())]);
+        let target = mock_target("blocked", false).with_health_gate(release.clone());
+        let started = target.health_started();
+        let pipeline = pipeline_with(vec![target]);
         let registry = Arc::clone(&pipeline.registry);
         let snapshot_task = tokio::spawn(async move { pipeline.snapshot_target_health().await });
         started.notified().await;
@@ -706,14 +640,14 @@ mod tests {
     // whole-batch loss instead of returning Ok.
     #[tokio::test]
     async fn dispatch_batch_returns_err_when_all_targets_fail() {
-        let pipeline = pipeline_with(vec![MockTarget::new("a:webhook", true)]);
+        let pipeline = pipeline_with(vec![mock_target("a:webhook", true)]);
         let result = pipeline.dispatch_batch(vec![entry(), entry()]).await;
         assert!(matches!(result, Err(AuditError::Target(_))), "expected Err, got {result:?}");
     }
 
     #[tokio::test]
     async fn dispatch_batch_returns_ok_when_all_targets_succeed() {
-        let pipeline = pipeline_with(vec![MockTarget::new("a:webhook", false), MockTarget::new("b:webhook", false)]);
+        let pipeline = pipeline_with(vec![mock_target("a:webhook", false), mock_target("b:webhook", false)]);
         pipeline
             .dispatch_batch(vec![entry(), entry()])
             .await
