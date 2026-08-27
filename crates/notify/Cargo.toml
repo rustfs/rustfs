@@ -91,6 +91,7 @@ metrics = { workspace = true }
 quick-xml = { workspace = true, features = ["serialize", "serde-types", "encoding"] }
 
 [dev-dependencies]
+rustfs-targets = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 axum = { workspace = true }

@@ -577,76 +577,17 @@ fn warn_audit_state(state: &str, reason: Option<&str>) {
 mod tests {
     use super::{AuditSystem, AuditSystemState};
     use crate::{AuditEntry, AuditError};
-    use async_trait::async_trait;
     use rustfs_targets::ReplayWorkerManager;
-    use rustfs_targets::arn::TargetID;
-    use rustfs_targets::store::{Key, Store};
-    use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
-    use rustfs_targets::{StoreError, Target, TargetError};
+    use rustfs_targets::testkit::MockTarget;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
-
-    #[derive(Clone)]
-    struct TestTarget {
-        close_calls: Arc<AtomicUsize>,
-        id: TargetID,
-    }
-
-    impl TestTarget {
-        fn new(id: &str, name: &str) -> Self {
-            Self {
-                close_calls: Arc::new(AtomicUsize::new(0)),
-                id: TargetID::new(id.to_string(), name.to_string()),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for TestTarget
-    where
-        E: rustfs_targets::PluginEvent,
-    {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            self.close_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            None
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
-    }
 
     #[tokio::test]
     async fn reload_with_empty_config_stops_existing_runtime() {
         let system = AuditSystem::new();
-        let target = TestTarget::new("primary", "webhook");
-        let close_calls = Arc::clone(&target.close_calls);
+        let target = MockTarget::new("primary", "webhook");
+        let observer = target.clone();
 
         {
             let mut registry = system.registry.lock().await;
@@ -671,7 +612,7 @@ mod tests {
         assert_eq!(system.get_state().await, AuditSystemState::Stopped);
         assert!(system.list_targets().await.is_empty());
         assert_eq!(system.runtime_status_snapshot().await, ReplayWorkerManager::new().snapshot(0));
-        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.close_call_count(), 1);
         assert_eq!(*system.config.read().await, Some(rustfs_config::server_config::Config(HashMap::new())));
     }
 
@@ -693,7 +634,7 @@ mod tests {
         // Seed a target + replay worker so both critical sections touch real state.
         {
             let mut registry = system.registry.lock().await;
-            registry.add_target("primary:webhook".to_string(), Box::new(TestTarget::new("primary", "webhook")));
+            registry.add_target("primary:webhook".to_string(), Box::new(MockTarget::new("primary", "webhook")));
         }
         {
             let mut replay_workers = system.stream_cancellers.write().await;
@@ -793,8 +734,8 @@ mod tests {
     async fn commit_closes_old_targets_before_installing_new() {
         let system = AuditSystem::new();
 
-        let old = TestTarget::new("old", "webhook");
-        let old_close = Arc::clone(&old.close_calls);
+        let old = MockTarget::new("old", "webhook");
+        let old_observer = old.clone();
         {
             let mut registry = system.registry.lock().await;
             registry.add_target("old:webhook".to_string(), Box::new(old));
@@ -809,17 +750,17 @@ mod tests {
             *state = AuditSystemState::Running;
         }
 
-        let new = TestTarget::new("new", "webhook");
-        let new_close = Arc::clone(&new.close_calls);
+        let new = MockTarget::new("new", "webhook");
+        let new_observer = new.clone();
         system
             .commit_runtime_targets(vec![Box::new(new)], AuditSystemState::Running)
             .await
             .expect("commit should succeed");
 
         // Old target closed exactly once during the pre-install shutdown.
-        assert_eq!(old_close.load(Ordering::SeqCst), 1);
+        assert_eq!(old_observer.close_call_count(), 1);
         // New target installed and left open.
-        assert_eq!(new_close.load(Ordering::SeqCst), 0);
+        assert_eq!(new_observer.close_call_count(), 0);
         assert_eq!(system.list_targets().await, vec!["new:webhook".to_string()]);
         // Old replay worker stopped; the store-less new target adds none.
         assert_eq!(system.runtime_status_snapshot().await.replay_worker_count, 0);

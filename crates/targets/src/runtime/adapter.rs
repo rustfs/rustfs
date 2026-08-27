@@ -441,13 +441,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{BuiltinPluginRuntimeAdapter, MAX_PARALLEL_STORE_OPENS, PluginRuntimeAdapter};
-    use crate::PluginEvent;
-    use crate::arn::TargetID;
     use crate::store::{Key, QueueStore, Store};
-    use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
-    use crate::{StoreError, Target, TargetError};
-    use async_trait::async_trait;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::target::QueuedPayload;
+    use crate::testkit::MockTarget;
+    use crate::{StoreError, Target};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
     use tempfile::tempdir;
@@ -569,96 +566,14 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
-    struct TestTarget {
-        close_calls: Arc<AtomicUsize>,
-        id: TargetID,
-        init_calls: Arc<AtomicUsize>,
-        init_entered: Option<Arc<Notify>>,
-        init_fails: bool,
-        store: Option<Arc<TestStore>>,
-    }
-
-    impl TestTarget {
-        fn new(id: &str, name: &str) -> Self {
-            Self {
-                close_calls: Arc::new(AtomicUsize::new(0)),
-                id: TargetID::new(id.to_string(), name.to_string()),
-                init_calls: Arc::new(AtomicUsize::new(0)),
-                init_entered: None,
-                init_fails: false,
-                store: None,
-            }
-        }
-
-        fn with_failed_init(mut self) -> Self {
-            self.init_fails = true;
-            self
-        }
-
-        fn with_pending_init(mut self, init_entered: Arc<Notify>) -> Self {
-            self.init_entered = Some(init_entered);
-            self
-        }
-
-        fn with_store(mut self) -> Self {
-            let dir = tempdir().expect("tempdir should be created for queue store tests");
-            let store = QueueStore::<QueuedPayload>::new(dir.path(), 16, ".queue");
-            store.open().expect("queue store should open");
-            self.store = Some(Arc::new(store));
-            self
-        }
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for TestTarget
-    where
-        E: PluginEvent,
-    {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            self.close_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            self.store.as_deref()
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        async fn init(&self) -> Result<(), TargetError> {
-            self.init_calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(init_entered) = &self.init_entered {
-                init_entered.notify_one();
-                return std::future::pending().await;
-            }
-            if self.init_fails {
-                return Err(TargetError::Configuration("forced init failure".to_string()));
-            }
-            Ok(())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
+    /// Builds the tempdir-backed, already-opened queue store the store-backed mock targets use.
+    /// The tempdir handle is dropped here on purpose, matching the previous in-module mock: these
+    /// tests never write through the store, they only need an openable handle.
+    fn opened_queue_store() -> Arc<TestStore> {
+        let dir = tempdir().expect("tempdir should be created for queue store tests");
+        let store = QueueStore::<QueuedPayload>::new(dir.path(), 16, ".queue");
+        store.open().expect("queue store should open");
+        Arc::new(store)
     }
 
     fn builtin_adapter() -> BuiltinPluginRuntimeAdapter<String> {
@@ -684,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn builtin_adapter_skips_non_store_target_when_init_fails() {
         let adapter = builtin_adapter();
-        let target = TestTarget::new("primary", "webhook").with_failed_init();
+        let target = MockTarget::new("primary", "webhook").with_init_failures(usize::MAX);
 
         let activation = adapter.activate_with_replay(vec![Box::new(target)]).await;
 
@@ -695,7 +610,9 @@ mod tests {
     #[tokio::test]
     async fn builtin_adapter_keeps_store_backed_target_when_init_fails() {
         let adapter = builtin_adapter();
-        let target = TestTarget::new("primary", "webhook").with_failed_init().with_store();
+        let target = MockTarget::new("primary", "webhook")
+            .with_init_failures(usize::MAX)
+            .with_store(opened_queue_store());
 
         let activation = adapter.activate_with_replay(vec![Box::new(target)]).await;
 
@@ -706,7 +623,9 @@ mod tests {
     #[tokio::test]
     async fn prepared_store_target_reports_init_failure_without_dropping_queue_runtime() {
         let adapter = builtin_adapter();
-        let target = TestTarget::new("primary", "webhook").with_failed_init().with_store();
+        let target = MockTarget::new("primary", "webhook")
+            .with_init_failures(usize::MAX)
+            .with_store(opened_queue_store());
 
         let prepared = adapter.prepare_targets(vec![Box::new(target)]).await;
         assert_eq!(prepared.targets.len(), 1);
@@ -729,11 +648,10 @@ mod tests {
     async fn cancellable_preparation_returns_current_and_remaining_targets_for_shutdown() {
         let adapter = builtin_adapter();
         let init_entered = Arc::new(Notify::new());
-        let first = TestTarget::new("first", "webhook").with_pending_init(init_entered.clone());
-        let first_close_calls = first.close_calls.clone();
-        let second = TestTarget::new("second", "webhook");
-        let second_close_calls = second.close_calls.clone();
-        let second_init_calls = second.init_calls.clone();
+        let first = MockTarget::new("first", "webhook").with_blocking_init(init_entered.clone());
+        let first_observer = first.clone();
+        let second = MockTarget::new("second", "webhook");
+        let second_observer = second.clone();
         let cancellation = CancellationToken::new();
         let prepare_adapter = adapter.clone();
         let prepare_cancellation = cancellation.clone();
@@ -755,9 +673,9 @@ mod tests {
             .close_prepared(prepared)
             .await
             .expect("cancelled targets should close");
-        assert_eq!(first_close_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_close_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(second_init_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(first_observer.close_call_count(), 1);
+        assert_eq!(second_observer.close_call_count(), 1);
+        assert_eq!(second_observer.init_call_count(), 0);
     }
 
     #[tokio::test]
@@ -765,8 +683,11 @@ mod tests {
         let adapter = builtin_adapter();
         let dir = tempdir().expect("tempdir should be created");
         let queue_path = dir.path().join("queue");
-        let mut target = TestTarget::new("primary", "webhook");
-        target.store = Some(Arc::new(QueueStore::<QueuedPayload>::new(&queue_path, 16, ".queue")));
+        let target = MockTarget::new("primary", "webhook").with_store(Arc::new(QueueStore::<QueuedPayload>::new(
+            &queue_path,
+            16,
+            ".queue",
+        )));
 
         let prepared = adapter.prepare_targets(vec![Box::new(target)]).await;
         assert!(!queue_path.exists(), "dormant preparation must not open the queue store");
@@ -789,15 +710,18 @@ mod tests {
         let dir = tempdir().expect("tempdir should be created");
         let invalid_base = dir.path().join("not-a-directory");
         std::fs::write(&invalid_base, b"file").expect("invalid queue base should be created");
-        let mut target = TestTarget::new("primary", "webhook");
-        let close_calls = target.close_calls.clone();
-        target.store = Some(Arc::new(QueueStore::<QueuedPayload>::new(&invalid_base, 16, ".queue")));
+        let target = MockTarget::new("primary", "webhook").with_store(Arc::new(QueueStore::<QueuedPayload>::new(
+            &invalid_base,
+            16,
+            ".queue",
+        )));
+        let observer = target.clone();
 
         let activation = adapter.activate_with_replay(vec![Box::new(target)]).await;
 
         assert!(activation.targets.is_empty());
         assert!(activation.replay_workers.is_empty());
-        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.close_call_count(), 1);
     }
 
     #[tokio::test]
@@ -810,14 +734,13 @@ mod tests {
         let mut targets: Vec<Box<dyn Target<String> + Send + Sync>> = Vec::with_capacity(TARGETS);
         let mut expected_ids = Vec::with_capacity(TARGETS);
         for index in 0..TARGETS {
-            let mut target = TestTarget::new(&format!("target-{index}"), "webhook");
-            expected_ids.push(target.id.to_string());
             let open_gate = gate.clone();
-            target.store = Some(Arc::new(TestOpenStore {
+            let target = MockTarget::new(&format!("target-{index}"), "webhook").with_store(Arc::new(TestOpenStore {
                 before_clone: Arc::new(|| {}),
                 before_open: Arc::new(move || open_gate.enter()),
                 store: QueueStore::new(dir.path().join(index.to_string()), 16, ".queue"),
             }));
+            expected_ids.push(target.target_id().to_string());
             targets.push(Box::new(target));
         }
 
@@ -848,13 +771,12 @@ mod tests {
     async fn panicking_store_open_rejects_and_closes_only_that_target() {
         let adapter = builtin_adapter();
         let dir = tempdir().expect("tempdir should be created");
-        let mut target = TestTarget::new("panicking", "webhook");
-        let close_calls = target.close_calls.clone();
-        target.store = Some(Arc::new(TestOpenStore {
+        let target = MockTarget::new("panicking", "webhook").with_store(Arc::new(TestOpenStore {
             before_clone: Arc::new(|| {}),
             before_open: Arc::new(|| panic!("forced store open panic: do-not-expose-payload")),
             store: QueueStore::new(dir.path(), 16, ".queue"),
         }));
+        let observer = target.clone();
 
         let prepared = adapter.prepare_targets(vec![Box::new(target)]).await;
         let (opened, rejected) = adapter.open_prepared_stores(prepared);
@@ -875,20 +797,19 @@ mod tests {
             .close_prepared(rejected)
             .await
             .expect("a target rejected after a store panic should close");
-        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.close_call_count(), 1);
     }
 
     #[tokio::test]
     async fn panicking_store_clone_cannot_publish_target_without_replay_worker() {
         let adapter = builtin_adapter();
         let dir = tempdir().expect("tempdir should be created");
-        let mut target = TestTarget::new("panicking-clone", "webhook");
-        let close_calls = target.close_calls.clone();
-        target.store = Some(Arc::new(TestOpenStore {
+        let target = MockTarget::new("panicking-clone", "webhook").with_store(Arc::new(TestOpenStore {
             before_clone: Arc::new(|| panic!("forced store clone panic: do-not-expose-payload")),
             before_open: Arc::new(|| {}),
             store: QueueStore::new(dir.path(), 16, ".queue"),
         }));
+        let observer = target.clone();
 
         let prepared = adapter.prepare_targets(vec![Box::new(target)]).await;
         let (opened, open_rejected) = adapter.open_prepared_stores(prepared);
@@ -906,14 +827,14 @@ mod tests {
             .close_prepared(rejected)
             .await
             .expect("a target rejected during replay activation should close");
-        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.close_call_count(), 1);
     }
 
     #[tokio::test]
     async fn builtin_adapter_shutdown_clears_runtime_and_replay_workers() {
         let adapter = builtin_adapter();
-        let target = TestTarget::new("primary", "webhook");
-        let close_calls = Arc::clone(&target.close_calls);
+        let target = MockTarget::new("primary", "webhook");
+        let observer = target.clone();
         let mut runtime = crate::runtime::TargetRuntimeManager::new();
         let mut replay_workers = crate::runtime::ReplayWorkerManager::new();
 
@@ -933,6 +854,6 @@ mod tests {
 
         assert!(runtime.is_empty());
         assert!(replay_workers.is_empty());
-        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.close_call_count(), 1);
     }
 }

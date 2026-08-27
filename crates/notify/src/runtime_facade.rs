@@ -409,107 +409,13 @@ mod tests {
         Event, integration::NotificationMetrics, notifier::EventNotifier, rule_engine::NotifyRuleEngine,
         runtime_view::NotifyRuntimeView,
     };
-    use async_trait::async_trait;
     use rustfs_targets::arn::TargetID;
-    use rustfs_targets::store::{Key, QueueStore, Store};
-    use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
-    use rustfs_targets::{ReplayWorkerManager, SharedTarget, StoreError, Target, TargetError};
+    use rustfs_targets::store::QueueStore;
+    use rustfs_targets::target::QueuedPayload;
+    use rustfs_targets::testkit::MockTarget;
+    use rustfs_targets::{ReplayWorkerManager, SharedTarget, TargetError};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::{Notify, RwLock, Semaphore};
-
-    #[derive(Clone)]
-    struct TestTarget {
-        close_entered: Option<Arc<Notify>>,
-        close_error: bool,
-        close_release: Option<Arc<Notify>>,
-        close_calls: Arc<AtomicUsize>,
-        id: TargetID,
-        store: Option<QueueStore<QueuedPayload>>,
-    }
-
-    impl TestTarget {
-        fn new(id: &str, name: &str) -> Self {
-            Self {
-                close_entered: None,
-                close_error: false,
-                close_release: None,
-                close_calls: Arc::new(AtomicUsize::new(0)),
-                id: TargetID::new(id.to_string(), name.to_string()),
-                store: None,
-            }
-        }
-
-        fn with_blocking_close(mut self, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
-            self.close_entered = Some(entered);
-            self.close_release = Some(release);
-            self
-        }
-
-        fn with_close_error(mut self) -> Self {
-            self.close_error = true;
-            self
-        }
-
-        fn with_store(mut self, store: QueueStore<QueuedPayload>) -> Self {
-            self.store = Some(store);
-            self
-        }
-    }
-
-    #[async_trait]
-    impl<E> Target<E> for TestTarget
-    where
-        E: rustfs_targets::PluginEvent,
-    {
-        fn id(&self) -> TargetID {
-            self.id.clone()
-        }
-
-        async fn is_active(&self) -> Result<bool, TargetError> {
-            Ok(true)
-        }
-
-        async fn save(&self, _event: Arc<EntityTarget<E>>) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn send_raw_from_store(&self, _key: Key, _body: Vec<u8>, _meta: QueuedPayloadMeta) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        async fn close(&self) -> Result<(), TargetError> {
-            self.close_calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(entered) = &self.close_entered {
-                entered.notify_one();
-            }
-            if let Some(release) = &self.close_release {
-                release.notified().await;
-            }
-            if self.close_error {
-                return Err(TargetError::Storage("forced close failure".to_string()));
-            }
-            Ok(())
-        }
-
-        fn store(&self) -> Option<&(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync)> {
-            self.store
-                .as_ref()
-                .map(|store| store as &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync))
-        }
-
-        fn clone_dyn(&self) -> Box<dyn Target<E> + Send + Sync> {
-            Box::new(self.clone())
-        }
-
-        async fn init(&self) -> Result<(), TargetError> {
-            Ok(())
-        }
-
-        fn is_enabled(&self) -> bool {
-            true
-        }
-    }
 
     fn build_facade() -> (NotifyRuntimeFacade, Arc<EventNotifier>, Arc<RwLock<ReplayWorkerManager>>) {
         let metrics = Arc::new(NotificationMetrics::new());
@@ -555,8 +461,8 @@ mod tests {
     async fn compatibility_activation_stays_dormant_until_ordered_replace() {
         let (facade, _, replay_workers) = build_facade();
         let queue_root = tempfile::tempdir().expect("queue root");
-        let store = QueueStore::new_with_compression(queue_root.path(), 16, ".event", false);
-        let target = TestTarget::new("primary", "webhook").with_store(store);
+        let store = QueueStore::<QueuedPayload>::new_with_compression(queue_root.path(), 16, ".event", false);
+        let target = MockTarget::new("primary", "webhook").with_store(Arc::new(store));
 
         let activation = facade.activate_targets_with_replay(vec![Box::new(target)]).await;
         assert_eq!(activation.targets.len(), 1);
@@ -574,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_facade_replace_targets_commits_runtime_state() {
         let (facade, notifier, replay_workers) = build_facade();
-        let target = TestTarget::new("primary", "webhook");
+        let target = MockTarget::new("primary", "webhook");
         let activation = rustfs_targets::RuntimeActivation {
             replay_workers: ReplayWorkerManager::new(),
             targets: vec![Arc::new(target) as SharedTarget<Event>],
@@ -594,9 +500,9 @@ mod tests {
     #[tokio::test]
     async fn runtime_queries_do_not_wait_for_target_close() {
         let (facade, notifier, replay_workers) = build_facade();
-        let close_entered = Arc::new(Notify::new());
-        let close_release = Arc::new(Notify::new());
-        let target = TestTarget::new("primary", "webhook").with_blocking_close(close_entered.clone(), close_release.clone());
+        let target = MockTarget::new("primary", "webhook");
+        target.set_block_on_close(true);
+        let observer = target.clone();
         facade
             .replace_targets(rustfs_targets::RuntimeActivation {
                 replay_workers: ReplayWorkerManager::new(),
@@ -609,12 +515,12 @@ mod tests {
             let facade = facade.clone();
             async move { facade.shutdown_checked().await }
         });
-        close_entered.notified().await;
+        observer.close_started().notified().await;
 
         let target_list = notifier.target_list();
         assert!(target_list.try_read().is_ok(), "target list lock must not be held during close");
         assert!(replay_workers.try_read().is_ok(), "replay manager lock must not be held during close");
-        close_release.notify_one();
+        observer.close_gate().add_permits(1);
         shutdown
             .await
             .expect("shutdown task should not panic")
@@ -664,7 +570,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_returns_close_error_after_detaching_runtime() {
         let (facade, notifier, replay_workers) = build_facade();
-        let target = TestTarget::new("primary", "webhook").with_close_error();
+        let target = MockTarget::new("primary", "webhook").with_close_failures(usize::MAX);
         facade
             .replace_targets(rustfs_targets::RuntimeActivation {
                 replay_workers: ReplayWorkerManager::new(),
@@ -686,9 +592,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_bounds_a_target_that_never_closes() {
         let (facade, notifier, replay_workers) = build_facade();
-        let close_entered = Arc::new(Notify::new());
-        let never_release = Arc::new(Notify::new());
-        let target = TestTarget::new("primary", "webhook").with_blocking_close(close_entered.clone(), never_release);
+        // The close gate never receives a permit, so this target's close blocks forever.
+        let target = MockTarget::new("primary", "webhook");
+        target.set_block_on_close(true);
+        let observer = target.clone();
         facade
             .replace_targets(rustfs_targets::RuntimeActivation {
                 replay_workers: ReplayWorkerManager::new(),
@@ -701,7 +608,7 @@ mod tests {
             let facade = facade.clone();
             async move { facade.shutdown_checked().await }
         });
-        close_entered.notified().await;
+        observer.close_started().notified().await;
         tokio::time::advance(super::TARGET_CLOSE_TIMEOUT).await;
 
         let err = shutdown
