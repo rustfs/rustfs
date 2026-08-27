@@ -16,14 +16,10 @@ use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
-use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
 };
-use serial_test::serial;
 use std::env;
-use std::time::Duration;
-use uuid::Uuid;
 
 struct Settings {
     oss_endpoint: String,
@@ -31,8 +27,6 @@ struct Settings {
     oss_secret_key: String,
     oss_bucket_name: String,
     oss_lifecycle_days: i32,
-    #[allow(dead_code)]
-    oss_secure: bool,
     oss_region: String,
 }
 
@@ -44,7 +38,6 @@ impl Settings {
             oss_secret_key: "rustfsadmin".to_string(),
             oss_bucket_name: "mblock99".to_string(),
             oss_lifecycle_days: 1,
-            oss_secure: false,
             oss_region: "us-east-1".to_string(),
         }
     }
@@ -74,10 +67,6 @@ impl Oss {
             bucket_name: settings.oss_bucket_name.clone(),
             lifecycle_days: settings.oss_lifecycle_days,
         })
-    }
-
-    fn new_uuid(&self) -> String {
-        Uuid::new_v4().to_string()
     }
 
     async fn create_bucket(&self) -> Result<()> {
@@ -136,49 +125,9 @@ impl Oss {
 
         Ok(())
     }
-
-    #[allow(dead_code)]
-    async fn upload_file(&self, filename: &str, content: &[u8]) -> Result<String> {
-        let ext = std::path::Path::new(filename)
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-
-        let uuid = self.new_uuid();
-        let object_name = if ext.is_empty() { uuid } else { format!("{}.{}", uuid, ext) };
-
-        self.client
-            .put_object()
-            .bucket(&self.bucket_name)
-            .key(&object_name)
-            .body(content.to_vec().into())
-            .send()
-            .await
-            .context("Failed to upload file")?;
-
-        Ok(object_name)
-    }
-
-    #[allow(dead_code)]
-    async fn get_presigned_url(&self, filename: &str) -> Result<String> {
-        let expires_in = Duration::from_secs((self.lifecycle_days * 24 * 60 * 60) as u64);
-        let presigning_config = PresigningConfig::expires_in(expires_in)?;
-
-        let presigned_req = self
-            .client
-            .get_object()
-            .bucket(&self.bucket_name)
-            .key(filename)
-            .presigned(presigning_config)
-            .await
-            .context("Failed to get presigned URL")?;
-
-        Ok(presigned_req.uri().to_string())
-    }
 }
 
 #[tokio::test]
-#[serial]
 #[ignore = "requires a running RustFS server at TEST_RUSTFS_SERVER (default http://localhost:9000)"]
 async fn test_lifecycle_minio_sdk() -> Result<()> {
     let settings = Settings::new();

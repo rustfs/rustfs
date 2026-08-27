@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Manual concurrent-download performance tool: requires a running RustFS server
+//! configured via `DOWNLOAD_*` env vars. Run with
+//! `cargo run -p rustfs --example concurrent_download_tool`.
+
 use anyhow::{Context, Result, anyhow};
 use futures::stream::{self, StreamExt};
 use reqwest::{Client, Url};
@@ -368,9 +372,8 @@ async fn run_concurrent_downloads(settings: DownloadSettings) -> Result<Download
     })
 }
 
-#[tokio::test]
-#[ignore = "manual performance tool: requires a running RustFS server configured via env vars"]
-async fn concurrent_download_tool() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let settings = DownloadSettings::from_env()?;
     let summary = run_concurrent_downloads(settings).await?;
 
