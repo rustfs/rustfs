@@ -31,15 +31,11 @@
 //!
 //! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-3p3x-734c-h5vx>
 
-use crate::common::local_http_client;
 use crate::common::rustfs_binary_path_with_features;
+use crate::common::{AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via};
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
-use http::header::{CONTENT_TYPE, HOST};
 use reqwest::Client;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use s3s::Body;
 use tokio::process::Command;
 use tracing::info;
 
@@ -67,92 +63,43 @@ fn basic_auth_header_for(access_key: &str, secret_key: &str) -> String {
     format!("Basic {}", encoded)
 }
 
-async fn signed_admin_request(
-    method: http::Method,
-    url: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri
-        .authority()
-        .ok_or_else(|| anyhow::anyhow!("request URL missing authority"))?
-        .to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(
-        request.body(Body::empty())?,
-        content_len,
+async fn admin_create_user(base_url: &str, username: &str, secret_key: &str) -> Result<()> {
+    admin_create_user_via(
+        AdminTransport::Signed,
+        base_url,
         DEFAULT_ACCESS_KEY,
         DEFAULT_SECRET_KEY,
-        "",
-        "us-east-1",
-    );
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let mut request_builder = local_http_client().request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
-}
-
-async fn admin_create_user(base_url: &str, username: &str, secret_key: &str) -> Result<()> {
-    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", base_url, username);
-    let body = serde_json::json!({
-        "secretKey": secret_key,
-        "status": "enabled"
-    });
-    let response =
-        signed_admin_request(http::Method::PUT, &url, Some(body.to_string().into_bytes()), Some("application/json")).await?;
-
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("create user failed: {status} {body}");
-    }
-
-    Ok(())
+        username,
+        secret_key,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 async fn admin_add_canned_policy(base_url: &str, policy_name: &str, policy: &serde_json::Value) -> Result<()> {
-    let url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", base_url, policy_name);
-    let response =
-        signed_admin_request(http::Method::PUT, &url, Some(policy.to_string().into_bytes()), Some("application/json")).await?;
-
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("add canned policy failed: {status} {body}");
-    }
-
-    Ok(())
+    admin_add_canned_policy_via(
+        AdminTransport::Signed,
+        base_url,
+        DEFAULT_ACCESS_KEY,
+        DEFAULT_SECRET_KEY,
+        policy_name,
+        &policy.to_string(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 async fn admin_attach_policy_to_user(base_url: &str, policy_name: &str, username: &str) -> Result<()> {
-    let url = format!(
-        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=false",
-        base_url, policy_name, username
-    );
-    let response = signed_admin_request(http::Method::PUT, &url, Some(Vec::new()), None).await?;
-
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("attach policy failed: {status} {body}");
-    }
-
-    Ok(())
+    admin_attach_user_policy_via(
+        AdminTransport::Signed,
+        base_url,
+        DEFAULT_ACCESS_KEY,
+        DEFAULT_SECRET_KEY,
+        policy_name,
+        username,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Test WebDAV: MKCOL (create bucket), PUT, GET, DELETE, PROPFIND operations

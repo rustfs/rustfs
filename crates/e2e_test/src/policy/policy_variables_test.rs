@@ -15,28 +15,24 @@
 //! Tests for AWS IAM policy variables with single-value, multi-value, and nested scenarios
 
 use crate::common::{
-    RustFSTestEnvironment, awscurl_delete, awscurl_put, build_test_s3_config, build_test_sts_client, init_logging,
+    AdminTransport, RustFSTestEnvironment, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via,
+    awscurl_delete, awscurl_put, build_test_s3_config, build_test_sts_client, init_logging,
 };
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use tracing::info;
 
-/// Helper function to create a regular user with given credentials
+/// Helper function to create a regular user with given credentials.
+///
+/// This suite deliberately drives the admin API through the external `awscurl`
+/// binary, so the shared helpers are pinned to `AdminTransport::Awscurl`.
 async fn create_user(
     env: &RustFSTestEnvironment,
     username: &str,
     password: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let create_user_body = serde_json::json!({
-        "secretKey": password,
-        "status": "enabled"
-    })
-    .to_string();
-
-    let create_user_url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
-    awscurl_put(&create_user_url, &create_user_body, &env.access_key, &env.secret_key).await?;
-    Ok(())
+    admin_create_user_via(AdminTransport::Awscurl, &env.url, &env.access_key, &env.secret_key, username, password).await
 }
 
 /// Helper function to create and attach a policy
@@ -46,18 +42,17 @@ async fn create_and_attach_policy(
     username: &str,
     policy_document: serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let policy_string = policy_document.to_string();
-
-    // Create policy
-    let add_policy_url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", env.url, policy_name);
-    awscurl_put(&add_policy_url, &policy_string, &env.access_key, &env.secret_key).await?;
-
-    // Attach policy to user
-    let attach_policy_url = format!(
-        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=false",
-        env.url, policy_name, username
-    );
-    awscurl_put(&attach_policy_url, "", &env.access_key, &env.secret_key).await?;
+    admin_add_canned_policy_via(
+        AdminTransport::Awscurl,
+        &env.url,
+        &env.access_key,
+        &env.secret_key,
+        policy_name,
+        &policy_document.to_string(),
+    )
+    .await?;
+    admin_attach_user_policy_via(AdminTransport::Awscurl, &env.url, &env.access_key, &env.secret_key, policy_name, username)
+        .await?;
     Ok(())
 }
 

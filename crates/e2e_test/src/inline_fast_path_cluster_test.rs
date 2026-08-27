@@ -21,7 +21,7 @@
 //! One S3 GET can select readers on multiple EC nodes, so the counter tracks
 //! distributed reader selection rather than HTTP request count.
 
-use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging, local_http_client};
+use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -30,7 +30,7 @@ use aws_sdk_s3::types::{
 };
 use bytes::Bytes;
 use flate2::read::GzDecoder;
-use http::header::{CONTENT_ENCODING, HOST};
+use http::header::CONTENT_ENCODING;
 use http::{Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -42,9 +42,6 @@ use opentelemetry_proto::tonic::metrics::v1::{
     Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric, number_data_point,
 };
 use prost::Message;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use s3s::Body;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::error::Error;
@@ -1262,6 +1259,8 @@ async fn put_two_part_multipart(client: &Client, bucket: &str, key: &str) -> Tes
     Ok((body, part2, complete.e_tag().map(str::to_owned)))
 }
 
+/// Thin wrapper over [`crate::common::admin_request`], kept local so the call
+/// sites below keep their `Option<&str>` body shape.
 async fn signed_admin_request(
     base_url: &str,
     method: Method,
@@ -1270,30 +1269,7 @@ async fn signed_admin_request(
     access_key: &str,
     secret_key: &str,
 ) -> TestResult<(reqwest::StatusCode, String)> {
-    let url = format!("{base_url}{path}");
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let body_bytes = body.map(|value| value.as_bytes().to_vec()).unwrap_or_default();
-
-    let request = http::Request::builder()
-        .method(method.clone())
-        .uri(uri)
-        .header(HOST, authority)
-        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    let signed = sign_v4(request.body(Body::empty())?, 0, access_key, secret_key, "", "us-east-1");
-
-    let client = local_http_client();
-    let mut request_builder = client.request(method, url.as_str());
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if !body_bytes.is_empty() {
-        request_builder = request_builder.body(body_bytes);
-    }
-    let response = request_builder.send().await?;
-    let status = response.status();
-    let text = response.text().await?;
-    Ok((status, text))
+    crate::common::admin_request(base_url, method, path, body.map(str::to_string), access_key, secret_key).await
 }
 
 fn unique_tier_name() -> String {

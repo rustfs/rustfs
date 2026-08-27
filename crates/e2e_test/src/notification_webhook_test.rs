@@ -38,14 +38,10 @@ use aws_sdk_s3::types::{
     NotificationConfiguration, NotificationConfigurationFilter, ObjectIdentifier, QueueConfiguration, S3KeyFilter,
     VersioningConfiguration,
 };
-use http::header::{CONTENT_TYPE, HOST};
 use local_ip_address::local_ip;
 use reqwest::StatusCode;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
 use rustfs_utils::egress::ENV_OUTBOUND_ALLOW_ORIGINS;
 use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
-use s3s::Body;
 use serde_json::Value;
 use std::error::Error;
 use std::io::Cursor;
@@ -415,42 +411,16 @@ async fn collect_until(
 // Admin target configuration (signed admin HTTP)
 // ---------------------------------------------------------------------------
 
+/// Thin wrapper over [`crate::common::signed_request`] with this suite's
+/// root credentials; a `Some` body is always JSON here.
 async fn signed_admin_request(
     env: &RustFSTestEnvironment,
     method: http::Method,
     url: &str,
     body: Option<Vec<u8>>,
 ) -> Result<reqwest::Response, BoxError> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("admin URL missing authority")?.to_string();
-    let mut builder = http::Request::builder()
-        .method(method.clone())
-        .uri(uri)
-        .header(HOST, authority)
-        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if body.is_some() {
-        builder = builder.header(CONTENT_TYPE, "application/json");
-    }
-
-    let content_len = body.as_ref().map(|b| b.len() as i64).unwrap_or_default();
-    let signed = sign_v4(
-        builder.body(Body::empty())?,
-        content_len,
-        &env.access_key,
-        &env.secret_key,
-        "",
-        "us-east-1",
-    );
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let mut request = crate::common::local_http_client().request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request = request.header(name, value);
-    }
-    if let Some(body) = body {
-        request = request.body(body);
-    }
-    Ok(request.send().await?)
+    let content_type = body.is_some().then_some("application/json");
+    crate::common::signed_request(method, url, &env.access_key, &env.secret_key, body, content_type).await
 }
 
 async fn enable_notify_module(env: &RustFSTestEnvironment) -> TestResult {

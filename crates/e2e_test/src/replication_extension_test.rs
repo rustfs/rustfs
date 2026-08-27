@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::common::{
-    RustFSTestEnvironment, admin_create_user, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
-    replication_fast_env, rustfs_binary_path, signed_request, signed_request_with_client, signed_request_with_session_token,
+    AdminTransport, RustFSTestEnvironment, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user,
+    awscurl_post_sts_form_urlencoded, init_logging, local_http_client, replication_fast_env, rustfs_binary_path, signed_request,
+    signed_request_with_client, signed_request_with_session_token,
 };
 use crate::fake_s3_target::{
     FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FaultAction as FakeTargetFault, Operation as FakeTargetOperation,
@@ -25,7 +26,7 @@ use crate::kms::common::{
     sse_customer_key_md5_base64,
 };
 use crate::storage_api::replication_extension::BucketTargetSys;
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::primitives::ByteStream;
@@ -33,7 +34,6 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DeleteMarkerEntry, ObjectVersion, ServerSideEncryption,
     VersioningConfiguration,
 };
-use aws_sdk_s3::{Client, Config};
 use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
@@ -895,15 +895,7 @@ async fn wait_for_replicated_object_over_https(
 }
 
 fn create_user_s3_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str) -> Client {
-    let credentials = Credentials::new(access_key, secret_key, None, None, "e2e-site-replication");
-    let config = Config::builder()
-        .credentials_provider(credentials)
-        .region(Region::new("us-east-1"))
-        .endpoint_url(&env.url)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-    Client::from_conf(config)
+    env.create_s3_client_with_credentials(access_key, secret_key)
 }
 
 async fn admin_add_canned_policy(
@@ -911,24 +903,15 @@ async fn admin_add_canned_policy(
     policy_name: &str,
     policy: &serde_json::Value,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", env.url, policy_name);
-    let response = signed_request(
-        http::Method::PUT,
-        &url,
+    admin_add_canned_policy_via(
+        AdminTransport::Signed,
+        &env.url,
         &env.access_key,
         &env.secret_key,
-        Some(policy.to_string().into_bytes()),
-        Some("application/json"),
+        policy_name,
+        &policy.to_string(),
     )
-    .await?;
-
-    if response.status() != StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("add canned policy failed: {status} {body}").into());
-    }
-
-    Ok(())
+    .await
 }
 
 async fn admin_attach_policy_to_user(
@@ -936,19 +919,7 @@ async fn admin_attach_policy_to_user(
     policy_name: &str,
     username: &str,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let url = format!(
-        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=false",
-        env.url, policy_name, username
-    );
-    let response = signed_request(http::Method::PUT, &url, &env.access_key, &env.secret_key, Some(Vec::new()), None).await?;
-
-    if response.status() != StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("attach policy to user failed: {status} {body}").into());
-    }
-
-    Ok(())
+    admin_attach_user_policy_via(AdminTransport::Signed, &env.url, &env.access_key, &env.secret_key, policy_name, username).await
 }
 
 async fn admin_update_group_members(
