@@ -11866,7 +11866,7 @@ mod tests {
         let mod_time = OffsetDateTime::now_utc();
         let version = rustfs_filemeta::FileInfo {
             mod_time: Some(mod_time),
-            metadata: HashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
+            metadata: AHashMap::from([("x-amz-meta-key".to_string(), "value".to_string())]),
             ..Default::default()
         };
 

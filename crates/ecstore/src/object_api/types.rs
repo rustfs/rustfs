@@ -1812,7 +1812,7 @@ mod tests {
             storageclass::GLACIER,
         ] {
             let fi = FileInfo {
-                metadata: HashMap::from([(AMZ_STORAGE_CLASS.to_string(), legacy_label.to_string())]),
+                metadata: AHashMap::from([(AMZ_STORAGE_CLASS.to_string(), legacy_label.to_string())]),
                 ..Default::default()
             };
 

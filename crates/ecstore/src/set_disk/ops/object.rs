@@ -77,7 +77,6 @@ use rustfs_lock::LockManager;
 use rustfs_rio::EtagResolvable;
 use rustfs_rio::HashReaderMut;
 use rustfs_rio::TryGetIndex;
-use rustfs_utils::http::HeaderExt;
 use tokio::io::AsyncWriteExt;
 
 #[cfg(all(test, feature = "test-util"))]
