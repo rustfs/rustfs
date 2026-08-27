@@ -7023,6 +7023,29 @@ mod tests {
         body
     }
 
+    // An erasure-coded write returns once write-quorum disks commit, so a
+    // lagging disk can legally still be missing its xl.meta when the write
+    // call returns. Fixtures that iterate every disk of the owning pool must
+    // wait for full materialization first, or they race the trailing disk
+    // writes under CI load (issue #6703). Bounded so a genuinely failed disk
+    // write still surfaces as a test failure instead of a hang.
+    async fn wait_for_object_on_every_disk(disk_paths: &[std::path::PathBuf], bucket: &str, object: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if disk_paths
+                .iter()
+                .all(|path| path.join(bucket).join(object).join("xl.meta").is_file())
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "object {bucket}/{object} must materialize xl.meta on every pool disk within the readiness window"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     // Deletes the given part files from every version data dir present on the
     // disks, simulating rebalance removing the object data while xl.meta stays
     // readable. Returns the number of version dirs visited and files removed.
@@ -7172,6 +7195,7 @@ mod tests {
                     .any(|path| path.join(&bucket).join(object).join("xl.meta").is_file())
             })
             .expect("multipart object must be placed in one source pool");
+        wait_for_object_on_every_disk(&pool_disk_paths[upload_pool], &bucket, object).await;
         if upload_pool != 0 {
             for (source_disk, target_disk) in pool_disk_paths[upload_pool].iter().zip(&pool_disk_paths[0]) {
                 let source_object = source_disk.join(&bucket).join(object);
