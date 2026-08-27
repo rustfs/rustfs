@@ -69,6 +69,7 @@ use crate::storage_api_contracts::{
     range::HTTPRangeSpec,
 };
 use crate::store::ECStore;
+use ahash::AHashMap;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use http::HeaderMap;
 use rand::RngExt as _;
@@ -2870,7 +2871,7 @@ fn spawn_transition_transaction_recovery_once(api: Arc<ECStore>) {
 struct StaleMultipartUploadCandidate {
     path: String,
     initiated: OffsetDateTime,
-    metadata: Option<HashMap<String, String>>,
+    metadata: Option<AHashMap<String, String>>,
 }
 
 fn parse_stale_uploads_duration(env_key: &str, default: StdDuration) -> StdDuration {
@@ -2915,9 +2916,9 @@ async fn stale_upload_current_size(set: &Arc<SetDisks>, metadata: &HashMap<Strin
     stale_upload_current_size_with_opts(set, metadata, upload_dir, false).await
 }
 
-async fn stale_upload_current_size_with_opts(
+async fn stale_upload_current_size_with_opts<S: std::hash::BuildHasher>(
     set: &Arc<SetDisks>,
-    metadata: &HashMap<String, String>,
+    metadata: &HashMap<String, String, S>,
     upload_dir: &str,
     no_lock: bool,
 ) -> Option<usize> {
@@ -2950,9 +2951,9 @@ async fn stale_upload_current_size_with_opts(
     )
 }
 
-async fn stale_upload_lifecycle_due(
+async fn stale_upload_lifecycle_due<S: std::hash::BuildHasher>(
     set: &Arc<SetDisks>,
-    metadata: &HashMap<String, String>,
+    metadata: &HashMap<String, String, S>,
     initiated: OffsetDateTime,
     upload_dir: &str,
     no_lock: bool,
@@ -2978,7 +2979,7 @@ async fn stale_upload_lifecycle_due(
             .unwrap_or_default(),
         is_latest: true,
         delete_marker: false,
-        user_defined: metadata.clone(),
+        user_defined: metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         ..Default::default()
     };
 
@@ -11616,7 +11617,7 @@ mod tests {
         // Persist the durable backend identity on the transitioned version so the
         // recovered free version carries it (matching a registered mock tier);
         // free-version remote cleanup fails closed without it.
-        let mut transitioned_metadata = HashMap::new();
+        let mut transitioned_metadata = AHashMap::new();
         if let Some(identity) = backend_identity {
             rustfs_utils::http::metadata_compat::insert_str(
                 &mut transitioned_metadata,
@@ -12353,7 +12354,7 @@ mod tests {
             StaleMultipartUploadCandidate {
                 path: "sha/upload".to_string(),
                 initiated: OffsetDateTime::UNIX_EPOCH,
-                metadata: Some(HashMap::from([("k".to_string(), "v".to_string())])),
+                metadata: Some(AHashMap::from([("k".to_string(), "v".to_string())])),
             },
         );
 

@@ -26,18 +26,18 @@ static STRICT_BUCKET_NAME_REGEX: LazyLock<Regex> =
 static NON_STRICT_BUCKET_NAME_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9\.\-_:]{1,61}[A-Za-z0-9]$").expect("valid non-strict bucket name regex"));
 
-pub fn clean_metadata(metadata: &mut HashMap<String, String>) {
+pub fn clean_metadata<S: std::hash::BuildHasher>(metadata: &mut HashMap<String, String, S>) {
     remove_standard_storage_class(metadata);
     clean_metadata_keys(metadata, &["md5Sum", "etag", "expires", AMZ_OBJECT_TAGGING, "last-modified"]);
 }
 
-pub fn remove_standard_storage_class(metadata: &mut HashMap<String, String>) {
+pub fn remove_standard_storage_class<S: std::hash::BuildHasher>(metadata: &mut HashMap<String, String, S>) {
     if metadata.get(AMZ_STORAGE_CLASS) == Some(&STANDARD.to_string()) {
         metadata.remove(AMZ_STORAGE_CLASS);
     }
 }
 
-pub fn clean_metadata_keys(metadata: &mut HashMap<String, String>, key_names: &[&str]) {
+pub fn clean_metadata_keys<S: std::hash::BuildHasher>(metadata: &mut HashMap<String, String, S>, key_names: &[&str]) {
     for key in key_names {
         metadata.remove(key.to_owned());
     }

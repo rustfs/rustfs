@@ -184,13 +184,13 @@ pub fn internal_key_rustfs(suffix: &str) -> String {
 
 // === String type (FileInfo.metadata, user_defined) ===
 
-pub fn insert_str(map: &mut HashMap<String, String>, suffix: &str, value: String) {
+pub fn insert_str<S: std::hash::BuildHasher>(map: &mut HashMap<String, String, S>, suffix: &str, value: String) {
     let (k1, k2) = both_keys(suffix);
     map.insert(k1, value.clone());
     map.insert(k2, value);
 }
 
-pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
+pub fn get_str<S: std::hash::BuildHasher>(map: &HashMap<String, String, S>, suffix: &str) -> Option<String> {
     if let Some(v) = with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.get(k1).cloned()) {
         return Some(v);
     }
@@ -204,7 +204,10 @@ pub fn get_str(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
-fn get_consistent_value<'a, V: AsRef<[u8]>>(map: &'a HashMap<String, V>, suffix: &str) -> Option<&'a V> {
+fn get_consistent_value<'a, V: AsRef<[u8]>, S: std::hash::BuildHasher>(
+    map: &'a HashMap<String, V, S>,
+    suffix: &str,
+) -> Option<&'a V> {
     let (rustfs_key, minio_key) = both_keys(suffix);
     let mut value = None;
     for (key, candidate) in map {
@@ -222,11 +225,11 @@ fn get_consistent_value<'a, V: AsRef<[u8]>>(map: &'a HashMap<String, V>, suffix:
 /// Returns a non-empty value when every compatibility key present for `suffix` agrees.
 /// A single RustFS or MinIO key is accepted for backward compatibility; conflicting or empty
 /// values return `None` so callers at destructive boundaries can fail closed.
-pub fn get_consistent_str<'a>(map: &'a HashMap<String, String>, suffix: &str) -> Option<&'a str> {
+pub fn get_consistent_str<'a, S: std::hash::BuildHasher>(map: &'a HashMap<String, String, S>, suffix: &str) -> Option<&'a str> {
     get_consistent_value(map, suffix).map(String::as_str)
 }
 
-pub fn contains_key_str(map: &HashMap<String, String>, suffix: &str) -> bool {
+pub fn contains_key_str<S: std::hash::BuildHasher>(map: &HashMap<String, String, S>, suffix: &str) -> bool {
     if with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.contains_key(k1)) {
         return true;
     }
@@ -238,7 +241,7 @@ pub fn contains_key_str(map: &HashMap<String, String>, suffix: &str) -> bool {
         .any(|key| key.eq_ignore_ascii_case(&k1) || key.eq_ignore_ascii_case(&k2))
 }
 
-pub fn remove_str(map: &mut HashMap<String, String>, suffix: &str) {
+pub fn remove_str<S: std::hash::BuildHasher>(map: &mut HashMap<String, String, S>, suffix: &str) {
     with_internal_key(RUSTFS_INTERNAL_PREFIX, suffix, |k1| map.remove(k1));
     with_internal_key(MINIO_INTERNAL_PREFIX, suffix, |k2| map.remove(k2));
     let (k1, k2) = both_keys(suffix);
@@ -287,7 +290,9 @@ pub fn strip_internal_prefix_preserving_case(key: &str) -> Option<&str> {
 
 /// Reads the bounded per-target delete-marker version map in one metadata scan.
 /// The boolean is set when matching metadata is malformed or compatibility keys disagree.
-pub fn target_delete_marker_versions(map: &HashMap<String, String>) -> (HashMap<String, String>, bool) {
+pub fn target_delete_marker_versions<S: std::hash::BuildHasher>(
+    map: &HashMap<String, String, S>,
+) -> (HashMap<String, String>, bool) {
     const MAX_ENTRIES: usize = 1_000;
     const MAX_ARN_LEN: usize = 1_024;
     const MAX_VERSION_ID_LEN: usize = 1_024;
