@@ -38,6 +38,7 @@ use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tracing::{debug, trace, warn};
+use url::form_urlencoded;
 
 const LOG_COMPONENT_AUTH: &str = "auth";
 const LOG_SUBSYSTEM_CREDENTIALS: &str = "credentials";
@@ -49,6 +50,15 @@ const EVENT_KEYSTONE_CREDENTIALS_DETECTED: &str = "keystone_credentials_detected
 const EVENT_KEYSTONE_CREDENTIALS_VALIDATED: &str = "keystone_credentials_validated";
 const EVENT_KEYSTONE_CONTEXT_MISSING: &str = "keystone_context_missing";
 const EVENT_SESSION_TOKEN_EXTRACTION: &str = "session_token_extraction";
+
+/// RustFS-specific query capability for a single presigned PutObject request.
+pub(crate) const RUSTFS_MAX_CONTENT_LENGTH_QUERY: &str = "x-rustfs-max-content-length";
+
+/// Inserted by the S3 access boundary after the upstream verifier accepts a
+/// request as SigV4 presigned. Downstream capability parsing must require this
+/// marker instead of treating query syntax as proof of authentication.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VerifiedPresignedRequest;
 
 /// Performs constant-time string comparison to prevent timing attacks.
 ///
@@ -913,9 +923,11 @@ pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, q
     if let Some(credential) = header.get(AMZ_CREDENTIAL) {
         return !credential.to_str().unwrap_or("").is_empty();
     }
-    query
-        .and_then(|query| get_query_param(query, "x-amz-credential"))
-        .is_some_and(|credential| !credential.is_empty())
+    query.is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-credential"))
+            .is_some_and(|(_, credential)| !credential.is_empty())
+    })
 }
 
 /// Verify request has AWS PreSign Version '2'
@@ -1005,6 +1017,98 @@ pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> 
         }
     }
     None
+}
+
+/// Parse the RustFS presigned PutObject size capability after authentication.
+///
+/// The query value is covered by SigV4 when it is present before presigning, but
+/// the signature does not assign any semantics to the extension. Keep parsing
+/// strict and only enable the capability for a verified SigV4 presigned request.
+pub(crate) fn parse_presigned_put_max_content_length(
+    header: &HeaderMap,
+    query: Option<&str>,
+    verified_presigned: bool,
+) -> S3Result<Option<u64>> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+
+    let mut value = None;
+    let mut decoded_query = Vec::new();
+    for (name, candidate) in form_urlencoded::parse(query.as_bytes()) {
+        decoded_query.push((name.to_string(), candidate.to_string()));
+        if name == RUSTFS_MAX_CONTENT_LENGTH_QUERY {
+            if value.is_some() {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must appear exactly once"),
+                ));
+            }
+            value = Some(candidate.into_owned());
+        } else if name.eq_ignore_ascii_case(RUSTFS_MAX_CONTENT_LENGTH_QUERY) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("query parameter name must be exactly {RUSTFS_MAX_CONTENT_LENGTH_QUERY}"),
+            ));
+        }
+    }
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let query_value = |wanted: &str| {
+        decoded_query
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.as_str())
+    };
+    let is_complete_sigv4_query = [
+        ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+        ("x-amz-date", ""),
+        ("x-amz-expires", ""),
+        ("x-amz-signedheaders", ""),
+        ("x-amz-credential", ""),
+        ("x-amz-signature", ""),
+    ]
+    .into_iter()
+    .all(|(name, expected)| {
+        query_value(name).is_some_and(|value| !value.is_empty() && (expected.is_empty() || value == expected))
+    });
+    if !verified_presigned
+        || !is_complete_sigv4_query
+        || !matches!(get_request_auth_type_with_query(header, Some(query)), AuthType::Presigned)
+    {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} requires a SigV4 presigned request"),
+        ));
+    }
+
+    let limit = value.parse::<u64>().map_err(|_| {
+        S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must be a non-negative 64-bit integer"),
+        )
+    })?;
+
+    Ok(Some(limit))
+}
+
+/// Reject the PutObject-only size capability when it appears on another
+/// operation. Callers must invoke this after request authentication has run.
+pub(crate) fn reject_presigned_put_max_content_length_for_other_operation(
+    header: &HeaderMap,
+    query: Option<&str>,
+    verified_presigned: bool,
+) -> S3Result<()> {
+    if parse_presigned_put_max_content_length(header, query, verified_presigned)?.is_some() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1649,6 +1753,67 @@ mod tests {
         let result = get_query_param(query, "param1");
 
         assert_eq!(result, Some("value=with=equals"));
+    }
+
+    #[test]
+    fn presigned_put_max_content_length_requires_exactly_one_signed_query_value() {
+        let headers = HeaderMap::new();
+        let signed_prefix = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+
+        let query = format!("{signed_prefix}&x-rustfs-max-content-length=104857600");
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(&query), true).unwrap(),
+            Some(104_857_600)
+        );
+
+        let encoded_credential = query.replacen("X-Amz-Credential", "X%2DAmz-Credential", 1);
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(&encoded_credential), true).unwrap(),
+            Some(104_857_600)
+        );
+
+        let duplicate = format!("{query}&x-rustfs-max-content-length=1");
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(&duplicate), true)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+
+        let wrong_case = format!("{signed_prefix}&X-RustFS-Max-Content-Length=1");
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(&wrong_case), true)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+
+        assert_eq!(
+            reject_presigned_put_max_content_length_for_other_operation(&headers, Some(&query), true)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn presigned_put_max_content_length_rejects_unsigned_or_invalid_values() {
+        let headers = HeaderMap::new();
+        let forged = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/credential&X-Amz-Signature=fake&x-rustfs-max-content-length=1";
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(forged), false)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        for query in [
+            "x-rustfs-max-content-length=1",
+            "X-Amz-Credential=test/credential&x-rustfs-max-content-length=-1",
+            "X-Amz-Credential=test/credential&x-rustfs-max-content-length=18446744073709551616",
+        ] {
+            let error = parse_presigned_put_max_content_length(&headers, Some(query), true).unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        }
     }
 
     #[test]

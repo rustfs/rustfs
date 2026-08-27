@@ -16,8 +16,9 @@ use super::ObjectOptions;
 use super::ecfs::FS;
 use super::{ECStore, PolicySys, ReplicationStatusType, StorageError, get_lock_acquire_timeout, is_err_bucket_not_found};
 use crate::auth::{
-    check_key_valid_with_context, get_condition_values_with_client_info, get_condition_values_with_query_and_client_info,
-    get_session_token,
+    AuthType, RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, check_key_valid_with_context,
+    get_condition_values_with_client_info, get_condition_values_with_query_and_client_info, get_request_auth_type_with_query,
+    get_session_token, parse_presigned_put_max_content_length,
 };
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -1770,9 +1771,28 @@ impl S3Access for FS {
 
         // Publish this server's context slot so downstream data-plane handlers
         // resolve the same store (backlog#1052 S6).
-        let ext = cx.extensions_mut();
-        ext.insert(self.server_ctx().clone());
-        ext.insert(req_info);
+        let verified_presigned = matches!(get_request_auth_type_with_query(cx.headers(), cx.uri().query()), AuthType::Presigned);
+        {
+            let ext = cx.extensions_mut();
+            ext.insert(self.server_ctx().clone());
+            ext.insert(req_info);
+            if verified_presigned {
+                ext.insert(VerifiedPresignedRequest);
+            }
+        }
+
+        // The size capability is intentionally scoped to the single-object
+        // PutObject operation. Validate this at the operation-aware access
+        // boundary so unsupported GET/HEAD/DELETE/bucket routes cannot silently
+        // ignore a signed capability query.
+        if parse_presigned_put_max_content_length(cx.headers(), cx.uri().query(), verified_presigned)?.is_some()
+            && cx.s3_op().name() != "PutObject"
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
+            ));
+        }
         license_check().map_err(|er| match er.kind() {
             std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
             _ => {
