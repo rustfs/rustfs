@@ -591,7 +591,7 @@ struct FeatureSpec {
     default_enabled: bool,
 }
 
-fn feature_specs() -> [FeatureSpec; 8] {
+fn feature_specs() -> [FeatureSpec; 7] {
     [
         FeatureSpec {
             name: "metrics-gpu",
@@ -632,13 +632,6 @@ fn feature_specs() -> [FeatureSpec; 8] {
             name: "io-scheduler-debug",
             enabled: cfg!(feature = "io-scheduler-debug"),
             description: "Enable debug information in I/O scheduler",
-            dependencies: "(none)",
-            default_enabled: false,
-        },
-        FeatureSpec {
-            name: "manual-test-runners",
-            enabled: cfg!(feature = "manual-test-runners"),
-            description: "Enable manual test binaries",
             dependencies: "(none)",
             default_enabled: false,
         },
@@ -1008,11 +1001,11 @@ mod tests {
         let info = collect_deps_info_json();
         let feature_names: Vec<_> = info.features.iter().map(|feature| feature.name).collect();
 
-        assert_eq!(info.total_count, 8);
-        assert_eq!(info.features.len(), 8);
+        assert_eq!(info.total_count, 7);
+        assert_eq!(info.features.len(), 7);
         assert!(feature_names.contains(&"metrics-gpu"));
         assert!(feature_names.contains(&"io-scheduler-debug"));
-        assert!(feature_names.contains(&"manual-test-runners"));
+        assert!(!feature_names.contains(&"manual-test-runners"));
         assert!(!feature_names.contains(&"metrics"));
         assert!(!feature_names.contains(&"direct-io"));
     }
@@ -1023,7 +1016,7 @@ mod tests {
 
         assert!(output.contains("| metrics-gpu |"));
         assert!(output.contains("| io-scheduler-debug |"));
-        assert!(output.contains("| manual-test-runners |"));
+        assert!(!output.contains("| manual-test-runners |"));
         assert!(output.contains("| ftps | enabled by default |"));
         assert!(output.contains("| webdav | enabled by default |"));
         assert!(output.contains("| full | metrics-gpu + ftps + swift + webdav |"));
