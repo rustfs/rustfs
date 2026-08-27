@@ -168,7 +168,7 @@ pub fn to_s3s_etag(etag: &str) -> ETag {
     ETag::Strong(etag.to_string())
 }
 
-pub fn get_raw_etag(metadata: &HashMap<String, String>) -> String {
+pub fn get_raw_etag<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> String {
     metadata
         .get("etag")
         .cloned()

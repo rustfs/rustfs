@@ -181,7 +181,7 @@ mod tests {
             data_dir: Some(data_dir),
             size: 64 * 1024,
             mod_time: Some(OffsetDateTime::now_utc()),
-            metadata,
+            metadata: metadata.into_iter().collect(),
             erasure: ErasureInfo {
                 algorithm: ErasureAlgo::ReedSolomon.to_string(),
                 data_blocks: 4,

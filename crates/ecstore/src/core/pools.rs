@@ -5796,7 +5796,7 @@ fn decommission_remote_tiered_opts(
         versioned: version_id.is_some(),
         version_id,
         mod_time: version.mod_time,
-        user_defined: version.metadata.clone(),
+        user_defined: version.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         src_pool_idx,
         data_movement: true,
         incl_free_versions: version.tier_free_version(),

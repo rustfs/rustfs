@@ -51,6 +51,9 @@ s3s = { workspace = true, features = ["minio"] }
 regex.workspace = true
 arc-swap.workspace = true
 
+# High-performance hashing
+ahash = { workspace = true, features = ["serde"] }
+
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }

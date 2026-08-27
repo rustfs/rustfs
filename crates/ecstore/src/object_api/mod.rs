@@ -64,7 +64,7 @@ pub(crate) const ENCRYPTED_FRAME_LAYOUT_FIXED8K_SUFFIX: &str = "encrypted-frame-
 pub(crate) const ENV_RUSTFS_ENCRYPTED_RANGE_SEEK: &str = "RUSTFS_ENCRYPTED_RANGE_SEEK";
 pub(crate) const DEFAULT_RUSTFS_ENCRYPTED_RANGE_SEEK: bool = true;
 
-pub(crate) fn has_encrypted_part_layout_marker(metadata: &HashMap<String, String>, suffix: &str, expected: &str) -> bool {
+pub(crate) fn has_encrypted_part_layout_marker<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>, suffix: &str, expected: &str) -> bool {
     let mut value = None;
     for (key, candidate) in metadata {
         if !rustfs_utils::http::has_internal_suffix(key, suffix) {

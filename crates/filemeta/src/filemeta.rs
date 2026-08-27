@@ -174,10 +174,10 @@ fn valid_target_delete_marker_version(arn: &str, version_id: &str) -> bool {
 /// included in the quorum hash, so such a divergence does surface — but as a
 /// quorum failure on an otherwise healthy object, which is not a state worth
 /// reaching. Merge the RPC metadata carrier instead, and only ever insert.
-fn persist_target_delete_marker_versions(
+fn persist_target_delete_marker_versions<S: std::hash::BuildHasher>(
     meta_sys: &mut HashMap<String, Vec<u8>>,
     versions: &HashMap<String, String>,
-    transport_metadata: &HashMap<String, String>,
+    transport_metadata: &HashMap<String, String, S>,
 ) {
     let mut bounded = BTreeMap::new();
     // A corrupt carrier means the dual internal prefixes disagreed. Do not merge

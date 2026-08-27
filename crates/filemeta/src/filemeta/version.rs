@@ -26,7 +26,7 @@ use super::msgp_decode::{
     PrependByteReader, prealloc_hint, read_exact_vec, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value,
 };
 use super::*;
-use crate::{ChecksumInfo, TransitionVersionState};
+use crate::{AHashMap, ChecksumInfo, TransitionVersionState};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
     RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PART_CHECKSUMS, SUFFIX_PURGESTATUS,
@@ -377,7 +377,7 @@ impl<'a> DerivedInternalMetadata<'a> {
     }
 }
 
-struct UniquePartChecksums(HashMap<String, String>);
+struct UniquePartChecksums(AHashMap<String, String>);
 
 impl<'de> serde::Deserialize<'de> for UniquePartChecksums {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
@@ -397,7 +397,7 @@ impl<'de> serde::Deserialize<'de> for UniquePartChecksums {
             where
                 A: serde::de::SeqAccess<'de>,
             {
-                let mut checksums = HashMap::with_capacity(seq.size_hint().unwrap_or_default());
+                let mut checksums = AHashMap::with_capacity(seq.size_hint().unwrap_or_default());
                 while let Some((key, value)) = seq.next_element::<(String, String)>()? {
                     if checksums.insert(key, value).is_some() {
                         return Err(serde::de::Error::custom("duplicate part checksum name"));
@@ -1477,7 +1477,7 @@ pub struct MetaObjectV1 {
     #[serde(rename = "Erasure")]
     pub erasure: MetaObjectV1Erasure,
     #[serde(rename = "Meta")]
-    pub meta: HashMap<String, String>,
+    pub meta: AHashMap<String, String>,
     #[serde(rename = "Parts")]
     pub parts: Vec<MetaObjectV1Part>,
     #[serde(rename = "VersionID")]
@@ -1543,7 +1543,7 @@ pub struct MetaObjectV1Part {
     #[serde(rename = "i")]
     pub index: Option<Bytes>,
     #[serde(rename = "crc")]
-    pub checksums: Option<HashMap<String, String>>,
+    pub checksums: Option<AHashMap<String, String>>,
     #[serde(rename = "err")]
     pub error: Option<String>,
 }
@@ -1887,7 +1887,7 @@ impl MetaObjectV1Part {
                 "i" => self.index = Some(Bytes::from(read_msgp_bin(rd)?)),
                 "crc" => {
                     let len = rmp::decode::read_map_len(rd)? as usize;
-                    let mut checksums = HashMap::with_capacity(prealloc_hint(len));
+                    let mut checksums = AHashMap::with_capacity(prealloc_hint(len));
                     for _ in 0..len {
                         checksums.insert(read_msgp_string(rd)?, read_msgp_string(rd)?);
                     }
@@ -2570,7 +2570,7 @@ impl MetaObject {
             Vec::new()
         };
 
-        let mut metadata = HashMap::with_capacity(self.meta_user.len() + self.meta_sys.len());
+        let mut metadata = AHashMap::with_capacity(self.meta_user.len() + self.meta_sys.len());
         for (k, v) in &self.meta_user {
             if k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH || k == AMZ_META_UNENCRYPTED_CONTENT_MD5 {
                 continue;
@@ -2861,7 +2861,7 @@ impl From<FileInfo> for MetaObject {
     }
 }
 
-fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<ReplicationState> {
+fn get_internal_replication_state<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> Option<ReplicationState> {
     let mut rs = ReplicationState::default();
     let mut has = false;
 
@@ -2942,7 +2942,7 @@ impl MetaDeleteMarker {
     }
 
     pub fn into_fileinfo(&self, volume: &str, path: &str, _all_parts: bool) -> Result<FileInfo> {
-        let metadata = self
+        let metadata: AHashMap<String, String> = self
             .meta_sys
             .clone()
             .into_iter()
@@ -5500,10 +5500,10 @@ mod tests {
     /// entirely, silently dropping the whole legacy body on re-marshal.
     #[test]
     fn legacy_version_body_round_trips_through_encode() {
-        let mut meta = HashMap::new();
+        let mut meta = AHashMap::new();
         meta.insert("content-type".to_string(), "application/octet-stream".to_string());
 
-        let mut crc = HashMap::new();
+        let mut crc = AHashMap::new();
         crc.insert("crc32c".to_string(), "deadbeef".to_string());
 
         let legacy = MetaObjectV1 {

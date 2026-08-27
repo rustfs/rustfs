@@ -19,6 +19,7 @@
 //! bounds are unchanged, and the impls reach shared primitives through the
 //! SetDisks core (io_primitives) via inherent calls.
 
+use ahash::AHashMap;
 #[cfg(test)]
 use super::super::MetadataCacheInvalidationProbe;
 use super::super::{
@@ -1107,13 +1108,13 @@ fn is_restore_control_metadata(key: &str) -> bool {
             .is_some_and(|remainder| remainder.is_empty())
 }
 
-fn restore_metadata_update_preserves_protected_metadata(
-    existing: &HashMap<String, String>,
-    replacement: &HashMap<String, String>,
+fn restore_metadata_update_preserves_protected_metadata<S1: std::hash::BuildHasher, S2: std::hash::BuildHasher>(
+    existing: &HashMap<String, String, S1>,
+    replacement: &HashMap<String, String, S2>,
 ) -> bool {
-    let mut existing = existing.clone();
+    let mut existing: HashMap<String, String> = existing.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     clean_metadata(&mut existing);
-    let mut replacement = replacement.clone();
+    let mut replacement: HashMap<String, String> = replacement.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     clean_metadata(&mut replacement);
     let existing_count = existing.keys().filter(|key| !is_restore_control_metadata(key)).count();
     let replacement_count = replacement.keys().filter(|key| !is_restore_control_metadata(key)).count();
@@ -2211,9 +2212,9 @@ pub(in crate::set_disk) fn stored_replication_category_metadata(existing: &Objec
 ///
 /// Returns whether `inbound` was modified. Callers must hold the object write
 /// lock so the stored values compared here are the ones being replaced.
-pub(in crate::set_disk) fn merge_replication_metadata_lww(
-    inbound: &mut HashMap<String, String>,
-    existing: &HashMap<String, String>,
+pub(in crate::set_disk) fn merge_replication_metadata_lww<S1: std::hash::BuildHasher, S2: std::hash::BuildHasher>(
+    inbound: &mut HashMap<String, String, S1>,
+    existing: &HashMap<String, String, S2>,
     opts: &ObjectOptions,
 ) -> bool {
     use rustfs_utils::http::headers::{
@@ -2844,7 +2845,7 @@ impl SetDisks {
                 )));
             }
 
-            fi.metadata = user_defined;
+            fi.metadata = user_defined.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             fi.mod_time = mod_time;
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
@@ -6051,7 +6052,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         } else {
             None
         };
-        let mut replacement_metadata = (*src_info.user_defined).clone();
+        let mut replacement_metadata: AHashMap<String, String> = (*src_info.user_defined).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         if let Some(part_checksums) = preserved_part_checksums {
             rustfs_utils::http::insert_str(&mut replacement_metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, part_checksums);
         }
@@ -7493,7 +7494,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str(),
             X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str(),
         ] {
-            if let Some(value) = fi.metadata.lookup(header).filter(|value| !value.is_empty()) {
+            if let Some(value) = fi.metadata.get(header).filter(|value| !value.is_empty()) {
                 transition_meta.insert(header.to_ascii_lowercase(), value.to_string());
             }
         }

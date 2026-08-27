@@ -58,6 +58,9 @@ transform-stream = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
+# High-performance hashing
+ahash = { workspace = true, optional = true }
+
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }

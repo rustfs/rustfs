@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use ahash::AHashMap;
 use super::{metadata_boundary, object_lock_boundary, runtime_boundary as runtime_sources};
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{
     LcAuditEvent, LcEventSrc, emit_non_transitioned_expiration_event, emit_transition_complete_event,
@@ -2870,7 +2871,7 @@ fn spawn_transition_transaction_recovery_once(api: Arc<ECStore>) {
 struct StaleMultipartUploadCandidate {
     path: String,
     initiated: OffsetDateTime,
-    metadata: Option<HashMap<String, String>>,
+    metadata: Option<AHashMap<String, String>>,
 }
 
 fn parse_stale_uploads_duration(env_key: &str, default: StdDuration) -> StdDuration {
@@ -2915,9 +2916,9 @@ async fn stale_upload_current_size(set: &Arc<SetDisks>, metadata: &HashMap<Strin
     stale_upload_current_size_with_opts(set, metadata, upload_dir, false).await
 }
 
-async fn stale_upload_current_size_with_opts(
+async fn stale_upload_current_size_with_opts<S: std::hash::BuildHasher>(
     set: &Arc<SetDisks>,
-    metadata: &HashMap<String, String>,
+    metadata: &HashMap<String, String, S>,
     upload_dir: &str,
     no_lock: bool,
 ) -> Option<usize> {
@@ -2950,9 +2951,9 @@ async fn stale_upload_current_size_with_opts(
     )
 }
 
-async fn stale_upload_lifecycle_due(
+async fn stale_upload_lifecycle_due<S: std::hash::BuildHasher>(
     set: &Arc<SetDisks>,
-    metadata: &HashMap<String, String>,
+    metadata: &HashMap<String, String, S>,
     initiated: OffsetDateTime,
     upload_dir: &str,
     no_lock: bool,
@@ -2978,7 +2979,7 @@ async fn stale_upload_lifecycle_due(
             .unwrap_or_default(),
         is_latest: true,
         delete_marker: false,
-        user_defined: metadata.clone(),
+        user_defined: metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         ..Default::default()
     };
 
