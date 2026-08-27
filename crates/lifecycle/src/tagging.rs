@@ -12,34 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+//! Lifecycle tag decoding reuses the parser owned by `rustfs-replication`.
+//!
+//! `crates/lifecycle` already depends on `rustfs-replication`, so this is a
+//! plain re-export: no new crate edge, and no second copy of the parser to
+//! drift from the replication contract.
 
-use url::form_urlencoded;
-
-pub(crate) fn decode_tags_to_map(tags: &str) -> HashMap<String, String> {
-    let mut list = HashMap::new();
-
-    for (k, v) in form_urlencoded::parse(tags.as_bytes()) {
-        if k.is_empty() {
-            continue;
-        }
-
-        list.insert(k.to_string(), v.to_string());
-    }
-
-    list
-}
-
-#[cfg(test)]
-mod tests {
-    use super::decode_tags_to_map;
-
-    #[test]
-    fn decode_tags_to_map_preserves_bucket_tagging_parser_behavior() {
-        let tags = decode_tags_to_map("env=prod&encoded=a%2Fb&=ignored");
-
-        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
-        assert_eq!(tags.get("encoded").map(String::as_str), Some("a/b"));
-        assert!(!tags.contains_key(""));
-    }
-}
+pub(crate) use rustfs_replication::tagging::decode_tags_to_map;

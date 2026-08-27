@@ -27,7 +27,6 @@ pub use self::core as lifecycle;
 mod replication_sink;
 pub mod rule;
 mod runtime_boundary;
-mod tagging_boundary;
 pub mod tier_delete_journal;
 pub mod tier_free_version_recovery;
 pub mod tier_last_day_stats;
