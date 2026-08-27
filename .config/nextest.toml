@@ -196,6 +196,17 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget)'
 retries = 2
 
+# QUARANTINE: OPEN rustfs#6703 — the relocated-pool GET resume test stages its
+# fixture by copying xl.meta from every source-pool disk, but an EC write only
+# guarantees quorum-many disks have materialized; a lagging disk under CI load
+# panics the staging copy with NotFound (failed on a zero-overlap s3-client PR).
+# Subsumes the previous serialization-only ci entry for this test: the
+# test-group is re-declared here per the header rule above.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
+test-group = 'ecstore-serial-flaky'
+retries = 2
+
 # Serialize the 4-disk reliability / degraded-read e2e tests under the ci
 # profile too (see the e2e-reliability test-group note near the top). Not a
 # quarantine: no retries, just single-threaded so several 4-disk servers never
@@ -209,10 +220,6 @@ test-group = 'e2e-reliability'
 # no retries, just serialized 4-disk cross-disk-commit IO.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
-test-group = 'ecstore-serial-flaky'
-
-[[profile.ci.overrides]]
-filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
 test-group = 'ecstore-serial-flaky'
 
 # Match the default-profile embedded test isolation without quarantining or
