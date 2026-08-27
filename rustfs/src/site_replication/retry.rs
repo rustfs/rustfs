@@ -860,15 +860,10 @@ pub(crate) async fn drain_one_site_replication_retry_event(
             let edit_path = peer_edit_path_with_fence(local_deployment_id, generation);
             let delivery_fence = local_deployment_id.is_some().then_some(generation);
             for body in &bodies {
-                if let Err(err) = send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    &edit_path,
-                    access_key,
-                    secret_key,
-                    body,
-                )
-                .await
+                if let Err(err) = PeerAdminRequest::put(&transport.connection, &edit_path, access_key)
+                    .with_client(&transport.client)
+                    .send(secret_key, body)
+                    .await
                 {
                     enqueue_site_replication_retry_event_for_generation(
                         peer,

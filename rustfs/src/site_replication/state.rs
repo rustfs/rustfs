@@ -192,14 +192,13 @@ pub(crate) async fn site_replication_operator_rule_contract(runtime: &SiteReplic
         .collect();
     let probes = futures::future::join_all(remote_peers.iter().map(|peer| async move {
         let transport = PeerTransport::for_runtime_peer(peer).await?;
-        let (status, body) = send_peer_admin_request_raw_with_client(
-            &transport.client,
+        let (status, body) = PeerAdminRequest::put(
             &transport.connection,
             SITE_REPLICATION_PEER_DERIVED_RULE_CONTRACT_CAPABILITY_PATH,
             &runtime.state.service_account_access_key,
-            &runtime.service_account_secret_key,
-            &(),
         )
+        .with_client(&transport.client)
+        .send_raw(&runtime.service_account_secret_key, Some(&()))
         .await?;
         peer_capability_response_supported(peer, status, &body)
     }))

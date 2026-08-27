@@ -964,14 +964,10 @@ async fn local_add_preflight_info(
 async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationAddPreflightInfo> {
     let connection = PeerConnection::try_from(site)?;
     let client = site_replication_client_for(&connection).await?;
-    let info_body = send_peer_admin_get_request_with_client(
-        &client,
-        &connection,
-        "/rustfs/admin/v3/site-replication/metainfo",
-        &site.access_key,
-        &site.secret_key,
-    )
-    .await?;
+    let info_body = PeerAdminRequest::get(&connection, "/rustfs/admin/v3/site-replication/metainfo", &site.access_key)
+        .with_client(&client)
+        .send_get(&site.secret_key)
+        .await?;
     let info: SRInfo = serde_json::from_slice(&info_body).map_err(|e| {
         S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -991,14 +987,10 @@ async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationA
         );
     }
 
-    let idp_body = send_peer_admin_get_request_with_client(
-        &client,
-        &connection,
-        "/rustfs/admin/v3/site-replication/peer/idp-settings",
-        &site.access_key,
-        &site.secret_key,
-    )
-    .await?;
+    let idp_body = PeerAdminRequest::get(&connection, "/rustfs/admin/v3/site-replication/peer/idp-settings", &site.access_key)
+        .with_client(&client)
+        .send_get(&site.secret_key)
+        .await?;
     let idp_settings: IDPSettings = serde_json::from_slice(&idp_body).map_err(|e| {
         S3Error::with_message(
             S3ErrorCode::InvalidRequest,
@@ -1697,52 +1689,40 @@ async fn send_site_replication_bootstrap_plan(
 ) -> S3Result<()> {
     let transport = PeerTransport::for_runtime_peer(peer).await?;
     for item in &plan.iam_items {
-        send_peer_admin_request_with_retry_event_transport(
-            peer,
-            &transport,
+        PeerAdminRequest::put(
+            &transport.connection,
             "/rustfs/admin/v3/site-replication/peer/iam-item",
             service_account_access_key,
-            service_account_secret_key,
-            item,
         )
+        .with_client(&transport.client)
+        .send_with_retry_event(peer, service_account_secret_key, item)
         .await?;
     }
 
     let empty = serde_json::json!({});
     for path in &plan.bucket_make_ops {
-        send_peer_admin_request_with_retry_event_transport(
-            peer,
-            &transport,
-            path,
-            service_account_access_key,
-            service_account_secret_key,
-            &empty,
-        )
-        .await?;
+        PeerAdminRequest::put(&transport.connection, path, service_account_access_key)
+            .with_client(&transport.client)
+            .send_with_retry_event(peer, service_account_secret_key, &empty)
+            .await?;
     }
 
     for item in &plan.bucket_items {
-        send_peer_admin_request_with_retry_event_transport(
-            peer,
-            &transport,
+        PeerAdminRequest::put(
+            &transport.connection,
             "/rustfs/admin/v3/site-replication/peer/bucket-meta",
             service_account_access_key,
-            service_account_secret_key,
-            item,
         )
+        .with_client(&transport.client)
+        .send_with_retry_event(peer, service_account_secret_key, item)
         .await?;
     }
 
     for path in &plan.bucket_configure_ops {
-        send_peer_admin_request_with_retry_event_transport(
-            peer,
-            &transport,
-            path,
-            service_account_access_key,
-            service_account_secret_key,
-            &empty,
-        )
-        .await?;
+        PeerAdminRequest::put(&transport.connection, path, service_account_access_key)
+            .with_client(&transport.client)
+            .send_with_retry_event(peer, service_account_secret_key, &empty)
+            .await?;
     }
 
     Ok(())
@@ -1951,13 +1931,9 @@ async fn fetch_peer_sr_info(
         return Err(s3_error!(InvalidRequest, "site replication service account is not configured"));
     }
 
-    let body = send_peer_admin_get_request(
-        &runtime_peer_connection(peer)?,
-        &sr_metainfo_path(uri),
-        &state.service_account_access_key,
-        service_account_secret_key,
-    )
-    .await?;
+    let body = PeerAdminRequest::get(&runtime_peer_connection(peer)?, &sr_metainfo_path(uri), &state.service_account_access_key)
+        .send_get(service_account_secret_key)
+        .await?;
 
     serde_json::from_slice(&body).map_err(|e| {
         S3Error::with_message(
@@ -2788,15 +2764,10 @@ async fn require_add_peer_tls_capability(sites: &[PeerSite], local_peer: &PeerIn
     let probes = futures::future::join_all(remote_sites.iter().map(|site| async move {
         let connection = PeerConnection::try_from(*site)?;
         let client = site_replication_client_for(&connection).await?;
-        send_peer_admin_request_raw_with_client(
-            &client,
-            &connection,
-            SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH,
-            &site.access_key,
-            &site.secret_key,
-            &(),
-        )
-        .await
+        PeerAdminRequest::put(&connection, SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH, &site.access_key)
+            .with_client(&client)
+            .send_raw(&site.secret_key, Some(&()))
+            .await
     }))
     .await;
     for (site, probe) in remote_sites.into_iter().zip(probes) {
@@ -2867,15 +2838,10 @@ async fn require_edit_peer_tls_capability(
 async fn probe_proposed_peer_tls_transport(peer: &PeerInfo, access_key: &str, secret_key: &str) -> S3Result<()> {
     let connection = PeerConnection::try_from(peer)?;
     let client = site_replication_client_for(&connection).await?;
-    let (status, body) = send_peer_admin_request_raw_with_client(
-        &client,
-        &connection,
-        SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH,
-        access_key,
-        secret_key,
-        &(),
-    )
-    .await?;
+    let (status, body) = PeerAdminRequest::put(&connection, SITE_REPLICATION_PEER_TLS_CAPABILITY_PATH, access_key)
+        .with_client(&client)
+        .send_raw(secret_key, Some(&()))
+        .await?;
     if peer_capability_response_supported(peer, status, &body)? {
         Ok(())
     } else {
@@ -3016,15 +2982,10 @@ async fn send_endpoint_refresh_admin_request_raw_with_transports<T: Serialize>(
     let mut last_error = None;
     let mut last_response = None;
     for transport in transports {
-        match send_peer_admin_request_raw_with_client(
-            &transport.client,
-            &transport.connection,
-            path,
-            access_key,
-            secret_key,
-            body,
-        )
-        .await
+        match PeerAdminRequest::put(&transport.connection, path, access_key)
+            .with_client(&transport.client)
+            .send_raw(secret_key, Some(body))
+            .await
         {
             Ok((status, response))
                 if matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::GONE)
@@ -3056,13 +3017,13 @@ async fn legacy_peer_bucket_names_with_transports(
 ) -> S3Result<Vec<String>> {
     let mut last_error = None;
     for transport in transports {
-        match send_peer_admin_get_request_with_client(
-            &transport.client,
+        match PeerAdminRequest::get(
             &transport.connection,
             "/rustfs/admin/v3/site-replication/metainfo?buckets=true",
             access_key,
-            secret_key,
         )
+        .with_client(&transport.client)
+        .send_get(secret_key)
         .await
         {
             Ok(body) => return peer_bucket_names_from_metainfo(transport.connection.endpoint(), &body),
@@ -3618,13 +3579,12 @@ async fn drive_pending_remove(pending_remove: &PendingRemove, local_peer: &PeerI
             {
                 continue;
             }
-            if let Err(err) = send_peer_admin_request_with_secret_candidates(
+            if let Err(err) = PeerAdminRequest::put(
                 &runtime_peer_connection(peer)?,
                 SITE_REPLICATION_PEER_REMOVE_PATH,
                 &pending_remove.service_account_access_key,
-                &secret_candidates,
-                &pending_remove.req,
             )
+            .send_with_secret_candidates(&secret_candidates, &pending_remove.req)
             .await
             {
                 let err_detail = summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint));
@@ -4323,14 +4283,9 @@ async fn probe_reverse_peer_reachability(state: &SiteReplicationState, local_pee
                 continue;
             }
         };
-        if let Err(err) = send_peer_admin_request(
-            &connection,
-            SITE_REPLICATION_DEVNULL_PATH,
-            &state.service_account_access_key,
-            &secret_key,
-            &serde_json::json!({}),
-        )
-        .await
+        if let Err(err) = PeerAdminRequest::put(&connection, SITE_REPLICATION_DEVNULL_PATH, &state.service_account_access_key)
+            .send(&secret_key, &serde_json::json!({}))
+            .await
         {
             errors.push(format!("{} is not reachable from this site: {err}", peer.endpoint));
         }
@@ -5653,8 +5608,9 @@ impl Operation for SiteReplicationAddHandler {
             let mut peer_join_req = join_req.clone();
             peer_join_req.request.svc_acct_parent = site.access_key.clone();
             let connection = PeerConnection::try_from(site)?;
-            let body =
-                send_peer_admin_request(&connection, &peer_join_path, &site.access_key, &site.secret_key, &peer_join_req).await?;
+            let body = PeerAdminRequest::put(&connection, &peer_join_path, &site.access_key)
+                .send(&site.secret_key, &peer_join_req)
+                .await?;
 
             let mut fallback_peer = existing_peer_for_endpoint(&state, &site.endpoint)
                 .unwrap_or_else(|| normalize_peer_site(site.clone(), replicate_ilm_expiry));
@@ -5767,15 +5723,11 @@ impl Operation for SiteReplicationAddHandler {
                 }
             };
             for peer in state.peers.values() {
-                if let Err(err) = send_peer_admin_request_with_client(
-                    &transport.client,
-                    &transport.connection,
-                    &finalize_edit_path,
-                    &state.service_account_access_key,
-                    &service_account_secret_key,
-                    peer,
-                )
-                .await
+                if let Err(err) =
+                    PeerAdminRequest::put(&transport.connection, &finalize_edit_path, &state.service_account_access_key)
+                        .with_client(&transport.client)
+                        .send(&service_account_secret_key, peer)
+                        .await
                 {
                     initial_sync_errors
                         .push(format!("{}: finalize sync state for {} failed: {err}", target.endpoint, peer.endpoint));
@@ -6613,15 +6565,11 @@ impl Operation for SiteReplicationEditHandler {
                 'fanout: for target in remote_targets {
                     let transport = PeerTransport::for_runtime_peer(target).await?;
                     for peer in &peers_to_send {
-                        if let Err(err) = send_peer_admin_request_with_client(
-                            &transport.client,
-                            &transport.connection,
-                            &edit_path,
-                            &current_state.service_account_access_key,
-                            &service_account_secret_key,
-                            peer,
-                        )
-                        .await
+                        if let Err(err) =
+                            PeerAdminRequest::put(&transport.connection, &edit_path, &current_state.service_account_access_key)
+                                .with_client(&transport.client)
+                                .send(&service_account_secret_key, peer)
+                                .await
                         {
                             failure = Some((target.clone(), err));
                             break 'fanout;
@@ -7291,13 +7239,12 @@ impl Operation for SRRotateServiceAccountHandler {
             // means the peer never installed the new secret. Acking it would
             // finalize a rotation half the mesh cannot authenticate against
             // (rustfs/rustfs#5963).
-            let rotation_error = match send_peer_admin_request_with_secret_candidates(
+            let rotation_error = match PeerAdminRequest::put(
                 &runtime_peer_connection(peer)?,
                 SITE_REPLICATION_PEER_JOIN_PATH,
                 &pending_rotation.access_key,
-                &secret_candidates,
-                &join_req,
             )
+            .send_with_secret_candidates(&secret_candidates, &join_req)
             .await
             {
                 Err(err) => Some(summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint))),
@@ -8056,14 +8003,10 @@ mod tests {
                         .expect("custom production peer client");
 
                 for (client, connection) in [(&default_client, &default_connection), (&custom_client, &custom_connection)] {
-                    let result = send_peer_admin_get_request_with_client(
-                        client,
-                        connection,
-                        "/rustfs/admin/v3/site-replication/metainfo",
-                        "access-key",
-                        "secret-key",
-                    )
-                    .await;
+                    let result = PeerAdminRequest::get(connection, "/rustfs/admin/v3/site-replication/metainfo", "access-key")
+                        .with_client(client)
+                        .send_get("secret-key")
+                        .await;
                     assert!(result.is_err(), "forbidden DNS result must fail closed");
                 }
             },
@@ -8156,7 +8099,8 @@ mod tests {
                     .await;
             let ca_connection =
                 PeerConnection::new(&ca_endpoint, false, &ca_identity.cert_pem).expect("production custom-CA peer connection");
-            let get_body = send_peer_admin_get_request(&ca_connection, "/rustfs/admin/v3/site-replication/metainfo", "ak", "sk")
+            let get_body = PeerAdminRequest::get(&ca_connection, "/rustfs/admin/v3/site-replication/metainfo", "ak")
+                .send_get("sk")
                 .await
                 .expect("production custom-CA GET");
             assert_eq!(get_body, b"ok");
@@ -8169,15 +8113,10 @@ mod tests {
             )
             .await;
             let skip_connection = PeerConnection::new(&skip_endpoint, true, "").expect("production skip-verify peer connection");
-            let (status, put_body) = send_peer_admin_request_raw(
-                &skip_connection,
-                "/rustfs/admin/v3/site-replication/peer/edit",
-                "ak",
-                "sk",
-                &serde_json::json!({"peer": "test"}),
-            )
-            .await
-            .expect("production skip-verify PUT");
+            let (status, put_body) = PeerAdminRequest::put(&skip_connection, "/rustfs/admin/v3/site-replication/peer/edit", "ak")
+                .send_raw("sk", Some(&serde_json::json!({"peer": "test"})))
+                .await
+                .expect("production skip-verify PUT");
             assert_eq!(status, StatusCode::OK);
             assert_eq!(put_body, b"ok");
             assert_eq!(skip_server.await.expect("skip-verify PUT server task").as_deref(), Some("PUT"));
