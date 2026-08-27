@@ -205,16 +205,6 @@ retries = 2
 filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
 test-group = 'ecstore-serial-flaky'
 
-# QUARANTINE: OPEN rustfs#6711 — the multipart fencing test's epoch helper
-# reads xl.meta back from EVERY disk, but a multipart commit only guarantees
-# quorum-many disks have persisted; a lagging disk under CI load panics the
-# read-back with "file not found" (observed on the rio-v2 leg of a
-# nextest-config-only PR; same all-disk-materialization assumption as the
-# relocated-pool fixture fixed by #6707).
-[[profile.ci.overrides]]
-filter = 'package(rustfs-ecstore) & test(object_transaction_fencing_persists_epoch_on_multipart_commit)'
-retries = 2
-
 # Serialize the 4-disk reliability / degraded-read e2e tests under the ci
 # profile too (see the e2e-reliability test-group note near the top). Not a
 # quarantine: no retries, just single-threaded so several 4-disk servers never
