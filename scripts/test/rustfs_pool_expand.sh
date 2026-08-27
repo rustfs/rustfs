@@ -1128,6 +1128,12 @@ main() {
   trap 'rm -f "${ADMIN_API_CODE_FILE}"' EXIT
   if [ -n "${LOG_FILE}" ]; then
     mkdir -p "$(dirname "${LOG_FILE}")"
+    if ! touch "${LOG_FILE}" 2>/dev/null; then
+      # A fixed /tmp path may be owned by another user (e.g. a previous root
+      # run); fall back to a unique, always-writable temp file.
+      LOG_FILE="$(mktemp "${TMPDIR:-/tmp}/rustfs-pool-test.XXXXXX.log")"
+      warn "log file not writable; using ${LOG_FILE}"
+    fi
     exec > >(tee -a "${LOG_FILE}") 2>&1
   fi
   if [ "${RESET}" -eq 1 ]; then

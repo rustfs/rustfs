@@ -900,7 +900,11 @@ step6_monitor_heal() {
     if printf '%s' "${summary}" | grep -qiE '^(finished|completed|success|done)$' \
       && [ "${vm002_used}" -ge "${HEAL_TARGET_GB}" ]; then
       log "heal done: summary=${summary} failed=0 ${NODES[${OUTAGE_NODE_INDEX}]}_used=${vm002_used}GB >= ${HEAL_TARGET_GB}GB"
-      printf '%s\n' "${body}" > "${TMPDIR:-/tmp}/rustfs-heal-final-status.json"
+      final_status_file="$(mktemp "${TMPDIR:-/tmp}/rustfs-heal-final-status.XXXXXX.json" 2>/dev/null \
+        || printf '%s' "${TMPDIR:-/tmp}/rustfs-heal-final-status.$$.json")"
+      printf '%s\n' "${body}" > "${final_status_file}" 2>/dev/null \
+        && log "final heal status saved: ${final_status_file}" \
+        || warn "could not save final heal status to ${final_status_file}"
       return 0
     fi
     sleep "${POLL_INTERVAL}"
@@ -1068,6 +1072,12 @@ main() {
   trap 'rm -f "${ADMIN_API_CODE_FILE}"' EXIT
   if [ -n "${LOG_FILE}" ]; then
     mkdir -p "$(dirname "${LOG_FILE}")"
+    if ! touch "${LOG_FILE}" 2>/dev/null; then
+      # A fixed /tmp path may be owned by another user (e.g. a previous root
+      # run); fall back to a unique, always-writable temp file.
+      LOG_FILE="$(mktemp "${TMPDIR:-/tmp}/rustfs-heal-test.XXXXXX.log")"
+      warn "log file not writable; using ${LOG_FILE}"
+    fi
     exec > >(tee -a "${LOG_FILE}") 2>&1
   fi
   if [ "${RESET}" -eq 1 ]; then

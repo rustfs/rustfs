@@ -109,7 +109,7 @@ jobs:
         with:
           name: rustfs-heal-test-${{ github.run_id }}
           path: |
-            /tmp/rustfs-heal-test.log
+            /tmp/rustfs-heal-test*.log
             /tmp/rustfs-warp.*.log
           if-no-files-found: warn
 
