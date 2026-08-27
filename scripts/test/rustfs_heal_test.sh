@@ -5,15 +5,16 @@
 #
 # Based on the Obsidian note "RustFS Heal 测试步骤". Full workflow:
 #   1. Download the RustFS package on all nodes
-#   2. Install RustFS on all nodes (dpkg -i), write the 3-pool config,
-#      start all nodes in parallel and verify 3 pools via the admin API
+#   2. Install RustFS on all nodes (dpkg -i), write the 3x4 single-pool
+#      config, start all nodes in parallel and verify the topology via the
+#      admin API
 #   3. Write data (warp); when the surviving nodes reach STOP_NODE_AT_GB
 #      stop vm002 (simulated node outage), keep writing until the surviving
 #      nodes reach WARP_STOP_AT_GB
 #   4. Restart vm002 (the node that was offline while data was written)
 #   5. Start cluster heal (POST /rustfs/admin/v3/heal/ {"recursive":true})
-#   6. Monitor heal via background-heal/status until complete AND vm002's
-#      disk usage reaches HEAL_TARGET_GB
+#   6. Monitor the heal task (POST /rustfs/admin/v3/heal/?clientToken=...)
+#      until a terminal success AND vm002's disk usage reaches HEAL_TARGET_GB
 #   7. Result analysis: heal stats, per-node disk usage, success verdict
 #
 # The script is driven from an admin host (e.g. a jumpbox or a GitHub
@@ -112,6 +113,9 @@ HEAL_START_RETRY_DELAY=20       # delay between heal start retries (seconds)
 # Per-task heal timeout on the server (default is 5 minutes, far too short
 # for healing tens of GiB); written into /etc/default/rustfs.
 HEAL_TASK_TIMEOUT_SECS="${RUSTFS_HEAL_TASK_TIMEOUT_SECS:-21600}"
+# Disable the background scanner so the explicit heal is the only repair
+# mechanism (otherwise automatic repairs can mask the outage effect).
+HEAL_AUTO_HEAL_ENABLE="${RUSTFS_HEAL_AUTO_HEAL_ENABLE:-false}"
 
 # ==================== Runtime options (set by CLI) ====================
 DRY_RUN=0
@@ -380,6 +384,7 @@ RUSTFS_ACCESS_KEY=${ACCESS_KEY}
 RUSTFS_SECRET_KEY=${SECRET_KEY}
 RUSTFS_VOLUMES="${volumes}"
 RUSTFS_HEAL_TASK_TIMEOUT_SECS=${HEAL_TASK_TIMEOUT_SECS}
+RUSTFS_HEAL_AUTO_HEAL_ENABLE=${HEAL_AUTO_HEAL_ENABLE}
 RUSTFS_ADDRESS="${RUSTFS_ADDRESS}"
 RUSTFS_CONSOLE_ADDRESS="${RUSTFS_CONSOLE_ADDRESS}"
 RUSTFS_CONSOLE_ENABLE=${RUSTFS_CONSOLE_ENABLE}
@@ -514,6 +519,16 @@ node_used_gb() {
   done < <(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${node}" \
     "df -B1G | awk '/\\/data\\/rustfs/ {gsub(/[^0-9]/,\"\",\$3); print \$3+0}'" 2>/dev/null)
   printf '%s' "${total}"
+}
+
+# Read a heal-progress counter. The heal API serializes progress in camelCase
+# (objectsScanned / objectsHealed / objectsFailed / progressPercentage); keep a
+# snake_case fallback for older builds. Prints "null" when the field is absent.
+heal_progress_field() {
+  local body="$1" camel="$2" snake="$3"
+  printf '%s' "${body}" | jq -r --arg c "${camel}" --arg s "${snake}" '
+    (.progress // null) as $p
+    | if $p == null then "null" else (($p[$c] // $p[$s] // null) | if . == null then "null" else tostring end) end'
 }
 
 # Verify the expected number of pools via the admin API (JSON + jq assertions)
@@ -696,7 +711,7 @@ step3_write_data_with_node_outage() {
   fi
 
   local warp_log warp_pid outage_node="${NODES[${OUTAGE_NODE_INDEX}]}"
-  local survived_a survived_b used_a used_b used_c waited=0 node_stopped=0
+  local survived_a survived_b used_a used_b used_c waited=0 node_stopped=0 target_reached=0
 
   warp_log="${WARP_LOG_FILE:-$(mktemp "${TMPDIR:-/tmp}/rustfs-warp.XXXXXX.log")}"
   log "starting warp writes (background), log: ${warp_log}"
@@ -734,15 +749,22 @@ step3_write_data_with_node_outage() {
       log "surviving nodes reached ${STOP_NODE_AT_GB}GB; stopping ${outage_node}"
       service_action stop "${outage_node}"
       node_stopped=1
+      # Fail closed: the outage node must actually be down before continuing.
+      if ssh "${SSH_OPTS[@]}" "${SSH_USER}@${outage_node}" \
+          "systemctl is-active ${RUSTFS_SERVICE} 2>/dev/null" | grep -q active; then
+        die "${outage_node} is still active after systemctl stop; cannot continue the outage scenario"
+      fi
+      log "${outage_node} service is down"
     fi
 
     if [ "${used_a}" -ge "${WARP_STOP_AT_GB}" ] && [ "${used_b}" -ge "${WARP_STOP_AT_GB}" ]; then
       log "surviving nodes reached ${WARP_STOP_AT_GB}GB; stopping warp"
+      target_reached=1
       break
     fi
 
     if ! kill -0 "${warp_pid}" 2>/dev/null; then
-      warn "warp exited early at ${used_a}/${used_b}GB (log: ${warp_log}); continuing with whatever was written"
+      die "warp exited early at ${used_a}/${used_b}GB before reaching ${WARP_STOP_AT_GB}GB (log: ${warp_log})"
       break
     fi
 
@@ -755,7 +777,10 @@ step3_write_data_with_node_outage() {
   log "warp stopped (log: ${warp_log})"
 
   if [ "${node_stopped}" -eq 0 ]; then
-    warn "never reached ${STOP_NODE_AT_GB}GB on both surviving nodes within ${WARP_TIMEOUT}s; the outage node was NOT stopped"
+    die "never reached ${STOP_NODE_AT_GB}GB on both surviving nodes within ${WARP_TIMEOUT}s; the outage node was NOT stopped — test invalid"
+  fi
+  if [ "${target_reached}" -eq 0 ]; then
+    die "warp did not reach ${WARP_STOP_AT_GB}GB on the surviving nodes within ${WARP_TIMEOUT}s — test invalid"
   fi
   used_a="$(node_used_gb "${survived_a}")"
   used_b="$(node_used_gb "${survived_b}")"
@@ -766,10 +791,24 @@ step4_restart_node() {
   local node="${NODES[${OUTAGE_NODE_INDEX}]}"
   log "step 4: restart ${node} after the outage"
   confirm "About to start rustfs on ${node}. Continue?"
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    service_action start "${node}"
+    log "DRY-RUN: waiting for ${node} to become active"
+    return 0
+  fi
   service_action start "${node}"
   wait_service_active "${node}"
-  log "${node} is back; current pool status:"
-  verify_pools 1 || true
+  # Bounded readiness: wait for the admin API to report an active pool.
+  local attempts=0
+  while ! verify_pools 1 >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    if [ "${attempts}" -ge 12 ]; then
+      verify_pools 1   # final call fails loudly
+    fi
+    log "cluster not ready yet (attempt ${attempts}/12); waiting 5s"
+    sleep 5
+  done
+  log "${node} is back; cluster reports an active pool"
 }
 
 step5_start_heal() {
@@ -793,6 +832,10 @@ step5_start_heal() {
       fi
       return 0
     fi
+    if [ "${code}" = "400" ] || [ "${code}" = "403" ]; then
+      printf '\033[1;31m[ERROR]\033[0m heal start rejected (HTTP %s): %s\n' "${code}" "${body}" >&2
+      die "heal start rejected (HTTP ${code}); fix the request, not the retry"
+    fi
     warn "heal start attempt ${attempt}/${attempts} failed (HTTP ${code}): ${body}"
     hint_server_issue "${body}" || true
     if [ "${attempt}" -ge "${attempts}" ]; then
@@ -805,15 +848,16 @@ step5_start_heal() {
 
 step6_monitor_heal() {
   log "step 6: monitor heal task until done AND ${NODES[${OUTAGE_NODE_INDEX}]} reaches ${HEAL_TARGET_GB}GB"
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    log "DRY-RUN: waiting for heal to complete"
+    return 0
+  fi
   if [ -z "${HEAL_CLIENT_TOKEN}" ]; then
     die "no heal client token (run step 5 first, or pass --heal-token)"
   fi
-  local waited=0 body code summary failed healed scanned pct vm002_used warned501=0
+  local waited=0 body code summary failed healed scanned pct prog_present
+  local failed_n healed_n scanned_n pct_n vm002_used warned501=0
   while [ "${waited}" -lt "${HEAL_TIMEOUT}" ]; do
-    if [ "${DRY_RUN}" -eq 1 ]; then
-      log "DRY-RUN: waiting for heal to complete"
-      return 0
-    fi
     body="$(admin_api POST /rustfs/admin/v3/heal/ "clientToken=${HEAL_CLIENT_TOKEN}" "")"
     code="$(admin_api_code)"
     if [ "${code}" != "200" ]; then
@@ -828,18 +872,27 @@ step6_monitor_heal() {
       continue
     fi
     summary="$(printf '%s' "${body}" | jq -r '.summary // "running"')"
-    failed="$(printf '%s' "${body}" | jq -r '(.progress.objects_failed // 0)')"
-    healed="$(printf '%s' "${body}" | jq -r '(.progress.objects_healed // 0)')"
-    scanned="$(printf '%s' "${body}" | jq -r '(.progress.objects_scanned // 0)')"
-    pct="$(printf '%s' "${body}" | jq -r '(.progress.progress_percentage // 0)')"
+    prog_present="$(printf '%s' "${body}" | jq -r '.progress != null')"
+    failed="$(heal_progress_field "${body}" objectsFailed objects_failed)"
+    healed="$(heal_progress_field "${body}" objectsHealed objects_healed)"
+    scanned="$(heal_progress_field "${body}" objectsScanned objects_scanned)"
+    pct="$(heal_progress_field "${body}" progressPercentage progress_percentage)"
+    failed_n="${failed}"; [ "${failed_n}" = "null" ] && failed_n=0
+    healed_n="${healed}"; [ "${healed_n}" = "null" ] && healed_n=0
+    scanned_n="${scanned}"; [ "${scanned_n}" = "null" ] && scanned_n=0
+    pct_n="${pct}"; [ "${pct_n}" = "null" ] && pct_n=0
     vm002_used="$(node_used_gb "${NODES[${OUTAGE_NODE_INDEX}]}")"
-    log "heal: summary=${summary} scanned=${scanned} healed=${healed} failed=${failed} pct=${pct} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${vm002_used}GB (target ${HEAL_TARGET_GB}GB)"
+    log "heal: summary=${summary} scanned=${scanned_n} healed=${healed_n} failed=${failed_n} pct=${pct_n} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${vm002_used}GB (target ${HEAL_TARGET_GB}GB)"
 
-    if [ "${failed}" -gt 0 ] || printf '%s' "${summary}" | grep -qiE 'fail|error|stopped'; then
-      printf '\033[1;31m[ERROR]\033[0m heal reported failed objects (%s)\n' "${failed}" >&2
+    if [ "${prog_present}" = "false" ] && [ "${summary}" = "running" ]; then
+      warn "heal progress is null while the task is running (server-side reporting gap; see rustfs/backlog#2035)"
+    fi
+
+    if [ "${failed_n}" -gt 0 ] || printf '%s' "${summary}" | grep -qiE 'fail|error|stopped'; then
+      printf '\033[1;31m[ERROR]\033[0m heal reported failed objects (%s)\n' "${failed_n}" >&2
       printf '%s\n' "--- full heal status JSON ---" >&2
       printf '%s\n' "${body}" >&2
-      die "heal failed (summary=${summary}, objects_failed=${failed})"
+      die "heal failed (summary=${summary}, objects_failed=${failed_n})"
     fi
 
     # Success only for a real terminal summary; "running"/"notFound"/"" mean
@@ -867,18 +920,27 @@ step7_analyze_results() {
   if [ -z "${HEAL_CLIENT_TOKEN}" ]; then
     die "no heal client token (run step 5 first, or pass --heal-token)"
   fi
-  local body summary failed healed scanned pct i used
+  local body summary failed healed scanned pct prog_present
+  local failed_n healed_n scanned_n pct_n i used
   body="$(admin_api POST /rustfs/admin/v3/heal/ "clientToken=${HEAL_CLIENT_TOKEN}" "")"
   if [ "$(admin_api_code)" = "200" ]; then
     summary="$(printf '%s' "${body}" | jq -r '.summary // "unknown"')"
-    failed="$(printf '%s' "${body}" | jq -r '(.progress.objects_failed // 0)')"
-    healed="$(printf '%s' "${body}" | jq -r '(.progress.objects_healed // 0)')"
-    scanned="$(printf '%s' "${body}" | jq -r '(.progress.objects_scanned // 0)')"
-    pct="$(printf '%s' "${body}" | jq -r '(.progress.progress_percentage // 0)')"
+    prog_present="$(printf '%s' "${body}" | jq -r '.progress != null')"
+    failed="$(heal_progress_field "${body}" objectsFailed objects_failed)"
+    healed="$(heal_progress_field "${body}" objectsHealed objects_healed)"
+    scanned="$(heal_progress_field "${body}" objectsScanned objects_scanned)"
+    pct="$(heal_progress_field "${body}" progressPercentage progress_percentage)"
+    failed_n="${failed}"; [ "${failed_n}" = "null" ] && failed_n=0
+    healed_n="${healed}"; [ "${healed_n}" = "null" ] && healed_n=0
+    scanned_n="${scanned}"; [ "${scanned_n}" = "null" ] && scanned_n=0
+    pct_n="${pct}"; [ "${pct_n}" = "null" ] && pct_n=0
   fi
   printf '%s\n' "--- heal status ---"
   printf '  summary=%s scanned=%s healed=%s failed=%s progress=%s%%\n' \
-    "${summary}" "${scanned}" "${healed}" "${failed}" "${pct}"
+    "${summary}" "${scanned_n}" "${healed_n}" "${failed_n}" "${pct_n}"
+  if [ "${prog_present}" = "false" ]; then
+    warn "heal progress was absent (null) in the final task response — see rustfs/backlog#2035"
+  fi
   printf '%s\n' "--- per-node disk usage (GiB) ---"
   for i in "${!NODES[@]}"; do
     used="$(node_used_gb "${NODES[$i]}")"
@@ -888,12 +950,12 @@ step7_analyze_results() {
   local outage_used
   outage_used="$(node_used_gb "${NODES[${OUTAGE_NODE_INDEX}]}")"
   if printf '%s' "${summary}" | grep -qiE '^(finished|completed|success|done)$' \
-    && [ "${failed}" -eq 0 ] \
+    && [ "${failed_n}" -eq 0 ] \
     && [ "${outage_used}" -ge "${HEAL_TARGET_GB}" ]; then
     log "heal test PASSED: cluster heal complete, 0 failed, ${NODES[${OUTAGE_NODE_INDEX}]} reached ${outage_used}GB"
     return 0
   fi
-  die "heal test FAILED: summary=${summary} failed=${failed} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${outage_used}GB (target ${HEAL_TARGET_GB}GB)"
+  die "heal test FAILED: summary=${summary} failed=${failed_n} ${NODES[${OUTAGE_NODE_INDEX}]}_used=${outage_used}GB (target ${HEAL_TARGET_GB}GB)"
 }
 # ==================== CLI parsing ====================
 

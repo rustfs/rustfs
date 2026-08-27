@@ -89,3 +89,16 @@ Same repository secrets/variables as the pool expansion workflow:
 - Nightly builds gate pool/rebalance activation on a live fleet capability
   proof (rustfs/backlog#2031); the script retries heal/rebalance starts and
   prints a hint when the signature appears.
+- The cluster-level `GET /rustfs/admin/v3/background-heal/status` aggregator
+  returns 501 in the single-pool 3x4 topology (no notification system), so the
+  script monitors the started heal task via its `clientToken` instead.
+- The heal task may report `progress: null` while running; the script logs
+  this as evidence (rustfs/backlog#2035) rather than coercing it to zero, and
+  reads the canonical camelCase progress fields
+  (`objectsScanned`/`objectsHealed`/`objectsFailed`/`progressPercentage`) with
+  a snake_case fallback.
+- The server-side per-task heal timeout defaults to 5 minutes; the script
+  writes `RUSTFS_HEAL_TASK_TIMEOUT_SECS=21600` (6h) into the node config so a
+  multi-tens-of-GiB heal can finish. The background scanner is disabled
+  (`RUSTFS_HEAL_AUTO_HEAL_ENABLE=false`) so the explicit heal is the only
+  repair mechanism and the outage effect stays observable.

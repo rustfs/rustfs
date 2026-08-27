@@ -84,12 +84,13 @@ jobs:
     timeout-minutes: 360
     # Run on manual dispatch, or when the nightly build completed successfully
     # (its deb is what the tests install). Skipped when nightly failed.
-    if: ${{ github.event.workflow_run.conclusion != 'failure' && github.event.workflow_run.conclusion != 'cancelled' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Show environment
         run: |
@@ -107,7 +108,7 @@ jobs:
 
       - name: Install RustFS package & start first pool
         run: |
-          ARGS=(--steps 1,2,3 -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          ARGS=(--steps "1,2,3" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
           if [ -n "${{ inputs.package_url }}" ]; then
             ARGS+=(--package-url "${{ inputs.package_url }}")
           elif [ -n "${{ inputs.rustfs_version }}" ]; then
@@ -176,12 +177,13 @@ jobs:
     runs-on: smoke-testing
     timeout-minutes: 480
     needs: pool-expansion-test
-    if: ${{ always() && github.event.workflow_run.conclusion != 'failure' && github.event.workflow_run.conclusion != 'cancelled' }}
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Reset test environment (before)
         if: ${{ inputs.cleanup_before != 'false' }}
@@ -191,7 +193,7 @@ jobs:
 
       - name: Install RustFS package & start cluster
         run: |
-          ARGS=(--steps 1,2 -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          ARGS=(--steps "1,2" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
           if [ -n "${{ inputs.package_url }}" ]; then
             ARGS+=(--package-url "${{ inputs.package_url }}")
           else
