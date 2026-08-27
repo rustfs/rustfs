@@ -68,7 +68,6 @@ impl WarmBackendAliyun {
         let opts = Options {
             creds,
             secure: u.scheme() == "https",
-            trailing_headers: true,
             region: conf.region.clone(),
             bucket_lookup: BucketLookupType::BucketLookupDNS,
             ..Default::default()

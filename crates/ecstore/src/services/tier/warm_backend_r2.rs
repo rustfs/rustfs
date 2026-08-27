@@ -68,7 +68,6 @@ impl WarmBackendR2 {
         let opts = Options {
             creds,
             secure: u.scheme() == "https",
-            trailing_headers: true,
             region: conf.region.clone(),
             ..Default::default()
         };
