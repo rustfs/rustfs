@@ -41,6 +41,12 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(trino["status"], "manual-live-read-probe")
         self.assertContainsScenario(trino, "catalog-load", "manual-live-probe")
 
+        duckdb = by_client["DuckDB Iceberg"]
+        self.assertEqual(duckdb["status"], "manual-live-harness")
+        self.assertContainsScenario(duckdb, "metadata-read", "manual-live-probe")
+        self.assertContainsScenario(duckdb, "catalog-attach", "generated-harness")
+        self.assertContainsScenario(duckdb, "write-table", "manual-validation-required")
+
     def test_spark_config_uses_rustfs_rest_catalog_and_s3fileio(self) -> None:
         config = engine_compatibility.spark_catalog_config(
             endpoint="http://127.0.0.1:9000",
@@ -156,6 +162,70 @@ class EngineCompatibilityTest(unittest.TestCase):
                 catalog_name="rustfs",
                 namespace="sales`prod",
                 table="orders",
+            )
+
+    def test_duckdb_rest_catalog_sql_uses_rustfs_compatibility_options(self) -> None:
+        sql = engine_compatibility.duckdb_rest_catalog_sql(
+            endpoint="http://127.0.0.1:9000",
+            warehouse="rustfs-s3table-smoke",
+            access_key="rustfsadmin",
+            secret_key="rustfsadmin",
+            region="us-east-1",
+            catalog_name="rustfs",
+            namespace="smoke",
+            table="events",
+            rest_path="/iceberg",
+            rest_signing_name="s3",
+        )
+
+        self.assertIn("CREATE OR REPLACE SECRET rustfs_s3", sql)
+        self.assertIn("ENDPOINT '127.0.0.1:9000'", sql)
+        self.assertIn("SCOPE 's3://rustfs-s3table-smoke'", sql)
+        self.assertIn("ATTACH 'rustfs-s3table-smoke' AS \"rustfs\"", sql)
+        self.assertIn("ENDPOINT 'http://127.0.0.1:9000/iceberg'", sql)
+        self.assertIn("SIGV4_SERVICE 's3'", sql)
+        self.assertIn("STAGE_CREATE_TABLES false", sql)
+        self.assertIn("SKIP_CREATE_TABLE_METADATA_UPDATES true", sql)
+        self.assertIn("DISABLE_MULTI_TABLE_COMMIT true", sql)
+        self.assertIn("REMOVE_FILES_ON_DELETE false", sql)
+        self.assertIn("PURGE_REQUESTED false", sql)
+        self.assertIn('FROM "rustfs"."smoke"."events"', sql)
+        self.assertNotIn("ENDPOINT_TYPE", sql)
+
+    def test_duckdb_rest_catalog_sql_supports_s3tables_alias(self) -> None:
+        sql = engine_compatibility.duckdb_rest_catalog_sql(
+            endpoint="https://rustfs.example",
+            warehouse="analytics",
+            access_key="access'key",
+            secret_key="secret'key",
+            region="us-east-1",
+            catalog_name="rustfs_compat",
+            namespace="smoke",
+            table="events",
+            rest_path="/_iceberg",
+            rest_signing_name="s3tables",
+        )
+
+        self.assertIn("USE_SSL true", sql)
+        self.assertIn("ENDPOINT 'rustfs.example'", sql)
+        self.assertIn("ENDPOINT 'https://rustfs.example/_iceberg'", sql)
+        self.assertIn("SIGV4_SERVICE 's3tables'", sql)
+        self.assertIn("KEY_ID 'access''key'", sql)
+        self.assertIn("SECRET 'secret''key'", sql)
+
+    def test_duckdb_rest_catalog_sql_rejects_endpoint_without_scheme(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must include http:// or https://"):
+            engine_compatibility.duckdb_rest_catalog_sql(
+                endpoint="127.0.0.1:9000",
+                warehouse="analytics",
+                access_key="rustfsadmin",
+                secret_key="rustfsadmin",
+                region="us-east-1",
+                catalog_name="rustfs",
+                namespace="smoke",
+                table="events",
+                rest_path="/iceberg",
+                rest_signing_name="s3",
             )
 
     def test_cli_prints_machine_readable_engine_matrix(self) -> None:
@@ -308,6 +378,27 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "http://127.0.0.1:9000/_iceberg")
         self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
 
+    def test_cli_prints_duckdb_rest_catalog_sql(self) -> None:
+        sql = engine_compatibility.cli_json(
+            [
+                "--print-duckdb-rest-sql",
+                "--endpoint",
+                "http://127.0.0.1:9000",
+                "--warehouse",
+                "analytics",
+                "--catalog-name",
+                "rustfs_compat",
+                "--rest-path",
+                "/_iceberg",
+                "--rest-signing-name",
+                "s3tables",
+            ]
+        )
+
+        self.assertIn("ATTACH 'analytics' AS \"rustfs_compat\"", sql)
+        self.assertIn("ENDPOINT 'http://127.0.0.1:9000/_iceberg'", sql)
+        self.assertIn("SIGV4_SERVICE 's3tables'", sql)
+
     def test_live_conformance_harness_pins_clients_and_records_commands(self) -> None:
         harness = engine_compatibility.live_conformance_harness(
             endpoint="http://127.0.0.1:9000",
@@ -359,10 +450,15 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertEqual(trino["write_compatibility"], "not-claimed")
 
         duckdb = by_client["DuckDB Iceberg"]
-        self.assertEqual(duckdb["status"], "manual-live-read-probe")
+        self.assertEqual(duckdb["status"], "manual-live-harness")
+        self.assertEqual(duckdb["version"], "1.5.5")
         self.assertIn("LOAD httpfs", duckdb["sql"])
         self.assertIn("LOAD iceberg", duckdb["sql"])
         self.assertIn("iceberg_scan", duckdb["sql"])
+        self.assertIn("ATTACH 'rustfs-s3table-smoke'", duckdb["rest_catalog_sql"])
+        self.assertIn("STAGE_CREATE_TABLES false", duckdb["rest_catalog_sql"])
+        self.assertIn("SKIP_CREATE_TABLE_METADATA_UPDATES true", duckdb["rest_catalog_sql"])
+        self.assertEqual(duckdb["rest_catalog_write_compatibility"], "manual-live-validation-required")
         self.assertEqual(duckdb["write_compatibility"], "not-claimed")
 
         snowflake = by_client["Snowflake Open Catalog / Iceberg integrations"]

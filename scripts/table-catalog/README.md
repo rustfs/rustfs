@@ -241,6 +241,7 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --table-bucket analytics \
   --print-spark-config
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-sql --cleanup
+python3 scripts/table-catalog/engine_compatibility.py --print-duckdb-rest-sql
 python3 scripts/table-catalog/engine_compatibility.py --print-live-conformance --cleanup
 python3 scripts/table-catalog/engine_compatibility.py --print-operations-guide
 ```
@@ -310,7 +311,7 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
 | PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe |
 | Spark Iceberg REST catalog | Manual/live harness | pinned Spark and Iceberg package inputs, configuration, SQL, run command, expected row count, and cleanup can be generated for a running RustFS endpoint; CI execution is opt-in |
 | Trino Iceberg REST catalog | Manual/live read probe | generated catalog properties and a read-only SELECT probe for a table created by PyIceberg or Spark; no write compatibility claim yet |
-| DuckDB Iceberg | Manual/live read probe | generated httpfs/iceberg SQL using an operator-supplied current metadata location; read-path only |
+| DuckDB Iceberg | Manual/live harness | generated metadata-location read SQL plus generic Iceberg REST Catalog attach SQL for `/iceberg` with `s3` signing or `/_iceberg` with `s3tables` signing; write compatibility still requires repeatable live evidence |
 | StarRocks Iceberg REST catalog | Documented, not automated | external catalog read-path reference only |
 | Databend | Manual/live S3 stage probe | generated S3 stage read probe for table data files; Iceberg REST catalog integration is not claimed |
 | Snowflake/Open Catalog integrations | Manual reference probe | generated external volume/catalog SQL template; live RustFS interoperability is not claimed |
@@ -502,6 +503,43 @@ RUSTFS_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS=900
 ```
 
 The TTL is clamped to the supported short-lived range by the server.
+
+## DuckDB REST Catalog Profile
+
+DuckDB can read an individual Iceberg table with `iceberg_scan` or attach RustFS
+as a generic Iceberg REST Catalog. The metadata-location path remains read-only.
+The attached catalog path is the prerequisite for DuckDB writes.
+
+Generate the canonical RustFS REST Catalog profile:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --endpoint http://127.0.0.1:9000 \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --rest-path /iceberg \
+  --rest-signing-name s3 \
+  --print-duckdb-rest-sql
+```
+
+Generate the compatibility alias profile by changing the last three arguments:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --rest-path /_iceberg \
+  --rest-signing-name s3tables \
+  --print-duckdb-rest-sql
+```
+
+The generated `ATTACH` disables staged create, post-create metadata updates,
+multi-table commit, client-side file removal, and purge-on-drop. These options
+keep DuckDB within RustFS's claimed single-table REST surface. Do not replace
+the explicit endpoint with DuckDB `ENDPOINT_TYPE S3_TABLES`; that shortcut is
+for AWS S3 Tables endpoint and warehouse shapes.
+
+This profile is generated conformance input. It does not promote DuckDB write
+compatibility until the repeatable live smoke records passing evidence.
 
 ## Spark Manual/Live Harness
 

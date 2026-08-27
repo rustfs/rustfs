@@ -43,7 +43,7 @@ catalog extension.
 | PyIceberg | Automated | Creates namespace and table, appends rows, reloads, scans, probes metadata-location, refs, views, maintenance, diagnostics, and optional catalog-vended table credentials with an exact-prefix data-plane scope check. |
 | Spark Iceberg REST catalog | Manual/live harness | RustFS can generate pinned Spark/Iceberg package inputs, REST catalog properties, SQL, run commands, expected `row_count=2`, and a CI opt-in gate for namespace creation, table creation, append, refresh, count, and cleanup. Live Spark execution and commit-conflict probing are still manual validation items unless explicitly enabled in the runner. |
 | Trino Iceberg REST catalog | Manual/live harness | RustFS can generate catalog properties and a read-only `SELECT COUNT(*)` command for a table created by PyIceberg or Spark. Write compatibility is not claimed. |
-| DuckDB Iceberg | Manual/live harness | RustFS can generate `httpfs` and `iceberg` SQL using an operator-supplied current metadata location. Write and commit compatibility are not claimed. |
+| DuckDB Iceberg | Manual/live harness | RustFS can generate the read-only `iceberg_scan` path using an operator-supplied current metadata location and a generic signed Iceberg REST Catalog profile for `/iceberg` or `/_iceberg`. The REST profile disables staged create, post-create metadata updates, multi-table commit, client-side file removal, and purge-on-drop. Write and commit compatibility remain not claimed until repeatable live evidence is automated. |
 | StarRocks Iceberg REST catalog | Documented, not automated | External catalog read-path reference only. Write compatibility is not claimed. |
 | Databend | Manual/live harness | RustFS can generate an S3 stage read probe for table data files. RustFS does not claim Databend Iceberg REST Catalog integration yet. |
 | Snowflake Open Catalog / Iceberg integrations | Generated harness | RustFS can generate an operator-adapted external volume/catalog SQL template. Live RustFS interoperability is not claimed. |
@@ -250,6 +250,7 @@ python3 scripts/table-catalog/pyiceberg_smoke.py --print-vendor-profiles
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
 python3 scripts/table-catalog/engine_compatibility.py --print-vendor-audit
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-config
+python3 scripts/table-catalog/engine_compatibility.py --print-duckdb-rest-sql
 python3 scripts/table-catalog/engine_compatibility.py \
   --profile aws-s3tables \
   --region us-east-1 \
