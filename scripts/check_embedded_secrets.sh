@@ -88,7 +88,7 @@ PATTERNS=(
 # the guard fire again. Entries that stop matching anything are reported as
 # stale, so the list cannot decay into a blanket exclusion.
 #
-# 1-2: rustfs/src/admin/handlers/site_replication.rs negative fixtures for
+# 1-2: rustfs/src/site_replication/tests.rs negative fixtures for
 #      `validate_peer_connection_inner`, which must reject a private key
 #      submitted where a peer CA certificate is expected. Asserting on the
 #      rejection requires the header in the input; the key bodies are the
