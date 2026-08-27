@@ -12,67 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use lazy_static::lazy_static;
-use std::collections::HashMap;
-
-use s3s::header::X_AMZ_STORAGE_CLASS;
-
-lazy_static! {
-    static ref SUPPORTED_QUERY_VALUES: HashMap<String, bool> = {
-        let mut m = HashMap::new();
-        m.insert("attributes".to_string(), true);
-        m.insert("partNumber".to_string(), true);
-        m.insert("versionId".to_string(), true);
-        m.insert("response-cache-control".to_string(), true);
-        m.insert("response-content-disposition".to_string(), true);
-        m.insert("response-content-encoding".to_string(), true);
-        m.insert("response-content-language".to_string(), true);
-        m.insert("response-content-type".to_string(), true);
-        m.insert("response-expires".to_string(), true);
-        m
-    };
-    static ref SUPPORTED_HEADERS: HashMap<String, bool> = {
-        let mut m = HashMap::new();
-        m.insert("content-type".to_string(), true);
-        m.insert("cache-control".to_string(), true);
-        m.insert("content-encoding".to_string(), true);
-        m.insert("content-disposition".to_string(), true);
-        m.insert("content-language".to_string(), true);
-        m.insert("x-amz-website-redirect-location".to_string(), true);
-        m.insert("x-amz-object-lock-mode".to_string(), true);
-        m.insert("x-amz-metadata-directive".to_string(), true);
-        m.insert("x-amz-object-lock-retain-until-date".to_string(), true);
-        m.insert("expires".to_string(), true);
-        m.insert("x-amz-replication-status".to_string(), true);
-        m
-    };
-}
-
-pub fn is_storageclass_header(header_key: &str) -> bool {
-    header_key.to_lowercase() == X_AMZ_STORAGE_CLASS.as_str().to_lowercase()
-}
-
-pub fn is_standard_header(header_key: &str) -> bool {
-    *SUPPORTED_HEADERS.get(&header_key.to_lowercase()).unwrap_or(&false)
-}
-
-pub fn is_amz_header(header_key: &str) -> bool {
-    let key = header_key.to_lowercase();
-    key.starts_with("x-amz-meta-")
-        || key.starts_with("x-amz-grant-")
-        || key == "x-amz-acl"
-        || rustfs_utils::http::is_sse_header(header_key)
-        || key.starts_with("x-amz-checksum-")
-}
-
-pub fn is_rustfs_header(header_key: &str) -> bool {
-    header_key.to_lowercase().starts_with("x-rustfs-")
-}
-
-pub fn is_minio_header(header_key: &str) -> bool {
-    header_key.to_lowercase().starts_with("x-minio-")
-}
-
 /// Standard base64 (with `+`/`/` and `=` padding). Every base64 value this
 /// transition client emits or parses — `Content-MD5`, `x-amz-checksum-*`, and
 /// checksum digests in request/response bodies — is S3 wire format, which is
