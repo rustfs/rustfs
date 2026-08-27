@@ -163,10 +163,10 @@ python3 scripts/table-catalog/engine_compatibility.py --print-live-evidence-sche
 ```
 
 Use these outputs when updating release notes, PR descriptions, or follow-up
-work items. They are intentionally conservative: only PyIceberg is automated by
-this script today. Spark has a repeatable manual/live harness with pinned
-client package inputs, generated configuration, generated SQL, expected
-results, and a CI opt-in gate. Trino, DuckDB, Databend, and Snowflake now have
+work items. They are intentionally conservative: PyIceberg and DuckDB have
+separate automated smoke entrypoints. Spark has a repeatable manual/live harness
+with pinned client package inputs, generated configuration, generated SQL,
+expected results, and a CI opt-in gate. Trino, Databend, and Snowflake have
 generated manual probe inputs, but they remain opt-in and do not promote write
 or full vendor interoperability claims.
 
@@ -311,7 +311,7 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
 | PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe |
 | Spark Iceberg REST catalog | Manual/live harness | pinned Spark and Iceberg package inputs, configuration, SQL, run command, expected row count, and cleanup can be generated for a running RustFS endpoint; CI execution is opt-in |
 | Trino Iceberg REST catalog | Manual/live read probe | generated catalog properties and a read-only SELECT probe for a table created by PyIceberg or Spark; no write compatibility claim yet |
-| DuckDB Iceberg | Manual/live harness | generated metadata-location read SQL plus generic Iceberg REST Catalog attach SQL for `/iceberg` with `s3` signing or `/_iceberg` with `s3tables` signing; write compatibility still requires repeatable live evidence |
+| DuckDB Iceberg | Automated smoke target | metadata-location read plus generic REST Catalog single-table DDL, DML, schema evolution, snapshots, `/iceberg` and `/_iceberg` signing, fail-closed unsupported boundaries, endpoint-disabled non-atomic multi-table mode, concurrent writers, and PyIceberg cross-read |
 | StarRocks Iceberg REST catalog | Documented, not automated | external catalog read-path reference only |
 | Databend | Manual/live S3 stage probe | generated S3 stage read probe for table data files; Iceberg REST catalog integration is not claimed |
 | Snowflake/Open Catalog integrations | Manual reference probe | generated external volume/catalog SQL template; live RustFS interoperability is not claimed |
@@ -538,8 +538,35 @@ keep DuckDB within RustFS's claimed single-table REST surface. Do not replace
 the explicit endpoint with DuckDB `ENDPOINT_TYPE S3_TABLES`; that shortcut is
 for AWS S3 Tables endpoint and warehouse shapes.
 
-This profile is generated conformance input. It does not promote DuckDB write
-compatibility until the repeatable live smoke records passing evidence.
+Run the repeatable DuckDB 1.5.5 smoke against an already running RustFS:
+
+```bash
+python3 scripts/table-catalog/duckdb_smoke.py \
+  --duckdb /path/to/duckdb \
+  --endpoint http://127.0.0.1:9000 \
+  --bucket rustfs-duckdb-smoke \
+  --namespace duckdb_smoke \
+  --table events \
+  --cleanup \
+  --rustfs-build rustfs-v1.0.0-rc.4 \
+  --git-sha "$(git rev-parse HEAD)" \
+  --catalog-backing object \
+  --live-evidence-output /tmp/rustfs-duckdb-live-evidence.json
+```
+
+The script requires the same PyIceberg, PyArrow, and boto3 dependencies as the
+PyIceberg smoke because it verifies both cross-engine directions. It creates an
+isolated namespace, keeps the final verified table at two rows for the shared
+evidence contract, and cleans all smoke tables only when `--cleanup` is set.
+It refuses to remove pre-existing suffixed smoke tables unless `--replace` is
+set explicitly. Cleanup preserves a namespace that existed before the run.
+
+The automated claim is limited to DuckDB 1.5.5, static S3 credentials, and the
+single-table scenarios exercised by this script. It does not claim DuckDB's AWS
+`S3_TABLES` shortcut, staged create, purge-on-drop, format v3, multi-table
+atomicity, or catalog-vended credential integration. The smoke verifies that
+DuckDB can run a two-table transaction with its multi-table commit endpoint
+disabled, but each table remains an independent RustFS commit.
 
 ## Spark Manual/Live Harness
 
@@ -629,8 +656,9 @@ engines that are not run by default in RustFS CI:
 - Trino: catalog properties and a read-only `SELECT COUNT(*)` command for a
   table already created by PyIceberg or Spark. Trino write compatibility is not
   claimed.
-- DuckDB: `httpfs` and `iceberg` SQL using an operator-supplied current Iceberg
-  metadata location. DuckDB write and commit compatibility are not claimed.
+- DuckDB: a legacy `httpfs` and `iceberg` read probe using an operator-supplied
+  current Iceberg metadata location. The separate `duckdb_smoke.py` entrypoint
+  owns the automated generic REST Catalog single-table read/write claim.
 - Databend: an S3 stage read probe for Parquet data files under the table
   warehouse. Databend Iceberg REST Catalog integration is not claimed.
 - Snowflake: an operator-adapted external volume/catalog integration SQL

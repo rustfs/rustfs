@@ -43,7 +43,7 @@ catalog extension.
 | PyIceberg | Automated | Creates namespace and table, appends rows, reloads, scans, probes metadata-location, refs, views, maintenance, diagnostics, and optional catalog-vended table credentials with an exact-prefix data-plane scope check. |
 | Spark Iceberg REST catalog | Manual/live harness | RustFS can generate pinned Spark/Iceberg package inputs, REST catalog properties, SQL, run commands, expected `row_count=2`, and a CI opt-in gate for namespace creation, table creation, append, refresh, count, and cleanup. Live Spark execution and commit-conflict probing are still manual validation items unless explicitly enabled in the runner. |
 | Trino Iceberg REST catalog | Manual/live harness | RustFS can generate catalog properties and a read-only `SELECT COUNT(*)` command for a table created by PyIceberg or Spark. Write compatibility is not claimed. |
-| DuckDB Iceberg | Manual/live harness | RustFS can generate the read-only `iceberg_scan` path using an operator-supplied current metadata location and a generic signed Iceberg REST Catalog profile for `/iceberg` or `/_iceberg`. The REST profile disables staged create, post-create metadata updates, multi-table commit, client-side file removal, and purge-on-drop. Write and commit compatibility remain not claimed until repeatable live evidence is automated. |
+| DuckDB Iceberg 1.5.5 | Automated | `duckdb_smoke.py` verifies the metadata-location read path and generic REST Catalog single-table create, insert, update, delete, merge, schema evolution, snapshots, concurrent writers, normal drop, PyIceberg cross-read, `/iceberg` with `s3` signing, and `/_iceberg` with `s3tables` signing. Staged create, purge-on-drop, and format v3 are verified as fail-closed boundaries. DuckDB's endpoint-disabled two-table mode is exercised without claiming cross-table atomicity. AWS `ENDPOINT_TYPE S3_TABLES` and catalog-vended credential integration are not claimed. |
 | StarRocks Iceberg REST catalog | Documented, not automated | External catalog read-path reference only. Write compatibility is not claimed. |
 | Databend | Manual/live harness | RustFS can generate an S3 stage read probe for table data files. RustFS does not claim Databend Iceberg REST Catalog integration yet. |
 | Snowflake Open Catalog / Iceberg integrations | Generated harness | RustFS can generate an operator-adapted external volume/catalog SQL template. Live RustFS interoperability is not claimed. |
@@ -52,10 +52,10 @@ catalog extension.
 
 | Area | Status | Current RustFS claim |
 |---|---|---|
-| Live conformance evidence | Manual/live harness | `engine_compatibility.py --print-live-evidence-schema` defines the required evidence schema and claim promotion boundaries. `pyiceberg_smoke.py --live-evidence-output` writes a validated PyIceberg evidence record after a successful live smoke run. |
+| Live conformance evidence | Automated for PyIceberg and DuckDB | `engine_compatibility.py --print-live-evidence-schema` defines the required evidence schema and claim promotion boundaries. `pyiceberg_smoke.py --live-evidence-output` and `duckdb_smoke.py --live-evidence-output` write validated client evidence records after successful live smoke runs. |
 | Production operations guide | Generated harness | `engine_compatibility.py --print-operations-guide` records command, evidence, pass criteria, and fail-closed signals for live conformance, durable backing cutover, maintenance, recovery, permissions, credential vending, and unsupported-claim governance. |
 | Vendor compatibility gap audit | Generated harness | `engine_compatibility.py --print-vendor-audit` records provider source URLs, catalog path and warehouse shapes, signing/auth models, error/permission/maintenance validation categories, and not-claimed boundaries for AWS S3 Tables, MinIO AIStor Tables, Cloudflare R2 Data Catalog, and Alibaba OSS Tables. |
-| Client claim promotion | Documented, not automated | PyIceberg remains the automated claim. Spark can be promoted only with recorded manual/live evidence; Trino and DuckDB read probes do not promote write compatibility; Snowflake and vendor profiles remain reference-only without repeatable live evidence. |
+| Client claim promotion | Automated for scoped clients | PyIceberg and DuckDB claims remain bounded by their repeatable smoke entrypoints and recorded versions. Spark can be promoted only with recorded manual/live evidence; Trino remains read-only; Snowflake and vendor profiles remain reference-only without repeatable live evidence. |
 
 ## Catalog API Matrix
 
@@ -242,6 +242,7 @@ compatibility claims:
 ```bash
 python3 scripts/table-catalog/test_pyiceberg_smoke.py
 python3 scripts/table-catalog/test_engine_compatibility.py
+python3 scripts/table-catalog/test_duckdb_smoke.py
 python3 scripts/table-catalog/test_failure_coverage.py
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-client-matrix
 python3 scripts/table-catalog/pyiceberg_smoke.py --print-engine-compatibility
@@ -305,9 +306,9 @@ Use conservative release wording that matches the matrix.
 Acceptable wording:
 
 > RustFS includes a core Iceberg REST Catalog-based S3 Tables implementation
-> with PyIceberg smoke coverage, table-aware S3 data-plane policy checks,
+> with PyIceberg and DuckDB smoke coverage, table-aware S3 data-plane policy checks,
 > controlled maintenance, catalog recovery diagnostics, manual conformance
-> input for Spark, Trino, DuckDB, Databend, and Snowflake, production-failure
+> input for Spark, Trino, Databend, and Snowflake, production-failure
 > probe harnesses, disaster-recovery and scale/fault rehearsal probes, and a
 > machine-readable production operations evidence guide.
 
