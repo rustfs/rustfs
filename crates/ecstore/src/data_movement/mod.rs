@@ -27,7 +27,6 @@ use crate::storage_api_contracts::{
     object::{HTTPPreconditions, ObjectOperations as _},
 };
 use crate::store::{ECStore, ObjectLockDiagGuard, SourceCleanupMutationFence};
-use ahash::AHashMap;
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};

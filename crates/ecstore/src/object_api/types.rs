@@ -19,7 +19,6 @@ use crate::storage_api_contracts::{
         HTTPPreconditions, ObjectLockRetentionOptions, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
     },
 };
-use ahash::AHashMap;
 
 #[derive(Clone)]
 pub struct NamespaceLockFence {

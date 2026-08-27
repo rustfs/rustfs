@@ -44,7 +44,6 @@ use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
     object::{DeleteAccounting, ObjectIO as _, ObjectOperations as _},
 };
-use ahash::AHashMap;
 use parking_lot::Mutex as ParkingMutex;
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_hold_duration, record_object_lock_diag_slow_acquire,
