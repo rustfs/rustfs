@@ -1033,6 +1033,55 @@ jobs:
           echo "🎉 Released $TAG successfully!"
           echo "📄 Release URL: ${{ needs.create-release.outputs.release_url }}"
 
+  # Remove the internal preview releases once the deliverable release is live.
+  # Only the Releases are deleted; the -preview.N tags stay so the validated
+  # commit remains traceable.
+  cleanup-preview-releases:
+    name: Cleanup Preview Releases
+    needs: [ build-check, publish-release ]
+    if: startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Delete preview releases for this target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${{ needs.build-check.outputs.version }}"
+          RELEASES_JSON="${RUNNER_TEMP}/releases.json"
+
+          # Fetch before filtering: a failed listing must abort here instead of
+          # looking like "nothing to clean up".
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RELEASES_JSON"
+
+          # Match only <target>-preview.<digits>. String operations, not a
+          # regex over the tag, so dots in the version cannot widen the match.
+          DELETED=0
+          while IFS= read -r preview_tag; do
+            [[ -n "$preview_tag" ]] || continue
+            echo "🧹 Deleting preview release $preview_tag (tag kept)"
+            gh release delete "$preview_tag" --yes
+            DELETED=$((DELETED + 1))
+          done < <(
+            jq -r --arg tag "$TAG" '
+              .[]
+              | select(.tag_name | startswith($tag + "-preview."))
+              | select(.tag_name | ltrimstr($tag + "-preview.") | test("^[0-9]+$"))
+              | .tag_name
+            ' "$RELEASES_JSON"
+          )
+
+          if [[ "$DELETED" -eq 0 ]]; then
+            echo "ℹ️  No preview releases to clean up for $TAG"
+          else
+            echo "✅ Removed $DELETED preview release(s) for $TAG"
+          fi
+
   alert-on-failure:
     name: Alert on scheduled failure
     needs: [build-check, prepare-platform-matrix, build-rustfs, build-summary]

@@ -140,6 +140,14 @@ done
 latest_guard="startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')"
 require_job_if "$build_workflow" "update-latest-version" "    if: $latest_guard"
 require_line "$build_workflow" "    needs: [ build-check, publish-release ]" "latest update must follow release publication"
+
+# Preview releases are internal validation artifacts: once the deliverable
+# release is published they are deleted, while their tags stay behind.
+require_job_if "$build_workflow" "cleanup-preview-releases" "    if: $latest_guard"
+require_line "$build_workflow" "            gh release delete \"\$preview_tag\" --yes" "preview release cleanup after publication"
+require_line "$build_workflow" "              | select(.tag_name | startswith(\$tag + \"-preview.\"))" "cleanup must match the target's own preview tags"
+require_line "$build_workflow" "              | select(.tag_name | ltrimstr(\$tag + \"-preview.\") | test(\"^[0-9]+\$\"))" "cleanup must match a numeric preview iteration"
+require_absent "$build_workflow" "--cleanup-tag" "preview tags must survive their release cleanup"
 require_line "$build_workflow" "          TARGET_COMMITISH=\$(git rev-parse --verify \"refs/tags/\${TAG}^{commit}\")" "release target commit resolution"
 require_line "$build_workflow" "          ./scripts/release/create_or_update_release.sh \\" "managed release creation"
 require_absent "$build_workflow" "git tag -l --format='%(contents)'" "annotated tag messages must not become release notes"
