@@ -304,7 +304,7 @@ rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { git = "https://github.com/rustfs/s3s.git", rev = "f4dedc905ec621fa85a4686df6304190b55375f6", version = "0.15.0", features = ["minio"] }
+s3s = { git = "https://github.com/s3s-project/s3s.git", rev = "db7142432597942c67182f8b2b26bc75f12eda12", version = "0.15.0", features = ["minio"] }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.3"
