@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::checksum::{ChecksumMode, add_auto_checksum_headers, apply_auto_checksum};
+use crate::checksum::{ChecksumMode, add_auto_checksum_headers, apply_auto_checksum, checksum_header_value};
 use crate::{
     api_error_response::{err_invalid_argument, err_unexpected_eof, http_resp_to_error_response},
     api_put_object::PutObjectOptions,
@@ -503,7 +503,6 @@ impl TransitionClient {
             content_md5_base64: md5_base64.to_string(),
             content_sha256_hex: sha256_hex.to_string(),
             stream_sha256: !opts.disable_content_sha256,
-            add_crc: Default::default(),
             bucket_location: Default::default(),
             pre_sign_url: Default::default(),
             query_values: Default::default(),
@@ -511,21 +510,7 @@ impl TransitionClient {
             expires: Default::default(),
             trailer: Default::default(),
         };
-        let mut add_crc = false; //self.trailing_header_support && md5_base64 == "" && !s3utils.IsGoogleEndpoint(self.endpoint_url) && (opts.disable_content_sha256 || self.secure);
-        let mut opts = opts.clone();
-        if opts.checksum.is_set() {
-            req_metadata.add_crc = opts.checksum;
-        } else if add_crc {
-            for (k, _) in opts.user_metadata {
-                if k.to_lowercase().starts_with("x-amz-checksum-") {
-                    add_crc = false;
-                }
-            }
-            if add_crc {
-                opts.auto_checksum.set_default(ChecksumMode::ChecksumCRC32C);
-                req_metadata.add_crc = opts.auto_checksum;
-            }
-        }
+        let opts = opts.clone();
 
         if opts.internal.source_version_id != "" {
             if !opts.internal.source_version_id.is_empty() {
@@ -570,31 +555,11 @@ impl TransitionClient {
             size,
             expiration: exp_time,
             expiration_rule_id: rule_id,
-            checksum_crc32: if let Some(h_checksum_crc32) = h.get(ChecksumMode::ChecksumCRC32.key()) {
-                h_checksum_crc32.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
-            checksum_crc32c: if let Some(h_checksum_crc32c) = h.get(ChecksumMode::ChecksumCRC32C.key()) {
-                h_checksum_crc32c.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
-            checksum_sha1: if let Some(h_checksum_sha1) = h.get(ChecksumMode::ChecksumSHA1.key()) {
-                h_checksum_sha1.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
-            checksum_sha256: if let Some(h_checksum_sha256) = h.get(ChecksumMode::ChecksumSHA256.key()) {
-                h_checksum_sha256.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
-            checksum_crc64nvme: if let Some(h_checksum_crc64nvme) = h.get(ChecksumMode::ChecksumCRC64NVME.key()) {
-                h_checksum_crc64nvme.to_str().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            },
+            checksum_crc32: checksum_header_value(h, ChecksumMode::ChecksumCRC32),
+            checksum_crc32c: checksum_header_value(h, ChecksumMode::ChecksumCRC32C),
+            checksum_sha1: checksum_header_value(h, ChecksumMode::ChecksumSHA1),
+            checksum_sha256: checksum_header_value(h, ChecksumMode::ChecksumSHA256),
+            checksum_crc64nvme: checksum_header_value(h, ChecksumMode::ChecksumCRC64NVME),
             ..Default::default()
         })
     }

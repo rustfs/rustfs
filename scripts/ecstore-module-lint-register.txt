@@ -59,9 +59,6 @@ crates/s3-client/src/api_stat.rs|unused_variables
 crates/s3-client/src/bucket_cache.rs|clippy::all
 crates/s3-client/src/bucket_cache.rs|unused_must_use
 crates/s3-client/src/bucket_cache.rs|unused_variables
-crates/s3-client/src/checksum.rs|clippy::all
-crates/s3-client/src/checksum.rs|unused_must_use
-crates/s3-client/src/checksum.rs|unused_variables
 crates/s3-client/src/constants.rs|unused_must_use
 crates/s3-client/src/constants.rs|unused_variables
 crates/s3-client/src/credentials.rs|clippy::all

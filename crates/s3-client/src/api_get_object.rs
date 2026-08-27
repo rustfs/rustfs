@@ -69,7 +69,6 @@ impl TransitionClient {
                     stream_sha256: false,
                     trailer: HeaderMap::new(),
                     pre_sign_url: Default::default(),
-                    add_crc: Default::default(),
                     extra_pre_sign_header: Default::default(),
                     bucket_location: Default::default(),
                     expires: Default::default(),

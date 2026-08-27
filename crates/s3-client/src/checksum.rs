@@ -1,4 +1,3 @@
-#![allow(clippy::map_entry)]
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,17 +11,10 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-#![allow(unused_mut)]
-#![allow(unused_assignments)]
-#![allow(unused_must_use)]
-#![allow(clippy::all)]
 
 use rustfs_checksums::ChecksumAlgorithm;
 use std::collections::HashMap;
 
-use crate::utils::base64_decode;
 use crate::utils::base64_encode;
 use crate::{api_put_object::PutObjectOptions, api_s3_datatypes::ObjectPart};
 
@@ -104,10 +96,6 @@ impl ChecksumMode {
             .is_some_and(|a| a.supports_full_object() && !a.supports_composite())
     }
 
-    pub fn key_capitalized(&self) -> String {
-        self.key()
-    }
-
     pub fn raw_byte_len(&self) -> usize {
         self.algorithm().map(|a| a.raw_len()).unwrap_or(0)
     }
@@ -144,39 +132,13 @@ impl ChecksumMode {
         Ok(base64_encode(hash.as_ref()))
     }
 
-    pub fn to_string(&self) -> String {
-        match self.algorithm() {
-            Some(algorithm) => algorithm.s3_algorithm_name().to_string(),
-            None if matches!(self, ChecksumMode::ChecksumNone) => "".to_string(),
-            None => "<invalid>".to_string(),
-        }
-    }
-
-    // pub fn check_sum_reader(&self, r: GetObjectReader) -> Result<Checksum, std::io::Error> {
-    //     let mut h = self.hasher()?;
-    //     Ok(Checksum::new(self.clone(), h.sum().as_bytes()))
-    // }
-
-    // pub fn check_sum_bytes(&self, b: &[u8]) -> Result<Checksum, std::io::Error> {
-    //     let mut h = self.hasher()?;
-    //     Ok(Checksum::new(self.clone(), h.sum().as_bytes()))
-    // }
-
     pub fn composite_checksum(&self, p: &mut [ObjectPart]) -> Result<Checksum, std::io::Error> {
         if !self.can_composite() {
             return Err(std::io::Error::other("cannot do composite checksum"));
         }
-        p.sort_by(|i, j| {
-            if i.part_num < j.part_num {
-                std::cmp::Ordering::Less
-            } else if i.part_num > j.part_num {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
+        p.sort_by_key(|part| part.part_num);
         let c = self.base();
-        let mut crc_bytes = Vec::<u8>::with_capacity(p.len() * self.raw_byte_len() as usize);
+        let mut crc_bytes = Vec::<u8>::with_capacity(p.len() * self.raw_byte_len());
         let mut h = self.hasher()?;
         for part in p.iter() {
             let part_checksum = part.checksum_raw(&c)?;
@@ -185,9 +147,8 @@ impl ChecksumMode {
         h.update(crc_bytes.as_ref());
         let hash = h.finalize();
         Ok(Checksum {
-            checksum_type: self.clone(),
+            checksum_type: *self,
             r: hash.as_ref().to_vec(),
-            computed: false,
         })
     }
 
@@ -197,6 +158,19 @@ impl ChecksumMode {
         }
 
         self.composite_checksum(p)
+    }
+}
+
+impl std::fmt::Display for ChecksumMode {
+    /// The `x-amz-checksum-algorithm` wire value: the algorithm name for
+    /// concrete modes, `""` for `ChecksumNone`, `"<invalid>"` for a bare
+    /// `ChecksumFullObject` flag.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.algorithm() {
+            Some(algorithm) => f.write_str(algorithm.s3_algorithm_name()),
+            None if matches!(self, ChecksumMode::ChecksumNone) => Ok(()),
+            None => f.write_str("<invalid>"),
+        }
     }
 }
 
@@ -332,7 +306,6 @@ mod tests {
 
         for e in table {
             assert_eq!(e.mode.key(), e.key, "{:?} key()", e.mode);
-            assert_eq!(e.mode.key_capitalized(), e.key, "{:?} key_capitalized()", e.mode);
             assert_eq!(e.mode.to_string(), e.name, "{:?} to_string()", e.mode);
             assert_eq!(e.mode.raw_byte_len(), e.raw_len, "{:?} raw_byte_len()", e.mode);
             assert_eq!(e.mode.can_composite(), e.composite, "{:?} can_composite()", e.mode);
@@ -349,6 +322,24 @@ mod tests {
                 assert_eq!(e.raw_len, 0, "{:?} has no hasher but a nonzero raw_len", e.mode);
             }
         }
+    }
+
+    #[test]
+    fn test_checksum_header_value_reads_present_absent_and_invalid() {
+        use super::checksum_header_value;
+        use http::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-checksum-crc32c", HeaderValue::from_static("yZRlqg=="));
+        headers.insert("x-amz-checksum-sha256", HeaderValue::from_bytes(b"\xff\xfe").unwrap());
+
+        // Present header returns its value verbatim.
+        assert_eq!(checksum_header_value(&headers, ChecksumMode::ChecksumCRC32C), "yZRlqg==");
+        // Absent header and the unset modes (whose key() is "") return "".
+        assert_eq!(checksum_header_value(&headers, ChecksumMode::ChecksumCRC32), "");
+        assert_eq!(checksum_header_value(&headers, ChecksumMode::ChecksumNone), "");
+        // A non-UTF-8 header value degrades to "" instead of erroring.
+        assert_eq!(checksum_header_value(&headers, ChecksumMode::ChecksumSHA256), "");
     }
 
     #[test]
@@ -371,42 +362,9 @@ mod tests {
 pub struct Checksum {
     checksum_type: ChecksumMode,
     r: Vec<u8>,
-    #[allow(
-        dead_code,
-        reason = "checksum bookkeeping field kept beside the value it guards (backlog#1823)"
-    )]
-    computed: bool,
 }
 
 impl Checksum {
-    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
-    fn new(t: ChecksumMode, b: &[u8]) -> Checksum {
-        if t.is_set() && b.len() == t.raw_byte_len() {
-            return Checksum {
-                checksum_type: t,
-                r: b.to_vec(),
-                computed: false,
-            };
-        }
-        Checksum::default()
-    }
-
-    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
-    fn new_checksum_string(t: ChecksumMode, s: &str) -> Result<Checksum, std::io::Error> {
-        let b = match base64_decode(s.as_bytes()) {
-            Ok(b) => b,
-            Err(err) => return Err(std::io::Error::other(err.to_string())),
-        };
-        if t.is_set() && b.len() == t.raw_byte_len() {
-            return Ok(Checksum {
-                checksum_type: t,
-                r: b,
-                computed: false,
-            });
-        }
-        Ok(Checksum::default())
-    }
-
     fn is_set(&self) -> bool {
         self.checksum_type.is_set() && self.r.len() == self.checksum_type.raw_byte_len()
     }
@@ -417,14 +375,17 @@ impl Checksum {
         }
         base64_encode(&self.r)
     }
+}
 
-    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
-    fn raw(&self) -> Option<Vec<u8>> {
-        if !self.is_set() {
-            return None;
-        }
-        Some(self.r.clone())
-    }
+/// Read the base64 digest carried by `mode`'s `x-amz-checksum-*` response
+/// header, or an empty string when the header is absent (the client's
+/// datatypes use `""` for "no checksum").
+pub fn checksum_header_value(headers: &http::HeaderMap, mode: ChecksumMode) -> String {
+    headers
+        .get(mode.key())
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string()
 }
 
 pub fn add_auto_checksum_headers(opts: &mut PutObjectOptions) {
@@ -448,7 +409,7 @@ pub fn apply_auto_checksum(opts: &mut PutObjectOptions, all_parts: &mut [ObjectP
         let crc = opts.auto_checksum.full_object_checksum(all_parts)?;
         opts.user_metadata = {
             let mut hm = HashMap::new();
-            hm.insert(opts.auto_checksum.key_capitalized(), crc.encoded());
+            hm.insert(opts.auto_checksum.key(), crc.encoded());
             hm.insert("X-Amz-Checksum-Type".to_string(), "FULL_OBJECT".to_string());
             hm
         }
