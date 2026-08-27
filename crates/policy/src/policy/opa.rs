@@ -173,20 +173,28 @@ pub async fn lookup_config() -> Result<Args, OpaConfigError> {
 
 impl AuthZPlugin {
     pub fn new(config: Args) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(1))
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Some(Duration::from_secs(60)))
-            .tcp_keepalive(Some(Duration::from_secs(30)))
-            .tcp_nodelay(true)
-            .http2_keep_alive_interval(Some(Duration::from_secs(30)))
-            .http2_keep_alive_timeout(Duration::from_secs(15))
-            .build()
-            .unwrap_or_else(|err| {
-                error!("failed to build OPA HTTP client, falling back to default reqwest client: {err}");
-                reqwest::Client::new()
-            });
+        let builder = || {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .connect_timeout(Duration::from_secs(1))
+                .pool_max_idle_per_host(10)
+                .pool_idle_timeout(Some(Duration::from_secs(60)))
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                .tcp_nodelay(true)
+                .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+                .http2_keep_alive_timeout(Duration::from_secs(15))
+        };
+        // Never fall back to `reqwest::Client::new()`: it panics for the same
+        // reason the first build failed (e.g. no system CA bundle, issue
+        // #6734). Retry with an explicit empty trust store instead — an HTTP
+        // OPA endpoint keeps working, an HTTPS one fails closed per request.
+        let client = builder().build().unwrap_or_else(|err| {
+            error!("failed to build OPA HTTP client ({err}); continuing with an empty trust store");
+            builder()
+                .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+                .build()
+                .expect("HTTP client construction must succeed with an explicit empty trust store")
+        });
 
         Self { client, args: config }
     }

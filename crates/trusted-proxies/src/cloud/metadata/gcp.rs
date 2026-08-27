@@ -34,7 +34,7 @@ pub struct GcpMetadataFetcher {
 impl GcpMetadataFetcher {
     /// Creates a new `GcpMetadataFetcher`.
     pub fn new(timeout: Duration) -> Self {
-        let client = Client::builder().timeout(timeout).build().unwrap_or_else(|_| Client::new());
+        let client = super::metadata_http_client(timeout);
 
         Self {
             client,

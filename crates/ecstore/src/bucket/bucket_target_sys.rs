@@ -352,6 +352,28 @@ pub struct BucketTargetSys {
     heartbeat_started: OnceLock<()>,
 }
 
+/// Build the bucket-target health-check HTTP client without panicking when
+/// the host has no system CA bundle (issue #6734).
+///
+/// `BucketTargetSys::get()` initializes lazily on the startup path (bucket
+/// metadata install calls it on the main thread), and `reqwest::Client::new()`
+/// panics when the TLS backend cannot load any system trust root — the state
+/// of a minimal container image. Fall back to a client with an explicit empty
+/// trust store: HTTP health checks keep working, and HTTPS targets fail closed
+/// at the TLS handshake with a clear certificate error instead of aborting
+/// the whole process at startup.
+fn build_health_check_client() -> HttpClient {
+    HttpClient::builder().build().unwrap_or_else(|error| {
+        warn!(
+            "bucket target health-check HTTP client could not load system TLS roots ({error}); continuing with an empty trust store — HTTPS target health checks will fail until a CA bundle is installed"
+        );
+        HttpClient::builder()
+            .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+            .build()
+            .expect("HTTP client construction must succeed with an explicit empty trust store")
+    })
+}
+
 impl BucketTargetSys {
     pub fn get() -> &'static Self {
         GLOBAL_BUCKET_TARGET_SYS.get_or_init(Self::new)
@@ -364,7 +386,7 @@ impl BucketTargetSys {
             targets_map: Arc::new(RwLock::new(HashMap::new())),
             h_mutex: Arc::new(RwLock::new(HashMap::new())),
             target_h_mutex: Arc::new(RwLock::new(HashMap::new())),
-            hc_client: Arc::new(HttpClient::new()),
+            hc_client: Arc::new(build_health_check_client()),
             a_mutex: Arc::new(Mutex::new(HashMap::new())),
             arn_errs_map: Arc::new(RwLock::new(HashMap::new())),
             target_update_mutexes: Arc::new(Mutex::new(HashMap::new())),
@@ -2489,6 +2511,18 @@ impl Error for BucketTargetError {}
 mod tests {
     use super::*;
     use rcgen::generate_simple_self_signed;
+
+    // The startup panic fix for hosts without a CA bundle (issue #6734) rests
+    // on two properties: the health-check client constructor never panics, and
+    // its degraded fallback — an explicit empty trust store — always builds.
+    #[test]
+    fn health_check_client_construction_never_panics() {
+        let _ = build_health_check_client();
+        HttpClient::builder()
+            .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+            .build()
+            .expect("empty-trust-store client build must succeed without touching system roots");
+    }
 
     #[derive(Clone, Debug)]
     struct RecordingHttpConnector {
