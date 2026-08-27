@@ -23,14 +23,21 @@ use super::config::Dial9Config;
 use super::state::{dial9_runtime_state, measure_disk_usage_bytes};
 use super::{EVENT_DIAL9_STATE, LOG_COMPONENT_OBS, LOG_SUBSYSTEM_DIAL9};
 use crate::TelemetryError;
-use dial9_tokio_telemetry::telemetry::{ProcessResourceUsageConfig, RotatingWriter, TracedRuntime};
+use dial9_tokio_telemetry::telemetry::{
+    Dial9Handle, Dial9HandleTokioExt, DiskBuffer, ProcessResourceUsageConfig, RecorderPerfExt, TokioAttachOptions, recorder,
+};
 use std::time::Duration;
 use tracing::{info, warn};
 
-pub use dial9_tokio_telemetry::telemetry::TelemetryGuard;
+pub type TelemetryGuard = Dial9Handle;
+
+type ShutdownRecorder = Box<dyn FnOnce() + Send + 'static>;
 
 /// How often the background refresher restates trace-file disk usage.
 const DISK_USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Maximum time spent flushing the recorder during graceful shutdown.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Name recorded in segment metadata so the trace viewer can label workers.
 const RUNTIME_NAME: &str = "rustfs-worker";
@@ -43,13 +50,14 @@ const RUNTIME_NAME: &str = "rustfs-worker";
 /// are lost.
 pub struct Dial9SessionGuard {
     guard: TelemetryGuard,
+    shutdown: Option<ShutdownRecorder>,
     config: Dial9Config,
 }
 
 impl Dial9SessionGuard {
     /// Whether the underlying telemetry session is recording.
     pub fn is_active(&self) -> bool {
-        self.guard.is_enabled()
+        self.guard.is_enabled() && self.guard.is_connected() && !self.guard.is_stopped()
     }
 }
 
@@ -72,8 +80,10 @@ impl Drop for Dial9SessionGuard {
             state = "flushed",
             "dial9 state changed"
         );
-        // `TelemetryGuard`'s own `Drop` flushes buffered events and seals the
-        // active segment; it runs immediately after this body.
+
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown();
+        }
     }
 }
 
@@ -97,53 +107,58 @@ pub fn build_traced_runtime(
         TelemetryError::Io(format!("Failed to create dial9 output directory '{}': {e}", config.output_dir))
     })?;
 
-    let writer = RotatingWriter::new(config.base_path(), config.max_file_size, config.total_disk_budget()).map_err(|e| {
-        dial9_runtime_state().record_runtime_error(&config);
-        TelemetryError::Io(format!("Failed to create dial9 RotatingWriter: {e}"))
-    })?;
+    let writer = DiskBuffer::builder()
+        .base_path(config.base_path())
+        .max_file_size(config.max_file_size)
+        .max_total_size(config.total_disk_budget())
+        .build()
+        .map_err(|e| {
+            dial9_runtime_state().record_runtime_error(&config);
+            TelemetryError::Io(format!("Failed to create dial9 DiskBuffer: {e}"))
+        })?;
 
-    // `with_trace_path` transitions the builder into the state that spawns the
-    // background worker, which drives the segment pipeline.
-    let traced = TracedRuntime::builder()
-        .with_trace_path(&config.output_dir)
-        .with_task_tracking(true)
-        .with_runtime_name(RUNTIME_NAME)
-        .with_process_resource_usage(ProcessResourceUsageConfig::default());
+    let recorder = recorder(writer)
+        .with_process_resource_usage(ProcessResourceUsageConfig::default())
+        .build();
+    let guard = recorder.handle().clone();
+    let shutdown: ShutdownRecorder = Box::new(move || recorder.graceful_shutdown(SHUTDOWN_TIMEOUT));
 
-    // `build_and_start` rather than `build`: `build` returns a live guard that
-    // never records, writing segments that contain only a header.
-    //
-    // No `with_task_dumps` here. dial9 captures a task dump only for futures it
+    let attached = guard
+        .attach_tokio_runtime(
+            builder,
+            TokioAttachOptions::builder()
+                .runtime_name(RUNTIME_NAME)
+                .task_tracking_enabled(true)
+                .build(),
+        )
+        .map(|runtime| (runtime, guard, shutdown));
+
+    // No task dumps here. dial9 captures a task dump only for futures it
     // wrapped itself, i.e. those spawned via `dial9_tokio_telemetry::spawn`;
     // `tokio::spawn` gets no wrapper. RustFS spawns with `tokio::spawn`
-    // throughout, so calling `with_task_dumps` records nothing. Measured on an
+    // throughout, so enabling task dumps records nothing. Measured on an
     // identical workload: 0 dumps via `tokio::spawn`, 14709 via `dial9::spawn`.
     // See rustfs/backlog#1157 (D9-16) and dial9-rs/dial9#477.
     //
     // No `with_s3_uploader` here: dial9's `worker-s3` feature carries a
     // vulnerable TLS stack. See the note in `crates/obs/Cargo.toml`.
-    finish_traced_runtime(traced.build_and_start(builder, writer), config)
+    finish_traced_runtime(attached, config)
 }
 
 /// Publish the outcome of a traced-runtime build and start the background
 /// disk-usage refresher.
 fn finish_traced_runtime(
-    started: std::io::Result<(tokio::runtime::Runtime, TelemetryGuard)>,
+    started: std::io::Result<(tokio::runtime::Runtime, TelemetryGuard, ShutdownRecorder)>,
     config: Dial9Config,
 ) -> Result<(tokio::runtime::Runtime, Dial9SessionGuard), TelemetryError> {
-    let (runtime, guard) = started.map_err(|e| {
+    let (runtime, guard, shutdown) = started.map_err(|e| {
         dial9_runtime_state().record_runtime_error(&config);
-        TelemetryError::Io(format!("Failed to build dial9 TracedRuntime: {e}"))
+        TelemetryError::Io(format!("Failed to attach dial9 runtime telemetry: {e}"))
     })?;
 
-    // `is_enabled` distinguishes a live guard from the inert one a lenient
-    // config produces after a build failure. It does NOT mean recording has
-    // started — a guard from `build` (rather than `build_and_start`) reports
-    // `true` while writing segments that contain only a header. Recording is
-    // guaranteed by the `build_and_start` call above, not by this check.
     if !guard.is_enabled() {
         dial9_runtime_state().record_runtime_error(&config);
-        return Err(TelemetryError::Io("dial9 TracedRuntime built with telemetry disabled".to_string()));
+        return Err(TelemetryError::Io("dial9 runtime telemetry attached with recording disabled".to_string()));
     }
 
     dial9_runtime_state().record_runtime_started(&config);
@@ -160,7 +175,14 @@ fn finish_traced_runtime(
         "dial9 state changed"
     );
 
-    Ok((runtime, Dial9SessionGuard { guard, config }))
+    Ok((
+        runtime,
+        Dial9SessionGuard {
+            guard,
+            shutdown: Some(shutdown),
+            config,
+        },
+    ))
 }
 
 /// Periodically restate trace-file disk usage so the metrics collector can read

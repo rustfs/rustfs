@@ -16,6 +16,9 @@
 
 use super::*;
 
+use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
+use crate::error::UploadLimitExceeded;
+
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
 
 const ENV_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: &str = "RUSTFS_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES";
@@ -122,6 +125,58 @@ struct RequestBodyReadTimeout {
     key: String,
     request_id: String,
     timed_out: bool,
+}
+
+/// Enforces a maximum size on the decoded request entity while preserving the
+/// streaming behavior of the underlying S3 body.
+struct MaxContentLengthStream {
+    inner: StreamingBlob,
+    limit: u64,
+    received: u64,
+    exceeded: bool,
+}
+
+impl Stream for MaxContentLengthStream {
+    type Item = Result<Bytes, StdError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        if this.exceeded {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                let exceeds = this.received > this.limit || chunk_len > this.limit.saturating_sub(this.received);
+                if exceeds {
+                    this.exceeded = true;
+                    return Poll::Ready(Some(Err(Box::new(UploadLimitExceeded { limit: this.limit }))));
+                }
+
+                this.received = this.received.saturating_add(chunk_len);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            other => other,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = usize::try_from(self.limit.saturating_sub(self.received)).unwrap_or(usize::MAX);
+        let (lower, upper) = self.inner.size_hint();
+        (lower.min(remaining), upper.map(|upper| upper.min(remaining)))
+    }
+}
+
+impl ByteStream for MaxContentLengthStream {
+    fn remaining_length(&self) -> RemainingLength {
+        let remaining = usize::try_from(self.limit.saturating_sub(self.received)).unwrap_or(usize::MAX);
+        let inner = self.inner.remaining_length();
+        inner
+            .exact()
+            .map(|exact| RemainingLength::new_exact(exact.min(remaining)))
+            .unwrap_or_else(RemainingLength::unknown)
+    }
 }
 
 impl Stream for RequestBodyReadTimeout {
@@ -752,6 +807,11 @@ impl DefaultObjectUsecase {
         }
 
         let (event_name, quota_operation, request_method_name) = Self::put_object_execution_context(&req);
+        let max_content_length = parse_presigned_put_max_content_length(
+            &req.headers,
+            req.uri.query(),
+            req.extensions.get::<VerifiedPresignedRequest>().is_some(),
+        )?;
         if req.extensions.get::<PostObjectRequestMarker>().is_some() && is_post_object_sse_kms_requested(&req.input, &req.headers)
         {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for POST object uploads"));
@@ -769,6 +829,12 @@ impl DefaultObjectUsecase {
         // member) instead of writing the replica.
         let inbound_replication_put = replication_request_authorized(&req)
             && get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
+        if max_content_length.is_some() && is_put_object_extract_requested(&req.headers) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is not supported for archive extraction"),
+            ));
+        }
         if is_put_object_extract_requested(&req.headers) && !inbound_replication_put {
             return Box::pin(self.execute_put_object_extract(req)).await;
         }
@@ -842,8 +908,24 @@ impl DefaultObjectUsecase {
             guard_put_object_body_read_timeout(body, &bucket, &key, &request_id, content_length, put_object_body_read_timeout())
         };
 
+        let body = match max_content_length {
+            Some(limit) => StreamingBlob::new(MaxContentLengthStream {
+                inner: body,
+                limit,
+                received: 0,
+                exceeded: false,
+            }),
+            None => body,
+        };
+
         // Resolve the authoritative decoded/plain object length (rejecting negative/unknown) before anything else consumes it.
         let mut size = resolve_put_object_authoritative_size(&req.headers, content_length)?;
+
+        if let Some(limit) = max_content_length
+            && u64::try_from(size).is_ok_and(|size| size > limit)
+        {
+            return Err(S3Error::new(S3ErrorCode::EntityTooLarge));
+        }
 
         // The app check preserves the existing S3 error contract; the storage
         // commit path reserves the exact net logical growth under its locks.
@@ -1555,6 +1637,7 @@ pub(super) fn previous_current_size_from_backfill(backfill: Option<OldCurrentSiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
     use s3s::dto::{DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule};
     use std::pin::Pin;
@@ -1592,6 +1675,39 @@ mod tests {
         })
         .await
         .expect("cancelled owner must abort and reap the stalled storage task");
+    }
+
+    #[tokio::test]
+    async fn max_content_length_stream_rejects_the_first_chunk_over_limit() {
+        let inner = StreamingBlob::wrap(futures::stream::iter([
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"1234")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"56")),
+        ]));
+        let mut limited = MaxContentLengthStream {
+            inner,
+            limit: 5,
+            received: 0,
+            exceeded: false,
+        };
+
+        assert_eq!(limited.next().await.unwrap().unwrap(), Bytes::from_static(b"1234"));
+        let error = limited.next().await.unwrap().unwrap_err();
+        assert!(error.downcast_ref::<UploadLimitExceeded>().is_some());
+        assert!(limited.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn max_content_length_stream_allows_exact_limit() {
+        let inner = StreamingBlob::from_bytes(Bytes::from_static(b"12345"));
+        let mut limited = MaxContentLengthStream {
+            inner,
+            limit: 5,
+            received: 0,
+            exceeded: false,
+        };
+
+        assert_eq!(limited.next().await.unwrap().unwrap(), Bytes::from_static(b"12345"));
+        assert!(limited.next().await.is_none());
     }
 
     #[test]
