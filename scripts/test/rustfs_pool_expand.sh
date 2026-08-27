@@ -681,11 +681,25 @@ preflight() {
     body="$(admin_api GET /rustfs/admin/v3/pools/list "")"
     code="$(admin_api_code)"
     if [ "${code}" != "200" ]; then
-      printf '\033[1;31m[ERROR]\033[0m admin API check failed (HTTP %s)\n' "${code}" >&2
+      # In the automated workflow the cluster is stopped before preflight
+      # (reset), so an unreachable admin API is expected there; the test
+      # starts the cluster and verifies the API in step 3. Only fail hard
+      # when the service is actually running but the API is broken.
+      local service_state
+      service_state="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODES[0]}" \
+        "systemctl is-active ${RUSTFS_SERVICE} 2>/dev/null || true")"
+      if [ "${service_state}" = "active" ]; then
+        printf '\033[1;31m[ERROR]\033[0m admin API check failed (HTTP %s) while ${RUSTFS_SERVICE} is active on %s\n' \
+          "${code}" "${NODES[0]}" >&2
+        printf '%s\n' "${body}" >&2
+        die "cannot reach the admin API at ${API_ENDPOINT} with the configured credentials"
+      fi
+      printf '\033[1;33m[WARN]\033[0m admin API not reachable (HTTP %s) — ${RUSTFS_SERVICE} is not active on %s; the test will start the cluster and verify the API in step 3\n' \
+        "${code}" "${NODES[0]}" >&2
       printf '%s\n' "${body}" >&2
-      die "cannot reach the admin API at ${API_ENDPOINT} with the configured credentials"
+    else
+      log "admin API OK ($(printf '%s' "${body}" | jq 'length') pool(s) listed)"
     fi
-    log "admin API OK ($(printf '%s' "${body}" | jq 'length') pool(s) listed)"
     # Check that each node resolves the rustfs-node* hostnames used by the volumes
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${NODES[0]}" \
       "grep -q rustfs-node /etc/hosts" || warn "rustfs-node* hostnames not found in /etc/hosts on ${NODES[0]}"
