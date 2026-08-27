@@ -3693,19 +3693,30 @@ mod tests {
         }
     }
 
-    async fn object_transaction_epochs(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<Option<Uuid>> {
+    async fn object_transaction_epochs(
+        disks: &[DiskStore],
+        bucket: &str,
+        object: &str,
+        write_quorum: usize,
+    ) -> Vec<Option<Uuid>> {
         let mut epochs = Vec::with_capacity(disks.len());
         for (disk_index, disk) in disks.iter().enumerate() {
-            let file_info = disk
-                .read_version("", bucket, object, "", &ReadOptions::default())
-                .await
-                .unwrap_or_else(|err| panic!("disk {disk_index} should persist object metadata: {err}"));
+            let file_info = match disk.read_version("", bucket, object, "", &ReadOptions::default()).await {
+                Ok(file_info) => file_info,
+                Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) => continue,
+                Err(err) => panic!("disk {disk_index} should read object metadata: {err}"),
+            };
             epochs.push(
                 file_info
                     .object_transaction_epoch()
                     .unwrap_or_else(|err| panic!("disk {disk_index} transaction epoch should decode: {err}")),
             );
         }
+        assert!(
+            epochs.len() >= write_quorum,
+            "object metadata should persist on write quorum: found {}, need {write_quorum}",
+            epochs.len()
+        );
         epochs
     }
 
@@ -3729,6 +3740,7 @@ mod tests {
             [
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false")),
             ],
             async {
                 set_disks
@@ -3777,7 +3789,11 @@ mod tests {
         )
         .await;
 
-        let epochs = object_transaction_epochs(&disk_stores, bucket, object).await;
+        disk_stores[0]
+            .delete_paths(bucket, &[format!("{object}/{STORAGE_FORMAT_FILE}")])
+            .await
+            .expect("one lagging disk should be simulated");
+        let epochs = object_transaction_epochs(&disk_stores, bucket, object, set_disks.default_write_quorum()).await;
         let first = epochs[0].expect("fenced multipart completion should persist an epoch");
         assert!(!first.is_nil());
         assert!(epochs.into_iter().all(|epoch| epoch == Some(first)));
@@ -3811,7 +3827,7 @@ mod tests {
                     )
                     .await
                     .expect("initial fenced PUT should commit");
-                let initial_epoch = object_transaction_epochs(&disk_stores, bucket, object)
+                let initial_epoch = object_transaction_epochs(&disk_stores, bucket, object, set_disks.default_write_quorum())
                     .await
                     .into_iter()
                     .next()
@@ -3853,7 +3869,7 @@ mod tests {
                     )
                     .await
                     .expect("concurrent fenced PUT should advance the epoch");
-                let winning_epoch = object_transaction_epochs(&disk_stores, bucket, object)
+                let winning_epoch = object_transaction_epochs(&disk_stores, bucket, object, set_disks.default_write_quorum())
                     .await
                     .into_iter()
                     .next()
@@ -3868,7 +3884,8 @@ mod tests {
                     .expect_err("stale epoch multipart completion must be rejected");
                 assert_eq!(err, StorageError::PreconditionFailed);
 
-                let final_epochs = object_transaction_epochs(&disk_stores, bucket, object).await;
+                let final_epochs =
+                    object_transaction_epochs(&disk_stores, bucket, object, set_disks.default_write_quorum()).await;
                 assert!(final_epochs.into_iter().all(|epoch| epoch == Some(winning_epoch)));
                 let mut reader = set_disks
                     .get_object_reader(
