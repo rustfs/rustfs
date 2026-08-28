@@ -127,20 +127,25 @@ impl Operation for RestLoadTableHandler {
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let snapshot_selection = rest_table_snapshot_selection_from_query(&req.uri)?;
         let issuer = IamTableCredentialIssuer::from_request(&req)?;
-        if issuer.enabled() {
+        let vended_credentials_requested = requests_vended_credentials(&req.headers);
+        if vended_credentials_requested && issuer.enabled() {
             authorize_table_catalog_resource_for_principal(&req, &principal, &resource, AdminAction::GetTableCredentialsAction)
                 .await?;
         }
-        let mut response = load_table_response_with_credentials(
-            &store,
-            &metadata_backend,
-            &warehouse,
-            &namespace,
-            &table,
-            &issuer,
-            Some(&principal.credentials),
-        )
-        .await?;
+        let mut response = if vended_credentials_requested {
+            load_table_response_with_credentials(
+                &store,
+                &metadata_backend,
+                &warehouse,
+                &namespace,
+                &table,
+                &issuer,
+                Some(&principal.credentials),
+            )
+            .await?
+        } else {
+            load_table_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?
+        };
         apply_rest_table_snapshot_selection(&mut response.metadata, snapshot_selection);
         build_sensitive_json_response(StatusCode::OK, &response)
     }

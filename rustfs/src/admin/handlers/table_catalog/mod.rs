@@ -73,6 +73,8 @@ pub use view::*;
 const JSON_CONTENT_TYPE: &str = "application/json";
 const ENV_TABLE_CATALOG_CREDENTIAL_VENDING: &str = "RUSTFS_TABLE_CATALOG_CREDENTIAL_VENDING";
 const ENV_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: &str = "RUSTFS_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS";
+const ICEBERG_ACCESS_DELEGATION_HEADER: &str = "x-iceberg-access-delegation";
+const ICEBERG_VENDED_CREDENTIALS_DELEGATION: &[u8] = b"vended-credentials";
 const DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 15 * 60;
 const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
 const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
@@ -735,8 +737,10 @@ impl std::fmt::Debug for RestStorageCredential {
 
 #[derive(Debug, Clone)]
 struct TableCredentialScope {
-    scope_prefix: String,
-    object_prefix: String,
+    warehouse_scope_prefix: String,
+    warehouse_object_prefix: String,
+    metadata_scope_prefix: String,
+    metadata_object: String,
 }
 
 #[derive(Debug, Clone)]
@@ -745,6 +749,7 @@ struct TableCredentialIssueRequest<'a> {
     principal: Option<&'a rustfs_credentials::Credentials>,
     scope_prefix: String,
     object_prefix: String,
+    metadata_object: String,
 }
 
 #[derive(Clone)]
@@ -844,7 +849,7 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
             ));
         }
 
-        let policy = table_credential_session_policy(request.entry, &request.object_prefix)?;
+        let policy = table_credential_session_policy(request.entry, &request.object_prefix, &request.metadata_object)?;
         let policy_buf = serde_json::to_vec(&policy)
             .map_err(|err| s3_error!(InternalError, "failed to serialize table credential session policy: {}", err))?;
         let expiration = OffsetDateTime::now_utc().saturating_add(Duration::seconds(self.ttl_seconds));
@@ -2483,9 +2488,16 @@ fn table_credential_scope(entry: &crate::table_catalog::TableEntry) -> S3Result<
         return Err(s3_error!(InvalidRequest, "table warehouse location must be inside the table bucket"));
     }
     let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
+    validate_persisted_table_metadata_location(entry, &entry.metadata_location)?;
+    let metadata_object =
+        crate::table_catalog::table_catalog_object_key_from_location(&entry.table_bucket, &entry.metadata_location)
+            .ok_or_else(|| persisted_metadata_error("table"))?;
+    let metadata_scope_prefix = table_metadata_location_for_client(&entry.table_bucket, &entry.metadata_location);
     Ok(TableCredentialScope {
-        scope_prefix: format!("s3://{bucket}/{object_prefix}"),
-        object_prefix,
+        warehouse_scope_prefix: format!("s3://{bucket}/{object_prefix}"),
+        warehouse_object_prefix: object_prefix,
+        metadata_scope_prefix,
+        metadata_object,
     })
 }
 
@@ -2523,9 +2535,16 @@ fn table_credential_catalog_resource(entry: &crate::table_catalog::TableEntry) -
     Ok(format!("namespaces/{}/tables/{}", namespace.storage_id(), table.as_str()))
 }
 
-fn table_credential_session_policy(entry: &crate::table_catalog::TableEntry, object_prefix: &str) -> S3Result<Policy> {
+fn table_credential_session_policy(
+    entry: &crate::table_catalog::TableEntry,
+    object_prefix: &str,
+    metadata_object: &str,
+) -> S3Result<Policy> {
     let bucket = &entry.table_bucket;
     let object_prefix = normalize_table_credential_object_prefix(object_prefix)?;
+    validate_persisted_table_metadata_location(entry, metadata_object)?;
+    let metadata_object = crate::table_catalog::table_catalog_object_key_from_location(bucket, metadata_object)
+        .ok_or_else(|| persisted_metadata_error("table"))?;
     let catalog_resource = table_credential_catalog_resource(entry)?;
     let policy = serde_json::json!({
         "Version": "2012-10-17",
@@ -2541,6 +2560,15 @@ fn table_credential_session_policy(entry: &crate::table_catalog::TableEntry, obj
                 ],
                 "Resource": [
                     format!("arn:aws:s3:::{bucket}/{object_prefix}*")
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject"
+                ],
+                "Resource": [
+                    format!("arn:aws:s3:::{bucket}/{metadata_object}")
                 ]
             },
             {
@@ -2569,23 +2597,44 @@ fn table_credential_session_policy(entry: &crate::table_catalog::TableEntry, obj
     Policy::parse_config(&data).map_err(|err| s3_error!(InvalidRequest, "invalid table credential policy: {}", err))
 }
 
-fn storage_credential_from_issued(scope: TableCredentialScope, issued: IssuedTableCredentials) -> RestStorageCredential {
+fn storage_credential_config(scope_prefix: &str, issued: &IssuedTableCredentials) -> BTreeMap<String, String> {
     let mut config = BTreeMap::new();
-    config.insert(S3_ACCESS_KEY_ID_CONFIG_KEY.to_string(), issued.access_key_id);
-    config.insert(S3_SECRET_ACCESS_KEY_CONFIG_KEY.to_string(), issued.secret_access_key);
-    config.insert(S3_SESSION_TOKEN_CONFIG_KEY.to_string(), issued.session_token);
+    config.insert(S3_ACCESS_KEY_ID_CONFIG_KEY.to_string(), issued.access_key_id.clone());
+    config.insert(S3_SECRET_ACCESS_KEY_CONFIG_KEY.to_string(), issued.secret_access_key.clone());
+    config.insert(S3_SESSION_TOKEN_CONFIG_KEY.to_string(), issued.session_token.clone());
     config.insert(CREDENTIAL_VENDING_CONFIG_KEY.to_string(), CREDENTIAL_VENDING_SUPPORTED.to_string());
     config.insert(CREDENTIAL_MODE_CONFIG_KEY.to_string(), CREDENTIAL_MODE_CATALOG_VENDED.to_string());
     config.insert(CREDENTIAL_SCOPE_CONFIG_KEY.to_string(), CREDENTIAL_SCOPE_TABLE_PREFIX.to_string());
-    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), scope.scope_prefix.clone());
+    config.insert(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY.to_string(), scope_prefix.to_string());
     config.insert(
         CREDENTIAL_EXPIRATION_CONFIG_KEY.to_string(),
         issued.expiration.unix_timestamp().to_string(),
     );
-    RestStorageCredential {
-        prefix: scope.scope_prefix,
-        config,
-    }
+    config
+}
+
+fn storage_credentials_from_issued(scope: TableCredentialScope, issued: IssuedTableCredentials) -> Vec<RestStorageCredential> {
+    let warehouse_config = storage_credential_config(&scope.warehouse_scope_prefix, &issued);
+    let metadata_config = storage_credential_config(&scope.metadata_scope_prefix, &issued);
+    vec![
+        RestStorageCredential {
+            prefix: scope.warehouse_scope_prefix,
+            config: warehouse_config,
+        },
+        RestStorageCredential {
+            prefix: scope.metadata_scope_prefix,
+            config: metadata_config,
+        },
+    ]
+}
+
+fn requests_vended_credentials(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(ICEBERG_ACCESS_DELEGATION_HEADER)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .map(|token| token.trim_ascii())
+        .any(|token| token == ICEBERG_VENDED_CREDENTIALS_DELEGATION)
 }
 
 fn table_metadata_location_for_client(table_bucket: &str, metadata_location: &str) -> String {
@@ -2693,12 +2742,13 @@ async fn load_credentials_response_from_entry(
     let request = TableCredentialIssueRequest {
         entry,
         principal,
-        scope_prefix: scope.scope_prefix.clone(),
-        object_prefix: scope.object_prefix.clone(),
+        scope_prefix: scope.warehouse_scope_prefix.clone(),
+        object_prefix: scope.warehouse_object_prefix.clone(),
+        metadata_object: scope.metadata_object.clone(),
     };
-    let scope_prefix = scope.scope_prefix.clone();
+    let scope_prefix = scope.warehouse_scope_prefix.clone();
     let storage_credentials = match issuer.issue_table_credentials(request).await? {
-        Some(issued) => vec![storage_credential_from_issued(scope, issued)],
+        Some(issued) => storage_credentials_from_issued(scope, issued),
         None => {
             let mut config = load_credentials_response_config(
                 CREDENTIAL_VENDING_UNSUPPORTED,

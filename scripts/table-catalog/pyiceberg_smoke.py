@@ -32,6 +32,17 @@ REQUIRED_STORAGE_CREDENTIAL_KEYS = (
     "s3.secret-access-key",
     "s3.session-token",
 )
+CATALOG_STORAGE_CREDENTIAL_KEYS = (
+    "s3.access-key-id",
+    "s3.secret-access-key",
+    "s3.session-token",
+)
+AMBIENT_AWS_CREDENTIAL_KEYS = (
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+)
 SENSITIVE_COMMAND_FLAGS = {
     "--access-key",
     "--secret-key",
@@ -150,7 +161,7 @@ CLIENT_MATRIX: list[dict[str, str]] = [
     {
         "client": "PyIceberg",
         "status": "automated",
-        "coverage": "create namespace, create table, append, reload, scan, metadata-location, refs, paginated views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe",
+        "coverage": "create namespace, create table, append, reload, scan, metadata-location, refs, paginated views, maintenance, diagnostics, optional native LoadTable credential resolution without long-term S3 data credentials after bootstrap",
         "entrypoint": "scripts/table-catalog/pyiceberg_smoke.py",
     },
     {
@@ -191,7 +202,7 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "status": "automated-after-table-bootstrap",
         "roadmap_area": "credential-vending",
         "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
-        "expected_behavior": "the rustfs-vended-credentials profile requests vended credentials through the standard LoadTable response, verifies the returned prefix exactly matches the table warehouse location, verifies scoped data-plane access, and switches append, reload, and scan operations to the returned table-scoped credentials after table creation; the dedicated credentials endpoint uses the same issuer path",
+        "expected_behavior": "the rustfs-vended-credentials profile uses native PyIceberg RestCatalog.load_table credential resolution after removing catalog and ambient long-term S3 data credentials, verifies scoped data-plane access, and uses the returned temporary session for append, reload, and scan; the dedicated credentials endpoint uses the same issuer path",
     },
     {
         "capability": "background-maintenance-worker",
@@ -418,7 +429,7 @@ def parse_args() -> argparse.Namespace:
         "--require-vended-credentials",
         action="store_true",
         default=None,
-        help="Require table-scoped credentials from the REST credentials endpoint before data-plane operations.",
+        help="Require native PyIceberg LoadTable credential resolution before data-plane operations.",
     )
     parser.add_argument("--timeout", type=float, default=float(os.getenv("RUSTFS_TABLE_SMOKE_TIMEOUT", "20")))
     parser.add_argument("--cleanup", action="store_true", help="Drop the smoke table and namespace before exiting.")
@@ -523,6 +534,11 @@ def ensure_aws_env(access_key: str, secret_key: str, region: str) -> None:
     os.environ.setdefault("AWS_DEFAULT_REGION", region)
 
 
+def clear_ambient_aws_credentials() -> None:
+    for key in AMBIENT_AWS_CREDENTIAL_KEYS:
+        os.environ.pop(key, None)
+
+
 def unsigned_ssl_context(insecure: bool) -> ssl.SSLContext | None:
     if not insecure:
         return None
@@ -624,13 +640,6 @@ def enable_table_bucket(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     signed_rest_request(args, deps, "PUT", f"{args.rest_path}/v1/buckets/{encoded_bucket}")
 
 
-def credentials_endpoint_path(args: argparse.Namespace) -> str:
-    encoded_bucket = urllib.parse.quote(args.bucket, safe="")
-    encoded_namespace = urllib.parse.quote(args.namespace, safe="")
-    encoded_table = urllib.parse.quote(args.table, safe="")
-    return f"{args.rest_path}/v1/{encoded_bucket}/namespaces/{encoded_namespace}/tables/{encoded_table}/credentials"
-
-
 def table_endpoint_path(args: argparse.Namespace, suffix: str = "") -> str:
     encoded_bucket = urllib.parse.quote(args.bucket, safe="")
     encoded_namespace = urllib.parse.quote(args.namespace, safe="")
@@ -723,38 +732,30 @@ def default_maintenance_config() -> dict[str, Any]:
     }
 
 
-def storage_credential_from_response(response: dict[str, Any]) -> StorageCredential:
-    credentials = response.get("storage-credentials")
-    if not isinstance(credentials, list) or not credentials:
-        raise RuntimeError("no storage credentials were returned by the table response")
-
-    for credential in credentials:
-        if not isinstance(credential, dict):
-            continue
-        config = credential.get("config")
-        if not isinstance(config, dict):
-            continue
-        missing_keys = [key for key in REQUIRED_STORAGE_CREDENTIAL_KEYS if not config.get(key)]
-        if missing_keys:
-            continue
-        prefix = credential.get("prefix")
-        if not isinstance(prefix, str):
-            prefix = ""
-        return StorageCredential(prefix=prefix, config={str(key): str(value) for key, value in config.items()})
-
-    required = ", ".join(REQUIRED_STORAGE_CREDENTIAL_KEYS)
-    raise RuntimeError(f"no storage credentials contained the required keys: {required}")
+def strip_catalog_storage_credentials(catalog: Any) -> None:
+    properties = getattr(catalog, "properties", None)
+    if not isinstance(properties, dict):
+        raise RuntimeError("PyIceberg REST catalog does not expose mutable properties")
+    for key in CATALOG_STORAGE_CREDENTIAL_KEYS:
+        properties.pop(key, None)
 
 
-def load_table_storage_credential(args: argparse.Namespace, deps: RuntimeDeps) -> StorageCredential:
-    response = signed_rest_request(
-        args,
-        deps,
-        "GET",
-        table_endpoint_path(args),
-        request_headers={"X-Iceberg-Access-Delegation": "vended-credentials"},
+def native_table_storage_credential(table: Any, table_location: str) -> StorageCredential:
+    file_io = getattr(table, "io", None)
+    properties = getattr(file_io, "properties", None)
+    if not isinstance(properties, dict):
+        raise RuntimeError("PyIceberg table FileIO does not expose resolved storage properties")
+    missing_keys = [key for key in REQUIRED_STORAGE_CREDENTIAL_KEYS if not properties.get(key)]
+    if missing_keys:
+        required = ", ".join(missing_keys)
+        raise RuntimeError(f"native PyIceberg LoadTable did not resolve vended credentials: {required}")
+    if properties.get("rustfs.credential-mode") != "catalog-vended-temporary-credentials":
+        raise RuntimeError("native PyIceberg LoadTable did not select the catalog-vended credential mode")
+    bucket, object_prefix = s3_scope_from_uri(table_location, "table warehouse location")
+    return StorageCredential(
+        prefix=f"s3://{bucket}/{object_prefix}",
+        config={str(key): str(value) for key, value in properties.items()},
     )
-    return storage_credential_from_response(response)
 
 
 def s3_scope_from_uri(s3_uri: str, description: str) -> tuple[str, str]:
@@ -920,7 +921,7 @@ def verify_vended_credential_data_plane_scope(
                 print(f"warning: failed to clean denied-scope read probe object {denied_key}: {cleanup_error}", file=sys.stderr)
 
 
-def catalog_properties(args: argparse.Namespace, storage_credential: StorageCredential | None = None) -> dict[str, str]:
+def catalog_properties(args: argparse.Namespace) -> dict[str, str]:
     endpoint = normalized_endpoint(args.endpoint)
     warehouse = profile_warehouse(args)
     properties = {
@@ -938,8 +939,6 @@ def catalog_properties(args: argparse.Namespace, storage_credential: StorageCred
         "rest.signing-region": args.region,
         "rest.signing-name": args.rest_signing_name,
     }
-    if storage_credential is not None:
-        properties.update(storage_credential.config)
     if args.insecure:
         properties["s3.verify-ssl"] = "false"
     return properties
@@ -1406,7 +1405,12 @@ def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps) -> dict[
 def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
     endpoint = normalized_endpoint(args.endpoint)
     ensure_local_proxy_bypass(endpoint)
-    ensure_aws_env(args.access_key, args.secret_key, args.region)
+    if args.require_vended_credentials:
+        clear_ambient_aws_credentials()
+        os.environ.setdefault("AWS_REGION", args.region)
+        os.environ.setdefault("AWS_DEFAULT_REGION", args.region)
+    else:
+        ensure_aws_env(args.access_key, args.secret_key, args.region)
 
     print(f"[1/10] ensuring S3 bucket {args.bucket}")
     ensure_bucket(args, deps)
@@ -1435,25 +1439,27 @@ def run_smoke(args: argparse.Namespace, deps: RuntimeDeps) -> SmokeResult:
     )
     created_table = catalog.create_table(identifier, schema=arrow_schema)
 
-    storage_credential = None
+    table = None
     if args.require_vended_credentials:
-        print(f"[6/10] loading table-scoped storage credentials")
-        storage_credential = load_table_storage_credential(args, deps)
-        print(f"credential scope: {storage_credential.prefix or 'not reported'}")
-        print(f"[7/10] verifying table-scoped data-plane access")
+        print(f"[6/10] loading table through native PyIceberg credential resolution")
+        strip_catalog_storage_credentials(catalog)
+        clear_ambient_aws_credentials()
         try:
             expected_table_location = table_warehouse_location(created_table)
         except RuntimeError:
-            expected_table_location = table_warehouse_location(catalog.load_table(identifier))
+            expected_table_location = f"s3://{args.bucket}/tables/{args.table}"
+        table = catalog.load_table(identifier)
+        storage_credential = native_table_storage_credential(table, expected_table_location)
+        print(f"credential scope: {storage_credential.prefix}")
+        print(f"[7/10] verifying table-scoped data-plane access")
         verify_vended_credential_data_plane_scope(args, deps, storage_credential, expected_table_location)
-        catalog = deps.load_catalog(args.catalog_name, **catalog_properties(args, storage_credential=storage_credential))
-        install_rustfs_rest_sigv4_adapter(catalog, args, deps)
     else:
         print(f"[6/10] using configured S3 credentials for data-plane operations")
         print(f"[7/10] skipping vended credential data-plane scope probe")
 
     print(f"[8/10] appending rows through PyIceberg")
-    table = catalog.load_table(identifier)
+    if table is None:
+        table = catalog.load_table(identifier)
     rows = deps.pyarrow.Table.from_pylist(
         [
             {"id": 1, "payload": "alpha"},

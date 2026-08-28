@@ -165,55 +165,6 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(args.rest_signing_name, "s3")
         self.assertEqual(pyiceberg_smoke.catalog_properties(args)["uri"], "http://rustfs.local:9000/iceberg")
 
-    def test_credentials_endpoint_path_uses_encoded_table_identifier(self) -> None:
-        args = self.parse_with_args([
-            "--bucket",
-            "lake bucket",
-            "--namespace",
-            "sales.analytics",
-            "--table",
-            "orders table",
-        ])
-
-        self.assertEqual(
-            pyiceberg_smoke.credentials_endpoint_path(args),
-            "/iceberg/v1/lake%20bucket/namespaces/sales.analytics/tables/orders%20table/credentials",
-        )
-
-    def test_vended_credential_probe_uses_standard_load_table_response(self) -> None:
-        args = self.parse_with_args([
-            "--bucket",
-            "lake bucket",
-            "--namespace",
-            "sales.analytics",
-            "--table",
-            "orders table",
-        ])
-        response = {
-            "storage-credentials": [
-                {
-                    "prefix": "s3://lake bucket/tables/table-id/",
-                    "config": {
-                        "s3.access-key-id": "temp-access",
-                        "s3.secret-access-key": "temp-secret",
-                        "s3.session-token": "temp-token",
-                    },
-                }
-            ]
-        }
-
-        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=response) as request:
-            credential = pyiceberg_smoke.load_table_storage_credential(args, object())
-
-        self.assertEqual(credential.prefix, "s3://lake bucket/tables/table-id/")
-        request.assert_called_once_with(
-            args,
-            mock.ANY,
-            "GET",
-            "/iceberg/v1/lake%20bucket/namespaces/sales.analytics/tables/orders%20table",
-            request_headers={"X-Iceberg-Access-Delegation": "vended-credentials"},
-        )
-
     def test_table_catalog_endpoint_paths_encode_identifier_components(self) -> None:
         args = self.parse_with_args([
             "--bucket",
@@ -673,6 +624,14 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
 
         class FakeTable:
             metadata = SimpleNamespace(location="s3://lake/tables/table-id")
+            io = SimpleNamespace(
+                properties={
+                    "s3.access-key-id": "temp-access",
+                    "s3.secret-access-key": "temp-secret",
+                    "s3.session-token": "temp-token",
+                    "rustfs.credential-mode": "catalog-vended-temporary-credentials",
+                }
+            )
 
             def append(self, rows: object) -> None:
                 events.append("append")
@@ -681,6 +640,9 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                 return FakeScan()
 
         class FakeCatalog:
+            def __init__(self, properties: dict[str, str]) -> None:
+                self.properties = properties
+
             def create_table(self, identifier: tuple[str, str], *, schema: object) -> FakeTable:
                 events.append(f"create:{'.'.join(identifier)}")
                 return FakeTable()
@@ -689,27 +651,19 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                 events.append(f"load:{'.'.join(identifier)}")
                 return FakeTable()
 
-        deps = SimpleNamespace(pyarrow=FakePyArrow(), load_catalog=lambda *_args, **_kwargs: FakeCatalog())
-        storage_credential = pyiceberg_smoke.StorageCredential(
-            prefix="s3://lake/tables/table-id/",
-            config={
-                "s3.access-key-id": "temp-access",
-                "s3.secret-access-key": "temp-secret",
-                "s3.session-token": "temp-token",
-            },
-        )
+        def load_catalog(*_args: object, **properties: str) -> FakeCatalog:
+            events.append("load-catalog")
+            return FakeCatalog(properties)
+
+        deps = SimpleNamespace(pyarrow=FakePyArrow(), load_catalog=load_catalog)
 
         with mock.patch.object(pyiceberg_smoke, "ensure_local_proxy_bypass"):
             with mock.patch.object(pyiceberg_smoke, "ensure_aws_env"):
-                with mock.patch.object(pyiceberg_smoke, "ensure_bucket"):
-                    with mock.patch.object(pyiceberg_smoke, "enable_table_bucket"):
-                        with mock.patch.object(pyiceberg_smoke, "install_rustfs_rest_sigv4_adapter"):
-                            with mock.patch.object(pyiceberg_smoke, "ensure_namespace"):
-                                with mock.patch.object(
-                                    pyiceberg_smoke,
-                                    "load_table_storage_credential",
-                                    side_effect=lambda *_args: (events.append("load-vended-credential"), storage_credential)[1],
-                                ):
+                with mock.patch.object(pyiceberg_smoke, "clear_ambient_aws_credentials"):
+                    with mock.patch.object(pyiceberg_smoke, "ensure_bucket"):
+                        with mock.patch.object(pyiceberg_smoke, "enable_table_bucket"):
+                            with mock.patch.object(pyiceberg_smoke, "install_rustfs_rest_sigv4_adapter"):
+                                with mock.patch.object(pyiceberg_smoke, "ensure_namespace"):
                                     with mock.patch.object(
                                         pyiceberg_smoke,
                                         "verify_vended_credential_data_plane_scope",
@@ -771,7 +725,8 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         events = self.run_smoke_with_fakes(args, probe_calls)
 
         self.assertEqual(probe_calls, ["catalog-probes"])
-        self.assertLess(events.index("load-vended-credential"), events.index("verify-vended-scope"))
+        self.assertEqual(events.count("load-catalog"), 1)
+        self.assertLess(events.index("load:sales.orders"), events.index("verify-vended-scope"))
         self.assertLess(events.index("verify-vended-scope"), events.index("append"))
         self.assertLess(events.index("scan"), events.index("catalog-probes"))
 
@@ -787,39 +742,36 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         self.assertEqual(request["view-version"]["representations"][0]["dialect"], "spark")
         self.assertEqual(request["properties"]["rustfs.smoke.table"], "orders")
 
-    def test_catalog_properties_can_use_vended_storage_credentials(self) -> None:
+    def test_native_load_table_uses_vended_file_io_without_catalog_data_credentials(self) -> None:
         args = self.parse_with_args([
             "--access-key",
             "root-access",
             "--secret-key",
             "root-secret",
         ])
-        credential = pyiceberg_smoke.storage_credential_from_response(
-            {
-                "storage-credentials": [
-                    {
-                        "prefix": "s3://lake/tables/table-id/",
-                        "config": {
-                            "s3.access-key-id": "temp-access",
-                            "s3.secret-access-key": "temp-secret",
-                            "s3.session-token": "temp-token",
-                            "rustfs.credential-mode": "catalog-vended-temporary-credentials",
-                        },
-                    }
-                ]
-            }
+        catalog = SimpleNamespace(properties=pyiceberg_smoke.catalog_properties(args))
+        table = SimpleNamespace(
+            io=SimpleNamespace(
+                properties={
+                    "s3.access-key-id": "temp-access",
+                    "s3.secret-access-key": "temp-secret",
+                    "s3.session-token": "temp-token",
+                    "rustfs.credential-mode": "catalog-vended-temporary-credentials",
+                    "rustfs.credential-scope-prefix": "s3://lake/.rustfs-table/current.metadata.json",
+                }
+            )
         )
 
-        properties = pyiceberg_smoke.catalog_properties(args, storage_credential=credential)
+        pyiceberg_smoke.strip_catalog_storage_credentials(catalog)
+        credential = pyiceberg_smoke.native_table_storage_credential(table, "s3://lake/tables/table-id")
 
-        self.assertEqual(properties["s3.access-key-id"], "temp-access")
-        self.assertEqual(properties["s3.secret-access-key"], "temp-secret")
-        self.assertEqual(properties["s3.session-token"], "temp-token")
-        self.assertEqual(properties["rustfs.credential-mode"], "catalog-vended-temporary-credentials")
-
-    def test_empty_vended_credentials_response_is_rejected(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "no storage credentials"):
-            pyiceberg_smoke.storage_credential_from_response({"storage-credentials": []})
+        self.assertNotIn("s3.access-key-id", catalog.properties)
+        self.assertNotIn("s3.secret-access-key", catalog.properties)
+        self.assertNotIn("s3.session-token", catalog.properties)
+        self.assertEqual(credential.prefix, "s3://lake/tables/table-id/")
+        self.assertEqual(credential.config["s3.access-key-id"], "temp-access")
+        self.assertEqual(credential.config["s3.secret-access-key"], "temp-secret")
+        self.assertEqual(credential.config["s3.session-token"], "temp-token")
 
     def test_storage_credential_prefix_parses_bucket_and_key_prefix(self) -> None:
         bucket, key_prefix = pyiceberg_smoke.s3_scope_from_credential(

@@ -67,6 +67,16 @@ fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, sec
     }
 }
 
+fn with_access_delegation(mut request: S3Request<Body>, values: &[&str]) -> S3Request<Body> {
+    for value in values {
+        request.headers.append(
+            ICEBERG_ACCESS_DELEGATION_HEADER,
+            HeaderValue::from_str(value).expect("access delegation header should be valid"),
+        );
+    }
+    request
+}
+
 async fn call_load_table_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
     let mut router = matchit::Router::new();
     router
@@ -291,8 +301,46 @@ async fn load_table_handler_gates_vended_credentials_without_breaking_disabled_c
     );
     assert_eq!(disabled_json["storage-credentials"], serde_json::json!([]));
 
-    let denied = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
+    let absent = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
         call_load_table_handler(table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key)).await
+    })
+    .await
+    .expect("metadata-only caller should load without requesting delegation");
+    let absent_json: serde_json::Value = serde_json::from_slice(
+        &absent
+            .output
+            .1
+            .bytes()
+            .expect("absent delegation response body should be buffered"),
+    )
+    .expect("absent delegation response should parse");
+    assert_eq!(absent_json["storage-credentials"], serde_json::json!([]));
+
+    let remote_signing = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
+        call_load_table_handler(with_access_delegation(
+            table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key),
+            &["remote-signing"],
+        ))
+        .await
+    })
+    .await
+    .expect("metadata-only caller should load when only remote signing is requested");
+    let remote_signing_json: serde_json::Value = serde_json::from_slice(
+        &remote_signing
+            .output
+            .1
+            .bytes()
+            .expect("remote signing response body should be buffered"),
+    )
+    .expect("remote signing response should parse");
+    assert_eq!(remote_signing_json["storage-credentials"], serde_json::json!([]));
+
+    let denied = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
+        call_load_table_handler(with_access_delegation(
+            table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key),
+            &["vended-credentials"],
+        ))
+        .await
     })
     .await
     .expect_err("metadata-only caller should not receive vended credentials");
@@ -303,7 +351,11 @@ async fn load_table_handler_gates_vended_credentials_without_breaking_disabled_c
     assert!(!denied_text.contains("load-table-root-secret-key"));
 
     let issued = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
-        call_load_table_handler(table_catalog_handler_request(context.clone(), vended_access_key, vended_secret_key)).await
+        call_load_table_handler(with_access_delegation(
+            table_catalog_handler_request(context.clone(), vended_access_key, vended_secret_key),
+            &["remote-signing", "unknown, vended-credentials"],
+        ))
+        .await
     })
     .await
     .expect("credential-authorized caller should receive vended credentials");
@@ -324,19 +376,48 @@ async fn load_table_handler_gates_vended_credentials_without_breaking_disabled_c
         issued_json["config"][CREDENTIAL_MODE_CONFIG_KEY],
         serde_json::Value::String(CREDENTIAL_MODE_CATALOG_VENDED.to_string())
     );
-    assert_eq!(issued_json["storage-credentials"].as_array().map(Vec::len), Some(1));
+    assert_eq!(issued_json["storage-credentials"].as_array().map(Vec::len), Some(2));
+    assert_eq!(issued_json["storage-credentials"][1]["prefix"], issued_json["metadata-location"]);
+    assert_eq!(
+        issued_json["storage-credentials"][0]["config"][S3_ACCESS_KEY_ID_CONFIG_KEY],
+        issued_json["storage-credentials"][1]["config"][S3_ACCESS_KEY_ID_CONFIG_KEY]
+    );
     for required_key in [
         S3_ACCESS_KEY_ID_CONFIG_KEY,
         S3_SECRET_ACCESS_KEY_CONFIG_KEY,
         S3_SESSION_TOKEN_CONFIG_KEY,
     ] {
-        assert!(
-            issued_json["storage-credentials"][0]["config"][required_key]
-                .as_str()
-                .is_some_and(|value| !value.is_empty()),
-            "LoadTable should include {required_key}"
-        );
+        for credential in issued_json["storage-credentials"]
+            .as_array()
+            .expect("storage credentials should be an array")
+        {
+            assert!(
+                credential["config"][required_key]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "LoadTable should include {required_key}"
+            );
+        }
     }
+
+    let requested = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
+        call_load_table_handler(with_access_delegation(
+            table_catalog_handler_request(context.clone(), vended_access_key, vended_secret_key),
+            &["vended-credentials"],
+        ))
+        .await
+    })
+    .await
+    .expect("credential-authorized caller should receive explicitly requested credentials");
+    let requested_json: serde_json::Value = serde_json::from_slice(
+        &requested
+            .output
+            .1
+            .bytes()
+            .expect("requested delegation response body should be buffered"),
+    )
+    .expect("requested delegation response should parse");
+    assert_eq!(requested_json["storage-credentials"].as_array().map(Vec::len), Some(2));
 }
 
 #[test]
@@ -10159,6 +10240,10 @@ impl TableCredentialIssuer for TestTableCredentialIssuer {
         assert_eq!(request.entry.table_bucket, "warehouse");
         assert_eq!(request.scope_prefix, "s3://warehouse/tables/table-id/");
         assert_eq!(request.object_prefix, "tables/table-id/");
+        assert_eq!(
+            request.metadata_object,
+            ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
+        );
         Ok(Some(IssuedTableCredentials {
             access_key_id: "temporary-access-key".to_string(),
             secret_access_key: "temporary-secret-key".to_string(),
@@ -10192,25 +10277,27 @@ async fn credential_issuer_returns_temporary_scoped_storage_credentials() {
     assert!(!response.config.contains_key(S3_ACCESS_KEY_ID_CONFIG_KEY));
     assert!(!response.config.contains_key(S3_SECRET_ACCESS_KEY_CONFIG_KEY));
     assert!(!response.config.contains_key(S3_SESSION_TOKEN_CONFIG_KEY));
-    assert_eq!(response.storage_credentials.len(), 1);
-    let credential = &response.storage_credentials[0];
-    assert_eq!(credential.prefix, "s3://warehouse/tables/table-id/");
-    assert_eq!(credential.config.get("s3.access-key-id"), Some(&"temporary-access-key".to_string()));
-    assert_eq!(credential.config.get("s3.secret-access-key"), Some(&"temporary-secret-key".to_string()));
-    assert_eq!(credential.config.get("s3.session-token"), Some(&"temporary-session-token".to_string()));
+    assert_eq!(response.storage_credentials.len(), 2);
+    assert_eq!(response.storage_credentials[0].prefix, "s3://warehouse/tables/table-id/");
     assert_eq!(
-        credential.config.get("rustfs.credential-mode"),
-        Some(&"catalog-vended-temporary-credentials".to_string())
+        response.storage_credentials[1].prefix,
+        "s3://warehouse/.rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json"
     );
-    assert_eq!(
-        credential.config.get("rustfs.credential-scope-prefix"),
-        Some(&"s3://warehouse/tables/table-id/".to_string())
-    );
-    assert_eq!(
-        credential.config.get("rustfs.credential-expiration-unix-seconds"),
-        Some(&"1800000000".to_string())
-    );
-    assert!(!credential.config.contains_key("rustfs.credential-vending-reason"));
+    for credential in &response.storage_credentials {
+        assert_eq!(credential.config.get("s3.access-key-id"), Some(&"temporary-access-key".to_string()));
+        assert_eq!(credential.config.get("s3.secret-access-key"), Some(&"temporary-secret-key".to_string()));
+        assert_eq!(credential.config.get("s3.session-token"), Some(&"temporary-session-token".to_string()));
+        assert_eq!(
+            credential.config.get("rustfs.credential-mode"),
+            Some(&"catalog-vended-temporary-credentials".to_string())
+        );
+        assert_eq!(credential.config.get("rustfs.credential-scope-prefix"), Some(&credential.prefix));
+        assert_eq!(
+            credential.config.get("rustfs.credential-expiration-unix-seconds"),
+            Some(&"1800000000".to_string())
+        );
+        assert!(!credential.config.contains_key("rustfs.credential-vending-reason"));
+    }
 }
 
 #[tokio::test]
@@ -10382,7 +10469,8 @@ fn table_credentials_do_not_snapshot_parent_groups() {
 
 #[tokio::test]
 async fn table_credential_session_policy_is_limited_to_table_prefix() {
-    let policy = table_credential_session_policy(&table_entry_for_credentials(), "tables/table-id/")
+    let metadata_object = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json";
+    let policy = table_credential_session_policy(&table_entry_for_credentials(), "tables/table-id/", metadata_object)
         .expect("table credential policy should build");
     let groups = None;
     let conditions = std::collections::HashMap::new();
@@ -10434,6 +10522,66 @@ async fn table_credential_session_policy_is_limited_to_table_prefix() {
             .await
     );
     assert!(
+        policy
+            .is_allowed(&rustfs_policy::policy::Args {
+                account: "temporary-access-key",
+                groups: &groups,
+                action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetObjectAction),
+                bucket: "warehouse",
+                conditions: &conditions,
+                is_owner: false,
+                object: metadata_object,
+                claims: &claims,
+                deny_only: false,
+            })
+            .await
+    );
+    assert!(
+        !policy
+            .is_allowed(&rustfs_policy::policy::Args {
+                account: "temporary-access-key",
+                groups: &groups,
+                action: Action::S3Action(rustfs_policy::policy::action::S3Action::PutObjectAction),
+                bucket: "warehouse",
+                conditions: &conditions,
+                is_owner: false,
+                object: metadata_object,
+                claims: &claims,
+                deny_only: false,
+            })
+            .await
+    );
+    assert!(
+        !policy
+            .is_allowed(&rustfs_policy::policy::Args {
+                account: "temporary-access-key",
+                groups: &groups,
+                action: Action::S3Action(rustfs_policy::policy::action::S3Action::DeleteObjectAction),
+                bucket: "warehouse",
+                conditions: &conditions,
+                is_owner: false,
+                object: metadata_object,
+                claims: &claims,
+                deny_only: false,
+            })
+            .await
+    );
+    assert!(
+        !policy
+            .is_allowed(&rustfs_policy::policy::Args {
+                account: "temporary-access-key",
+                groups: &groups,
+                action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetObjectAction),
+                bucket: "warehouse",
+                conditions: &conditions,
+                is_owner: false,
+                object: ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00002.metadata.json",
+                claims: &claims,
+                deny_only: false,
+            })
+            .await
+    );
+    assert!(
         !policy
             .is_allowed(&rustfs_policy::policy::Args {
                 account: "temporary-access-key",
@@ -10467,8 +10615,12 @@ async fn table_credential_session_policy_is_limited_to_table_prefix() {
 
 #[tokio::test]
 async fn table_credential_session_policy_includes_table_resource_actions() {
-    let policy = table_credential_session_policy(&table_entry_for_credentials(), "tables/table-id/")
-        .expect("table credential policy should build");
+    let policy = table_credential_session_policy(
+        &table_entry_for_credentials(),
+        "tables/table-id/",
+        ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/00001.metadata.json",
+    )
+    .expect("table credential policy should build");
     let groups = None;
     let conditions = std::collections::HashMap::new();
     let claims = std::collections::HashMap::new();
@@ -10529,6 +10681,32 @@ fn table_credential_scope_rejects_cross_bucket_or_unsafe_prefix() {
     let mut entry = table_entry_for_credentials();
     entry.warehouse_location = "s3://warehouse/tables/../table-id".to_string();
     assert!(table_credential_scope(&entry).is_err());
+
+    let mut entry = table_entry_for_credentials();
+    entry.metadata_location = "s3://other/.rustfs-table/metadata/00001.metadata.json".to_string();
+    assert!(table_credential_scope(&entry).is_err());
+
+    let mut entry = table_entry_for_credentials();
+    entry.metadata_location =
+        ".rustfs-table/warehouses/default/namespaces/analytics/tables/orders/metadata/00001.metadata.json".to_string();
+    assert!(table_credential_scope(&entry).is_err());
+}
+
+#[test]
+fn vended_credential_delegation_requires_an_exact_comma_separated_token() {
+    let mut headers = HeaderMap::new();
+    assert!(!requests_vended_credentials(&headers));
+
+    headers.append(ICEBERG_ACCESS_DELEGATION_HEADER, HeaderValue::from_static("remote-signing"));
+    headers.append(ICEBERG_ACCESS_DELEGATION_HEADER, HeaderValue::from_static("unknown, vended-credentials"));
+    assert!(requests_vended_credentials(&headers));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ICEBERG_ACCESS_DELEGATION_HEADER,
+        HeaderValue::from_static("not-vended-credentials, VENDED-CREDENTIALS"),
+    );
+    assert!(!requests_vended_credentials(&headers));
 }
 
 #[test]
