@@ -15,9 +15,9 @@
 //! Four-node EC regression gate for inline storage and the inline GET reader.
 //!
 //! The storage decision is based on shard bytes (256 KiB / 32 KiB objects for
-//! the default EC 2+2 geometry), while the GET fast path has its own object-size
-//! limits (128 KiB / 16 KiB). A local OTLP/HTTP collector observes the existing
-//! reader-path counter without adding a scrape endpoint or production logging.
+//! the default EC 2+2 geometry), and the GET fast path follows the persisted
+//! inline marker. A local OTLP/HTTP collector observes the existing reader-path
+//! counter without adding a scrape endpoint or production logging.
 //! One S3 GET can select readers on multiple EC nodes, so the counter tracks
 //! distributed reader selection rather than HTTP request count.
 
@@ -89,6 +89,7 @@ const MPU_PART_1_SIZE: usize = 5 * 1024 * 1024;
 const MPU_PART_2_SIZE: usize = 16 * KIB;
 const TIER_BUCKET: &str = "inline-fallback-cold-tier";
 const TIER_PREFIX: &str = "tiered";
+const ALLOW_LOOPBACK_TIER_ENDPOINT_ENV: &str = "RUSTFS_TIER_RUSTFS_ALLOW_LOOPBACK_ENDPOINT";
 const MSGPACK_FALLBACK_CONTROL_SERIES: [(&str, &str); 4] = [
     (FALLBACK_REQUEST_DIRECTION, "ReadMultipleReq"),
     (FALLBACK_RESPONSE_DIRECTION, "ReadMultipleResp"),
@@ -791,12 +792,12 @@ fn metric_attribute(key: &str, value: &str) -> KeyValue {
 }
 
 fn boundary_cases(state: VersionState) -> Vec<BoundaryCase> {
-    let (fast_limit, storage_limit) = match state {
-        VersionState::Enabled => (16 * KIB, 32 * KIB),
-        VersionState::Unversioned => (128 * KIB, 256 * KIB),
+    let storage_limit = match state {
+        VersionState::Enabled => 32 * KIB,
+        VersionState::Unversioned => 256 * KIB,
         // A suspended bucket stores its null version using the unversioned
         // shard threshold, while ObjectInfo keeps version-aware GET semantics.
-        VersionState::Suspended => (16 * KIB, 256 * KIB),
+        VersionState::Suspended => 256 * KIB,
     };
     let mut sizes = vec![0, 16 * KIB - 1, 16 * KIB, 16 * KIB + 1, 32 * KIB - 1, 32 * KIB, 32 * KIB + 1];
     if !matches!(state, VersionState::Enabled) {
@@ -817,7 +818,7 @@ fn boundary_cases(state: VersionState) -> Vec<BoundaryCase> {
             stored_inline: size <= storage_limit,
             expected_reader_path: if size == 0 {
                 EMPTY
-            } else if size <= fast_limit {
+            } else if size <= storage_limit {
                 INLINE_DIRECT
             } else {
                 LEGACY_DUPLEX
@@ -2100,6 +2101,7 @@ async fn four_node_add_tier_converges() -> TestResult {
     cold.create_s3_client().create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV, "true");
     hot.start().await?;
 
     let tier_name = unique_tier_name();
@@ -2118,6 +2120,7 @@ async fn four_node_add_tier_converges_after_offline_node_restart_without_second_
     cold.create_s3_client().create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV, "true");
     hot.start().await?;
 
     let tier_name = unique_tier_name();
@@ -2214,6 +2217,7 @@ async fn four_node_manual_transition_distributed_admission_conflict_reports_stat
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV, "true");
     hot.set_env("RUSTFS_SCANNER_ENABLED", "false");
     hot.set_env("RUSTFS_SCANNER_CYCLE", "3600");
     hot.set_env("RUSTFS_MAX_TRANSITION_WORKERS", "1");
@@ -2356,6 +2360,7 @@ async fn four_node_manual_transition_rollout_non_empty_restart_readback() -> Tes
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV, "true");
     hot.set_env("RUSTFS_SCANNER_ENABLED", "false");
     hot.set_env("RUSTFS_SCANNER_CYCLE", "3600");
     hot.set_env("RUSTFS_MAX_TRANSITION_WORKERS", "2");
@@ -2460,6 +2465,7 @@ async fn four_node_mixed_msgpack_compat_mode_preserves_fallback_controls_during_
 
     let collector = OtlpMetricCollector::start().await?;
     let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV, "true");
     configure_mixed_msgpack_cluster(&mut hot, &collector)?;
     hot.set_env("RUSTFS_SCANNER_CYCLE", "1");
     hot.set_env("RUSTFS_ILM_PROCESS_TIME", "1");
@@ -2571,6 +2577,7 @@ async fn four_node_transitioned_inline_fallback() -> TestResult {
 
     let collector = OtlpMetricCollector::start().await?;
     let mut hot = RustFSTestClusterEnvironment::new(4).await?;
+    hot.set_env(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV, "true");
     configure_reader_metric_cluster(&mut hot, &collector);
     hot.set_env("RUSTFS_SCANNER_CYCLE", "1");
     hot.set_env("RUSTFS_ILM_PROCESS_TIME", "1");
