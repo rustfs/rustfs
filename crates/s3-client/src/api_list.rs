@@ -471,4 +471,58 @@ mod tests {
         assert_eq!(parsed.delete_markers.len(), 1);
         assert_eq!(parsed.delete_markers[0].version_id, "marker-a");
     }
+
+    // Regression test for backlog#2076: a ListObjectsV2 response for a delimited
+    // listing over a bucket that holds nested-key objects (e.g. any warm-tier
+    // target that already stores more than one flat object) includes a
+    // <CommonPrefixes><Prefix>...</Prefix></CommonPrefixes> element. `CommonPrefix`
+    // previously had no `rename_all = "PascalCase"`, so quick_xml looked for a
+    // lowercase `<prefix>` child, never found one, and (with no `#[serde(default)]`
+    // either) failed the whole response with "missing field `prefix`" — surfacing to
+    // callers of `WarmBackendS3::in_use()` (tier add/remove) as `TierPermErr`.
+    #[test]
+    fn list_objects_v2_xml_parses_common_prefixes() {
+        let xml = br#"
+            <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                <Name>warm-bucket</Name>
+                <Prefix></Prefix>
+                <Delimiter>/</Delimiter>
+                <MaxKeys>1</MaxKeys>
+                <IsTruncated>false</IsTruncated>
+                <CommonPrefixes>
+                    <Prefix>subdir/</Prefix>
+                </CommonPrefixes>
+            </ListBucketResult>
+        "#;
+
+        let parsed = quick_xml::de::from_reader::<_, ListBucketV2Result>(xml.as_slice()).expect("ListObjectsV2 XML should parse");
+
+        assert_eq!(parsed.common_prefixes.len(), 1);
+        assert_eq!(parsed.common_prefixes[0].prefix, "subdir/");
+    }
+
+    // Same fixture shape as list_object_versions_query hits (ListVersionsResult
+    // reuses the same CommonPrefix type).
+    #[test]
+    fn list_object_versions_xml_parses_common_prefixes() {
+        let xml = br#"
+            <ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                <Name>warm-bucket</Name>
+                <Prefix></Prefix>
+                <KeyMarker></KeyMarker>
+                <VersionIdMarker></VersionIdMarker>
+                <MaxKeys>1</MaxKeys>
+                <IsTruncated>false</IsTruncated>
+                <CommonPrefixes>
+                    <Prefix>subdir/</Prefix>
+                </CommonPrefixes>
+            </ListVersionsResult>
+        "#;
+
+        let parsed =
+            quick_xml::de::from_reader::<_, ListVersionsResult>(xml.as_slice()).expect("ListObjectVersions XML should parse");
+
+        assert_eq!(parsed.common_prefixes.len(), 1);
+        assert_eq!(parsed.common_prefixes[0].prefix, "subdir/");
+    }
 }
