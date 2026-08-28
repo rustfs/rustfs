@@ -89,11 +89,13 @@ jobs:
     # Skipped when nightly failed.
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - name: Checkout
+      - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
           persist-credentials: false
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Show environment
         run: |
@@ -105,8 +107,8 @@ jobs:
       - name: Reset test environment (before)
         if: ${{ inputs.cleanup_before != 'false' }}
         run: |
-          chmod +x scripts/test/rustfs_performance_test.sh
-          ./scripts/test/rustfs_performance_test.sh --step 1 -y
+          chmod +x auto-testing/rustfs_performance_test.sh
+          ./auto-testing/rustfs_performance_test.sh --step 1 -y
 
       - name: Install RustFS package & start cluster (4x4)
         run: |
@@ -116,7 +118,7 @@ jobs:
           else
             ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
           fi
-          ./scripts/test/rustfs_performance_test.sh "${ARGS[@]}"
+          ./auto-testing/rustfs_performance_test.sh "${ARGS[@]}"
 
       - name: Preflight checks
         run: |
@@ -126,7 +128,7 @@ jobs:
           else
             ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
           fi
-          ./scripts/test/rustfs_performance_test.sh "${ARGS[@]}"
+          ./auto-testing/rustfs_performance_test.sh "${ARGS[@]}"
 
       - name: Run benchmark (GET/PUT/MIXED)
         id: benchmark
@@ -135,7 +137,7 @@ jobs:
           # Manual dispatch can restrict method(s)/size(s).
           export WARP_METHODS="${{ inputs.test_method }}"
           export WARP_SIZES="${{ inputs.object_size }}"
-          ./scripts/test/rustfs_performance_test.sh \
+          ./auto-testing/rustfs_performance_test.sh \
             --step 5 -y \
             --warp-duration "${{ inputs.warp_duration || '5m' }}" \
             --warp-concurrency "${{ inputs.warp_concurrency || '64' }}" \
@@ -144,7 +146,7 @@ jobs:
       - name: Analyze results
         if: ${{ steps.benchmark.conclusion == 'success' }}
         run: |
-          ./scripts/test/rustfs_performance_test.sh --step 6 -y
+          ./auto-testing/rustfs_performance_test.sh --step 6 -y
 
       - name: Post results to backlog issue
         if: ${{ steps.benchmark.conclusion == 'success' }}
@@ -193,7 +195,7 @@ jobs:
       - name: Reset test environment (after)
         if: ${{ always() && inputs.cleanup_after != 'false' }}
         run: |
-          ./scripts/test/rustfs_performance_test.sh --step 7 -y
+          ./auto-testing/rustfs_performance_test.sh --step 7 -y
 
       - name: Notify on failure
         if: failure()
