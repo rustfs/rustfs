@@ -1,13 +1,11 @@
 # KMS Bulk Rekey Job Contract
 
-This document defines the contract for the object-side bulk rekey job: a long-running administrative job that re-wraps stored data-key envelopes under the current key-encryption key (KEK) without rewriting object bodies. It is a design contract, not an implementation. No execution engine exists in the tree today.
+This document defines the contract for the object-side bulk rekey job: a long-running administrative job that re-wraps stored data-key envelopes under the current key-encryption key (KEK) without rewriting object bodies. A first execution engine has shipped: the sweep in `rustfs/src/kms_rekey.rs`, driven by the admin endpoints in `rustfs/src/admin/handlers/kms_rekey.rs`. The contract remains the acceptance bar; where the shipped v1 sweep deliberately narrows it, the [Implementation Status](#implementation-status-v1-sweep) section records the deviation so the document and the tree cannot drift apart silently.
 
 It tracks [`rustfs/backlog#1642`](https://github.com/rustfs/backlog/issues/1642), which lands the `bulk migrate/rekey` line of [`rustfs/backlog#1562`](https://github.com/rustfs/backlog/issues/1562).
 
 ## Scope
 
-- PR type: `docs-only`.
-- Baseline: `f34aba1be7`.
 - Applies to: the job lifecycle, ownership, idempotency, failure semantics, exclusion rules, and completion evidence for bulk envelope re-wrap.
 - Out of scope, and deliberately so: the cryptographic definition of a single-object re-wrap (owned by the re-wrap primitive), master key material migration between KMS backends, a pause state, multi-node parallel execution, and destruction of superseded key versions.
 
@@ -15,12 +13,25 @@ It tracks [`rustfs/backlog#1642`](https://github.com/rustfs/backlog/issues/1642)
 
 Vault Transit, AWS KMS, and HSM backends are designed so that key material cannot be exported. There is no path that moves a Local master key into Transit, and the reverse direction would export production key material from an HSM onto local disk, which is a security regression. The one case that is both possible and useful, Local to Local, is already served by the KMS backup and restore bundle in `crates/kms/src/backup/local_export.rs` and `crates/kms/src/backup/local_restore.rs`. Nothing in this contract creates a second, weaker copy of that capability.
 
+## Implementation Status (v1 Sweep)
+
+The shipped sweep (`rustfs/src/kms_rekey.rs`, admin surface `POST /rustfs/admin/v3/kms/keys/rekey` plus `/status` and `/cancel`, all gated on the cluster-scoped `kms:Rekey` action) implements the contract with these deliberate narrowings:
+
+- **One sweep per process, not scope-scoped admission.** A single in-memory slot serializes sweeps cluster-wide on the node that received the request; a second start request is refused with the running job id. This is narrower than the scope-scoped ownership below — two disjoint-scope jobs cannot run concurrently — which is the safe direction: concurrent sweeps would double every KMS round-trip for zero extra coverage. The persisted CAS job record, lease, and crash-recovered ownership described under [Skeleton, Ownership, And Admission](#skeleton-ownership-and-admission) are not implemented; job state and counters are process-local and reset on restart. Correctness does not depend on them: the envelope itself is the resume state.
+- **Cursor-free convergence.** No checkpoint exists at all. The contract already declared the cursor a performance optimization; v1 takes that to its limit — recovery from a crash, cancel, or partial failure is re-running the sweep, and every already-current envelope costs one describe-shaped KMS call and no write.
+- **Backend gate at start.** The start endpoint refuses with `501` when the configured backend does not advertise `BackendCapabilities::rewrap`. Vault KV2 and Vault Transit pass; Local, Static, and AWS are refused. This is the "refused at admission" behavior the contract requires for AWS, and it is also what disarms the Local blocker below: a sweep can only run where superseded key versions demonstrably remain decryptable.
+- **Collapsed exclusion counting.** Plaintext objects, SSE-C objects, and MinIO-sealed envelopes are counted together as `not_applicable` rather than per-class; delete markers and directory entries are skipped without counting. Per-class exclusion counts remain future work.
+- **No dry run.** The dry-run report model below is not implemented; the closest present capability is reading `/status` counters from a completed sweep.
+- **Admission posture.** The sweep processes exactly one object at a time — each iteration awaits a KMS round-trip and, on rewrap, one metadata write — so its foreground contention is bounded by strict serialization, the KMS policy layer's shared concurrency cap, and the storage layer's own namespace locks and quorum rules. It does not integrate with a workload-admission mechanism, because [workload-admission-contracts.md](workload-admission-contracts.md) currently defines an observation-only snapshot surface repo-wide, with no runtime admission API for any background job to join. When such a mechanism exists, this job joins it alongside the scanner, heal, and decommission; until then, the requirement is bounded contention, which serialization provides.
+
+What v1 keeps exactly as contracted: work units are `(bucket, object, versionId)` with `latest_only: false`; `mod_time` is never set on the rewrap write; object-lock retention is inherited from `put_object_metadata`; the rewrap replaces every stored envelope copy by value match across the RustFS-internal and MinIO-compatible slots, and treats "no replaceable copy found" as an error rather than a silent success — the stale-branch hazard rule from [Metadata Write Contract](#metadata-write-contract); failures are counted and logged per object and never abort the sweep; cancellation is cooperative and terminal.
+
 ## Terms
 
 | Term | Meaning |
 |---|---|
 | Envelope | The sealed data key (DEK) stored on an object version's metadata, together with the identifiers needed to unseal it. |
-| Re-wrap primitive | A single-object operation that unseals one envelope and re-seals it under the target KEK, changing metadata only. It does not exist in the tree yet. |
+| Re-wrap primitive | A single-object operation that unseals one envelope and re-seals it under the target KEK, changing metadata only. Implemented as `rewrap_object_encryption_metadata` in `rustfs/src/storage/sse.rs`, over `KmsManager::rewrap_data_key`. |
 | Rekey job | The scan-and-drive layer defined by this document, which applies the re-wrap primitive across a scope. |
 | Work unit | One `(bucket, object, versionId)` triple. Never `(bucket, object)`: each version carries its own envelope. |
 | Scope | The bucket and prefix selector that bounds one job, and the unit of admission exclusion. |
@@ -69,7 +80,7 @@ Two traps follow, and both are contract rules.
 
 The requirement this places on the re-wrap primitive is therefore narrower than "record a version", most of which the tree already satisfies:
 
-- The primitive must expose the wrapping version through **one backend-dispatched accessor**. The knowledge is currently split between an envelope field and a ciphertext-prefix convention documented only in a comment and pinned by backend tests. A rekey job driving this from ecstore must not reimplement per-backend parsing, which would also put KMS format knowledge on the wrong side of the crate boundary.
+- The primitive must expose the wrapping version through **one backend-dispatched accessor** — satisfied by `KmsManager::describe_data_key_wrapping`, which dispatches per backend so callers never reimplement envelope-field or ciphertext-prefix parsing, which would also put KMS format knowledge on the wrong side of the crate boundary.
 - The primitive must report **"already at target state" as an outcome distinct from "re-wrapped"**, so the job counts a skip instead of inferring one.
 - For AWS, neither is achievable by inspection, and the contract must say so rather than pretend otherwise (see below).
 
@@ -131,7 +142,7 @@ Ownership is scope-scoped, not cluster-scoped. Two jobs on disjoint scopes may r
 
 The first implementation is single-node: one owner plus a lease plus recovery is sufficient for correctness. Multi-node parallel execution is a throughput optimization and is out of scope until correctness and its acceptance evidence are both in place.
 
-Because the job runs online, it is subject to admission control alongside the scanner, heal, and decommission, per [workload-admission-contracts.md](workload-admission-contracts.md). It must not contend its way into the foreground data path.
+Because the job runs online, it must not contend its way into the foreground data path. The v1 posture — strict serialization plus the KMS policy layer's shared cap and the storage layer's own locks — and the reason no workload-admission mechanism is joined yet are recorded under [Implementation Status](#implementation-status-v1-sweep); when a runtime admission mechanism exists per [workload-admission-contracts.md](workload-admission-contracts.md), this job joins it alongside the scanner, heal, and decommission.
 
 ## What Is Taken From KMS Backup, And What Is Not
 
@@ -148,11 +159,9 @@ The job also does not belong in the KMS crate. `crates/kms/Cargo.toml` does not 
 
 ## API Surface
 
-The job reuses the existing MinIO-compatible batch-job endpoints in `rustfs/src/admin/handlers/batch_job.rs`. `KNOWN_JOB_TYPES` there already lists `keyrotate` alongside `replicate` and `expire`, and the module documents that RustFS ships no batch-job execution engine: `start-job` validates the declared type and returns a deliberate `NotImplemented`, unknown types get `InvalidRequest`, `list-jobs` returns an empty list, and the status, describe, and cancel endpoints return a no-such-job error. No job is ever accepted, persisted, or faked as successful.
+This section originally required reusing the MinIO-compatible batch-job endpoints in `rustfs/src/admin/handlers/batch_job.rs` and forbade a second REST surface. The shipped v1 superseded that rule: the sweep landed on RustFS-specific endpoints (`/v3/kms/keys/rekey`, `/status`, `/cancel`), reviewed and merged with the engine. The batch-job surface parses MinIO's full job-definition format, whose semantics (per-job flags, retries, notifications) the v1 sweep does not implement — and accepting a job definition whose semantics cannot be executed is exactly what this section forbids.
 
-Two rules follow. A second, RustFS-specific REST surface must not be introduced, because it would leave two live semantics for one operation. And the current `NotImplemented` is an external promise: `start-job` must never report success while no engine can execute the job.
-
-Request shapes should track MinIO's `keyrotate` closely enough for `mc admin batch` to work, but compatibility never justifies accepting semantics RustFS cannot execute safely.
+The rule that survives is about live semantics, not endpoint shape: **one operation must never have two live semantics.** Today there is one live surface (the RustFS endpoints) and one refusing stub — `KNOWN_JOB_TYPES` in `batch_job.rs` still lists `keyrotate`, and `start-job` still returns a deliberate `NotImplemented`, unknown types get `InvalidRequest`, `list-jobs` returns an empty list, and status, describe, and cancel return a no-such-job error. That `NotImplemented` remains an external promise: the batch-job `keyrotate` type must keep refusing until it either proxies to this same engine with full batch-job semantics or is removed. It must never report success while it executes nothing, and it must never grow a second, divergent rekey implementation.
 
 ## Completion Evidence
 
@@ -162,14 +171,14 @@ Rekey must inherit that discipline. An empty result means nothing was found in t
 
 ## Blockers
 
-**Hard blocker — no execution path may be implemented until this closes.** [`rustfs/backlog#1565`](https://github.com/rustfs/backlog/issues/1565), specifically the absence of rotation history in the Local backend. `crates/kms/src/backup/local_restore.rs` records this in its own out-of-scope note: remapping stable key ids would require proving that object envelopes migrate in lockstep, bulk rekey is a non-goal there, and Local has no rotation history. If superseded versions are not retained, a rekey interrupted halfway leaves every unprocessed object permanently unreadable after rotation, which falsifies the partial-completion guarantee this entire contract is built on.
+**Resolved by capability gating — Local rotation history.** [`rustfs/backlog#1565`](https://github.com/rustfs/backlog/issues/1565) (no rotation history in the Local backend) was a hard blocker while a sweep could run against Local: without retained superseded versions, a rekey interrupted halfway would leave every unprocessed object permanently unreadable after rotation, falsifying the partial-completion guarantee this contract is built on. The shipped resolution is not rotation history but scope: the Local backend is positioned as non-production, rotation stays rejected there, and the sweep's start endpoint refuses any backend that does not advertise `BackendCapabilities::rewrap` — so a sweep can only run where the retained-versions invariant holds by construction (Vault KV2 and Vault Transit). If Local ever gains rotation, the coupling recorded under [Reading the wrapping KEK version](#reading-the-wrapping-kek-version) still applies: rotation history and envelope version recording must land in the same change before Local may advertise `rewrap`.
 
-**Hard blocker — the job still has nothing to drive.** Half of this has since landed: the envelope-level re-wrap primitive exists as `KmsManager::rewrap_data_key` and `KmsManager::describe_data_key_wrapping` (`crates/kms/src/manager.rs`), gated by `BackendCapabilities::rewrap`, which Vault KV2 and Vault Transit advertise and Local, Static and AWS do not. `DescribeDataKeyWrappingResponse::is_current` is the "already at target state" signal this contract asks for. What is still missing is the object-level adapter: a primitive callable per `(bucket, object, versionId)` that reads the version's envelope, reconstructs its encryption context, re-wraps, and writes the result back through `put_object_metadata`. Until that exists, nothing outside the KMS crate calls the primitive.
+**Resolved — the execution chain is complete.** The envelope-level primitive (`KmsManager::rewrap_data_key`, `KmsManager::describe_data_key_wrapping` in `crates/kms/src/manager.rs`), the object-level adapter (`rewrap_object_encryption_metadata` in `rustfs/src/storage/sse.rs`, which reads a version's envelope, reconstructs its encryption context, re-wraps, and returns the metadata overrides), and the sweep that drives the adapter and persists through `put_object_metadata` (`rustfs/src/kms_rekey.rs`) all exist.
 
-**Affects acceptance, not start.** Key usage inventory coverage over object envelopes, without which completion cannot be proven. KMS key list pagination, which a job enumerating keys would hit. And [`rustfs/backlog#1619`](https://github.com/rustfs/backlog/issues/1619), which decides replica propagation.
+**Affects acceptance, not start — still open.** Key usage inventory coverage over object envelopes: `crates/kms/src/key_impact.rs` still reports `ObjectEnvelopes` and `InProgressMultipartUploads` as not scanned, so a completed sweep's counters are evidence from that run only, not inventory-grade completion proof. KMS key list pagination, which a job enumerating keys would hit. And [`rustfs/backlog#1619`](https://github.com/rustfs/backlog/issues/1619), which decides replica propagation — until it closes, a rewrap never propagates to a replica site and each site runs its own sweep.
 
 ## Verification Expectations
 
-For this docs-only contract, the architecture guard scripts must pass and no Rust source, Cargo metadata, CI workflow, Makefile, or runtime config may change.
+This list is the acceptance bar for the full contract, not a claim about what the v1 sweep has already demonstrated: the dry-run and checkpoint items await the features themselves (a cursor-free sweep satisfies the checkpoint-deletion clause vacuously), and per-class exclusion counting is narrowed as recorded under [Implementation Status](#implementation-status-v1-sweep).
 
 Implementation work under this contract must be able to demonstrate, at minimum: that dry run performs zero storage writes; that non-rekeyable objects are excluded and counted rather than failing the job; that an immediate second run skips every object and writes no metadata, on both a KV2-backed and a Transit-backed scope, since the two recover the wrapping version by different mechanisms; that a scope on an AWS-backed key is refused at admission rather than accepted as a job whose re-runs rewrite everything; that an envelope with no recorded version is classified by backend rather than by the bare `None`; that deleting the checkpoint changes only the skip count, not the outcome; that a killed and recovered job reaches a terminal state while every object remains readable throughout; that a concurrent writer causes a conflict-and-skip rather than an overwrite; that ETag, part layout, and storage usage are unchanged at the `xl.meta` level; that each version of a multi-version object is processed independently with its `versionId` intact; that superseded key versions still exist and still decrypt afterward; and that success, skip, exclusion, conflict, and failure counts sum to the number of work units scanned.
