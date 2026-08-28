@@ -23,9 +23,9 @@
 //!
 //! There are no containers, no external S3 backend and no `awscurl`: the
 //! `AddTier` admin call is signed in-process with `rustfs_signer`, exactly like
-//! the other admin-API e2e suites in this crate. The RustFS warm backend has no
-//! loopback/SSRF restriction (that guard is replication-only), so `hot` can tier
-//! to `cold` over `http://127.0.0.1:<port>`.
+//! the other admin-API e2e suites in this crate. The source server uses the
+//! explicit test-only loopback opt-in to tier to `cold` over
+//! `http://127.0.0.1:<port>` while production keeps the SSRF guard enabled.
 //!
 //! The hermetic tests drive the transition and restore paths and pin the
 //! chains required by ilm-7 and the restore follow-up:
@@ -96,6 +96,7 @@ const MANUAL_ACTIVE_CANCEL_OBJECTS: usize = 512;
 const MANUAL_RESTART_CANCEL_OBJECTS: usize = 512;
 const MANUAL_ACTIVE_CANCEL_RUNNING_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const MANUAL_TRANSITION_CANCEL_BARRIER_ENV: &str = "RUSTFS_E2E_MANUAL_TRANSITION_CANCEL_BARRIER";
+const ALLOW_LOOPBACK_TIER_ENDPOINT_ENV: (&str, &str) = ("RUSTFS_TIER_RUSTFS_ALLOW_LOOPBACK_ENDPOINT", "true");
 const MANUAL_ASYNC_CONFLICT_TERMINAL_TIMEOUT: StdDuration = StdDuration::from_secs(90);
 const MANUAL_RESTART_RECOVERY_TIMEOUT: StdDuration = StdDuration::from_secs(80);
 const OBJECT_KEY: &str = "tier/鲁A12345/report.bin";
@@ -111,6 +112,20 @@ const USER_META_VAL: &str = "hermetic-transition";
 const HDR_SOURCE_REPLICATION_REQUEST: &str = "x-rustfs-source-replication-request";
 const HDR_SOURCE_MTIME: &str = "x-rustfs-source-mtime";
 const TIER_MUTATION_RECOVERY_CHANGED: &str = "Remote tier mutation recovery changed before publish";
+
+async fn start_tier_source(hot: &mut RustFSTestEnvironment, extra_env: &[(&str, &str)]) -> TestResult {
+    let mut env = Vec::with_capacity(extra_env.len() + 1);
+    env.push(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV);
+    env.extend_from_slice(extra_env);
+    hot.start_rustfs_server_with_env(vec![], &env).await
+}
+
+async fn restart_tier_source(hot: &mut RustFSTestEnvironment, extra_env: &[(&str, &str)]) -> TestResult {
+    let mut env = Vec::with_capacity(extra_env.len() + 1);
+    env.push(ALLOW_LOOPBACK_TIER_ENDPOINT_ENV);
+    env.extend_from_slice(extra_env);
+    hot.restart_server_preserving_data(vec![], &env).await
+}
 
 /// 5 MiB — the S3 minimum size for a non-final multipart part; the object's only
 /// internal part boundary sits at this offset.
@@ -860,8 +875,7 @@ async fn test_hermetic_transition_main_path() -> TestResult {
     // Hot/source server. A 1s scanner cycle is a backstop; transition is
     // primarily driven immediately by the multipart completion path.
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_CYCLE", "1")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_CYCLE", "1")]).await?;
     let hot_client = hot.create_s3_client();
 
     // Wire the RustFS remote tier (real connectivity probe, no force).
@@ -959,8 +973,7 @@ async fn test_hermetic_transition_restore_failure_expiry_and_retry() -> TestResu
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_ILM_DEBUG_DAY_SECS", "5")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_CYCLE", "1"), ("RUSTFS_ILM_DEBUG_DAY_SECS", "5")]).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
@@ -1088,8 +1101,7 @@ async fn test_manual_transition_run_black_box_semantics() -> TestResult {
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")]).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
     let due_mtime = OffsetDateTime::now_utc() - time::Duration::hours(25);
@@ -1194,8 +1206,7 @@ async fn test_manual_transition_async_job_status_polling() -> TestResult {
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")]).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
@@ -1293,8 +1304,7 @@ async fn test_manual_transition_async_limit_reports_terminal_partial() -> TestRe
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")]).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
@@ -1455,8 +1465,8 @@ async fn test_manual_transition_async_scope_conflicts_report_active_job() -> Tes
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(
-        vec![],
+    start_tier_source(
+        &mut hot,
         &[
             ("RUSTFS_SCANNER_ENABLED", "false"),
             ("RUSTFS_SCANNER_CYCLE", "3600"),
@@ -1565,8 +1575,7 @@ async fn test_manual_transition_async_different_buckets_admit_concurrently() -> 
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")]).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
@@ -1686,8 +1695,7 @@ async fn test_manual_transition_async_tier_failure_reports_terminal_partial() ->
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")]).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
@@ -1779,8 +1787,7 @@ async fn test_manual_transition_async_worker_failure_reports_terminal_partial() 
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")]).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
     cold.stop_server();
@@ -1872,8 +1879,8 @@ async fn test_manual_transition_async_active_cancel_reports_terminal_cancelled()
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(
-        vec![],
+    start_tier_source(
+        &mut hot,
         &[
             ("RUSTFS_SCANNER_ENABLED", "false"),
             ("RUSTFS_SCANNER_CYCLE", "3600"),
@@ -1978,7 +1985,7 @@ async fn test_manual_transition_async_cancel_after_process_restart_recovers_term
         ("RUSTFS_TRANSITION_QUEUE_CAPACITY", "512"),
     ];
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &restart_env).await?;
+    start_tier_source(&mut hot, &restart_env).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
@@ -2006,7 +2013,7 @@ async fn test_manual_transition_async_cancel_after_process_restart_recovers_term
         .ok_or("async response must include status_endpoint")?;
     assert_eq!(accepted.cancel_endpoint.as_deref(), Some(status_endpoint));
 
-    hot.restart_server_preserving_data(vec![], &restart_env).await?;
+    restart_tier_source(&mut hot, &restart_env).await?;
 
     let restarted = manual_transition_job_status(&hot, status_endpoint).await?;
     assert_eq!(restarted.job_id, job_id);
@@ -2130,8 +2137,7 @@ async fn test_manual_transition_run_contract_no_status_cancel_fields() -> TestRe
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")]).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
@@ -2169,8 +2175,7 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    start_tier_source(&mut hot, &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")]).await?;
     let hot_client = hot.create_s3_client();
     add_rustfs_tier(&hot, &cold).await?;
 
@@ -2210,8 +2215,7 @@ async fn test_manual_transition_run_continuation_token_resumes_without_raw_marke
         "continuation token must not expose the raw object prefix: {continuation}"
     );
 
-    hot.restart_server_preserving_data(vec![], &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")])
-        .await?;
+    restart_tier_source(&mut hot, &[("RUSTFS_SCANNER_ENABLED", "false"), ("RUSTFS_SCANNER_CYCLE", "3600")]).await?;
 
     let second = manual_transition_run_with_max_and_continuation(
         &hot,
@@ -2244,8 +2248,8 @@ async fn test_manual_transition_run_queue_pressure_partial() -> TestResult {
     cold_client.create_bucket().bucket(TIER_BUCKET).send().await?;
 
     let mut hot = RustFSTestEnvironment::new().await?;
-    hot.start_rustfs_server_with_env(
-        vec![],
+    start_tier_source(
+        &mut hot,
         &[
             ("RUSTFS_SCANNER_ENABLED", "false"),
             ("RUSTFS_SCANNER_CYCLE", "3600"),
