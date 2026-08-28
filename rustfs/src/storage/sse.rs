@@ -687,6 +687,10 @@ pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
         let code = match resolution_error.kind() {
             EncryptionResolutionErrorKind::InvalidRequest => S3ErrorCode::InvalidRequest,
             EncryptionResolutionErrorKind::ServiceUnavailable => S3ErrorCode::ServiceUnavailable,
+            // A permanent property of the stored object, not a transient server
+            // fault: 5xx would invite client retry storms against an object
+            // this server can never decrypt.
+            EncryptionResolutionErrorKind::InvalidMetadata => S3ErrorCode::InvalidObjectState,
             _ => S3ErrorCode::InternalError,
         };
         return ApiError {
@@ -1382,7 +1386,29 @@ impl ObjectEncryptionResolver for SseObjectEncryptionResolver {
         .await
         .map_err(map_encryption_resolution_error)?;
 
-        Ok(material.map(|material| ReadEncryptionMaterial {
+        let Some(material) = material else {
+            // Fail closed with a diagnosis instead of a bare `None`: the read
+            // plan classifies the object as encrypted from these same markers
+            // and would refuse to serve it anyway, but its generic error names
+            // neither the object's format nor what the operator can do about it.
+            if metadata
+                .keys()
+                .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
+            {
+                #[cfg(not(feature = "rio-v2"))]
+                let message = "object is stored encrypted, but its decryption material could not be resolved: the \
+                               encryption metadata is incomplete, or it is in the MinIO-compatible sealed format, \
+                               which this server build has no read path for (reading it requires a build with the \
+                               `rio-v2` feature)";
+                #[cfg(feature = "rio-v2")]
+                let message = "object is stored encrypted, but its decryption material could not be resolved: the \
+                               encryption metadata is incomplete or in an unrecognized sealed format";
+                return Err(EncryptionResolutionError::new(EncryptionResolutionErrorKind::InvalidMetadata, message));
+            }
+            return Ok(None);
+        };
+
+        Ok(Some(ReadEncryptionMaterial {
             key_bytes: material.key_bytes,
             mode: match material.key_kind {
                 EncryptionKeyKind::Direct => ReadEncryptionMode::Direct {
@@ -2229,11 +2255,13 @@ pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Resul
     // Same key-id resolution chain as the unwrap path, so authorization and the
     // response header name the same key.
     let normalized_metadata = normalize_managed_metadata(request.metadata, Some(recode_minio_kms_context));
-    let kms_key_id = normalized_metadata
-        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-        .or_else(|| request.metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
+    let kms_key_id = resolve_stored_kms_key_id(
+        normalized_metadata
+            .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
+            .or_else(|| request.metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
+            .cloned(),
+    )
+    .await;
 
     // Ahead of every other failure mode, so a denied caller learns nothing
     // about the key beyond "not yours".
@@ -2619,6 +2647,27 @@ async fn apply_managed_decryption_material(
     result
 }
 
+/// Key id an SSE-KMS read authorizes and reports when the stored metadata
+/// carries none (legacy envelopes and MinIO-written objects predate the
+/// explicit key-id headers).
+///
+/// The KMS service's configured default key is the key such envelopes were
+/// actually wrapped under, so per-key authorization must target it — the bare
+/// literal `default` would silently escape any policy narrowed to real key
+/// ids. The literal remains only as the last resort when no service is
+/// running, matching what the legacy write path recorded implicitly.
+async fn resolve_stored_kms_key_id(stored: Option<String>) -> String {
+    if let Some(key_id) = stored {
+        return key_id;
+    }
+    if let Some(service) = runtime_sources::current_encryption_service().await
+        && let Some(key_id) = service.get_default_key_id()
+    {
+        return key_id.clone();
+    }
+    "default".to_string()
+}
+
 async fn apply_managed_decryption_material_inner(
     bucket: &str,
     key: &str,
@@ -2664,11 +2713,13 @@ async fn apply_managed_decryption_material_inner(
     let normalized_metadata = normalize_managed_metadata(metadata, Some(recode_minio_kms_context));
 
     // Extract KMS key ID from metadata (optional, used for provider context)
-    let kms_key_id = normalized_metadata
-        .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
-        .or_else(|| metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
+    let kms_key_id = resolve_stored_kms_key_id(
+        normalized_metadata
+            .get(INTERNAL_ENCRYPTION_KEY_ID_HEADER)
+            .or_else(|| metadata.get("x-amz-server-side-encryption-aws-kms-key-id"))
+            .cloned(),
+    )
+    .await;
 
     // Ahead of every other failure mode below, so a denied caller learns nothing about the
     // key beyond "not yours" — not whether it is disabled, pending deletion, or unreadable.
@@ -3967,21 +4018,21 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 mod tests {
     use super::{
         ApiError, DataKey, DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest,
-        EncryptionResolutionErrorKind, INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
-        INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsAction, KmsKeyAuthorizer, KmsSseDekProvider,
-        KmsUnavailableError, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER,
-        MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, ObjectDekRewrapOutcome, ObjectEncryptionResolver,
-        PrepareEncryptionRequest, ReadEncryptionMode, ReadEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER, SSEType, SseDekProvider,
-        SseKmsPrincipal, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
+        EncryptionResolutionError, EncryptionResolutionErrorKind, INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
+        INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsAction,
+        KmsKeyAuthorizer, KmsSseDekProvider, KmsUnavailableError, MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_IV_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER, ObjectDekRewrapOutcome,
+        ObjectEncryptionResolver, PrepareEncryptionRequest, ReadEncryptionMode, ReadEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER,
+        SSEType, SseDekProvider, SseKmsPrincipal, SseObjectEncryptionResolver, SsecParams, StorageError, TestSseDekProvider,
         apply_managed_decryption_material, apply_managed_encryption_material, authorize_sse_kms_object_read,
         build_kms_request_context, classify_sse_read_response, encode_minio_kms_context, encryption_material_to_metadata,
         extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
         generate_ssec_nonce, is_managed_sse, kms_operation_error, map_get_object_reader_error, mark_encrypted_multipart_metadata,
         md5_base64, normalize_managed_metadata, recode_minio_kms_context, reset_sse_dek_provider, resolve_effective_kms_key_id,
-        rewrap_object_encryption_metadata, sse_decryption, sse_encryption, sse_prepare_encryption,
+        resolve_stored_kms_key_id, rewrap_object_encryption_metadata, sse_decryption, sse_encryption, sse_prepare_encryption,
         strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
         validate_ssec_params, verify_ssec_key_match,
     };
@@ -4242,6 +4293,68 @@ mod tests {
         };
 
         assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidMetadata);
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_diagnoses_unresolvable_encrypted_metadata() {
+        // A MinIO-written SSE-C object carries only internal sealed-key slots:
+        // no public scheme header, no customer-algorithm metadata. No decrypt
+        // branch recognizes it, so the read must fail closed — but with a
+        // typed, diagnosable error instead of a bare `None` that surfaces as a
+        // generic internal error.
+        let metadata = HashMap::from([(
+            MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
+            "c2VhbGVkLWtleQ==".to_string(),
+        )]);
+        let result = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &HeaderMap::new(),
+            })
+            .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("encryption markers without resolvable material must fail closed"),
+        };
+
+        assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidMetadata);
+        assert!(
+            error.to_string().contains("could not be resolved"),
+            "error must diagnose the unresolvable metadata, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_encryption_resolver_keeps_plaintext_objects_unresolved() {
+        let metadata = HashMap::from([("content-type".to_string(), "text/plain".to_string())]);
+        let material = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &HeaderMap::new(),
+            })
+            .await
+            .expect("plaintext metadata resolves without error");
+        assert!(material.is_none(), "plaintext objects carry no read material");
+    }
+
+    #[test]
+    fn map_get_object_reader_error_maps_unresolvable_metadata_to_invalid_object_state() {
+        let error = StorageError::Io(std::io::Error::other(EncryptionResolutionError::new(
+            EncryptionResolutionErrorKind::InvalidMetadata,
+            "object is marked encrypted, but no decryption material could be resolved from its metadata",
+        )));
+        let api_error = map_get_object_reader_error(error);
+        assert_eq!(api_error.code, S3ErrorCode::InvalidObjectState);
+        assert!(api_error.message.contains("no decryption material could be resolved"));
+    }
+
+    #[tokio::test]
+    async fn resolve_stored_kms_key_id_prefers_the_stored_id() {
+        assert_eq!(resolve_stored_kms_key_id(Some("app-key".to_string())).await, "app-key");
     }
 
     #[test]
@@ -5512,7 +5625,7 @@ mod tests {
     /// single leftover marker makes a plaintext destination report itself encrypted.
     /// `object_api::readers` then takes its encrypted branch and demands read material,
     /// but the material itself was stripped, so `sse_decryption` reports no encryption
-    /// and the read fails with "encrypted object metadata is incomplete" — a destination
+    /// and the read fails closed on unresolvable encryption metadata — a destination
     /// that CopyObject wrote successfully becomes permanently unreadable.
     #[test]
     fn test_strip_managed_encryption_metadata_clears_encryption_markers() {
