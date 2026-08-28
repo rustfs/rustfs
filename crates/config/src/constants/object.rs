@@ -297,7 +297,7 @@ const _: () = assert!(!DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE);
 pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE";
 pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: bool = true;
 
-/// Maximum large foreground PutObject requests admitted concurrently per process.
+/// Maximum automatic foreground write requests admitted concurrently per process.
 ///
 /// `0` derives a conservative default from the local disk-read scheduler cap,
 /// currently clamped to protect the commit path without making ordinary high
@@ -305,14 +305,24 @@ pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: bool = true;
 pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT";
 pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: usize = 0;
 
-/// Minimum object size that enters automatic large PutObject admission.
+/// Minimum direct PutObject size that enters automatic foreground write admission.
 ///
 /// Requests with an unknown size are treated as large because the write pressure
 /// cannot be bounded from headers.
 pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES";
 pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Time in milliseconds a large foreground PutObject waits for a permit.
+/// Minimum UploadPart size that enters automatic foreground write admission.
+///
+/// Multipart pressure is often many moderate-sized parts rather than one very
+/// large request. The default gates every multipart part through the same permit
+/// pool as large/unknown-size PutObject while keeping small direct PUTs on the
+/// legacy path.
+pub const ENV_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: &str =
+    "RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES";
+pub const DEFAULT_PUT_MULTIPART_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 0;
+
+/// Time in milliseconds an automatic foreground write waits for a permit.
 ///
 /// A short wait smooths transient bursts while still returning S3
 /// `SlowDown`/503 before body ingest when the node is already saturated.

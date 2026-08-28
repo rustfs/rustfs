@@ -966,12 +966,12 @@ impl DefaultObjectUsecase {
             .await
             .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
         {
-            PutObjectAdmission::Disabled => None,
-            PutObjectAdmission::Admitted(permit) => {
+            ForegroundWriteAdmission::Disabled => None,
+            ForegroundWriteAdmission::Admitted(permit) => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "admitted").increment(1);
                 Some(permit)
             }
-            PutObjectAdmission::Rejected => {
+            ForegroundWriteAdmission::Rejected => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
                 return Err(s3_error!(
                     SlowDown,

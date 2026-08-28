@@ -44,7 +44,11 @@ cd "$(dirname "$0")/.."
 # inlined one s3_error! call in transport.rs (+1); measured 1615 on the
 # pre-move main (after #6694) and 1616 after, so the slack 1620 baseline is
 # retightened to the measured 1616.
-S3S_IMPORT_FILES_BASELINE=215
+# 215 → 213 on 2026-08-28: multipart foreground admission cleanup moved the
+# new usecase dependency behind the app object-domain facade while main had
+# already shed two direct s3s-importing files. Retighten the file counter only;
+# s3_error! stays flat at 1616.
+S3S_IMPORT_FILES_BASELINE=213
 S3_ERROR_LINES_BASELINE=1616
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
