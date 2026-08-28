@@ -1,4 +1,4 @@
-name: RustFS Pool Expansion / Decommission Test
+name: RustFS Functional Test Suite (pool/heal/S3/KMS/tier)
 
 on:
   workflow_dispatch:
@@ -47,15 +47,17 @@ on:
         type: boolean
         default: true
   workflow_run:
-    # Run after the nightly build completes: pool expansion first, then heal.
+    # Run after the nightly build completes: pool expansion first, then heal,
+    # then the S3 compatibility / KMS / data-tiering suites.
     workflows: ["Nightly GNU Build"]
     types: [completed]
 
 permissions:
   contents: read
 
-# Only one pool-expansion test at a time: the workflow mutates a shared
-# test environment, so concurrent runs must not clobber each other.
+# Only one test run at a time: every job mutates the same shared test
+# environment (vm000/vm001/vm002), so concurrent runs must not clobber each
+# other. Jobs inside a run are chained with needs to serialize them.
 concurrency:
   group: rustfs-pool-expansion-test
   cancel-in-progress: false
@@ -235,4 +237,161 @@ jobs:
         if: failure()
         run: |
           echo "RustFS heal test failed"
+          echo "See the uploaded log artifact for details."
+
+  # S3 compatibility suite (auto-testing repo): single-single / single-multi /
+  # multi-multi. Runs after heal regardless of its outcome so a failure is
+  # reported but does not block the remaining suites.
+  s3-compat-test:
+    name: S3 compatibility test (after heal)
+    runs-on: smoke-testing
+    timeout-minutes: 240
+    needs: heal-test
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
+    steps:
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Run S3 compatibility suite
+        run: |
+          chmod +x auto-testing/rustfs-s3-compat-test.sh
+          ARGS=(--all-topologies -y --log-file /tmp/rustfs-s3-compat.log)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          elif [ -n "${{ inputs.rustfs_version }}" ]; then
+            ARGS+=(--version "${{ inputs.rustfs_version }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs-s3-compat-test.sh "${ARGS[@]}"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-s3-compat-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-s3-compat*.log
+          if-no-files-found: warn
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS S3 compatibility suite failed"
+          echo "See the uploaded log artifact for details."
+
+  # KMS suite (auto-testing repo): local + vault-kv2 backends across all three
+  # topologies. Vault runs in a throwaway docker container on the runner.
+  kms-test:
+    name: KMS test (after S3)
+    runs-on: smoke-testing
+    timeout-minutes: 360
+    needs: s3-compat-test
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
+    steps:
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Ensure docker (Vault container)
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+          fi
+          sudo systemctl enable --now docker
+          docker info >/dev/null 2>&1 || sudo docker info >/dev/null 2>&1
+
+      - name: Run KMS suite
+        run: |
+          chmod +x auto-testing/rustfs-kms-test.sh
+          ARGS=(--all-topologies --backends local,vault-kv2 -y --log-file /tmp/rustfs-kms.log)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          elif [ -n "${{ inputs.rustfs_version }}" ]; then
+            ARGS+=(--version "${{ inputs.rustfs_version }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs-kms-test.sh "${ARGS[@]}"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-kms-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-kms*.log
+          if-no-files-found: warn
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS KMS suite failed"
+          echo "See the uploaded log artifact for details."
+
+  # Data tiering / event notification / audit suite (auto-testing repo):
+  # single-single and single-multi with a peer RustFS as the warm tier.
+  tier-test:
+    name: Tier / event / audit test (after KMS)
+    runs-on: smoke-testing
+    timeout-minutes: 360
+    needs: kms-test
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
+    steps:
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Ensure MQTT broker + clients (event notification tests)
+        run: |
+          if ! command -v mosquitto_sub >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y mosquitto mosquitto-clients
+          fi
+          sudo mkdir -p /etc/mosquitto/conf.d
+          printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/rustfs-test.conf >/dev/null
+          sudo systemctl restart mosquitto
+          sleep 2
+          ss -tln 2>/dev/null | grep -q ':1883' || { echo "mosquitto not listening on 1883"; exit 1; }
+
+      - name: Run tier / event / audit suite
+        run: |
+          chmod +x auto-testing/rustfs-tier-test.sh
+          ARGS=(--all-topologies -y --log-file /tmp/rustfs-tier.log)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          elif [ -n "${{ inputs.rustfs_version }}" ]; then
+            ARGS+=(--version "${{ inputs.rustfs_version }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs-tier-test.sh "${ARGS[@]}"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-tier-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-tier*.log
+          if-no-files-found: warn
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS tier/event/audit suite failed"
           echo "See the uploaded log artifact for details."
