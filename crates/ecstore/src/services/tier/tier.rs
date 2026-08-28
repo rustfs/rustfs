@@ -2545,6 +2545,24 @@ impl TierConfigMgr {
             })?;
         }
 
+        // The Azure warm backend goes through the same S3-compatible TransitionClient as every
+        // other provider (backlog#2055): it has no Azure Blob-native client and no Azure AD
+        // dependency, so `storage_class` and `sp_auth` cannot be honored today even though the
+        // config type carries them. Reject them explicitly here instead of silently accepting
+        // and then dropping them at the WarmBackendAzure construction boundary.
+        if matches!(&tier_config.tier_type, TierType::Azure)
+            && let Some(azure) = tier_config.azure.as_ref()
+        {
+            let sp_auth_set = !azure.sp_auth.tenant_id.is_empty()
+                || !azure.sp_auth.client_id.is_empty()
+                || !azure.sp_auth.client_secret.is_empty();
+            if !azure.storage_class.is_empty() || sp_auth_set {
+                let mut err = ERR_TIER_INVALID_CONFIG.clone();
+                err.message = "Azure remote tiers do not support storageClass or spAuth yet; leave both unset".to_string();
+                return Err(err);
+            }
+        }
+
         let d = new_warm_backend(&tier_config, true).await?;
 
         if !force {
@@ -6382,6 +6400,57 @@ mod tests {
         assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
         assert_eq!(err.message, "Wasabi endpoint must be https://s3.ap-northeast-1.wasabisys.com");
         assert!(mgr.tiers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_rejects_azure_storage_class_before_backend_setup() {
+        let mut mgr = empty_mgr();
+        let mut tier = build_azure_tier("account-a");
+        tier.azure.as_mut().expect("Azure payload should exist").storage_class = "HOT".to_string();
+
+        let err = mgr
+            .add(tier, true)
+            .await
+            .expect_err("a non-empty Azure storageClass must be rejected before backend setup");
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert!(err.message.contains("storageClass"), "{}", err.message);
+        assert!(mgr.tiers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_rejects_azure_partial_sp_auth_before_backend_setup() {
+        // Only `tenant_id` is set: `TierAzure::is_sp_enabled()`-style "all three fields"
+        // logic would miss this, so the check must reject on *any* sp_auth sub-field
+        // being non-empty rather than requiring all three.
+        let mut mgr = empty_mgr();
+        let mut tier = build_azure_tier("account-a");
+        tier.azure.as_mut().expect("Azure payload should exist").sp_auth.tenant_id = "tenant".to_string();
+
+        let err = mgr
+            .add(tier, true)
+            .await
+            .expect_err("a partially-filled Azure spAuth must be rejected before backend setup");
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert!(err.message.contains("spAuth"), "{}", err.message);
+        assert!(mgr.tiers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_does_not_reject_azure_config_without_storage_class_or_sp_auth() {
+        // A plain Azure config (the common case: static access/secret key, no
+        // storageClass, no spAuth) must sail past the new gate. `new_warm_backend`
+        // builds the S3-compatible client lazily (no eager DNS/connect), so with
+        // `force: true` (which also skips the `in_use` probe) this succeeds even
+        // against a fake endpoint — the point here is only that the gate itself
+        // does not fire.
+        let mut mgr = empty_mgr();
+        let tier = build_azure_tier("account-a");
+        let tier_name = tier.name.clone();
+
+        mgr.add(tier, true)
+            .await
+            .expect("a config with no storageClass/spAuth must not trip the new gate");
+        assert!(mgr.tiers.contains_key(&tier_name));
     }
 
     #[tokio::test]
