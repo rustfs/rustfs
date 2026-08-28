@@ -7,6 +7,11 @@
   { "workflow": ".github/workflows/e2e-s3tests.yml", "max_age_hours": 192 },
   { "workflow": ".github/workflows/fuzz.yml", "max_age_hours": 36 },
   { "workflow": ".github/workflows/mint.yml", "max_age_hours": 192 },
+  {
+    "workflow": ".github/workflows/minio-interop.yml",
+    "max_age_hours": 36,
+    "never_ran_grace_until": "2026-09-08T00:00:00Z"
+  },
   { "workflow": ".github/workflows/nightly-gnu.yml", "max_age_hours": 36 },
   { "workflow": ".github/workflows/performance-ab.yml", "max_age_hours": 36 },
   {
