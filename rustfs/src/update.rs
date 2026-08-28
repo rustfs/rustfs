@@ -16,7 +16,7 @@ use crate::version;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Update check related errors
 #[derive(Error, Debug)]
@@ -73,17 +73,31 @@ impl Default for VersionChecker {
     }
 }
 
+/// Build the update-check HTTP client without panicking when the host has no
+/// system CA bundle (issue #6734): `reqwest::Client::new()` panics for the
+/// same reason a builder `build()` fails, so falling back to it turned a
+/// degraded environment into a process abort. With an explicit empty trust
+/// store the HTTPS version check fails closed per request instead.
+fn version_check_client(timeout: Duration) -> reqwest::Client {
+    let builder = || {
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .user_agent(format!("RustFS/{}", get_current_version()))
+    };
+    builder().build().unwrap_or_else(|error| {
+        warn!("update-check HTTP client could not load system TLS roots ({error}); continuing with an empty trust store");
+        builder()
+            .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+            .build()
+            .expect("HTTP client construction must succeed with an explicit empty trust store")
+    })
+}
+
 impl VersionChecker {
     /// Create a new version checker
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent(format!("RustFS/{}", get_current_version()))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
         Self {
-            client,
+            client: version_check_client(Duration::from_secs(10)),
             version_url: "https://version.rustfs.com/latest.json".to_string(),
             timeout: Duration::from_secs(10),
         }
@@ -91,14 +105,8 @@ impl VersionChecker {
 
     /// Create version checker with custom configuration
     pub fn with_config(url: String, timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .user_agent(format!("RustFS/{}", get_current_version()))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
         Self {
-            client,
+            client: version_check_client(timeout),
             version_url: url,
             timeout,
         }
@@ -181,6 +189,18 @@ pub async fn check_updates_with_url(url: String) -> Result<UpdateCheckResult, Up
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The startup panic fix for hosts without a CA bundle (issue #6734) rests
+    // on the constructor never panicking and its degraded fallback — an
+    // explicit empty trust store — always building.
+    #[test]
+    fn version_check_client_construction_never_panics() {
+        let _ = version_check_client(Duration::from_secs(1));
+        reqwest::Client::builder()
+            .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
+            .build()
+            .expect("empty-trust-store client build must succeed without touching system roots");
+    }
 
     #[tokio::test]
     async fn test_get_current_version() {
