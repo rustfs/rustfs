@@ -30,6 +30,7 @@ use crate::utils::base64_decode;
 use super::transition_api;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
 pub struct CommonPrefix {
     pub prefix: String,
 }
