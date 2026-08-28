@@ -2357,6 +2357,7 @@ enum GetCodecStreamingFallbackReason {
     ReadQuorumNotSafe,
     MultipartPartLimit,
     CopySourceDemandBound,
+    InvalidMetadataShape,
 }
 
 impl GetCodecStreamingFallbackReason {
@@ -2379,6 +2380,7 @@ impl GetCodecStreamingFallbackReason {
             Self::ReadQuorumNotSafe => "read_quorum_not_safe",
             Self::MultipartPartLimit => "multipart_part_limit",
             Self::CopySourceDemandBound => "copy_source_demand_bound",
+            Self::InvalidMetadataShape => "invalid_metadata_shape",
         }
     }
 }
@@ -2438,6 +2440,7 @@ enum GetDirectMemoryFallbackReason {
     Remote,
     ObjectInfoMultipart,
     FileInfoMultipart,
+    MetadataShape,
     InvalidSize,
     SizeMismatch,
     AboveThreshold,
@@ -2463,6 +2466,7 @@ impl GetDirectMemoryFallbackReason {
             Self::Remote => "remote",
             Self::ObjectInfoMultipart => "object_info_multipart",
             Self::FileInfoMultipart => "file_info_multipart",
+            Self::MetadataShape => "metadata_shape",
             Self::InvalidSize => "invalid_size",
             Self::SizeMismatch => "size_mismatch",
             Self::AboveThreshold => "above_threshold",
@@ -2617,14 +2621,24 @@ fn get_small_object_direct_memory_decision_with_threshold(
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::FileInfoMultipart);
     }
 
-    let Ok(object_size) = usize::try_from(fi.size) else {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InvalidSize);
+    if object_info.size != fi.size {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::SizeMismatch);
+    }
+    let Some(shape) = read_path_shape(object_info, fi) else {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::MetadataShape);
     };
+    let object_size = shape.object_size;
     if object_size == 0 {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InvalidSize);
     }
-    if object_info.size != fi.size {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::SizeMismatch);
+    if !shape.is_plain(object_info, fi) {
+        if object_info.is_encrypted() || fi.metadata.keys().any(|key| is_object_encryption_marker(key)) {
+            return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Encrypted);
+        }
+        if object_info.is_compressed() || fi.is_compressed() {
+            return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Compressed);
+        }
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Remote);
     }
     if object_size > threshold {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::AboveThreshold);
@@ -2786,6 +2800,22 @@ fn get_codec_streaming_reader_gate(
             return GetCodecStreamingGate {
                 object_class,
                 decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::MultipartPartLimit),
+                prefer_data_blocks_first_reader_setup: false,
+            };
+        }
+    }
+    if object_class == GetCodecStreamingObjectClass::PlainSinglePart {
+        let Some(shape) = read_path_shape(object_info, fi) else {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMetadataShape),
+                prefer_data_blocks_first_reader_setup: false,
+            };
+        };
+        if !shape.is_plain(object_info, fi) {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMetadataShape),
                 prefer_data_blocks_first_reader_setup: false,
             };
         }
@@ -4074,6 +4104,53 @@ fn object_fits_single_block(object_size: i64, block_size: usize) -> bool {
     }
 }
 
+/// The common metadata contract consumed by all bounded GET fast paths.
+///
+/// `ObjectInfo` is assembled from `FileInfo`, but callers may also provide a
+/// prepared snapshot or metadata from an older peer.  Never let either copy
+/// independently decide that a request is safe: a disagreement must fall
+/// back to the regular reader.  The returned size is the only size used for
+/// fast-path allocation and reader setup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ReadPathShape {
+    pub(super) object_size: usize,
+}
+
+impl ReadPathShape {
+    pub(super) fn is_plain(self, object_info: &ObjectInfo, fi: &FileInfo) -> bool {
+        !object_info.is_encrypted()
+            && !fi.metadata.keys().any(|key| is_object_encryption_marker(key))
+            && !object_info.is_compressed()
+            && !fi.is_compressed()
+            && !object_info.is_remote()
+            && !fi.is_remote()
+    }
+}
+
+/// Validate the single-part geometry shared by inline, direct-memory, and
+/// bounded mid-size readers.  This is deliberately fail-closed: a stale or
+/// mixed-version `ObjectInfo`/`FileInfo` pair must use the legacy path rather
+/// than risk allocating or decoding with a mismatched size.
+pub(super) fn read_path_shape(object_info: &ObjectInfo, fi: &FileInfo) -> Option<ReadPathShape> {
+    if object_info.parts.len() != 1 || fi.parts.len() != 1 || object_info.size < 0 || fi.size < 0 || object_info.size != fi.size {
+        return None;
+    }
+
+    let object_part = object_info.parts.first()?;
+    let file_part = fi.parts.first()?;
+    let object_size = usize::try_from(fi.size).ok()?;
+    if object_part.number != file_part.number
+        || object_part.size != file_part.size
+        || object_part.actual_size != file_part.actual_size
+        || file_part.size != object_size
+        || file_part.actual_size != fi.size
+    {
+        return None;
+    }
+
+    Some(ReadPathShape { object_size })
+}
+
 fn should_use_inline_small_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
     is_inline_buffer && object_fits_single_block(object_size, block_size)
 }
@@ -4092,25 +4169,16 @@ fn should_use_inline_fast_path(
         return false;
     }
 
+    let Some(shape) = read_path_shape(object_info, fi) else {
+        return false;
+    };
     // The persisted marker is authoritative for the storage decision, but it
     // is still untrusted metadata at this boundary. Revalidate its geometry so
     // a stale/corrupt marker cannot route an oversized payload into the
-    // in-memory decoder. The persisted marker is the writer's policy decision;
-    // reloading the current storage-class config here would add a hot-path
-    // snapshot load and could make an already durable inline object unreadable
-    // after an operator changes the admission policy. The independent
-    // direct-memory reader remains capped at 128 KiB below.
-    let Some(part) = fi.parts.first() else {
-        return false;
-    };
-    // Plain inline metadata must describe one coherent object. In particular,
-    // do not trust `fi.size` for the allocation below when a corrupt part has
-    // a different `actual_size`; compressed/unknown `actual_size` objects are
-    // excluded earlier by the plain-object checks.
-    if fi.size < 0
-        || fi.size > INLINE_FAST_PATH_MAX_OBJECT_SIZE
-        || object_info.size != fi.size
-        || part.actual_size != fi.size
+    // in-memory decoder. The independent direct-memory reader remains capped
+    // at 128 KiB below.
+    if !shape.is_plain(object_info, fi)
+        || shape.object_size > usize::try_from(INLINE_FAST_PATH_MAX_OBJECT_SIZE).expect("inline fast path limit fits usize")
         || fi.erasure.data_blocks == 0
         || fi.erasure.block_size == 0
     {
@@ -11023,6 +11091,41 @@ mod tests {
     }
 
     #[test]
+    fn read_path_shape_rejects_mismatched_metadata_copies_and_transforms() {
+        let (object_info, fi, _) = direct_memory_test_metadata(1024);
+        let shape = read_path_shape(&object_info, &fi).expect("matching metadata should have a valid shape");
+        assert_eq!(shape.object_size, 1024);
+        assert!(shape.is_plain(&object_info, &fi));
+
+        let mut bad_part_number = object_info.clone();
+        Arc::make_mut(&mut bad_part_number.parts)[0].number = 2;
+        assert!(read_path_shape(&bad_part_number, &fi).is_none());
+
+        let mut bad_part_size = fi.clone();
+        bad_part_size.parts[0].size += 1;
+        assert!(read_path_shape(&object_info, &bad_part_size).is_none());
+
+        let mut bad_actual_size = object_info.clone();
+        Arc::make_mut(&mut bad_actual_size.parts)[0].actual_size += 1;
+        assert!(read_path_shape(&bad_actual_size, &fi).is_none());
+
+        let mut compressed = fi.clone();
+        insert_str(&mut compressed.metadata, SUFFIX_COMPRESSION, "zstd".to_string());
+        let compressed_shape = read_path_shape(&object_info, &compressed).expect("geometry remains valid");
+        assert!(!compressed_shape.is_plain(&object_info, &compressed));
+
+        let mut encrypted = fi;
+        encrypted
+            .metadata
+            .insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+        assert!(
+            !read_path_shape(&object_info, &encrypted)
+                .expect("geometry remains valid")
+                .is_plain(&object_info, &encrypted)
+        );
+    }
+
+    #[test]
     fn inline_fast_path_rejects_part_number_requests() {
         let (mut object_info, mut fi, opts) = direct_memory_test_metadata(1024);
         object_info.inlined = true;
@@ -11169,6 +11272,13 @@ mod tests {
         assert_eq!(
             get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, true, 128 * 1024),
             GetDirectMemoryDecision::Use { object_size: 1024 }
+        );
+
+        let mut corrupt_part = fi.clone();
+        corrupt_part.parts[0].actual_size += 1;
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &corrupt_part, &opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::MetadataShape)
         );
     }
 

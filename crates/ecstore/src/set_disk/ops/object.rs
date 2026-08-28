@@ -48,7 +48,7 @@ use super::super::{
     get_transitioned_object_reader_with_tier_manager, inline_erasure_shard_file_offset, inline_erasure_shard_size, insert_str,
     is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found, is_explicit_null_version,
     is_get_codec_streaming_base_enabled, is_lock_optimization_enabled, issue3031_diag_enabled, join_all,
-    known_put_object_storage_size, path_join_buf, put_restore_opts, record_compression_total_memory,
+    known_put_object_storage_size, path_join_buf, put_restore_opts, read_path_shape, record_compression_total_memory,
     record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
     record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
@@ -149,26 +149,18 @@ fn get_mid_size_streaming_object_size_with_flags(
         || object_info.delete_marker
         || object_info.metadata_only
         || object_info.version_only
-        || object_info.is_encrypted()
-        || object_info.is_compressed()
-        || object_info.is_remote()
         || crate::set_disk::get_object_read_policy() != super::super::GetObjectReadPolicy::Default
-        || object_info.parts.len() != 1
-        || fi.parts.len() != 1
-        || object_info.size != fi.size
     {
         return None;
     }
 
-    let object_size = usize::try_from(fi.size).ok()?;
-    let object_part = object_info.parts.first()?;
-    let file_part = fi.parts.first()?;
-    if object_part.number != file_part.number || file_part.size != object_size || file_part.actual_size != fi.size {
+    let shape = read_path_shape(object_info, fi)?;
+    if !shape.is_plain(object_info, fi) {
         return None;
     }
     (GET_MID_SIZE_STREAMING_MIN_SIZE..=GET_MID_SIZE_STREAMING_MAX_SIZE)
-        .contains(&object_size)
-        .then_some(object_size)
+        .contains(&shape.object_size)
+        .then_some(shape.object_size)
 }
 
 #[cfg(all(test, feature = "test-util"))]
@@ -1892,27 +1884,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
         }
 
-        let path_decision_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let codec_streaming_gate = get_codec_streaming_reader_gate(
-            bucket,
-            object,
-            opts.part_number,
-            object_class,
-            &object_info,
-            fi,
-            lock_optimization_enabled,
-        );
-        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
-
         if object_info.is_remote() {
-            if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_gate.decision {
-                record_get_codec_streaming_gate_decision(
-                    codec_streaming_gate.object_class,
-                    codec_streaming_gate.decision,
-                    size_bucket,
-                );
-                rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
-            }
             record_get_object_reader_path_observation(GET_OBJECT_PATH_REMOTE_TRANSITION, object_class, size_bucket);
             let mut opts = opts.clone();
             if object_info.parts.len() == 1 {
@@ -1931,6 +1903,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             .await?;
             return Ok(finish_set_disk_read_lock(gr, read_lock_guard.take(), bucket, object));
         }
+
+        // Metadata resolution and the remote-tier branch are complete here.
+        // Keep the rollout/configuration gate deferred until the request
+        // really needs codec streaming so an opted-out codec path cannot add
+        // fixed cost to the inline/direct-memory/mid-size hot paths.
+        let path_decision_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
 
         // App-layer object data cache probe: metadata (etag/size) is resolved
         // but no data shards have been read yet, so a hit skips the erasure
@@ -2095,6 +2074,16 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
         }
+
+        let codec_streaming_gate = get_codec_streaming_reader_gate(
+            bucket,
+            object,
+            opts.part_number,
+            object_class,
+            &object_info,
+            fi,
+            lock_optimization_enabled,
+        );
 
         match codec_streaming_gate.decision {
             GetCodecStreamingDecision::Use => {
