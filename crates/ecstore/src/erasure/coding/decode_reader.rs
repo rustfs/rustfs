@@ -27,6 +27,8 @@ use std::io;
 use std::io::ErrorKind;
 use std::pin::Pin;
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -37,6 +39,14 @@ const ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: &str = "RUSTFS_GET_CODEC_STRE
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: usize = 2;
 const FILL_POLICY_SINGLE_INFLIGHT: &str = "single_inflight";
 const FILL_POLICY_DUAL_INFLIGHT: &str = "dual_inflight";
+
+#[cfg(test)]
+static SINGLE_INFLIGHT_CONSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn test_single_inflight_construction_count() -> u64 {
+    SINGLE_INFLIGHT_CONSTRUCTIONS.load(Ordering::Relaxed)
+}
 
 type FillTask = oneshot::Receiver<FillResult>;
 
@@ -167,6 +177,8 @@ where
         total_length: usize,
         metrics_path: &'static str,
     ) -> io::Result<Self> {
+        #[cfg(test)]
+        SINGLE_INFLIGHT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
         Self::new_with_fill_policy_inner(source, engine, total_length, metrics_path, FillPolicy::SingleInFlight)
     }
 

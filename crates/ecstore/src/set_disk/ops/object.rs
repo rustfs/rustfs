@@ -9782,6 +9782,7 @@ mod inline_put_commit_path_tests {
                     .expect("mid-size wiring fixture should commit");
 
                 crate::set_disk::reset_test_get_object_reader_path();
+                let single_inflight_before = crate::set_disk::coding::decode_reader::test_single_inflight_construction_count();
                 let mut reader = set_disks
                     .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
                     .await
@@ -9798,6 +9799,10 @@ mod inline_put_commit_path_tests {
                     crate::set_disk::test_get_object_reader_selected_mid_size(),
                     "full get_object_reader path must select mid-size streaming (path id {})",
                     crate::set_disk::test_get_object_reader_path_id()
+                );
+                assert!(
+                    crate::set_disk::coding::decode_reader::test_single_inflight_construction_count() > single_inflight_before,
+                    "mid-size get_object_reader wiring must construct SingleInFlight"
                 );
             },
         )

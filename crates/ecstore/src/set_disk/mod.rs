@@ -2518,7 +2518,7 @@ fn record_get_object_reader_path_observation(
     #[cfg(test)]
     LAST_GET_OBJECT_READER_PATH.store(
         match path {
-            "mid_size_streaming" => 1,
+            crate::set_disk::read::GET_OBJECT_PATH_MID_SIZE_STREAMING => 1,
             GET_OBJECT_PATH_DIRECT_MEMORY => 2,
             GET_OBJECT_PATH_INLINE_DIRECT => 3,
             GET_OBJECT_PATH_BODY_CACHE => 4,
