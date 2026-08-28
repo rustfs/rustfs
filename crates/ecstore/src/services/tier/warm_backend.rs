@@ -43,6 +43,7 @@ use rustfs_s3_client::{
     api_put_object::{AdvancedPutOptions, PutObjectOptions},
     transition_api::{ReadCloser, ReaderImpl},
 };
+use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
@@ -249,6 +250,13 @@ pub(crate) struct S3CompatibleWarmBackendParams<'a> {
     /// Tag handed to [`TransitionClient::new`] so per-provider client behavior
     /// and metrics stay attributable.
     pub provider_tag: &'a str,
+    /// SSRF guard run against the parsed endpoint once it's known to have a
+    /// host. Almost every provider passes [`rustfs_utils::egress::validate_outbound_url`]
+    /// unchanged; RustFS passes its own wrapper that adds a debug-only,
+    /// env-gated loopback exception for its e2e tier tests (see
+    /// rustfs/rustfs#6773) — the shared constructor stays the single call
+    /// site either way, so no provider can silently end up unvalidated.
+    pub validate_endpoint: fn(&url::Url) -> Result<(), rustfs_utils::egress::OutboundUrlError>,
 }
 
 /// Build the [`WarmBackendS3`] shared by the S3-compatible warm backend providers.
@@ -256,10 +264,6 @@ pub(crate) struct S3CompatibleWarmBackendParams<'a> {
 /// Credential, bucket, and endpoint validation run in this order because the
 /// existing provider constructors report the first failure they hit, and their
 /// error texts are user-visible through the tier admin API.
-#[allow(
-    dead_code,
-    reason = "expand step of the shared warm-backend extraction; the per-provider migrate step adds the production callers (backlog#2040)"
-)]
 pub(crate) async fn new_s3_compatible_warm_backend(
     params: S3CompatibleWarmBackendParams<'_>,
 ) -> Result<WarmBackendS3, std::io::Error> {
@@ -298,6 +302,10 @@ pub(crate) async fn new_s3_compatible_warm_backend(
     let host = u
         .host_str()
         .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+    // Runs after the host-presence check above (not immediately after Url::parse) so a
+    // host-less endpoint still reports this constructor's own "missing host" text instead of
+    // validate_endpoint's differently-worded rejection for the same input.
+    (params.validate_endpoint)(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
     let client =
         TransitionClient::new(&format!("{}:{}", host, u.port().unwrap_or(default_port)), opts, params.provider_tag).await?;
 
@@ -317,10 +325,6 @@ pub(crate) async fn new_s3_compatible_warm_backend(
 ///
 /// `object_size == -1` means "length unknown", so the caller is charged the
 /// worst case of a full [`MAX_MULTIPART_PUT_OBJECT_SIZE`] object.
-#[allow(
-    dead_code,
-    reason = "expand step of the shared warm-backend extraction; the per-provider migrate step adds the production callers (backlog#2040)"
-)]
 pub(crate) fn optimal_part_size(object_size: i64, min_part_size: i64) -> Result<i64, std::io::Error> {
     let mut object_size = object_size;
     if object_size == -1 {
@@ -936,6 +940,7 @@ mod tests {
             region: "us-east-1",
             bucket_lookup: BucketLookupType::BucketLookupDNS,
             provider_tag: "aliyun",
+            validate_endpoint: validate_outbound_url,
         }
     }
 
@@ -982,6 +987,18 @@ mod tests {
         let err = init_error(s3_compatible_params("rustfs://"), "an endpoint without a host must be rejected").await;
 
         assert_eq!(err.to_string(), "Invalid endpoint URL: missing host");
+    }
+
+    /// Every migrated provider that uses `validate_outbound_url` directly (all
+    /// but RustFS, which injects its own debug-only, env-gated wrapper — see
+    /// rustfs/rustfs#6773) goes through this one construction path, so the
+    /// SSRF guard only needs to be pinned here rather than once per provider
+    /// file (see backlog#2040's migrate steps and rustfs/rustfs#6764).
+    #[tokio::test]
+    async fn s3_compatible_backend_rejects_a_loopback_endpoint_before_any_network_setup() {
+        let err = init_error(s3_compatible_params("https://127.0.0.1:9000"), "a loopback endpoint must be rejected").await;
+
+        assert!(err.to_string().contains("not allowed"), "unexpected error: {err}");
     }
 
     #[tokio::test]
