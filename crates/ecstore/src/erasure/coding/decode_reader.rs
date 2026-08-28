@@ -2401,13 +2401,11 @@ mod tests {
 
         assert_eq!(read, first_read.len());
         assert_eq!(first_read[0], data[0]);
-        timeout(Duration::from_secs(1), async {
-            while read_count.load(Ordering::SeqCst) < 2 {
-                yield_now().await;
-            }
-        })
-        .await
-        .expect("reader should start reading the next stripe before the current output buffer is fully consumed");
+        assert_eq!(
+            read_count.load(Ordering::SeqCst),
+            2,
+            "dual-inflight reader should prefetch the next stripe before returning the first byte"
+        );
     }
 
     #[tokio::test]
