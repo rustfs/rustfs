@@ -246,21 +246,33 @@ impl Config {
         }
 
         let shard_size = shard_size as usize;
-        // Keep the historical two-data-shard object budget while preventing
-        // wider EC layouts from multiplying the maximum inline object size.
-        // Use div_ceil to match the shard_file_size calculation (which also uses
-        // div_ceil), avoiding a 1-byte rounding discrepancy that prevents inline
-        // for objects right at the threshold.
-        let inline_block = if self.initialized && self.inline_block_explicit {
-            self.inline_block
-        } else {
-            DEFAULT_INLINE_OBJECT_BUDGET.div_ceil(data_shards).min(DEFAULT_INLINE_BLOCK)
-        };
+        let inline_block = self.effective_inline_block(data_shards);
 
         if versioned {
             shard_size <= inline_block / 8
         } else {
             shard_size <= inline_block
+        }
+    }
+
+    /// Returns the per-shard inline budget used by both write admission and
+    /// legacy read fallback.
+    ///
+    /// The default budget is scaled by the number of data shards so a wider EC
+    /// layout does not silently increase the maximum inline object size. An
+    /// explicitly configured `inline_block` remains a fixed per-shard limit for
+    /// compatibility with deployments that opted into the historical policy.
+    pub(crate) fn effective_inline_block(&self, data_shards: usize) -> usize {
+        if data_shards == 0 {
+            return 0;
+        }
+
+        if self.initialized && self.inline_block_explicit {
+            self.inline_block
+        } else {
+            // Keep the historical two-data-shard object budget while preventing
+            // wider EC layouts from multiplying the maximum inline object size.
+            DEFAULT_INLINE_OBJECT_BUDGET.div_ceil(data_shards).min(DEFAULT_INLINE_BLOCK)
         }
     }
 
@@ -600,6 +612,51 @@ mod tests {
                 "{case}: object_size={object_size}, shard_size={shard_size}, versioned={versioned}"
             );
         }
+    }
+
+    #[test]
+    fn should_inline_keeps_ec8_and_ec12_object_boundaries_consistent() {
+        let config = Config::default();
+        let object_sizes = [128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024, 4 * 1024 * 1024];
+
+        for (data_shards, parity_shards) in [(8, 4), (12, 4)] {
+            let erasure = crate::erasure::coding::Erasure::new(data_shards, parity_shards, 1024 * 1024);
+            let mut previous = true;
+            for object_size in object_sizes {
+                let shard_size = erasure.shard_file_size(object_size);
+                let inline = config.should_inline(shard_size, data_shards, false);
+
+                // The effective policy is monotonic across object sizes. This
+                // table covers the boundaries that previously exposed the
+                // fixed-shard read-ahead mismatch, including the 1 MiB case.
+                assert!(!inline || previous, "inline decision must not re-enable at {object_size} bytes");
+                previous = inline;
+            }
+
+            assert!(
+                !config.should_inline(erasure.shard_file_size(1024 * 1024), data_shards, false),
+                "1 MiB must use the non-inline path for EC{data_shards}+{parity_shards}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_inline_block_scales_default_budget_and_preserves_explicit_limit() {
+        let config = Config::default();
+        assert_eq!(config.effective_inline_block(8), 32 * 1024);
+        assert_eq!(config.effective_inline_block(12), 21_846);
+        assert_eq!(config.effective_inline_block(0), 0);
+
+        let explicit = lookup_config_for_pools_with_env(
+            &KVS::new(),
+            &[12],
+            StorageClassEnvOverrides {
+                inline_block: Some("128KiB".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("explicit inline block should resolve");
+        assert_eq!(explicit.effective_inline_block(12), 128 * 1024);
     }
 
     #[test]

@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="https://docs.rustfs.com/installation/">快速开始</a>
+  <a href="https://docs.rustfs.com/zh/installation">快速开始</a>
   · <a href="https://docs.rustfs.com/">文档</a>
   · <a href="https://github.com/rustfs/rustfs/issues">报告 Bug</a>
   · <a href="https://github.com/rustfs/rustfs/discussions">社区讨论</a>

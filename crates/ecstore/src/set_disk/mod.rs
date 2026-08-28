@@ -740,6 +740,10 @@ const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: &str = "RUSTFS_GET_SMALL_OBJECT
 const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: bool = true;
 const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD";
 const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 1024;
+// Bound the in-memory inline decoder independently from the configurable
+// storage-class admission policy. This protects its Vec allocation while
+// allowing explicitly configured EC layouts to inline objects above 128 KiB.
+const INLINE_FAST_PATH_MAX_OBJECT_SIZE: i64 = 1024 * 1024;
 
 // --- Metadata Early-Stop Configuration ---
 
@@ -2283,6 +2287,14 @@ fn get_codec_streaming_config() -> GetCodecStreamingConfig {
     {
         get_codec_streaming_config_cached_core(load_get_codec_streaming_config)
     }
+}
+
+/// Shared kill-switch and compatibility guard for all non-duplex GET readers.
+/// Size-specific readers may have independent rollout gates, but they must not
+/// bypass these emergency controls.
+pub(super) fn is_get_codec_streaming_base_enabled() -> bool {
+    let config = get_codec_streaming_config();
+    config.enabled && config.body_compat_confirmed && config.header_compat_confirmed
 }
 
 fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
@@ -4076,7 +4088,35 @@ fn should_use_inline_fast_path(
     fi: &FileInfo,
     opts: &ObjectOptions,
 ) -> bool {
-    object_info.is_inline_fast_path_eligible() && fi.data.is_some() && range.is_none() && opts.part_number.is_none()
+    if !object_info.is_inline_fast_path_eligible() || fi.data.is_none() || range.is_some() || opts.part_number.is_some() {
+        return false;
+    }
+
+    // The persisted marker is authoritative for the storage decision, but it
+    // is still untrusted metadata at this boundary. Revalidate its geometry so
+    // a stale/corrupt marker cannot route an oversized payload into the
+    // in-memory decoder. The persisted marker is the writer's policy decision;
+    // reloading the current storage-class config here would add a hot-path
+    // snapshot load and could make an already durable inline object unreadable
+    // after an operator changes the admission policy. The independent
+    // direct-memory reader remains capped at 128 KiB below.
+    let Some(part) = fi.parts.first() else {
+        return false;
+    };
+    // Plain inline metadata must describe one coherent object. In particular,
+    // do not trust `fi.size` for the allocation below when a corrupt part has
+    // a different `actual_size`; compressed/unknown `actual_size` objects are
+    // excluded earlier by the plain-object checks.
+    if fi.size < 0
+        || fi.size > INLINE_FAST_PATH_MAX_OBJECT_SIZE
+        || object_info.size != fi.size
+        || part.actual_size != fi.size
+        || fi.erasure.data_blocks == 0
+        || fi.erasure.block_size == 0
+    {
+        return false;
+    }
+    true
 }
 
 enum SmallWritePath {
@@ -10993,6 +11033,68 @@ mod tests {
         let mut part_opts = opts;
         part_opts.part_number = Some(1);
         assert!(!should_use_inline_fast_path(&None, &object_info, &fi, &part_opts));
+    }
+
+    #[test]
+    fn inline_fast_path_allows_layout_specific_ec8_and_ec12_256kib_objects() {
+        for (data_blocks, parity_blocks) in [(8, 4), (12, 4)] {
+            let object_size = 256 * 1024_i64;
+            let mut fi = FileInfo::new("bucket/object", data_blocks, parity_blocks);
+            fi.size = object_size;
+            fi.data = Some(Bytes::from_static(b"payload"));
+            fi.add_object_part(1, String::new(), object_size as usize, None, object_size, None, None);
+            let object_info = ObjectInfo {
+                size: object_size,
+                data_blocks,
+                parity_blocks,
+                inlined: true,
+                parts: Arc::new(fi.parts.clone()),
+                ..Default::default()
+            };
+
+            assert!(should_use_inline_fast_path(&None, &object_info, &fi, &ObjectOptions::default()));
+        }
+    }
+
+    #[test]
+    fn inline_fast_path_rejects_oversized_or_corrupt_inline_markers() {
+        for (data_blocks, parity_blocks) in [(1, 0), (8, 4), (12, 4)] {
+            let object_size = 4 * 1024 * 1024_i64;
+            let mut fi = FileInfo::new("bucket/object", data_blocks, parity_blocks);
+            fi.size = object_size;
+            fi.data = Some(Bytes::from_static(b"payload"));
+            fi.add_object_part(1, String::new(), object_size as usize, None, object_size, None, None);
+            let object_info = ObjectInfo {
+                size: object_size,
+                data_blocks,
+                parity_blocks,
+                inlined: true,
+                parts: Arc::new(fi.parts.clone()),
+                ..Default::default()
+            };
+
+            assert!(
+                object_info.is_inline_fast_path_eligible(),
+                "the marker and object shape alone must not be the final trust boundary"
+            );
+            assert!(!should_use_inline_fast_path(&None, &object_info, &fi, &ObjectOptions::default()));
+        }
+
+        // A malformed erasure geometry must fail closed before shard-size
+        // arithmetic, even when an inline marker and payload are present.
+        let (mut object_info, mut fi, opts) = direct_memory_test_metadata(4 * 1024 * 1024);
+        object_info.inlined = true;
+        fi.data = Some(Bytes::from_static(b"payload"));
+        fi.erasure.data_blocks = 0;
+        assert!(!should_use_inline_fast_path(&None, &object_info, &fi, &opts));
+
+        // A mismatched plain part size must not allow the large object size to
+        // reach the inline decoder's `Vec::with_capacity` allocation.
+        let (mut object_info, mut fi, opts) = direct_memory_test_metadata(4 * 1024 * 1024);
+        object_info.inlined = true;
+        fi.data = Some(Bytes::from_static(b"payload"));
+        fi.parts[0].actual_size = 0;
+        assert!(!should_use_inline_fast_path(&None, &object_info, &fi, &opts));
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub use io_schedule::{
 pub use request_guard::{GetObjectGuard, PutObjectGuard};
 
 // Concurrency manager
-pub use manager::{ConcurrencyManager, DiskReadAdmission, PutObjectAdmission};
+pub use manager::{ConcurrencyManager, DiskReadAdmission, ForegroundWriteAdmission};
 
 // ============================================
 // Helper Functions

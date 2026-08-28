@@ -966,10 +966,40 @@ step8_rebalance() {
   wait_rebalance
 }
 
+# Abort any stale in-flight multipart uploads in a bucket. warp is killed at
+# the write threshold and can leave incomplete uploads behind; decommission's
+# post-check refuses to finalize a pool that still contains them ("resolve it
+# before retrying decommission").
+abort_stale_multipart_uploads() {
+  local bucket="$1" body code key id
+  body="$(admin_api GET "/${bucket}" "uploads")"
+  code="$(admin_api_code)"
+  if [ "${code}" != "200" ]; then
+    warn "list multipart uploads failed (HTTP ${code}); continuing without cleanup"
+    return 0
+  fi
+  # Split the one-line XML into one <Upload>...</Upload> block per line.
+  while IFS= read -r block; do
+    [ -z "${block}" ] && continue
+    key="$(printf '%s' "${block}" | grep -oE '<Key>[^<]+</Key>' | sed 's#</\?Key>##g')"
+    id="$(printf '%s' "${block}" | grep -oE '<UploadId>[^<]+</UploadId>' | sed 's#</\?UploadId>##g')"
+    if [ -n "${key}" ] && [ -n "${id}" ]; then
+      log "aborting stale multipart upload ${id} for ${key}"
+      admin_api DELETE "/${bucket}/${key}" "uploadId=${id}" ""
+      [ "$(admin_api_code)" = "200" ] || [ "$(admin_api_code)" = "204" ] \
+        || warn "abort multipart upload returned HTTP $(admin_api_code)"
+    fi
+  done < <(printf '%s' "${body}" | sed 's#</Upload>#</Upload>\n#g' | grep '<Upload>')
+  log "multipart upload cleanup done for ${bucket}"
+}
+
 step9_decommission() {
   log "step 9: decommission pool ${DECOMMISSION_POOL_ID} (admin API)"
   confirm "About to decommission pool ${DECOMMISSION_POOL_ID} (up to ${DECOMMISSION_RETRIES} automatic retries). Continue?"
   local attempt=1 body
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    abort_stale_multipart_uploads "${WARP_BUCKET}"
+  fi
   # If the previous decommission is in a failed/cancelled state, clear its metadata first
   if [ "${DRY_RUN}" -eq 0 ]; then
     body="$(admin_api POST /rustfs/admin/v3/pools/clear "by-id=true&pool=${DECOMMISSION_POOL_ID}")"

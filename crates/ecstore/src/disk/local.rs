@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::crash_inject::{self, CrashPoint};
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
 use crate::diagnostics::get::{
@@ -10410,8 +10409,14 @@ impl DiskAPI for LocalDisk {
                 fi.data = None;
             }
 
-            let inline = fi.transition_status.is_empty() && fi.data_dir.is_some() && fi.parts.len() == 1;
-            if inline && fi.shard_file_size(fi.parts[0].actual_size) < DEFAULT_INLINE_BLOCK as i64 {
+            // Keep this compatibility read-ahead decision on the same policy
+            // as PUT's inline admission. In particular, do not use the old
+            // fixed 128 KiB shard limit: a non-inline object in a wider EC
+            // layout can have a smaller shard and would otherwise be copied
+            // out of part.1 during every metadata read. Such objects remain
+            // fully readable through the normal EC reader below.
+            let storage_class_config = runtime_sources::storage_class_config_snapshot();
+            if should_read_legacy_inline_part(&fi, storage_class_config.as_ref()) {
                 let part_path = path_join_buf(&[
                     path,
                     fi.data_dir.map_or_else(|| "".to_string(), |dir| dir.to_string()).as_str(),
@@ -10913,6 +10918,21 @@ impl DiskAPI for LocalDisk {
     }
 }
 
+/// Whether a legacy object without the inline marker should have its external
+/// part materialized into `FileInfo.data` for compatibility with the old GET
+/// fast path. The marker-bearing path is handled by `read_raw`/`get_file_info`;
+/// this is only a conservative fallback for old metadata.
+fn should_read_legacy_inline_part(fi: &FileInfo, storage_class_config: &crate::config::storageclass::Config) -> bool {
+    if !fi.transition_status.is_empty() || fi.data_dir.is_none() || fi.parts.len() != 1 || fi.inline_data() {
+        return false;
+    }
+
+    let part = &fi.parts[0];
+    let shard_size = fi.shard_file_size(part.actual_size);
+    let versioned = fi.versioned || fi.version_id.is_some_and(|version_id| !version_id.is_nil());
+    storage_class_config.should_inline(shard_size, fi.erasure.data_blocks, versioned)
+}
+
 impl LocalDisk {
     pub(crate) async fn rename_data_borrowed(
         &self,
@@ -11047,6 +11067,46 @@ mod test {
         }];
         file_info.mod_time = Some(OffsetDateTime::now_utc());
         file_info
+    }
+
+    #[test]
+    fn legacy_inline_read_ahead_matches_writer_policy_for_ec_layouts() {
+        let config = crate::config::storageclass::Config::default();
+        let object_sizes = [128 * 1024_i64, 256 * 1024, 512 * 1024, 1024 * 1024, 4 * 1024 * 1024];
+
+        for (data_shards, parity_shards) in [(8, 4), (12, 4)] {
+            for object_size in object_sizes {
+                let mut fi = FileInfo::new("object", data_shards, parity_shards);
+                fi.data_dir = Some(Uuid::from_u128(1));
+                fi.parts = vec![ObjectPartInfo {
+                    number: 1,
+                    size: usize::try_from(object_size).expect("test object size should fit usize"),
+                    actual_size: object_size,
+                    ..Default::default()
+                }];
+
+                let writer_decision = config.should_inline(fi.shard_file_size(object_size), data_shards, false);
+                assert_eq!(
+                    should_read_legacy_inline_part(&fi, &config),
+                    writer_decision,
+                    "legacy read-ahead must match PUT for EC{data_shards}+{parity_shards}, size={object_size}"
+                );
+            }
+        }
+
+        let mut ec12 = FileInfo::new("object", 12, 4);
+        ec12.data_dir = Some(Uuid::from_u128(1));
+        ec12.parts = vec![ObjectPartInfo {
+            number: 1,
+            size: 1024 * 1024,
+            actual_size: 1024 * 1024,
+            ..Default::default()
+        }];
+        assert!(
+            ec12.shard_file_size(1024 * 1024) < crate::config::storageclass::DEFAULT_INLINE_BLOCK as i64,
+            "the regression guard must exercise the old fixed 128 KiB read-ahead boundary"
+        );
+        assert!(!should_read_legacy_inline_part(&ec12, &config));
     }
 
     fn test_meta(fi: FileInfo) -> Vec<u8> {
