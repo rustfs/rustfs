@@ -1436,7 +1436,7 @@ impl SetDisks {
             let part = &fi.parts[0];
             let part_length =
                 usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
-            return Self::build_codec_streaming_part_reader_with_metrics(
+            return Self::build_codec_streaming_part_reader(
                 bucket,
                 object,
                 fi,
@@ -1489,7 +1489,7 @@ impl SetDisks {
         // detected before any byte is streamed and the whole request can fall
         // back to the legacy duplex path.
         let first_part = &fi.parts[0];
-        let first_reader = match Self::build_codec_streaming_part_reader_with_metrics(
+        let first_reader = match Self::build_codec_streaming_part_reader(
             bucket,
             object,
             fi,
@@ -1536,7 +1536,7 @@ impl SetDisks {
             let ctx = Arc::clone(&ctx);
             let (part_number, part_size) = remaining_parts[remaining_index];
             tokio::task::spawn(async move {
-                SetDisks::build_codec_streaming_part_reader_with_metrics(
+                SetDisks::build_codec_streaming_part_reader(
                     &ctx.bucket,
                     &ctx.object,
                     &ctx.fi,
@@ -1568,7 +1568,8 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn build_codec_streaming_part_reader_with_metrics(
+    #[hotpath::measure(impl_type = "SetDisks")]
+    async fn build_codec_streaming_part_reader(
         bucket: &str,
         object: &str,
         fi: &FileInfo,
@@ -4795,7 +4796,7 @@ mod tests {
         let erasure = coding::Erasure::new(4, 2, 8);
         let fi = codec_streaming_test_fileinfo(8, 1);
 
-        let oversized = SetDisks::build_codec_streaming_part_reader_with_metrics(
+        let oversized = SetDisks::build_codec_streaming_part_reader(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
@@ -4816,7 +4817,7 @@ mod tests {
         .await;
         assert!(oversized.is_err(), "part_length > part_size must be rejected");
 
-        let missing_quorum = SetDisks::build_codec_streaming_part_reader_with_metrics(
+        let missing_quorum = SetDisks::build_codec_streaming_part_reader(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
