@@ -31,8 +31,13 @@ This file contains repository-wide rules. Use the nearest subdirectory
 - An existing clean, isolated task worktree is sufficient. Create another
   worktree only when the current checkout is shared, dirty with unrelated work,
   or belongs to another task.
-- Never commit from a shared checkout. Use an `overtrue/` feature branch unless
-  the user requests another name.
+- Never commit from a shared checkout.
+- Use a task-specific branch named `<type>/<topic>`, such as `fix/...`,
+  `feat/...`, `test/...`, or `docs/...`, unless the user specifies a name.
+- Do not include agent, tool, contributor, account, or organization names in
+  branch names.
+- Push to the user-requested remote or the repository's configured push remote.
+  Do not hard-code or infer a remote from an account name.
 - Check free space before artifact-heavy builds, tests, coverage, or downloads.
   Re-check before a broad gate when space is tight.
 - Remove only task-owned temporary/build artifacts. Never delete another task's
