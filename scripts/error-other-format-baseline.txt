@@ -56,9 +56,7 @@
 1|crates/ecstore/src/services/tier/tier_config.rs
 1|crates/ecstore/src/services/tier/warm_backend.rs
 2|crates/ecstore/src/services/tier/warm_backend_gcs.rs
-1|crates/ecstore/src/services/tier/warm_backend_huaweicloud.rs
 1|crates/ecstore/src/services/tier/warm_backend_s3.rs
-1|crates/ecstore/src/services/tier/warm_backend_tencent.rs
 1|crates/ecstore/src/services/tier/warm_backend_wasabi.rs
 7|crates/ecstore/src/set_disk/core/io_primitives.rs
 1|crates/ecstore/src/set_disk/mod.rs

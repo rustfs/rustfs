@@ -159,9 +159,13 @@ impl ErasureSetHealer {
 
     /// Classify an error returned by [`HealStorageAPI::heal_object`].
     ///
-    /// Both the inner `Ok((_, Some(err)))` and the outer `Err(err)` produced by
-    /// `heal_object` wrap `Error::Storage(StorageError)`, so match on that.
+    /// Most heal object failures wrap `Error::Storage(StorageError)`, while
+    /// compatibility markers can also arrive through Disk/Io/task wrappers.
     fn classify_heal_object_error(err: &Error) -> HealObjectOutcome {
+        if err.is_dangling_delete_grace() {
+            return HealObjectOutcome::Transient;
+        }
+
         let Error::Storage(se) = err else {
             return HealObjectOutcome::Failed;
         };
@@ -1459,6 +1463,7 @@ mod tests {
     // genuine object absence, or transient failures get recorded as "healed" and
     // permanently skipped.
     use super::{EcstoreError, Error, HealObjectOutcome};
+    use crate::heal::DiskError;
 
     fn classify(err: EcstoreError) -> HealObjectOutcome {
         ErasureSetHealer::classify_heal_object_error(&Error::Storage(err))
@@ -1475,6 +1480,16 @@ mod tests {
         assert!(matches!(classify(EcstoreError::ErasureReadQuorum), HealObjectOutcome::Transient));
         assert!(matches!(
             classify(EcstoreError::InsufficientReadQuorum(String::new(), String::new())),
+            HealObjectOutcome::Transient
+        ));
+    }
+
+    #[test]
+    fn dangling_delete_grace_is_transient() {
+        assert!(matches!(
+            ErasureSetHealer::classify_heal_object_error(&Error::Disk(DiskError::other(
+                "dangling object deletion deferred by heal grace window; retry_after_secs=3599; grace_secs=3600"
+            ))),
             HealObjectOutcome::Transient
         ));
     }

@@ -682,6 +682,10 @@ impl HealTask {
         Self::is_data_usage_cache_object(bucket, object) && Self::is_transient_lock_or_timeout_error(err)
     }
 
+    fn is_dangling_delete_grace_error(err: &Error) -> bool {
+        err.is_dangling_delete_grace()
+    }
+
     fn is_no_heal_required_error(err: &Error) -> bool {
         match err {
             Error::Storage(EcstoreError::NoHealRequired) | Error::Disk(DiskError::NoHealRequired) => true,
@@ -742,6 +746,30 @@ impl HealTask {
             "Heal object skipped for data usage cache after transient error"
         );
         let mut progress = self.progress.write().await;
+        progress.update_stage(3, 3);
+        true
+    }
+
+    async fn skip_dangling_delete_grace_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
+        if !Self::is_dangling_delete_grace_error(err) {
+            return false;
+        }
+
+        warn!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            result = "dangling_delete_grace_skip",
+            error = %err,
+            "Heal object dangling cleanup deferred by grace window"
+        );
+        let mut progress = self.progress.write().await;
+        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
+        progress.update_object_progress(1, 0, 0, 1, 0);
         progress.update_stage(3, 3);
         true
     }

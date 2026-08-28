@@ -359,7 +359,21 @@ impl HealTask {
                         };
 
                         if let Some(err) = error {
-                            if Self::should_skip_data_usage_cache_heal_error(bucket, object, &err) {
+                            if Self::is_dangling_delete_grace_error(&err) {
+                                telemetry_unknown |= !increment_counter(&mut skipped);
+                                warn!(
+                                    target: "rustfs::heal::task",
+                                    event = EVENT_HEAL_BUCKET_RESULT,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_TASK,
+                                    task_id = %self.id,
+                                    bucket,
+                                    object,
+                                    result = "dangling_delete_grace_skip",
+                                    error = %err,
+                                    "Heal bucket object dangling cleanup deferred by grace window"
+                                );
+                            } else if Self::should_skip_data_usage_cache_heal_error(bucket, object, &err) {
                                 telemetry_unknown |= !increment_counter(&mut skipped);
                                 warn!(
                                     target: "rustfs::heal::task",
