@@ -19,23 +19,18 @@
 #![allow(clippy::all)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::services::tier::{
     tier_config::TierRustFS,
-    warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options},
+    warm_backend::{
+        S3CompatibleWarmBackendParams, TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
+        new_s3_compatible_warm_backend, optimal_part_size,
+    },
     warm_backend_s3::WarmBackendS3,
 };
-use rustfs_s3_client::{
-    admin_handler_utils::AdminError,
-    api_put_object::PutObjectOptions,
-    credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
-};
+use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
 use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 
-const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
-const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 // Debug-only opt-in for single-host test/dev setups; release builds always reject loopback.
@@ -63,11 +58,16 @@ pub struct WarmBackendRustFS(WarmBackendS3);
 
 impl WarmBackendRustFS {
     pub async fn new(conf: &TierRustFS, tier: &str) -> Result<Self, std::io::Error> {
-        if conf.access_key == "" || conf.secret_key == "" {
+        // This provider reports endpoint problems with its own wording (and keeps the
+        // `url::ParseError` as the io::Error source) while the shared constructor carries the
+        // MinIO-derived texts. Unifying the two is a separate change, so the endpoint is
+        // pre-validated here, after the credential and bucket checks so the order in which the
+        // shared constructor would report the same failures is preserved.
+        if conf.access_key.is_empty() || conf.secret_key.is_empty() {
             return Err(std::io::Error::other("both access and secret keys are required"));
         }
 
-        if conf.bucket == "" {
+        if conf.bucket.is_empty() {
             return Err(std::io::Error::other("no bucket name was provided"));
         }
 
@@ -75,37 +75,30 @@ impl WarmBackendRustFS {
             Ok(u) => u,
             Err(e) => return Err(std::io::Error::other(e)),
         };
-        validate_rustfs_tier_endpoint(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
 
-        let creds = Credentials::new(Static(Value {
-            access_key_id: conf.access_key.clone(),
-            secret_access_key: conf.secret_key.clone(),
-            session_token: "".to_string(),
-            signer_type: SignatureType::SignatureV4,
-            ..Default::default()
-        }));
-        let opts = Options {
-            creds,
-            secure: u.scheme() == "https",
-            region: conf.region.clone(),
-            ..Default::default()
-        };
-        let scheme = u.scheme();
-        let default_port = if scheme == "https" { 443 } else { 80 };
-        let host = u
-            .host_str()
-            .ok_or_else(|| std::io::Error::other("endpoint URL must include a host"))?;
-        let client = TransitionClient::new(&format!("{host}:{}", u.port().unwrap_or(default_port)), opts, "rustfs").await?;
+        if u.host_str().is_none() {
+            return Err(std::io::Error::other("endpoint URL must include a host"));
+        }
 
-        let client = Arc::new(client);
-        let core = TransitionCore(Arc::clone(&client));
-        Ok(Self(WarmBackendS3 {
-            client,
-            core,
-            bucket: conf.bucket.clone(),
-            prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
-            storage_class: "".to_string(),
-        }))
+        Ok(Self(
+            new_s3_compatible_warm_backend(S3CompatibleWarmBackendParams {
+                endpoint: &conf.endpoint,
+                access_key: &conf.access_key,
+                secret_key: &conf.secret_key,
+                bucket: &conf.bucket,
+                prefix: &conf.prefix,
+                region: &conf.region,
+                // RustFS tier endpoints are path-style, so bucket addressing stays on
+                // `BucketLookupAuto`; pinning DNS here would break those endpoints.
+                bucket_lookup: BucketLookupType::BucketLookupAuto,
+                provider_tag: "rustfs",
+                // Debug-only, env-gated loopback exception for this provider's own e2e tier
+                // tests (rustfs/rustfs#6773); every other provider passes plain
+                // `validate_outbound_url`.
+                validate_endpoint: validate_rustfs_tier_endpoint,
+            })
+            .await?,
+        ))
     }
 }
 
@@ -118,7 +111,7 @@ impl WarmBackend for WarmBackendRustFS {
         length: i64,
         meta: HashMap<String, String>,
     ) -> Result<String, std::io::Error> {
-        let part_size = optimal_part_size(length)?;
+        let part_size = optimal_part_size(length, MIN_PART_SIZE)?;
         let client = self.0.client.clone();
         let res = client
             .put_object(&self.0.bucket, &self.0.get_dest(object), r, length, &{
@@ -165,27 +158,6 @@ impl crate::services::tier::warm_backend::TransitionCandidateReconciler for Warm
         )
         .await
     }
-}
-
-fn optimal_part_size(object_size: i64) -> Result<i64, std::io::Error> {
-    let mut object_size = object_size;
-    if object_size == -1 {
-        object_size = MAX_MULTIPART_PUT_OBJECT_SIZE;
-    }
-
-    if object_size > MAX_MULTIPART_PUT_OBJECT_SIZE {
-        return Err(std::io::Error::other("entity too large"));
-    }
-
-    let configured_part_size = MIN_PART_SIZE;
-    let mut part_size_flt = object_size as f64 / MAX_PARTS_COUNT as f64;
-    part_size_flt = (part_size_flt as f64 / configured_part_size as f64).ceil() * configured_part_size as f64;
-
-    let part_size = part_size_flt as i64;
-    if part_size == 0 {
-        return Ok(MIN_PART_SIZE);
-    }
-    Ok(part_size)
 }
 
 #[cfg(test)]

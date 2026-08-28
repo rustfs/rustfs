@@ -2631,29 +2631,19 @@ impl SetDisks {
 
         let mut object_lock_guard = None;
         let mut bucket_lifecycle_guard = None;
-        let deferred_data_movement_precondition = opts.data_movement && opts.http_preconditions.is_some();
 
-        if opts.http_preconditions.is_some() && !deferred_data_movement_precondition {
-            if !opts.no_lock {
-                if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
-                    && opts.bucket_lifecycle_lock_fence.is_none()
-                {
-                    bucket_lifecycle_guard = Some(
-                        metadata_sys::object_store_in(&self.ctx)
-                            .await?
-                            .acquire_bucket_incarnation_fence(bucket, expected_incarnation_id)
-                            .await?,
-                    );
-                }
-                object_lock_guard = Some(
-                    self.acquire_write_lock_diag("put_object_precondition", bucket, object)
-                        .await?,
-                );
-            }
-
-            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
-                return Err(err);
-            }
+        // This pre-body check is advisory fast-fail only: the authoritative
+        // precondition evaluation happens under the commit namespace lock
+        // below, so the namespace write lock must NOT be taken here — holding
+        // it across client-paced body ingestion starves concurrent reads of
+        // the same object into lock-timeout 503s (rustfs/backlog#2074).
+        // Data movement skips the advisory read: its staleness predicate is
+        // only meaningful at commit time.
+        if opts.http_preconditions.is_some()
+            && !opts.data_movement
+            && let Some(err) = self.check_write_precondition(bucket, object, opts).await
+        {
+            return Err(err);
         }
 
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
@@ -3123,7 +3113,9 @@ impl SetDisks {
             #[cfg(any(test, feature = "test-util"))]
             pause_put_object_commit(bucket, object, PutObjectCommitPause::AfterNamespace).await;
 
-            if deferred_data_movement_precondition && let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+            if opts.http_preconditions.is_some()
+                && let Some(err) = self.check_write_precondition(bucket, object, opts).await
+            {
                 return Err(err);
             }
 
@@ -15936,6 +15928,161 @@ mod put_object_tmp_cleanup_tests {
             .await
             .expect("client object should drain");
         assert_eq!(body, b"new client body");
+    }
+
+    #[tokio::test]
+    async fn conditional_put_does_not_block_reads_during_body_ingestion() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "conditional-put-nonblocking-read";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut initial_reader = PutObjReader::from_vec(b"old body".to_vec());
+        let initial = set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be written");
+        let initial_etag = initial.etag.clone().expect("initial object should have an etag");
+
+        let body = vec![b'c'; 64 * 1024];
+        let split = body.len() / 2;
+        let (mut source, stream) = tokio::io::duplex(64);
+        let hash_reader = HashReader::from_stream(
+            stream,
+            i64::try_from(body.len()).expect("body length should fit i64"),
+            i64::try_from(body.len()).expect("body length should fit i64"),
+            None,
+            None,
+            false,
+        )
+        .expect("conditional hash reader should be created");
+        let writer_store = Arc::clone(&set_disks);
+        let etag_for_put = initial_etag.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::new(hash_reader);
+            writer_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        http_preconditions: Some(HTTPPreconditions {
+                            if_match: Some(etag_for_put),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        source
+            .write_all(&body[..split])
+            .await
+            .expect("conditional PUT should consume the first half of the body");
+        let info = tokio::time::timeout(
+            Duration::from_secs(5),
+            set_disks.get_object_info(bucket, object, &ObjectOptions::default()),
+        )
+        .await
+        .expect("reads must not wait for the conditional PUT body")
+        .expect("the old version must stay readable during body ingestion");
+        assert_eq!(info.etag.as_deref(), Some(initial_etag.as_str()));
+
+        source
+            .write_all(&body[split..])
+            .await
+            .expect("conditional PUT should consume the remaining body");
+        drop(source);
+        put.await
+            .expect("conditional PUT task should join")
+            .expect("conditional PUT should commit after the body completes");
+    }
+
+    #[tokio::test]
+    async fn conditional_put_precondition_is_rechecked_at_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "conditional-put-commit-recheck";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut initial_reader = PutObjReader::from_vec(b"old body".to_vec());
+        let initial = set_disks
+            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be written");
+        let initial_etag = initial.etag.clone().expect("initial object should have an etag");
+
+        let body = vec![b'c'; 64 * 1024];
+        let split = body.len() / 2;
+        let (mut source, stream) = tokio::io::duplex(64);
+        let hash_reader = HashReader::from_stream(
+            stream,
+            i64::try_from(body.len()).expect("body length should fit i64"),
+            i64::try_from(body.len()).expect("body length should fit i64"),
+            None,
+            None,
+            false,
+        )
+        .expect("conditional hash reader should be created");
+        let writer_store = Arc::clone(&set_disks);
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::new(hash_reader);
+            writer_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        http_preconditions: Some(HTTPPreconditions {
+                            if_match: Some(initial_etag),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        source
+            .write_all(&body[..split])
+            .await
+            .expect("conditional PUT should consume the first half of the body");
+        let mut interloper_reader = PutObjReader::from_vec(b"interloper body".to_vec());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            set_disks.put_object(bucket, object, &mut interloper_reader, &ObjectOptions::default()),
+        )
+        .await
+        .expect("the interloper write must not wait for the conditional PUT body")
+        .expect("the interloper write should commit while the conditional PUT streams");
+
+        source
+            .write_all(&body[split..])
+            .await
+            .expect("conditional PUT should consume the remaining body");
+        drop(source);
+        let err = put
+            .await
+            .expect("conditional PUT task should join")
+            .expect_err("the conditional PUT must recheck its precondition under the commit lock");
+        assert_eq!(err, StorageError::PreconditionFailed);
+
+        let mut reader = set_disks
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the interloper object should remain readable");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("the interloper object should drain");
+        assert_eq!(body, b"interloper body");
     }
 
     #[tokio::test]
