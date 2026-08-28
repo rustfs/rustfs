@@ -5696,6 +5696,8 @@ impl SetDisks {
         {
             let grace = dangling_delete_grace();
             if !grace.is_zero() && OffsetDateTime::now_utc() - mod_time < grace {
+                let elapsed = OffsetDateTime::now_utc() - mod_time;
+                let retry_after_secs = grace.saturating_sub(elapsed).whole_seconds().max(0);
                 info!(
                     bucket = bucket,
                     object = object,
@@ -5703,7 +5705,7 @@ impl SetDisks {
                     grace_secs = grace.whole_seconds(),
                     "skipping dangling-object deletion within grace window"
                 );
-                return Err(DiskError::ErasureReadQuorum);
+                return Err(DiskError::dangling_delete_grace(retry_after_secs, grace.whole_seconds()));
             }
         }
 
@@ -6799,6 +6801,7 @@ pub(in crate::set_disk) mod rename_fanout_barrier {
 
 #[cfg(test)]
 mod tests {
+    use crate::disk::error::HEAL_DANGLING_DELETE_GRACE_MESSAGE;
     use crate::disk::local::{DurabilityMode, durability_mode_override};
 
     use super::*;
@@ -10746,7 +10749,13 @@ mod tests {
         let object = "object";
         let (_dir, disk) = read_multiple_test_disk(bucket, &[]).await;
         let set = io_primitives_test_set(vec![Some(disk.clone()), None, None], 1).await;
-        let mut fi = metadata_test_fileinfo(object);
+        let mut fi = FileInfo::new(object, 2, 1);
+        fi.volume = bucket.to_string();
+        fi.name = object.to_string();
+        fi.size = 1;
+        fi.erasure.index = 1;
+        fi.metadata.insert("etag".to_string(), "etag-1".to_string());
+        fi.add_object_part(1, "part-etag-1".to_string(), 1, None, 1, None, None);
         fi.mod_time = Some(OffsetDateTime::now_utc());
         disk.write_metadata(bucket, bucket, object, fi.clone())
             .await
@@ -10764,7 +10773,15 @@ mod tests {
             .await
             .expect_err("recent dangling metadata must stay protected by grace");
 
-        assert_eq!(err, DiskError::ErasureReadQuorum);
+        let message = err.to_string();
+        assert!(
+            message.contains(HEAL_DANGLING_DELETE_GRACE_MESSAGE),
+            "grace-protected dangling cleanup must explain the deferred delete: {message}"
+        );
+        assert!(
+            message.contains("retry_after_secs="),
+            "grace-protected dangling cleanup must include retry timing: {message}"
+        );
         disk.read_all(bucket, &path_join_buf(&[object, STORAGE_FORMAT_FILE]))
             .await
             .expect("metadata should remain during dangling grace");
