@@ -47,13 +47,13 @@ use super::super::{
     get_small_object_direct_memory_decision, get_stage_timer_if_enabled, get_str,
     get_transitioned_object_reader_with_tier_manager, inline_erasure_shard_file_offset, inline_erasure_shard_size, insert_str,
     is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found, is_explicit_null_version,
-    is_lock_optimization_enabled, issue3031_diag_enabled, join_all, known_put_object_storage_size, path_join_buf,
-    put_restore_opts, record_compression_total_memory, record_get_codec_streaming_gate_decision,
-    record_get_direct_memory_decision, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
-    record_get_object_reader_path_observation, record_get_stage_duration_if_enabled, record_lock_acquire,
-    reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate, require_restore_operation_id,
-    resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result, resolve_write_layout,
-    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
+    is_get_codec_streaming_base_enabled, is_lock_optimization_enabled, issue3031_diag_enabled, join_all,
+    known_put_object_storage_size, path_join_buf, put_restore_opts, record_compression_total_memory,
+    record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
+    record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
+    require_restore_operation_id, resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result,
+    resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
     set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version,
     should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path,
     take_prepared_get_object_metadata, to_object_err, try_read_inline_data_shards_direct, warn,
@@ -68,7 +68,7 @@ use crate::set_disk::coding;
 use crate::set_disk::core::io_primitives::GetCodecStreamingReaderBuildOutcome;
 use crate::set_disk::mem;
 use crate::set_disk::metadata_sys;
-use crate::set_disk::read::GetObjectDownstreamWriter;
+use crate::set_disk::read::{GET_OBJECT_PATH_MID_SIZE_STREAMING, GetObjectDownstreamWriter};
 use crate::set_disk::runtime_sources;
 use crate::storage_api_contracts::multipart::MultipartOperations;
 use crate::storage_api_contracts::object::ObjectIO;
@@ -79,6 +79,97 @@ use rustfs_rio::HashReaderMut;
 use rustfs_rio::TryGetIndex;
 use rustfs_utils::http::HeaderExt;
 use tokio::io::AsyncWriteExt;
+
+// Keep the mid-size reader separate from the codec-streaming rollout. The
+// latter is intentionally opt-in because its per-stripe worker can regress
+// tiny objects; this bounded range is the gap between direct-memory GETs and
+// the legacy duplex reader.
+const ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE: &str = "RUSTFS_GET_MID_SIZE_STREAMING_ENABLE";
+const DEFAULT_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE: bool = true;
+const GET_MID_SIZE_STREAMING_MIN_SIZE: usize = 128 * 1024 + 1;
+const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 1024 * 1024;
+
+fn is_get_mid_size_streaming_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            rustfs_utils::get_env_bool(ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE)
+        })
+    }
+}
+
+/// Return the object size when the bounded non-duplex reader is safe.
+///
+/// This predicate deliberately has a narrower contract than the general
+/// codec-streaming gate: only a whole, plain, single-part object is eligible.
+/// Ranges, transforms, remote objects, multipart reads, copy-source reads and
+/// special movement/version requests retain their existing legacy semantics.
+fn get_mid_size_streaming_object_size(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+    lock_optimization_enabled: bool,
+) -> Option<usize> {
+    get_mid_size_streaming_object_size_with_flags(
+        range,
+        object_info,
+        fi,
+        opts,
+        lock_optimization_enabled,
+        is_get_mid_size_streaming_enabled(),
+        is_get_codec_streaming_base_enabled(),
+    )
+}
+
+fn get_mid_size_streaming_object_size_with_flags(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+    lock_optimization_enabled: bool,
+    mid_size_enabled: bool,
+    codec_base_enabled: bool,
+) -> Option<usize> {
+    if !mid_size_enabled
+        || !codec_base_enabled
+        || !lock_optimization_enabled
+        || range.is_some()
+        || opts.part_number.is_some()
+        || opts.version_id.is_some()
+        || opts.incl_free_versions
+        || opts.skip_free_version
+        || opts.data_movement
+        || opts.raw_data_movement_read
+        || object_info.delete_marker
+        || object_info.metadata_only
+        || object_info.version_only
+        || object_info.is_encrypted()
+        || object_info.is_compressed()
+        || object_info.is_remote()
+        || crate::set_disk::get_object_read_policy() != super::super::GetObjectReadPolicy::Default
+        || object_info.parts.len() != 1
+        || fi.parts.len() != 1
+        || object_info.size != fi.size
+    {
+        return None;
+    }
+
+    let object_size = usize::try_from(fi.size).ok()?;
+    let object_part = object_info.parts.first()?;
+    let file_part = fi.parts.first()?;
+    if object_part.number != file_part.number || file_part.size != object_size || file_part.actual_size != fi.size {
+        return None;
+    }
+    (GET_MID_SIZE_STREAMING_MIN_SIZE..=GET_MID_SIZE_STREAMING_MAX_SIZE)
+        .contains(&object_size)
+        .then_some(object_size)
+}
 
 #[cfg(all(test, feature = "test-util"))]
 use super::super::GetObjectMetadataCacheEntry;
@@ -1634,7 +1725,12 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // Uses the shared predicate from ObjectInfo; additionally checks that
         // inline data is actually present and neither range nor partNumber is
         // in flight.
-        if should_use_inline_fast_path(&range, &object_info, fi, opts) {
+        let use_inline_fast_path = object_info.is_inline_fast_path_eligible()
+            && fi.data.is_some()
+            && range.is_none()
+            && opts.part_number.is_none()
+            && should_use_inline_fast_path(&range, &object_info, fi, opts);
+        if use_inline_fast_path {
             let mut inline_prepare_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             let data_shards = fi.erasure.data_blocks;
 
@@ -1961,6 +2057,43 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 debug!(bucket, object, "Lock optimization: released read lock after direct-memory read");
             }
             return Ok(reader);
+        }
+
+        // Mid-size plain objects use a bounded, non-duplex reader. Keep this
+        // path independent from the general codec-streaming rollout: that
+        // rollout remains off by default because its worker overhead is not a
+        // win for tiny objects. A failed setup degrades to the existing codec
+        // gate/legacy path before any response bytes are returned.
+        if get_mid_size_streaming_object_size(&range, &object_info, fi, opts, lock_optimization_enabled).is_some() {
+            match Self::get_object_mid_size_reader_with_fileinfo(
+                bucket,
+                object,
+                Arc::clone(&self.erasure_cache),
+                fi,
+                files,
+                disks,
+                self.set_index,
+                self.pool_index,
+                opts.skip_verify_bitrot,
+                object_class.as_str(),
+                size_bucket,
+                false,
+            )
+            .await?
+            {
+                GetCodecStreamingReaderBuildOutcome::Reader(stream) => {
+                    record_get_object_reader_path_observation(GET_OBJECT_PATH_MID_SIZE_STREAMING, object_class, size_bucket);
+                    let (mut reader, _offset, _length) =
+                        get_object_reader_with_context(&self.ctx, stream, range, &object_info, opts, &h).await?;
+                    reader.body_source = body_source;
+                    return Ok(finish_set_disk_read_lock(reader, read_lock_guard.take(), bucket, object));
+                }
+                GetCodecStreamingReaderBuildOutcome::Fallback(_) => {
+                    // The setup found a degraded-but-readable layout. Let the
+                    // established codec gate and then legacy path handle it;
+                    // this preserves whole-request fallback semantics.
+                }
+            }
         }
 
         match codec_streaming_gate.decision {
@@ -8195,6 +8328,190 @@ mod erasure_construction_tests {
             .source()
             .expect("io::Error must expose the erasure construction error");
         assert!(construction_source.is::<ErasureConstructionError>());
+    }
+}
+
+#[cfg(test)]
+mod mid_size_streaming_gate_tests {
+    use super::*;
+    use rustfs_filemeta::ObjectPartInfo;
+    use serial_test::serial;
+
+    fn plain_metadata(size: usize) -> (ObjectInfo, FileInfo) {
+        let size_i64 = i64::try_from(size).expect("test size fits i64");
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.size = size_i64;
+        fi.add_object_part(1, "etag".to_string(), size, fi.mod_time, size_i64, None, None);
+        let object_info = ObjectInfo {
+            size: size_i64,
+            parts: Arc::new(vec![ObjectPartInfo {
+                number: 1,
+                size,
+                actual_size: size_i64,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        (object_info, fi)
+    }
+
+    #[test]
+    #[serial]
+    fn direct_memory_boundary_stays_out_of_mid_size_streaming() {
+        let (object_info, fi) = plain_metadata(128 * 1024);
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(&None, &object_info, &fi, &ObjectOptions::default(), true, true, true),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mid_size_streaming_accepts_object_just_above_direct_memory_ceiling() {
+        let (object_info, fi) = plain_metadata(128 * 1024 + 1);
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(&None, &object_info, &fi, &ObjectOptions::default(), true, true, true),
+            Some(128 * 1024 + 1)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mid_size_streaming_includes_one_mib_and_rejects_larger_objects() {
+        let (object_info, fi) = plain_metadata(1024 * 1024);
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(&None, &object_info, &fi, &ObjectOptions::default(), true, true, true),
+            Some(1024 * 1024)
+        );
+
+        let (large_info, large_fi) = plain_metadata(1024 * 1024 + 1);
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(
+                &None,
+                &large_info,
+                &large_fi,
+                &ObjectOptions::default(),
+                true,
+                true,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mid_size_streaming_rejects_ranges_and_transformed_objects() {
+        let (object_info, fi) = plain_metadata(256 * 1024);
+        let range = Some(HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 0,
+            end: 1,
+        });
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(&range, &object_info, &fi, &ObjectOptions::default(), true, true, true),
+            None
+        );
+
+        let mut encrypted = object_info;
+        encrypted.user_defined = Arc::new(HashMap::from([("x-minio-encryption-key".to_string(), "opaque".to_string())]));
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(&None, &encrypted, &fi, &ObjectOptions::default(), true, true, true),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mid_size_streaming_rejects_inconsistent_part_geometry() {
+        let (object_info, mut fi) = plain_metadata(256 * 1024);
+        fi.parts[0].size += 1;
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(&None, &object_info, &fi, &ObjectOptions::default(), true, true, true),
+            None
+        );
+
+        let (mut object_info, fi) = plain_metadata(256 * 1024);
+        object_info.parts = Arc::new(vec![ObjectPartInfo {
+            number: 2,
+            size: fi.parts[0].size,
+            actual_size: fi.parts[0].actual_size,
+            ..Default::default()
+        }]);
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(&None, &object_info, &fi, &ObjectOptions::default(), true, true, true),
+            None
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mid_size_streaming_can_be_disabled_without_affecting_direct_memory_gate() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE, Some("false")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+            ],
+            || {
+                let (object_info, fi) = plain_metadata(256 * 1024);
+                assert_eq!(
+                    get_mid_size_streaming_object_size(&None, &object_info, &fi, &ObjectOptions::default(), true),
+                    None
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mid_size_streaming_respects_codec_compatibility_kill_switches() {
+        let (object_info, fi) = plain_metadata(256 * 1024);
+        for (name, value) in [
+            (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, "false"),
+            (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, "false"),
+            (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, "false"),
+        ] {
+            temp_env::with_vars(
+                [
+                    (ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE, Some("true")),
+                    (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                    (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                    (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                    (name, Some(value)),
+                ],
+                || {
+                    assert_eq!(
+                        get_mid_size_streaming_object_size(&None, &object_info, &fi, &ObjectOptions::default(), true),
+                        None
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn mid_size_streaming_rejects_copy_source_policy() {
+        let (object_info, fi) = plain_metadata(256 * 1024);
+        let result = tokio::runtime::Runtime::new()
+            .expect("test runtime should initialize")
+            .block_on(crate::set_disk::with_get_object_read_policy(
+                crate::set_disk::GetObjectReadPolicy::CopySource,
+                async {
+                    get_mid_size_streaming_object_size_with_flags(
+                        &None,
+                        &object_info,
+                        &fi,
+                        &ObjectOptions::default(),
+                        true,
+                        true,
+                        true,
+                    )
+                },
+            ));
+        assert_eq!(result, None);
     }
 }
 

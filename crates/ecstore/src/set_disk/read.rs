@@ -52,6 +52,8 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+pub(super) const GET_OBJECT_PATH_MID_SIZE_STREAMING: &str = "mid_size_streaming";
+
 #[cfg(test)]
 use super::DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES;
 #[cfg(test)]
@@ -1346,12 +1348,86 @@ impl SetDisks {
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
+        set_index: usize,
+        pool_index: usize,
+        skip_verify_bitrot: bool,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+        prefer_data_blocks_first_reader_setup: bool,
+    ) -> Result<GetCodecStreamingReaderBuildOutcome> {
+        Self::get_object_decode_reader_with_fileinfo_inner(
+            bucket,
+            object,
+            erasure_cache,
+            fi,
+            files,
+            disks,
+            set_index,
+            pool_index,
+            skip_verify_bitrot,
+            metrics_object_class,
+            metrics_size_bucket,
+            prefer_data_blocks_first_reader_setup,
+            get_codec_streaming_metrics_path(),
+            false,
+        )
+        .await
+    }
+
+    /// Build the bounded mid-size reader while allowing a degraded part to
+    /// reuse the shard readers it just opened for an in-place legacy fallback.
+    /// This avoids opening every shard twice when a healthy quorum requires
+    /// reconstruction.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn get_object_mid_size_reader_with_fileinfo(
+        bucket: &str,
+        object: &str,
+        erasure_cache: Arc<ErasureCache>,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        set_index: usize,
+        pool_index: usize,
+        skip_verify_bitrot: bool,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+        prefer_data_blocks_first_reader_setup: bool,
+    ) -> Result<GetCodecStreamingReaderBuildOutcome> {
+        Self::get_object_decode_reader_with_fileinfo_inner(
+            bucket,
+            object,
+            erasure_cache,
+            fi,
+            files,
+            disks,
+            set_index,
+            pool_index,
+            skip_verify_bitrot,
+            metrics_object_class,
+            metrics_size_bucket,
+            prefer_data_blocks_first_reader_setup,
+            GET_OBJECT_PATH_MID_SIZE_STREAMING,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn get_object_decode_reader_with_fileinfo_inner(
+        bucket: &str,
+        object: &str,
+        erasure_cache: Arc<ErasureCache>,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
         _set_index: usize,
         _pool_index: usize,
         skip_verify_bitrot: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
+        metrics_path: &'static str,
+        allow_inplace_legacy_fallback: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         let erasure = erasure_cache.get_for_file_info(fi)?;
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
@@ -1360,7 +1436,7 @@ impl SetDisks {
             let part = &fi.parts[0];
             let part_length =
                 usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
-            return Self::build_codec_streaming_part_reader(
+            return Self::build_codec_streaming_part_reader_with_metrics(
                 bucket,
                 object,
                 fi,
@@ -1378,7 +1454,8 @@ impl SetDisks {
                 // Single-part objects keep the whole-request fallback: a degraded
                 // sole part is detected before any byte streams, so the caller can
                 // still hand the request to the legacy duplex path unchanged.
-                false,
+                allow_inplace_legacy_fallback,
+                metrics_path,
             )
             .await;
         }
@@ -1412,7 +1489,7 @@ impl SetDisks {
         // detected before any byte is streamed and the whole request can fall
         // back to the legacy duplex path.
         let first_part = &fi.parts[0];
-        let first_reader = match Self::build_codec_streaming_part_reader(
+        let first_reader = match Self::build_codec_streaming_part_reader_with_metrics(
             bucket,
             object,
             fi,
@@ -1431,6 +1508,7 @@ impl SetDisks {
             // if part 1 is already degraded, the entire GET drops to the legacy
             // duplex path before a single byte is streamed (semantics unchanged).
             false,
+            metrics_path,
         )
         .await?
         {
@@ -1452,12 +1530,13 @@ impl SetDisks {
             skip_verify_bitrot,
             metrics_object_class,
             metrics_size_bucket,
+            metrics_path,
         });
         let builder: LazyPartBuilder = Box::new(move |remaining_index| {
             let ctx = Arc::clone(&ctx);
             let (part_number, part_size) = remaining_parts[remaining_index];
             tokio::task::spawn(async move {
-                SetDisks::build_codec_streaming_part_reader(
+                SetDisks::build_codec_streaming_part_reader_with_metrics(
                     &ctx.bucket,
                     &ctx.object,
                     &ctx.fi,
@@ -1477,19 +1556,19 @@ impl SetDisks {
                     // part in place to a legacy per-part decode reader instead of
                     // failing the stream mid-flight.
                     true,
+                    ctx.metrics_path,
                 )
                 .await
             })
         });
 
         Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
-            LazyMultipartCodecStreamingReader::new(first_reader, total_parts, builder, get_codec_streaming_metrics_path()),
+            LazyMultipartCodecStreamingReader::new(first_reader, total_parts, builder, metrics_path),
         )))
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[hotpath::measure(impl_type = "SetDisks")]
-    async fn build_codec_streaming_part_reader(
+    async fn build_codec_streaming_part_reader_with_metrics(
         bucket: &str,
         object: &str,
         fi: &FileInfo,
@@ -1504,14 +1583,8 @@ impl SetDisks {
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
-        // backlog#879: when the codec streaming fast path cannot serve this part
-        // (a shard is missing and reconstruction is required), `false` preserves
-        // the historical whole-request fallback by returning `Fallback`, while
-        // `true` degrades in place — building a legacy per-part decode reader that
-        // reuses the shard readers already opened here. Only lazily-built later
-        // parts pass `true`, so the eager first-part fallback semantics are
-        // untouched and the common read path is never affected.
         allow_inplace_legacy_fallback: bool,
+        metrics_path: &'static str,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
@@ -1528,7 +1601,6 @@ impl SetDisks {
         let read_length = till_offset.saturating_sub(read_offset);
 
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
-        let metrics_path = get_codec_streaming_metrics_path();
         let reader_stage_metrics = stage_metrics_enabled.then_some(BitrotReaderStageMetrics {
             path: metrics_path,
             reader_construction_stage: GET_STAGE_READER_TASK_READER_CONSTRUCTION,
@@ -1751,6 +1823,7 @@ struct LazyCodecPartContext {
     skip_verify_bitrot: bool,
     metrics_object_class: &'static str,
     metrics_size_bucket: &'static str,
+    metrics_path: &'static str,
 }
 
 type LazyPartBuildHandle = tokio::task::JoinHandle<Result<GetCodecStreamingReaderBuildOutcome>>;
@@ -4595,6 +4668,90 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn mid_size_reader_restores_plain_objects_without_duplex() {
+        for size in [256_usize * 1024, 1024_usize * 1024] {
+            let payload = (0..size)
+                .map(|index| u8::try_from(index % 251).expect("pattern byte fits u8"))
+                .collect::<Vec<_>>();
+            let erasure = coding::Erasure::new(4, 2, 1024 * 1024);
+            let mut fi = codec_streaming_test_fileinfo(i64::try_from(size).expect("test size fits i64"), 1);
+            fi.erasure.block_size = erasure.block_size;
+            fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+            let files = codec_streaming_inline_files(&erasure, &payload).await;
+            let (_dirs, disks) = local_test_disks(files.len(), CODEC_STREAMING_TEST_BUCKET).await;
+
+            let outcome = SetDisks::get_object_mid_size_reader_with_fileinfo(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
+                &fi,
+                &files,
+                &disks,
+                0,
+                0,
+                false,
+                "plain_single_part",
+                "le_1mib",
+                false,
+            )
+            .await
+            .expect("mid-size reader setup should succeed");
+            let GetCodecStreamingReaderBuildOutcome::Reader(mut reader) = outcome else {
+                panic!("mid-size plain object should use streaming reader");
+            };
+
+            let mut body = Vec::new();
+            reader
+                .read_to_end(&mut body)
+                .await
+                .expect("mid-size reader should restore full body");
+            assert_eq!(body, payload, "mid-size reader must preserve every payload byte for object size {size}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mid_size_reader_reuses_open_readers_for_degraded_quorum() {
+        let size = 256 * 1024;
+        let payload = vec![0x5a; size];
+        let erasure = coding::Erasure::new(4, 2, 1024 * 1024);
+        let mut fi = codec_streaming_test_fileinfo(i64::try_from(size).expect("test size fits i64"), 1);
+        fi.erasure.block_size = erasure.block_size;
+        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+        let mut files = codec_streaming_inline_files(&erasure, &payload).await;
+        files[0].data = None;
+        let (_dirs, disks) = local_test_disks(files.len(), CODEC_STREAMING_TEST_BUCKET).await;
+
+        let outcome = SetDisks::get_object_mid_size_reader_with_fileinfo(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
+            &fi,
+            &files,
+            &disks,
+            0,
+            0,
+            false,
+            "plain_single_part",
+            "le_1mib",
+            false,
+        )
+        .await
+        .expect("degraded mid-size reader setup should retain read quorum");
+        let GetCodecStreamingReaderBuildOutcome::Reader(mut reader) = outcome else {
+            panic!("degraded quorum should use in-place legacy fallback reader");
+        };
+
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .await
+            .expect("degraded reader should reconstruct full body");
+        assert_eq!(body, payload);
+    }
+
+    #[tokio::test]
     async fn get_object_with_fileinfo_restores_missing_inline_data_shard_and_submits_repair() {
         let part_data = b"abcdefgh";
         let erasure = coding::Erasure::new(4, 2, part_data.len());
@@ -4638,7 +4795,7 @@ mod tests {
         let erasure = coding::Erasure::new(4, 2, 8);
         let fi = codec_streaming_test_fileinfo(8, 1);
 
-        let oversized = SetDisks::build_codec_streaming_part_reader(
+        let oversized = SetDisks::build_codec_streaming_part_reader_with_metrics(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
@@ -4654,11 +4811,12 @@ mod tests {
             "test-size-bucket",
             false,
             false,
+            get_codec_streaming_metrics_path(),
         )
         .await;
         assert!(oversized.is_err(), "part_length > part_size must be rejected");
 
-        let missing_quorum = SetDisks::build_codec_streaming_part_reader(
+        let missing_quorum = SetDisks::build_codec_streaming_part_reader_with_metrics(
             CODEC_STREAMING_TEST_BUCKET,
             CODEC_STREAMING_TEST_OBJECT,
             &fi,
@@ -4674,6 +4832,7 @@ mod tests {
             "test-size-bucket",
             false,
             false,
+            get_codec_streaming_metrics_path(),
         )
         .await;
         assert!(missing_quorum.is_err(), "reader setup must fail closed when no shard can answer");
@@ -5208,7 +5367,7 @@ mod tests {
         Ok(decoded)
     }
 
-    async fn codec_streaming_inline_files(erasure: &coding::Erasure, part_data: &'static [u8]) -> Vec<FileInfo> {
+    async fn codec_streaming_inline_files(erasure: &coding::Erasure, part_data: &[u8]) -> Vec<FileInfo> {
         let shards = erasure.encode_data(part_data).expect("test part should encode");
         let distribution = (1..=erasure.total_shard_count()).collect::<Vec<_>>();
         let mut files = Vec::with_capacity(shards.len());
