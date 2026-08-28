@@ -35,6 +35,10 @@ const DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 const DEFAULT_SMALL_EAGER_PUT_MAX_SIZE_BYTES: usize = 512 * 1024;
 
+// Keep bounded conditional writes eager through the historical 1 MiB boundary
+// so the old object remains readable until the replacement body is complete.
+const CONDITIONAL_SMALL_EAGER_PUT_MAX_SIZE_BYTES: i64 = 1024 * 1024;
+
 const PUT_EAGER_STATUS_ELIGIBLE: &str = "eligible";
 
 const PUT_EAGER_STATUS_EXTRACT: &str = "extract";
@@ -516,6 +520,17 @@ fn should_use_small_eager_put_path_with_max_size(
     if is_extract || should_compress || server_side_encryption_requested {
         return false;
     }
+
+    let has_conditional_write = [http::header::IF_MATCH, http::header::IF_NONE_MATCH]
+        .into_iter()
+        .filter_map(|name| headers.get(name))
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| !value.trim().is_empty());
+    let max_size = if has_conditional_write {
+        max_size.max(CONDITIONAL_SMALL_EAGER_PUT_MAX_SIZE_BYTES)
+    } else {
+        max_size
+    };
 
     if size <= 0 || size > max_size {
         return false;
@@ -2349,6 +2364,31 @@ mod tests {
             false,
             1024 * 1024,
         ));
+    }
+
+    #[test]
+    fn should_use_small_eager_put_path_keeps_conditional_1mb_writes_atomic() {
+        for header in [http::header::IF_MATCH, http::header::IF_NONE_MATCH] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header, HeaderValue::from_static("*"));
+
+            assert!(should_use_small_eager_put_path_with_max_size(
+                1024 * 1024,
+                &headers,
+                false,
+                false,
+                false,
+                512 * 1024,
+            ));
+            assert!(!should_use_small_eager_put_path_with_max_size(
+                1024 * 1024 + 1,
+                &headers,
+                false,
+                false,
+                false,
+                512 * 1024,
+            ));
+        }
     }
 
     #[test]
