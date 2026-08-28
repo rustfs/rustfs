@@ -67,7 +67,10 @@ use super::storage_api::multipart_usecase::sse::{
 use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
 };
-use crate::app::object::{guard_put_object_body_read_timeout, put_object_body_read_timeout};
+use crate::app::object::{
+    ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
+    put_object_body_read_timeout,
+};
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
     invalidate_object_data_cache_before_mutation,
@@ -90,6 +93,7 @@ use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, Uri};
+use metrics::counter;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
@@ -382,17 +386,24 @@ fn build_complete_multipart_location(headers: &HeaderMap, uri: &Uri, bucket: &st
 #[derive(Clone, Default)]
 pub struct DefaultMultipartUsecase {
     context: Option<Arc<AppContext>>,
+    #[cfg(test)]
+    concurrency_manager: Option<Arc<ConcurrencyManager>>,
 }
 
 impl DefaultMultipartUsecase {
     #[cfg(test)]
     pub fn without_context() -> Self {
-        Self { context: None }
+        Self {
+            context: None,
+            concurrency_manager: None,
+        }
     }
 
     pub fn from_global() -> Self {
         Self {
             context: current_app_context(),
+            #[cfg(test)]
+            concurrency_manager: None,
         }
     }
 
@@ -401,7 +412,22 @@ impl DefaultMultipartUsecase {
     /// so the use-case resolves that server's store; `None` falls back to the
     /// ambient default.
     pub fn with_context(context: Option<std::sync::Arc<crate::runtime_sources::AppContext>>) -> Self {
-        Self { context }
+        Self {
+            context,
+            #[cfg(test)]
+            concurrency_manager: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_context_and_concurrency_manager(
+        context: Option<std::sync::Arc<crate::runtime_sources::AppContext>>,
+        concurrency_manager: Arc<ConcurrencyManager>,
+    ) -> Self {
+        Self {
+            context,
+            concurrency_manager: Some(concurrency_manager),
+        }
     }
 
     fn bucket_metadata_sys(&self) -> Option<Arc<RwLock<metadata_sys::BucketMetadataSys>>> {
@@ -414,6 +440,15 @@ impl DefaultMultipartUsecase {
 
     fn object_data_cache(&self) -> Arc<ObjectDataCacheAdapter> {
         current_object_data_cache_for_context(self.context.as_deref())
+    }
+
+    fn concurrency_manager(&self) -> &ConcurrencyManager {
+        #[cfg(test)]
+        if let Some(concurrency_manager) = self.concurrency_manager.as_deref() {
+            return concurrency_manager;
+        }
+
+        get_concurrency_manager()
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1071,6 +1106,25 @@ impl DefaultMultipartUsecase {
         {
             return Err(S3Error::new(S3ErrorCode::EntityTooLarge));
         }
+        let upload_part_admission = match self
+            .concurrency_manager()
+            .admit_multipart_part(size.unwrap_or(-1))
+            .await
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "foreground write admission closed"))?
+        {
+            ForegroundWriteAdmission::Disabled => None,
+            ForegroundWriteAdmission::Admitted(permit) => {
+                counter!("rustfs.upload_part.foreground_admission.total", "result" => "admitted").increment(1);
+                Some(permit)
+            }
+            ForegroundWriteAdmission::Rejected => {
+                counter!("rustfs.upload_part.foreground_admission.total", "result" => "rejected").increment(1);
+                return Err(S3Error::with_message(
+                    S3ErrorCode::SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate",
+                ));
+            }
+        };
         if max_total_object_size.is_some() {
             let request_id = req
                 .extensions
@@ -1252,10 +1306,12 @@ impl DefaultMultipartUsecase {
             );
         }
 
+        let _upload_part_admission = upload_part_admission;
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
+        drop(_upload_part_admission);
 
         let mut checksum_crc32 = input.checksum_crc32;
         let mut checksum_crc32c = input.checksum_crc32c;
@@ -2929,5 +2985,53 @@ mod tests {
             assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
             assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_upload_part_rejects_when_foreground_write_admission_is_full() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("upload-part-admission-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create upload part admission test bucket");
+        let upload = store
+            .new_multipart_upload(&bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("create multipart upload");
+        let concurrency_manager = Arc::new(ConcurrencyManager::with_large_put_admission_for_test(
+            true,
+            1,
+            rustfs_config::DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES,
+            Duration::ZERO,
+        ));
+        let held = concurrency_manager
+            .admit_multipart_part(1024)
+            .await
+            .expect("first multipart part should acquire the only permit");
+        let usecase =
+            DefaultMultipartUsecase::with_context_and_concurrency_manager(Some(context), Arc::clone(&concurrency_manager));
+        let body = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
+        let input = UploadPartInput::builder()
+            .bucket(bucket)
+            .key("object".to_string())
+            .upload_id(upload.upload_id)
+            .part_number(1)
+            .content_length(Some(1024))
+            .body(Some(body))
+            .build()
+            .expect("upload part input should build");
+
+        let err = usecase
+            .execute_upload_part(build_request(input, Method::PUT))
+            .await
+            .expect_err("full foreground write admission should reject before body ingest");
+        assert_eq!(err.code(), &S3ErrorCode::SlowDown);
+        drop(held);
     }
 }
