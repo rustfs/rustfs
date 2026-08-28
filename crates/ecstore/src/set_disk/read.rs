@@ -4713,6 +4713,70 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn mid_size_reader_restores_plain_objects_from_external_part_files() {
+        for size in [256_usize * 1024, 1024_usize * 1024] {
+            let payload = (0..size)
+                .map(|index| u8::try_from(index % 251).expect("pattern byte fits u8"))
+                .collect::<Vec<_>>();
+            let erasure = coding::Erasure::new(4, 2, 1024 * 1024);
+            let mut fi = codec_streaming_test_fileinfo(i64::try_from(size).expect("test size fits i64"), 1);
+            fi.erasure.block_size = erasure.block_size;
+            fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+            let (_dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+            let (data_dir, files) = codec_streaming_external_files(&erasure, &payload, &disks).await;
+            fi.data_dir = Some(data_dir);
+
+            let outcome = SetDisks::get_object_mid_size_reader_with_fileinfo(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                Arc::new(ErasureCache::new()),
+                &fi,
+                &files,
+                &disks,
+                0,
+                0,
+                false,
+                "plain_single_part",
+                "le_1mib",
+                false,
+            )
+            .await
+            .expect("external mid-size reader setup should succeed");
+            let GetCodecStreamingReaderBuildOutcome::Reader(mut reader) = outcome else {
+                panic!("external plain object should use streaming reader");
+            };
+
+            let mut body = Vec::new();
+            reader
+                .read_to_end(&mut body)
+                .await
+                .expect("external mid-size reader should restore full body");
+            assert_eq!(
+                body, payload,
+                "external part files must preserve every payload byte for object size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn minio_large_object_metadata_remains_reader_compatible() {
+        let raw = rustfs_filemeta::test_data::create_minio_large_object_xlmeta().expect("load MinIO large-object fixture");
+        let file_info = rustfs_filemeta::FileMeta::load(&raw)
+            .expect("MinIO xl.meta should decode")
+            .into_fileinfo("interop", "large.bin", "", false, false, true)
+            .expect("MinIO xl.meta should materialize FileInfo");
+
+        file_info
+            .validate_for_metadata_read()
+            .expect("MinIO metadata should satisfy the reader validation contract");
+        assert_eq!(file_info.size, 300_000);
+        assert_eq!(file_info.parts.len(), 1);
+        assert!(file_info.data_dir.is_some());
+        assert!(!file_info.inline_data());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn mid_size_reader_reuses_open_readers_for_degraded_quorum() {
         let size = 256 * 1024;
         let payload = vec![0x5a; size];
@@ -5389,6 +5453,27 @@ mod tests {
         }
 
         files
+    }
+
+    async fn codec_streaming_external_files(
+        erasure: &coding::Erasure,
+        part_data: &[u8],
+        disks: &[Option<crate::disk::DiskStore>],
+    ) -> (Uuid, Vec<FileInfo>) {
+        let data_dir = Uuid::from_u128(0x2060_0000_0000_0000_0000_0000_0000_0001);
+        let mut files = codec_streaming_inline_files(erasure, part_data).await;
+        for (index, file) in files.iter_mut().enumerate() {
+            let shard = file.data.take().expect("external fixture shard should be encoded");
+            file.data_dir = Some(data_dir);
+            let path = format!("{CODEC_STREAMING_TEST_OBJECT}/{data_dir}/part.1");
+            disks[index]
+                .as_ref()
+                .expect("external fixture disk should be online")
+                .write_all(CODEC_STREAMING_TEST_BUCKET, &path, shard)
+                .await
+                .expect("external fixture shard should be written");
+        }
+        (data_dir, files)
     }
 
     #[tokio::test]
