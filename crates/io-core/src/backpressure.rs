@@ -227,7 +227,7 @@ impl BackpressureMonitor {
         // usize::MAX, which would permanently reject all future acquisitions.
         let prev = match self
             .current
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
         {
             Ok(prev) => prev,
             Err(_) => {

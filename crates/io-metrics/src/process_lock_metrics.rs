@@ -69,12 +69,12 @@ pub fn record_write_lock_held_acquire() {
 
 #[inline(always)]
 pub fn record_read_lock_held_release() {
-    let _ = READ_LOCKS_HELD.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_sub(1)));
+    let _ = READ_LOCKS_HELD.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_sub(1)));
 }
 
 #[inline(always)]
 pub fn record_write_lock_held_release() {
-    let _ = WRITE_LOCKS_HELD.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_sub(1)));
+    let _ = WRITE_LOCKS_HELD.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_sub(1)));
 }
 
 #[inline(always)]

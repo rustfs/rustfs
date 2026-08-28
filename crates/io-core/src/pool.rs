@@ -448,7 +448,7 @@ impl PoolTier {
         if let Some(buffer) = buffer {
             let released_bytes = buffer.capacity() as u64;
             self.tier_current_allocated_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_sub(released_bytes))
                 })
                 .ok();
@@ -457,7 +457,7 @@ impl PoolTier {
             {
                 metrics
                     .current_allocated_bytes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                         Some(current.saturating_sub(released_bytes))
                     })
                     .ok();

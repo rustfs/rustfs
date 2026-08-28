@@ -3945,7 +3945,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for TransitionUploadReader<R> {
                 let read =
                     u64::try_from(read).map_err(|_| std::io::Error::other("transition upload read count exceeds u64::MAX"))?;
                 self.consumed
-                    .fetch_update(Ordering::Release, Ordering::Relaxed, |consumed| consumed.checked_add(read))
+                    .try_update(Ordering::Release, Ordering::Relaxed, |consumed| consumed.checked_add(read))
                     .map_err(|_| std::io::Error::other("transition upload read count overflow"))?;
                 Poll::Ready(Ok(()))
             }
@@ -7018,7 +7018,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         (del_objects, del_errs, accounting)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, opts))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
         // Scanner cleanup carries the per-peer lease fence as transient
         // request metadata. Consume it before any delete-prefix fanout so it

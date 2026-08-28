@@ -3542,7 +3542,7 @@ impl SetDisks {
         let hash_bytes = hash.to_le_bytes();
         let index = usize::from(u16::from_le_bytes([hash_bytes[0], hash_bytes[1]]) % GET_OBJECT_METADATA_CACHE_FENCE_SHARDS);
         let generation = &self.get_object_metadata_cache_generations[index];
-        let previous = match generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1)) {
+        let previous = match generation.try_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1)) {
             Ok(previous) | Err(previous) => previous,
         };
         let previous = GetObjectMetadataCacheGeneration {
@@ -3559,7 +3559,7 @@ impl SetDisks {
 
     fn invalidate_all_get_object_metadata_cache(&self) {
         for generation in self.get_object_metadata_cache_generations.iter() {
-            let _ = generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1));
+            let _ = generation.try_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1));
         }
         self.get_object_metadata_cache.invalidate_all();
     }
