@@ -705,6 +705,7 @@ fn replacement_identity(
 enum MockHealObjectOutcome {
     OkWithOtherError(&'static str),
     ErrOther(&'static str),
+    DanglingGraceDeferred,
     RetryableReadQuorum,
     RetryableSlowDown,
     PermanentOther(&'static str),
@@ -806,6 +807,12 @@ impl HealStorageAPI for MockStorage {
             .and_then(VecDeque::pop_front)
         {
             return match outcome {
+                MockHealObjectOutcome::DanglingGraceDeferred => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Disk(DiskError::other(
+                        "dangling object deletion deferred by heal grace window; retry_after_secs=3599; grace_secs=3600",
+                    ))),
+                )),
                 MockHealObjectOutcome::RetryableReadQuorum => Err(Error::Storage(EcstoreError::InsufficientReadQuorum(
                     bucket.to_string(),
                     object.to_string(),
@@ -820,6 +827,12 @@ impl HealStorageAPI for MockStorage {
         }
         if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
             return match outcome {
+                MockHealObjectOutcome::DanglingGraceDeferred => Ok((
+                    HealResultItem::default(),
+                    Some(Error::Disk(DiskError::other(
+                        "dangling object deletion deferred by heal grace window; retry_after_secs=3599; grace_secs=3600",
+                    ))),
+                )),
                 MockHealObjectOutcome::OkWithOtherError(message) => Ok((HealResultItem::default(), Some(Error::other(message)))),
                 MockHealObjectOutcome::ErrOther(message) | MockHealObjectOutcome::PermanentOther(message) => {
                     Err(Error::other(message))
@@ -1310,6 +1323,31 @@ async fn test_cluster_heal_visits_bucket_objects() {
     assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
 }
 
+#[tokio::test]
+async fn object_heal_skips_dangling_delete_grace_without_failing_task() {
+    let storage = Arc::new(MockStorage {
+        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::DanglingGraceDeferred)),
+        ..Default::default()
+    });
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "recent.txt".to_string(), None),
+        storage.clone(),
+    );
+
+    task.execute()
+        .await
+        .expect("grace-protected dangling cleanup should be reported as a skipped object");
+
+    assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+    assert!(storage.healed_objects.lock().unwrap().is_empty());
+    let progress = task.get_progress().await;
+    assert_eq!(progress.current_object.as_deref(), Some("skipped: bucket-a/recent.txt"));
+    assert_eq!(progress.objects_scanned, 1);
+    assert_eq!(progress.objects_healed, 0);
+    assert_eq!(progress.objects_failed, 0);
+    assert_eq!(progress.skipped_objects, 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn test_recursive_bucket_heal_retries_only_retryable_objects() {
     let storage = Arc::new(MockStorage::default());
@@ -1343,6 +1381,43 @@ async fn test_recursive_bucket_heal_retries_only_retryable_objects() {
     assert_eq!(progress.objects_scanned, 2);
     assert_eq!(progress.objects_healed, 2);
     assert_eq!(progress.objects_failed, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_skips_dangling_delete_grace_without_batch_failure() {
+    let storage = Arc::new(MockStorage::default());
+    storage
+        .heal_object_outcomes
+        .lock()
+        .unwrap()
+        .insert("object-a".to_string(), VecDeque::from([MockHealObjectOutcome::DanglingGraceDeferred]));
+    let request = HealRequest::new(
+        HealType::Bucket {
+            bucket: "bucket-a".to_string(),
+        },
+        HealOptions {
+            recursive: true,
+            timeout: None,
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.heal_bucket("bucket-a")
+        .await
+        .expect("grace-protected dangling cleanup should not fail the bucket heal batch");
+
+    assert_eq!(
+        storage.heal_object_calls.lock().unwrap().as_slice(),
+        ["object-a".to_string(), "object-b".to_string()]
+    );
+    assert_eq!(storage.healed_objects.lock().unwrap().as_slice(), ["object-b".to_string()]);
+    let progress = task.get_progress().await;
+    assert_eq!(progress.objects_scanned, 2);
+    assert_eq!(progress.objects_healed, 1);
+    assert_eq!(progress.objects_failed, 0);
+    assert_eq!(progress.skipped_objects, 1);
 }
 
 #[tokio::test(start_paused = true)]
