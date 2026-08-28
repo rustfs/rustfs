@@ -224,63 +224,59 @@ missing piece is a source adapter that points the importer at a MinIO
 
 ## Part C — Server-Side Encryption (SSE)
 
-Container-format parity does **not** extend to encrypted object payloads. RustFS currently does not support reading objects that MinIO wrote with server-side encryption — SSE-S3, SSE-KMS, or SSE-C. This is true of every released binary and container image. Tracked in rustfs/backlog#1638.
+Reading MinIO-written SSE objects is implemented, with a deliberate build boundary. The read path lives behind the `rio-v2` feature and is a **special-purpose migration capability**: it is not compiled into released binaries or container images, and there is no short-term plan to promote it into default builds. A default build fails such reads closed with a diagnosed error (see "How default builds fail" below); a `rio-v2` build reads them, within the scenario matrix below. The read-path work was tracked in rustfs/backlog#1638 (landed across rustfs/rustfs#6191, #6784, #6785).
 
 ### Scope boundary: KMS wire protocols and the production gate
 
 This document covers MinIO on-disk metadata and object-encryption seams only. The **AWS KMS wire protocol** and the **MinIO KES wire protocol** are explicit non-targets: RustFS's AWS backend uses the AWS SDK's `awsJson1_1` client path (`crates/kms/src/backends/aws.rs:830`), while KES compatibility is outside this interop work. Those ecosystem evaluations remain separate work in the [#1562 Production Ready exit gate](https://github.com/rustfs/backlog/issues/1562), whose compatibility criterion covers MinIO/RustFS SSE data and rolling upgrades. Closing #1638 does not by itself close that gate.
 
-Note the asymmetry with Parts A and B: the `xl.meta` around a MinIO SSE object parses fine, so such objects list, HEAD, and report plausible sizes. Only the payload is unreadable.
+Note the asymmetry with Parts A and B: the `xl.meta` around a MinIO SSE object parses fine, so such objects list, HEAD, and report plausible sizes. Only payload readability depends on the build and the scenario.
 
 ### What can and cannot be migrated
 
-| Object class | Readable after moving the drives / copying via S3 | Notes |
-|---|:--:|---|
-| Unencrypted objects | ✅ | Parts A and B apply. |
-| Bucket metadata, IAM config | ✅ | Via the importer, once a `.minio.sys` source adapter exists (see Part B). |
-| Bucket-level default-encryption *configuration* | ✅ | The `encryption` config blob round-trips as a blob; it does not make existing ciphertext readable. |
-| MinIO-written SSE-S3 objects | ❌ | Seams 1 and 2 below. |
-| MinIO-written SSE-KMS objects | ❌ | Seams 1 and 2 below. |
-| MinIO-written SSE-C objects | ❌ | Seam 3 below. |
-| RustFS-written SSE objects read back by MinIO | ❌ | See "Reverse direction". |
+| Object class | Default build | `rio-v2` build | Notes |
+|---|:--:|:--:|---|
+| Unencrypted objects | ✅ | ✅ | Parts A and B apply. |
+| Bucket metadata, IAM config | ✅ | ✅ | Via the importer, once a `.minio.sys` source adapter exists (see Part B). |
+| Bucket-level default-encryption *configuration* | ✅ | ✅ | The `encryption` config blob round-trips as a blob; it does not make existing ciphertext readable. |
+| SSE-S3 / SSE-KMS, MinIO builtin static KMS (`MINIO_KMS_SECRET_KEY`), single- and multipart | ❌ diagnosed | ✅ | Requires `RUSTFS_SSE_S3_MASTER_KEY` set to the same 32-byte key material as MinIO's static secret. Proven against real MinIO fixtures (rustfs/rustfs#6191). |
+| SSE-C, MinIO-written | ❌ diagnosed | ✅ | Detection via MinIO's sealed-key slot; the customer key is proven by the AEAD unseal, since MinIO stores no key MD5 (rustfs/rustfs#6785). |
+| Any SSE, MinIO backed by KES / KMS plugin / MinKMS | ❌ | ❌ **not planned** | The wrapped DEK is sealed by the KES service itself; it is not a Vault/Transit ciphertext RustFS could be pointed at. Re-encrypt on the MinIO side before migrating. |
+| Objects sealed with legacy `DARE-SHA256` (`InsecureSealAlgorithm`) | ❌ | ❌ out of scope | Pre-DAREv2-HMAC MinIO; `parse_minio_managed_sealed_key` rejects the algorithm and the read fails closed. |
+| RustFS-written SSE objects read back by MinIO | ❌ | ❌ | See "Reverse direction". |
 
-### Where the read path stops
+### The seams, and where they closed
 
-The primitives match — RustFS implements the same DARE V2 stream format and the same object-key derivation and sealing, and a MinIO sealed-key parser exists (`parse_minio_managed_sealed_key`, `rustfs/src/storage/sse.rs:3195`). Three seams above the cryptography still reject MinIO-written objects.
+The cryptographic primitives were never the gap — RustFS implements the same DARE V2 stream format, object-key derivation, and sealing. Three seams above the cryptography rejected MinIO-written objects; all three are closed in `rio-v2` builds.
 
-| # | Seam | Evidence |
+| # | Seam | Resolution |
 |---|---|---|
-| 1 | The managed-SSE (SSE-S3 / SSE-KMS) read path returns "not encrypted" unless the object's *persisted* metadata carries the S3 response key `x-amz-server-side-encryption`. RustFS writes that key into metadata on PUT; MinIO's internal sealed-key headers alone do not satisfy the gate. | Gate: `rustfs/src/storage/sse.rs:2432`. RustFS write side: `rustfs/src/storage/sse.rs:391-400`. |
-| 2 | MinIO's wrapped-DEK blob (`{"aead": ...}`) is neither produced nor accepted. `is_data_key_envelope` classifies that shape as not a RustFS envelope, and `LocalSseDekEnvelope` is `deny_unknown_fields`. | `crates/kms/src/encryption/dek.rs:425`, `:443`; `rustfs/src/storage/sse.rs:2784-2790`. Already documented for the static backend at `crates/kms/src/config.rs:304-308`. |
-| 3 | SSE-C detection keys on `x-amz-server-side-encryption-customer-algorithm`, and `contains_managed_encryption_metadata` omits MinIO's SSE-C sealed-key header, so a MinIO SSE-C object matches neither detection branch. The unsealing code it would need is already written. | Detection: `rustfs/src/storage/sse.rs:2059` and `:3178-3184`; the omitted constant is `rustfs/src/storage/sse.rs:124`. Unsealing: `rustfs/src/storage/sse.rs:2236-2245`. |
+| 1 | Managed-SSE detection required the *persisted* public `x-amz-server-side-encryption` key, which MinIO synthesizes at response time and never stores. | Closed by rustfs/rustfs#6191: `infer_minio_managed_sse_type` infers the scheme from which MinIO sealed-key slot is present (the slot also selects the sealing-key domain, so a wrong inference cannot silently derive a wrong key). Inference from the KMS key id would misclassify — MinIO writes `-S3-Kms-Key-Id` on SSE-S3 objects too. |
+| 2 | MinIO's wrapped-DEK ciphertext was not accepted by any envelope parser. | Closed by rustfs/rustfs#6191: `decrypt_minio_kms_data_key` implements MinIO's builtin-KMS sealing (`sealingKey = HMAC-SHA256(master, iv)`), accepting both the raw `sealed‖iv‖nonce` layout and the legacy `{"aead": ...}` JSON. Routing is by the data key's own byte shape — RustFS's strict JSON envelopes are recognized positively, everything else goes to the MinIO decoder — because slot names cannot distinguish the writer. `LocalSseDekEnvelope` keeps `deny_unknown_fields`. |
+| 3 | SSE-C detection keyed on the stored customer-algorithm header, which MinIO also never persists, and the early key check demanded a stored key MD5 MinIO does not write. | Closed by rustfs/rustfs#6785: `stored_ssec_metadata` also accepts MinIO's SSE-C sealed-key slot (rio-v2 builds only), and `verify_ssec_key_match` tolerates a missing stored MD5 for exactly that shape — the AEAD unseal remains the key proof, and a wrong key still fails there. |
 
-### How it fails
+Two further single-part defects were fixed on the way (both rustfs/rustfs#6191 follow-ups): multipart classification now trusts MinIO's own `X-Minio-Internal-Encrypted-Multipart` marker instead of an ETag-length heuristic (MinIO stores *encrypted* ETags, so every single-part SSE object mis-classified as multipart), and single-part plaintext sizes are recovered by DARE reverse-size arithmetic (`dare_v2_decrypted_size`) since MinIO records an explicit size only for multipart uploads.
 
-The read fails closed: ciphertext is never served as plaintext. Seams 1 and 3 return `Ok(None)`, but that value does not reach the data path. `is_object_encryption_marker` matches the whole `x-minio-internal-server-side-encryption-` prefix (`crates/utils/src/http/header_compat.rs:50-67`), so `ObjectInfo::is_encrypted()` is true for these objects, and `crates/ecstore/src/object_api/readers.rs:559-568` turns the `Ok(None)` into `encrypted object metadata is incomplete` while constructing the reader. GET, CopyObject, replication and multipart sources all build the reader through that path. The inline fast path and the body cache both exclude encrypted objects explicitly, so neither bypasses it.
+### How default builds fail
 
-What migrates badly is the *diagnosis*, not the data. That error is not recognised by `map_get_object_reader_error` (`rustfs/src/storage/sse.rs:667`), so it surfaces as a 500 `InternalError` — which reads as a RustFS fault rather than "this object was encrypted by another implementation". List and HEAD still succeed, because `xl.meta` itself parses normally, so the object looks healthy until something reads it.
+The read fails closed: ciphertext is never served as plaintext. `is_object_encryption_marker` matches the whole `x-minio-internal-server-side-encryption-` prefix, so `ObjectInfo::is_encrypted()` is true for these objects, and the read plan refuses to construct a reader without decryption material. Since rustfs/rustfs#6784 the refusal is diagnosed: the resolver raises a typed error naming the condition — in default builds it points at the MinIO-compatible sealed format and the `rio-v2` read path it would require — and it surfaces as S3 `InvalidObjectState` (non-retryable) instead of the former undiagnosed 500 `InternalError`. List and HEAD still succeed, because `xl.meta` parses normally.
 
-Seam 2 surfaces its own error, but only for objects that got past seam 1.
+### What a `rio-v2` migration build needs
 
-### The `rio-v2` feature does not change this
+- A binary built with `--features rio-v2`. The feature is deliberately absent from `default` and `full` in `rustfs/Cargo.toml`; released binaries and images never include it.
+- For SSE-S3/SSE-KMS objects: `RUSTFS_SSE_S3_MASTER_KEY` (base64, 32 bytes) set to the same key material as the source MinIO's `MINIO_KMS_SECRET_KEY`. For SSE-C objects: nothing server-side — the client supplies the customer key per request, as on MinIO.
+- The interop harness is the evidence chain: `rustfs/src/storage/minio_generated_read_test.rs` (`#[ignore]` reader tests over real MinIO-generated fixtures, run with `--features rio-v2`), the fixture lab under `crates/rio-v2/tests/minio_fixture_lab/`, and the `minio-interop` workflow. The SSE-C lane of that harness (customer-key handout from a fixture capture to the reader test) is not wired yet; SSE-C coverage currently lives in the unit suite, which builds the MinIO shape with the same sealing primitives the fixture suite proved byte-compatible.
 
-`rustfs/src/storage/sse.rs` contains MinIO-interop code behind `#[cfg(feature = "rio-v2")]`, which can give the impression that enabling the feature closes the gap. It does not, for two independent reasons.
-
-- The feature is not compiled into anything that ships. `rio-v2` is absent from both `default` and `full` in `rustfs/Cargo.toml:39`, `:48`, `:51`; release binaries are built with no `--features` flag, and the published images install that binary rather than compiling their own.
-- Seam 1 is not feature-gated and runs *before* the MinIO parser is consulted (`rustfs/src/storage/sse.rs:2432` precedes `:2458`). Even with `rio-v2` enabled, a MinIO-written managed-SSE object returns at the gate and never reaches `parse_minio_managed_sealed_key`.
-
-The interop harness reflects this. The reader tests are `#[ignore]` (`rustfs/src/storage/minio_generated_read_test.rs:244`, `:250`), the workflow that would run them is disabled at the GitHub Actions level and states in its own header that end-to-end MinIO-to-RustFS SSE interop is not implemented (`.github/workflows/minio-interop.yml:24-29`, `:34-39`), and the fixture suite's scope note says the tests "do not yet validate full plaintext reconstruction from MinIO-written encrypted data" (`crates/rio-v2/tests/README.md:55`).
+Known unverified edge: MinIO seals ETags on SSE objects (`SealETag`); RustFS does not unseal them, so ETag display and `If-Match` semantics on migrated SSE objects are not guaranteed to match MinIO's.
 
 ### Reverse direction
 
 Migrating back is also unsupported. Under `rio-v2` RustFS writes its own DEK envelope into MinIO's sealed-key metadata slots and labels it with MinIO's seal algorithm (`rustfs/src/storage/sse.rs:1830-1852`), so the metadata is MinIO-shaped while the key bytes are not MinIO-openable. Default builds do not populate those slots at all (`rustfs/src/storage/sse.rs:1796-1798`). Treat RustFS-written SSE objects as readable only by RustFS.
 
-### Working around the limitation
+### Migration options
 
-Until rustfs/backlog#1638 lands, the options are:
-
-- Decrypt on the MinIO side first: rewrite the affected objects as plaintext (or copy them out through MinIO's S3 endpoint, which decrypts on read) and migrate the plaintext, applying RustFS-side encryption afterwards.
-- Copy through the S3 API rather than moving drives: a client that reads from MinIO and writes to RustFS gets plaintext from the source and lets RustFS encrypt with its own KMS. This re-encrypts rather than preserving ciphertext, and costs a full data transfer.
+- For static-KMS MinIO sources: run the migration through a `rio-v2` build with the shared master key (see above), either serving reads in place or copying objects out into a default-build cluster (the copy re-encrypts under RustFS's own KMS).
+- For KES/MinKMS-backed sources, or when a special-purpose build is not wanted: decrypt on the MinIO side first — rewrite the affected objects as plaintext, or copy them out through MinIO's S3 endpoint, which decrypts on read — and let RustFS apply its own encryption on ingest.
 - Leave encrypted objects on MinIO and migrate only unencrypted data.
 
 Inventory the source first — bucket default-encryption settings mean objects can be encrypted without the uploader having asked for it, so "we never set SSE headers" is not sufficient evidence that a bucket has no encrypted objects.
@@ -291,13 +287,15 @@ Inventory the source first — bucket default-encryption settings mean objects c
 |---|:--:|:--:|:--:|
 | DARE V2 stream format parity | ✅ | | |
 | Object-key derivation / sealing parity | ✅ | | |
-| MinIO sealed-key parser exists (behind `rio-v2`) | | ⚠️ | |
-| Managed-SSE detection accepts MinIO-written metadata | | | ❌ |
-| MinIO `{"aead": ...}` wrapped-DEK parser | | | ❌ |
-| SSE-C detection accepts MinIO-written metadata | | | ❌ |
-| Read MinIO-written SSE-S3 / SSE-KMS / SSE-C objects end to end | | | ❌ |
+| Managed-SSE detection accepts MinIO-written metadata (`rio-v2`) | ✅ | | |
+| MinIO builtin-KMS wrapped-DEK parser (raw + legacy JSON) | ✅ | | |
+| SSE-C detection accepts MinIO-written metadata (`rio-v2`) | ✅ | | |
+| Read MinIO-written SSE-S3 / SSE-KMS end to end, single- and multipart | ✅ | | |
+| Read MinIO-written SSE-C end to end | | ⚠️ unit-proven; fixture-lab lane unwired | |
+| Migrated-object sealed-ETag semantics | | | ❌ unverified |
+| KES / MinKMS / legacy `DARE-SHA256` sources | | | ❌ not planned |
 | RustFS-written SSE objects readable by MinIO | | | ❌ |
-| CI proof of SSE read parity | | | ❌ |
+| CI proof of SSE read parity | | ⚠️ `minio-interop` workflow; nightly once re-enabled | |
 
 ---
 
