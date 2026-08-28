@@ -1912,6 +1912,21 @@ async fn site_replication_info(env: &RustFSTestEnvironment) -> Result<SiteReplic
     Ok(serde_json::from_slice(&response.bytes().await?)?)
 }
 
+async fn site_replication_rotate_svc_acct(
+    env: &RustFSTestEnvironment,
+) -> Result<ReplicateEditStatus, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/rustfs/admin/v3/site-replication/rotate-svc-acct", env.url);
+    let response = signed_request(http::Method::POST, &url, &env.access_key, &env.secret_key, None, None).await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("site replication rotate-svc-acct failed: {status} {body}").into());
+    }
+
+    Ok(serde_json::from_slice(&response.bytes().await?)?)
+}
+
 async fn site_replication_resync_op(
     env: &RustFSTestEnvironment,
     operation: &str,
@@ -6306,6 +6321,112 @@ async fn test_site_replication_remove_all_real_dual_node() -> Result<(), Box<dyn
             Err(err) => return Err(err.into()),
         }
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_site_replication_rotate_svc_acct_completes_and_replication_survives_real_dual_node()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env
+        .start_rustfs_server_with_env(vec![], LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env
+        .start_rustfs_server_without_cleanup_with_env(LOOPBACK_REPLICATION_TARGET_ENV)
+        .await?;
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+    let bucket = "site-repl-rotate-svc-acct";
+
+    let add_status = site_replication_add(
+        &source_env,
+        &[
+            PeerSite {
+                name: "source-site".to_string(),
+                endpoint: source_env.url.clone(),
+                access_key: source_env.access_key.clone(),
+                secret_key: source_env.secret_key.clone(),
+                ..Default::default()
+            },
+            PeerSite {
+                name: "target-site".to_string(),
+                endpoint: target_env.url.clone(),
+                access_key: target_env.access_key.clone(),
+                secret_key: target_env.secret_key.clone(),
+                ..Default::default()
+            },
+        ],
+    )
+    .await?;
+    assert!(add_status.success, "unexpected site add result: {add_status:?}");
+
+    let _source_info = wait_for_site_replication_enabled(&source_env, 2).await?;
+    let _target_info = wait_for_site_replication_enabled(&target_env, 2).await?;
+
+    source_client.create_bucket().bucket(bucket).send().await?;
+    enable_bucket_versioning(&source_env, bucket).await?;
+    wait_for_bucket_on_target(&target_client, bucket).await?;
+    let baseline_payload = b"before rotation".to_vec();
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key("before-rotate.txt")
+        .body(ByteStream::from(baseline_payload.clone()))
+        .send()
+        .await?;
+    let replicated_baseline = wait_for_object_on_target(&target_client, bucket, "before-rotate.txt").await?;
+    assert_eq!(replicated_baseline, baseline_payload);
+
+    // A single rotation call must finish the whole hand-over. Before the fix
+    // the join push could only sign with the freshly installed secret, every
+    // peer rejected it, the rotation stayed pending forever, and both
+    // replication directions were dead until an operator retried.
+    let rotate_status = site_replication_rotate_svc_acct(&source_env).await?;
+    assert!(rotate_status.success, "rotation did not complete in one call: {rotate_status:?}");
+
+    for env in [&source_env, &target_env] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let info = site_replication_info(env).await?;
+            if info.enabled && info.pending_operation.is_none() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(format!("rotation left {} with a pending operation: {:?}", env.url, info.pending_operation).into());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    // Replication must actually flow again in both directions with the
+    // rotated service-account secret.
+    let forward_payload = b"after rotation from source".to_vec();
+    source_client
+        .put_object()
+        .bucket(bucket)
+        .key("after-rotate-forward.txt")
+        .body(ByteStream::from(forward_payload.clone()))
+        .send()
+        .await?;
+    let replicated_forward = wait_for_object_on_target(&target_client, bucket, "after-rotate-forward.txt").await?;
+    assert_eq!(replicated_forward, forward_payload);
+
+    let reverse_payload = b"after rotation from target".to_vec();
+    target_client
+        .put_object()
+        .bucket(bucket)
+        .key("after-rotate-reverse.txt")
+        .body(ByteStream::from(reverse_payload.clone()))
+        .send()
+        .await?;
+    let replicated_reverse = wait_for_object_on_target(&source_client, bucket, "after-rotate-reverse.txt").await?;
+    assert_eq!(replicated_reverse, reverse_payload);
 
     Ok(())
 }
