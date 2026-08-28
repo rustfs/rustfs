@@ -646,12 +646,6 @@ pub struct TierAzure {
     pub sp_auth: ServicePrincipalAuth,
 }
 
-impl TierAzure {
-    pub fn is_sp_enabled(&self) -> bool {
-        !self.sp_auth.tenant_id.is_empty() && !self.sp_auth.client_id.is_empty() && !self.sp_auth.client_secret.is_empty()
-    }
-}
-
 /*
 fn AzureServicePrincipal(tenantID, clientID, clientSecret string) func(az *TierAzure) error {
   return func(az *TierAzure) error {
