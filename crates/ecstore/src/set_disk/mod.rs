@@ -11389,7 +11389,7 @@ mod tests {
             GetDirectMemoryDecision::Use { object_size: 1024 }
         );
 
-        let mut corrupt_part = fi.clone();
+        let mut corrupt_part = fi;
         corrupt_part.parts[0].actual_size += 1;
         assert_eq!(
             get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &corrupt_part, &opts, true, 128 * 1024),
