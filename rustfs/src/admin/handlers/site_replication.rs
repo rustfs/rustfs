@@ -1637,7 +1637,17 @@ fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Fut
 
         match load_site_replication_state().await {
             Ok(state) => {
-                if state.pending_endpoint_refresh.is_some() || state.pending_rotation.is_some() {
+                if state.pending_endpoint_refresh.is_some() {
+                    return;
+                }
+                // A wedged rotation is worse than a wedged removal: the local
+                // secret is already switched, so until the join lands every
+                // outbound peer push signs with a secret the peers reject and
+                // every inbound peer request carries a secret this site
+                // rejects — both replication directions are dead. Nothing
+                // else re-drives it; push it forward like the removal below.
+                if let Some(pending_rotation) = state.pending_rotation.clone() {
+                    resume_pending_rotation(&state, &pending_rotation).await;
                     return;
                 }
                 // A removal whose peers were unreachable is the one pending
@@ -3516,6 +3526,143 @@ async fn finalize_pending_rotation_if_complete(rotation_id: &str, local_peer: &P
         Ok(StateCommit::Changed(true))
     })
     .await
+}
+
+/// The candidate secrets a rotation push may sign with, in trial order: the
+/// persisted candidates recorded by earlier attempts, then the currently
+/// installed secret (the pre-rotation one on a fresh drive — peers still hold
+/// it, so it must come before the new secret), then the new secret itself.
+fn rotation_secret_candidates(pending: &PendingRotation, current_secret: Option<String>) -> Vec<String> {
+    let mut candidates = pending.secret_candidates.clone();
+    if let Some(current_secret) = current_secret {
+        push_unique_secret_candidate(&mut candidates, current_secret);
+    }
+    push_unique_secret_candidate(&mut candidates, pending.new_secret_key.clone());
+    candidates
+}
+
+/// Push a half-finished service-account rotation one step forward: install the
+/// new secret locally (idempotent), send the rotation join to every peer that
+/// has not acked yet, then finalize if that completed the set. Returns the
+/// per-peer failures and whether the rotation is now finished.
+///
+/// Shared by the operator-driven `SRRotateServiceAccountHandler` and the
+/// reconcile tick. The tick is what makes this self-healing: a rotation whose
+/// join push failed used to sit in `pending_rotation` forever while the local
+/// secret was already switched — so both replication directions stayed dead
+/// (outbound signed with a secret the peers reject, inbound rejecting the
+/// secret the peers still sign with) until an operator re-ran the rotation.
+///
+/// Callers must hold the lifecycle guard.
+async fn drive_pending_rotation(pending: &PendingRotation, local_peer: &PeerInfo) -> S3Result<(Vec<String>, bool)> {
+    // Capture the still-installed secret BEFORE the overwrite below: on the
+    // first drive of a fresh rotation this is the secret the peers hold, and
+    // it must be able to sign the join push — with only the new secret as a
+    // candidate every peer rejects the push and the rotation wedges.
+    let current_secret = site_replicator_service_account_secret(&pending.access_key).await.ok();
+    if let Some(current_secret) = current_secret.clone() {
+        record_pending_rotation_secret_candidate(&pending.id, current_secret).await?;
+    }
+    let secret_candidates = rotation_secret_candidates(pending, current_secret);
+
+    set_site_replicator_service_account_secret(&pending.parent, pending.new_secret_key.clone()).await?;
+    refresh_bucket_targets_after_service_account_rotation().await;
+
+    let join_req = SRPeerJoinReq {
+        svc_acct_access_key: pending.access_key.clone(),
+        svc_acct_secret_key: pending.new_secret_key.clone(),
+        svc_acct_parent: pending.parent.clone(),
+        peers: pending.peers.clone(),
+        updated_at: pending.updated_at,
+    };
+
+    let mut peer_errors = Vec::new();
+    for peer in pending.peers.values() {
+        if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
+            || pending.acked_deployment_ids.contains(&peer.deployment_id)
+        {
+            continue;
+        }
+        // A superseded join returns BEFORE `apply_iam`, so a no-op answer
+        // means the peer never installed the new secret. Acking it would
+        // finalize a rotation half the mesh cannot authenticate against
+        // (rustfs/rustfs#5963).
+        let rotation_error =
+            match PeerAdminRequest::put(&runtime_peer_connection(peer)?, SITE_REPLICATION_PEER_JOIN_PATH, &pending.access_key)
+                .send_with_secret_candidates(&secret_candidates, &join_req)
+                .await
+            {
+                Err(err) => Some(summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint))),
+                Ok(body) => match parse_peer_join_response(&body, peer.clone()) {
+                    Ok(response) if response.applied == Some(false) => Some(summarize_peer_error_detail(&format!(
+                        "{}: peer did not apply the rotation join (its site replication state is newer than the snapshot it \
+                     was sent); the new service account secret was not installed",
+                        peer.endpoint
+                    ))),
+                    // Unparseable bodies keep the pre-existing behaviour: the
+                    // transport succeeded, and MinIO peers answer with an empty
+                    // body this helper already tolerates.
+                    Ok(_) | Err(_) => None,
+                },
+            };
+        if let Some(detail) = rotation_error {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                peer = %peer.endpoint,
+                result = "service_account_rotation_failed",
+                error = %detail,
+                "admin site replication state"
+            );
+            peer_errors.push(detail);
+        } else {
+            mark_pending_rotation_peer_acked(&pending.id, &peer.deployment_id).await?;
+        }
+    }
+
+    let complete = finalize_pending_rotation_if_complete(&pending.id, local_peer).await?;
+    Ok((peer_errors, complete))
+}
+
+/// The reconcile tick's half of [`drive_pending_rotation`]: resume the rotation
+/// this site could not finish, and report the outcome. Runs under the tick's
+/// lifecycle guard, which is what keeps it from racing an operator re-running
+/// the rotation (that handler takes the same guard).
+async fn resume_pending_rotation(state: &SiteReplicationState, pending: &PendingRotation) {
+    let local_peer = current_local_runtime_peer(state);
+    match drive_pending_rotation(pending, &local_peer).await {
+        Ok((peer_errors, complete)) => {
+            if complete && peer_errors.is_empty() {
+                info!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "pending_rotation_resumed",
+                    "admin site replication state"
+                );
+            } else {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "pending_rotation_still_pending",
+                    error_count = peer_errors.len(),
+                    "admin site replication state"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "pending_rotation_resume_failed",
+                error = ?err,
+                "admin site replication state"
+            );
+        }
+    }
 }
 
 async fn pending_remove_ready_to_finalize(remove_id: &str, local_peer: &PeerInfo) -> S3Result<Option<PendingRemove>> {
@@ -7211,79 +7358,21 @@ impl Operation for SRRotateServiceAccountHandler {
         })
         .await?;
 
+        // Record the pre-rotation secret before drive_pending_rotation
+        // overwrites the local one: the join push must still be able to sign
+        // with the secret the peers hold, and the persisted candidate is also
+        // what lets a later resume recover a rotation this attempt could not
+        // finish. Push it into the local copy too — the persisted record alone
+        // is invisible to the snapshot this call already holds.
+        let mut pending_rotation = pending_rotation;
         if !previous_access_key.is_empty()
             && let Ok(previous_iam_secret) = site_replicator_service_account_secret(&previous_access_key).await
         {
-            record_pending_rotation_secret_candidate(&pending_rotation.id, previous_iam_secret).await?;
+            record_pending_rotation_secret_candidate(&pending_rotation.id, previous_iam_secret.clone()).await?;
+            push_unique_secret_candidate(&mut pending_rotation.secret_candidates, previous_iam_secret);
         }
 
-        set_site_replicator_service_account_secret(&pending_rotation.parent, pending_rotation.new_secret_key.clone()).await?;
-
-        refresh_bucket_targets_after_service_account_rotation().await;
-
-        let mut secret_candidates = pending_rotation.secret_candidates.clone();
-        if let Ok(current_secret) = site_replicator_service_account_secret(&pending_rotation.access_key).await {
-            push_unique_secret_candidate(&mut secret_candidates, current_secret);
-        }
-        push_unique_secret_candidate(&mut secret_candidates, pending_rotation.new_secret_key.clone());
-
-        let join_req = SRPeerJoinReq {
-            svc_acct_access_key: pending_rotation.access_key.clone(),
-            svc_acct_secret_key: pending_rotation.new_secret_key.clone(),
-            svc_acct_parent: pending_rotation.parent.clone(),
-            peers: pending_rotation.peers.clone(),
-            updated_at: pending_rotation.updated_at,
-        };
-
-        let mut peer_errors = Vec::new();
-        for peer in pending_rotation.peers.values() {
-            if same_identity_endpoint(&peer.endpoint, &local_peer.endpoint)
-                || pending_rotation.acked_deployment_ids.contains(&peer.deployment_id)
-            {
-                continue;
-            }
-            // A superseded join returns BEFORE `apply_iam`, so a no-op answer
-            // means the peer never installed the new secret. Acking it would
-            // finalize a rotation half the mesh cannot authenticate against
-            // (rustfs/rustfs#5963).
-            let rotation_error = match PeerAdminRequest::put(
-                &runtime_peer_connection(peer)?,
-                SITE_REPLICATION_PEER_JOIN_PATH,
-                &pending_rotation.access_key,
-            )
-            .send_with_secret_candidates(&secret_candidates, &join_req)
-            .await
-            {
-                Err(err) => Some(summarize_peer_error_detail(&format!("{}: {err}", peer.endpoint))),
-                Ok(body) => match parse_peer_join_response(&body, peer.clone()) {
-                    Ok(response) if response.applied == Some(false) => Some(summarize_peer_error_detail(&format!(
-                        "{}: peer did not apply the rotation join (its site replication state is newer than the snapshot it \
-                         was sent); the new service account secret was not installed",
-                        peer.endpoint
-                    ))),
-                    // Unparseable bodies keep the pre-existing behaviour: the
-                    // transport succeeded, and MinIO peers answer with an empty
-                    // body this helper already tolerates.
-                    Ok(_) | Err(_) => None,
-                },
-            };
-            if let Some(detail) = rotation_error {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    peer = %peer.endpoint,
-                    result = "service_account_rotation_failed",
-                    error = %detail,
-                    "admin site replication state"
-                );
-                peer_errors.push(detail);
-            } else {
-                mark_pending_rotation_peer_acked(&pending_rotation.id, &peer.deployment_id).await?;
-            }
-        }
-
-        let complete = finalize_pending_rotation_if_complete(&pending_rotation.id, &local_peer).await?;
+        let (mut peer_errors, complete) = drive_pending_rotation(&pending_rotation, &local_peer).await?;
         if !complete && peer_errors.is_empty() {
             peer_errors.push("service account rotation is still pending".to_string());
         }
@@ -7309,6 +7398,36 @@ impl Operation for SRRotateServiceAccountHandler {
 mod tests {
     use super::*;
     use crate::site_replication::identity::deployment_id_for_endpoint;
+
+    #[test]
+    fn test_rotation_secret_candidates_try_the_installed_secret_before_the_new_one() {
+        let mut pending = PendingRotation {
+            id: "rotation-id".to_string(),
+            access_key: SITE_REPLICATOR_SERVICE_ACCOUNT.to_string(),
+            parent: "root".to_string(),
+            new_secret_key: "new-secret".to_string(),
+            ..Default::default()
+        };
+
+        // Fresh rotation: nothing persisted yet, the installed secret is still
+        // the pre-rotation one the peers hold — it must be tried first.
+        assert_eq!(
+            rotation_secret_candidates(&pending, Some("old-secret".to_string())),
+            ["old-secret", "new-secret"]
+        );
+
+        // Resume after a failed first push: the old secret was persisted by
+        // that attempt, and the installed secret is already the new one.
+        pending.secret_candidates = vec!["old-secret".to_string()];
+        assert_eq!(
+            rotation_secret_candidates(&pending, Some("new-secret".to_string())),
+            ["old-secret", "new-secret"]
+        );
+
+        // An unreadable installed secret must still leave the push a candidate.
+        pending.secret_candidates = Vec::new();
+        assert_eq!(rotation_secret_candidates(&pending, None), ["new-secret"]);
+    }
     use axum::{Router, extract::State, routing::any};
     use base64_simd::STANDARD as BASE64_STANDARD;
     use http::Uri;

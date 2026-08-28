@@ -27,6 +27,7 @@ Usage:
     ./scripts/test/site_replication_smoke.py            # up: start both + pair
     ./scripts/test/site_replication_smoke.py status     # process + pair status
     ./scripts/test/site_replication_smoke.py smoke      # bidirectional object check
+    ./scripts/test/site_replication_smoke.py rotate     # svc-account rotation regression
     ./scripts/test/site_replication_smoke.py diverge    # rustfs/rustfs#5963 regression
     ./scripts/test/site_replication_smoke.py logs       # tail both server logs
     ./scripts/test/site_replication_smoke.py down       # stop both processes
@@ -400,6 +401,42 @@ def smoke(site_a: Site, site_b: Site, timeout: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Service-account rotation regression
+# ---------------------------------------------------------------------------
+
+
+def rotate(site_a: Site, site_b: Site, timeout: float) -> None:
+    """Rotate the site-replicator service account and assert nothing wedges.
+
+    A wedged rotation is the nastiest failure mode this lab can produce: the
+    rotating site installs the new secret locally before the peers learn it,
+    so a failed join push kills BOTH replication directions at once. A single
+    rotate call must therefore complete the hand-over, clear pendingOperation
+    on every site, and leave replication flowing.
+    """
+    ensure_pair(site_a, site_b)
+
+    status, body = admin(site_a, "POST", "site-replication/rotate-svc-acct")
+    if status != 200:
+        raise SystemExit(f"[fail] rotate-svc-acct: HTTP {status} {body.decode(errors='replace')}")
+    result = json.loads(body)
+    print(f"[ok] rotate accepted: {json.dumps(result)}")
+    if not result.get("success", False):
+        raise SystemExit(f"[fail] rotation did not complete in one call: {json.dumps(result)}")
+
+    for site in (site_a, site_b):
+        wait_for(
+            f"{site.name} still reports a pending operation after the rotation",
+            lambda site=site: not pair_state(site).get("pendingOperation"),
+            timeout,
+        )
+    print("[ok] rotation settled on both sites")
+
+    smoke(site_a, site_b, timeout)
+    print("[ok] rotation regression passed")
+
+
+# ---------------------------------------------------------------------------
 # Divergence regression (rustfs/rustfs#5963)
 # ---------------------------------------------------------------------------
 
@@ -572,7 +609,7 @@ def main() -> None:
         "command",
         nargs="?",
         default="up",
-        choices=["up", "down", "restart", "status", "logs", "smoke", "diverge", "info", "remove", "clean"],
+        choices=["up", "down", "restart", "status", "logs", "smoke", "rotate", "diverge", "info", "remove", "clean"],
     )
     parser.add_argument("--port-a", type=int, default=9000, help="site A S3 port (default: %(default)s)")
     parser.add_argument("--port-b", type=int, default=9020, help="site B S3 port (default: %(default)s)")
@@ -603,6 +640,8 @@ def main() -> None:
         cmd_logs(sites, args.lines)
     elif args.command == "smoke":
         smoke(site_a, site_b, args.timeout)
+    elif args.command == "rotate":
+        rotate(site_a, site_b, args.timeout)
     elif args.command == "diverge":
         diverge(site_a, site_b, args.binary, args.console, args.timeout)
     elif args.command == "info":
