@@ -791,6 +791,19 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
 // production registration helper intentionally honors that environment switch.
 #[test]
 #[serial]
+fn test_reverse_probe_targets_a_registered_devnull_route() {
+    // The reverse-reachability probe used to send PUT while only POST is
+    // routed for devnull, so every probe failed with 501 and every add/join
+    // reported a false "not reachable" warning.
+    let router = registered_admin_router();
+    let connection = crate::site_replication::transport::PeerConnection::new("http://peer.example.com:9000", false, "")
+        .expect("peer connection");
+    let request = crate::admin::handlers::site_replication::devnull_probe_request(&connection, "site-replicator-0");
+    assert_route(&router, request.method().clone(), request.path());
+}
+
+#[test]
+#[serial]
 fn test_admin_route_matrix_matches_registered_routes() {
     let router = registered_admin_router();
 

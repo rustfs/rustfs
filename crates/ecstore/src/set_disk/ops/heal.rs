@@ -3543,7 +3543,20 @@ mod heal_result_report_tests {
                 .await
                 .expect("grace-protected dangling metadata should return a typed heal result");
 
-            assert_eq!(error, Some(DiskError::ErasureReadQuorum));
+            let error = error.expect("grace-protected dangling metadata should be reported as deferred");
+            assert!(
+                error.is_dangling_delete_grace(),
+                "grace-protected dangling metadata should keep a typed deferred-cleanup marker: {error}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("dangling object deletion deferred by heal grace window"),
+                "grace-protected dangling metadata should explain that cleanup was deferred: {message}"
+            );
+            assert!(
+                message.contains("retry_after_secs="),
+                "grace-protected dangling metadata should include retry timing: {message}"
+            );
             assert!(
                 temp_dirs[0]
                     .path()
