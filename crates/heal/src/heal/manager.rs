@@ -20,7 +20,10 @@ use crate::heal::{
 };
 use crate::{Error, Result};
 use metrics::{counter, gauge};
-use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
+use rustfs_concurrency::workload::{ForegroundPressure, foreground_pressure};
+#[cfg(test)]
+use rustfs_concurrency::{AdmissionState, WorkloadClass};
 use rustfs_heal_contracts::heal_channel::{
     HealAdmissionDropReason, HealAdmissionReceipt, HealAdmissionResult, HealRequestSource,
 };
@@ -813,40 +816,11 @@ impl HealManager {
         }
 
         let provider = provider.as_ref()?;
-        let snapshot = provider.workload_admission_snapshot();
-        [
-            (WorkloadClass::ForegroundRead, config.mainline_read_utilization_high_percent),
-            (WorkloadClass::ForegroundWrite, config.mainline_write_utilization_high_percent),
-        ]
-        .into_iter()
-        .filter_map(|(class, threshold_pct)| {
-            if threshold_pct == 0 {
-                return None;
-            }
-
-            let entry = snapshot.get(class)?;
-            let usage_pct = if matches!(entry.state, AdmissionState::Saturated) {
-                100
-            } else {
-                let limit = entry.limit?;
-                if limit == 0 {
-                    return None;
-                }
-                entry
-                    .active
-                    .unwrap_or(0)
-                    .saturating_mul(100)
-                    .checked_div(limit)
-                    .unwrap_or(100)
-            };
-
-            (usage_pct >= threshold_pct).then_some(ForegroundPressure {
-                class,
-                usage_pct,
-                threshold_pct,
-            })
-        })
-        .max_by_key(|pressure| pressure.usage_pct)
+        foreground_pressure(
+            &provider.workload_admission_snapshot(),
+            config.mainline_read_utilization_high_percent,
+            config.mainline_write_utilization_high_percent,
+        )
     }
 
     fn schedule_mainline_throttle_recheck(notify: Arc<Notify>, delay: Duration) {

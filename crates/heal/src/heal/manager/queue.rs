@@ -78,23 +78,6 @@ pub(super) enum QueuePushOutcome {
     Merged,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ForegroundPressure {
-    pub(super) class: WorkloadClass,
-    pub(super) usage_pct: usize,
-    pub(super) threshold_pct: usize,
-}
-
-impl ForegroundPressure {
-    pub(super) const fn reason(self) -> &'static str {
-        match self.class {
-            WorkloadClass::ForegroundRead => "foreground_read_pressure",
-            WorkloadClass::ForegroundWrite => "foreground_write_pressure",
-            _ => "foreground_pressure",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct CompletedHealStatus {
     pub(super) heal_type: HealType,
