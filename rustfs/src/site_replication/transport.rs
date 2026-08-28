@@ -612,9 +612,26 @@ impl<'a> PeerAdminRequest<'a> {
         }
     }
 
+    pub(crate) fn post(connection: &'a PeerConnection, path: &'a str, access_key: &'a str) -> Self {
+        Self {
+            method: Method::POST,
+            ..Self::put(connection, path, access_key)
+        }
+    }
+
     pub(crate) fn with_client(mut self, client: &'a reqwest::Client) -> Self {
         self.client = Some(client);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn method(&self) -> &Method {
+        &self.method
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &str {
+        self.path
     }
 
     async fn resolved_client(&self) -> S3Result<reqwest::Client> {
@@ -916,17 +933,36 @@ pub(crate) fn summarize_peer_error_detail(detail: &str) -> String {
         return detail.to_string();
     }
 
-    let suffix = "... (truncated)";
-    let take_chars = SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT.saturating_sub(suffix.chars().count());
-    let mut summary: String = detail.chars().take(take_chars).collect();
-    summary.push_str(suffix);
-    summary
+    // Keep both ends: nested peer errors append the decisive status/code at
+    // the tail, so a prefix-only cut drops exactly the part an operator needs.
+    let ellipsis = " ... (truncated) ... ";
+    let budget = SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT.saturating_sub(ellipsis.chars().count());
+    let head_chars = budget / 2;
+    let tail_chars = budget - head_chars;
+    let head: String = detail.chars().take(head_chars).collect();
+    let tail: String = detail.chars().skip(detail_chars.saturating_sub(tail_chars)).collect();
+    format!("{head}{ellipsis}{tail}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn test_summarize_peer_error_detail_keeps_head_and_tail() {
+        let detail = format!("HEAD{}TAIL", "x".repeat(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT * 2));
+        let summary = summarize_peer_error_detail(&detail);
+        assert!(summary.starts_with("HEAD"));
+        assert!(summary.ends_with("TAIL"));
+        assert!(summary.contains("(truncated)"));
+        assert!(summary.chars().count() <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT);
+    }
+
+    #[test]
+    fn test_summarize_peer_error_detail_passes_short_details_through() {
+        assert_eq!(summarize_peer_error_detail("  short error  "), "short error");
+    }
 
     #[tokio::test]
     #[serial]

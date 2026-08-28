@@ -730,7 +730,18 @@ impl ReadPlan {
                 })
                 .await
                 .map_err(Error::other)?
-                .ok_or_else(|| Error::other("encrypted object metadata is incomplete"))?;
+                .ok_or_else(|| {
+                    // The resolver saw no encryption it recognizes, yet the
+                    // object's markers say it is encrypted. Keep failing closed,
+                    // but as a typed, non-retryable error: the condition is a
+                    // permanent property of the stored metadata, not a fault a
+                    // retry can fix.
+                    Error::other(EncryptionResolutionError::new(
+                        EncryptionResolutionErrorKind::InvalidMetadata,
+                        "object is marked encrypted, but no decryption material could be resolved from its metadata; \
+                         the encryption metadata is incomplete or in a format this server cannot read",
+                    ))
+                })?;
             let material = resolved;
             #[cfg(feature = "rio-v2")]
             let uses_legacy_encryption = matches!(material.mode, ReadEncryptionMode::Direct { .. });
