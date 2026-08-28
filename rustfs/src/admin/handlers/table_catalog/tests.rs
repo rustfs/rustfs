@@ -10795,48 +10795,180 @@ async fn namespace_helpers_call_catalog_store() {
 }
 
 #[tokio::test]
-async fn namespace_property_handler_helper_updates_object_backed_catalog() {
-    let backend = TestTableCatalogObjectBackend::default();
-    let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
-        backend,
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
-    );
-    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-    ensure_table_bucket_entry(&store, "warehouse", true)
-        .await
-        .expect("table bucket entry should be seeded");
-    create_namespace_response(
-        &store,
-        "warehouse",
-        CreateNamespaceRequest {
-            namespace: vec!["analytics".to_string()],
-            properties: BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]),
-        },
-        true,
-    )
-    .await
-    .expect("namespace should be created");
+#[serial_test::serial]
+async fn namespace_property_handler_updates_object_backed_catalog_and_maps_errors() {
+    use rustfs_storage_api::{BucketOperations as _, MakeBucketOptions};
 
-    let response = update_namespace_properties_response(
-        &store,
-        "warehouse",
-        &namespace,
-        UpdateNamespacePropertiesRequest {
-            removals: vec!["owner".to_string(), "missing".to_string()],
-            updates: BTreeMap::from([("retention".to_string(), "30d".to_string())]),
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            let bucket = format!("namespace-properties-{}", Uuid::new_v4().simple());
+            object_store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("table bucket should be created");
+            enable_table_bucket_marker(&object_store, &bucket)
+                .await
+                .expect("table bucket marker should be enabled");
+
+            rustfs_iam::store::object::ObjectStore::new(object_store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("request IAM format should be seeded");
+            let iam = rustfs_iam::build_iam_sys(object_store.clone())
+                .await
+                .expect("request IAM should initialize");
+            let context = Arc::new(AppContext::new(
+                object_store.clone(),
+                Arc::new(RequestIam { handle: iam }),
+                Arc::new(RequestKms),
+            ));
+            let root_access_key = "namespace-properties-root";
+            let root_secret_key = "namespace-properties-root-secret";
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: root_access_key.to_string(),
+                secret_key: root_secret_key.to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            }));
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(context.clone()));
+
+            let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+                object_store,
+                context.table_catalog_strong_runtime(),
+            );
+            let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+                backend.clone(),
+                crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+            );
+            catalog
+                .put_table_bucket(table_bucket_entry_from_metadata_marker(&bucket))
+                .await
+                .expect("table bucket catalog entry should be seeded");
+            let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+            let entry = crate::table_catalog::NamespaceEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: bucket.clone(),
+                namespace: namespace.public_name(),
+                namespace_id: namespace.storage_id(),
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]),
+                created_at: None,
+                updated_at: None,
+            };
+            catalog
+                .create_namespace(entry.clone())
+                .await
+                .expect("namespace should be seeded");
+
+            let request = |namespace: &str, body: serde_json::Value| {
+                let mut extensions = http::Extensions::new();
+                extensions.insert(slot.clone());
+                S3Request {
+                    input: Body::from(serde_json::to_vec(&body).expect("request body should serialize")),
+                    method: Method::POST,
+                    uri: format!("/iceberg/v1/{bucket}/namespaces/{namespace}/properties")
+                        .parse()
+                        .expect("request URI should parse"),
+                    headers: HeaderMap::new(),
+                    extensions,
+                    credentials: Some(s3s::auth::Credentials {
+                        access_key: root_access_key.to_string(),
+                        secret_key: s3s::auth::SecretKey::from(root_secret_key.to_string()),
+                    }),
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                }
+            };
+            let mut params_router = matchit::Router::new();
+            params_router
+                .insert("/iceberg/v1/{prefix}/namespaces/{namespace}/properties", ())
+                .expect("handler parameter route should register");
+            let success_path = format!("/iceberg/v1/{bucket}/namespaces/analytics/properties");
+            let params = params_router
+                .at(&success_path)
+                .expect("success handler parameters should match")
+                .params;
+            let response = RestUpdateNamespacePropertiesHandler {}
+                .call(
+                    request(
+                        "analytics",
+                        serde_json::json!({
+                        "removals": ["owner", "missing"],
+                        "updates": {"retention": "30d"}
+                            }),
+                    ),
+                    params,
+                )
+                .await
+                .expect("handler should update object-backed namespace properties");
+            assert_eq!(response.output.0, StatusCode::OK);
+            let body = http_body_util::BodyExt::collect(response.output.1)
+                .await
+                .expect("response body should collect")
+                .to_bytes();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).expect("response body should decode"),
+                serde_json::json!({
+                    "updated": ["retention"],
+                    "removed": ["owner"],
+                    "missing": ["missing"]
+                })
+            );
+            let persisted = catalog
+                .get_namespace(&bucket, &namespace.public_name())
+                .await
+                .expect("updated namespace should load")
+                .expect("updated namespace should remain");
+            assert_eq!(persisted.properties.get("retention").map(String::as_str), Some("30d"));
+            assert!(!persisted.properties.contains_key("owner"));
+
+            let missing_path = format!("/iceberg/v1/{bucket}/namespaces/missing/properties");
+            let params = params_router
+                .at(&missing_path)
+                .expect("missing handler parameters should match")
+                .params;
+            let missing = RestUpdateNamespacePropertiesHandler {}
+                .call(request("missing", serde_json::json!({"updates": {"owner": "platform"}})), params)
+                .await
+                .expect_err("missing namespace should fail");
+            assert_eq!(missing.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_NO_SUCH_NAMESPACE.into()));
+            assert_eq!(missing.status_code(), Some(StatusCode::NOT_FOUND));
+
+            let corrupt = crate::table_catalog::Namespace::parse("corrupt").expect("namespace should parse");
+            let corrupt_path = crate::table_catalog::TableCatalogObjectPaths::default().namespace_entry_path(&bucket, &corrupt);
+            backend
+                .put_object(
+                    crate::admin::storage_api::RUSTFS_META_BUCKET,
+                    &corrupt_path,
+                    b"{".to_vec(),
+                    crate::table_catalog::TableCatalogPutPrecondition::Any,
+                )
+                .await
+                .expect("corrupt namespace entry should be seeded");
+            let corrupt_request_path = format!("/iceberg/v1/{bucket}/namespaces/corrupt/properties");
+            let params = params_router
+                .at(&corrupt_request_path)
+                .expect("corrupt handler parameters should match")
+                .params;
+            let corrupt = RestUpdateNamespacePropertiesHandler {}
+                .call(request("corrupt", serde_json::json!({"updates": {"owner": "platform"}})), params)
+                .await
+                .expect_err("corrupt namespace should fail");
+            assert_eq!(corrupt.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+            assert_eq!(corrupt.status_code(), Some(StatusCode::BAD_REQUEST));
         },
     )
-    .await
-    .expect("object-backed namespace properties should update");
-
-    assert_eq!(response.updated, vec!["retention".to_string()]);
-    assert_eq!(response.removed, vec!["owner".to_string()]);
-    assert_eq!(response.missing, vec!["missing".to_string()]);
-    let updated = get_namespace_response(&store, "warehouse", &namespace)
-        .await
-        .expect("updated namespace should load");
-    assert_eq!(updated.properties.get("retention").map(String::as_str), Some("30d"));
-    assert!(!updated.properties.contains_key("owner"));
+    .await;
 }
 
 #[tokio::test]
