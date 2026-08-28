@@ -752,12 +752,18 @@ impl ObjectInfo {
             .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
     }
 
-    /// Maximum inline size for non-versioned objects (128 KiB).
-    /// Matches `DEFAULT_INLINE_BLOCK` in `storageclass.rs`.
+    /// Historical non-versioned inline size reference.
+    ///
+    /// Inline admission is layout-specific now; callers must not use this
+    /// constant to decide whether an object is eligible for the fast path.
+    #[deprecated(note = "inline eligibility is layout-specific; use persisted metadata and the read-path policy")]
     pub const INLINE_MAX_SIZE: i64 = 128 * 1024;
 
-    /// Maximum inline size for versioned objects (16 KiB).
-    /// Matches `DEFAULT_INLINE_BLOCK / 8` in `storageclass.rs`.
+    /// Historical versioned inline size reference.
+    ///
+    /// Inline admission is layout-specific now; callers must not use this
+    /// constant to decide whether an object is eligible for the fast path.
+    #[deprecated(note = "inline eligibility is layout-specific; use persisted metadata and the read-path policy")]
     pub const INLINE_MAX_SIZE_VERSIONED: i64 = 16 * 1024;
 
     /// Returns `true` when this object qualifies for the inline data fast path.
@@ -765,10 +771,12 @@ impl ObjectInfo {
     /// The inline fast path decodes erasure-coded data entirely in memory,
     /// bypassing disk I/O, duplex pipes, and the disk-read semaphore.
     ///
-    /// The `inlined` flag is the primary signal — PUT sets it through the
-    /// captured storage-class snapshot's `Config::should_inline`, which applies
-    /// the correct version-aware threshold (128 KiB non-versioned, 16 KiB versioned).
-    /// The size check below is a safety net using the same thresholds.
+    /// The persisted `inlined` flag is the canonical size-policy decision. PUT
+    /// sets it through the captured storage-class snapshot's effective policy,
+    /// which is layout- and version-aware. Reapplying a fixed object-size limit
+    /// here would disagree with that policy for wider EC layouts and explicit
+    /// inline configurations. The direct-memory reader retains its own bounded
+    /// 128 KiB allocation gate at the call site.
     ///
     /// Additional conditions:
     /// - Single part
@@ -779,14 +787,8 @@ impl ObjectInfo {
         if !self.inlined {
             return false;
         }
-        // Apply the same version-aware threshold as PUT (storageclass.rs).
-        let max_size = if self.version_id.is_some() {
-            Self::INLINE_MAX_SIZE_VERSIONED
-        } else {
-            Self::INLINE_MAX_SIZE
-        };
         self.parts.len() == 1
-            && self.size <= max_size
+            && self.size >= 0
             && !self.is_encrypted()
             && !self.is_compressed()
             && self.transitioned_object.tier.is_empty()
@@ -1382,14 +1384,14 @@ mod tests {
     }
 
     #[test]
-    fn inline_fast_path_eligibility_preserves_exact_versioned_boundaries() {
+    fn inline_fast_path_eligibility_follows_persisted_marker() {
         for (case, size, versioned, expected) in [
             ("unversioned below", 128 * 1024 - 1, false, true),
             ("unversioned exact", 128 * 1024, false, true),
-            ("unversioned above", 128 * 1024 + 1, false, false),
+            ("unversioned above", 128 * 1024 + 1, false, true),
             ("versioned below", 16 * 1024 - 1, true, true),
             ("versioned exact", 16 * 1024, true, true),
-            ("versioned above", 16 * 1024 + 1, true, false),
+            ("versioned above", 16 * 1024 + 1, true, true),
         ] {
             assert_eq!(
                 inline_fast_path_object(size, versioned).is_inline_fast_path_eligible(),
@@ -1400,8 +1402,28 @@ mod tests {
     }
 
     #[test]
+    fn inline_fast_path_marker_allows_ec8_and_ec12_layout_specific_256kib_objects() {
+        for data_blocks in [8, 12] {
+            let object = ObjectInfo {
+                size: 256 * 1024,
+                data_blocks,
+                parity_blocks: 4,
+                inlined: true,
+                version_id: Some(Uuid::from_u128(1)),
+                parts: Arc::new(vec![ObjectPartInfo::default()]),
+                ..Default::default()
+            };
+
+            assert!(
+                object.is_inline_fast_path_eligible(),
+                "the persisted inline marker must be authoritative for EC{data_blocks}+4"
+            );
+        }
+    }
+
+    #[test]
     fn inline_fast_path_eligibility_rejects_incompatible_object_shapes() {
-        let mut object = inline_fast_path_object(ObjectInfo::INLINE_MAX_SIZE, false);
+        let mut object = inline_fast_path_object(128 * 1024, false);
 
         object.inlined = false;
         assert!(!object.is_inline_fast_path_eligible(), "non-inline objects must fall back");

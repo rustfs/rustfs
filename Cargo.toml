@@ -198,7 +198,7 @@ serde_urlencoded = "0.7.1"
 # have incompatible APIs. Keep them exact-pinned and monitor upstream for stable
 # releases.
 aes-gcm = { version = "=0.11.1" }
-argon2 = { version = "=0.6.0-rc.8" }
+argon2 = { version = "=0.6.0" }
 blake2 = "=0.11.0"
 chacha20poly1305 = { version = "=0.11.0" }
 crc-fast = "1.10.0"
@@ -247,7 +247,7 @@ base64-simd = "0.8.0"
 brotli = "8.0.4"
 clap = { version = "4.6.6" }
 const-str = { version = "1.1.0" }
-convert_case = "0.11.0"
+convert_case = "0.12.0"
 criterion = { version = "0.8" }
 crossbeam-queue = "0.3.13"
 crossbeam-channel = "0.5.16"
