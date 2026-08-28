@@ -490,7 +490,9 @@ impl EncryptionRequest<'_> {
                 "The provided encryption parameters did not match the multipart upload.",
             ));
         }
-        verify_ssec_key_match(&validated.key_md5, stored_key_md5)
+        // Multipart session metadata is written by our own CreateMultipartUpload,
+        // which always records the MD5 — the MinIO no-stored-MD5 shape cannot occur.
+        verify_ssec_key_match(&validated.key_md5, stored_key_md5, false)
     }
 }
 
@@ -645,7 +647,7 @@ pub(crate) fn validate_sse_headers_for_read(metadata: &HashMap<String, String>, 
         || headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id")
         || headers.contains_key("x-amz-server-side-encryption-context");
 
-    let is_object_ssec = metadata.contains_key("x-amz-server-side-encryption-customer-algorithm");
+    let is_object_ssec = stored_ssec_metadata(metadata);
     let is_object_sse = metadata.contains_key("x-amz-server-side-encryption");
 
     if is_object_ssec {
@@ -2137,10 +2139,7 @@ pub async fn sse_prepare_encryption(request: PrepareEncryptionRequest<'_>) -> Re
 /// ```
 pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<DecryptionMaterial>, ApiError> {
     // Check for SSE-C encryption
-    if request
-        .metadata
-        .contains_key("x-amz-server-side-encryption-customer-algorithm")
-    {
+    if stored_ssec_metadata(request.metadata) {
         let (key, key_md5) = match (request.sse_customer_key, request.sse_customer_key_md5) {
             (Some(k), Some(md5)) => (k, md5),
             _ => {
@@ -2153,7 +2152,7 @@ pub async fn sse_decryption(request: DecryptionRequest<'_>) -> Result<Option<Dec
 
         // Verify that the provided key MD5 matches the stored MD5 for security
         let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
-        verify_ssec_key_match(key_md5, stored_md5)?;
+        verify_ssec_key_match(key_md5, stored_md5, minio_sealed_ssec_metadata(request.metadata))?;
 
         let mut material = apply_ssec_decryption_material(request.bucket, request.key, request.metadata, key, key_md5).await?;
         material.customer_key_md5 = Some(key_md5.clone());
@@ -2200,10 +2199,7 @@ pub struct SseReadResponseHeaders {
 ///   be established in this build — classify as `None`, exactly where
 ///   [`sse_decryption`] returned `None`.
 pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Result<Option<SseReadResponseHeaders>, ApiError> {
-    if request
-        .metadata
-        .contains_key("x-amz-server-side-encryption-customer-algorithm")
-    {
+    if stored_ssec_metadata(request.metadata) {
         let (key, key_md5) = match (request.sse_customer_key, request.sse_customer_key_md5) {
             (Some(k), Some(md5)) => (k, md5),
             _ => {
@@ -2215,7 +2211,7 @@ pub async fn classify_sse_read_response(request: DecryptionRequest<'_>) -> Resul
         };
 
         let stored_md5 = request.metadata.get("x-amz-server-side-encryption-customer-key-md5");
-        verify_ssec_key_match(key_md5, stored_md5)?;
+        verify_ssec_key_match(key_md5, stored_md5, minio_sealed_ssec_metadata(request.metadata))?;
 
         let algorithm = request
             .metadata
@@ -3816,7 +3812,27 @@ fn is_legacy_rustfs_managed_metadata(metadata: &HashMap<String, String>) -> bool
         && !metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)
 }
 
-#[cfg(feature = "rio-v2")]
+/// True when the stored metadata marks the object as SSE-C protected.
+///
+/// RustFS persists the public `x-amz-server-side-encryption-customer-algorithm`
+/// key on SSE-C writes. MinIO persists only its internal sealed-key slot and
+/// synthesizes the public header onto responses (backlog#1638), so the slot is
+/// the only durable evidence on a MinIO-written object. That shape is readable
+/// solely through the rio-v2 sealed-object-key path, so it participates in
+/// detection only in builds that can actually read it — default builds keep
+/// the resolver's fail-closed diagnosis instead of demanding customer keys
+/// they could not use.
+fn stored_ssec_metadata(metadata: &HashMap<String, String>) -> bool {
+    metadata.contains_key("x-amz-server-side-encryption-customer-algorithm") || minio_sealed_ssec_metadata(metadata)
+}
+
+/// True when the object carries MinIO's SSE-C sealed-key slot — the shape that
+/// stores no customer-key MD5 and proves the key through the AEAD unseal
+/// instead.
+fn minio_sealed_ssec_metadata(metadata: &HashMap<String, String>) -> bool {
+    cfg!(feature = "rio-v2") && metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
+}
+
 #[cfg(feature = "rio-v2")]
 /// Infer the managed SSE scheme from the MinIO sealed-key slot that is present.
 ///
@@ -3949,12 +3965,18 @@ pub fn generate_ssec_nonce(bucket: &str, key: &str) -> [u8; 12] {
 ///
 /// Used during GetObject/HeadObject to ensure the client provided the correct key.
 /// Returns 400 InvalidRequest on mismatch, consistent with AWS S3 behavior.
-pub fn verify_ssec_key_match(provided_md5: &str, stored_md5: Option<&String>) -> Result<(), ApiError> {
+pub fn verify_ssec_key_match(provided_md5: &str, stored_md5: Option<&String>, minio_sealed_ssec: bool) -> Result<(), ApiError> {
     match stored_md5 {
         Some(stored) if stored == provided_md5 => Ok(()),
         Some(_) => Err(ssec_invalid_request(
             "The provided encryption parameters did not match the ones used originally to encrypt the object.",
         )),
+        // MinIO never persists the customer-key MD5, so this early check has
+        // nothing to compare against on a migrated object. The key itself is
+        // still proven: a wrong key fails the AEAD unseal of the sealed object
+        // key. The check exists only for the friendlier early error, so its
+        // absence is tolerated for exactly that shape and no other.
+        None if minio_sealed_ssec => Ok(()),
         None => Err(ssec_invalid_request("Object has no stored SSE-C key metadata.")),
     }
 }
@@ -3976,8 +3998,7 @@ pub fn validate_ssec_for_read(
     sse_customer_key: Option<&SSECustomerKey>,
     sse_customer_key_md5: Option<&SSECustomerKeyMD5>,
 ) -> Result<(), ApiError> {
-    let stored_algorithm = metadata.get("x-amz-server-side-encryption-customer-algorithm");
-    if stored_algorithm.is_none() {
+    if !stored_ssec_metadata(metadata) {
         return Ok(());
     }
 
@@ -3993,7 +4014,10 @@ pub fn validate_ssec_for_read(
 
     // Full param validation: decode key, verify 32 bytes, recompute MD5
     // from actual key bytes and compare to the client-provided MD5 header.
-    let algorithm = stored_algorithm.cloned().unwrap_or_else(|| DEFAULT_SSE_ALGORITHM.to_string());
+    let algorithm = metadata
+        .get("x-amz-server-side-encryption-customer-algorithm")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_SSE_ALGORITHM.to_string());
     let validated = validate_ssec_params(SsecParams {
         algorithm,
         key: key.to_string(),
@@ -4001,7 +4025,7 @@ pub fn validate_ssec_for_read(
     })?;
 
     let stored_md5 = metadata.get("x-amz-server-side-encryption-customer-key-md5");
-    verify_ssec_key_match(&validated.key_md5, stored_md5)
+    verify_ssec_key_match(&validated.key_md5, stored_md5, minio_sealed_ssec_metadata(metadata))
 }
 
 /// Build an `ApiError` with `InvalidRequest` (HTTP 400) for SSE-C related errors.
@@ -4298,10 +4322,10 @@ mod tests {
     #[tokio::test]
     async fn object_encryption_resolver_diagnoses_unresolvable_encrypted_metadata() {
         // A MinIO-written SSE-C object carries only internal sealed-key slots:
-        // no public scheme header, no customer-algorithm metadata. No decrypt
-        // branch recognizes it, so the read must fail closed — but with a
-        // typed, diagnosable error instead of a bare `None` that surfaces as a
-        // generic internal error.
+        // no public scheme header, no customer-algorithm metadata. The read
+        // must fail closed either way, but the failure differs by build: a
+        // default build has no read path for the shape and diagnoses that; a
+        // rio-v2 build recognizes it as SSE-C and asks for the customer key.
         let metadata = HashMap::from([(
             MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(),
             "c2VhbGVkLWtleQ==".to_string(),
@@ -4319,11 +4343,22 @@ mod tests {
             Ok(_) => panic!("encryption markers without resolvable material must fail closed"),
         };
 
-        assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidMetadata);
-        assert!(
-            error.to_string().contains("could not be resolved"),
-            "error must diagnose the unresolvable metadata, got: {error}"
-        );
+        #[cfg(not(feature = "rio-v2"))]
+        {
+            assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidMetadata);
+            assert!(
+                error.to_string().contains("could not be resolved"),
+                "error must diagnose the unresolvable metadata, got: {error}"
+            );
+        }
+        #[cfg(feature = "rio-v2")]
+        {
+            assert_eq!(error.kind(), EncryptionResolutionErrorKind::InvalidRequest);
+            assert!(
+                error.to_string().contains("must be provided"),
+                "error must ask for the SSE-C parameters, got: {error}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5951,6 +5986,163 @@ mod tests {
         assert_eq!(resolved.key_bytes, material.key_bytes);
     }
 
+    /// Rewrites rio-v2 SSE-C metadata into the shape MinIO actually persists:
+    /// only the internal sealed-key slot, IV, and seal algorithm — the public
+    /// scheme, customer-algorithm, and customer-key-MD5 keys are synthesized
+    /// onto responses by MinIO and never hit disk (backlog#1638).
+    #[cfg(feature = "rio-v2")]
+    fn strip_to_minio_ssec_shape(metadata: &mut HashMap<String, String>) {
+        metadata.remove("x-amz-server-side-encryption");
+        metadata.remove("x-amz-server-side-encryption-customer-algorithm");
+        metadata.remove("x-amz-server-side-encryption-customer-key-md5");
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn test_minio_shaped_ssec_metadata_decrypts_with_the_right_key_only() {
+        let customer_key_bytes = [0x42u8; 32];
+        let customer_key = BASE64_STANDARD.encode_to_string(customer_key_bytes);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
+
+        let material = sse_encryption(EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(customer_key.clone()),
+            sse_customer_key_md5: Some(customer_key_md5.clone()),
+            content_size: 4096,
+            principal: None,
+        })
+        .await
+        .expect("sse-c encryption")
+        .expect("sse-c material");
+
+        let mut metadata = encryption_material_to_metadata(&material).expect("sse-c metadata should serialize");
+        strip_to_minio_ssec_shape(&mut metadata);
+        assert!(
+            !metadata.contains_key("x-amz-server-side-encryption-customer-key-md5"),
+            "the MinIO shape stores no customer-key MD5"
+        );
+
+        // Correct key: detected via the sealed slot, proven by the unseal.
+        let decrypted = sse_decryption(DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &metadata,
+            sse_customer_key: Some(&customer_key),
+            sse_customer_key_md5: Some(&customer_key_md5),
+            principal: None,
+        })
+        .await
+        .expect("minio-shaped sse-c decryption")
+        .expect("minio-shaped sse-c material");
+        assert_eq!(decrypted.key_kind, EncryptionKeyKind::Object);
+        assert_eq!(decrypted.key_bytes, material.key_bytes);
+
+        // Wrong key with a self-consistent MD5: the missing stored MD5 cannot
+        // catch it, so the AEAD unseal must — the relaxation is not a bypass.
+        let wrong_key_bytes = [0x43u8; 32];
+        let wrong_key = BASE64_STANDARD.encode_to_string(wrong_key_bytes);
+        let wrong_key_md5 = md5_base64(wrong_key_bytes);
+        let result = sse_decryption(DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &metadata,
+            sse_customer_key: Some(&wrong_key),
+            sse_customer_key_md5: Some(&wrong_key_md5),
+            principal: None,
+        })
+        .await;
+        assert!(result.is_err(), "a wrong customer key must fail the sealed-key unseal");
+
+        // No key at all: detected as SSE-C, so the caller is asked for the
+        // parameters instead of getting an opaque unreadable-object error.
+        let result = sse_decryption(DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await;
+        let error = result.expect_err("missing SSE-C parameters must fail closed");
+        assert!(error.message.contains("must be provided"), "got: {}", error.message);
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[tokio::test]
+    async fn test_minio_shaped_ssec_metadata_resolves_and_classifies() {
+        let customer_key_bytes = [0x51u8; 32];
+        let customer_key = BASE64_STANDARD.encode_to_string(customer_key_bytes);
+        let customer_key_md5 = md5_base64(customer_key_bytes);
+
+        let material = sse_encryption(EncryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            server_side_encryption: None,
+            ssekms_key_id: None,
+            ssekms_context: None,
+            sse_customer_algorithm: Some("AES256".to_string()),
+            sse_customer_key: Some(customer_key.clone()),
+            sse_customer_key_md5: Some(customer_key_md5.clone()),
+            content_size: 4096,
+            principal: None,
+        })
+        .await
+        .expect("sse-c encryption")
+        .expect("sse-c material");
+        let mut metadata = encryption_material_to_metadata(&material).expect("sse-c metadata should serialize");
+        strip_to_minio_ssec_shape(&mut metadata);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key",
+            HeaderValue::from_str(&customer_key).expect("customer key header"),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5",
+            HeaderValue::from_str(&customer_key_md5).expect("customer key MD5 header"),
+        );
+        let resolved = SseObjectEncryptionResolver
+            .resolve_read_material(ReadEncryptionRequest {
+                bucket: "bucket",
+                object: "object",
+                metadata: &metadata,
+                headers: &headers,
+            })
+            .await
+            .expect("minio-shaped SSE-C resolver")
+            .expect("minio-shaped SSE-C material");
+        assert_eq!(resolved.mode, ReadEncryptionMode::Object);
+        assert_eq!(resolved.key_bytes, material.key_bytes);
+
+        // HEAD-path key validation: no stored MD5 to compare against, so a
+        // self-consistent key passes here and the unseal remains the proof.
+        super::validate_ssec_for_read(&metadata, Some(&customer_key), Some(&customer_key_md5))
+            .expect("self-consistent SSE-C parameters validate");
+        super::validate_ssec_for_read(&metadata, None, None).expect_err("missing SSE-C parameters must be rejected");
+
+        // Response classification reports SSE-C, not managed SSE.
+        let classified = classify_sse_read_response(DecryptionRequest {
+            bucket: "bucket",
+            key: "object",
+            metadata: &metadata,
+            sse_customer_key: Some(&customer_key),
+            sse_customer_key_md5: Some(&customer_key_md5),
+            principal: None,
+        })
+        .await
+        .expect("minio-shaped sse-c classification")
+        .expect("minio-shaped sse-c response headers");
+        assert!(classified.sse_customer_algorithm.is_some());
+        assert!(classified.ssekms_key_id.is_none());
+    }
+
     #[cfg(feature = "rio-v2")]
     #[test]
     fn test_mark_encrypted_multipart_metadata_sets_minio_marker() {
@@ -5960,22 +6152,33 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_ssec_key_match_tolerates_missing_md5_only_for_minio_sealed_ssec() {
+        // MinIO SSE-C objects store no customer-key MD5; the AEAD unseal is the
+        // real key proof, so the early check stands down for that shape only.
+        assert!(verify_ssec_key_match("provided_md5", None, true).is_ok());
+        // A stored MD5 always wins, even on the MinIO shape: a mismatch is a
+        // mismatch.
+        let stored = "stored_md5".to_string();
+        assert!(verify_ssec_key_match("provided_md5", Some(&stored), true).is_err());
+    }
+
+    #[test]
     fn test_verify_ssec_key_match_success() {
         let md5 = "test_md5".to_string();
-        let result = verify_ssec_key_match("test_md5", Some(&md5));
+        let result = verify_ssec_key_match("test_md5", Some(&md5), false);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_verify_ssec_key_match_mismatch() {
         let md5 = "stored_md5".to_string();
-        let result = verify_ssec_key_match("provided_md5", Some(&md5));
+        let result = verify_ssec_key_match("provided_md5", Some(&md5), false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_verify_ssec_key_match_no_stored() {
-        let result = verify_ssec_key_match("provided_md5", None);
+        let result = verify_ssec_key_match("provided_md5", None, false);
         assert!(result.is_err());
     }
 
@@ -6686,13 +6889,13 @@ mod tests {
     #[test]
     fn test_verify_ssec_key_match_returns_invalid_request() {
         let stored = "stored_md5".to_string();
-        let err = verify_ssec_key_match("wrong_md5", Some(&stored)).unwrap_err();
+        let err = verify_ssec_key_match("wrong_md5", Some(&stored), false).unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
     }
 
     #[test]
     fn test_verify_ssec_key_match_no_stored_returns_invalid_request() {
-        let err = verify_ssec_key_match("any_md5", None).unwrap_err();
+        let err = verify_ssec_key_match("any_md5", None, false).unwrap_err();
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
     }
 
