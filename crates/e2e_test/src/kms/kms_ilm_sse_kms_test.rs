@@ -66,6 +66,7 @@ const SURVIVOR_KEY: &str = "keep/object.bin";
 const TIER_NAME: &str = "KMSCOLD";
 const TIER_BUCKET: &str = "kms-ilm-cold-tier";
 const TIER_PREFIX: &str = "tiered";
+const ALLOW_LOOPBACK_TIER_ENDPOINT_ENV: (&str, &str) = ("RUSTFS_TIER_RUSTFS_ALLOW_LOOPBACK_ENDPOINT", "true");
 const TRANSITION_BUCKET: &str = "kms-ilm-transition";
 const TRANSITION_KEY: &str = "tier/object.bin";
 
@@ -80,7 +81,7 @@ const ILM_DEADLINE: StdDuration = StdDuration::from_secs(90);
 /// `--kms-default-key-id`, insecure dev defaults). The lifecycle env matches
 /// `reliant/lifecycle.rs::fast_lifecycle_env` plus `RUSTFS_ILM_DEBUG_DAY_SECS=2`,
 /// so a `Days=1` rule is due about two seconds after the write.
-async fn start_enforcing_ilm_server(env: &mut LocalKMSTestEnvironment) -> TestResult {
+async fn start_enforcing_ilm_server(env: &mut LocalKMSTestEnvironment, extra_env: &[(&str, &str)]) -> TestResult {
     create_key_with_specific_id(&env.kms_keys_dir, SSE_KEY).await?;
 
     let key_dir = env.kms_keys_dir.clone();
@@ -94,13 +95,14 @@ async fn start_enforcing_ilm_server(env: &mut LocalKMSTestEnvironment) -> TestRe
         SSE_KEY,
     ];
 
-    let envs = [
+    let mut envs = vec![
         ("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"),
         ("RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY", "true"),
         ("RUSTFS_SCANNER_CYCLE", "1"),
         ("RUSTFS_ILM_PROCESS_TIME", "1"),
         ("RUSTFS_ILM_DEBUG_DAY_SECS", "2"),
     ];
+    envs.extend_from_slice(extra_env);
 
     env.base_env.start_rustfs_server_with_env(args, &envs).await?;
     Ok(())
@@ -427,7 +429,7 @@ async fn ilm_expiration_on_sse_kms_bucket_under_enforcement() -> TestResult {
     init_logging();
 
     let mut env = LocalKMSTestEnvironment::new().await?;
-    start_enforcing_ilm_server(&mut env).await?;
+    start_enforcing_ilm_server(&mut env, &[]).await?;
     env.base_env.create_test_bucket(EXPIRY_BUCKET).await?;
 
     let client = env.base_env.create_s3_client();
@@ -499,7 +501,7 @@ async fn ilm_transition_on_sse_kms_bucket_under_enforcement_reads_back() -> Test
 
     // Hot server: Local KMS + enforcement + accelerated lifecycle clock.
     let mut env = LocalKMSTestEnvironment::new().await?;
-    start_enforcing_ilm_server(&mut env).await?;
+    start_enforcing_ilm_server(&mut env, &[ALLOW_LOOPBACK_TIER_ENDPOINT_ENV]).await?;
     let hot_client = env.base_env.create_s3_client();
 
     add_rustfs_tier(&env.base_env, &cold.base_env).await?;

@@ -22,6 +22,7 @@ pub type Error = DiskError;
 pub type Result<T> = core::result::Result<T, Error>;
 
 const METACACHE_OUTPUT_STREAM_CLOSED: &str = "metacache output stream closed";
+pub(crate) const HEAL_DANGLING_DELETE_GRACE_MESSAGE: &str = "dangling object deletion deferred by heal grace window";
 
 /// Marker carried by a shard-read `io::Error` when the underlying reader can
 /// no longer be realigned after a fresh remote open failed.  The marker is
@@ -31,6 +32,12 @@ const METACACHE_OUTPUT_STREAM_CLOSED: &str = "metacache output stream closed";
 #[derive(Debug)]
 pub(crate) struct TerminalReadError {
     source: DiskError,
+}
+
+#[derive(Debug)]
+struct DanglingDeleteGraceError {
+    retry_after_secs: i64,
+    grace_secs: i64,
 }
 
 // DiskError == StorageErr
@@ -200,6 +207,18 @@ impl StdError for TerminalReadError {
     }
 }
 
+impl std::fmt::Display for DanglingDeleteGraceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{HEAL_DANGLING_DELETE_GRACE_MESSAGE}; retry_after_secs={}; grace_secs={}",
+            self.retry_after_secs, self.grace_secs
+        )
+    }
+}
+
+impl StdError for DanglingDeleteGraceError {}
+
 fn classify_internode_missing_error(error: &InternodeHttpError) -> Option<DiskError> {
     if error.is_remote_file_not_found() {
         return Some(DiskError::FileNotFound);
@@ -251,6 +270,24 @@ impl DiskError {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         DiskError::Io(std::io::Error::other(error))
+    }
+
+    pub(crate) fn dangling_delete_grace(retry_after_secs: i64, grace_secs: i64) -> Self {
+        DiskError::other(DanglingDeleteGraceError {
+            retry_after_secs,
+            grace_secs,
+        })
+    }
+
+    pub fn is_dangling_delete_grace(&self) -> bool {
+        matches!(self, DiskError::Io(io_error) if Self::io_error_is_dangling_delete_grace(io_error))
+    }
+
+    pub fn io_error_is_dangling_delete_grace(io_error: &io::Error) -> bool {
+        io_error
+            .get_ref()
+            .is_some_and(|source| source.downcast_ref::<DanglingDeleteGraceError>().is_some())
+            || io_error.to_string().contains(HEAL_DANGLING_DELETE_GRACE_MESSAGE)
     }
 
     pub(crate) fn metacache_output_stream_closed() -> Self {

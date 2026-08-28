@@ -16,6 +16,8 @@ use thiserror::Error;
 
 use super::heal::{DiskError, EcstoreError};
 
+const HEAL_DANGLING_DELETE_GRACE_MESSAGE: &str = "dangling object deletion deferred by heal grace window";
+
 /// Custom error type for heal operations
 /// This enum defines various error variants that can occur during
 /// the execution of heal-related tasks, such as I/O errors, storage errors,
@@ -98,6 +100,9 @@ impl Error {
             // them.
             Error::Storage(EcstoreError::Lock(lock_err)) => !lock_err.is_fatal(),
             Error::Storage(err) => {
+                if err.is_dangling_delete_grace() {
+                    return true;
+                }
                 err.is_quorum_error()
                     || matches!(
                         err,
@@ -110,6 +115,9 @@ impl Error {
                     || is_recoverable_heal_error_message(&err.to_string())
             }
             Error::Disk(err) => {
+                if err.is_dangling_delete_grace() {
+                    return true;
+                }
                 matches!(
                     err,
                     DiskError::DiskNotFound
@@ -124,6 +132,18 @@ impl Error {
             }
             Error::TaskExecutionFailed { message } | Error::Other(message) => is_recoverable_heal_error_message(message),
             Error::Io(err) => is_recoverable_heal_error_message(&err.to_string()),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_dangling_delete_grace(&self) -> bool {
+        match self {
+            Error::Storage(err) => err.is_dangling_delete_grace(),
+            Error::Disk(err) => err.is_dangling_delete_grace(),
+            Error::Io(err) => DiskError::io_error_is_dangling_delete_grace(err),
+            Error::TaskExecutionFailed { message } | Error::Other(message) => {
+                message.contains(HEAL_DANGLING_DELETE_GRACE_MESSAGE)
+            }
             _ => false,
         }
     }

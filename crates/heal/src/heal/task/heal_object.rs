@@ -169,6 +169,10 @@ impl HealTask {
         match heal_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
+                    if self.skip_dangling_delete_grace_error(bucket, object, &e).await {
+                        return Ok(());
+                    }
+
                     if self.skip_data_usage_cache_heal_error(bucket, object, &e).await {
                         return Ok(());
                     }
@@ -257,6 +261,10 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
+                if self.skip_dangling_delete_grace_error(bucket, object, &e).await {
+                    return Ok(());
+                }
+
                 if self.skip_data_usage_cache_heal_error(bucket, object, &e).await {
                     return Ok(());
                 }

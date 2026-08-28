@@ -277,6 +277,10 @@ impl StorageError {
                 | StorageError::NamespaceLockQuorumUnavailable { .. }
         )
     }
+
+    pub fn is_dangling_delete_grace(&self) -> bool {
+        matches!(self, StorageError::Io(io_error) if DiskError::io_error_is_dangling_delete_grace(io_error))
+    }
 }
 
 impl From<HTTPRangeError> for StorageError {
