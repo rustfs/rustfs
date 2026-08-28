@@ -2392,7 +2392,7 @@ mod tests {
             engine,
             data.len(),
             GET_OBJECT_PATH_CODEC_STREAMING,
-            FillPolicy::SingleInFlight,
+            FillPolicy::DualInFlight,
         )
         .expect("reader should be constructed");
         let mut first_read = [0u8; 1];
