@@ -26,6 +26,14 @@ use std::sync::LazyLock;
 
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit webhook settings.
+///
+/// `WEBHOOK_BATCH_SIZE`/`WEBHOOK_MAX_RETRY`/`WEBHOOK_RETRY_INTERVAL`/`WEBHOOK_HTTP_TIMEOUT`
+/// exist here but not in [`crate::config::notify::DEFAULT_NOTIFY_WEBHOOK_KVS`]. This mirrors
+/// MinIO upstream: `internal/logger/config.go`'s `DefaultAuditWebhookKVS` carries the same
+/// four keys with the same defaults (`"1"`/`"0"`/`"3s"`/`"5s"`), while
+/// `internal/config/notify/parse.go`'s `DefaultWebhookKVS` (bucket event notifications) does
+/// not — the notify webhook delivery path never supported them. Not a copy/paste gap
+/// (backlog#2054).
 pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
@@ -41,7 +49,7 @@ pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
         KV {
             key: WEBHOOK_AUTH_TOKEN.to_owned(),
             value: "".to_owned(),
-            hidden_if_empty: false,
+            hidden_if_empty: true, // Sensitive field; matches notify's webhook auth_token (backlog#2054)
         },
         KV {
             key: WEBHOOK_CLIENT_CERT.to_owned(),
@@ -103,6 +111,15 @@ pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
 
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit MQTT settings.
+///
+/// `MQTT_QOS`/`MQTT_KEEP_ALIVE_INTERVAL`/`MQTT_RECONNECT_INTERVAL` default to a stronger
+/// delivery posture here (`"1"`/`"60s"`/`"5s"`) than
+/// [`crate::config::notify::DEFAULT_NOTIFY_MQTT_KVS`] (`"0"`/`"0s"`/`"0s"`, which matches
+/// MinIO's own `DefaultMQTTKVS` in `internal/config/notify/parse.go` byte-for-byte). MinIO has
+/// no MQTT audit target to compare against — audit-over-MQTT is a RustFS-original addition —
+/// so this divergence cannot be checked against upstream; it is intentional (audit favors
+/// at-least-once delivery and faster reconnect over notify's opt-in defaults), not a
+/// copy/paste gap (backlog#2054).
 pub static DEFAULT_AUDIT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
