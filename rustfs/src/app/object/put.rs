@@ -23,7 +23,17 @@ const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 102
 
 const ENV_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: &str = "RUSTFS_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES";
 
+/// Maximum body size materialized by the ordinary eager PUT path.
+///
+/// Bodies above this boundary stay streaming so a 1 MiB request does not
+/// reserve a full request-sized buffer while the EC writer is consuming it.
+/// The environment override keeps the boundary reversible for workload A/B
+/// tests and for deployments whose measured workload favors eager ingestion.
+const ENV_SMALL_EAGER_PUT_MAX_SIZE_BYTES: &str = "RUSTFS_SMALL_EAGER_PUT_MAX_SIZE_BYTES";
+
 const DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
+const DEFAULT_SMALL_EAGER_PUT_MAX_SIZE_BYTES: usize = 512 * 1024;
 
 const PUT_EAGER_STATUS_ELIGIBLE: &str = "eligible";
 
@@ -42,6 +52,8 @@ const PUT_EAGER_STATUS_ZERO_COPY_INELIGIBLE: &str = "zero_copy_ineligible";
 const PUT_EAGER_STATUS_AWS_CHUNKED_MISSING_DECODED_LENGTH: &str = "aws_chunked_missing_decoded_length";
 
 static CACHED_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+static CACHED_SMALL_EAGER_PUT_MAX_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
 
@@ -483,13 +495,29 @@ fn should_use_small_eager_put_path(
     should_compress: bool,
     is_extract: bool,
 ) -> bool {
-    const SMALL_EAGER_PUT_MAX_SIZE: i64 = 1024 * 1024;
+    should_use_small_eager_put_path_with_max_size(
+        size,
+        headers,
+        server_side_encryption_requested,
+        should_compress,
+        is_extract,
+        small_eager_put_max_size_bytes(),
+    )
+}
 
+fn should_use_small_eager_put_path_with_max_size(
+    size: i64,
+    headers: &HeaderMap,
+    server_side_encryption_requested: bool,
+    should_compress: bool,
+    is_extract: bool,
+    max_size: i64,
+) -> bool {
     if is_extract || should_compress || server_side_encryption_requested {
         return false;
     }
 
-    if size <= 0 || size > SMALL_EAGER_PUT_MAX_SIZE {
+    if size <= 0 || size > max_size {
         return false;
     }
 
@@ -502,6 +530,42 @@ fn should_use_small_eager_put_path(
     }
 
     true
+}
+
+fn small_eager_put_max_size_bytes() -> i64 {
+    let configured = *CACHED_SMALL_EAGER_PUT_MAX_SIZE_BYTES
+        .get_or_init(|| rustfs_utils::get_env_usize(ENV_SMALL_EAGER_PUT_MAX_SIZE_BYTES, DEFAULT_SMALL_EAGER_PUT_MAX_SIZE_BYTES));
+    i64::try_from(configured).unwrap_or(i64::MAX)
+}
+
+fn select_put_path(
+    size: i64,
+    headers: &HeaderMap,
+    server_side_encryption_requested: bool,
+    should_compress: bool,
+    is_extract: bool,
+) -> (&'static str, &'static str, bool, bool) {
+    let use_empty_or_small_eager_put_path = size == 0
+        || should_use_small_eager_put_path(size, headers, server_side_encryption_requested, should_compress, is_extract);
+    let zero_copy_eager_put_path_status =
+        zero_copy_eager_put_path_status(size, headers, server_side_encryption_requested, should_compress, is_extract);
+    let use_zero_copy_eager_put_path = zero_copy_eager_put_path_status == PUT_EAGER_STATUS_ELIGIBLE;
+    let put_path = if should_compress {
+        "stream_compressed"
+    } else if use_zero_copy_eager_put_path {
+        "zero_copy_eager"
+    } else if use_empty_or_small_eager_put_path {
+        "small_eager"
+    } else {
+        "streaming"
+    };
+
+    (
+        put_path,
+        zero_copy_eager_put_path_status,
+        use_zero_copy_eager_put_path,
+        use_empty_or_small_eager_put_path,
+    )
 }
 
 /// Objects at or below this size bypass BytesPool and use direct allocation.
@@ -800,10 +864,24 @@ impl DefaultObjectUsecase {
 
     async fn execute_put_object_inner(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let start_time = std::time::Instant::now();
+        let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
         let mut req = req;
+
+        let request_shape_stage_start = put_stage_metrics_enabled.then(Instant::now);
 
         if let Some(context) = &self.context {
             let _ = context.object_store();
+        }
+
+        // Authentication and header parsing happen in the S3 middleware before
+        // this use case runs. Attribute that already-paid request prefix from
+        // the request context without adding per-request work when stage
+        // metrics are disabled.
+        if put_stage_metrics_enabled && let Some(context) = req.extensions.get::<request_context::RequestContext>() {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "request_ingress_to_context",
+                context.start_time.elapsed().as_secs_f64() * 1000.0,
+            );
         }
 
         let (event_name, quota_operation, request_method_name) = Self::put_object_execution_context(&req);
@@ -893,6 +971,7 @@ impl DefaultObjectUsecase {
             req.headers.get("content-type").and_then(|value| value.to_str().ok()),
             req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         )?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_request_shape", request_shape_stage_start);
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
 
@@ -929,6 +1008,7 @@ impl DefaultObjectUsecase {
 
         // The app check preserves the existing S3 error contract; the storage
         // commit path reserves the exact net logical growth under its locks.
+        let quota_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let quota_check = self
             .check_bucket_quota(
                 &bucket,
@@ -936,6 +1016,7 @@ impl DefaultObjectUsecase {
                 u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
             )
             .await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_quota_check", quota_stage_start);
         let quota_enabled = quota_check.as_ref().is_some_and(|result| result.quota_limit.is_some());
         if quota_enabled && ciphertext_passthrough {
             return Err(S3Error::with_message(
@@ -944,7 +1025,6 @@ impl DefaultObjectUsecase {
             ));
         }
 
-        let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
         let ingress_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let should_compress =
             is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
@@ -954,11 +1034,13 @@ impl DefaultObjectUsecase {
         // Resolve the store through the request-bound server context
         // (backlog#1052 S6), not the process-global handle, so an embedded
         // second server never writes into the first server's store.
+        let store_lookup_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
         let bucket_validate_stage_start = put_stage_metrics_enabled.then(Instant::now);
         validate_bucket_exists(&store, &bucket).await?;
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_store_lookup", store_lookup_stage_start);
         rustfs_io_metrics::record_put_object_stage_duration_from("app_bucket_validate", bucket_validate_stage_start);
 
         let put_admission = match get_concurrency_manager()
@@ -1006,24 +1088,12 @@ impl DefaultObjectUsecase {
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
-        let use_empty_or_small_eager_put_path = size == 0
-            || should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
-        let zero_copy_eager_put_path_status =
-            zero_copy_eager_put_path_status(size, &req.headers, server_side_encryption_requested, should_compress, false);
-        let use_zero_copy_eager_put_path = zero_copy_eager_put_path_status == PUT_EAGER_STATUS_ELIGIBLE;
+        let (put_path, zero_copy_eager_put_path_status, use_zero_copy_eager_put_path, use_empty_or_small_eager_put_path) =
+            select_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         if use_zero_copy_eager_put_path {
             counter!(buffered_write::ATTEMPTS_TOTAL).increment(1);
             histogram!(buffered_write::ATTEMPT_SIZE_BYTES).record(size as f64);
         }
-        let put_path = if should_compress {
-            "stream_compressed"
-        } else if use_zero_copy_eager_put_path {
-            "zero_copy_eager"
-        } else if use_empty_or_small_eager_put_path {
-            "small_eager"
-        } else {
-            "streaming"
-        };
         rustfs_io_metrics::record_put_object_diagnostics(
             put_path,
             zero_copy_eager_put_path_status,
@@ -1518,6 +1588,7 @@ impl DefaultObjectUsecase {
                 Ok::<_, S3Error>(PutObjectCommitResult { obj_info, put_versioned })
             }
         });
+        let commit_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let put_commit_result = if let Some(cancellation) = eager_put_commit_cancellation {
             EagerPutCommitOwner::new(put_commit, cancellation, EAGER_PUT_COMMIT_CANCELLATION_GRACE)
                 .join()
@@ -1525,6 +1596,7 @@ impl DefaultObjectUsecase {
         } else {
             put_commit.await
         };
+        rustfs_io_metrics::record_put_object_stage_duration_from("store_commit", commit_stage_start);
         let PutObjectCommitResult { obj_info, put_versioned } = match put_commit_result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
@@ -1589,10 +1661,12 @@ impl DefaultObjectUsecase {
         // For browser-based POST uploads (multipart/form-data), response status/body handling
         // is decided by s3s PostObject serializer (success_action_status / redirect semantics).
 
+        let response_build_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let mut response = S3Response::new(output);
         // Echo XXHash3/64/128 / SHA-512 checksums that s3s PutObjectOutput has no typed
         // field for (#1256).
         inject_additional_checksum_headers(&mut response.headers, &put_extra_checksum_headers);
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_response_build", response_build_stage_start);
         let result = Ok(response);
         let _ = helper.complete(&result);
 
@@ -2230,12 +2304,51 @@ mod tests {
     }
 
     #[test]
-    fn should_use_small_eager_put_path_allows_up_to_1mb() {
+    fn should_use_small_eager_put_path_keeps_small_objects_eager() {
         let headers = HeaderMap::new();
 
         assert!(should_use_small_eager_put_path(1024, &headers, false, false, false));
-        assert!(should_use_small_eager_put_path(1024 * 1024, &headers, false, false, false));
-        assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
+        assert!(should_use_small_eager_put_path(128 * 1024, &headers, false, false, false));
+        assert!(should_use_small_eager_put_path(512 * 1024, &headers, false, false, false));
+        assert!(!should_use_small_eager_put_path(512 * 1024 + 1, &headers, false, false, false));
+        assert!(!should_use_small_eager_put_path(1024 * 1024, &headers, false, false, false));
+    }
+
+    #[test]
+    fn select_put_path_switches_at_small_eager_boundary() {
+        let headers = HeaderMap::new();
+
+        let (small_path, _, use_zero_copy, use_small_eager) = select_put_path(512 * 1024, &headers, false, false, false);
+        assert_eq!(small_path, "small_eager");
+        assert!(!use_zero_copy);
+        assert!(use_small_eager);
+
+        let (streaming_path, _, use_zero_copy, use_small_eager) = select_put_path(512 * 1024 + 1, &headers, false, false, false);
+        assert_eq!(streaming_path, "streaming");
+        assert!(!use_zero_copy);
+        assert!(!use_small_eager);
+    }
+
+    #[test]
+    fn should_use_small_eager_put_path_allows_a_b_override_at_1mb() {
+        let headers = HeaderMap::new();
+
+        assert!(should_use_small_eager_put_path_with_max_size(
+            1024 * 1024,
+            &headers,
+            false,
+            false,
+            false,
+            1024 * 1024,
+        ));
+        assert!(!should_use_small_eager_put_path_with_max_size(
+            1024 * 1024 + 1,
+            &headers,
+            false,
+            false,
+            false,
+            1024 * 1024,
+        ));
     }
 
     #[test]
@@ -2454,6 +2567,35 @@ mod tests {
             .await
             .expect_err("extra direct body should fail");
         assert_eq!(extra.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn streaming_put_hash_reader_rejects_extra_byte_at_eager_boundary() {
+        use tokio::io::AsyncReadExt;
+
+        let declared_size = 512 * 1024;
+        let declared_size_i64 = i64::try_from(declared_size).expect("test size should fit i64");
+        let mut reader = HashReader::from_stream(
+            std::io::Cursor::new(vec![0x5a; declared_size + 1]),
+            declared_size_i64,
+            declared_size_i64,
+            None,
+            None,
+            false,
+        )
+        .expect("streaming PUT hash reader should be constructed");
+        let mut body = Vec::new();
+
+        let err = reader
+            .read_to_end(&mut body)
+            .await
+            .expect_err("streaming PUT must reject a body larger than Content-Length");
+
+        assert!(
+            err.to_string().contains("more bytes than specified"),
+            "unexpected extra-body error: {err}"
+        );
+        assert_eq!(body.len(), declared_size);
     }
 
     #[tokio::test]
