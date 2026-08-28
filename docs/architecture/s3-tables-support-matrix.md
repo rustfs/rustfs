@@ -30,7 +30,7 @@ catalog extension.
 | `/_iceberg/v1` | Supported compatibility alias | MinIO AIStor-style alias. The smoke profile defaults to REST signing name `s3tables`. |
 | S3 object data plane | Supported | Data, metadata, manifest, and delete files remain ordinary S3 objects, with table-aware policy checks for table warehouse paths. |
 | Table bucket enablement | Supported | A regular RustFS bucket can be enabled for table catalog use and then addressed as the REST catalog warehouse. |
-| Catalog-vended table credentials | Automated when enabled | Disabled by default. When enabled, the credentials endpoint returns short-lived table-scoped S3 credentials. |
+| Catalog-vended table credentials | Automated when enabled | Disabled by default. When enabled, standard LoadTable responses and the dedicated credentials endpoint return short-lived table-scoped S3 credentials through one issuer path. |
 | AWS S3 Tables endpoint shape | Profile generator | Generates the AWS catalog URI and S3 Tables warehouse ARN shape for migration docs. Full AWS S3 Tables API parity is not claimed. |
 | MinIO AIStor Tables profile | Profile generator plus RustFS alias smoke | RustFS exposes the alias shape, but does not claim all AIStor private extensions. |
 | Cloudflare R2 Data Catalog profile | Profile generator | Generates the catalog URI and warehouse-name shape for migration docs. Live RustFS interoperability is not claimed. |
@@ -69,7 +69,7 @@ catalog extension.
 | Commit recovery | Supported | Commit log, idempotency lookup, diagnostics, and recovery routes expose staged/finalization gaps and repair safe idempotency gaps without moving the table pointer. |
 | Snapshot refs | Supported | Refs can be listed, created or replaced, and deleted through catalog commits. `main` is protected and refs with explicit retention require forced delete. |
 | Iceberg views | Supported | Basic create, list, load, replace, existence check, and drop routes persist view metadata with view-scoped authorization. Replace identifiers must match the URL resource, `schema-id: -1` resolves to the last added schema, one commit timestamp is used consistently, and only Iceberg view format version 1 is accepted. |
-| Table credentials endpoint | Supported | Returns an empty `storage-credentials` list by default. Returns table-scoped temporary credentials only when credential vending is enabled. Credential responses set `Cache-Control: no-store, private`, `Pragma: no-cache`, and `Expires: 0`. |
+| LoadTable and table credentials endpoint | Supported | LoadTable keeps the client-provided credential mode and an empty `storage-credentials` list by default. When vending is enabled and authorized, LoadTable and the dedicated credentials endpoint use the same issuer, table-prefix scope, expiration fields, and refusal semantics. Responses that may carry credentials set `Cache-Control: no-store, private`, `Pragma: no-cache`, and `Expires: 0`. |
 | Catalog diagnostics and export | Supported | Exposes recovery state, consistency state, backing manifest, recoverable commit-log WAL state, strong backing migration target, single-active-writer policy, and scale validation matrix. |
 | Catalog import and rollback | Supported | Import/register and online rollback use catalog validation and commit paths rather than direct pointer mutation. Online rollback accepts only a forward-safe metadata target that preserves assignment watermarks and retained definitions. Restoring an older target that lowers those watermarks is an offline disaster-recovery operation and requires every writer to be stopped. |
 | External catalog bridge | Supported operator path | Operator-supplied metadata pointer sync/import is supported for external catalog identity boundaries. Online vendor SDK polling and policy mirroring are not claimed. |
@@ -82,7 +82,7 @@ catalog extension.
 | Table-aware S3 policy bridge | Supported | Ordinary S3 actions against table warehouse paths are checked through the table data-plane bridge so table policy cannot be bypassed by direct object access. |
 | Reserved catalog protection | Supported | Catalog-reserved internal prefixes are protected from ordinary object mutation. |
 | Static S3 credentials | Automated | The default PyIceberg smoke path uses configured S3 credentials for REST signing and object data-plane access. |
-| Catalog-vended credentials | Automated when enabled | `rustfs-vended-credentials` verifies the returned table prefix, then checks `PutObject`, `HeadObject`, `GetObject`, and `DeleteObject` inside the prefix and denies access outside the prefix. |
+| Catalog-vended credentials | Automated when enabled | `rustfs-vended-credentials` requests `vended-credentials` through the standard LoadTable response, verifies the returned table prefix, then checks `PutObject`, `HeadObject`, `GetObject`, and `DeleteObject` inside the prefix and denies access outside the prefix. |
 | Credential lifetime | Supported | Vended credential TTL is server-side and clamped to a short-lived range. |
 | No-long-term-data-credential bootstrap | Not claimed | The current credential-vending flow still uses the configured principal for catalog setup before table-scoped credentials are requested. |
 

@@ -1,5 +1,6 @@
 use super::*;
 use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
+use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 use crate::table_catalog::{TableCatalogObjectBackend, TableCatalogStore};
 use datafusion::{
     arrow::{
@@ -41,6 +42,39 @@ impl KmsInterface for RequestKms {
     fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
         Arc::new(rustfs_kms::KmsServiceManager::new())
     }
+}
+
+fn table_catalog_handler_request(context: Arc<AppContext>, access_key: &str, secret_key: &str) -> S3Request<Body> {
+    let slot = ServerContextSlot::new();
+    assert!(slot.install(context));
+    let mut extensions = http::Extensions::new();
+    extensions.insert(slot);
+    S3Request {
+        input: Body::empty(),
+        method: Method::GET,
+        uri: "/iceberg/v1/warehouse/namespaces/analytics/tables/events"
+            .parse()
+            .expect("load table URI"),
+        headers: HeaderMap::new(),
+        extensions,
+        credentials: Some(s3s::auth::Credentials {
+            access_key: access_key.to_string(),
+            secret_key: s3s::auth::SecretKey::from(secret_key.to_string()),
+        }),
+        region: None,
+        service: None,
+        trailing_headers: None,
+    }
+}
+
+async fn call_load_table_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    router
+        .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}", ())
+        .expect("load table test route should insert");
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("load table test route should match");
+    RestLoadTableHandler {}.call(request, matched.params).await
 }
 
 #[tokio::test]
@@ -128,6 +162,181 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
     let resolved_store =
         runtime_sources::object_store_from_extensions(&request.extensions).expect("request object store should resolve");
     assert!(Arc::ptr_eq(&resolved_store, &store));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn load_table_handler_gates_vended_credentials_without_breaking_disabled_callers() {
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    object_store
+        .make_bucket("warehouse", &MakeBucketOptions::default())
+        .await
+        .expect("table bucket should be created");
+    rustfs_iam::store::object::ObjectStore::new(object_store.clone())
+        .save_iam_config(
+            serde_json::json!({"version": 1}),
+            format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+        )
+        .await
+        .expect("request IAM format should be seeded");
+    let iam = rustfs_iam::build_iam_sys(object_store.clone())
+        .await
+        .expect("request IAM should initialize");
+    let metadata_access_key = "load-table-metadata-only";
+    let metadata_secret_key = "load-table-metadata-only-secret";
+    let vended_access_key = "load-table-vended";
+    let vended_secret_key = "load-table-vended-secret";
+    for (access_key, secret_key) in [
+        (metadata_access_key, metadata_secret_key),
+        (vended_access_key, vended_secret_key),
+    ] {
+        iam.create_user(
+            access_key,
+            &AddOrUpdateUserReq {
+                secret_key: secret_key.to_string(),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("load table user should be created");
+    }
+    iam.set_policy(
+        "load-table-metadata-only-policy",
+        Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:GetTableMetadata"]}]}"#)
+            .expect("metadata-only policy should parse"),
+    )
+    .await
+    .expect("metadata-only policy should be stored");
+    iam.policy_db_set(metadata_access_key, UserType::Reg, false, "load-table-metadata-only-policy")
+        .await
+        .expect("metadata-only policy should be attached");
+    iam.set_policy(
+        "load-table-vended-policy",
+        Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:GetTableMetadata","admin:GetTableCredentials"]}]}"#)
+            .expect("vended credential policy should parse"),
+    )
+    .await
+    .expect("vended credential policy should be stored");
+    iam.policy_db_set(vended_access_key, UserType::Reg, false, "load-table-vended-policy")
+        .await
+        .expect("vended credential policy should be attached");
+
+    let action_credentials = rustfs_credentials::Credentials {
+        access_key: "load-table-root-access-key".to_string(),
+        secret_key: "load-table-root-secret-key".to_string(),
+        status: "on".to_string(),
+        ..Default::default()
+    };
+    let context = Arc::new(AppContext::new(
+        object_store.clone(),
+        Arc::new(RequestIam { handle: iam }),
+        Arc::new(RequestKms),
+    ));
+    assert!(context.publish_action_credentials(action_credentials));
+
+    let setup_request = table_catalog_handler_request(context.clone(), vended_access_key, vended_secret_key);
+    let metadata_backend =
+        table_catalog_backend_from_extensions(&setup_request.extensions).expect("table catalog backend should resolve");
+    let catalog_store = table_catalog_store_from_backend(metadata_backend.clone()).expect("table catalog store should resolve");
+    enable_table_bucket_marker(object_store.as_ref(), "warehouse")
+        .await
+        .expect("table bucket should be enabled");
+    ensure_table_bucket_entry(&catalog_store, "warehouse", true)
+        .await
+        .expect("table bucket entry should be created");
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    create_namespace_response(
+        &catalog_store,
+        "warehouse",
+        CreateNamespaceRequest {
+            namespace: vec!["analytics".to_string()],
+            properties: BTreeMap::new(),
+        },
+        true,
+    )
+    .await
+    .expect("namespace should be created");
+    let create_request = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+        "name": "events",
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+        }
+    }))
+    .expect("create table request should parse");
+    create_table_response(
+        &catalog_store,
+        &TableCommitObjectBackend::trusted(metadata_backend),
+        "warehouse",
+        &namespace,
+        create_request,
+        true,
+    )
+    .await
+    .expect("table should be created");
+
+    let disabled = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, None::<&str>)], async {
+        call_load_table_handler(table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key)).await
+    })
+    .await
+    .expect("metadata-only caller should load the table while vending is disabled");
+    assert_eq!(disabled.output.0, StatusCode::OK);
+    let disabled_body = disabled.output.1.bytes().expect("load table body should be buffered");
+    let disabled_json: serde_json::Value = serde_json::from_slice(&disabled_body).expect("load table JSON should parse");
+    assert_eq!(
+        disabled_json["config"][CREDENTIAL_MODE_CONFIG_KEY],
+        serde_json::Value::String(CREDENTIAL_MODE_CLIENT_PROVIDED.to_string())
+    );
+    assert_eq!(disabled_json["storage-credentials"], serde_json::json!([]));
+
+    let denied = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
+        call_load_table_handler(table_catalog_handler_request(context.clone(), metadata_access_key, metadata_secret_key)).await
+    })
+    .await
+    .expect_err("metadata-only caller should not receive vended credentials");
+    assert_eq!(denied.code(), &S3ErrorCode::AccessDenied);
+    assert_eq!(denied.status_code(), Some(StatusCode::FORBIDDEN));
+    let denied_text = format!("{denied:?}");
+    assert!(!denied_text.contains(metadata_secret_key));
+    assert!(!denied_text.contains("load-table-root-secret-key"));
+
+    let issued = temp_env::async_with_vars([(ENV_TABLE_CATALOG_CREDENTIAL_VENDING, Some("true"))], async {
+        call_load_table_handler(table_catalog_handler_request(context.clone(), vended_access_key, vended_secret_key)).await
+    })
+    .await
+    .expect("credential-authorized caller should receive vended credentials");
+    assert_eq!(issued.output.0, StatusCode::OK);
+    assert_eq!(
+        issued.headers.get(http::header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store, private"))
+    );
+    assert_eq!(issued.headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
+    assert_eq!(issued.headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+    let issued_body = issued.output.1.bytes().expect("load table body should be buffered");
+    let issued_json: serde_json::Value = serde_json::from_slice(&issued_body).expect("load table JSON should parse");
+    assert_eq!(
+        issued_json["config"][CREDENTIAL_VENDING_CONFIG_KEY],
+        serde_json::Value::String(CREDENTIAL_VENDING_SUPPORTED.to_string())
+    );
+    assert_eq!(
+        issued_json["config"][CREDENTIAL_MODE_CONFIG_KEY],
+        serde_json::Value::String(CREDENTIAL_MODE_CATALOG_VENDED.to_string())
+    );
+    assert_eq!(issued_json["storage-credentials"].as_array().map(Vec::len), Some(1));
+    for required_key in [
+        S3_ACCESS_KEY_ID_CONFIG_KEY,
+        S3_SECRET_ACCESS_KEY_CONFIG_KEY,
+        S3_SESSION_TOKEN_CONFIG_KEY,
+    ] {
+        assert!(
+            issued_json["storage-credentials"][0]["config"][required_key]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "LoadTable should include {required_key}"
+        );
+    }
 }
 
 #[test]
@@ -479,6 +688,20 @@ fn standard_rest_handlers_wire_strict_response_guards() {
     let load_table = operation_block(&src, "RestLoadTableHandler");
     assert!(load_table.contains("rest_table_snapshot_selection_from_query(&req.uri)?"));
     assert!(load_table.contains("apply_rest_table_snapshot_selection(&mut response.metadata, snapshot_selection);"));
+    assert!(load_table.contains("let issuer = IamTableCredentialIssuer::from_request(&req)?;"));
+    assert!(load_table.contains("if issuer.enabled()"));
+    assert!(load_table.contains("AdminAction::GetTableCredentialsAction"));
+    assert!(load_table.contains("load_table_response_with_credentials("));
+    assert!(load_table.contains("build_sensitive_json_response(StatusCode::OK, &response)"));
+    assert!(
+        load_table
+            .find("AdminAction::GetTableCredentialsAction")
+            .expect("credential authorization should be present")
+            < load_table
+                .find("load_table_response_with_credentials(")
+                .expect("credential issue path should be present"),
+        "LoadTable must authorize credential vending before invoking the issuer path"
+    );
 
     let credentials = operation_block(&src, "RestLoadCredentialsHandler");
     assert!(credentials.contains("build_sensitive_json_response(StatusCode::OK, &response)"));
@@ -9913,6 +10136,18 @@ async fn unavailable_table_credential_issuer_reports_fallback_scope() {
     );
 }
 
+struct RefusingTableCredentialIssuer;
+
+#[async_trait::async_trait]
+impl TableCredentialIssuer for RefusingTableCredentialIssuer {
+    async fn issue_table_credentials(
+        &self,
+        _request: TableCredentialIssueRequest<'_>,
+    ) -> S3Result<Option<IssuedTableCredentials>> {
+        Err(s3_error!(AccessDenied, "table credential issuer refused request"))
+    }
+}
+
 struct TestTableCredentialIssuer;
 
 #[async_trait::async_trait]
@@ -9979,6 +10214,110 @@ async fn credential_issuer_returns_temporary_scoped_storage_credentials() {
 }
 
 #[tokio::test]
+async fn load_table_uses_the_shared_credential_vending_result() {
+    let entry = table_entry_for_credentials();
+    let metadata = serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "table-uuid",
+        "location": "s3://warehouse/tables/table-id"
+    });
+    let issuer = TestTableCredentialIssuer;
+    let principal = rustfs_credentials::Credentials {
+        access_key: "parent-access-key".to_string(),
+        secret_key: "parent-secret-key".to_string(),
+        ..Default::default()
+    };
+    let load_table = enrich_load_table_response_with_credentials(
+        load_table_response_from_entry(entry.clone(), metadata),
+        &entry,
+        &issuer,
+        Some(&principal),
+    )
+    .await
+    .expect("load table should include vended credentials");
+    let credentials = load_credentials_response_from_entry(&entry, &issuer, Some(&principal))
+        .await
+        .expect("credentials endpoint should include vended credentials");
+
+    assert_eq!(
+        load_table.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+        Some(&CREDENTIAL_VENDING_SUPPORTED.to_string())
+    );
+    assert_eq!(
+        load_table.config.get(CREDENTIAL_MODE_CONFIG_KEY),
+        Some(&CREDENTIAL_MODE_CATALOG_VENDED.to_string())
+    );
+    assert!(!load_table.config.contains_key(CREDENTIAL_VENDING_REASON_CONFIG_KEY));
+    assert_eq!(
+        load_table.config.get(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY),
+        credentials.config.get(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY)
+    );
+    assert_eq!(
+        serde_json::to_value(&load_table.storage_credentials).expect("load table credentials should serialize"),
+        serde_json::to_value(&credentials.storage_credentials).expect("endpoint credentials should serialize")
+    );
+    assert_eq!(
+        load_table.storage_credentials[0]
+            .config
+            .get(CREDENTIAL_EXPIRATION_CONFIG_KEY)
+            .map(String::as_str),
+        Some("1800000000")
+    );
+}
+
+#[tokio::test]
+async fn load_table_keeps_disabled_vending_compatible() {
+    let entry = table_entry_for_credentials();
+    let response = enrich_load_table_response_with_credentials(
+        load_table_response_from_entry(entry.clone(), serde_json::json!({})),
+        &entry,
+        &DisabledTableCredentialIssuer,
+        None,
+    )
+    .await
+    .expect("disabled vending should keep the client-provided response");
+
+    assert!(response.storage_credentials.is_empty());
+    assert_eq!(
+        response.config.get(CREDENTIAL_VENDING_CONFIG_KEY),
+        Some(&CREDENTIAL_VENDING_UNSUPPORTED.to_string())
+    );
+    assert_eq!(
+        response.config.get(CREDENTIAL_MODE_CONFIG_KEY),
+        Some(&CREDENTIAL_MODE_CLIENT_PROVIDED.to_string())
+    );
+    assert_eq!(
+        response.config.get(CREDENTIAL_VENDING_REASON_CONFIG_KEY),
+        Some(&CREDENTIAL_VENDING_DISABLED_REASON.to_string())
+    );
+    assert_eq!(
+        response.config.get(CREDENTIAL_SCOPE_PREFIX_CONFIG_KEY).map(String::as_str),
+        Some("s3://warehouse/tables/table-id")
+    );
+}
+
+#[tokio::test]
+async fn load_table_and_credentials_endpoint_propagate_issuer_refusal() {
+    let entry = table_entry_for_credentials();
+    let credentials_error = load_credentials_response_from_entry(&entry, &RefusingTableCredentialIssuer, None)
+        .await
+        .expect_err("credentials endpoint should propagate issuer refusal");
+    let load_table_error = enrich_load_table_response_with_credentials(
+        load_table_response_from_entry(entry.clone(), serde_json::json!({})),
+        &entry,
+        &RefusingTableCredentialIssuer,
+        None,
+    )
+    .await
+    .expect_err("load table should propagate issuer refusal");
+
+    assert_eq!(load_table_error.code(), credentials_error.code());
+    assert_eq!(load_table_error.status_code(), credentials_error.status_code());
+    assert_eq!(load_table_error.message(), credentials_error.message());
+    assert_eq!(load_table_error.code(), &S3ErrorCode::AccessDenied);
+}
+
+#[tokio::test]
 async fn credential_response_serializes_sensitive_config_only_inside_storage_credentials() {
     let issuer = TestTableCredentialIssuer;
     let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &issuer, None)
@@ -10011,6 +10350,19 @@ fn credential_http_response_disables_caching() {
     );
     assert_eq!(response.headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
     assert_eq!(response.headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+}
+
+#[tokio::test]
+async fn credential_debug_output_redacts_secrets_and_tokens() {
+    let response = load_credentials_response_from_entry(&table_entry_for_credentials(), &TestTableCredentialIssuer, None)
+        .await
+        .expect("issuer should build a scoped credential response");
+    let debug_output = format!("{response:?}");
+
+    assert!(!debug_output.contains("temporary-access-key"));
+    assert!(!debug_output.contains("temporary-secret-key"));
+    assert!(!debug_output.contains("temporary-session-token"));
+    assert!(debug_output.contains("[REDACTED]"));
 }
 
 #[test]

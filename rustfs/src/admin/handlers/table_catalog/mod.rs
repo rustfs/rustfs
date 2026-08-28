@@ -717,10 +717,20 @@ struct RestLoadViewResponse {
     config: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 struct RestStorageCredential {
     prefix: String,
     config: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for RestStorageCredential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestStorageCredential")
+            .field("prefix", &self.prefix)
+            .field("config", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -737,12 +747,24 @@ struct TableCredentialIssueRequest<'a> {
     object_prefix: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct IssuedTableCredentials {
     access_key_id: String,
     secret_access_key: String,
     session_token: String,
     expiration: OffsetDateTime,
+}
+
+impl std::fmt::Debug for IssuedTableCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IssuedTableCredentials")
+            .field("access_key_id", &"[REDACTED]")
+            .field("secret_access_key", &"[REDACTED]")
+            .field("session_token", &"[REDACTED]")
+            .field("expiration", &self.expiration)
+            .finish()
+    }
 }
 
 #[async_trait::async_trait]
@@ -2696,6 +2718,21 @@ async fn load_credentials_response_from_entry(
         config,
         storage_credentials,
     })
+}
+
+async fn enrich_load_table_response_with_credentials(
+    mut response: RestLoadTableResponse,
+    entry: &crate::table_catalog::TableEntry,
+    issuer: &dyn TableCredentialIssuer,
+    principal: Option<&rustfs_credentials::Credentials>,
+) -> S3Result<RestLoadTableResponse> {
+    let credential_response = load_credentials_response_from_entry(entry, issuer, principal).await?;
+    response.config.remove(CREDENTIAL_VENDING_CONFIG_KEY);
+    response.config.remove(CREDENTIAL_VENDING_REASON_CONFIG_KEY);
+    response.config.remove(CREDENTIAL_MODE_CONFIG_KEY);
+    response.config.extend(credential_response.config);
+    response.storage_credentials = credential_response.storage_credentials;
+    Ok(response)
 }
 
 fn commit_table_response_from_result(
@@ -5513,6 +5550,37 @@ async fn load_table_response<S>(
 where
     S: crate::table_catalog::TableCatalogStore + ?Sized,
 {
+    let (entry, metadata) = load_table_entry_and_metadata(store, metadata_backend, bucket, namespace, table).await?;
+    Ok(load_table_response_from_entry(entry, metadata))
+}
+
+async fn load_table_response_with_credentials<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+    issuer: &dyn TableCredentialIssuer,
+    principal: Option<&rustfs_credentials::Credentials>,
+) -> S3Result<RestLoadTableResponse>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
+    let (entry, metadata) = load_table_entry_and_metadata(store, metadata_backend, bucket, namespace, table).await?;
+    let response = load_table_response_from_entry(entry.clone(), metadata);
+    enrich_load_table_response_with_credentials(response, &entry, issuer, principal).await
+}
+
+async fn load_table_entry_and_metadata<S>(
+    store: &S,
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    namespace: &crate::table_catalog::Namespace,
+    table: &str,
+) -> S3Result<(crate::table_catalog::TableEntry, serde_json::Value)>
+where
+    S: crate::table_catalog::TableCatalogStore + ?Sized,
+{
     let Some(entry) = store
         .load_table(bucket, &namespace.public_name(), table)
         .await
@@ -5521,7 +5589,7 @@ where
         return Err(iceberg_rest_error(ICEBERG_ERROR_NO_SUCH_TABLE, StatusCode::NOT_FOUND, "table not found"));
     };
     let metadata = read_persisted_table_metadata_for_entry(metadata_backend, &entry, &entry.metadata_location, true).await?;
-    Ok(load_table_response_from_entry(entry, metadata))
+    Ok((entry, metadata))
 }
 
 async fn list_views_response<S>(

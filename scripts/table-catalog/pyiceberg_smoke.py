@@ -190,8 +190,8 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "capability": "credential-vending",
         "status": "automated-after-table-bootstrap",
         "roadmap_area": "credential-vending",
-        "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
-        "expected_behavior": "the rustfs-vended-credentials profile requires server-side temporary credential vending, verifies the returned prefix exactly matches the table warehouse location, verifies scoped data-plane access, and switches append, reload, and scan operations to the returned table-scoped credentials after table creation",
+        "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+        "expected_behavior": "the rustfs-vended-credentials profile requests vended credentials through the standard LoadTable response, verifies the returned prefix exactly matches the table warehouse location, verifies scoped data-plane access, and switches append, reload, and scan operations to the returned table-scoped credentials after table creation; the dedicated credentials endpoint uses the same issuer path",
     },
     {
         "capability": "background-maintenance-worker",
@@ -529,7 +529,15 @@ def unsigned_ssl_context(insecure: bool) -> ssl.SSLContext | None:
     return ssl._create_unverified_context()
 
 
-def signed_rest_request(args: argparse.Namespace, deps: RuntimeDeps, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+def signed_rest_request(
+    args: argparse.Namespace,
+    deps: RuntimeDeps,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    *,
+    request_headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     endpoint = normalized_endpoint(args.endpoint)
     url = f"{endpoint}{path}"
     payload = b"" if body is None else json.dumps(body, separators=(",", ":")).encode("utf-8")
@@ -539,6 +547,8 @@ def signed_rest_request(args: argparse.Namespace, deps: RuntimeDeps, method: str
     }
     if body is not None:
         headers["content-type"] = "application/json"
+    if request_headers is not None:
+        headers.update(request_headers)
 
     aws_request = deps.botocore_awsrequest(method=method, url=url, data=payload, headers=headers)
     credentials = deps.botocore_credentials(args.access_key, args.secret_key)
@@ -716,7 +726,7 @@ def default_maintenance_config() -> dict[str, Any]:
 def storage_credential_from_response(response: dict[str, Any]) -> StorageCredential:
     credentials = response.get("storage-credentials")
     if not isinstance(credentials, list) or not credentials:
-        raise RuntimeError("no storage credentials were returned by the table credentials endpoint")
+        raise RuntimeError("no storage credentials were returned by the table response")
 
     for credential in credentials:
         if not isinstance(credential, dict):
@@ -737,7 +747,13 @@ def storage_credential_from_response(response: dict[str, Any]) -> StorageCredent
 
 
 def load_table_storage_credential(args: argparse.Namespace, deps: RuntimeDeps) -> StorageCredential:
-    response = signed_rest_request(args, deps, "GET", credentials_endpoint_path(args))
+    response = signed_rest_request(
+        args,
+        deps,
+        "GET",
+        table_endpoint_path(args),
+        request_headers={"X-Iceberg-Access-Delegation": "vended-credentials"},
+    )
     return storage_credential_from_response(response)
 
 

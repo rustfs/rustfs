@@ -180,6 +180,40 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
             "/iceberg/v1/lake%20bucket/namespaces/sales.analytics/tables/orders%20table/credentials",
         )
 
+    def test_vended_credential_probe_uses_standard_load_table_response(self) -> None:
+        args = self.parse_with_args([
+            "--bucket",
+            "lake bucket",
+            "--namespace",
+            "sales.analytics",
+            "--table",
+            "orders table",
+        ])
+        response = {
+            "storage-credentials": [
+                {
+                    "prefix": "s3://lake bucket/tables/table-id/",
+                    "config": {
+                        "s3.access-key-id": "temp-access",
+                        "s3.secret-access-key": "temp-secret",
+                        "s3.session-token": "temp-token",
+                    },
+                }
+            ]
+        }
+
+        with mock.patch.object(pyiceberg_smoke, "signed_rest_request", return_value=response) as request:
+            credential = pyiceberg_smoke.load_table_storage_credential(args, object())
+
+        self.assertEqual(credential.prefix, "s3://lake bucket/tables/table-id/")
+        request.assert_called_once_with(
+            args,
+            mock.ANY,
+            "GET",
+            "/iceberg/v1/lake%20bucket/namespaces/sales.analytics/tables/orders%20table",
+            request_headers={"X-Iceberg-Access-Delegation": "vended-credentials"},
+        )
+
     def test_table_catalog_endpoint_paths_encode_identifier_components(self) -> None:
         args = self.parse_with_args([
             "--bucket",
