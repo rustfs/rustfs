@@ -2515,8 +2515,40 @@ fn record_get_object_reader_path_observation(
     object_class: GetCodecStreamingObjectClass,
     size_bucket: &'static str,
 ) {
+    #[cfg(test)]
+    LAST_GET_OBJECT_READER_PATH.store(
+        match path {
+            "mid_size_streaming" => 1,
+            GET_OBJECT_PATH_DIRECT_MEMORY => 2,
+            GET_OBJECT_PATH_INLINE_DIRECT => 3,
+            GET_OBJECT_PATH_BODY_CACHE => 4,
+            GET_OBJECT_PATH_CODEC_STREAMING => 5,
+            GET_OBJECT_PATH_REMOTE_TRANSITION => 6,
+            GET_OBJECT_PATH_EMPTY => 7,
+            _ => 255,
+        },
+        Ordering::Relaxed,
+    );
     rustfs_io_metrics::record_get_object_reader_path(path);
     rustfs_io_metrics::record_get_object_reader_path_by_size(path, object_class.as_str(), size_bucket);
+}
+
+#[cfg(test)]
+static LAST_GET_OBJECT_READER_PATH: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_test_get_object_reader_path() {
+    LAST_GET_OBJECT_READER_PATH.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn test_get_object_reader_selected_mid_size() -> bool {
+    LAST_GET_OBJECT_READER_PATH.load(Ordering::Relaxed) == 1
+}
+
+#[cfg(test)]
+pub(crate) fn test_get_object_reader_path_id() -> u64 {
+    LAST_GET_OBJECT_READER_PATH.load(Ordering::Relaxed)
 }
 
 fn classify_get_codec_streaming_object_class(
@@ -2563,6 +2595,26 @@ fn get_small_object_direct_memory_decision_with_threshold(
     opts: &ObjectOptions,
     enabled: bool,
     threshold: usize,
+) -> GetDirectMemoryDecision {
+    get_small_object_direct_memory_decision_with_threshold_and_plan(
+        range,
+        object_info,
+        fi,
+        opts,
+        enabled,
+        threshold,
+        ReadPathPlan::new(object_info, fi),
+    )
+}
+
+fn get_small_object_direct_memory_decision_with_threshold_and_plan(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+    enabled: bool,
+    threshold: usize,
+    plan: ReadPathPlan,
 ) -> GetDirectMemoryDecision {
     if !enabled {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Disabled);
@@ -2624,14 +2676,14 @@ fn get_small_object_direct_memory_decision_with_threshold(
     if object_info.size != fi.size {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::SizeMismatch);
     }
-    let Some(shape) = read_path_shape(object_info, fi) else {
+    let Some(shape) = plan.shape() else {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::MetadataShape);
     };
     let object_size = shape.object_size;
     if object_size == 0 {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InvalidSize);
     }
-    if !shape.is_plain(object_info, fi) {
+    if !plan.is_plain() {
         if object_info.is_encrypted() || fi.metadata.keys().any(|key| is_object_encryption_marker(key)) {
             return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Encrypted);
         }
@@ -2647,6 +2699,7 @@ fn get_small_object_direct_memory_decision_with_threshold(
     GetDirectMemoryDecision::Use { object_size }
 }
 
+#[allow(dead_code, reason = "asserted by this file's gate tests")]
 fn get_small_object_direct_memory_decision(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
@@ -2681,6 +2734,7 @@ fn should_prefer_codec_streaming_data_blocks_first_reader_setup(
     max_size > 0 && object_size <= max_size
 }
 
+#[allow(dead_code, reason = "asserted by this file's gate tests")]
 fn get_codec_streaming_reader_gate(
     bucket: &str,
     object: &str,
@@ -2689,6 +2743,29 @@ fn get_codec_streaming_reader_gate(
     object_info: &ObjectInfo,
     fi: &FileInfo,
     lock_optimization_enabled: bool,
+) -> GetCodecStreamingGate {
+    get_codec_streaming_reader_gate_with_plan(
+        bucket,
+        object,
+        part_number,
+        object_class,
+        object_info,
+        fi,
+        lock_optimization_enabled,
+        ReadPathPlan::new(object_info, fi),
+    )
+}
+
+#[allow(clippy::too_many_arguments, reason = "keeps the hot-path gate inputs explicit")]
+fn get_codec_streaming_reader_gate_with_plan(
+    bucket: &str,
+    object: &str,
+    part_number: Option<usize>,
+    object_class: GetCodecStreamingObjectClass,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    lock_optimization_enabled: bool,
+    plan: ReadPathPlan,
 ) -> GetCodecStreamingGate {
     let config = get_codec_streaming_config();
 
@@ -2805,14 +2882,14 @@ fn get_codec_streaming_reader_gate(
         }
     }
     if object_class == GetCodecStreamingObjectClass::PlainSinglePart {
-        let Some(shape) = read_path_shape(object_info, fi) else {
+        let Some(_shape) = plan.shape() else {
             return GetCodecStreamingGate {
                 object_class,
                 decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMetadataShape),
                 prefer_data_blocks_first_reader_setup: false,
             };
         };
-        if !shape.is_plain(object_info, fi) {
+        if !plan.is_plain() {
             return GetCodecStreamingGate {
                 object_class,
                 decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMetadataShape),
@@ -4127,6 +4204,33 @@ impl ReadPathShape {
     }
 }
 
+/// Request-local metadata decision reused by all small-object GET gates.
+///
+/// The metadata pair is immutable for the lifetime of `get_object_reader`, so
+/// validating it once avoids repeating part-array and transform scans on every
+/// fast-path predicate while keeping the trust boundary fail-closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadPathPlan {
+    shape: Option<ReadPathShape>,
+    plain: bool,
+}
+
+impl ReadPathPlan {
+    fn new(object_info: &ObjectInfo, fi: &FileInfo) -> Self {
+        let shape = read_path_shape(object_info, fi);
+        let plain = shape.is_some_and(|shape| shape.is_plain(object_info, fi));
+        Self { shape, plain }
+    }
+
+    const fn shape(self) -> Option<ReadPathShape> {
+        self.shape
+    }
+
+    const fn is_plain(self) -> bool {
+        self.plain
+    }
+}
+
 /// Validate the single-part geometry shared by inline, direct-memory, and
 /// bounded mid-size readers.  This is deliberately fail-closed: a stale or
 /// mixed-version `ObjectInfo`/`FileInfo` pair must use the legacy path rather
@@ -4159,17 +4263,28 @@ fn should_use_single_block_non_inline_fast_path(is_inline_buffer: bool, object_s
     !is_inline_buffer && object_fits_single_block(object_size, block_size)
 }
 
+#[allow(dead_code, reason = "asserted by this file's gate tests")]
 fn should_use_inline_fast_path(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
     fi: &FileInfo,
     opts: &ObjectOptions,
 ) -> bool {
+    should_use_inline_fast_path_with_plan(range, object_info, fi, opts, ReadPathPlan::new(object_info, fi))
+}
+
+fn should_use_inline_fast_path_with_plan(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+    plan: ReadPathPlan,
+) -> bool {
     if !object_info.is_inline_fast_path_eligible() || fi.data.is_none() || range.is_some() || opts.part_number.is_some() {
         return false;
     }
 
-    let Some(shape) = read_path_shape(object_info, fi) else {
+    let Some(shape) = plan.shape() else {
         return false;
     };
     // The persisted marker is authoritative for the storage decision, but it
@@ -4177,7 +4292,7 @@ fn should_use_inline_fast_path(
     // a stale/corrupt marker cannot route an oversized payload into the
     // in-memory decoder. The independent direct-memory reader remains capped
     // at 128 KiB below.
-    if !shape.is_plain(object_info, fi)
+    if !plan.is_plain()
         || shape.object_size > usize::try_from(INLINE_FAST_PATH_MAX_OBJECT_SIZE).expect("inline fast path limit fits usize")
         || fi.erasure.data_blocks == 0
         || fi.erasure.block_size == 0
