@@ -1125,6 +1125,44 @@ fn test_site_replication_repair_dry_run_plan_is_non_mutating_and_redacted() {
 }
 
 #[test]
+fn test_site_replication_repair_preflight_token_is_deterministic_for_equal_state() {
+    // dry-run hands the operator a preflight token that execute must match, so
+    // equal state must hash equally across calls. A policy-less group used to
+    // break this: its desc was stamped with the wall clock on every read, and
+    // the flapping task id made execute permanently reject the token as stale.
+    let state = SiteReplicationState {
+        name: "local".to_string(),
+        service_account_access_key: "site-replicator-0".to_string(),
+        peers: BTreeMap::from([(
+            "remote-dep".to_string(),
+            PeerInfo {
+                deployment_id: "remote-dep".to_string(),
+                ..peer("remote", "https://remote.example.com")
+            },
+        )]),
+        ..Default::default()
+    };
+    let mut info = SRInfo::default();
+    info.group_desc_map.insert(
+        "policyless".to_string(),
+        rustfs_madmin::GroupDesc {
+            name: "policyless".to_string(),
+            status: "enabled".to_string(),
+            members: vec!["alice".to_string()],
+            policy: String::new(),
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        },
+    );
+
+    let plan_a = site_replication_bootstrap_plan(&info).expect("first plan");
+    let plan_b = site_replication_bootstrap_plan(&info).expect("second plan");
+    let token_a = site_replication_repair_preflight_token(&state, &plan_a, b"test-signing-key").expect("first token");
+    let token_b = site_replication_repair_preflight_token(&state, &plan_b, b"test-signing-key").expect("second token");
+
+    assert_eq!(token_a, token_b);
+}
+
+#[test]
 fn test_site_replication_repair_preflight_detects_stale_snapshot() {
     let mut state = SiteReplicationState {
         name: "local".to_string(),

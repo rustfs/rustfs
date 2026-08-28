@@ -2320,9 +2320,13 @@ fn filter_policies_from_docs(policy_docs: &CacheEntity<PolicyDoc>, policy_name: 
 }
 
 fn build_group_desc(name: &str, group_info: GroupInfo, mapped_policy: Option<MappedPolicy>) -> GroupDesc {
+    // A group without a mapped policy must report the group's own stored
+    // timestamp, not the wall clock: this value feeds content-addressed
+    // consumers (the site-replication repair plan hashes it), and a fresh
+    // clock on every read makes equal states hash differently.
     let (policy, updated_at) = mapped_policy
         .map(|policy| (policy.policies, Some(policy.update_at)))
-        .unwrap_or_else(|| (String::new(), Some(OffsetDateTime::now_utc())));
+        .unwrap_or_else(|| (String::new(), group_info.update_at));
 
     GroupDesc {
         name: name.to_string(),
@@ -2346,6 +2350,46 @@ mod tests {
         },
     };
     use tokio::sync::Notify;
+
+    #[test]
+    fn test_build_group_desc_without_mapping_reports_the_stored_group_timestamp() {
+        let stamp = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        let group_info = GroupInfo {
+            version: 1,
+            status: "enabled".to_string(),
+            members: vec!["alice".to_string()],
+            update_at: Some(stamp),
+        };
+
+        let first = build_group_desc("team", group_info.clone(), None);
+        let second = build_group_desc("team", group_info, None);
+
+        assert_eq!(first.updated_at, Some(stamp));
+        assert_eq!(first.updated_at, second.updated_at);
+        assert!(first.policy.is_empty());
+    }
+
+    #[test]
+    fn test_build_group_desc_with_mapping_reports_the_mapping_timestamp() {
+        let group_stamp = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
+        let mapping_stamp = OffsetDateTime::from_unix_timestamp(1_700_000_500).expect("valid timestamp");
+        let group_info = GroupInfo {
+            version: 1,
+            status: "enabled".to_string(),
+            members: vec![],
+            update_at: Some(group_stamp),
+        };
+        let mapping = MappedPolicy {
+            version: 1,
+            policies: "readwrite".to_string(),
+            update_at: mapping_stamp,
+        };
+
+        let desc = build_group_desc("team", group_info, Some(mapping));
+
+        assert_eq!(desc.updated_at, Some(mapping_stamp));
+        assert_eq!(desc.policy, "readwrite");
+    }
 
     #[derive(Clone)]
     struct FailingInitialLoadStore;

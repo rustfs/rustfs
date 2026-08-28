@@ -19,77 +19,38 @@
 #![allow(clippy::all)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::services::tier::{
     tier_config::TierAzure,
-    warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
+    warm_backend::{
+        S3CompatibleWarmBackendParams, WarmBackend, WarmBackendGetOpts, build_transition_put_options,
+        new_s3_compatible_warm_backend, optimal_part_size,
+    },
     warm_backend_s3::WarmBackendS3,
 };
-use rustfs_s3_client::{
-    admin_handler_utils::AdminError,
-    api_put_object::PutObjectOptions,
-    credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{BucketLookupType, Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
-};
+use rustfs_s3_client::transition_api::{BucketLookupType, ReadCloser, ReaderImpl};
 use rustfs_utils::egress::validate_outbound_url;
-use tracing::warn;
 
-const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
-const MAX_PARTS_COUNT: i64 = 10000;
-const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
 pub struct WarmBackendAzure(WarmBackendS3);
 
 impl WarmBackendAzure {
     pub async fn new(conf: &TierAzure, tier: &str) -> Result<Self, std::io::Error> {
-        if conf.access_key == "" || conf.secret_key == "" {
-            return Err(std::io::Error::other("both access and secret keys are required"));
-        }
-
-        if conf.bucket == "" {
-            return Err(std::io::Error::other("no bucket name was provided"));
-        }
-
-        let u = match url::Url::parse(&conf.endpoint) {
-            Ok(u) => u,
-            Err(e) => {
-                return Err(std::io::Error::other(e.to_string()));
-            }
-        };
-        validate_outbound_url(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
-
-        let creds = Credentials::new(Static(Value {
-            access_key_id: conf.access_key.clone(),
-            secret_access_key: conf.secret_key.clone(),
-            session_token: "".to_string(),
-            signer_type: SignatureType::SignatureV4,
-            ..Default::default()
-        }));
-        let opts = Options {
-            creds,
-            secure: u.scheme() == "https",
-            region: conf.region.clone(),
-            bucket_lookup: BucketLookupType::BucketLookupDNS,
-            ..Default::default()
-        };
-        let scheme = u.scheme();
-        let default_port = if scheme == "https" { 443 } else { 80 };
-        let host = u
-            .host_str()
-            .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
-        let client = TransitionClient::new(&format!("{}:{}", host, u.port().unwrap_or(default_port)), opts, "azure").await?;
-
-        let client = Arc::new(client);
-        let core = TransitionCore(Arc::clone(&client));
-        Ok(Self(WarmBackendS3 {
-            client,
-            core,
-            bucket: conf.bucket.clone(),
-            prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
-            storage_class: "".to_string(),
-        }))
+        Ok(Self(
+            new_s3_compatible_warm_backend(S3CompatibleWarmBackendParams {
+                endpoint: &conf.endpoint,
+                access_key: &conf.access_key,
+                secret_key: &conf.secret_key,
+                bucket: &conf.bucket,
+                prefix: &conf.prefix,
+                region: &conf.region,
+                bucket_lookup: BucketLookupType::BucketLookupDNS,
+                provider_tag: "azure",
+                validate_endpoint: validate_outbound_url,
+            })
+            .await?,
+        ))
     }
 }
 
@@ -102,7 +63,7 @@ impl WarmBackend for WarmBackendAzure {
         length: i64,
         meta: HashMap<String, String>,
     ) -> Result<String, std::io::Error> {
-        let part_size = optimal_part_size(length)?;
+        let part_size = optimal_part_size(length, MIN_PART_SIZE)?;
         let client = self.0.client.clone();
         let res = client
             .put_object(&self.0.bucket, &self.0.get_dest(object), r, length, &{
@@ -133,32 +94,15 @@ impl WarmBackend for WarmBackendAzure {
     }
 }
 
-fn optimal_part_size(object_size: i64) -> Result<i64, std::io::Error> {
-    let mut object_size = object_size;
-    if object_size == -1 {
-        object_size = MAX_MULTIPART_PUT_OBJECT_SIZE;
-    }
-
-    if object_size > MAX_MULTIPART_PUT_OBJECT_SIZE {
-        return Err(std::io::Error::other("entity too large"));
-    }
-
-    let configured_part_size = MIN_PART_SIZE;
-    let mut part_size_flt = object_size as f64 / MAX_PARTS_COUNT as f64;
-    part_size_flt = (part_size_flt as f64 / configured_part_size as f64).ceil() * configured_part_size as f64;
-
-    let part_size = part_size_flt as i64;
-    if part_size == 0 {
-        return Ok(MIN_PART_SIZE);
-    }
-    Ok(part_size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::services::tier::tier_config::TierAzure;
 
+    /// The SSRF guard itself is exercised once, generically, in
+    /// `warm_backend::tests` (see backlog#2040/backlog#2041 and
+    /// rustfs/rustfs#6764) — this test only pins that this provider's
+    /// production constructor really is wired through that shared path.
     #[tokio::test]
     async fn new_rejects_loopback_endpoint_before_network_setup() {
         let conf = TierAzure {
