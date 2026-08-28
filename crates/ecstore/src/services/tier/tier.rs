@@ -65,6 +65,7 @@ use crate::storage_api_contracts::{
 };
 use crate::{
     bucket::lifecycle::{
+        get_lifecycle_config,
         tier_delete_journal::{TIER_DELETE_JOURNAL_PREFIX, decode_tier_delete_journal_entry},
         transition_transaction::{TRANSITION_TRANSACTION_RECORD_PREFIX, decode_transition_transaction_record},
     },
@@ -81,7 +82,7 @@ use rustfs_filemeta::FileInfo;
 use rustfs_rio::HashReader;
 use rustfs_s3_client::{admin_handler_utils::AdminError, provider_versions::ProviderVersionCapabilities};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
-use s3s::S3ErrorCode;
+use s3s::{S3ErrorCode, dto::BucketLifecycleConfiguration};
 
 use super::{
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_PERM_ERR},
@@ -694,6 +695,7 @@ fn tier_backend_identity_admin_error(err: io::Error) -> AdminError {
     admin_err
 }
 
+#[async_trait::async_trait]
 trait TierReferenceProofStore:
     EcstoreObjectIO
     + BucketOperations<Error = Error>
@@ -705,23 +707,21 @@ trait TierReferenceProofStore:
         WalkOptions = TierReferenceProofWalkOptions,
         WalkCancellation = tokio_util::sync::CancellationToken,
         WalkResultSender = tokio::sync::mpsc::Sender<StorageObjectInfoOrErr<ObjectInfo, Error>>,
-    >
+    > + Send
+    + Sync
 {
+    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>>;
 }
 
-impl<T> TierReferenceProofStore for T where
-    T: EcstoreObjectIO
-        + BucketOperations<Error = Error>
-        + ListOperations<
-            Error = Error,
-            ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>,
-            ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>,
-            ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>,
-            WalkOptions = TierReferenceProofWalkOptions,
-            WalkCancellation = tokio_util::sync::CancellationToken,
-            WalkResultSender = tokio::sync::mpsc::Sender<StorageObjectInfoOrErr<ObjectInfo, Error>>,
-        >
-{
+#[async_trait::async_trait]
+impl TierReferenceProofStore for ECStore {
+    async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+        match get_lifecycle_config(bucket).await {
+            Ok((config, _updated_at)) => Ok(Some(config)),
+            Err(Error::ConfigNotFound) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 async fn ensure_no_authoritative_tier_object_references<S>(
@@ -754,6 +754,7 @@ where
         .await
         .map_err(tier_reference_proof_admin_error)?;
     for bucket in buckets {
+        ensure_no_authoritative_lifecycle_references(api.as_ref(), &bucket.name, targets).await?;
         let mut marker = None;
         let mut version_marker = None;
         loop {
@@ -787,6 +788,66 @@ where
         }
     }
     ensure_no_authoritative_persisted_references(api, targets).await
+}
+
+async fn ensure_no_authoritative_lifecycle_references(
+    api: &impl TierReferenceProofStore,
+    bucket: &str,
+    targets: &[TierMutationIntentTarget],
+) -> std::result::Result<(), AdminError> {
+    match api.lifecycle_config_for_reference_proof(bucket).await {
+        Ok(Some(config)) => {
+            if let Some(reference) = lifecycle_config_target_reference(&config, targets) {
+                return Err(tier_reference_proof_lifecycle_in_use_error(
+                    reference.tier_name,
+                    bucket,
+                    reference.rule_id,
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Err(tier_reference_proof_admin_error(format!("bucket {bucket} lifecycle config: {err}")));
+        }
+    }
+    Ok(())
+}
+
+struct TierLifecycleReference<'a> {
+    tier_name: &'a str,
+    rule_id: Option<&'a str>,
+}
+
+fn lifecycle_config_target_reference<'a>(
+    config: &'a BucketLifecycleConfiguration,
+    targets: &[TierMutationIntentTarget],
+) -> Option<TierLifecycleReference<'a>> {
+    for rule in &config.rules {
+        let rule_id = rule.id.as_deref();
+        if let Some(transitions) = &rule.transitions {
+            for transition in transitions {
+                let Some(storage_class) = &transition.storage_class else {
+                    continue;
+                };
+                let tier_name = storage_class.as_str();
+                if !tier_name.is_empty() && targets.iter().any(|target| target.tier_name == tier_name) {
+                    return Some(TierLifecycleReference { tier_name, rule_id });
+                }
+            }
+        }
+        if let Some(noncurrent_version_transitions) = &rule.noncurrent_version_transitions {
+            for transition in noncurrent_version_transitions {
+                let Some(storage_class) = &transition.storage_class else {
+                    continue;
+                };
+                let tier_name = storage_class.as_str();
+                if !tier_name.is_empty() && targets.iter().any(|target| target.tier_name == tier_name) {
+                    return Some(TierLifecycleReference { tier_name, rule_id });
+                }
+            }
+        }
+    }
+    None
 }
 
 async fn ensure_no_authoritative_persisted_references<S>(
@@ -917,6 +978,15 @@ fn tier_reference_proof_in_use_error(tier_name: &str, object: &ObjectInfo) -> Ad
 fn tier_reference_proof_persisted_in_use_error(tier_name: &str, object: &str) -> AdminError {
     let mut err = ERR_TIER_BACKEND_IN_USE.clone();
     err.message = format!("Remote tier {tier_name} still has a persisted reference, for example {object}");
+    err
+}
+
+fn tier_reference_proof_lifecycle_in_use_error(tier_name: &str, bucket: &str, rule_id: Option<&str>) -> AdminError {
+    let mut err = ERR_TIER_BACKEND_IN_USE.clone();
+    err.message = match rule_id {
+        Some(rule_id) => format!("Remote tier {tier_name} is still referenced by lifecycle rule {rule_id} in bucket {bucket}"),
+        None => format!("Remote tier {tier_name} is still referenced by a lifecycle rule in bucket {bucket}"),
+    };
     err
 }
 
@@ -5308,6 +5378,10 @@ mod tests {
         endpoints::{Endpoints, PoolEndpoints, SetupType},
     };
     use crate::services::tier::tier_mutation_intent::TIER_MUTATION_INTENT_RECORD_PREFIX;
+    use s3s::dto::{
+        BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, NoncurrentVersionTransition, Transition,
+        TransitionStorageClass,
+    };
 
     struct SetupTypeGuard {
         previous: SetupType,
@@ -6090,6 +6164,13 @@ mod tests {
                 },
                 "tier-config-test-owner".to_string(),
             ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TierReferenceProofStore for LockingTierConfigStore {
+        async fn lifecycle_config_for_reference_proof(&self, _bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+            Ok(None)
         }
     }
 
@@ -11296,6 +11377,7 @@ mod tests {
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         lock_requests: Mutex<Vec<(String, String)>>,
         listed_versions: Mutex<Vec<ObjectInfo>>,
+        lifecycle_configs: Mutex<HashMap<String, BucketLifecycleConfiguration>>,
     }
 
     impl Default for CasConfigStore {
@@ -11316,6 +11398,7 @@ mod tests {
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 lock_requests: Mutex::new(Vec::new()),
                 listed_versions: Mutex::new(Vec::new()),
+                lifecycle_configs: Mutex::new(HashMap::new()),
             }
         }
     }
@@ -11340,6 +11423,13 @@ mod tests {
                 .lock()
                 .expect("tier reference fixture should not poison")
                 .push(object);
+        }
+
+        fn add_lifecycle_config(&self, bucket: &str, config: BucketLifecycleConfiguration) {
+            self.lifecycle_configs
+                .lock()
+                .expect("tier reference fixture should not poison")
+                .insert(bucket.to_string(), config);
         }
 
         async fn insert_config_object(&self, object: String, data: Vec<u8>) {
@@ -11917,6 +12007,18 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl TierReferenceProofStore for CasConfigStore {
+        async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
+            Ok(self
+                .lifecycle_configs
+                .lock()
+                .expect("tier reference fixture should not poison")
+                .get(bucket)
+                .cloned())
+        }
+    }
+
     #[tokio::test]
     async fn remove_and_clear_full_update_paths_preserve_force() {
         let remove_store = Arc::new(CasConfigStore::default());
@@ -12088,6 +12190,96 @@ mod tests {
             .expect_err("references to the old destination identity must block rebind");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
         assert!(err.message.contains("photos/2026/old-destination.jpg"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn zero_reference_proof_blocks_lifecycle_transition_references() {
+        let current = build_rustfs_tier("COLD-A");
+        let current_identity = tier_backend_identity(&current).expect("current identity should encode");
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: Some(current_identity),
+            new_backend_identity: None,
+        };
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("move-current".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: Some(1),
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                }]),
+            }],
+        };
+        let store = Arc::new(CasConfigStore::default());
+        store.add_listed_version(ObjectInfo {
+            bucket: "photos".to_string(),
+            name: "safe.txt".to_string(),
+            ..Default::default()
+        });
+        store.add_lifecycle_config("photos", config);
+
+        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+            .await
+            .expect_err("lifecycle rule should block deletion");
+
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(err.message.contains("move-current"), "{}", err.message);
+        assert!(err.message.contains("photos"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn zero_reference_proof_blocks_lifecycle_noncurrent_transition_references() {
+        let current = build_rustfs_tier("COLD-A");
+        let current_identity = tier_backend_identity(&current).expect("current identity should encode");
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: Some(current_identity),
+            new_backend_identity: None,
+        };
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("move-noncurrent".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: None,
+                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                }]),
+                prefix: None,
+                transitions: None,
+            }],
+        };
+        let store = Arc::new(CasConfigStore::default());
+        store.add_listed_version(ObjectInfo {
+            bucket: "photos".to_string(),
+            name: "safe.txt".to_string(),
+            ..Default::default()
+        });
+        store.add_lifecycle_config("photos", config);
+
+        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+            .await
+            .expect_err("lifecycle rule should block deletion");
+
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(err.message.contains("move-noncurrent"), "{}", err.message);
+        assert!(err.message.contains("photos"), "{}", err.message);
     }
 
     #[tokio::test]

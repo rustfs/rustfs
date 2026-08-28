@@ -3820,7 +3820,15 @@ impl DefaultObjectUsecase {
         Box::pin(self.execute_get_object_inner(req))
     }
 
+    fn complete_get_object_error<T>(helper: OperationHelper, err: S3Error) -> S3Result<S3Response<T>> {
+        let result = Err(err);
+        let _ = helper.complete(&result);
+        result
+    }
+
     async fn execute_get_object_inner(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -3840,7 +3848,10 @@ impl DefaultObjectUsecase {
                 context.start_time.elapsed().as_secs_f64(),
             );
         }
-        let bootstrap = self.init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
+        let bootstrap = match self.init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id) {
+            Ok(bootstrap) => bootstrap,
+            Err(err) => return Self::complete_get_object_error(helper, err),
+        };
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_REQUEST_SHAPE, request_shape_start);
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
@@ -3848,7 +3859,6 @@ impl DefaultObjectUsecase {
         let concurrent_requests = bootstrap.concurrent_requests;
         let mut lifecycle = GetObjectBodyLifecycle::tracked(bootstrap.request_guard);
 
-        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
         // mc get 3
 
         // Cheap request-shape validations run first so invalid requests keep
@@ -3858,7 +3868,7 @@ impl DefaultObjectUsecase {
             Ok(validated) => validated,
             Err(err) => {
                 lifecycle.finish_err();
-                return Err(err);
+                return Self::complete_get_object_error(helper, err);
             }
         };
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_REQUEST_VALIDATION, request_validation_start);
@@ -3875,7 +3885,10 @@ impl DefaultObjectUsecase {
         let store_lookup_start = stage_metrics_enabled.then(std::time::Instant::now);
         let Some(store) = self.object_store() else {
             lifecycle.finish_err();
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+            return Self::complete_get_object_error(
+                helper,
+                S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()),
+            );
         };
         if let Some(store_lookup_start) = store_lookup_start {
             rustfs_io_metrics::record_get_object_stage_duration(
@@ -3887,7 +3900,7 @@ impl DefaultObjectUsecase {
         let bucket_validation_start = stage_metrics_enabled.then(std::time::Instant::now);
         if let Err(err) = validate_bucket_exists(&store, &req.input.bucket).await {
             lifecycle.finish_err();
-            return Err(err);
+            return Self::complete_get_object_error(helper, err);
         }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BUCKET_VALIDATION, bucket_validation_start);
 
@@ -3896,7 +3909,7 @@ impl DefaultObjectUsecase {
             Ok(request_context) => request_context,
             Err(err) => {
                 lifecycle.finish_err();
-                return Err(err);
+                return Self::complete_get_object_error(helper, err);
             }
         };
         if let Some(request_context_start) = request_context_start {
@@ -3951,7 +3964,7 @@ impl DefaultObjectUsecase {
                     return result;
                 }
                 lifecycle.finish_err();
-                return Err(err);
+                return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
             }
         };
         let GetObjectPreparedRead { io_planning, read_setup } = prepared_read;
@@ -4040,7 +4053,7 @@ impl DefaultObjectUsecase {
             .await;
         let output_context = match output_context {
             Ok(output_context) => output_context,
-            Err(err) => return Err(err),
+            Err(err) => return Self::complete_get_object_error(helper.version_id(version_id_for_event), err),
         };
         if let Some(output_build_start) = output_build_start {
             rustfs_io_metrics::record_get_object_stage_duration(
