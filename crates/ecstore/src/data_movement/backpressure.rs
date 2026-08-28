@@ -15,7 +15,8 @@
 use crate::error::{Error, Result};
 use crate::runtime::sources::{self as runtime_sources, WorkloadSnapshotProviderRef};
 use metrics::{counter, histogram};
-use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
+use rustfs_concurrency::workload::ForegroundPressure;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -137,23 +138,6 @@ async fn wait_for_data_movement_admission_with_provider(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ForegroundPressure {
-    class: WorkloadClass,
-    usage_pct: usize,
-    threshold_pct: usize,
-}
-
-impl ForegroundPressure {
-    const fn reason(self) -> &'static str {
-        match self.class {
-            WorkloadClass::ForegroundRead => "foreground_read_pressure",
-            WorkloadClass::ForegroundWrite => "foreground_write_pressure",
-            _ => "foreground_pressure",
-        }
-    }
-}
-
 fn foreground_pressure(
     config: &DataMovementBackpressureConfig,
     provider: Option<&(dyn WorkloadAdmissionSnapshotProvider + Send + Sync)>,
@@ -163,39 +147,11 @@ fn foreground_pressure(
     }
 
     let snapshot = provider?.workload_admission_snapshot();
-    [
-        (WorkloadClass::ForegroundRead, config.foreground_read_high_percent),
-        (WorkloadClass::ForegroundWrite, config.foreground_write_high_percent),
-    ]
-    .into_iter()
-    .filter_map(|(class, threshold_pct)| {
-        if threshold_pct == 0 {
-            return None;
-        }
-
-        let entry = snapshot.get(class)?;
-        let usage_pct = if matches!(entry.state, AdmissionState::Saturated) {
-            100
-        } else {
-            let limit = entry.limit?;
-            if limit == 0 {
-                return None;
-            }
-            entry
-                .active
-                .unwrap_or(0)
-                .saturating_mul(100)
-                .checked_div(limit)
-                .unwrap_or(100)
-        };
-
-        (usage_pct >= threshold_pct).then_some(ForegroundPressure {
-            class,
-            usage_pct,
-            threshold_pct,
-        })
-    })
-    .max_by_key(|pressure| pressure.usage_pct)
+    rustfs_concurrency::workload::foreground_pressure(
+        &snapshot,
+        config.foreground_read_high_percent,
+        config.foreground_write_high_percent,
+    )
 }
 
 fn record_delay_start(
@@ -276,7 +232,7 @@ fn record_delay_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_concurrency::{WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot};
+    use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
     use std::sync::Arc;
 
     #[derive(Debug)]

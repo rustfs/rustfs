@@ -979,8 +979,8 @@ pub(crate) mod bucket {
 
 pub(crate) mod concurrency {
     pub(crate) use crate::storage::storage_api::concurrency_consumer::{
-        ConcurrencyManager, DiskReadAdmission, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectAdmission, PutObjectGuard,
-        get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
+        ConcurrencyManager, DiskReadAdmission, ForegroundWriteAdmission, GetObjectGuard, IoQueueStatus, IoStrategy,
+        PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
     };
 }
 

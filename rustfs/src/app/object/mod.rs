@@ -57,8 +57,8 @@ use super::storage_api::object_usecase::bucket::{
     versioning_sys::BucketVersioningSys,
 };
 use super::storage_api::object_usecase::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-use super::storage_api::object_usecase::concurrency::{
-    self, ConcurrencyManager, DiskReadAdmission, GetObjectGuard, PutObjectAdmission, PutObjectGuard,
+pub(crate) use super::storage_api::object_usecase::concurrency::{
+    self, ConcurrencyManager, DiskReadAdmission, ForegroundWriteAdmission, GetObjectGuard, PutObjectGuard,
     get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
 };
 #[cfg(test)]

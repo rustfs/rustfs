@@ -180,6 +180,14 @@ const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
 
 const GET_OBJECT_STAGE_REQUEST_INGRESS_TO_CONTEXT: &str = "request_ingress_to_context";
 
+const GET_OBJECT_STAGE_REQUEST_SHAPE: &str = "request_shape";
+
+const GET_OBJECT_STAGE_REQUEST_VALIDATION: &str = "request_validation";
+
+const GET_OBJECT_STAGE_BUCKET_VALIDATION: &str = "bucket_validation";
+
+const GET_OBJECT_STAGE_RESPONSE_FINALIZE: &str = "response_finalize";
+
 const GET_OBJECT_STAGE_OUTPUT_STRATEGY: &str = "output_strategy";
 
 const GET_OBJECT_STAGE_BODY_BUILD: &str = "body_build";
@@ -3817,6 +3825,8 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
+        let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let request_shape_start = stage_metrics_enabled.then(std::time::Instant::now);
         let inbound_request_context = req.extensions.get::<request_context::RequestContext>();
         let request_id = inbound_request_context
             .map(|ctx| ctx.request_id.clone())
@@ -3831,6 +3841,7 @@ impl DefaultObjectUsecase {
             );
         }
         let bootstrap = self.init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_REQUEST_SHAPE, request_shape_start);
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
         let request_start = bootstrap.request_start;
@@ -3842,6 +3853,7 @@ impl DefaultObjectUsecase {
 
         // Cheap request-shape validations run first so invalid requests keep
         // their InvalidArgument precedence over bucket existence.
+        let request_validation_start = stage_metrics_enabled.then(std::time::Instant::now);
         let validated = match Self::validate_get_object_request(&req) {
             Ok(validated) => validated,
             Err(err) => {
@@ -3849,6 +3861,7 @@ impl DefaultObjectUsecase {
                 return Err(err);
             }
         };
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_REQUEST_VALIDATION, request_validation_start);
 
         // SF05: Store lookup next (5s-TTL bucket-validation cache). Bucket
         // existence is established before any bucket-metadata work, so requests
@@ -3859,24 +3872,26 @@ impl DefaultObjectUsecase {
         let object_metadata_progress = object_traffic_health
             .as_deref()
             .and_then(ObjectTrafficHealth::track_read_metadata);
-        let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+        let store_lookup_start = stage_metrics_enabled.then(std::time::Instant::now);
         let Some(store) = self.object_store() else {
             lifecycle.finish_err();
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-        if let Err(err) = validate_bucket_exists(&store, &req.input.bucket).await {
-            lifecycle.finish_err();
-            return Err(err);
-        }
         if let Some(store_lookup_start) = store_lookup_start {
             rustfs_io_metrics::record_get_object_stage_duration(
-                "s3_handler",
+                GET_OBJECT_STAGE_PATH_S3_HANDLER,
                 "store_lookup",
                 store_lookup_start.elapsed().as_secs_f64(),
             );
         }
+        let bucket_validation_start = stage_metrics_enabled.then(std::time::Instant::now);
+        if let Err(err) = validate_bucket_exists(&store, &req.input.bucket).await {
+            lifecycle.finish_err();
+            return Err(err);
+        }
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BUCKET_VALIDATION, bucket_validation_start);
 
-        let request_context_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+        let request_context_start = stage_metrics_enabled.then(std::time::Instant::now);
         let request_context = match Self::prepare_get_object_request_context(validated, &req.headers).await {
             Ok(request_context) => request_context,
             Err(err) => {
@@ -4051,7 +4066,8 @@ impl DefaultObjectUsecase {
             optimal_buffer_size,
         );
 
-        Self::finalize_get_object_response(
+        let response_finalize_start = stage_metrics_enabled.then(std::time::Instant::now);
+        let response = Self::finalize_get_object_response(
             helper,
             &bucket,
             &req.method,
@@ -4061,7 +4077,9 @@ impl DefaultObjectUsecase {
             output,
             extra_checksum_headers,
         )
-        .await
+        .await;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_RESPONSE_FINALIZE, response_finalize_start);
+        response
     }
 
     pub async fn execute_get_object_attributes(
