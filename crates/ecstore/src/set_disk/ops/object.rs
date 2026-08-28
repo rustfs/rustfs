@@ -30,11 +30,11 @@ use super::super::{
     GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_INTERNAL_META,
     GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT,
     GET_STAGE_INLINE_PREPARE, GET_STAGE_LOCK_ACQUIRE, GET_STAGE_METADATA, GET_STAGE_OBJECT_INFO, GET_STAGE_PATH_DECISION,
-    GET_STAGE_READER_SETUP, GenericError, GetCodecStreamingDecision, GetDirectMemoryDecision, GetObjectReader, HTTPRangeSpec,
-    HashAlgorithm, HashMap, HashReader, HashSet, HeaderMap, HealChannelPriority, InstanceContext, Instant, LOG_COMPONENT_ECSTORE,
-    LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo, ObjectKey, ObjectLockConfigSnapshot,
-    ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime, Ordering, Pin, PutObjReader,
-    RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReaderImpl, ReplicateDecision, ReplicationObjectBridge, Result,
+    GET_STAGE_READER_SETUP, GenericError, GetCodecStreamingDecision, GetCodecStreamingFallbackReason, GetDirectMemoryDecision,
+    GetObjectReader, HTTPRangeSpec, HashAlgorithm, HashMap, HashReader, HashSet, HeaderMap, HealChannelPriority, InstanceContext,
+    Instant, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo, ObjectKey,
+    ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime, Ordering, Pin,
+    PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReaderImpl, ReplicateDecision, ReplicationObjectBridge, Result,
     SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE,
     SUFFIX_RESTORE_OPERATION_ID, SetDisks, SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid,
     WriteLayout, X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE,
@@ -1885,6 +1885,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         }
 
         if object_info.is_remote() {
+            let decision = GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote);
+            record_get_codec_streaming_gate_decision(object_class, decision, size_bucket);
+            rustfs_io_metrics::record_get_object_codec_streaming_fallback(GetCodecStreamingFallbackReason::Remote.as_str());
             record_get_object_reader_path_observation(GET_OBJECT_PATH_REMOTE_TRANSITION, object_class, size_bucket);
             let mut opts = opts.clone();
             if object_info.parts.len() == 1 {
@@ -1908,9 +1911,6 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // Keep the rollout/configuration gate deferred until the request
         // really needs codec streaming so an opted-out codec path cannot add
         // fixed cost to the inline/direct-memory/mid-size hot paths.
-        let path_decision_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
-
         // App-layer object data cache probe: metadata (etag/size) is resolved
         // but no data shards have been read yet, so a hit skips the erasure
         // read, bitrot verify and decode entirely. The hook validates object
@@ -2075,6 +2075,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
         }
 
+        let path_decision_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let codec_streaming_gate = get_codec_streaming_reader_gate(
             bucket,
             object,
@@ -2084,6 +2085,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             fi,
             lock_optimization_enabled,
         );
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
 
         match codec_streaming_gate.decision {
             GetCodecStreamingDecision::Use => {

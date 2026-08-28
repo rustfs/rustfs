@@ -617,7 +617,8 @@ where
 
         loop {
             if self.output_pos < self.output_buf.len() {
-                if self.prefetched_bufs.len() < self.fill_policy.max_inflight()
+                if self.fill_policy == FillPolicy::DualInFlight
+                    && self.prefetched_bufs.len() < self.fill_policy.max_inflight()
                     && self.prefetch_error.is_none()
                     && self.remaining > 0
                     && let Poll::Ready(result) = self.poll_prefetch(cx)
@@ -1689,6 +1690,36 @@ mod tests {
         }
 
         assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn single_inflight_reader_does_not_prefetch_before_output_is_drained() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..96u8).collect::<Vec<_>>();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let mut source = source_from_data(&erasure, &data, &[]);
+        source.read_count = Some(Arc::clone(&read_count));
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_single_inflight_with_metrics_path(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+        )
+        .expect("single-inflight reader should be constructed");
+        let mut first = [0u8; 3];
+
+        reader
+            .read_exact(&mut first)
+            .await
+            .expect("first partial read should succeed");
+
+        assert_eq!(
+            read_count.load(Ordering::SeqCst),
+            1,
+            "single-inflight must not prefetch while output remains"
+        );
+        assert_eq!(&first, &data[..3]);
     }
 
     #[tokio::test]
