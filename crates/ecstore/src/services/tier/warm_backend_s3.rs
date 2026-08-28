@@ -26,7 +26,7 @@ use crate::services::tier::{
     tier_config::TierS3,
     warm_backend::{
         TransitionCandidateIdentity, TransitionCandidateProbe, TransitionCandidateReconciler, WarmBackend, WarmBackendGetOpts,
-        build_transition_put_options,
+        build_transition_put_options, validate_tier_endpoint_url,
     },
 };
 use http::HeaderMap;
@@ -41,7 +41,6 @@ use rustfs_s3_client::{
     transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore},
     transition_api::{ReadCloser, ReaderImpl},
 };
-use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use s3s::dto::BucketVersioningStatus;
 
@@ -90,7 +89,7 @@ impl WarmBackendS3 {
                 return Err(std::io::Error::other(err.to_string()));
             }
         };
-        validate_outbound_url(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
+        validate_tier_endpoint_url(&u)?;
 
         if conf.aws_role_web_identity_token_file == "" && conf.aws_role_arn != ""
             || conf.aws_role_web_identity_token_file != "" && conf.aws_role_arn == ""

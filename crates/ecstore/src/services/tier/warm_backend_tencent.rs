@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::services::tier::{
     tier_config::TierTencent,
-    warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
+    warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options, validate_tier_endpoint_url},
     warm_backend_s3::WarmBackendS3,
 };
 use rustfs_s3_client::{
@@ -32,7 +32,6 @@ use rustfs_s3_client::{
     credentials::{Credentials, SignatureType, Static, Value},
     transition_api::{BucketLookupType, Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
-use rustfs_utils::egress::validate_outbound_url;
 use tracing::warn;
 
 const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
@@ -58,7 +57,7 @@ impl WarmBackendTencent {
                 return Err(std::io::Error::other(e.to_string()));
             }
         };
-        validate_outbound_url(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
+        validate_tier_endpoint_url(&u)?;
 
         let creds = Credentials::new(Static(Value {
             access_key_id: conf.access_key.clone(),

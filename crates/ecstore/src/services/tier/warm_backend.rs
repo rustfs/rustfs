@@ -41,6 +41,7 @@ use rustfs_s3_client::{
     api_put_object::{AdvancedPutOptions, PutObjectOptions},
     transition_api::{ReadCloser, ReaderImpl},
 };
+use rustfs_utils::egress::OutboundPolicy;
 use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
@@ -53,10 +54,30 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
 use tracing::{info, warn};
+use url::Url;
 
 pub type WarmBackendImpl = Box<dyn WarmBackend + Send + Sync + 'static>;
 
 const PROBE_OBJECT: &str = "probeobject";
+
+/// Validates a warm-tier `endpoint` URL against the shared outbound policy
+/// (crates/utils/src/egress.rs), the same fail-closed check already applied to
+/// webhook targets and OIDC discovery URLs. By default this rejects loopback,
+/// RFC1918/link-local, and known cloud metadata-service hosts; an operator can
+/// allowlist one exact self-hosted origin via `RUSTFS_OUTBOUND_ALLOW_ORIGINS`
+/// (metadata, link-local, and unspecified addresses can never be allowlisted).
+///
+/// Every `WarmBackendXxx::new` constructor must call this immediately after
+/// parsing `conf.endpoint` and before building any credentials or network
+/// client, so a tier endpoint can never reach the network unvalidated
+/// regardless of provider (rustfs/backlog#2039 adversarial-review finding).
+pub(crate) fn validate_tier_endpoint_url(url: &Url) -> Result<(), std::io::Error> {
+    let policy =
+        OutboundPolicy::from_env_cached().map_err(|err| std::io::Error::other(format!("invalid outbound policy: {err}")))?;
+    policy
+        .validate_url(url)
+        .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))
+}
 
 #[derive(Default)]
 pub struct WarmBackendGetOpts {

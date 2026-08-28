@@ -32,14 +32,13 @@ use std::convert::TryFrom;
 
 use crate::services::tier::{
     tier_config::TierGCS,
-    warm_backend::{WarmBackend, WarmBackendGetOpts},
+    warm_backend::{WarmBackend, WarmBackendGetOpts, validate_tier_endpoint_url},
 };
 use rustfs_s3_client::{
     admin_handler_utils::AdminError,
     api_put_object::PutObjectOptions,
     transition_api::{Options, ReadCloser, ReaderImpl},
 };
-use rustfs_utils::egress::validate_outbound_url;
 use tracing::warn;
 
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
@@ -76,8 +75,7 @@ impl WarmBackendGCS {
 
         if !conf.endpoint.is_empty() {
             let endpoint_url = url::Url::parse(&conf.endpoint).map_err(|e| std::io::Error::other(e.to_string()))?;
-            validate_outbound_url(&endpoint_url)
-                .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
+            validate_tier_endpoint_url(&endpoint_url)?;
         }
 
         let authorized_user = serde_json::from_str(&conf.creds)?;

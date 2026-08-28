@@ -23,7 +23,9 @@ use std::sync::Arc;
 
 use crate::services::tier::{
     tier_config::TierRustFS,
-    warm_backend::{TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options},
+    warm_backend::{
+        TransitionCandidateProbe, WarmBackend, WarmBackendGetOpts, build_transition_put_options, validate_tier_endpoint_url,
+    },
     warm_backend_s3::WarmBackendS3,
 };
 use rustfs_s3_client::{
@@ -32,7 +34,6 @@ use rustfs_s3_client::{
     credentials::{Credentials, SignatureType, Static, Value},
     transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
-use rustfs_utils::egress::validate_outbound_url;
 
 const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
 const MAX_PARTS_COUNT: i64 = 10000;
@@ -55,7 +56,7 @@ impl WarmBackendRustFS {
             Ok(u) => u,
             Err(e) => return Err(std::io::Error::other(e)),
         };
-        validate_outbound_url(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
+        validate_tier_endpoint_url(&u)?;
 
         let creds = Credentials::new(Static(Value {
             access_key_id: conf.access_key.clone(),
@@ -186,18 +187,25 @@ mod tests {
         }
     }
 
+    // `validate_tier_endpoint_url` now runs before this constructor's own
+    // `u.host_str()` check, and it only accepts a parsed URL once its scheme
+    // is http(s) and its host is non-empty (http/https can never parse with a
+    // missing host per the WHATWG URL spec), so that local host check is
+    // unreachable in practice. This regression instead pins the shared policy
+    // rejecting a non-http(s) endpoint scheme, which is the case that now
+    // actually exercises this path first.
     #[tokio::test]
-    async fn new_returns_error_when_endpoint_has_no_host() {
+    async fn new_rejects_endpoint_with_disallowed_scheme() {
         let conf = rustfs_tier("rustfs://");
 
         let outcome = AssertUnwindSafe(WarmBackendRustFS::new(&conf, "tier")).catch_unwind().await;
 
         let result = outcome.expect("initialization should return an error instead of panicking");
         let err = match result {
-            Ok(_) => panic!("endpoint without host must be rejected"),
+            Ok(_) => panic!("endpoint with a non-http(s) scheme must be rejected"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("host"), "expected host validation error, got: {err}");
+        assert!(err.to_string().contains("scheme"), "expected scheme validation error, got: {err}");
     }
 
     #[tokio::test]
