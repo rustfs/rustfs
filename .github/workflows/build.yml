@@ -1065,7 +1065,7 @@ jobs:
           while IFS= read -r preview_tag; do
             [[ -n "$preview_tag" ]] || continue
             echo "🧹 Deleting preview release $preview_tag (tag kept)"
-            gh release delete "$preview_tag" --yes
+            gh release delete "$preview_tag" --repo "${GITHUB_REPOSITORY}" --yes
             DELETED=$((DELETED + 1))
           done < <(
             jq -r --arg tag "$TAG" '
