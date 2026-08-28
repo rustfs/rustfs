@@ -15,20 +15,11 @@
 //! E2E tests for group management (fixes #2028).
 
 use crate::common::{RustFSTestEnvironment, admin_ok, admin_request, init_logging};
-use aws_sdk_s3::config::{Credentials, Region};
-use aws_sdk_s3::{Client, Config};
+use aws_sdk_s3::Client;
 use tracing::info;
 
 fn create_user_s3_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str) -> Client {
-    let credentials = Credentials::new(access_key, secret_key, None, None, "e2e-group-test");
-    let config = Config::builder()
-        .credentials_provider(credentials)
-        .region(Region::new("us-east-1"))
-        .endpoint_url(&env.url)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-    Client::from_conf(config)
+    env.create_s3_client_with_credentials(access_key, secret_key)
 }
 
 #[tokio::test(flavor = "multi_thread")]

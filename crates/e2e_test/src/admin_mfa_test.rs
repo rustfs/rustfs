@@ -59,8 +59,8 @@ mod tests {
 
     /// One signed admin request, returning the status and the raw body.
     ///
-    /// Signs with `UNSIGNED_PAYLOAD` so the body does not participate in the
-    /// hash, matching how the other admin e2e tests drive these routes.
+    /// Thin wrapper over [`crate::common::admin_request`], kept local so the
+    /// call sites below keep their `Option<&str>` body shape.
     async fn signed_request(
         base_url: &str,
         method: http::Method,
@@ -69,30 +69,7 @@ mod tests {
         access_key: &str,
         secret_key: &str,
     ) -> Result<(reqwest::StatusCode, String), Box<dyn Error + Send + Sync>> {
-        let url = format!("{base_url}{path}");
-        let uri = url.parse::<http::Uri>()?;
-        let authority = uri.authority().ok_or("missing authority")?.to_string();
-        let body_bytes = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
-
-        let request = http::Request::builder()
-            .method(method.clone())
-            .uri(uri)
-            .header(HOST, authority)
-            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-        let signed = sign_v4(request.body(Body::empty())?, 0, access_key, secret_key, "", "us-east-1");
-
-        let client = local_http_client();
-        let mut builder = client.request(method, url.as_str());
-        for (name, value) in signed.headers() {
-            builder = builder.header(name, value);
-        }
-        if !body_bytes.is_empty() {
-            builder = builder.body(body_bytes);
-        }
-        let response = builder.send().await?;
-        let status = response.status();
-        let text = response.text().await?;
-        Ok((status, text))
+        crate::common::admin_request(base_url, method, path, body.map(str::to_string), access_key, secret_key).await
     }
 
     /// A SigV4-signed `AssumeRole` form POST, optionally carrying a second factor.

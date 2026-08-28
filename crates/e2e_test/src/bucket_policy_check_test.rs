@@ -15,39 +15,23 @@
 //! Regression test for Issue #1423
 //! Verifies that Bucket Policies are honored for Authenticated Users.
 
-use crate::common::{RustFSTestEnvironment, init_logging};
-use aws_sdk_s3::config::{Credentials, Region};
+use crate::common::{AdminTransport, RustFSTestEnvironment, admin_create_user_via, init_logging};
+use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::{Client, Config};
 use tracing::info;
 
+/// This suite deliberately drives the admin API through the external `awscurl`
+/// binary, so user creation pins `AdminTransport::Awscurl`.
 async fn create_user(
     env: &RustFSTestEnvironment,
     username: &str,
     password: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let create_user_body = serde_json::json!({
-        "secretKey": password,
-        "status": "enabled"
-    })
-    .to_string();
-
-    let create_user_url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
-    crate::common::awscurl_put(&create_user_url, &create_user_body, &env.access_key, &env.secret_key).await?;
-    Ok(())
+    admin_create_user_via(AdminTransport::Awscurl, &env.url, &env.access_key, &env.secret_key, username, password).await
 }
 
 fn create_user_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str) -> Client {
-    let credentials = Credentials::new(access_key, secret_key, None, None, "test-user");
-    let config = Config::builder()
-        .credentials_provider(credentials)
-        .region(Region::new("us-east-1"))
-        .endpoint_url(&env.url)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-
-    Client::from_conf(config)
+    env.create_s3_client_with_credentials(access_key, secret_key)
 }
 
 #[tokio::test]

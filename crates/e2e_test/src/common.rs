@@ -1744,28 +1744,126 @@ pub(crate) async fn admin_create_user(
     username: &str,
     secret_key: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", env.url, username);
-    let body = serde_json::json!({
-        "secretKey": secret_key,
-        "status": "enabled"
-    });
-    let response = signed_request(
-        http::Method::PUT,
-        &url,
-        &env.access_key,
-        &env.secret_key,
-        Some(body.to_string().into_bytes()),
-        Some("application/json"),
-    )
-    .await?;
+    admin_create_user_via(AdminTransport::Signed, &env.url, &env.access_key, &env.secret_key, username, secret_key).await
+}
 
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("create user failed: {status} {body}").into());
+/// Transport used by the shared admin-API helpers: in-process SigV4 signing
+/// via [`signed_request`], or the external `awscurl` binary (an independent
+/// SigV4 implementation exercised by the awscurl-gated suites).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdminTransport {
+    Signed,
+    Awscurl,
+}
+
+/// Execute an admin-API request against `base_url` with admin credentials over
+/// the chosen transport, failing on any non-success response.
+pub(crate) async fn admin_execute_at(
+    transport: AdminTransport,
+    method: http::Method,
+    base_url: &str,
+    admin_access_key: &str,
+    admin_secret_key: &str,
+    path_and_query: &str,
+    body: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!("{base_url}{path_and_query}");
+    match transport {
+        AdminTransport::Signed => {
+            let content_type = match body {
+                Some(body) if !body.is_empty() => Some("application/json"),
+                _ => None,
+            };
+            let response = signed_request(
+                method.clone(),
+                &url,
+                admin_access_key,
+                admin_secret_key,
+                body.map(|body| body.as_bytes().to_vec()),
+                content_type,
+            )
+            .await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(format!("{method} {path_and_query} failed: {status} {text}").into());
+            }
+        }
+        AdminTransport::Awscurl => {
+            execute_awscurl(&url, method.as_str(), body, admin_access_key, admin_secret_key).await?;
+        }
     }
-
     Ok(())
+}
+
+/// Create a new IAM user via the admin API over the chosen transport.
+pub(crate) async fn admin_create_user_via(
+    transport: AdminTransport,
+    base_url: &str,
+    admin_access_key: &str,
+    admin_secret_key: &str,
+    username: &str,
+    secret_key: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = format!("/rustfs/admin/v3/add-user?accessKey={username}");
+    let body = serde_json::json!({"secretKey": secret_key, "status": "enabled"}).to_string();
+    admin_execute_at(
+        transport,
+        http::Method::PUT,
+        base_url,
+        admin_access_key,
+        admin_secret_key,
+        &path,
+        Some(&body),
+    )
+    .await
+}
+
+/// Install a canned policy via the admin API over the chosen transport.
+pub(crate) async fn admin_add_canned_policy_via(
+    transport: AdminTransport,
+    base_url: &str,
+    admin_access_key: &str,
+    admin_secret_key: &str,
+    policy_name: &str,
+    policy_json: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = format!("/rustfs/admin/v3/add-canned-policy?name={policy_name}");
+    admin_execute_at(
+        transport,
+        http::Method::PUT,
+        base_url,
+        admin_access_key,
+        admin_secret_key,
+        &path,
+        Some(policy_json),
+    )
+    .await
+}
+
+/// Attach a canned policy to a user via the admin API over the chosen transport.
+pub(crate) async fn admin_attach_user_policy_via(
+    transport: AdminTransport,
+    base_url: &str,
+    admin_access_key: &str,
+    admin_secret_key: &str,
+    policy_name: &str,
+    username: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let path = format!("/rustfs/admin/v3/set-user-or-group-policy?policyName={policy_name}&userOrGroup={username}&isGroup=false");
+    // `Some("")` preserves the historical wire shape on both transports: awscurl
+    // keeps sending `-d ''` and the signed path attaches an empty body with no
+    // content type.
+    admin_execute_at(
+        transport,
+        http::Method::PUT,
+        base_url,
+        admin_access_key,
+        admin_secret_key,
+        &path,
+        Some(""),
+    )
+    .await
 }
 
 #[cfg(test)]

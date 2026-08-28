@@ -46,7 +46,7 @@
 //!      retry serves the object locally until expiry, and expiry leaves the
 //!      remote object available for a second restore.
 
-use crate::common::{RustFSTestEnvironment, local_http_client};
+use crate::common::RustFSTestEnvironment;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -56,10 +56,6 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use http::Method;
-use http::header::HOST;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use s3s::Body;
 use serde::Deserialize;
 use std::time::{Duration as StdDuration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -131,9 +127,8 @@ fn payload() -> Vec<u8> {
 
 /// Sign and send an admin request in-process (no `awscurl`).
 ///
-/// Mirrors the shared admin-API e2e pattern: the SigV4 signature is computed
-/// over `UNSIGNED_PAYLOAD`, so the JSON body rides on the wire without being
-/// pre-hashed. Returns the response status and body text.
+/// Thin wrapper over [`crate::common::admin_request`], kept local so the call
+/// sites below keep their `Option<&str>` body shape.
 async fn signed_admin_request(
     base_url: &str,
     method: Method,
@@ -142,30 +137,7 @@ async fn signed_admin_request(
     access_key: &str,
     secret_key: &str,
 ) -> Result<(reqwest::StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{base_url}{path}");
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-    let body_bytes = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
-
-    let request = http::Request::builder()
-        .method(method.clone())
-        .uri(uri)
-        .header(HOST, authority)
-        .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    let signed = sign_v4(request.body(Body::empty())?, 0, access_key, secret_key, "", "us-east-1");
-
-    let client = local_http_client();
-    let mut request_builder = client.request(method, url.as_str());
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if !body_bytes.is_empty() {
-        request_builder = request_builder.body(body_bytes);
-    }
-    let response = request_builder.send().await?;
-    let status = response.status();
-    let text = response.text().await?;
-    Ok((status, text))
+    crate::common::admin_request(base_url, method, path, body.map(str::to_string), access_key, secret_key).await
 }
 
 /// Wire `hot` -> `cold` as a `TierType::RustFS` remote tier via `AddTier`.
