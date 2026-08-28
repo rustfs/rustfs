@@ -20,7 +20,7 @@ mod durable_namespace;
 pub mod evaluator;
 pub mod manual_transition_job;
 mod metadata_boundary;
-pub(crate) use metadata_boundary::{LifecycleExpiryConfigs, get_expiry_configs};
+pub(crate) use metadata_boundary::{LifecycleExpiryConfigs, get_expiry_configs, get_lifecycle_config};
 mod object_handlers_common;
 mod object_lock_boundary;
 pub use self::core as lifecycle;

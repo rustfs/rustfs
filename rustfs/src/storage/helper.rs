@@ -23,7 +23,7 @@ use http::StatusCode;
 use metrics::counter;
 use rustfs_audit::{
     ObjectVersion,
-    entity::{ApiDetails, ApiDetailsBuilder, AuditEntryBuilder},
+    entity::{ApiDetailsBuilder, AuditEntryBuilder},
     global::AuditLogger,
 };
 use rustfs_io_metrics::record_s3_op;
@@ -136,7 +136,7 @@ impl OperationHelper {
 
         record_s3_op(op);
 
-        // Fast path: when both chains are disabled, avoid all request parsing/builder work.
+        // Fast path: when both chains are disabled, avoid audit/notify builder work.
         if !audit_enabled && !notify_enabled {
             return Self::Disabled;
         }
@@ -180,7 +180,7 @@ impl OperationHelper {
 
         let audit_builder = if audit_enabled {
             Some(
-                AuditEntryBuilder::new("1.0", event, trigger, ApiDetails::default())
+                AuditEntryBuilder::new("1.0", event, trigger, api_builder.clone().build())
                     .remote_host(remote_host)
                     .user_agent(get_request_user_agent(&req.headers))
                     .req_host(get_request_host(&req.headers))
@@ -453,8 +453,8 @@ mod tests {
     use rustfs_s3_ops::S3Operation;
     use rustfs_s3_types::EventName;
     use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
-    use s3s::dto::{DeleteObjectTaggingInput, DeleteObjectTaggingOutput};
-    use s3s::{S3Request, S3Response};
+    use s3s::dto::{DeleteObjectTaggingInput, DeleteObjectTaggingOutput, GetObjectInput, GetObjectOutput};
+    use s3s::{S3Error, S3ErrorCode, S3Request, S3Response};
     use std::sync::{Arc, Mutex};
     use temp_env::{async_with_vars, with_vars};
 
@@ -611,6 +611,71 @@ mod tests {
                 };
                 let audit_entry = state.audit_builder.take().expect("audit builder should exist").build();
                 assert_eq!(audit_entry.api.objects, Some(objects));
+            },
+        );
+    }
+
+    #[test]
+    fn operation_helper_initializes_audit_api_details_before_completion() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = GetObjectInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("missing/object.txt".to_string())
+                    .build()
+                    .expect("get object input should build");
+                let req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/missing/object.txt"));
+                let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+
+                let OperationHelper::Enabled(state) = &mut helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                let audit_entry = state.audit_builder.take().expect("audit builder should exist").build();
+
+                assert_eq!(audit_entry.api.name.as_deref(), Some("s3:GetObject"));
+                assert_eq!(audit_entry.api.bucket.as_deref(), Some("audit-bucket"));
+                assert_eq!(audit_entry.api.object.as_deref(), Some("missing/object.txt"));
+                assert!(audit_entry.api.status_code.is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn operation_helper_complete_records_failed_status_code() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = GetObjectInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("missing/object.txt".to_string())
+                    .build()
+                    .expect("get object input should build");
+                let req = build_request(input, Method::GET, Uri::from_static("/audit-bucket/missing/object.txt"));
+                let result: Result<S3Response<GetObjectOutput>, S3Error> = Err(S3Error::new(S3ErrorCode::NoSuchKey));
+                let mut helper =
+                    OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).complete(&result);
+
+                let OperationHelper::Enabled(state) = &mut helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                let audit_entry = state.audit_builder.take().expect("audit builder should exist").build();
+
+                assert_eq!(audit_entry.api.name.as_deref(), Some("s3:GetObject"));
+                assert_eq!(audit_entry.api.status.as_deref(), Some("failure"));
+                assert_eq!(audit_entry.api.status_code, Some(404));
             },
         );
     }

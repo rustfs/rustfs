@@ -30,6 +30,7 @@ use crate::utils::base64_decode;
 use super::transition_api;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
 pub struct CommonPrefix {
     pub prefix: String,
 }
@@ -393,5 +394,32 @@ impl DeleteMultiObjects {
                 })
                 .collect(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListBucketV2Result;
+
+    #[test]
+    fn list_bucket_v2_common_prefix_accepts_s3_pascal_case_xml() {
+        let xml = r#"
+            <ListBucketResult>
+                <Name>tier-bucket</Name>
+                <Prefix></Prefix>
+                <KeyCount>1</KeyCount>
+                <MaxKeys>1000</MaxKeys>
+                <Delimiter>/</Delimiter>
+                <IsTruncated>false</IsTruncated>
+                <CommonPrefixes>
+                    <Prefix>tenant-a/</Prefix>
+                </CommonPrefixes>
+            </ListBucketResult>
+        "#;
+
+        let result = quick_xml::de::from_str::<ListBucketV2Result>(xml).expect("S3 list response should decode");
+
+        assert_eq!(result.common_prefixes.len(), 1);
+        assert_eq!(result.common_prefixes[0].prefix, "tenant-a/");
     }
 }
