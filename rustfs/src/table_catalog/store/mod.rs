@@ -1159,9 +1159,7 @@ where
         update: NamespacePropertiesUpdate,
     ) -> TableCatalogStoreResult<NamespacePropertiesUpdateResult> {
         match self {
-            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
-                "namespace property updates require durable-strong catalog backing".to_string(),
-            )),
+            Self::ObjectBacked(store) => store.update_namespace_properties(table_bucket, namespace, update).await,
             Self::DurableStrong(store) => store.update_namespace_properties(table_bucket, namespace, update).await,
         }
     }

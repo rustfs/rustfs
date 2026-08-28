@@ -158,7 +158,7 @@ fn catalog_config_response_lists_standard_rest_endpoints() {
         Some(REST_NAMESPACE_SEPARATOR_URL_ENCODED)
     );
     assert!(
-        !response
+        response
             .endpoints
             .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties")
     );
@@ -10792,6 +10792,51 @@ async fn namespace_helpers_call_catalog_store() {
         .await
         .expect("namespace list should load after drop");
     assert!(list.namespaces.is_empty());
+}
+
+#[tokio::test]
+async fn namespace_property_handler_helper_updates_object_backed_catalog() {
+    let backend = TestTableCatalogObjectBackend::default();
+    let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+        backend,
+        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+    );
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    ensure_table_bucket_entry(&store, "warehouse", true)
+        .await
+        .expect("table bucket entry should be seeded");
+    create_namespace_response(
+        &store,
+        "warehouse",
+        CreateNamespaceRequest {
+            namespace: vec!["analytics".to_string()],
+            properties: BTreeMap::from([("owner".to_string(), "lakehouse".to_string())]),
+        },
+        true,
+    )
+    .await
+    .expect("namespace should be created");
+
+    let response = update_namespace_properties_response(
+        &store,
+        "warehouse",
+        &namespace,
+        UpdateNamespacePropertiesRequest {
+            removals: vec!["owner".to_string(), "missing".to_string()],
+            updates: BTreeMap::from([("retention".to_string(), "30d".to_string())]),
+        },
+    )
+    .await
+    .expect("object-backed namespace properties should update");
+
+    assert_eq!(response.updated, vec!["retention".to_string()]);
+    assert_eq!(response.removed, vec!["owner".to_string()]);
+    assert_eq!(response.missing, vec!["missing".to_string()]);
+    let updated = get_namespace_response(&store, "warehouse", &namespace)
+        .await
+        .expect("updated namespace should load");
+    assert_eq!(updated.properties.get("retention").map(String::as_str), Some("30d"));
+    assert!(!updated.properties.contains_key("owner"));
 }
 
 #[tokio::test]
