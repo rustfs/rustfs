@@ -246,6 +246,20 @@ where
         Ok(guard)
     }
 
+    pub(super) async fn acquire_object_backed_catalog_exclusive_write_permit(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        let lock_path = self.paths.backing_migration_fence_lock_path(table_bucket);
+        let guard = self.backend.acquire_write_lock(self.catalog_bucket(), &lock_path).await?;
+        if self.read_backing_migration_fence(table_bucket).await?.is_some() {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "object-backed catalog writes are fenced while table bucket {table_bucket} is prepared for durable strong cutover"
+            )));
+        }
+        Ok(guard)
+    }
+
     async fn ensure_global_backing_migration_fence(
         &self,
         fence_path: &str,

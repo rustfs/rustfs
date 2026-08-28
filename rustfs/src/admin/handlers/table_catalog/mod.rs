@@ -165,6 +165,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials",
     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "POST /v1/{prefix}/tables/rename",
     "GET /v1/{prefix}/namespaces/{namespace}/views",
     "POST /v1/{prefix}/namespaces/{namespace}/views",
     "GET /v1/{prefix}/namespaces/{namespace}/views/{view}",
@@ -172,10 +173,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /v1/{prefix}/namespaces/{namespace}/views/{view}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
 ];
-const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] = &[
-    "POST /v1/{prefix}/namespaces/{namespace}/properties",
-    "POST /v1/{prefix}/tables/rename",
-];
+const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] = &["POST /v1/{prefix}/namespaces/{namespace}/properties"];
 
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};

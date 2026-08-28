@@ -160,6 +160,156 @@ fn validate_table_warehouse_index_entry_object(
     Ok(())
 }
 
+fn table_rename_maintenance_object_kind(suffix: &str) -> Option<TableRenameMaintenanceObjectKind> {
+    if suffix == MAINTENANCE_CONFIG_FILE {
+        return Some(TableRenameMaintenanceObjectKind::Config);
+    }
+    if suffix == MAINTENANCE_LATEST_JOB_FILE || suffix == MAINTENANCE_CURRENT_JOB_FILE {
+        return Some(TableRenameMaintenanceObjectKind::Report);
+    }
+    suffix
+        .strip_prefix(&format!("{MAINTENANCE_JOB_ROOT}/"))
+        .filter(|name| !name.is_empty() && !name.contains('/') && name.ends_with(".json"))
+        .map(|_| TableRenameMaintenanceObjectKind::Report)
+}
+
+fn validate_table_rename_intent_object(
+    paths: &TableCatalogObjectPaths,
+    object: &str,
+    intent: &TableRenameIntent,
+) -> TableCatalogStoreResult<()> {
+    if intent.version != TABLE_RENAME_INTENT_VERSION {
+        return Err(TableCatalogStoreError::Invalid(format!(
+            "unsupported table rename intent version: {}",
+            intent.version
+        )));
+    }
+    if Uuid::parse_str(&intent.intent_id)
+        .ok()
+        .is_none_or(|intent_id| intent_id.is_nil())
+        || intent.table_id.is_empty()
+        || intent.source_etag.is_empty()
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "table rename intent has an empty required identity field".to_string(),
+        ));
+    }
+    if paths.table_rename_intent_path(&intent.table_bucket, &intent.table_id) != object {
+        return Err(TableCatalogStoreError::Invalid(
+            "table rename intent identity does not match its object path".to_string(),
+        ));
+    }
+    let source_namespace = validate_table_entry_object(
+        paths,
+        &paths.table_entry_path(
+            &intent.table_bucket,
+            &parse_namespace_for_store(&intent.source.namespace)?,
+            &parse_table_for_store(&intent.source.table)?,
+        ),
+        &intent.source,
+    )?;
+    let destination_namespace = validate_table_entry_object(
+        paths,
+        &paths.table_entry_path(
+            &intent.table_bucket,
+            &parse_namespace_for_store(&intent.destination.namespace)?,
+            &parse_table_for_store(&intent.destination.table)?,
+        ),
+        &intent.destination,
+    )?;
+    if intent.source.table_bucket != intent.table_bucket
+        || intent.destination.table_bucket != intent.table_bucket
+        || intent.source.table_id != intent.table_id
+        || intent.destination.table_id != intent.table_id
+        || intent.source.state != TableCatalogEntryState::Active
+        || intent.destination.state != TableCatalogEntryState::Active
+        || (intent.source.namespace == intent.destination.namespace && intent.source.table == intent.destination.table)
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "table rename intent contains inconsistent source or destination identity".to_string(),
+        ));
+    }
+    let mut expected_destination = intent.source.clone();
+    expected_destination.namespace = destination_namespace.public_name();
+    expected_destination.table = intent.destination.table.clone();
+    expected_destination.updated_at.clone_from(&intent.destination.updated_at);
+    if expected_destination != intent.destination || source_namespace.public_name() != intent.source.namespace {
+        return Err(TableCatalogStoreError::Invalid(
+            "table rename intent changes stable table state".to_string(),
+        ));
+    }
+    match (
+        intent.source_bridge.as_ref(),
+        intent.destination_bridge.as_ref(),
+        intent.source_bridge_etag.as_deref(),
+    ) {
+        (None, None, None) => {}
+        (Some(source_bridge), Some(destination_bridge), Some(source_bridge_etag)) if !source_bridge_etag.is_empty() => {
+            let source_bridge_path = paths.external_catalog_bridge_path(
+                &intent.table_bucket,
+                &source_namespace,
+                &parse_table_for_store(&intent.source.table)?,
+            );
+            let destination_bridge_path = paths.external_catalog_bridge_path(
+                &intent.table_bucket,
+                &destination_namespace,
+                &parse_table_for_store(&intent.destination.table)?,
+            );
+            validate_external_catalog_bridge_entry_object(paths, &source_bridge_path, source_bridge)?;
+            validate_external_catalog_bridge_entry_object(paths, &destination_bridge_path, destination_bridge)?;
+            let mut expected_bridge = source_bridge.clone();
+            expected_bridge.namespace.clone_from(&intent.destination.namespace);
+            expected_bridge.table.clone_from(&intent.destination.table);
+            expected_bridge.updated_at.clone_from(&destination_bridge.updated_at);
+            if expected_bridge != *destination_bridge {
+                return Err(TableCatalogStoreError::Invalid(
+                    "table rename intent changes stable external catalog bridge state".to_string(),
+                ));
+            }
+        }
+        _ => {
+            return Err(TableCatalogStoreError::Invalid(
+                "table rename intent has inconsistent external catalog bridge state".to_string(),
+            ));
+        }
+    }
+    let source_table = parse_table_for_store(&intent.source.table)?;
+    let destination_table = parse_table_for_store(&intent.destination.table)?;
+    let source_maintenance_prefix =
+        paths.table_maintenance_root_prefix(&intent.table_bucket, &source_namespace, &source_table, &intent.table_id);
+    let destination_maintenance_prefix =
+        paths.table_maintenance_root_prefix(&intent.table_bucket, &destination_namespace, &destination_table, &intent.table_id);
+    let mut previous_source = None::<&str>;
+    for object in &intent.maintenance_objects {
+        let Some(suffix) = object.source_object.strip_prefix(&source_maintenance_prefix) else {
+            return Err(TableCatalogStoreError::Invalid(
+                "table rename maintenance source is outside its table owner".to_string(),
+            ));
+        };
+        if suffix.is_empty()
+            || object.destination_object != format!("{destination_maintenance_prefix}{suffix}")
+            || object.source_etag.is_empty()
+            || table_rename_maintenance_object_kind(suffix) != Some(object.kind)
+            || previous_source.is_some_and(|previous| previous >= object.source_object.as_str())
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "table rename intent has invalid or unsorted maintenance objects".to_string(),
+            ));
+        }
+        previous_source = Some(&object.source_object);
+    }
+    let parse_timestamp = |timestamp: &str| {
+        OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| TableCatalogStoreError::Invalid("table rename intent has an invalid timestamp".to_string()))
+    };
+    if parse_timestamp(&intent.updated_at)? < parse_timestamp(&intent.created_at)? {
+        return Err(TableCatalogStoreError::Invalid(
+            "table rename intent updated timestamp precedes its creation".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn table_warehouse_index_state_ready(state: &TableWarehouseIndexStateEntry, table_bucket: &str) -> TableCatalogStoreResult<bool> {
     if state.version == 0 || state.version > TABLE_WAREHOUSE_INDEX_STATE_VERSION {
         return Err(TableCatalogStoreError::Invalid(format!(
@@ -199,6 +349,1000 @@ where
 
     pub(in crate::table_catalog) fn catalog_bucket(&self) -> &'static str {
         RUSTFS_META_BUCKET
+    }
+
+    async fn acquire_catalog_write_locks(
+        &self,
+        objects: impl IntoIterator<Item = String>,
+    ) -> TableCatalogStoreResult<Vec<TableCatalogLockGuard>> {
+        // Every multi-object catalog mutation acquires metadata locks in bytewise path order.
+        let mut objects = objects.into_iter().collect::<Vec<_>>();
+        objects.sort_unstable();
+        objects.dedup();
+        let mut guards = Vec::with_capacity(objects.len());
+        for object in objects {
+            guards.push(self.backend.acquire_write_lock(self.catalog_bucket(), &object).await?);
+        }
+        Ok(guards)
+    }
+
+    async fn read_table_rename_intent_with(
+        &self,
+        object: &str,
+        unlocked: bool,
+    ) -> TableCatalogStoreResult<Option<(TableRenameIntent, String)>> {
+        let object_data = if unlocked {
+            self.backend
+                .read_object_unlocked_limited(self.catalog_bucket(), object, TABLE_RENAME_INTENT_MAX_SIZE)
+                .await?
+        } else {
+            self.backend
+                .read_object_limited(self.catalog_bucket(), object, TABLE_RENAME_INTENT_MAX_SIZE)
+                .await?
+        };
+        let Some(object_data) = object_data else {
+            return Ok(None);
+        };
+        let intent = serde_json::from_slice::<TableRenameIntent>(&object_data.data)
+            .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to parse table rename intent {object}: {err}")))?;
+        validate_table_rename_intent_object(&self.paths, object, &intent)?;
+        let etag = object_data
+            .etag
+            .ok_or_else(|| TableCatalogStoreError::Internal(format!("table rename intent has no etag: {object}")))?;
+        Ok(Some((intent, etag)))
+    }
+
+    async fn read_table_rename_intent(
+        &self,
+        table_bucket: &str,
+        table_id: &str,
+    ) -> TableCatalogStoreResult<Option<(TableRenameIntent, String)>> {
+        self.read_table_rename_intent_with(&self.paths.table_rename_intent_path(table_bucket, table_id), false)
+            .await
+    }
+
+    async fn ensure_rename_intent_allows_reads(&self, entry: &TableEntry) -> TableCatalogStoreResult<()> {
+        if let Some((intent, _)) = self.read_table_rename_intent(&entry.table_bucket, &entry.table_id).await?
+            && intent.status.blocks_reads()
+        {
+            return Err(TableCatalogStoreError::Unavailable(format!(
+                "table rename {} is not yet published",
+                intent.intent_id
+            )));
+        }
+        Ok(())
+    }
+
+    async fn find_table_rename_intent(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+    ) -> TableCatalogStoreResult<Option<(String, TableRenameIntent, String)>> {
+        let table_path = self.paths.table_entry_path(table_bucket, namespace, table);
+        if let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? {
+            validate_table_entry_object(&self.paths, &table_path, &entry)?;
+            if let Some((intent, etag)) = self.read_table_rename_intent(table_bucket, &entry.table_id).await? {
+                return Ok(Some((self.paths.table_rename_intent_path(table_bucket, &entry.table_id), intent, etag)));
+            }
+        }
+        for object in self
+            .backend
+            .list_objects(self.catalog_bucket(), &self.paths.table_rename_intents_prefix(table_bucket))
+            .await?
+        {
+            let Some((intent, etag)) = self.read_table_rename_intent_with(&object, false).await? else {
+                continue;
+            };
+            let matches_source = intent.source.namespace == namespace.public_name() && intent.source.table == table.as_str();
+            let matches_destination =
+                intent.destination.namespace == namespace.public_name() && intent.destination.table == table.as_str();
+            if matches_source || matches_destination {
+                return Ok(Some((object, intent, etag)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn table_rename_recovery_report(intent: &TableRenameIntent) -> TableRenameRecoveryReport {
+        TableRenameRecoveryReport {
+            intent_id: intent.intent_id.clone(),
+            source_namespace: intent.source.namespace.clone(),
+            source_table: intent.source.table.clone(),
+            destination_namespace: intent.destination.namespace.clone(),
+            destination_table: intent.destination.table.clone(),
+            table_id: intent.table_id.clone(),
+            status: intent.status,
+            recovery_required: !matches!(intent.status, TableRenameIntentStatus::Completed),
+        }
+    }
+
+    async fn build_table_rename_maintenance_objects(
+        &self,
+        intent_source: &TableEntry,
+        destination_namespace: &Namespace,
+        destination_table: &IdentifierSegment,
+    ) -> TableCatalogStoreResult<Vec<TableRenameMaintenanceObject>> {
+        let source_namespace = parse_namespace_for_store(&intent_source.namespace)?;
+        let source_table = parse_table_for_store(&intent_source.table)?;
+        let source_prefix = self.paths.table_maintenance_root_prefix(
+            &intent_source.table_bucket,
+            &source_namespace,
+            &source_table,
+            &intent_source.table_id,
+        );
+        let destination_prefix = self.paths.table_maintenance_root_prefix(
+            &intent_source.table_bucket,
+            destination_namespace,
+            destination_table,
+            &intent_source.table_id,
+        );
+        if !self
+            .backend
+            .list_objects(self.catalog_bucket(), &destination_prefix)
+            .await?
+            .is_empty()
+        {
+            return Err(TableCatalogStoreError::Conflict(
+                "destination table has existing maintenance state".to_string(),
+            ));
+        }
+        let mut source_objects = self.backend.list_objects(self.catalog_bucket(), &source_prefix).await?;
+        source_objects.sort();
+        let mut objects = Vec::with_capacity(source_objects.len());
+        for source_object in source_objects {
+            let suffix = source_object.strip_prefix(&source_prefix).ok_or_else(|| {
+                TableCatalogStoreError::Invalid("table maintenance object escaped its catalog prefix".to_string())
+            })?;
+            let kind = table_rename_maintenance_object_kind(suffix).ok_or_else(|| {
+                TableCatalogStoreError::Conflict(format!("table rename does not support maintenance object {source_object}"))
+            })?;
+            let source_etag = self
+                .backend
+                .object_metadata(self.catalog_bucket(), &source_object)
+                .await?
+                .and_then(|metadata| metadata.etag)
+                .ok_or_else(|| {
+                    TableCatalogStoreError::Conflict(format!(
+                        "table maintenance object disappeared or has no etag: {source_object}"
+                    ))
+                })?;
+            objects.push(TableRenameMaintenanceObject {
+                destination_object: format!("{destination_prefix}{suffix}"),
+                source_object,
+                source_etag,
+                kind,
+            });
+        }
+        Ok(objects)
+    }
+
+    fn table_rename_maintenance_destination_data(
+        &self,
+        intent: &TableRenameIntent,
+        object: &TableRenameMaintenanceObject,
+        data: &[u8],
+        source: bool,
+    ) -> TableCatalogStoreResult<Vec<u8>> {
+        match object.kind {
+            TableRenameMaintenanceObjectKind::Config => {
+                let config = serde_json::from_slice::<TableMaintenanceConfig>(data).map_err(|err| {
+                    TableCatalogStoreError::Invalid(format!(
+                        "failed to parse table maintenance config {}: {err}",
+                        if source {
+                            &object.source_object
+                        } else {
+                            &object.destination_object
+                        }
+                    ))
+                })?;
+                validate_table_maintenance_config(&config)?;
+                serde_json::to_vec(&config).map_err(|err| {
+                    TableCatalogStoreError::Internal(format!("failed to serialize table maintenance config: {err}"))
+                })
+            }
+            TableRenameMaintenanceObjectKind::Report => {
+                let mut report = serde_json::from_slice::<TableMetadataMaintenanceReport>(data).map_err(|err| {
+                    TableCatalogStoreError::Invalid(format!(
+                        "failed to parse table maintenance report {}: {err}",
+                        if source {
+                            &object.source_object
+                        } else {
+                            &object.destination_object
+                        }
+                    ))
+                })?;
+                let (namespace, table, expected_object) = if source {
+                    let namespace = parse_namespace_for_store(&intent.source.namespace)?;
+                    let table = parse_table_for_store(&intent.source.table)?;
+                    let expected = self.table_metadata_maintenance_report_path(
+                        &intent.table_bucket,
+                        &namespace,
+                        &table,
+                        &intent.table_id,
+                        object
+                            .source_object
+                            .ends_with(MAINTENANCE_LATEST_JOB_FILE)
+                            .then_some(MAINTENANCE_JOB_ALIAS_LATEST)
+                            .or_else(|| {
+                                object
+                                    .source_object
+                                    .ends_with(MAINTENANCE_CURRENT_JOB_FILE)
+                                    .then_some(MAINTENANCE_JOB_ALIAS_CURRENT)
+                            })
+                            .unwrap_or(&report.job.job_id),
+                    );
+                    (namespace, table, expected)
+                } else {
+                    let namespace = parse_namespace_for_store(&intent.destination.namespace)?;
+                    let table = parse_table_for_store(&intent.destination.table)?;
+                    let expected = self.table_metadata_maintenance_report_path(
+                        &intent.table_bucket,
+                        &namespace,
+                        &table,
+                        &intent.table_id,
+                        object
+                            .destination_object
+                            .ends_with(MAINTENANCE_LATEST_JOB_FILE)
+                            .then_some(MAINTENANCE_JOB_ALIAS_LATEST)
+                            .or_else(|| {
+                                object
+                                    .destination_object
+                                    .ends_with(MAINTENANCE_CURRENT_JOB_FILE)
+                                    .then_some(MAINTENANCE_JOB_ALIAS_CURRENT)
+                            })
+                            .unwrap_or(&report.job.job_id),
+                    );
+                    (namespace, table, expected)
+                };
+                let actual_object = if source {
+                    &object.source_object
+                } else {
+                    &object.destination_object
+                };
+                if expected_object != *actual_object {
+                    return Err(TableCatalogStoreError::Invalid(format!(
+                        "table maintenance report identity does not match object {actual_object}"
+                    )));
+                }
+                validate_table_maintenance_report_owner(&report, &intent.table_bucket, &namespace, &table, &intent.table_id)?;
+                if source {
+                    report.job.namespace.clone_from(&intent.destination.namespace);
+                    report.job.table.clone_from(&intent.destination.table);
+                }
+                serde_json::to_vec(&report).map_err(|err| {
+                    TableCatalogStoreError::Internal(format!("failed to serialize table maintenance report: {err}"))
+                })
+            }
+        }
+    }
+
+    async fn copy_table_rename_maintenance_objects(&self, intent: &TableRenameIntent) -> TableCatalogStoreResult<()> {
+        if intent.status.rank() >= TableRenameIntentStatus::IndexPublished.rank() {
+            // Destination-owned maintenance state may change immediately after publication.
+            // Recovery must never replay an older source copy over that newer state.
+            return Ok(());
+        }
+        let expected_sources = intent
+            .maintenance_objects
+            .iter()
+            .map(|object| object.source_object.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected_destinations = intent
+            .maintenance_objects
+            .iter()
+            .map(|object| object.destination_object.as_str())
+            .collect::<BTreeSet<_>>();
+        let source_namespace = parse_namespace_for_store(&intent.source.namespace)?;
+        let source_table = parse_table_for_store(&intent.source.table)?;
+        let destination_namespace = parse_namespace_for_store(&intent.destination.namespace)?;
+        let destination_table = parse_table_for_store(&intent.destination.table)?;
+        let source_prefix =
+            self.paths
+                .table_maintenance_root_prefix(&intent.table_bucket, &source_namespace, &source_table, &intent.table_id);
+        let destination_prefix = self.paths.table_maintenance_root_prefix(
+            &intent.table_bucket,
+            &destination_namespace,
+            &destination_table,
+            &intent.table_id,
+        );
+        for object in self.backend.list_objects(self.catalog_bucket(), &source_prefix).await? {
+            if !expected_sources.contains(object.as_str()) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "source table gained unsupported maintenance state during rename: {object}"
+                )));
+            }
+        }
+        for object in self.backend.list_objects(self.catalog_bucket(), &destination_prefix).await? {
+            if !expected_destinations.contains(object.as_str()) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "destination table gained unsupported maintenance state during rename: {object}"
+                )));
+            }
+        }
+        for object in &intent.maintenance_objects {
+            let source = self
+                .backend
+                .read_object_limited(self.catalog_bucket(), &object.source_object, TABLE_RENAME_SECONDARY_OBJECT_MAX_SIZE)
+                .await?;
+            let Some(source) = source else {
+                if intent.status.rank() < TableRenameIntentStatus::DestinationPublished.rank() {
+                    return Err(TableCatalogStoreError::Conflict(format!(
+                        "source table maintenance object disappeared during rename: {}",
+                        object.source_object
+                    )));
+                }
+                let destination = self
+                    .backend
+                    .read_object_limited(
+                        self.catalog_bucket(),
+                        &object.destination_object,
+                        TABLE_RENAME_SECONDARY_OBJECT_MAX_SIZE,
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        TableCatalogStoreError::Unavailable(format!(
+                            "renamed table maintenance object is missing: {}",
+                            object.destination_object
+                        ))
+                    })?;
+                self.table_rename_maintenance_destination_data(intent, object, &destination.data, false)?;
+                continue;
+            };
+            if source.etag.as_deref() != Some(object.source_etag.as_str()) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "source table maintenance object changed during rename: {}",
+                    object.source_object
+                )));
+            }
+            let destination_data = self.table_rename_maintenance_destination_data(intent, object, &source.data, true)?;
+            match self
+                .backend
+                .read_object_limited(self.catalog_bucket(), &object.destination_object, TABLE_RENAME_SECONDARY_OBJECT_MAX_SIZE)
+                .await?
+            {
+                Some(destination) if destination.data == destination_data => {}
+                Some(_) => {
+                    return Err(TableCatalogStoreError::Conflict(format!(
+                        "destination table maintenance object already exists: {}",
+                        object.destination_object
+                    )));
+                }
+                None => {
+                    let write_result = self
+                        .backend
+                        .put_object(
+                            self.catalog_bucket(),
+                            &object.destination_object,
+                            destination_data.clone(),
+                            TableCatalogPutPrecondition::IfAbsent,
+                        )
+                        .await;
+                    let persisted = self
+                        .backend
+                        .read_object_limited(
+                            self.catalog_bucket(),
+                            &object.destination_object,
+                            TABLE_RENAME_SECONDARY_OBJECT_MAX_SIZE,
+                        )
+                        .await?;
+                    if persisted.as_ref().map(|persisted| &persisted.data) != Some(&destination_data) {
+                        return write_result.and(Err(TableCatalogStoreError::Conflict(format!(
+                            "destination table maintenance object changed during rename: {}",
+                            object.destination_object
+                        ))));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_table_rename_source_maintenance_objects(&self, intent: &TableRenameIntent) -> TableCatalogStoreResult<()> {
+        let expected_sources = intent
+            .maintenance_objects
+            .iter()
+            .map(|object| object.source_object.as_str())
+            .collect::<BTreeSet<_>>();
+        let source_namespace = parse_namespace_for_store(&intent.source.namespace)?;
+        let source_table = parse_table_for_store(&intent.source.table)?;
+        let source_prefix =
+            self.paths
+                .table_maintenance_root_prefix(&intent.table_bucket, &source_namespace, &source_table, &intent.table_id);
+        for object in self.backend.list_objects(self.catalog_bucket(), &source_prefix).await? {
+            if !expected_sources.contains(object.as_str()) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "source table has unsupported maintenance state during rename cleanup: {object}"
+                )));
+            }
+        }
+        for object in &intent.maintenance_objects {
+            let Some(source) = self
+                .backend
+                .read_object_limited(self.catalog_bucket(), &object.source_object, TABLE_RENAME_SECONDARY_OBJECT_MAX_SIZE)
+                .await?
+            else {
+                continue;
+            };
+            if source.etag.as_deref() != Some(object.source_etag.as_str()) {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "source table maintenance object changed before rename cleanup: {}",
+                    object.source_object
+                )));
+            }
+            let delete_result = self.backend.delete_object(self.catalog_bucket(), &object.source_object).await;
+            if delete_result.is_err()
+                && self
+                    .backend
+                    .object_exists(self.catalog_bucket(), &object.source_object)
+                    .await?
+            {
+                delete_result?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn table_rename_destination_state_is_safe_unlocked(
+        &self,
+        intent: &TableRenameIntent,
+        destination_path: &str,
+    ) -> TableCatalogStoreResult<bool> {
+        let Some((destination, _)) = self
+            .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), destination_path)
+            .await?
+        else {
+            // The renamed table may have been dropped after index publication.
+            return Ok(true);
+        };
+        validate_table_entry_object(&self.paths, destination_path, &destination)?;
+        if destination.table_id != intent.table_id {
+            // The destination name may have been reused after the renamed table was dropped.
+            return Ok(true);
+        }
+        if destination.state != TableCatalogEntryState::Active {
+            return Ok(false);
+        }
+        let destination_index = table_warehouse_index_entry(&destination)?;
+        let index_object = self
+            .paths
+            .warehouse_index_entry_path(&intent.table_bucket, &destination_index.warehouse_object_prefix);
+        let index = self
+            .read_entry_unlocked::<TableWarehouseIndexEntry>(self.catalog_bucket(), &index_object)
+            .await?;
+        if let Some((index, _)) = index {
+            validate_table_warehouse_index_entry_object(&self.paths, &index_object, &index)?;
+            if index != destination_index {
+                return Ok(false);
+            }
+        } else if self.warehouse_index_ready(&intent.table_bucket).await? {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    async fn table_rename_is_fully_published_unlocked(
+        &self,
+        intent: &TableRenameIntent,
+        source_path: &str,
+        destination_path: &str,
+    ) -> TableCatalogStoreResult<bool> {
+        if let Some((source, _)) = self
+            .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), source_path)
+            .await?
+        {
+            validate_table_entry_object(&self.paths, source_path, &source)?;
+            if source.table_id == intent.table_id {
+                return Ok(false);
+            }
+        }
+        self.table_rename_destination_state_is_safe_unlocked(intent, destination_path)
+            .await
+    }
+
+    async fn advance_table_rename_intent_unlocked(
+        &self,
+        object: &str,
+        intent: &mut TableRenameIntent,
+        intent_etag: &mut String,
+        status: TableRenameIntentStatus,
+    ) -> TableCatalogStoreResult<()> {
+        if intent.status.rank() >= status.rank() {
+            return Ok(());
+        }
+        let previous = intent.clone();
+        intent.status = status;
+        intent.updated_at = maintenance_timestamp(OffsetDateTime::now_utc());
+        let write_result = self
+            .write_entry_unlocked(
+                self.catalog_bucket(),
+                object,
+                intent,
+                TableCatalogPutPrecondition::IfMatch(intent_etag.clone()),
+            )
+            .await;
+        let Some((persisted, persisted_etag)) = self.read_table_rename_intent_with(object, true).await? else {
+            *intent = previous;
+            return Err(TableCatalogStoreError::Internal(
+                "table rename intent disappeared during a status transition".to_string(),
+            ));
+        };
+        if persisted != *intent {
+            *intent = previous;
+            return write_result.and(Err(TableCatalogStoreError::Conflict(
+                "table rename intent changed during a status transition".to_string(),
+            )));
+        }
+        *intent_etag = persisted_etag;
+        Ok(())
+    }
+
+    async fn put_table_rename_stage_unlocked(
+        &self,
+        object: &str,
+        entry: &TableEntry,
+        precondition: TableCatalogPutPrecondition,
+    ) -> TableCatalogStoreResult<String> {
+        let write_result = self
+            .write_entry_unlocked(self.catalog_bucket(), object, entry, precondition)
+            .await;
+        let Some((persisted, etag)) = self.read_entry_unlocked::<TableEntry>(self.catalog_bucket(), object).await? else {
+            return write_result.and(Err(TableCatalogStoreError::Internal(format!(
+                "table rename stage disappeared after write: {object}"
+            ))));
+        };
+        validate_table_entry_object(&self.paths, object, &persisted)?;
+        if persisted != *entry {
+            return write_result.and(Err(TableCatalogStoreError::Conflict(format!(
+                "table rename stage conflicts with catalog object: {object}"
+            ))));
+        }
+        let etag = etag.ok_or_else(|| TableCatalogStoreError::Internal(format!("catalog table entry has no etag: {object}")))?;
+        Ok(etag)
+    }
+
+    async fn write_table_rename_warehouse_index_unlocked(
+        &self,
+        intent: &TableRenameIntent,
+        index_object: &str,
+        publish_destination: bool,
+    ) -> TableCatalogStoreResult<()> {
+        let source_index = table_warehouse_index_entry(&intent.source)?;
+        let destination_index = table_warehouse_index_entry(&intent.destination)?;
+        let mut fenced_index = source_index.clone();
+        fenced_index.state = TableCatalogEntryState::Deleting;
+        let expected = if publish_destination {
+            &destination_index
+        } else {
+            &fenced_index
+        };
+        let current = self
+            .read_entry_unlocked::<TableWarehouseIndexEntry>(self.catalog_bucket(), index_object)
+            .await?;
+        let write_result = match current {
+            Some((current, _)) if current == *expected => return Ok(()),
+            Some((current, _)) if !publish_destination && current == destination_index => return Ok(()),
+            Some((current, etag)) if current == source_index || (publish_destination && current == fenced_index) => {
+                let etag = etag.ok_or_else(|| {
+                    TableCatalogStoreError::Internal(format!("catalog warehouse index has no etag: {index_object}"))
+                })?;
+                self.write_entry_unlocked(
+                    self.catalog_bucket(),
+                    index_object,
+                    expected,
+                    TableCatalogPutPrecondition::IfMatch(etag),
+                )
+                .await
+            }
+            Some((current, _)) => {
+                validate_table_warehouse_index_entry_object(&self.paths, index_object, &current)?;
+                Err(TableCatalogStoreError::Conflict(
+                    "table warehouse index changed during rename".to_string(),
+                ))
+            }
+            None if self.warehouse_index_ready(&intent.table_bucket).await? => {
+                self.write_entry_unlocked(self.catalog_bucket(), index_object, expected, TableCatalogPutPrecondition::IfAbsent)
+                    .await
+            }
+            None => return Ok(()),
+        };
+        let persisted = self
+            .read_entry_unlocked::<TableWarehouseIndexEntry>(self.catalog_bucket(), index_object)
+            .await?;
+        if persisted.as_ref().map(|(entry, _)| entry) == Some(expected) {
+            return Ok(());
+        }
+        write_result.and(Err(TableCatalogStoreError::Conflict(
+            "table warehouse index changed during rename".to_string(),
+        )))
+    }
+
+    async fn execute_table_rename_intent_unlocked(
+        &self,
+        intent_object: &str,
+        intent: &mut TableRenameIntent,
+        intent_etag: &mut String,
+        source_path: &str,
+        destination_path: &str,
+        source_bridge_path: &str,
+        destination_bridge_path: &str,
+        index_object: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let mut destination_staged = intent.destination.clone();
+        destination_staged.state = TableCatalogEntryState::Deleting;
+        let (destination_etag, destination_was_published) =
+            if intent.status.rank() >= TableRenameIntentStatus::IndexPublished.rank() {
+                (None, true)
+            } else {
+                match self
+                    .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), destination_path)
+                    .await?
+                {
+                    Some((current, etag)) => {
+                        validate_table_entry_object(&self.paths, destination_path, &current)?;
+                        if current == intent.destination {
+                            let etag = etag.ok_or_else(|| {
+                                TableCatalogStoreError::Internal(format!("catalog table entry has no etag: {destination_path}"))
+                            })?;
+                            (Some(etag), true)
+                        } else if current == destination_staged {
+                            let etag = etag.ok_or_else(|| {
+                                TableCatalogStoreError::Internal(format!("catalog table entry has no etag: {destination_path}"))
+                            })?;
+                            (Some(etag), false)
+                        } else {
+                            return Err(TableCatalogStoreError::AlreadyExists(format!(
+                                "destination table already exists: {}/{}/{}",
+                                intent.table_bucket, intent.destination.namespace, intent.destination.table
+                            )));
+                        }
+                    }
+                    None => {
+                        let etag = self
+                            .put_table_rename_stage_unlocked(
+                                destination_path,
+                                &destination_staged,
+                                TableCatalogPutPrecondition::IfAbsent,
+                            )
+                            .await?;
+                        (Some(etag), false)
+                    }
+                }
+            };
+        if intent.status.rank() < TableRenameIntentStatus::IndexPublished.rank()
+            && let Some(destination_bridge) = intent.destination_bridge.as_ref()
+        {
+            match self
+                .read_entry_unlocked::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), destination_bridge_path)
+                .await?
+            {
+                Some((current, _)) if current == *destination_bridge => {}
+                Some((current, _)) => {
+                    validate_external_catalog_bridge_entry_object(&self.paths, destination_bridge_path, &current)?;
+                    return Err(TableCatalogStoreError::AlreadyExists(format!(
+                        "destination external catalog bridge already exists: {destination_bridge_path}"
+                    )));
+                }
+                None => {
+                    let write_result = self
+                        .write_entry_unlocked(
+                            self.catalog_bucket(),
+                            destination_bridge_path,
+                            destination_bridge,
+                            TableCatalogPutPrecondition::IfAbsent,
+                        )
+                        .await;
+                    let persisted = self
+                        .read_entry_unlocked::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), destination_bridge_path)
+                        .await?;
+                    if persisted.as_ref().map(|(entry, _)| entry) != Some(destination_bridge) {
+                        return write_result.and(Err(TableCatalogStoreError::Conflict(
+                            "destination external catalog bridge changed during rename".to_string(),
+                        )));
+                    }
+                }
+            }
+        }
+        self.copy_table_rename_maintenance_objects(intent).await?;
+        self.advance_table_rename_intent_unlocked(
+            intent_object,
+            intent,
+            intent_etag,
+            TableRenameIntentStatus::DestinationWritten,
+        )
+        .await?;
+
+        let mut source_tombstone = intent.source.clone();
+        source_tombstone.state = TableCatalogEntryState::Deleting;
+        if intent.status.rank() < TableRenameIntentStatus::IndexPublished.rank() {
+            // Fence the authoritative warehouse index before retiring the source.
+            // This keeps object resolution fail closed without an intent lookup on
+            // every ordinary data-plane request.
+            self.write_table_rename_warehouse_index_unlocked(intent, index_object, false)
+                .await?;
+            self.advance_table_rename_intent_unlocked(intent_object, intent, intent_etag, TableRenameIntentStatus::IndexUpdated)
+                .await?;
+
+            if let (Some(source_bridge), Some(expected_etag)) =
+                (intent.source_bridge.as_ref(), intent.source_bridge_etag.as_deref())
+            {
+                let current = self
+                    .read_entry_unlocked::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), source_bridge_path)
+                    .await?;
+                if let Some((current, current_etag)) = current {
+                    validate_external_catalog_bridge_entry_object(&self.paths, source_bridge_path, &current)?;
+                    if current != *source_bridge || current_etag.as_deref() != Some(expected_etag) {
+                        return Err(TableCatalogStoreError::Conflict(
+                            "source external catalog bridge changed during rename".to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "source external catalog bridge disappeared during rename".to_string(),
+                    ));
+                }
+            }
+            match self
+                .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), source_path)
+                .await?
+            {
+                Some((current, _)) if current == source_tombstone => {}
+                Some((current, current_etag)) if current == intent.source => {
+                    let current_etag = current_etag.ok_or_else(|| {
+                        TableCatalogStoreError::Internal(format!("catalog table entry has no etag: {source_path}"))
+                    })?;
+                    if current_etag != intent.source_etag {
+                        return Err(TableCatalogStoreError::Conflict(
+                            "source table changed after rename intent creation".to_string(),
+                        ));
+                    }
+                    self.put_table_rename_stage_unlocked(
+                        source_path,
+                        &source_tombstone,
+                        TableCatalogPutPrecondition::IfMatch(intent.source_etag.clone()),
+                    )
+                    .await?;
+                }
+                Some((current, _)) => {
+                    validate_table_entry_object(&self.paths, source_path, &current)?;
+                    return Err(TableCatalogStoreError::Conflict("source table changed during rename".to_string()));
+                }
+                None if destination_was_published || intent.status.rank() >= TableRenameIntentStatus::SourceTombstoned.rank() => {
+                }
+                None => {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "source table disappeared before rename publication".to_string(),
+                    ));
+                }
+            }
+            self.advance_table_rename_intent_unlocked(
+                intent_object,
+                intent,
+                intent_etag,
+                TableRenameIntentStatus::SourceTombstoned,
+            )
+            .await?;
+        }
+
+        if intent.status.rank() < TableRenameIntentStatus::IndexPublished.rank() {
+            let destination_current = self
+                .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), destination_path)
+                .await?;
+            match destination_current {
+                Some((current, _)) if current == intent.destination => {}
+                Some((current, etag)) if current == destination_staged => {
+                    let etag = etag.or(destination_etag).ok_or_else(|| {
+                        TableCatalogStoreError::Internal(format!("catalog table entry has no etag: {destination_path}"))
+                    })?;
+                    self.put_table_rename_stage_unlocked(
+                        destination_path,
+                        &intent.destination,
+                        TableCatalogPutPrecondition::IfMatch(etag),
+                    )
+                    .await?;
+                }
+                Some((current, _)) => {
+                    validate_table_entry_object(&self.paths, destination_path, &current)?;
+                    return Err(TableCatalogStoreError::Conflict("destination table changed during rename".to_string()));
+                }
+                None => {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "destination table disappeared during rename".to_string(),
+                    ));
+                }
+            }
+            self.advance_table_rename_intent_unlocked(
+                intent_object,
+                intent,
+                intent_etag,
+                TableRenameIntentStatus::DestinationPublished,
+            )
+            .await?;
+            self.write_table_rename_warehouse_index_unlocked(intent, index_object, true)
+                .await?;
+            self.advance_table_rename_intent_unlocked(
+                intent_object,
+                intent,
+                intent_etag,
+                TableRenameIntentStatus::IndexPublished,
+            )
+            .await?;
+        }
+        if !self
+            .table_rename_destination_state_is_safe_unlocked(intent, destination_path)
+            .await?
+        {
+            return Err(TableCatalogStoreError::Unavailable(
+                "published table rename state is inconsistent with its warehouse index".to_string(),
+            ));
+        }
+
+        if intent.status.rank() < TableRenameIntentStatus::SourceCleaned.rank() {
+            if let Some(source_bridge) = intent.source_bridge.as_ref()
+                && let Some((current, current_etag)) = self
+                    .read_entry_unlocked::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), source_bridge_path)
+                    .await?
+            {
+                validate_external_catalog_bridge_entry_object(&self.paths, source_bridge_path, &current)?;
+                if current != *source_bridge || current_etag != intent.source_bridge_etag {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "source external catalog bridge changed before rename cleanup".to_string(),
+                    ));
+                }
+                let delete_result = self
+                    .backend
+                    .delete_object_unlocked(self.catalog_bucket(), source_bridge_path)
+                    .await;
+                if delete_result.is_err()
+                    && self
+                        .read_entry_unlocked::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), source_bridge_path)
+                        .await?
+                        .is_some()
+                {
+                    delete_result?;
+                }
+            }
+            self.delete_table_rename_source_maintenance_objects(intent).await?;
+            self.advance_table_rename_intent_unlocked(intent_object, intent, intent_etag, TableRenameIntentStatus::SourceCleaned)
+                .await?;
+        }
+
+        if let Some((current, _)) = self
+            .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), source_path)
+            .await?
+        {
+            validate_table_entry_object(&self.paths, source_path, &current)?;
+            if current.table_id == intent.table_id {
+                if current != source_tombstone {
+                    return Err(TableCatalogStoreError::Conflict("source table changed before rename cleanup".to_string()));
+                }
+                let delete_result = self.backend.delete_object_unlocked(self.catalog_bucket(), source_path).await;
+                if delete_result.is_err()
+                    && self
+                        .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), source_path)
+                        .await?
+                        .is_some()
+                {
+                    delete_result?;
+                }
+            }
+        }
+
+        self.advance_table_rename_intent_unlocked(intent_object, intent, intent_etag, TableRenameIntentStatus::Completed)
+            .await?;
+        let delete_result = self
+            .backend
+            .delete_object_unlocked(self.catalog_bucket(), intent_object)
+            .await;
+        if delete_result.is_err() && self.read_table_rename_intent_with(intent_object, true).await?.is_some() {
+            // A completed intent is safe for readers and can be cleaned by the next rename or recovery request.
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    async fn recover_table_rename_intent(
+        &self,
+        mut intent: TableRenameIntent,
+    ) -> TableCatalogStoreResult<TableRenameRecoveryReport> {
+        let publication = TableCommitLockPublication::new(&self.backend);
+        publication.begin_table_bucket(&intent.table_bucket).await?;
+        if !publication.holds_table_bucket(&intent.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "table rename recovery requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let _migration_guard = self
+            .acquire_object_backed_catalog_exclusive_write_permit(&intent.table_bucket)
+            .await?;
+        let source_namespace = parse_namespace_for_store(&intent.source.namespace)?;
+        let source_table = parse_table_for_store(&intent.source.table)?;
+        let destination_namespace = parse_namespace_for_store(&intent.destination.namespace)?;
+        let destination_table = parse_table_for_store(&intent.destination.table)?;
+        let source_path = self
+            .paths
+            .table_entry_path(&intent.table_bucket, &source_namespace, &source_table);
+        let destination_path = self
+            .paths
+            .table_entry_path(&intent.table_bucket, &destination_namespace, &destination_table);
+        let source_bridge_path = self
+            .paths
+            .external_catalog_bridge_path(&intent.table_bucket, &source_namespace, &source_table);
+        let destination_bridge_path =
+            self.paths
+                .external_catalog_bridge_path(&intent.table_bucket, &destination_namespace, &destination_table);
+        let intent_object = self.paths.table_rename_intent_path(&intent.table_bucket, &intent.table_id);
+        let index = table_warehouse_index_entry(&intent.destination)?;
+        let index_object = self
+            .paths
+            .warehouse_index_entry_path(&intent.table_bucket, &index.warehouse_object_prefix);
+        let _guards = self
+            .acquire_catalog_write_locks([
+                self.paths.namespace_entry_path(&intent.table_bucket, &source_namespace),
+                self.paths.namespace_entry_path(&intent.table_bucket, &destination_namespace),
+                source_path.clone(),
+                destination_path.clone(),
+                source_bridge_path.clone(),
+                destination_bridge_path.clone(),
+                intent_object.clone(),
+                index_object.clone(),
+            ])
+            .await?;
+        let Some((persisted, mut intent_etag)) = self.read_table_rename_intent_with(&intent_object, true).await? else {
+            if !self
+                .table_rename_is_fully_published_unlocked(&intent, &source_path, &destination_path)
+                .await?
+            {
+                return Err(TableCatalogStoreError::Unavailable(
+                    "table rename intent disappeared before recovery while catalog state remained incomplete".to_string(),
+                ));
+            }
+            intent.status = TableRenameIntentStatus::Completed;
+            return Ok(Self::table_rename_recovery_report(&intent));
+        };
+        intent = persisted;
+        if matches!(intent.status, TableRenameIntentStatus::Completed) {
+            if !self
+                .table_rename_is_fully_published_unlocked(&intent, &source_path, &destination_path)
+                .await?
+            {
+                return Err(TableCatalogStoreError::Unavailable(
+                    "completed table rename intent has incomplete catalog state".to_string(),
+                ));
+            }
+            let _ = self
+                .backend
+                .delete_object_unlocked(self.catalog_bucket(), &intent_object)
+                .await;
+            return Ok(Self::table_rename_recovery_report(&intent));
+        }
+        self.execute_table_rename_intent_unlocked(
+            &intent_object,
+            &mut intent,
+            &mut intent_etag,
+            &source_path,
+            &destination_path,
+            &source_bridge_path,
+            &destination_bridge_path,
+            &index_object,
+        )
+        .await?;
+        Ok(Self::table_rename_recovery_report(&intent))
+    }
+
+    pub(crate) async fn recover_table_rename(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<Option<TableRenameRecoveryReport>> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let Some((_, intent, _)) = self.find_table_rename_intent(table_bucket, &namespace, &table).await? else {
+            return Ok(None);
+        };
+        self.recover_table_rename_intent(intent).await.map(Some)
     }
 
     async fn list_entry_page<T, P, V>(
@@ -929,6 +2073,11 @@ where
         index: TableWarehouseIndexEntry,
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         validate_table_warehouse_index_entry_object(&self.paths, index_object, &index)?;
+        if index.state == TableCatalogEntryState::Deleting {
+            return Err(TableCatalogStoreError::Unavailable(format!(
+                "warehouse index {index_object} is fenced while a catalog mutation is in progress"
+            )));
+        }
         if index.state != TableCatalogEntryState::Active {
             return Err(TableCatalogStoreError::Internal(format!(
                 "warehouse index {index_object} for {}/{}/{} is inactive while the index is authoritative",
@@ -1433,6 +2582,17 @@ where
                 namespace.public_name()
             )));
         }
+        if self
+            .load_table(table_bucket, &namespace.public_name(), table.as_str())
+            .await?
+            .is_none()
+        {
+            return Err(TableCatalogStoreError::TableNotFound(format!(
+                "{table_bucket}/{}/{}",
+                namespace.public_name(),
+                table.as_str()
+            )));
+        }
         let bridge_path = self.paths.external_catalog_bridge_path(table_bucket, &namespace, &table);
         let Some((entry, _)) = self
             .read_entry::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), &bridge_path)
@@ -1449,6 +2609,14 @@ where
         entry: ExternalCatalogBridgeEntry,
     ) -> TableCatalogStoreResult<ExternalCatalogBridgeEntry> {
         validate_catalog_entry_version("external catalog bridge", entry.version)?;
+        let publication = TableCommitLockPublication::new(&self.backend);
+        publication.begin_table_bucket(&entry.table_bucket).await?;
+        if !publication.holds_table_bucket(&entry.table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "external catalog bridge update requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
         self.require_table_bucket(&entry.table_bucket).await?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(&entry.table_bucket).await?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
@@ -1457,6 +2625,16 @@ where
             return Err(TableCatalogStoreError::NotFound(format!(
                 "namespace {}/{}",
                 entry.table_bucket, entry.namespace
+            )));
+        }
+        if self
+            .load_table(&entry.table_bucket, &entry.namespace, table.as_str())
+            .await?
+            .is_none()
+        {
+            return Err(TableCatalogStoreError::TableNotFound(format!(
+                "{}/{}/{}",
+                entry.table_bucket, entry.namespace, entry.table
             )));
         }
         let bridge_path = self
@@ -1618,8 +2796,15 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
+        let rename_recovery = self.recover_table_rename(table_bucket, namespace, table).await?;
+        let recovery_namespace = rename_recovery
+            .as_ref()
+            .map_or(namespace, |rename| rename.destination_namespace.as_str());
+        let recovery_table = rename_recovery
+            .as_ref()
+            .map_or(table, |rename| rename.destination_table.as_str());
+        let namespace = parse_namespace_for_store(recovery_namespace)?;
+        let table = parse_table_for_store(recovery_table)?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
@@ -3353,7 +4538,18 @@ where
             .collect();
 
         let commit_recovery = self.plan_table_commit_recovery(table_bucket, namespace, table).await?;
-        let (recovery_status, recommended_actions) = table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
+        let (mut recovery_status, mut recommended_actions) =
+            table_catalog_recovery_summary(&current_metadata_status, &commit_recovery);
+        let rename_recovery = self
+            .find_table_rename_intent(table_bucket, &parsed_namespace, &parsed_table)
+            .await?
+            .map(|(_, intent, _)| Self::table_rename_recovery_report(&intent));
+        if rename_recovery.as_ref().is_some_and(|rename| rename.recovery_required) {
+            recovery_status = TableCatalogRecoveryStatus::Recoverable;
+            if !recommended_actions.contains(&TableCatalogRecoveryAction::RunRenameRecovery) {
+                recommended_actions.insert(0, TableCatalogRecoveryAction::RunRenameRecovery);
+            }
+        }
         let backing_manifest =
             table_catalog_backing_manifest(&self.paths, &parsed_namespace, &parsed_table, &catalog.table, &commit_recovery);
 
@@ -3363,6 +4559,7 @@ where
             recovery_status,
             recommended_actions,
             commit_recovery,
+            rename_recovery,
             backing_manifest,
             orphan_metadata_candidate_locations,
         })
@@ -4224,6 +5421,7 @@ where
             };
             validate_table_entry_object(&self.paths, &object, &entry)?;
             if entry.state == TableCatalogEntryState::Active {
+                self.ensure_rename_intent_allows_reads(&entry).await?;
                 entries.push(entry);
             }
         }
@@ -4232,12 +5430,14 @@ where
     }
 
     async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
-        self.list_all_table_entries(table_bucket).await.map(|entries| {
-            entries
-                .into_iter()
-                .filter(|entry| entry.state == TableCatalogEntryState::Active)
-                .collect()
-        })
+        let mut active = Vec::new();
+        for entry in self.list_all_table_entries(table_bucket).await? {
+            if entry.state == TableCatalogEntryState::Active {
+                self.ensure_rename_intent_allows_reads(&entry).await?;
+                active.push(entry);
+            }
+        }
+        Ok(active)
     }
 
     async fn list_tables_page(
@@ -4248,21 +5448,278 @@ where
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<TableEntry>> {
         let namespace = parse_namespace_for_store(namespace)?;
-        self.list_entry_page(
-            &self.paths.table_entries_prefix(table_bucket, &namespace),
-            TABLE_ENTRY_FILE,
-            cursor,
-            limit,
-            |entry: &TableEntry| entry.state == TableCatalogEntryState::Active,
-            |object, entry: &TableEntry| validate_table_entry_object(&self.paths, object, entry).map(|_| ()),
-        )
-        .await
+        let page = self
+            .list_entry_page(
+                &self.paths.table_entries_prefix(table_bucket, &namespace),
+                TABLE_ENTRY_FILE,
+                cursor,
+                limit,
+                |entry: &TableEntry| entry.state == TableCatalogEntryState::Active,
+                |object, entry: &TableEntry| validate_table_entry_object(&self.paths, object, entry).map(|_| ()),
+            )
+            .await?;
+        for entry in &page.entries {
+            self.ensure_rename_intent_allows_reads(entry).await?;
+        }
+        Ok(page)
     }
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>> {
-        self.load_table_entry(table_bucket, namespace, table)
+        let entry = self.load_table_entry(table_bucket, namespace, table).await?;
+        if let Some(entry) = entry.as_ref() {
+            self.ensure_rename_intent_allows_reads(entry).await?;
+        }
+        Ok(entry.filter(|table| table.state == TableCatalogEntryState::Active))
+    }
+
+    async fn rename_table(
+        &self,
+        table_bucket: &str,
+        source_namespace: &str,
+        source_table: &str,
+        destination_namespace: &str,
+        destination_table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let publication = TableCommitLockPublication::new(&self.backend);
+        publication.begin_table_bucket(table_bucket).await?;
+        if !publication.holds_table_bucket(table_bucket) {
+            return Err(TableCatalogStoreError::Internal(
+                "table rename requires a table-bucket publication fence".to_string(),
+            ));
+        }
+        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let source_namespace = parse_namespace_for_store(source_namespace)?;
+        let source_table = parse_table_for_store(source_table)?;
+        let destination_namespace = parse_namespace_for_store(destination_namespace)?;
+        let destination_table = parse_table_for_store(destination_table)?;
+        if source_namespace == destination_namespace && source_table == destination_table {
+            return Err(TableCatalogStoreError::AlreadyExists(format!(
+                "destination table already exists: {table_bucket}/{}/{}",
+                destination_namespace.public_name(),
+                destination_table.as_str()
+            )));
+        }
+        self.require_table_bucket(table_bucket).await?;
+        let _migration_guard = self
+            .acquire_object_backed_catalog_exclusive_write_permit(table_bucket)
+            .await?;
+        let source_namespace_path = self.paths.namespace_entry_path(table_bucket, &source_namespace);
+        let destination_namespace_path = self.paths.namespace_entry_path(table_bucket, &destination_namespace);
+        let source_path = self.paths.table_entry_path(table_bucket, &source_namespace, &source_table);
+        let destination_path = self
+            .paths
+            .table_entry_path(table_bucket, &destination_namespace, &destination_table);
+        let source_bridge_path = self
+            .paths
+            .external_catalog_bridge_path(table_bucket, &source_namespace, &source_table);
+        let destination_bridge_path =
+            self.paths
+                .external_catalog_bridge_path(table_bucket, &destination_namespace, &destination_table);
+        let _identity_guards = self
+            .acquire_catalog_write_locks([
+                source_namespace_path.clone(),
+                destination_namespace_path.clone(),
+                source_path.clone(),
+                destination_path.clone(),
+                source_bridge_path.clone(),
+                destination_bridge_path.clone(),
+            ])
+            .await?;
+        self.require_active_namespace_unlocked(table_bucket, &source_namespace, &source_namespace_path)
             .await
-            .map(|entry| entry.filter(|table| table.state == TableCatalogEntryState::Active))
+            .map_err(|err| match err {
+                TableCatalogStoreError::NotFound(_) => TableCatalogStoreError::TableNotFound(format!(
+                    "{table_bucket}/{}/{}",
+                    source_namespace.public_name(),
+                    source_table.as_str()
+                )),
+                other => other,
+            })?;
+        self.require_active_namespace_unlocked(table_bucket, &destination_namespace, &destination_namespace_path)
+            .await
+            .map_err(|err| match err {
+                TableCatalogStoreError::NotFound(_) => {
+                    TableCatalogStoreError::NamespaceNotFound(format!("{table_bucket}/{}", destination_namespace.public_name()))
+                }
+                other => other,
+            })?;
+        let Some((source, source_etag)) = self
+            .read_table_with_etag_unlocked(table_bucket, &source_namespace, &source_table)
+            .await?
+        else {
+            return Err(TableCatalogStoreError::TableNotFound(format!(
+                "{table_bucket}/{}/{}",
+                source_namespace.public_name(),
+                source_table.as_str()
+            )));
+        };
+        if source.state != TableCatalogEntryState::Active {
+            return Err(TableCatalogStoreError::TableNotFound(format!(
+                "{table_bucket}/{}/{}",
+                source_namespace.public_name(),
+                source_table.as_str()
+            )));
+        }
+        if !is_valid_table_metadata_location_for_entry(&source, &source.metadata_location) {
+            return Err(TableCatalogStoreError::Invalid(
+                "current metadata location must be inside the table metadata directory".to_string(),
+            ));
+        }
+        if self
+            .read_entry_unlocked::<TableEntry>(self.catalog_bucket(), &destination_path)
+            .await?
+            .is_some()
+        {
+            return Err(TableCatalogStoreError::AlreadyExists(format!(
+                "destination table already exists: {table_bucket}/{}/{}",
+                destination_namespace.public_name(),
+                destination_table.as_str()
+            )));
+        }
+        let destination_view_path = self
+            .paths
+            .view_entry_path(table_bucket, &destination_namespace, &destination_table);
+        if let Some((view, _)) = self
+            .read_entry_unlocked::<ViewEntry>(self.catalog_bucket(), &destination_view_path)
+            .await?
+        {
+            validate_view_entry_object(&self.paths, &destination_view_path, &view)?;
+            return Err(TableCatalogStoreError::AlreadyExists(format!(
+                "destination view already exists: {table_bucket}/{}/{}",
+                destination_namespace.public_name(),
+                destination_table.as_str()
+            )));
+        }
+
+        let source_bridge = self
+            .read_entry_unlocked::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), &source_bridge_path)
+            .await?;
+        if let Some((bridge, _)) = source_bridge.as_ref() {
+            validate_external_catalog_bridge_entry_object(&self.paths, &source_bridge_path, bridge)?;
+        }
+        if let Some((bridge, _)) = self
+            .read_entry_unlocked::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), &destination_bridge_path)
+            .await?
+        {
+            validate_external_catalog_bridge_entry_object(&self.paths, &destination_bridge_path, &bridge)?;
+            return Err(TableCatalogStoreError::AlreadyExists(format!(
+                "destination external catalog bridge already exists: {destination_bridge_path}"
+            )));
+        }
+        let maintenance_objects = self
+            .build_table_rename_maintenance_objects(&source, &destination_namespace, &destination_table)
+            .await?;
+
+        let now = maintenance_timestamp(OffsetDateTime::now_utc());
+        let mut destination = source.clone();
+        destination.namespace = destination_namespace.public_name();
+        destination.table = destination_table.as_str().to_string();
+        destination.updated_at = Some(now.clone());
+        let (source_bridge, source_bridge_etag, destination_bridge) = match source_bridge {
+            Some((source_bridge, source_bridge_etag)) => {
+                let source_bridge_etag = source_bridge_etag.ok_or_else(|| {
+                    TableCatalogStoreError::Internal(format!("catalog external bridge entry has no etag: {source_bridge_path}"))
+                })?;
+                let mut destination_bridge = source_bridge.clone();
+                destination_bridge.namespace = destination_namespace.public_name();
+                destination_bridge.table = destination_table.as_str().to_string();
+                destination_bridge.updated_at = Some(now.clone());
+                (Some(source_bridge), Some(source_bridge_etag), Some(destination_bridge))
+            }
+            None => (None, None, None),
+        };
+        let intent_object = self.paths.table_rename_intent_path(table_bucket, &source.table_id);
+        let index = table_warehouse_index_entry(&source)?;
+        let index_object = self
+            .paths
+            .warehouse_index_entry_path(table_bucket, &index.warehouse_object_prefix);
+        let _state_guards = self
+            .acquire_catalog_write_locks([intent_object.clone(), index_object.clone()])
+            .await?;
+        if let Some((existing, _)) = self.read_table_rename_intent_with(&intent_object, true).await? {
+            if matches!(existing.status, TableRenameIntentStatus::Completed) {
+                let existing_source_path = self.paths.table_entry_path(
+                    table_bucket,
+                    &parse_namespace_for_store(&existing.source.namespace)?,
+                    &parse_table_for_store(&existing.source.table)?,
+                );
+                let existing_destination_path = self.paths.table_entry_path(
+                    table_bucket,
+                    &parse_namespace_for_store(&existing.destination.namespace)?,
+                    &parse_table_for_store(&existing.destination.table)?,
+                );
+                if !self
+                    .table_rename_is_fully_published_unlocked(&existing, &existing_source_path, &existing_destination_path)
+                    .await?
+                {
+                    return Err(TableCatalogStoreError::Conflict(format!(
+                        "table rename recovery is required for intent {}",
+                        existing.intent_id
+                    )));
+                }
+                let delete_result = self
+                    .backend
+                    .delete_object_unlocked(self.catalog_bucket(), &intent_object)
+                    .await;
+                if delete_result.is_err() && self.read_table_rename_intent_with(&intent_object, true).await?.is_some() {
+                    delete_result?;
+                }
+            } else {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table rename recovery is required for intent {}",
+                    existing.intent_id
+                )));
+            }
+        }
+        let mut intent = TableRenameIntent {
+            version: TABLE_RENAME_INTENT_VERSION,
+            intent_id: Uuid::new_v4().to_string(),
+            table_bucket: table_bucket.to_string(),
+            table_id: source.table_id.clone(),
+            source_etag,
+            source,
+            destination,
+            source_bridge,
+            destination_bridge,
+            source_bridge_etag,
+            maintenance_objects,
+            status: TableRenameIntentStatus::Staged,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        validate_table_rename_intent_object(&self.paths, &intent_object, &intent)?;
+        let intent_size = serde_json::to_vec(&intent)
+            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize table rename intent: {err}")))?
+            .len();
+        if intent_size > TABLE_RENAME_INTENT_MAX_SIZE {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "table maintenance state requires a rename intent larger than {TABLE_RENAME_INTENT_MAX_SIZE} bytes"
+            )));
+        }
+        let create_result = self
+            .write_entry_unlocked(self.catalog_bucket(), &intent_object, &intent, TableCatalogPutPrecondition::IfAbsent)
+            .await;
+        let Some((persisted, mut intent_etag)) = self.read_table_rename_intent_with(&intent_object, true).await? else {
+            return create_result.and(Err(TableCatalogStoreError::Internal(
+                "table rename intent disappeared after creation".to_string(),
+            )));
+        };
+        if persisted != intent {
+            return create_result.and(Err(TableCatalogStoreError::Conflict(
+                "another table rename intent already exists".to_string(),
+            )));
+        }
+        self.execute_table_rename_intent_unlocked(
+            &intent_object,
+            &mut intent,
+            &mut intent_etag,
+            &source_path,
+            &destination_path,
+            &source_bridge_path,
+            &destination_bridge_path,
+            &index_object,
+        )
+        .await
     }
 
     async fn resolve_table_data_plane_resource(
@@ -4360,6 +5817,7 @@ where
                 ))),
             );
         };
+        self.ensure_rename_intent_allows_reads(&current).await?;
         if current.state != TableCatalogEntryState::Active {
             return table_commit_result(
                 &request.table_bucket,
@@ -4552,7 +6010,7 @@ where
                 )),
             );
         }
-        if !is_valid_table_metadata_location(&namespace, &table, &request.new_metadata_location) {
+        if !is_valid_table_metadata_location_for_entry(&current, &request.new_metadata_location) {
             return table_commit_result(
                 &request.table_bucket,
                 &request.namespace,
@@ -4775,6 +6233,7 @@ where
                 table.as_str()
             )));
         };
+        self.ensure_rename_intent_allows_reads(&entry).await?;
         self.delete_owned_table_warehouse_index_for_drop(&entry).await?;
         if !publication.holds_table_bucket(table_bucket)
             || !publication.holds_table(table_bucket, &namespace.public_name(), table.as_str())

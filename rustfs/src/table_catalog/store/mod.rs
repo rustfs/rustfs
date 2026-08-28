@@ -862,6 +862,21 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn table_maintenance_root_prefix(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+    ) -> String {
+        format!(
+            "{}{}/{MAINTENANCE_ROOT}/{}/",
+            self.table_entries_prefix(table_bucket, namespace),
+            table.as_str(),
+            table_catalog_path_hash(table_id)
+        )
+    }
+
     pub fn table_maintenance_job_path(
         &self,
         table_bucket: &str,
@@ -981,6 +996,18 @@ impl TableCatalogObjectPaths {
             self.table_bucket_root_prefix(table_bucket),
             WAREHOUSE_INDEX_ROOT,
             table_catalog_path_hash(warehouse_object_prefix)
+        )
+    }
+
+    pub fn table_rename_intents_prefix(&self, table_bucket: &str) -> String {
+        format!("{}{}/", self.table_bucket_root_prefix(table_bucket), TABLE_RENAME_INTENT_ROOT)
+    }
+
+    pub fn table_rename_intent_path(&self, table_bucket: &str, table_id: &str) -> String {
+        format!(
+            "{}{}.json",
+            self.table_rename_intents_prefix(table_bucket),
+            table_catalog_path_hash(table_id)
         )
     }
 
@@ -1241,9 +1268,11 @@ where
         destination_table: &str,
     ) -> TableCatalogStoreResult<()> {
         match self {
-            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
-                "table rename requires durable-strong catalog backing".to_string(),
-            )),
+            Self::ObjectBacked(store) => {
+                store
+                    .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)
+                    .await
+            }
             Self::DurableStrong(store) => {
                 store
                     .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)

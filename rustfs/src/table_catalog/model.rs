@@ -226,6 +226,85 @@ pub(crate) struct TableWarehouseIndexStateEntry {
     pub(super) state: TableCatalogEntryState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableRenameIntentStatus {
+    Staged,
+    DestinationWritten,
+    IndexUpdated,
+    SourceTombstoned,
+    DestinationPublished,
+    IndexPublished,
+    SourceCleaned,
+    Completed,
+}
+
+impl TableRenameIntentStatus {
+    pub(crate) fn blocks_reads(self) -> bool {
+        !matches!(self, Self::IndexPublished | Self::Completed)
+    }
+
+    pub(crate) fn rank(self) -> u8 {
+        match self {
+            Self::Staged => 0,
+            Self::DestinationWritten => 1,
+            Self::IndexUpdated => 2,
+            Self::SourceTombstoned => 3,
+            Self::DestinationPublished => 4,
+            Self::IndexPublished => 5,
+            Self::SourceCleaned => 6,
+            Self::Completed => 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableRenameIntent {
+    pub(crate) version: u16,
+    pub(crate) intent_id: String,
+    pub(crate) table_bucket: String,
+    pub(crate) table_id: String,
+    pub(crate) source_etag: String,
+    pub(crate) source: TableEntry,
+    pub(crate) destination: TableEntry,
+    pub(crate) source_bridge: Option<ExternalCatalogBridgeEntry>,
+    pub(crate) destination_bridge: Option<ExternalCatalogBridgeEntry>,
+    pub(crate) source_bridge_etag: Option<String>,
+    pub(crate) maintenance_objects: Vec<TableRenameMaintenanceObject>,
+    pub(crate) status: TableRenameIntentStatus,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableRenameMaintenanceObjectKind {
+    Config,
+    Report,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableRenameMaintenanceObject {
+    pub(crate) source_object: String,
+    pub(crate) destination_object: String,
+    pub(crate) source_etag: String,
+    pub(crate) kind: TableRenameMaintenanceObjectKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableRenameRecoveryReport {
+    pub(crate) intent_id: String,
+    pub(crate) source_namespace: String,
+    pub(crate) source_table: String,
+    pub(crate) destination_namespace: String,
+    pub(crate) destination_table: String,
+    pub(crate) table_id: String,
+    pub(crate) status: TableRenameIntentStatus,
+    pub(crate) recovery_required: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WarehouseIndexReservation {
     Created,
@@ -1349,6 +1428,7 @@ pub(crate) enum TableCatalogRecoveryStatus {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogRecoveryAction {
     RunCommitRecovery,
+    RunRenameRecovery,
     RetryCommit,
     RestoreCurrentMetadataObject,
     FixCurrentMetadataJson,
@@ -1363,6 +1443,7 @@ pub(crate) struct TableCatalogDiagnosticsReport {
     pub recovery_status: TableCatalogRecoveryStatus,
     pub recommended_actions: Vec<TableCatalogRecoveryAction>,
     pub commit_recovery: TableCommitRecoveryReport,
+    pub rename_recovery: Option<TableRenameRecoveryReport>,
     pub backing_manifest: TableCatalogBackingManifest,
     pub orphan_metadata_candidate_locations: Vec<String>,
 }
