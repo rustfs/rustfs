@@ -4283,7 +4283,7 @@ async fn probe_reverse_peer_reachability(state: &SiteReplicationState, local_pee
                 continue;
             }
         };
-        if let Err(err) = PeerAdminRequest::put(&connection, SITE_REPLICATION_DEVNULL_PATH, &state.service_account_access_key)
+        if let Err(err) = devnull_probe_request(&connection, &state.service_account_access_key)
             .send(&secret_key, &serde_json::json!({}))
             .await
         {
@@ -4292,6 +4292,13 @@ async fn probe_reverse_peer_reachability(state: &SiteReplicationState, local_pee
     }
 
     errors
+}
+
+/// The probe must target devnull with a method the admin router actually
+/// registers for it — a mismatched method makes every probe fail and turns
+/// the "not reachable" warning into permanent noise.
+pub(crate) fn devnull_probe_request<'a>(connection: &'a PeerConnection, access_key: &'a str) -> PeerAdminRequest<'a> {
+    PeerAdminRequest::post(connection, SITE_REPLICATION_DEVNULL_PATH, access_key)
 }
 
 async fn backfill_existing_buckets_after_add(
@@ -11098,13 +11105,15 @@ mod tests {
             deployment_id: "remote".to_string(),
             ..peer("remote", "https://remote.example.com")
         };
-        let detail = "x".repeat(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT + 32);
+        let detail = format!("HEAD{}TAIL", "x".repeat(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT + 32));
 
         let error = status_peer_error(&remote, detail);
 
         assert_eq!(error.name, "remote");
         assert_eq!(error.endpoint, "https://remote.example.com");
-        assert!(error.error.ends_with("(truncated)"));
+        assert!(error.error.contains("(truncated)"));
+        assert!(error.error.starts_with("HEAD"));
+        assert!(error.error.ends_with("TAIL"));
         assert!(error.error.chars().count() <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT);
     }
 
