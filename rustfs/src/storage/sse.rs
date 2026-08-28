@@ -2884,7 +2884,6 @@ pub(crate) enum ObjectDekRewrapOutcome {
 /// fills with the same bytes). A copy left behind would win a read-path
 /// fallback and resurrect the old wrapping, so finding no replaceable copy is
 /// an error, never a silent success.
-#[allow(dead_code)] // Consumed by the bulk rekey sweep in the follow-up PR; tests exercise it now.
 pub(crate) async fn rewrap_object_encryption_metadata(
     bucket: &str,
     key: &str,
