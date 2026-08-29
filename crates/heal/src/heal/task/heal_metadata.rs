@@ -97,6 +97,7 @@ impl HealTask {
             scan_mode: HealScanMode::Deep,
             update_parity: false,
             no_lock: self.options.no_lock,
+            read_repair: false,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
@@ -259,6 +260,7 @@ impl HealTask {
             scan_mode: HealScanMode::Deep,
             update_parity: true,
             no_lock: self.options.no_lock,
+            read_repair: false,
             pool: None,
             set: None,
         };

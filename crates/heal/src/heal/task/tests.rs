@@ -1061,6 +1061,72 @@ async fn scoped_object_heal_slowdown_is_not_treated_as_deleted() {
         .expect("heal options lock should be available");
     assert_eq!(opts[0].pool, Some(0));
     assert_eq!(opts[0].set, Some(1));
+    assert!(!opts[0].read_repair);
+}
+
+#[tokio::test]
+async fn read_repair_object_heal_sets_read_repair_option() {
+    let storage = Arc::new(MockStorage::default());
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), Some("version-a".to_string()));
+    request.source = HealRequestSource::ReadRepair;
+    let task = HealTask::from_request(request, storage.clone());
+
+    task.execute().await.expect("read-repair object heal should complete");
+
+    let opts = storage.object_heal_opts.lock().unwrap();
+    assert_eq!(opts.len(), 1);
+    assert!(opts[0].read_repair);
+    assert!(!opts[0].no_lock);
+}
+
+#[tokio::test]
+async fn read_repair_object_heal_is_not_failed_by_flat_task_timeout() {
+    let storage = Arc::new(MockStorage {
+        block_heal_object: Mutex::new(true),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    request.source = HealRequestSource::ReadRepair;
+    request.options.timeout = Some(Duration::from_millis(1));
+    let task = Arc::new(HealTask::from_request(request, storage.clone()));
+    let execution = tokio::spawn({
+        let task = task.clone();
+        async move { task.execute().await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !storage.object_heal_opts.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("read-repair object heal should start");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!execution.is_finished(), "read repair must not be failed by the flat task timeout");
+
+    execution.abort();
+    assert!(execution.await.is_err(), "aborted mock execution should not join successfully");
+    assert!(storage.object_heal_opts.lock().unwrap()[0].read_repair);
+}
+
+#[tokio::test]
+async fn non_read_repair_object_heal_still_uses_flat_timeout() {
+    let storage = Arc::new(MockStorage {
+        block_heal_object: Mutex::new(true),
+        ..Default::default()
+    });
+    let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+    request.options.timeout = Some(Duration::from_millis(1));
+    let task = HealTask::from_request(request, storage);
+
+    let result = tokio::time::timeout(Duration::from_secs(1), task.execute())
+        .await
+        .expect("flat timeout should finish the task");
+
+    assert!(matches!(result, Err(Error::TaskTimeout)));
 }
 
 async fn make_resume_disk(temp: &TempDir) -> DiskStore {

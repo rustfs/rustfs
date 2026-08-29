@@ -356,6 +356,7 @@ impl HealTask {
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
             no_lock: self.options.no_lock,
+            read_repair: false,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
@@ -411,6 +412,7 @@ impl HealTask {
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
             no_lock: self.options.no_lock,
+            read_repair: false,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };

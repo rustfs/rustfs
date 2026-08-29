@@ -497,6 +497,7 @@ mod serial_tests {
             scan_mode: HealScanMode::Normal,
             update_parity: false,
             no_lock: false,
+            read_repair: false,
             pool: None,
             set: None,
         };
@@ -518,6 +519,7 @@ mod serial_tests {
             scan_mode: HealScanMode::Normal,
             update_parity: false,
             no_lock: false,
+            read_repair: false,
             pool: None,
             set: None,
         };

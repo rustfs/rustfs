@@ -213,6 +213,8 @@ pub struct HealOpts {
     pub update_parity: bool,
     #[serde(rename = "nolock")]
     pub no_lock: bool,
+    #[serde(rename = "readRepair", default)]
+    pub read_repair: bool,
     #[serde(rename = "pool", default)]
     pub pool: Option<usize>,
     #[serde(rename = "set", default)]
@@ -670,6 +672,24 @@ mod tests {
 
         let request = HealChannelRequest::default();
         assert_eq!(request.source, HealRequestSource::Internal);
+    }
+
+    #[test]
+    fn heal_opts_deserializes_missing_read_repair_as_false() {
+        let opts: HealOpts = serde_json::from_str(
+            r#"{
+                "recursive": false,
+                "dryRun": false,
+                "remove": false,
+                "recreate": false,
+                "scanMode": "normal",
+                "updateParity": false,
+                "nolock": false
+            }"#,
+        )
+        .expect("old heal options without readRepair should decode");
+
+        assert!(!opts.read_repair);
     }
 
     #[test]
