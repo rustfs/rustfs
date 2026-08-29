@@ -29,15 +29,14 @@ mod storage_api;
 pub mod tagging;
 
 pub use config::{
-    ObjectOpts, OperatorRuleContract, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS,
-    REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION,
-    REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS, ReplicationConfigStructureError,
-    ReplicationConfigurationExt, ReplicationTargetValidationError, active_replication_rule_destination_arns,
-    assign_site_replication_rule_priorities, invalid_replication_config_status_field, is_reconciler_owned_site_replication_rule,
-    is_site_replication_role, is_site_replication_rule, merge_incoming_replication_config, merge_user_replication_config,
-    replication_target_arn_deployment_id, replication_target_arns, should_remove_replication_target,
-    site_replication_rule_deployment_id, unsupported_replication_config_field, validate_replication_config_structure,
-    validate_replication_config_target_arns,
+    ObjectOpts, OperatorRuleContract, REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS,
+    REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
+    REPLICATION_WRITABLE_FIELDS, ReplicationConfigStructureError, ReplicationConfigurationExt, ReplicationTargetValidationError,
+    active_replication_rule_destination_arns, assign_site_replication_rule_priorities, invalid_replication_config_status_field,
+    is_reconciler_owned_site_replication_rule, is_site_replication_role, is_site_replication_rule,
+    merge_incoming_replication_config, merge_user_replication_config, replication_target_arn_deployment_id,
+    replication_target_arns, should_remove_replication_target, site_replication_rule_deployment_id,
+    unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
 };
 pub use delete::{
     DeletedObjectReplicationInfo, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,

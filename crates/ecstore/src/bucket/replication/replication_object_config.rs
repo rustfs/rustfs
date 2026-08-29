@@ -436,14 +436,19 @@ pub(crate) async fn check_replicate_delete_strict(
     }
 
     for target in decision.targets_map.values_mut() {
-        if let Some(client) = ReplicationTargetStore::remote_target_client(bucket, &target.arn).await {
-            target.synchronous = client.replicate_sync;
-        } else {
-            target.replicate = false;
-            target.synchronous = false;
-        }
+        let replicate_sync = ReplicationTargetStore::remote_target_client(bucket, &target.arn)
+            .await
+            .map(|client| client.replicate_sync);
+        apply_target_delivery_mode(target, replicate_sync);
     }
     Ok(decision)
+}
+
+fn apply_target_delivery_mode(target: &mut ReplicateTargetDecision, replicate_sync: Option<bool>) {
+    // A missing runtime client is a delivery failure, not a rule mismatch.
+    // Preserve admission and fall back to the asynchronous worker, which can
+    // persist FAILED state for the heal/retry path.
+    target.synchronous = replicate_sync.unwrap_or(false);
 }
 
 pub(crate) fn check_replicate_delete_with_snapshot(
@@ -627,6 +632,23 @@ mod tests {
             name: "object".to_string(),
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn missing_target_client_preserves_delete_admission_as_async() {
+        let mut target = ReplicateTargetDecision::new("arn:target".to_string(), true, true);
+
+        apply_target_delivery_mode(&mut target, None);
+
+        assert!(target.replicate, "a runtime client miss must not erase the replication rule decision");
+        assert!(
+            !target.synchronous,
+            "unavailable synchronous targets must fall back to the async retry path"
+        );
+
+        apply_target_delivery_mode(&mut target, Some(true));
+        assert!(target.replicate);
+        assert!(target.synchronous);
     }
 
     #[test]
