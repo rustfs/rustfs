@@ -1205,6 +1205,10 @@ fn data_usage_persist_timeout() -> Duration {
     DataUsageCache::persistence_timeout()
 }
 
+fn scanner_publication_lease_budget_allows_persistence(timeout: Duration) -> bool {
+    timeout < Duration::from_millis(SCANNER_PUBLICATION_LEASE_TTL_MS)
+}
+
 #[cfg(not(test))]
 const SCANNER_CYCLE_EPOCH_FENCE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -1479,7 +1483,6 @@ async fn run_data_scanner_cycle_with_budget(
         Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
-    let publication_deferred = publication_defer_reason.is_some();
     let publication_epoch = scan_result.as_ref().ok().and_then(ScannerCycleResult::publication_epoch);
     let remote_publication_lease_targets = if publication_defer_reason.is_none() {
         scan_result
@@ -1493,11 +1496,11 @@ async fn run_data_scanner_cycle_with_budget(
     let mut remote_publication_leases = None;
     let remote_lease_defer_reason = if remote_publication_lease_targets.is_empty() {
         None
-    } else if usage_persist_timeout >= Duration::from_millis(SCANNER_PUBLICATION_LEASE_TTL_MS) {
+    } else if !scanner_publication_lease_budget_allows_persistence(usage_persist_timeout) {
         // The lease is intentionally fixed-duration and has no renewal path.
         // Refuse a persistence budget that could outlive it instead of
         // allowing the peer to admit movement while a local PUT is in flight.
-        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        Some(ScannerCycleDeferReason::PublicationLeaseBudgetExceeded)
     } else if let Some(notification_system) = storeapi.notification_system() {
         match notification_system
             .acquire_scanner_publication_leases(remote_publication_lease_targets.clone())
@@ -1557,8 +1560,13 @@ async fn run_data_scanner_cycle_with_budget(
         .or(remote_lease_defer_reason)
         .or(remote_lease_fence_defer_reason);
     let publication_defer_reason = (!remote_lease_covers_persistence)
-        .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        .then_some(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
         .or(publication_defer_reason);
+    // Include reasons discovered while acquiring or validating remote leases.
+    // In particular, the static budget gate above is reached after the scan
+    // result is classified, so computing this flag earlier would suppress its
+    // deferred metric.
+    let publication_deferred = publication_defer_reason.is_some();
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let remote_lease_probe = remote_publication_leases
         .as_ref()

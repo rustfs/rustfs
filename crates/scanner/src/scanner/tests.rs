@@ -4412,6 +4412,8 @@ fn scanner_cycle_cache_floor_stays_pending_during_deferred_usage_publication() {
     for reason in [
         ScannerCycleDeferReason::DataMovement,
         ScannerCycleDeferReason::ActivityBaselineUnavailable,
+        ScannerCycleDeferReason::PublicationLeaseBudgetExceeded,
+        ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded,
     ] {
         let deferred = DataUsagePersistOutcome::Deferred(reason);
         assert_eq!(
@@ -4579,6 +4581,25 @@ fn data_usage_persist_wait_covers_cache_retries_and_backup() {
         assert_eq!(data_usage_persist_timeout(), Duration::from_millis(31_350));
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[test]
+fn scanner_publication_lease_budget_has_a_strict_ttl_boundary() {
+    let ttl = Duration::from_millis(SCANNER_PUBLICATION_LEASE_TTL_MS);
+
+    assert!(scanner_publication_lease_budget_allows_persistence(
+        ttl.saturating_sub(Duration::from_millis(1))
+    ));
+    assert!(!scanner_publication_lease_budget_allows_persistence(ttl));
+    assert!(!scanner_publication_lease_budget_allows_persistence(ttl + Duration::from_millis(1)));
+    assert_eq!(
+        ScannerCycleDeferReason::PublicationLeaseBudgetExceeded.as_str(),
+        "publication_lease_budget_exceeded"
+    );
+    assert_eq!(
+        ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded.as_str(),
+        "publication_lease_deadline_exceeded"
+    );
 }
 
 #[tokio::test]
