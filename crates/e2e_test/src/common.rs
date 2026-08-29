@@ -217,7 +217,37 @@ pub(crate) async fn signed_s3_request(
     access_key: &str,
     secret_key: &str,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
-    signed_s3_request_with_session_token(method, url, body, content_type, access_key, secret_key, None).await
+    signed_s3_request_with_headers(method, url, body, content_type, access_key, secret_key, &http::HeaderMap::new()).await
+}
+
+pub(crate) async fn signed_s3_request_with_headers(
+    method: http::Method,
+    url: &str,
+    body: Option<String>,
+    content_type: Option<&str>,
+    access_key: &str,
+    secret_key: &str,
+    extra_headers: &http::HeaderMap,
+) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
+    signed_s3_request_with_session_token(
+        method,
+        url,
+        body,
+        content_type,
+        SigningCredentials {
+            access_key,
+            secret_key,
+            session_token: None,
+        },
+        extra_headers,
+    )
+    .await
+}
+
+struct SigningCredentials<'a> {
+    access_key: &'a str,
+    secret_key: &'a str,
+    session_token: Option<&'a str>,
 }
 
 async fn signed_s3_request_with_session_token(
@@ -225,9 +255,8 @@ async fn signed_s3_request_with_session_token(
     url: &str,
     body: Option<String>,
     content_type: Option<&str>,
-    access_key: &str,
-    secret_key: &str,
-    session_token: Option<&str>,
+    credentials: SigningCredentials<'_>,
+    extra_headers: &http::HeaderMap,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let uri = url.parse::<http::Uri>()?;
     let authority = uri.authority().ok_or("S3 URL missing authority")?.to_string();
@@ -239,14 +268,17 @@ async fn signed_s3_request_with_session_token(
     if let Some(content_type) = content_type {
         request = request.header(CONTENT_TYPE, content_type);
     }
+    for (name, value) in extra_headers {
+        request = request.header(name, value);
+    }
 
     let content_length = i64::try_from(body.as_ref().map_or(0, String::len)).map_err(|_| "S3 request body is too large")?;
     let signed = sign_v4(
         request.body(Body::empty())?,
         content_length,
-        access_key,
-        secret_key,
-        session_token.unwrap_or_default(),
+        credentials.access_key,
+        credentials.secret_key,
+        credentials.session_token.unwrap_or_default(),
         "us-east-1",
     );
 
@@ -283,8 +315,19 @@ pub(crate) async fn admin_request_with_session_token(
 ) -> Result<(StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{base_url}{path_and_query}");
     let content_type = body.as_ref().map(|_| "application/json");
-    let response =
-        signed_s3_request_with_session_token(method, &url, body, content_type, access_key, secret_key, session_token).await?;
+    let response = signed_s3_request_with_session_token(
+        method,
+        &url,
+        body,
+        content_type,
+        SigningCredentials {
+            access_key,
+            secret_key,
+            session_token,
+        },
+        &http::HeaderMap::new(),
+    )
+    .await?;
     let status = response.status();
     let body = response.text().await?;
     Ok((status, body))
