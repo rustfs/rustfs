@@ -425,7 +425,7 @@ fn record_active_http_requests(delta: i64) {
     } else {
         let decrement = (-delta) as u64;
         ACTIVE_HTTP_REQUESTS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(decrement)))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(decrement)))
             .unwrap_or_else(|current| current)
             .saturating_sub(decrement)
     };

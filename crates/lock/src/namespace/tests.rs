@@ -181,7 +181,7 @@ impl crate::client::LockClient for FlakyAcquireClient {
         self.acquire_attempts.fetch_add(1, Ordering::SeqCst);
         if self
             .failed_acquires_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
             .is_ok()
         {
             return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
@@ -254,7 +254,7 @@ impl crate::client::LockClient for FlakyReleaseClient {
         self.release_attempts.fetch_add(1, Ordering::SeqCst);
         if self
             .failed_releases_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
             .is_ok()
         {
             return Ok(false);

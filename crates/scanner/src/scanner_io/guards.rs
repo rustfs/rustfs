@@ -195,14 +195,14 @@ impl Drop for DiskBucketScanGaugeReset {
 
 pub(super) fn decrement_atomic_usize(counter: &AtomicUsize) -> usize {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(1)))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(1)))
         .map(|previous| previous.saturating_sub(1))
         .unwrap_or_else(|current| current)
 }
 
 pub(super) fn increment_atomic_usize(counter: &AtomicUsize) -> usize {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(1)))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(1)))
         .map(|previous| previous.saturating_add(1))
         .unwrap_or_else(|current| current)
 }

@@ -347,7 +347,7 @@ impl QuotaAdmission {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
@@ -449,6 +449,75 @@ pub struct ObjectOptions {
     /// Storage-owned journal writer used by the atomic delete path. This is
     /// populated only by the `ECStore` wrapper that holds the namespace locks.
     pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
+}
+
+impl std::fmt::Debug for ObjectOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectOptions")
+            .field("max_parity", &self.max_parity)
+            .field("mod_time", &self.mod_time)
+            .field("part_number", &self.part_number)
+            .field("delete_prefix", &self.delete_prefix)
+            .field("delete_prefix_object", &self.delete_prefix_object)
+            .field("version_id", &self.version_id.is_some())
+            .field("lifecycle_delete_all", &self.lifecycle_delete_all.is_some())
+            .field("lifecycle_delete_all_journal", &self.lifecycle_delete_all_journal.is_some())
+            .field("expected_current_version_id", &self.expected_current_version_id.is_some())
+            .field("expected_bucket_incarnation_id", &self.expected_bucket_incarnation_id)
+            .field("no_lock", &self.no_lock)
+            .field("metadata_cache_safe", &self.metadata_cache_safe)
+            .field("versioned", &self.versioned)
+            .field("version_suspended", &self.version_suspended)
+            .field("incl_free_versions", &self.incl_free_versions)
+            .field("skip_decommissioned", &self.skip_decommissioned)
+            .field("skip_rebalancing", &self.skip_rebalancing)
+            .field("skip_free_version", &self.skip_free_version)
+            .field("put_object_cancellation", &self.put_object_cancellation.is_some())
+            .field("data_movement", &self.data_movement)
+            .field("raw_data_movement_read", &self.raw_data_movement_read)
+            .field("include_part_checksums", &self.include_part_checksums)
+            .field("src_pool_idx", &self.src_pool_idx)
+            .field("user_defined_count", &self.user_defined.len())
+            .field("preserve_etag", &self.preserve_etag.is_some())
+            .field("metadata_chg", &self.metadata_chg)
+            .field("http_preconditions", &self.http_preconditions.is_some())
+            .field("delete_replication", &self.delete_replication.is_some())
+            .field("delete_replication_config_snapshot", &self.delete_replication_config_snapshot)
+            .field("namespace_lock_fence", &self.namespace_lock_fence.is_some())
+            .field("bucket_lifecycle_lock_fence", &self.bucket_lifecycle_lock_fence.is_some())
+            .field("replication_request", &self.replication_request)
+            .field("proxy_request", &self.proxy_request)
+            .field("proxy_header_set", &self.proxy_header_set)
+            .field("replication_tagging_timestamp", &self.replication_tagging_timestamp)
+            .field("replication_retention_timestamp", &self.replication_retention_timestamp)
+            .field("replication_legalhold_timestamp", &self.replication_legalhold_timestamp)
+            .field("preserve_ciphertext", &self.preserve_ciphertext)
+            .field("delete_marker", &self.delete_marker)
+            .field("synthetic_version_id", &self.synthetic_version_id)
+            .field(
+                "transition",
+                &(self.data_movement
+                    || !self.transition.status.is_empty()
+                    || !self.transition.tier.is_empty()
+                    || self.transition.expected_data_dir.is_some()),
+            )
+            .field("expiration", &self.expiration)
+            .field(
+                "lifecycle_audit_event",
+                &(!self.lifecycle_audit_event.event.rule_id.is_empty()
+                    || !self.lifecycle_audit_event.event.storage_class.is_empty()),
+            )
+            .field("eval_metadata_count", &self.eval_metadata.as_ref().map(HashMap::len))
+            .field("object_lock_retention", &self.object_lock_retention.is_some())
+            .field("object_lock_delete", &self.object_lock_delete)
+            .field("object_lock_config_snapshot", &self.object_lock_config_snapshot.is_some())
+            .field("want_checksum", &self.want_checksum)
+            .field("skip_verify_bitrot", &self.skip_verify_bitrot)
+            .field("capacity_scope_token", &self.capacity_scope_token)
+            .field("quota_admission", &self.quota_admission)
+            .field("tier_delete_journal_api", &self.tier_delete_journal_api.is_some())
+            .finish()
+    }
 }
 
 /// Transient scanner-only carrier for target-side publication lease tokens.

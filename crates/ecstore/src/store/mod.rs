@@ -275,11 +275,13 @@ pub struct ECStore {
 
 impl std::fmt::Debug for ECStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let disk_slot_count: usize = self.disk_map.values().map(Vec::len).sum();
+
         f.debug_struct("ECStore")
             .field("id", &self.id)
-            .field("disk_map", &self.disk_map)
-            .field("pools", &self.pools)
-            .field("pool_meta", &self.pool_meta)
+            .field("disk_map_pool_count", &self.disk_map.len())
+            .field("disk_slot_count", &disk_slot_count)
+            .field("pool_count", &self.pools.len())
             .finish_non_exhaustive()
     }
 }
@@ -1154,6 +1156,7 @@ mod tests {
     use super::*;
     use crate::core::pools::{PoolDecommissionInfo, PoolStatus};
     use crate::layout::endpoints::{Endpoints, PoolEndpoints, SetupType};
+    use crate::object_api::ObjectOptions;
     use crate::runtime::global::reset_local_disk_test_state;
     use crate::runtime::sources::{clear_local_disk_id_map_for_test, local_disk_path_by_id};
     use crate::store::init_format::{connect_load_init_formats, init_disks};
@@ -1168,6 +1171,81 @@ mod tests {
         assert_eq!(infos.len(), disks.len());
         // All should be None since we passed None disks
         assert!(infos.iter().all(|info| info.is_none()));
+    }
+
+    #[test]
+    fn ecstore_debug_is_bounded_summary() {
+        let endpoint_pools = EndpointServerPools::default();
+        let ctx = Arc::new(InstanceContext::new());
+        let store = ECStore {
+            id: uuid::Uuid::new_v4(),
+            disk_map: [(0, vec![None, None, None, None])].into_iter().collect(),
+            pools: Vec::new(),
+            peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, ctx.clone()),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
+            ctx,
+            bucket_fence_registry: Arc::default(),
+        };
+
+        let rendered = format!("{store:?}");
+
+        assert!(rendered.len() < 256, "ECStore Debug should stay bounded: {rendered}");
+        assert!(rendered.contains("disk_map_pool_count"));
+        assert!(rendered.contains("disk_slot_count"));
+        assert!(!rendered.contains("disk_map:"));
+        assert!(!rendered.contains("pools:"));
+        assert!(!rendered.contains("pool_meta"));
+        assert!(!rendered.contains("format.json"));
+        assert!(!rendered.contains("TimedActionSlot"));
+        assert!(!rendered.contains("DiskHealthTracker"));
+    }
+
+    #[test]
+    fn object_options_debug_does_not_expand_tier_store_handle() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let mut opts = ObjectOptions {
+            version_id: Some("large-version-id".repeat(1024)),
+            expected_current_version_id: Some("large-expected-version-id".repeat(1024)),
+            preserve_etag: Some("large-etag".repeat(1024)),
+            http_preconditions: Some(crate::storage_api_contracts::object::HTTPPreconditions {
+                if_match: Some("large-if-match".repeat(1024)),
+                if_none_match: Some("large-if-none-match".repeat(1024)),
+                ..Default::default()
+            }),
+            tier_delete_journal_api: Some(store),
+            ..Default::default()
+        };
+        opts.user_defined.insert("large-user-metadata".to_owned(), "x".repeat(8192));
+        opts.eval_metadata = Some([("large-eval-metadata".to_owned(), "y".repeat(8192))].into_iter().collect());
+        opts.transition.status = "large-transition-status".repeat(1024);
+        opts.transition.tier = "large-transition-tier".repeat(1024);
+        opts.lifecycle_audit_event.event.rule_id = "large-rule-id".repeat(1024);
+        opts.lifecycle_audit_event.event.storage_class = "large-storage-class".repeat(1024);
+
+        let rendered = format!("{opts:?}");
+
+        assert!(rendered.len() < 4096, "ObjectOptions Debug should stay bounded: {rendered}");
+        assert!(rendered.contains("tier_delete_journal_api: true"));
+        assert!(rendered.contains("user_defined_count: 1"));
+        assert!(rendered.contains("eval_metadata_count: Some(1)"));
+        assert!(!rendered.contains("ECStore {"));
+        assert!(!rendered.contains("disk_map"));
+        assert!(!rendered.contains("large-version-id"));
+        assert!(!rendered.contains("large-expected-version-id"));
+        assert!(!rendered.contains("large-etag"));
+        assert!(!rendered.contains("large-if-match"));
+        assert!(!rendered.contains("large-transition"));
+        assert!(!rendered.contains("large-rule-id"));
+        assert!(!rendered.contains("large-storage-class"));
+        assert!(!rendered.contains("large-user-metadata"));
+        assert!(!rendered.contains("large-eval-metadata"));
+        assert!(!rendered.contains("format.json"));
+        assert!(!rendered.contains("TimedActionSlot"));
+        assert!(!rendered.contains("DiskHealthTracker"));
     }
 
     // Build a minimal ECStore carrying an explicit instance context. Empty

@@ -210,19 +210,27 @@ async fn add_rustfs_tier(hot: &RustFSTestEnvironment, cold: &RustFSTestEnvironme
     }
 }
 
-async fn remove_rustfs_tier_force(hot: &RustFSTestEnvironment) -> TestResult {
-    let path = format!("/rustfs/admin/v3/tier/{TIER_NAME}?force=true");
+fn clear_tiers_confirmation_token(now: OffsetDateTime) -> String {
+    let mut rand = "AGD1R25GI3I1GJGUGJFD7FBS4DFAASDF".to_string();
+    rand.insert_str(3, &now.day().to_string());
+    rand.insert_str(17, &now.month().to_string());
+    rand.insert_str(23, &now.year().to_string());
+    rand
+}
+
+async fn clear_rustfs_tiers_force(hot: &RustFSTestEnvironment) -> TestResult {
     let deadline = Instant::now() + StdDuration::from_secs(30);
     loop {
-        let (status, resp) =
-            signed_admin_request(&hot.url, Method::DELETE, &path, None, &hot.access_key, &hot.secret_key).await?;
+        let rand = clear_tiers_confirmation_token(OffsetDateTime::now_utc());
+        let path = format!("/rustfs/admin/v3/tier/clear?rand={rand}&force=true");
+        let (status, resp) = signed_admin_request(&hot.url, Method::POST, &path, None, &hot.access_key, &hot.secret_key).await?;
         if status.is_success() {
             return Ok(());
         }
         if (!resp.contains("TierNameBackendInUse") && !resp.contains(TIER_MUTATION_RECOVERY_CHANGED))
             || Instant::now() >= deadline
         {
-            return Err(format!("RemoveTier(RustFS) failed: status={status}, body={resp}").into());
+            return Err(format!("ClearTier(RustFS) failed: status={status}, body={resp}").into());
         }
         // Tier mutation cleanup and startup recovery are asynchronous.
         tokio::time::sleep(StdDuration::from_millis(100)).await;
@@ -1708,7 +1716,7 @@ async fn test_manual_transition_async_tier_failure_reports_terminal_partial() ->
         0,
     )
     .await?;
-    remove_rustfs_tier_force(&hot).await?;
+    clear_rustfs_tiers_force(&hot).await?;
 
     let due_mtime = OffsetDateTime::now_utc() - time::Duration::hours(25);
     put_backdated_single_part_object(

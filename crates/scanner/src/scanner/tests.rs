@@ -2481,7 +2481,7 @@ impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
         }
         if self
             .block_publication_after_admissions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
             == Ok(1)
         {
             self.publication_admission_blocked.store(true, Ordering::Release);

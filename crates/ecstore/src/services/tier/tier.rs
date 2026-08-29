@@ -1651,7 +1651,7 @@ impl TierOperationLease {
     ) -> std::result::Result<Self, AdminError> {
         inner
             .active_leases
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_add(1))
             .map_err(|_| {
                 let mut err = ERR_TIER_INVALID_CONFIG.clone();
                 err.message = "Remote tier operation lease capacity exhausted".to_string();
@@ -1670,7 +1670,7 @@ impl Drop for TierOperationLease {
         let result = self
             .inner
             .active_leases
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_sub(1));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_sub(1));
         match result {
             Ok(1) => self.inner.drained.notify_one(),
             Ok(_) => {}
@@ -11909,7 +11909,7 @@ mod tests {
                 let should_pause =
                     match barrier
                         .matches_before_pause
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
                     {
                         Ok(_) => false,
                         Err(_) => barrier.armed.swap(false, Ordering::SeqCst),

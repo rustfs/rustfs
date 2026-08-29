@@ -659,7 +659,7 @@ pub(crate) fn observe_scanner_namespace_mutations(bucket: &str, delta: u64) {
     }
 
     let _ = SCANNER_NAMESPACE_MUTATION_GENERATION
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(delta)));
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(delta)));
 }
 
 pub(crate) async fn observe_list_objects_mutation(store: &ECStore, bucket: &str) -> u64 {
