@@ -1462,6 +1462,20 @@ async fn run_data_scanner_cycle_with_budget(
         {
             Some(ScannerCycleDeferReason::DataMovement)
         }
+        // A complete walk can still be retained as an observational snapshot
+        // when only the final activity proof was unavailable.  It must not
+        // block the observation receiver: the authoritative publication
+        // fence remains enforced by the usage store and the cycle is advanced
+        // as partial without acknowledging dirty usage.
+        Ok(result)
+            if result.has_observational_snapshot()
+                && matches!(
+                    result.status,
+                    ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+                ) =>
+        {
+            None
+        }
         Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
@@ -2803,12 +2817,7 @@ fn finalize_scanner_cycle_result(
     scan_cycle_result: crate::scanner_io::ScannerCycleResult,
     usage_persist_outcome: DataUsagePersistOutcome,
 ) -> (ScannerCycleOutcome, bool, Vec<ScannerDirtyUsageAcknowledgement>) {
-    let completion_outcome = scanner_cycle_completion_outcome(
-        scan_cycle_result.status,
-        usage_persist_outcome,
-        scan_cycle_result.has_dirty_usage_to_acknowledge(),
-        scan_cycle_result.has_failed_dirty_usage(),
-    );
+    let completion_outcome = scanner_cycle_completion_outcome_for_result(&scan_cycle_result, usage_persist_outcome);
     let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work();
     let durable_complete_snapshot = scan_cycle_result.status == ScannerCycleStatus::Complete
         && matches!(
@@ -2821,6 +2830,34 @@ fn finalize_scanner_cycle_result(
         Vec::new()
     };
     (completion_outcome, pending_maintenance_work, remote_dirty_usage_acknowledgements)
+}
+
+fn scanner_cycle_completion_outcome_for_result(
+    scan_cycle_result: &crate::scanner_io::ScannerCycleResult,
+    usage_persist_outcome: DataUsagePersistOutcome,
+) -> ScannerCycleOutcome {
+    let has_dirty_usage = scan_cycle_result.has_dirty_usage_to_acknowledge();
+    let has_failed_dirty_usage = scan_cycle_result.has_failed_dirty_usage();
+    if scan_cycle_result.has_observational_snapshot()
+        && matches!(
+            scan_cycle_result.status,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        )
+    {
+        return match usage_persist_outcome {
+            DataUsagePersistOutcome::Saved
+            | DataUsagePersistOutcome::AlreadyDurable
+            | DataUsagePersistOutcome::PriorCycleDurable
+            | DataUsagePersistOutcome::Current
+                if !has_failed_dirty_usage =>
+            {
+                ScannerCycleOutcome::Partial
+            }
+            DataUsagePersistOutcome::Deferred(reason) => ScannerCycleOutcome::Deferred(reason),
+            _ => ScannerCycleOutcome::Failed,
+        };
+    }
+    scanner_cycle_completion_outcome(scan_cycle_result.status, usage_persist_outcome, has_dirty_usage, has_failed_dirty_usage)
 }
 
 /// Decide whether an incoming usage snapshot must be skipped as stale, given the local

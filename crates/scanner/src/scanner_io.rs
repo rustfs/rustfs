@@ -269,6 +269,10 @@ fn should_publish_usage_snapshot(status: ScannerCycleStatus) -> bool {
     matches!(status, ScannerCycleStatus::Complete | ScannerCycleStatus::Superseded)
 }
 
+fn should_publish_observational_snapshot(status: ScannerCycleStatus) -> bool {
+    matches!(status, ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable))
+}
+
 fn prepare_usage_snapshot_for_publication(
     status: ScannerCycleStatus,
     mut data_usage_info: DataUsageInfo,
@@ -611,6 +615,7 @@ fn scanner_activity_preflight(
 pub(crate) struct ScannerCycleResult {
     pub(crate) status: ScannerCycleStatus,
     publication_epoch: Option<u64>,
+    observational_snapshot_published: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
     remote_publication_lease_targets: Vec<(String, String, u64)>,
@@ -624,6 +629,7 @@ impl ScannerCycleResult {
         Self {
             status,
             publication_epoch: None,
+            observational_snapshot_published: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
             remote_publication_lease_targets: Vec::new(),
@@ -640,6 +646,15 @@ impl ScannerCycleResult {
 
     pub(crate) fn publication_epoch(&self) -> Option<u64> {
         self.publication_epoch
+    }
+
+    pub(crate) fn with_observational_snapshot_published(mut self, published: bool) -> Self {
+        self.observational_snapshot_published = published;
+        self
+    }
+
+    pub(crate) fn has_observational_snapshot(&self) -> bool {
+        self.observational_snapshot_published
     }
 
     fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {

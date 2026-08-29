@@ -909,6 +909,47 @@ async fn structurally_complete_superseded_cycles_publish_without_claiming_conver
     );
 }
 
+#[tokio::test]
+async fn post_scan_activity_failure_retains_complete_usage_as_observation() {
+    let (updates, mut receiver) = mpsc::channel(1);
+    let status = ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+
+    assert!(should_publish_observational_snapshot(status));
+    assert!(
+        publish_observational_snapshot(
+            &updates,
+            DataUsageInfo {
+                last_update: Some(SystemTime::now()),
+                scanner_cycle: Some(7),
+                objects_total_count: 3,
+                objects_total_size: 12,
+                usage_snapshot_complete: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("post-scan activity failure should retain an observation")
+    );
+
+    let observed = receiver.recv().await.expect("observational update should be queued");
+    assert!(!observed.usage_snapshot_complete);
+    assert!(observed.usage_snapshot_partial);
+    assert_eq!(observed.usage_snapshot_converged, Some(false));
+    assert_eq!(observed.objects_total_count, 3);
+    assert_eq!(observed.objects_total_size, 12);
+}
+
+#[test]
+fn only_unverified_activity_allows_post_scan_observation() {
+    assert!(should_publish_observational_snapshot(ScannerCycleStatus::Deferred(
+        ScannerCycleDeferReason::ActivityBaselineUnavailable
+    )));
+    assert!(!should_publish_observational_snapshot(ScannerCycleStatus::Deferred(
+        ScannerCycleDeferReason::DataMovement
+    )));
+    assert!(!should_publish_observational_snapshot(ScannerCycleStatus::Incomplete));
+}
+
 #[test]
 fn scanner_cycle_fails_closed_for_namespace_disappearance() {
     for activity_status in [ScannerCycleActivityStatus::Changed, ScannerCycleActivityStatus::Unchanged] {

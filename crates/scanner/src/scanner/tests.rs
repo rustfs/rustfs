@@ -4478,6 +4478,26 @@ fn finalizing_a_deferred_usage_save_keeps_dirty_work_pending() {
     crate::scanner_io::clear_dirty_usage_bucket("photos");
 }
 
+#[test]
+#[serial]
+fn finalizing_post_scan_observation_advances_partially_without_dirty_ack() {
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
+    crate::scanner_io::record_dirty_usage_bucket("photos");
+    let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
+    let observed = crate::scanner_io::ScannerCycleResult::new(
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        Some(dirty_snapshot),
+    )
+    .with_observational_snapshot_published(true);
+
+    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(observed, DataUsagePersistOutcome::Saved);
+
+    assert_eq!(outcome, ScannerCycleOutcome::Partial);
+    assert!(acknowledgements.is_empty());
+    assert!(crate::scanner_io::dirty_usage_buckets_pending());
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
+}
+
 #[tokio::test]
 async fn scanner_cycle_keeps_remote_pending_acknowledgement() {
     let pending = remote_dirty_usage_acknowledgement_pending(7, 1, std::future::ready(Ok::<bool, std::io::Error>(true))).await;
