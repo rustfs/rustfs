@@ -23,12 +23,6 @@ on:
         description: 'Reset the nodes after the test (DESTROYS test data/config)'
         type: boolean
         default: true
-  workflow_run:
-    # Run after the nightly build completes: the nightly deb is what the test
-    # installs. Heal also runs inside the functional suite; this standalone
-    # workflow enables manual single-suite runs as well.
-    workflows: ["Nightly GNU Build"]
-    types: [completed]
 
 permissions:
   contents: read
@@ -55,9 +49,9 @@ jobs:
   heal-test:
     runs-on: smoke-testing
     timeout-minutes: 480
-    # Run on manual dispatch, or when the nightly build completed successfully.
-    # Skipped when nightly failed.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    # Manual-only standalone run. Nightly chain already runs heal in
+    # rustfs-pool-expand-test.yml to avoid duplicate heal executions.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
       - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

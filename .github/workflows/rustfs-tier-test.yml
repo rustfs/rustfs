@@ -12,8 +12,8 @@ on:
         required: false
         type: string
   workflow_run:
-    # Run after the nightly build completes; the nightly deb is what the test installs.
-    workflows: ["Nightly GNU Build"]
+    # Strict shared-environment order: run after KMS test succeeds.
+    workflows: ["RustFS KMS Test"]
     types: [completed]
 
 permissions:

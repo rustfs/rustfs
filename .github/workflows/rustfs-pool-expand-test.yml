@@ -46,8 +46,8 @@ on:
         type: boolean
         default: true
   workflow_run:
-    # Run after the nightly build completes: pool expansion -> heal.
-    workflows: ["Nightly GNU Build"]
+    # Strict shared-environment order: run after tier test succeeds.
+    workflows: ["RustFS Tier Test"]
     types: [completed]
 
 permissions:
