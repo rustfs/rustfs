@@ -482,7 +482,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("metadata_chg", &self.metadata_chg)
             .field("http_preconditions", &self.http_preconditions.is_some())
             .field("delete_replication", &self.delete_replication.is_some())
-            .field("delete_replication_config_snapshot", &self.delete_replication_config_snapshot.is_some())
+            .field("delete_replication_config_snapshot", &self.delete_replication_config_snapshot)
             .field("namespace_lock_fence", &self.namespace_lock_fence.is_some())
             .field("bucket_lifecycle_lock_fence", &self.bucket_lifecycle_lock_fence.is_some())
             .field("replication_request", &self.replication_request)
