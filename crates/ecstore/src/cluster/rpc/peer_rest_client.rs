@@ -725,7 +725,7 @@ impl PeerRestClient {
     /// never take it offline no matter what its message says. The substring
     /// fallback only covers failures that exist purely as text, such as the
     /// dial errors `get_client` wraps.
-    fn is_network_like_error(err: &Error) -> bool {
+    pub(crate) fn is_network_like_error(err: &Error) -> bool {
         if let Error::Io(io_err) = err
             && let Some(status) = embedded_tonic_status(io_err)
         {
