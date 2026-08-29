@@ -3005,11 +3005,12 @@ mod tests {
             "peer-1",
             move || {
                 let attempt = activity_attempts.fetch_add(1, Ordering::SeqCst);
+                let activity_snapshot = activity_snapshot.clone();
                 async move {
                     if attempt == 0 {
                         Err(Error::RemoteClientUnavailable("peer peer-1 is temporarily offline".to_string()))
                     } else {
-                        Ok(activity_snapshot.clone())
+                        Ok(activity_snapshot)
                     }
                 }
             },
