@@ -58,7 +58,7 @@ pub(crate) async fn init_embedded_startup_runtime_services(
     readiness: Arc<GlobalReadiness>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<EmbeddedStartupServiceRuntime> {
-    init_embedded_optional_service_runtime(config).await;
+    init_embedded_optional_service_runtime(config, store.clone()).await;
     let buckets = init_embedded_bucket_metadata_runtime(store.clone(), &ctx).await?;
     let iam_bootstrap = init_embedded_iam_runtime(store, ctx, readiness, server_ctx)
         .await
@@ -77,7 +77,7 @@ pub(crate) async fn init_startup_runtime_services(
     state_manager: Arc<ServiceStateManager>,
     server_ctx: Arc<ServerContextSlot>,
 ) -> Result<StartupServiceRuntime> {
-    init_kms_system(config).await?;
+    init_kms_system(config, store.clone()).await?;
 
     let optional_runtimes = init_optional_runtime_services().await?;
     let heartbeat_config = HeartbeatConfig::from_env().map_err(std::io::Error::other)?;
