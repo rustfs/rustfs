@@ -574,10 +574,6 @@ pub(crate) async fn scanner_set_disk_inventory(set: &SetDisks) -> Vec<Arc<Disk>>
 pub(crate) enum ScannerCycleDeferReason {
     ActivityBaselineUnavailable,
     DataMovement,
-    /// The configured persistence budget cannot fit within the fixed remote
-    /// publication-lease TTL. This is a deterministic configuration/contract
-    /// mismatch, not evidence that a peer activity probe failed.
-    PublicationLeaseBudgetExceeded,
     /// A granted lease's absolute deadline cannot cover the persistence
     /// operation. This can occur even when the configured budget fits the
     /// nominal TTL because lease acquisition consumed part of the window.
@@ -592,7 +588,6 @@ impl ScannerCycleDeferReason {
         match self {
             Self::ActivityBaselineUnavailable => "activity_baseline_unavailable",
             Self::DataMovement => "data_movement",
-            Self::PublicationLeaseBudgetExceeded => "publication_lease_budget_exceeded",
             Self::PublicationLeaseDeadlineExceeded => "publication_lease_deadline_exceeded",
             Self::PublicationLeaseReleaseFailed => "publication_lease_release_failed",
         }

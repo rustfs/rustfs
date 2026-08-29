@@ -63,7 +63,6 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::storage_api::owner::SCANNER_PUBLICATION_LEASE_TTL_MS;
 use crate::storage_api::scan::{
     BucketOperations, BucketOptions, NamespaceLocking as _, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
     SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
@@ -1205,10 +1204,6 @@ fn data_usage_persist_timeout() -> Duration {
     DataUsageCache::persistence_timeout()
 }
 
-fn scanner_publication_lease_budget_allows_persistence(timeout: Duration) -> bool {
-    timeout < Duration::from_millis(SCANNER_PUBLICATION_LEASE_TTL_MS)
-}
-
 #[cfg(not(test))]
 const SCANNER_CYCLE_EPOCH_FENCE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -1493,21 +1488,24 @@ async fn run_data_scanner_cycle_with_budget(
     let mut remote_publication_leases = None;
     let remote_lease_defer_reason = if remote_publication_lease_targets.is_empty() {
         None
-    } else if !scanner_publication_lease_budget_allows_persistence(usage_persist_timeout) {
-        // The lease is intentionally fixed-duration and has no renewal path.
-        // Refuse a persistence budget that could outlive it instead of
-        // allowing the peer to admit movement while a local PUT is in flight.
-        Some(ScannerCycleDeferReason::PublicationLeaseBudgetExceeded)
     } else if let Some(notification_system) = storeapi.notification_system() {
-        match notification_system
-            .acquire_scanner_publication_leases(remote_publication_lease_targets.clone())
-            .await
-        {
-            Ok(grants) => {
+        let publication_proof_ctx = cycle_budget.token();
+        let lease_result = await_scanner_publication_proof(
+            &publication_proof_ctx,
+            cycle_info.current,
+            "lease_acquire",
+            || notification_system.acquire_scanner_publication_leases(remote_publication_lease_targets.clone()),
+            |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
+        )
+        .await;
+        match lease_result {
+            ScannerPublicationProofWait::Ready(grants) => {
                 remote_publication_leases = Some((notification_system, grants));
                 None
             }
-            Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+            ScannerPublicationProofWait::Rejected(_) | ScannerPublicationProofWait::Cancelled => {
+                Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+            }
         }
     } else {
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
