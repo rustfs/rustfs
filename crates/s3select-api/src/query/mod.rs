@@ -89,3 +89,32 @@ impl Query {
         }
     }
 }
+
+#[cfg(test)]
+fn test_query() -> Query {
+    use s3s::dto::{CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentRequest};
+
+    let input = SelectObjectContentInput {
+        bucket: "bucket".to_string(),
+        expected_bucket_owner: None,
+        key: "input.csv".to_string(),
+        sse_customer_algorithm: None,
+        sse_customer_key: None,
+        sse_customer_key_md5: None,
+        request: SelectObjectContentRequest {
+            expression: "SELECT * FROM S3Object".to_string(),
+            expression_type: ExpressionType::from_static(ExpressionType::SQL),
+            input_serialization: InputSerialization {
+                csv: Some(CSVInput::default()),
+                ..Default::default()
+            },
+            output_serialization: OutputSerialization {
+                csv: Some(CSVOutput::default()),
+                ..Default::default()
+            },
+            request_progress: None,
+            scan_range: None,
+        },
+    };
+    Query::new(Context { input: Arc::new(input) }, "SELECT * FROM S3Object".to_string())
+}

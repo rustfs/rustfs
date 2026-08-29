@@ -71,12 +71,8 @@ pub trait QueryDispatcher: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::Context;
+    use crate::query::test_query;
     use parking_lot::Mutex;
-    use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
-        SelectObjectContentRequest,
-    };
 
     #[derive(Default)]
     struct DefaultDispatchDispatcher {
@@ -150,32 +146,6 @@ mod tests {
         async fn build_query_state_machine(&self, _query: Query) -> QueryResult<Arc<QueryStateMachine>> {
             unreachable!("dispatch routing test does not build state machines")
         }
-    }
-
-    fn test_query() -> Query {
-        let input = SelectObjectContentInput {
-            bucket: "bucket".to_string(),
-            expected_bucket_owner: None,
-            key: "input.csv".to_string(),
-            sse_customer_algorithm: None,
-            sse_customer_key: None,
-            sse_customer_key_md5: None,
-            request: SelectObjectContentRequest {
-                expression: "SELECT * FROM S3Object".to_string(),
-                expression_type: ExpressionType::from_static(ExpressionType::SQL),
-                input_serialization: InputSerialization {
-                    csv: Some(CSVInput::default()),
-                    ..Default::default()
-                },
-                output_serialization: OutputSerialization {
-                    csv: Some(CSVOutput::default()),
-                    ..Default::default()
-                },
-                request_progress: None,
-                scan_range: None,
-            },
-        };
-        Query::new(Context { input: Arc::new(input) }, "SELECT * FROM S3Object".to_string())
     }
 
     #[tokio::test]
