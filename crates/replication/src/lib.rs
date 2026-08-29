@@ -40,8 +40,9 @@ pub use config::{
 };
 pub use delete::{
     DeletedObjectReplicationInfo, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
-    is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome,
-    resync_existing_delete_replication_info, should_retry_delete_marker_purge, target_delete_version_id,
+    delete_replication_creates_marker, is_retryable_delete_replication_head_error, is_version_delete_replication,
+    replicate_delete_outcome, resync_existing_delete_replication_info, should_retry_delete_marker_purge,
+    target_delete_version_id,
 };
 pub use filemeta::{
     NULL_VERSION_ID, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, REPLICATE_INCOMING,

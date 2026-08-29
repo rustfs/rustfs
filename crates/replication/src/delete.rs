@@ -108,6 +108,20 @@ pub fn is_version_delete_replication(dobj: &DeletedObject) -> bool {
     dobj.version_id.is_some() || (dobj.delete_marker_version_id.is_some() && !dobj.delete_marker)
 }
 
+/// Whether the target DELETE for this delete replication may use
+/// marker-CREATION semantics (`replication_delete_marker`, which omits the
+/// `versionId` query so the target mints its own marker).
+///
+/// A version purge must never do so: the DELETE has to address the exact
+/// version, otherwise a generic S3 target — which ignores the internal
+/// source-version headers — mints a fresh delete marker on every retry
+/// instead of removing one (rustfs#6823). The `delete_marker` flag alone is
+/// not enough because heal/resync rebuilds carry `delete_marker: true`
+/// together with a purge-shaped entry.
+pub fn delete_replication_creates_marker(dobj: &DeletedObject) -> bool {
+    dobj.delete_marker && !is_version_delete_replication(dobj)
+}
+
 pub fn should_retry_delete_marker_purge(dobj: &DeletedObject) -> bool {
     dobj.delete_marker_version_id.is_some()
 }
@@ -223,13 +237,14 @@ mod tests {
 
     use super::{
         DeletedObjectReplicationInfo, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
-        is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome,
-        should_retry_delete_marker_purge, target_delete_version_id,
+        delete_replication_creates_marker, is_retryable_delete_replication_head_error, is_version_delete_replication,
+        replicate_delete_outcome, resync_existing_delete_replication_info, should_retry_delete_marker_purge,
+        target_delete_version_id,
     };
     use crate::storage_api::DeletedObject;
     use crate::{
-        MrfOpKind, NULL_VERSION_ID, ReplicationState, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
-        VersionPurgeStatusType,
+        MrfOpKind, NULL_VERSION_ID, ReplicateObjectInfo, ReplicationState, ReplicationStatusType, ReplicationType,
+        ReplicationWorkerOperation, VersionPurgeStatusType,
     };
     use uuid::Uuid;
 
@@ -398,6 +413,80 @@ mod tests {
         };
 
         assert!(!is_version_delete_replication(&dobj));
+    }
+
+    /// rustfs#6823 regression guard: a purge-shaped entry must never take
+    /// marker-creation semantics, which would drop the `versionId` from the
+    /// target DELETE and let a generic S3 target mint a fresh delete marker
+    /// on every heal/resync/MRF retry.
+    #[test]
+    fn purge_shapes_never_take_marker_creation_semantics() {
+        // Heal/resync rebuild of a delete-marker version purge: the entry
+        // carries `delete_marker: true` together with the purged version id.
+        let heal_purge = DeletedObject {
+            delete_marker: true,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(
+            !delete_replication_creates_marker(&heal_purge),
+            "a version purge must address the version, not mint a marker"
+        );
+
+        // Live delete-marker version purge addressed via the marker id.
+        let marker_purge = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(!delete_replication_creates_marker(&marker_purge));
+
+        // Only a plain delete-marker creation may let the target mint one.
+        let marker_creation = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(delete_replication_creates_marker(&marker_creation));
+
+        let versionless = DeletedObject {
+            delete_marker: false,
+            ..Default::default()
+        };
+        assert!(!delete_replication_creates_marker(&versionless));
+    }
+
+    /// The resync scan rebuilds purge work items with `delete_marker: true`
+    /// (crates/replication/src/delete.rs `resync_existing_delete_replication_info`);
+    /// pin that this shape flows into purge — not marker-creation — semantics.
+    #[test]
+    fn resync_rebuilt_purge_entry_keeps_versioned_delete_semantics() {
+        let roi = ReplicateObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+            version_purge_status: VersionPurgeStatusType::Pending,
+            ..Default::default()
+        };
+
+        let info = resync_existing_delete_replication_info(&roi, "arn:target-a");
+
+        assert!(is_version_delete_replication(&info.delete_object));
+        assert!(
+            !delete_replication_creates_marker(&info.delete_object),
+            "a rebuilt purge must not re-mint delete markers on the target"
+        );
+
+        // Without a pending purge the rebuild is a marker creation again.
+        let roi = ReplicateObjectInfo {
+            delete_marker: true,
+            version_id: Some(Uuid::new_v4()),
+            version_purge_status: VersionPurgeStatusType::Empty,
+            ..roi
+        };
+        let info = resync_existing_delete_replication_info(&roi, "arn:target-a");
+        assert!(delete_replication_creates_marker(&info.delete_object));
     }
 
     #[test]

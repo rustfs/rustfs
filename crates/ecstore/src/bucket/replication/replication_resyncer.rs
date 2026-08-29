@@ -30,8 +30,8 @@ use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_object_config::{ReplicationConfig, get_replication_config, must_replicate};
 use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationMultipartPartInput, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
-    heal_uses_delete_replication_path, is_retryable_delete_replication_head_error, is_version_delete_replication,
-    replicate_delete_outcome, replication_etags_match, replication_multipart_complete_actual_size,
+    delete_replication_creates_marker, heal_uses_delete_replication_path, is_retryable_delete_replication_head_error,
+    is_version_delete_replication, replicate_delete_outcome, replication_etags_match, replication_multipart_complete_actual_size,
     replication_multipart_part_plan, resync_existing_delete_replication_info, should_retry_delete_marker_purge,
     target_delete_version_id,
 };
@@ -1617,7 +1617,6 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
     }
 
     let bucket = dobj.bucket.clone();
-    let mut source_state_verified = true;
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         Some(version_id.to_owned())
     } else {
@@ -1675,7 +1674,12 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                 return purge_stale_delete_marker_targets(&bucket, &dobj).await;
             }
             Err(err) => {
-                source_state_verified = false;
+                // A transient source error (lock timeout, IO error) must not
+                // fall through to the marker-creation send below: that DELETE
+                // omits the versionId, so every such retry lets a generic S3
+                // target mint one more delete marker (rustfs#6823). Fail the
+                // entry without touching the target; the MRF replay / heal
+                // scanner retries once the source is readable again.
                 debug!(
                     event = EVENT_REPLICATION_DELETE_SKIPPED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -1687,6 +1691,20 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                     reason = "source_state_verification_failed",
                     "Failed to verify source delete-marker state before replication"
                 );
+                send_local_event(EventArgs {
+                    event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                    bucket_name: bucket.clone(),
+                    object: ObjectInfo {
+                        bucket: bucket.clone(),
+                        name: dobj.delete_object.object_name.clone(),
+                        version_id,
+                        delete_marker: dobj.delete_object.delete_marker,
+                        ..Default::default()
+                    },
+                    user_agent: "Internal: [Replication]".to_string(),
+                    ..Default::default()
+                });
+                return false;
             }
         }
     }
@@ -2008,7 +2026,9 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         expected_targets,
         rinfos.targets.len(),
         state_persisted,
-        source_state_verified,
+        // Source state is verified by construction here: a verification
+        // error returns early above instead of replicating unverified.
+        true,
         &replication_status,
     )
 }
@@ -2637,7 +2657,14 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             &tgt_client.bucket,
             &dobj.delete_object.object_name,
             version_id.clone(),
-            replication_delete_remove_options(dobj.delete_object.delete_marker, dobj.delete_object.delete_marker_mtime),
+            // A version purge must keep the versionId on the DELETE even when
+            // the purged version is a delete marker: marker-creation semantics
+            // would drop it and a generic S3 target would mint a fresh marker
+            // on every retry (rustfs#6823).
+            replication_delete_remove_options(
+                delete_replication_creates_marker(&dobj.delete_object),
+                dobj.delete_object.delete_marker_mtime,
+            ),
         )
         .await
     {
