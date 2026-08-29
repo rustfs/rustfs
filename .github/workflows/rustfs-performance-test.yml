@@ -149,11 +149,30 @@ jobs:
         run: |
           ./auto-testing/rustfs_performance_test.sh --step 6 -y
 
+      - name: Collect RustFS version info
+        if: ${{ steps.benchmark.conclusion == 'success' }}
+        env:
+          VERSION_FILE: /tmp/rustfs-version.txt
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES}"
+          [ "${#NODES[@]}" -gt 0 ] || { echo "RUSTFS_NODES is empty"; exit 1; }
+          NODE="${NODES[0]}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          {
+            echo "Node: ${NODE}"
+            echo "Command: rustfs --version"
+            echo ""
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+              "${SSH_USER}@${NODE}" 'rustfs --version'
+          } > "${VERSION_FILE}"
+
       - name: Upload report to dashboard (reports/YYYY-MM-DD.md)
         if: ${{ steps.benchmark.conclusion == 'success' }}
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
           RESULT_DIR: ${{ env.RUSTFS_RESULT_DIR }}
+          VERSION_FILE: /tmp/rustfs-version.txt
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -173,6 +192,11 @@ jobs:
             echo "- **Package**: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
             echo ""
             cat "${SUMMARY}"
+            echo ""
+            echo "## RustFS version"
+            echo '```text'
+            cat "${VERSION_FILE}"
+            echo '```'
           } > /tmp/rustfs-perf-report.md
           CONTENT="$(python3 -c 'import base64; print(base64.b64encode(open("/tmp/rustfs-perf-report.md","rb").read()).decode())')"
           SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
@@ -196,6 +220,7 @@ jobs:
           path: |
             /tmp/rustfs-perf-test*.log
             /tmp/rustfs-perf-results/**
+            /tmp/rustfs-version.txt
           if-no-files-found: warn
 
       - name: Reset test environment (after)
