@@ -678,17 +678,20 @@ impl DiskOperationMetrics {
         let elapsed_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let slot = &self.last_minute[(now_sec % 60) as usize];
         loop {
-            let version = slot.version.load(Ordering::Acquire);
+            // The successful CAS below is AcqRel, so it is the publication
+            // fence for the writer that owns this slot. The initial parity
+            // check does not need to acquire the slot payload.
+            let version = slot.version.load(Ordering::Relaxed);
             if !version.is_multiple_of(2) {
                 std::hint::spin_loop();
                 continue;
             }
             if slot
                 .version
-                .compare_exchange(version, version.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(version, version.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                if slot.unix_sec.load(Ordering::Acquire) != now_sec {
+                if slot.unix_sec.load(Ordering::Relaxed) != now_sec {
                     slot.count.store(0, Ordering::Relaxed);
                     slot.acc_time.store(0, Ordering::Relaxed);
                     slot.unix_sec.store(now_sec, Ordering::Release);
@@ -704,19 +707,32 @@ impl DiskOperationMetrics {
     fn last_minute_snapshot(&self, now_sec: u64) -> TimedAction {
         let mut snapshot = TimedAction::default();
         for slot in &self.last_minute {
-            let version = slot.version.load(Ordering::Acquire);
-            if !version.is_multiple_of(2) {
+            let Some((slot_sec, count, acc_time)) = slot.snapshot() else {
                 continue;
-            }
-            let slot_sec = slot.unix_sec.load(Ordering::Acquire);
-            let count = slot.count.load(Ordering::Acquire);
-            let acc_time = slot.acc_time.load(Ordering::Acquire);
-            if slot.version.load(Ordering::Acquire) == version && slot_sec <= now_sec && now_sec.saturating_sub(slot_sec) < 60 {
+            };
+            if slot_sec <= now_sec && now_sec.saturating_sub(slot_sec) < 60 {
                 snapshot.count = snapshot.count.saturating_add(count);
                 snapshot.acc_time = snapshot.acc_time.saturating_add(acc_time);
             }
         }
         snapshot
+    }
+}
+
+impl TimedActionSlot {
+    fn snapshot(&self) -> Option<(u64, u64, u64)> {
+        let version = self.version.load(Ordering::Acquire);
+        if !version.is_multiple_of(2) {
+            return None;
+        }
+
+        // The first Acquire load publishes the payload written before the
+        // matching Release store. Relaxed payload loads are sufficient while
+        // the final Acquire version load validates that no writer intervened.
+        let slot_sec = self.unix_sec.load(Ordering::Relaxed);
+        let count = self.count.load(Ordering::Relaxed);
+        let acc_time = self.acc_time.load(Ordering::Relaxed);
+        (self.version.load(Ordering::Acquire) == version).then_some((slot_sec, count, acc_time))
     }
 }
 
