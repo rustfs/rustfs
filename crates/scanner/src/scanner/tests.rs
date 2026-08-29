@@ -2039,6 +2039,34 @@ async fn scanner_usage_floor_rejects_backup_older_than_incomplete_v2_primary() {
 }
 
 #[tokio::test]
+async fn scanner_usage_floor_rejects_older_legacy_primary_after_incomplete_v2_primary() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    legacy.scanner_epoch = Some(6);
+    legacy.scanner_cycle = Some(103);
+    for (path, usage) in [
+        (DATA_USAGE_OBJ_NAME_PATH.as_str(), primary),
+        (LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(), legacy),
+    ] {
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, path),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
+        );
+    }
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("an older legacy baseline must not cross the incomplete v2 epoch fence");
+    assert!(err.to_string().contains("no authoritative baseline"));
+}
+
+#[tokio::test]
 async fn scanner_leadership_fencing_recovers_incomplete_v2_primary_from_backup() {
     let store = Arc::new(MemoryConfigStore::default());
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
