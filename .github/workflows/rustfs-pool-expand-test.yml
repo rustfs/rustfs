@@ -197,11 +197,25 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y mosquitto mosquitto-clients
           fi
+          # Make restart deterministic on shared runners: stop any previous
+          # mosquitto instance/process and drop stale config first.
+          sudo systemctl stop mosquitto 2>/dev/null || true
+          sudo pkill -f mosquitto 2>/dev/null || true
+          sleep 1
+          sudo rm -f /etc/mosquitto/conf.d/rustfs-test.conf
           sudo mkdir -p /etc/mosquitto/conf.d
           printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/rustfs-test.conf >/dev/null
-          sudo systemctl restart mosquitto
+          sudo systemctl reset-failed mosquitto 2>/dev/null || true
+          sudo systemctl start mosquitto
           sleep 2
-          ss -tln 2>/dev/null | grep -q ':1883' || { echo "mosquitto not listening on 1883"; exit 1; }
+          if ! ss -tln 2>/dev/null | grep -q ':1883'; then
+            echo "=== mosquitto status ==="
+            sudo systemctl status mosquitto --no-pager | head -20 || true
+            echo "=== mosquitto journal ==="
+            sudo journalctl -u mosquitto -n 30 --no-pager || true
+            echo "mosquitto not listening on 1883"
+            exit 1
+          fi
 
       - name: Run tier / event / audit suite
         run: |
