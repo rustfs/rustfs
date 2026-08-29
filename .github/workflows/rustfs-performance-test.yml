@@ -78,7 +78,7 @@ env:
   RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
   # Fixed benchmark result directory so later steps can read summary.md
   RUSTFS_RESULT_DIR: /tmp/rustfs-perf-results
-  # Cross-repo token for writing to rustfs/backlog (set in repo settings)
+  # Cross-repo token for uploading reports to rustfs/dashboard (set in repo settings)
   PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
 jobs:
