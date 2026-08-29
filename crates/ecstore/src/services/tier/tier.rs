@@ -536,6 +536,10 @@ enum TierCandidateMutation {
 }
 
 impl TierCandidateMutation {
+    fn checks_lifecycle_references(&self) -> bool {
+        !matches!(self, Self::Add(_, true) | Self::Remove(_, true) | Self::Clear(true))
+    }
+
     fn intent_kind(&self) -> TierMutationIntentKind {
         match self {
             Self::Add(_, _) => TierMutationIntentKind::Add,
@@ -727,6 +731,7 @@ impl TierReferenceProofStore for ECStore {
 async fn ensure_no_authoritative_tier_object_references<S>(
     api: Arc<S>,
     affected_targets: &[TierMutationIntentTarget],
+    check_lifecycle_references: bool,
 ) -> std::result::Result<(), AdminError>
 where
     S: TierReferenceProofStore,
@@ -739,12 +744,13 @@ where
     if targets.is_empty() {
         return Ok(());
     }
-    ensure_no_authoritative_target_references(api, &targets).await
+    ensure_no_authoritative_target_references(api, &targets, check_lifecycle_references).await
 }
 
 async fn ensure_no_authoritative_target_references<S>(
     api: Arc<S>,
     targets: &[TierMutationIntentTarget],
+    check_lifecycle_references: bool,
 ) -> std::result::Result<(), AdminError>
 where
     S: TierReferenceProofStore,
@@ -754,7 +760,9 @@ where
         .await
         .map_err(tier_reference_proof_admin_error)?;
     for bucket in buckets {
-        ensure_no_authoritative_lifecycle_references(api.as_ref(), &bucket.name, targets).await?;
+        if check_lifecycle_references {
+            ensure_no_authoritative_lifecycle_references(api.as_ref(), &bucket.name, targets).await?;
+        }
         let mut marker = None;
         let mut version_marker = None;
         loop {
@@ -3319,6 +3327,7 @@ impl TierConfigMgr {
                     let _config_lock = config_lock;
                     let _update = update;
                     let mutation_kind = mutation.intent_kind();
+                    let check_lifecycle_references = mutation.checks_lifecycle_references();
                     if version.is_none() && !candidate.tiers.is_empty() && mutation_kind != TierMutationIntentKind::Add {
                         return Err(TierConfigUpdateError::Load(io::Error::other(
                             "tier configuration mutation requires an existing config ETag",
@@ -3357,7 +3366,7 @@ impl TierConfigMgr {
                     let affected_targets =
                         build_tier_mutation_affected_targets(mutation_kind, proof_targets, &current_for_targets, &candidate)
                             .map_err(TierConfigUpdateError::Publish)?;
-                    ensure_no_authoritative_tier_object_references(api.clone(), &affected_targets)
+                    ensure_no_authoritative_tier_object_references(api.clone(), &affected_targets, check_lifecycle_references)
                         .await
                         .map_err(TierConfigUpdateError::Publish)?;
                     let coordinator_intent =
@@ -6240,6 +6249,17 @@ mod tests {
             .affected_targets(&current, &current)
             .expect("idempotent remove of a missing tier should not require an identity proof");
         assert!(noop_targets.is_empty());
+    }
+
+    #[test]
+    fn forced_tier_mutations_skip_only_lifecycle_reference_checks() {
+        assert!(!TierCandidateMutation::Add(build_rustfs_tier("COLD-A"), true).checks_lifecycle_references());
+        assert!(TierCandidateMutation::Add(build_rustfs_tier("COLD-A"), false).checks_lifecycle_references());
+        assert!(!TierCandidateMutation::Remove("COLD-A".to_string(), true).checks_lifecycle_references());
+        assert!(TierCandidateMutation::Remove("COLD-A".to_string(), false).checks_lifecycle_references());
+        assert!(!TierCandidateMutation::Clear(true).checks_lifecycle_references());
+        assert!(TierCandidateMutation::Clear(false).checks_lifecycle_references());
+        assert!(TierCandidateMutation::Edit("COLD-A".to_string(), TierCreds::default()).checks_lifecycle_references());
     }
 
     /// A fully offline `WarmBackend` used to exercise the driver-facing
@@ -12090,7 +12110,32 @@ mod tests {
 
     #[tokio::test]
     async fn remove_and_clear_full_update_paths_preserve_force() {
+        let lifecycle_config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("force-remove".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: Some(1),
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                }]),
+            }],
+        };
         let remove_store = Arc::new(CasConfigStore::default());
+        remove_store.add_listed_version(ObjectInfo {
+            bucket: "photos".to_string(),
+            name: "safe.txt".to_string(),
+            ..Default::default()
+        });
+        remove_store.add_lifecycle_config("photos", lifecycle_config.clone());
         let mut persisted = empty_mgr();
         persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
         persisted
@@ -12117,6 +12162,12 @@ mod tests {
         );
 
         let clear_store = Arc::new(CasConfigStore::default());
+        clear_store.add_listed_version(ObjectInfo {
+            bucket: "photos".to_string(),
+            name: "safe.txt".to_string(),
+            ..Default::default()
+        });
+        clear_store.add_lifecycle_config("photos", lifecycle_config);
         persisted
             .save_tiering_config_if_current(clear_store.clone(), None)
             .await
@@ -12244,7 +12295,7 @@ mod tests {
             "COLD-A",
             Some(replacement_identity),
         ));
-        ensure_no_authoritative_tier_object_references(store.clone(), std::slice::from_ref(&target))
+        ensure_no_authoritative_tier_object_references(store.clone(), std::slice::from_ref(&target), true)
             .await
             .expect("references already written with the new destination identity should not block rebind");
 
@@ -12254,7 +12305,7 @@ mod tests {
             "COLD-A",
             Some(current_identity),
         ));
-        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(store, &[target], true)
             .await
             .expect_err("references to the old destination identity must block rebind");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
@@ -12297,7 +12348,7 @@ mod tests {
         });
         store.add_lifecycle_config("photos", config);
 
-        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(store, &[target], true)
             .await
             .expect_err("lifecycle rule should block deletion");
 
@@ -12342,7 +12393,7 @@ mod tests {
         });
         store.add_lifecycle_config("photos", config);
 
-        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(store, &[target], true)
             .await
             .expect_err("lifecycle rule should block deletion");
 
@@ -12381,7 +12432,7 @@ mod tests {
                     .expect("journal record should encode"),
             )
             .await;
-        let err = ensure_no_authoritative_tier_object_references(journal_store, std::slice::from_ref(&target))
+        let err = ensure_no_authoritative_tier_object_references(journal_store, std::slice::from_ref(&target), true)
             .await
             .expect_err("unfinished delete journal for the old backend must block rebind");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
@@ -12419,7 +12470,7 @@ mod tests {
                 transaction.encode().expect("transaction record should encode"),
             )
             .await;
-        let err = ensure_no_authoritative_tier_object_references(transaction_store, std::slice::from_ref(&target))
+        let err = ensure_no_authoritative_tier_object_references(transaction_store, std::slice::from_ref(&target), true)
             .await
             .expect_err("unfinished transition transaction for the old backend must block rebind");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
@@ -12429,11 +12480,11 @@ mod tests {
         let mut free_version = transitioned_tier_object("photos", "2026/free-version.jpg", "COLD-A", Some(current_identity));
         free_version.transitioned_object.status = "pending".to_string();
         free_version.transitioned_object.free_version = true;
-        ensure_no_authoritative_tier_object_references(free_version_store.clone(), std::slice::from_ref(&target))
+        ensure_no_authoritative_tier_object_references(free_version_store.clone(), std::slice::from_ref(&target), true)
             .await
             .expect("empty free-version fixture should permit rebind");
         free_version_store.add_listed_version(free_version);
-        let err = ensure_no_authoritative_tier_object_references(free_version_store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(free_version_store, &[target], true)
             .await
             .expect_err("recoverable free version for the old backend must block rebind");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
@@ -12459,7 +12510,7 @@ mod tests {
         }
         store.omit_truncated_reference_marker();
 
-        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(store, &[target], true)
             .await
             .expect_err("truncated authoritative reference scan without a marker must fail closed");
         assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
