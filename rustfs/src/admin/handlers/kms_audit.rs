@@ -101,6 +101,8 @@ pub(super) enum KmsAdminOperation {
     Configure,
     /// Replacement of the running configuration.
     Reconfigure,
+    /// Reload of the persisted configuration.
+    Reload,
     /// Start or restart of the KMS service.
     Start,
     /// Stop of the KMS service.
@@ -127,6 +129,7 @@ impl KmsAdminOperation {
             Self::UntagResource => "UntagResource",
             Self::Configure => "Configure",
             Self::Reconfigure => "Reconfigure",
+            Self::Reload => "Reload",
             Self::Start => "Start",
             Self::Stop => "Stop",
             Self::Backup => "Backup",
@@ -147,7 +150,7 @@ impl KmsAdminOperation {
             // operations touch neither key material nor key state. Consumers
             // separate them from a plain access by the recorded operation name.
             Self::UpdateKeyDescription | Self::TagResource | Self::UntagResource => EventName::KmsKeyAccessed,
-            Self::Configure | Self::Reconfigure => EventName::KmsServiceConfigured,
+            Self::Configure | Self::Reconfigure | Self::Reload => EventName::KmsServiceConfigured,
             Self::Start => EventName::KmsServiceStarted,
             Self::Stop => EventName::KmsServiceStopped,
             // A backup reads the material of every key, and a restore

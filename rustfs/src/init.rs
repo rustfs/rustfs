@@ -19,6 +19,7 @@ use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOpera
 use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
+use crate::storage_api::startup::services::ECStore;
 use crate::storage_api::startup::sse::log_sse_kms_key_policy_mode;
 use crate::{admin, config, startup_runtime_sources, version};
 use rustfs_config::{
@@ -490,10 +491,11 @@ async fn configure_and_start_kms(
 /// cluster storage and starts the service if found.
 /// # Arguments
 /// * `config` - The application configuration options
+/// * `store` - The initialized cluster store used for persisted configuration
 ///
 /// Returns `std::io::Result<()>` indicating success or failure
-#[instrument(skip(config))]
-pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
+#[instrument(skip(config, store))]
+pub async fn init_kms_system(config: &config::Config, store: Arc<ECStore>) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
     let service_manager = startup_runtime_sources::init_kms_service_manager();
 
@@ -546,21 +548,21 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
             "Loading persisted KMS configuration"
         );
 
-        if let Some(persisted_config) = admin::handlers::kms_dynamic::load_kms_config().await {
-            info!(
-                target: "rustfs::init",
-                event = "kms_persisted_config_lookup",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_KMS,
-                state = "found",
-                "Loaded persisted KMS configuration"
-            );
+        match admin::handlers::kms_dynamic::load_kms_config_from_store(store).await {
+            Ok(Some(persisted_config)) => {
+                info!(
+                    target: "rustfs::init",
+                    event = "kms_persisted_config_lookup",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    state = "found",
+                    "Loaded persisted KMS configuration"
+                );
 
-            // Configure the KMS service with persisted config
-            match configure_and_start_kms(&service_manager, persisted_config, "persisted configuration").await {
-                Ok(()) => {}
-                Err(e) => {
-                    warn!(
+                if let Err(e) = configure_and_start_kms(&service_manager, persisted_config, "persisted configuration").await {
+                    let message = format!("Failed to apply persisted KMS configuration: {e}");
+                    service_manager.record_initialization_error(message.clone()).await;
+                    error!(
                         target: "rustfs::init",
                         event = "kms_service_state",
                         component = LOG_COMPONENT_INIT,
@@ -571,15 +573,29 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
                     );
                 }
             }
-        } else {
-            info!(
-                target: "rustfs::init",
-                event = "kms_persisted_config_lookup",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_KMS,
-                state = "not_found",
-                "No persisted KMS configuration found"
-            );
+            Ok(None) => {
+                info!(
+                    target: "rustfs::init",
+                    event = "kms_persisted_config_lookup",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    state = "not_found",
+                    "No persisted KMS configuration found"
+                );
+            }
+            Err(e) => {
+                let message = format!("Failed to load persisted KMS configuration: {e}");
+                service_manager.record_initialization_error(message).await;
+                error!(
+                    target: "rustfs::init",
+                    event = "kms_persisted_config_lookup",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_KMS,
+                    state = "load_failed",
+                    error = %e,
+                    "Persisted KMS configuration load failed"
+                );
+            }
         }
     }
 
