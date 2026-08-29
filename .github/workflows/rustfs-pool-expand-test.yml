@@ -309,12 +309,19 @@ jobs:
               STEPS="$STEPS,9"
             fi
           fi
-          ./auto-testing/rustfs_pool_expand.sh \
-            --steps "$STEPS" --with-warp -y \
+          ARGS=(--steps "$STEPS" --with-warp -y \
             --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
             --storage-threshold "${{ inputs.storage_threshold || '50' }}" \
             --warp-duration "${{ inputs.warp_duration || '10m' }}" \
-            --log-file /tmp/rustfs-pool-test.log
+            --log-file /tmp/rustfs-pool-test.log)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          elif [ -n "${{ inputs.rustfs_version }}" ]; then
+            ARGS+=(--version "${{ inputs.rustfs_version }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
 
       - name: Upload test logs
         if: always()
@@ -384,12 +391,17 @@ jobs:
 
       - name: Run heal test (write -> outage -> heal -> verify)
         run: |
-          ./auto-testing/rustfs_heal_test.sh \
-            --steps 3,4,5,6,7 -y \
+          ARGS=(--steps 3,4,5,6,7 -y \
             --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
             --stop-node-gb "${{ inputs.stop_node_gb || '15' }}" \
             --warp-stop-gb "${{ inputs.warp_stop_gb || '40' }}" \
-            --log-file /tmp/rustfs-heal-test.log
+            --log-file /tmp/rustfs-heal-test.log)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
 
       - name: Upload test logs
         if: always()
