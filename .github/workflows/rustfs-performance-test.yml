@@ -96,6 +96,7 @@ jobs:
           ref: main
           path: auto-testing
           persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
       - name: Show environment
         run: |
