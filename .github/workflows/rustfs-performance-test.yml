@@ -149,7 +149,7 @@ jobs:
         run: |
           ./auto-testing/rustfs_performance_test.sh --step 6 -y
 
-      - name: Post results to backlog issue
+      - name: Upload report to dashboard (reports/YYYY-MM-DD.md)
         if: ${{ steps.benchmark.conclusion == 'success' }}
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
@@ -157,30 +157,35 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; skipping issue post"
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping report upload"
             exit 0
           fi
           SUMMARY="${RESULT_DIR}/summary.md"
           [ -f "${SUMMARY}" ] || { echo "summary.md not found at ${SUMMARY}"; exit 1; }
           DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="reports/${DATE}.md"
           {
-            echo "## RustFS nightly build performance testing report"
+            echo "# RustFS nightly build performance testing report"
             echo ""
             echo "- **日期**: ${DATE}"
             echo "- **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "- **触发方式**: ${{ github.event_name }}"
+            echo "- **安装包**: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
             echo ""
             cat "${SUMMARY}"
-          } > /tmp/rustfs-perf-issue-body.md
-          TITLE="RustFS nightly build performance testing report"
-          EXISTING="$(gh issue list --repo rustfs/backlog \
-            --search "in:title \"${TITLE}\"" --state all --limit 5 \
-            --json number --jq '.[0].number // empty')"
-          if [ -n "${EXISTING}" ]; then
-            gh issue comment "${EXISTING}" --repo rustfs/backlog --body-file /tmp/rustfs-perf-issue-body.md
-            echo "commented on existing issue #${EXISTING}"
+          } > /tmp/rustfs-perf-report.md
+          CONTENT="$(python3 -c 'import base64; print(base64.b64encode(open("/tmp/rustfs-perf-report.md","rb").read()).decode())')"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report: ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+            echo "updated ${REPORT_PATH} in rustfs/dashboard"
           else
-            gh issue create --repo rustfs/backlog --title "${TITLE}" --body-file /tmp/rustfs-perf-issue-body.md
+            jq -n --arg msg "report: ${DATE}" --arg content "${CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+            echo "created ${REPORT_PATH} in rustfs/dashboard"
           fi
 
       - name: Upload test logs & results
