@@ -28,7 +28,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use datafusion::{
     common::{DataFusionError, runtime::SpawnedTask},
-    execution::memory_pool::{MemoryConsumer, MemoryPool, UnboundedMemoryPool},
+    execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation, UnboundedMemoryPool},
     object_store::{
         Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
         MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
@@ -1227,12 +1227,17 @@ where
             })?),
             None => None,
         };
+        let task_resources = JsonDocumentTaskResources {
+            _reservation: reservation,
+            query_guard: queued_query_guard,
+        };
         let pending_query_guard = PendingQueryExecutionGuard::new(query_tracker);
         let task_query_guard = pending_query_guard.task_state();
-        let (lines, _reservation, _query_guard) = SpawnedTask::spawn_blocking(move || {
+        let (lines, _task_resources) = SpawnedTask::spawn_blocking(move || {
             let query_guard = PendingQueryExecutionGuard::start(&task_query_guard)?;
-            drop(queued_query_guard);
-            parser(all_bytes, json_source).map(|lines| (lines, reservation, query_guard))
+            let mut task_resources = task_resources;
+            task_resources.query_guard = query_guard;
+            parser(all_bytes, json_source).map(|lines| (lines, task_resources))
         })
         .await
         .map_err(|e| o_Error::Generic {
@@ -1251,6 +1256,12 @@ where
         Ok(())
     })
     .boxed()
+}
+
+struct JsonDocumentTaskResources {
+    // Struct fields drop in declaration order, so admission covers the reservation through teardown.
+    _reservation: MemoryReservation,
+    query_guard: Option<QueryExecutionGuard>,
 }
 
 fn json_document_memory_reservation_bytes(input_bytes: usize, json_source: &JsonSource) -> datafusion::common::Result<usize> {
@@ -1559,7 +1570,7 @@ mod test {
     use bytes::Bytes;
     use datafusion::{
         common::DataFusionError,
-        execution::memory_pool::{GreedyMemoryPool, MemoryPool},
+        execution::memory_pool::{GreedyMemoryPool, MemoryLimit, MemoryPool, MemoryReservation},
         execution::{config::SessionConfig, context::SessionContext},
         object_store::{self, GetOptions, GetRange, GetResultPayload, ObjectStore as _, path::Path},
         physical_plan::ExecutionPlanProperties,
@@ -1567,6 +1578,7 @@ mod test {
     };
     use futures::{StreamExt, TryStreamExt, stream};
     use http::HeaderMap;
+    use parking_lot::Mutex;
     use rustfs_test_utils::PutObjectCommitBarrier;
     use s3s::S3ErrorCode;
     use s3s::dto::{
@@ -1583,6 +1595,64 @@ mod test {
     };
 
     use tokio::{io::AsyncReadExt, sync::Semaphore};
+
+    #[derive(Debug)]
+    struct AdmissionObservingMemoryPool {
+        inner: GreedyMemoryPool,
+        admission: Arc<Semaphore>,
+        reservation_release: Mutex<Option<tokio::sync::oneshot::Sender<bool>>>,
+    }
+
+    impl AdmissionObservingMemoryPool {
+        fn new(pool_size: usize, admission: Arc<Semaphore>) -> (Self, tokio::sync::oneshot::Receiver<bool>) {
+            let (reservation_release, reservation_released) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    inner: GreedyMemoryPool::new(pool_size),
+                    admission,
+                    reservation_release: Mutex::new(Some(reservation_release)),
+                },
+                reservation_released,
+            )
+        }
+    }
+
+    impl std::fmt::Display for AdmissionObservingMemoryPool {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&self.inner, f)
+        }
+    }
+
+    impl MemoryPool for AdmissionObservingMemoryPool {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+            self.inner.grow(reservation, additional);
+        }
+
+        fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+            self.inner.shrink(reservation, shrink);
+            if self.inner.reserved() == 0
+                && let Some(reservation_release) = self.reservation_release.lock().take()
+            {
+                let _ = reservation_release.send(self.admission.available_permits() == 0);
+            }
+        }
+
+        fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> datafusion::common::Result<()> {
+            self.inner.try_grow(reservation, additional)
+        }
+
+        fn reserved(&self) -> usize {
+            self.inner.reserved()
+        }
+
+        fn memory_limit(&self) -> MemoryLimit {
+            self.inner.memory_limit()
+        }
+    }
 
     fn source_key(name: &str) -> JsonPathSegment {
         JsonPathSegment::Key {
@@ -3161,13 +3231,17 @@ mod test {
                 30,
             );
             let input = b"{}".to_vec();
-            let memory_pool: Arc<dyn MemoryPool> =
-                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+            let (memory_pool, reservation_released) = AdmissionObservingMemoryPool::new(
+                input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER,
+                Arc::clone(&admission),
+            );
+            let memory_pool = Arc::new(memory_pool);
+            let query_memory_pool: Arc<dyn MemoryPool> = memory_pool.clone();
             let mut output = json_document_ndjson_stream(
                 Box::new(std::io::Cursor::new(input.clone())),
                 input.len() as u64,
                 JsonSource::default(),
-                Arc::clone(&memory_pool),
+                query_memory_pool,
                 Some(query_tracker),
             );
 
@@ -3188,6 +3262,13 @@ mod test {
             );
             release_blocking_tx.send(()).expect("release blocking worker");
             blocker.await.expect("blocking worker should finish");
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), reservation_released)
+                    .await
+                    .expect("cancelled JSON parse should release its memory reservation")
+                    .expect("memory reservation release observer should remain open"),
+                "query admission must cover the memory reservation through task teardown"
+            );
             let recovered_permit =
                 tokio::time::timeout(std::time::Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
                     .await
