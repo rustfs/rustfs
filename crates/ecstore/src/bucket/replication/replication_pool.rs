@@ -1048,7 +1048,6 @@ pub fn resync_start_conflict_id(error: &EcstoreError) -> Option<&str> {
 }
 
 /// Main replication pool structure
-#[derive(Debug)]
 pub struct ReplicationPool<S: ReplicationStorage> {
     // Atomic counters for active workers
     active_workers: Arc<AtomicI32>,
@@ -1092,6 +1091,16 @@ pub struct ReplicationPool<S: ReplicationStorage> {
 
     // Replication resyncer for handling bucket resync operations
     resyncer: Arc<ReplicationResyncer>,
+}
+
+impl<S: ReplicationStorage> std::fmt::Debug for ReplicationPool<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationPool")
+            .field("active_workers", &self.active_workers.load(Ordering::Relaxed))
+            .field("active_lrg_workers", &self.active_lrg_workers.load(Ordering::Relaxed))
+            .field("active_mrf_workers", &self.active_mrf_workers.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S: ReplicationStorage> ReplicationPool<S> {
@@ -2132,7 +2141,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 
     /// Load bucket replication resync statuses into memory
-    #[instrument(skip(_cancellation_token))]
+    #[instrument(skip(self, buckets, _cancellation_token), fields(bucket_count = buckets.len()))]
     async fn load_resync(
         self: Arc<Self>,
         buckets: &[String],

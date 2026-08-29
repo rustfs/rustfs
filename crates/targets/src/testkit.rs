@@ -53,7 +53,7 @@ impl Drop for HealthDropGuard {
 /// A budget of `usize::MAX` behaves as "always fail" for any realistic call count.
 fn consume_failure_budget(budget: &AtomicUsize) -> bool {
     budget
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
         .is_ok()
 }
 

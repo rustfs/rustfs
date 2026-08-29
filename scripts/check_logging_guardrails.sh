@@ -69,6 +69,11 @@ checked_files=(
   "crates/targets/src/target/webhook.rs"
   "crates/ecstore/src/store/peer.rs"
   "crates/ecstore/src/store/init.rs"
+  "crates/ecstore/src/store/mod.rs"
+  "crates/ecstore/src/object_api/types.rs"
+  "crates/ecstore/src/core/sets.rs"
+  "crates/ecstore/src/set_disk/ops/object.rs"
+  "crates/ecstore/src/bucket/replication/replication_pool.rs"
   "crates/s3-client/src/transition_api.rs"
   "crates/ecstore/src/services/tier/tier.rs"
   "crates/heal/src/heal/manager.rs"
@@ -741,6 +746,27 @@ require_patterns "crates/obs/src/telemetry/rolling.rs" \
   'Failed to flush log file before rotation' \
   'RollingAppender: Failed to rotate log file after' \
   'RollingAppender: failed to rotate log file'
+
+for raw_ecstore_debug_field in \
+  '.field("disk_map",' \
+  '.field("pools",' \
+  '.field("pool_meta",'; do
+  if rg -n -F -- "$raw_ecstore_debug_field" crates/ecstore/src/store/mod.rs >/dev/null; then
+    echo "❌ logging guardrail violation: ECStore Debug must stay bounded and must not render disk_map, pools, or pool_meta" >&2
+    exit 1
+  fi
+done
+
+for raw_object_options_debug_field in \
+  '.field("tier_delete_journal_api", &self.tier_delete_journal_api)' \
+  '.field("user_defined", &self.user_defined)' \
+  '.field("eval_metadata", &self.eval_metadata)' \
+  '.field("http_preconditions", &self.http_preconditions)'; do
+  if rg -n -F -- "$raw_object_options_debug_field" crates/ecstore/src/object_api/types.rs >/dev/null; then
+    echo "❌ logging guardrail violation: ObjectOptions Debug must summarize large or request-derived fields" >&2
+    exit 1
+  fi
+done
 
 if rg -n -F -- 'warn!(name = %MaskedAccessKey(name), user_type = ?user_type, "IAM user identity missing")' crates/iam/src/store/object.rs >/dev/null; then
   echo "❌ logging guardrail violation: missing IAM identity is an expected debug event, not a warning" >&2

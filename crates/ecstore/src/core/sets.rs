@@ -781,7 +781,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for Sets {
             .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, opts))]
     async fn delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         if opts.delete_prefix && !opts.delete_prefix_object {
             self.delete_prefix(bucket, object, &opts).await?;

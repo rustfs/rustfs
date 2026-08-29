@@ -625,7 +625,7 @@ impl WarmBackend for MockWarmBackend {
         let reject_once = self
             .inner
             .reject_non_empty_remote_version_validations
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
             .is_ok();
         if reject_once || self.inner.reject_non_empty_remote_versions.load(Ordering::Acquire) {
             return Err(std::io::Error::other("mock warm backend requires an unversioned remote object"));

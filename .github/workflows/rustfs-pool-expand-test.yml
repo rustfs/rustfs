@@ -92,6 +92,7 @@ jobs:
           ref: main
           path: auto-testing
           persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
       - name: Run S3 compatibility suite
         run: |
@@ -135,6 +136,7 @@ jobs:
           ref: main
           path: auto-testing
           persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
       - name: Ensure docker (Vault container)
         run: |
@@ -187,6 +189,7 @@ jobs:
           ref: main
           path: auto-testing
           persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
       - name: Ensure MQTT broker + clients (event notification tests)
         run: |
@@ -242,6 +245,7 @@ jobs:
           ref: main
           path: auto-testing
           persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
       - name: Show environment
         run: |
@@ -337,6 +341,7 @@ jobs:
           ref: main
           path: auto-testing
           persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
       - name: Reset test environment (before)
         if: ${{ inputs.cleanup_before != 'false' }}
