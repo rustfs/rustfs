@@ -25,15 +25,14 @@ const ENV_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: &str = "RUSTFS_ZERO_COPY_EAGER_PUT
 
 /// Maximum body size materialized by the ordinary eager PUT path.
 ///
-/// Bodies above this boundary stay streaming so a 1 MiB request does not
-/// reserve a full request-sized buffer while the EC writer is consuming it.
-/// The environment override keeps the boundary reversible for workload A/B
-/// tests and for deployments whose measured workload favors eager ingestion.
+/// Bodies above this boundary stay streaming while the EC writer consumes them.
+/// The environment override keeps the boundary reversible for workload A/B tests
+/// and for deployments whose measured workload favors streaming ingestion.
 const ENV_SMALL_EAGER_PUT_MAX_SIZE_BYTES: &str = "RUSTFS_SMALL_EAGER_PUT_MAX_SIZE_BYTES";
 
 const DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
-const DEFAULT_SMALL_EAGER_PUT_MAX_SIZE_BYTES: usize = 512 * 1024;
+const DEFAULT_SMALL_EAGER_PUT_MAX_SIZE_BYTES: usize = 1024 * 1024;
 
 // Keep bounded conditional writes eager through the historical 1 MiB boundary
 // so the old object remains readable until the replacement body is complete.
@@ -2325,20 +2324,20 @@ mod tests {
         assert!(should_use_small_eager_put_path(1024, &headers, false, false, false));
         assert!(should_use_small_eager_put_path(128 * 1024, &headers, false, false, false));
         assert!(should_use_small_eager_put_path(512 * 1024, &headers, false, false, false));
-        assert!(!should_use_small_eager_put_path(512 * 1024 + 1, &headers, false, false, false));
-        assert!(!should_use_small_eager_put_path(1024 * 1024, &headers, false, false, false));
+        assert!(should_use_small_eager_put_path(1024 * 1024, &headers, false, false, false));
+        assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
     }
 
     #[test]
     fn select_put_path_switches_at_small_eager_boundary() {
         let headers = HeaderMap::new();
 
-        let (small_path, _, use_zero_copy, use_small_eager) = select_put_path(512 * 1024, &headers, false, false, false);
+        let (small_path, _, use_zero_copy, use_small_eager) = select_put_path(1024 * 1024, &headers, false, false, false);
         assert_eq!(small_path, "small_eager");
         assert!(!use_zero_copy);
         assert!(use_small_eager);
 
-        let (streaming_path, _, use_zero_copy, use_small_eager) = select_put_path(512 * 1024 + 1, &headers, false, false, false);
+        let (streaming_path, _, use_zero_copy, use_small_eager) = select_put_path(1024 * 1024 + 1, &headers, false, false, false);
         assert_eq!(streaming_path, "streaming");
         assert!(!use_zero_copy);
         assert!(!use_small_eager);
