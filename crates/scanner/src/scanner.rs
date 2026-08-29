@@ -1420,13 +1420,10 @@ async fn run_data_scanner_cycle_with_budget(
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
     };
-    let usage_persist_baseline_result = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await;
+    let usage_persist_baseline_result = read_data_usage_persist_baseline(storeapi.clone()).await;
     drop(baseline_publication_guard);
     let usage_persist_baseline = match usage_persist_baseline_result {
-        Ok((data, revision)) => DataUsagePersistBaseline {
-            data: data.map(Bytes::from),
-            revision,
-        },
+        Ok(baseline) => baseline,
         Err(err) => {
             error!(
                 target: "rustfs::scanner",

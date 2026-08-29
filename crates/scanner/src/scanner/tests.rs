@@ -3325,6 +3325,79 @@ async fn test_observational_usage_defers_when_authoritative_baseline_is_missing(
 }
 
 #[tokio::test]
+async fn test_observational_usage_uses_fenced_backup_when_v2_primary_has_no_identity() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    backup.scanner_epoch = Some(7);
+    backup.scanner_cycle = Some(103);
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&primary).expect("incomplete primary should encode"),
+    );
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, &format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str())),
+        serde_json::to_vec(&backup).expect("backup baseline should encode"),
+    );
+
+    let (sender, receiver) = mpsc::channel(1);
+    let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
+    observation.usage_snapshot_converged = Some(false);
+    sender.send(observation).await.expect("observation should enqueue");
+    drop(sender);
+
+    let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+        CancellationToken::new(),
+        store.clone(),
+        receiver,
+        None,
+        None,
+        || async { false },
+    )
+    .await;
+
+    assert_eq!(outcome, DataUsagePersistOutcome::Saved);
+    let observed = read_config(store, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("observational snapshot should be persisted");
+    let observed = serde_json::from_slice::<DataUsageInfo>(&observed).expect("observational snapshot should decode");
+    assert_eq!(observed.usage_snapshot_authoritative_baseline, Some(backup.snapshot_identity()));
+}
+
+#[tokio::test]
+async fn usage_baseline_does_not_fall_back_to_older_legacy_snapshot() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    legacy.scanner_epoch = Some(6);
+    legacy.scanner_cycle = Some(103);
+    let primary_data = serde_json::to_vec(&primary).expect("incomplete primary should encode");
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        primary_data.clone(),
+    );
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&legacy).expect("legacy baseline should encode"),
+    );
+
+    let baseline = read_data_usage_persist_baseline(store)
+        .await
+        .expect("baseline inspection should complete");
+    assert_eq!(baseline.data.as_deref(), Some(primary_data.as_slice()));
+}
+
+#[tokio::test]
 #[serial]
 async fn test_usage_route_barrier_precedes_durable_reconciliation() {
     let store = Arc::new(MemoryConfigStore::default());
