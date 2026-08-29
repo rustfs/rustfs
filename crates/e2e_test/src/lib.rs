@@ -164,6 +164,10 @@ mod delete_objects_versioning_test;
 #[cfg(test)]
 mod delete_object_no_content_length_test;
 
+// Regression test for signed empty PutObject requests without Content-Length.
+#[cfg(test)]
+mod put_object_no_content_length_test;
+
 // Delete-marker visibility baseline for data-movement migration proof.
 #[cfg(test)]
 mod delete_marker_migration_semantics_test;
