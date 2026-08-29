@@ -2290,6 +2290,25 @@ mod tests {
     }
 
     #[test]
+    fn timed_action_slot_snapshot_skips_writer_owned_slot() {
+        let slot = TimedActionSlot::default();
+        slot.unix_sec.store(70, Ordering::Relaxed);
+        slot.count.store(2, Ordering::Relaxed);
+        slot.acc_time.store(18_000, Ordering::Relaxed);
+        slot.version.store(2, Ordering::Release);
+        assert_eq!(slot.snapshot(), Some((70, 2, 18_000)));
+
+        assert_eq!(slot.version.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Relaxed), Ok(2));
+        slot.unix_sec.store(71, Ordering::Relaxed);
+        slot.count.store(1, Ordering::Relaxed);
+        slot.acc_time.store(11_000, Ordering::Relaxed);
+        assert_eq!(slot.snapshot(), None);
+
+        slot.version.store(4, Ordering::Release);
+        assert_eq!(slot.snapshot(), Some((71, 1, 11_000)));
+    }
+
+    #[test]
     fn disk_health_metrics_snapshot_exports_waiting_errors_and_operation_windows() {
         let metrics = DiskHealthMetricEpoch::default();
         metrics.record_operation_call("read_all");
