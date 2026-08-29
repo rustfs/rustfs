@@ -3148,9 +3148,10 @@ impl LocalIoBackend for StdBackend {
                 direct_read_copy_fault_delta: MmapPageFaultDelta,
                 blocking_task_duration: StdDuration,
                 used_direct_io: bool,
-                /// The descriptor opened by THIS call (None on a cache hit), handed
-                /// back so the async caller can index it in the fd cache.
-                opened_fd: Option<Arc<std::fs::File>>,
+                /// The descriptor and size snapshot opened by THIS call (None on a
+                /// cache hit), handed back so the async caller can index it in the
+                /// fd cache.
+                opened_fd: Option<Arc<FdCacheEntry>>,
             }
 
             enum MmapCopyReadError {
@@ -3197,12 +3198,12 @@ impl LocalIoBackend for StdBackend {
                 (cache, key, gen_at_open)
             });
             #[cfg(target_os = "linux")]
-            let cached_fd: Option<Arc<std::fs::File>> = match &fd_lookup {
+            let cached_fd: Option<Arc<FdCacheEntry>> = match &fd_lookup {
                 Some((cache, key, _)) => cache.get(key).await,
                 None => None,
             };
             #[cfg(not(target_os = "linux"))]
-            let cached_fd: Option<Arc<std::fs::File>> = None;
+            let cached_fd: Option<Arc<FdCacheEntry>> = None;
 
             let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
             let read_result = tokio::task::spawn_blocking(move || {
@@ -3224,8 +3225,15 @@ impl LocalIoBackend for StdBackend {
                 // the read below is positioned (mmap offset argument / `read_exact_at`)
                 // and never depends on the descriptor's current offset. `cached_fd` being
                 // None also marks this call as a miss for the cache-insert side-channel.
-                let (file, access_check_duration) = if let Some(cached) = cached_fd.as_ref() {
-                    (cached.as_ref().try_clone().map_err(DiskError::from)?, StdDuration::ZERO)
+                // The cached length is the metadata snapshot captured at open time;
+                // all in-place/replacement writers invalidate this entry before
+                // publishing a mutation, so cache hits avoid a redundant fstat.
+                let (file, cached_len, access_check_duration) = if let Some(cached) = cached_fd.as_ref() {
+                    (
+                        cached.file.as_ref().try_clone().map_err(DiskError::from)?,
+                        Some(cached.len),
+                        StdDuration::ZERO,
+                    )
                 } else {
                     // Measure the volume access probe only — the part-path resolution
                     // above is accounted in `path_resolve_duration` (rustfs/backlog#1801).
@@ -3236,20 +3244,27 @@ impl LocalIoBackend for StdBackend {
                             .map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
                     }
                     let access_check_duration = access_check_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-                    (std::fs::File::open(&file_path).map_err(DiskError::from)?, access_check_duration)
+                    (std::fs::File::open(&file_path).map_err(DiskError::from)?, None, access_check_duration)
                 };
                 let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
-                let metadata_lookup_start = metrics_enabled.then(StdInstant::now);
-                // On a cache hit this fstats the cached descriptor — the inode it was
-                // opened against, which invalidation keeps current for live entries. EC
-                // shards are fixed-length, so a still-cached pre-heal length is benign.
-                let meta = file.metadata().map_err(DiskError::from)?;
-                let metadata_lookup_duration = metadata_lookup_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                let (metadata_len, metadata_lookup_duration) = if let Some(len) = cached_len {
+                    // Reuse the open-time metadata snapshot on a cache hit. The
+                    // generation fence and mutation invalidation keep this value
+                    // tied to the inode held by `file`.
+                    (len, StdDuration::ZERO)
+                } else {
+                    let metadata_lookup_start = metrics_enabled.then(StdInstant::now);
+                    let meta = file.metadata().map_err(DiskError::from)?;
+                    let duration = metadata_lookup_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+                    (meta.len(), duration)
+                };
 
                 let metadata_validate_start = metrics_enabled.then(StdInstant::now);
-                if meta.len() < end_offset_u64 {
-                    return Err(MmapCopyReadError::OutOfBounds { actual_size: meta.len() });
+                if metadata_len < end_offset_u64 {
+                    return Err(MmapCopyReadError::OutOfBounds {
+                        actual_size: metadata_len,
+                    });
                 }
                 let metadata_validate_duration =
                     metadata_validate_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
@@ -3395,9 +3410,14 @@ impl LocalIoBackend for StdBackend {
                 // Arc; `cached_fd.is_none()` is true exactly when this call did the open.
                 // Non-Linux has no fd cache, so skip the Arc allocation there.
                 #[cfg(target_os = "linux")]
-                let opened_fd: Option<Arc<std::fs::File>> = cached_fd.is_none().then(|| Arc::new(file));
+                let opened_fd: Option<Arc<FdCacheEntry>> = cached_fd.is_none().then(|| {
+                    Arc::new(FdCacheEntry {
+                        file: Arc::new(file),
+                        len: metadata_len,
+                    })
+                });
                 #[cfg(not(target_os = "linux"))]
-                let opened_fd: Option<Arc<std::fs::File>> = None;
+                let opened_fd: Option<Arc<FdCacheEntry>> = None;
 
                 Ok::<MmapCopyReadResult, MmapCopyReadError>(MmapCopyReadResult {
                     bytes,
@@ -3520,7 +3540,7 @@ impl LocalIoBackend for StdBackend {
                     }
                 }
             }
-            // Index the freshly opened descriptor for future cache hits
+            // Index the freshly opened descriptor and metadata snapshot for future cache hits
             // (rustfs/backlog#1801). `insert_if_fresh` refuses to cache if an
             // invalidation (heal/delete/rename) bumped the generation between the
             // open snapshot and now, so a stale pre-mutation inode is never served
@@ -3872,6 +3892,18 @@ struct FdKey {
     direct: bool,
 }
 
+/// Descriptor and immutable size snapshot retained for one cached shard inode.
+///
+/// The generation fence and explicit mutation invalidation keep the snapshot
+/// tied to the inode held by `file`, allowing cache hits to avoid a repeated
+/// metadata syscall without weakening replacement/heal semantics.
+struct FdCacheEntry {
+    /// An independently cloneable descriptor for the immutable shard inode.
+    file: Arc<std::fs::File>,
+    /// File length captured together with the descriptor.
+    len: u64,
+}
+
 /// Per-disk cache of open descriptors for io_uring reads (backlog#1145).
 ///
 /// Why this exists: `pread_uring` opened the file on the blocking pool for every
@@ -3901,7 +3933,7 @@ struct FdKey {
 /// the descriptor once no in-flight read still holds it.
 #[cfg(target_os = "linux")]
 struct FdCache {
-    cache: moka::future::Cache<FdKey, Arc<std::fs::File>>,
+    cache: moka::future::Cache<FdKey, Arc<FdCacheEntry>>,
     /// Bumped by every invalidation. A miss-path open snapshots this before it
     /// opens and refuses to insert if it moved, so an fd opened before a
     /// heal/delete commit can never be resurrected into the cache after the
@@ -3931,7 +3963,7 @@ impl FdCache {
         }
     }
 
-    async fn get(&self, key: &FdKey) -> Option<Arc<std::fs::File>> {
+    async fn get(&self, key: &FdKey) -> Option<Arc<FdCacheEntry>> {
         self.cache.get(key).await
     }
 
@@ -3946,7 +3978,7 @@ impl FdCache {
     /// open bumped the generation, so a stale pre-heal/pre-delete inode is never
     /// cached. The post-insert re-check closes the tiny window where an
     /// invalidate races the insert itself, by removing the entry we just added.
-    async fn insert_if_fresh(&self, key: FdKey, file: Arc<std::fs::File>, gen_at_open: u64) {
+    async fn insert_if_fresh(&self, key: FdKey, entry: Arc<FdCacheEntry>, gen_at_open: u64) {
         if self.generation.load(Ordering::Acquire) != gen_at_open {
             return;
         }
@@ -3986,7 +4018,7 @@ impl FdCache {
         self.generation.fetch_add(1, Ordering::AcqRel);
         let volume = volume.to_owned();
         let prefix = prefix.trim_end_matches('/').to_owned();
-        let matches = move |k: &FdKey, _: &Arc<std::fs::File>| {
+        let matches = move |k: &FdKey, _: &Arc<FdCacheEntry>| {
             k.volume == volume && (k.path == prefix || k.path.strip_prefix(&prefix).is_some_and(|r| r.starts_with('/')))
         };
         if self.cache.invalidate_entries_if(matches).is_err() {
@@ -4002,7 +4034,7 @@ impl FdCache {
     fn invalidate_volume(&self, volume: &str) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         let volume = volume.to_owned();
-        let matches = move |k: &FdKey, _: &Arc<std::fs::File>| k.volume == volume;
+        let matches = move |k: &FdKey, _: &Arc<FdCacheEntry>| k.volume == volume;
         if self.cache.invalidate_entries_if(matches).is_err() {
             self.cache.invalidate_all();
         }
@@ -4020,7 +4052,8 @@ impl FdCache {
     /// tests that drive the cache directly.
     #[cfg(test)]
     async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
-        self.cache.insert(key, file).await;
+        let len = file.metadata().map(|metadata| metadata.len()).unwrap_or_default();
+        self.cache.insert(key, Arc::new(FdCacheEntry { file, len })).await;
     }
 
     #[cfg(test)]
@@ -4399,7 +4432,12 @@ impl UringBackend {
         };
 
         let file = match cached {
-            Some(file) => file,
+            Some(entry) => {
+                if entry.len < u64::try_from(end_offset).map_err(|_| DiskError::FileCorrupt)? {
+                    return Err(DiskError::FileCorrupt);
+                }
+                Arc::clone(&entry.file)
+            }
             None => {
                 // Snapshot the cache generation BEFORE opening (rustfs/backlog#1176):
                 // if a heal/delete invalidation runs while this open is in flight,
@@ -4409,7 +4447,7 @@ impl UringBackend {
                 let root = self.root.clone();
                 let volume_owned = volume.to_owned();
                 let path_owned = path.to_owned();
-                let file = tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
+                let (file, len) = tokio::task::spawn_blocking(move || -> Result<(std::fs::File, u64)> {
                     let file_path = resolve_uring_object_path(&root, &volume_owned, &path_owned)?;
                     let file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
                     let meta = file.metadata().map_err(DiskError::from)?;
@@ -4417,30 +4455,22 @@ impl UringBackend {
                     if meta.len() < end_offset_u64 {
                         return Err(DiskError::FileCorrupt);
                     }
-                    Ok(file)
+                    Ok((file, meta.len()))
                 })
                 .await
                 .map_err(|e| DiskError::other(format!("uring pread join error: {e}")))??;
-                let file = Arc::new(file);
+                let file = Arc::new(FdCacheEntry {
+                    file: Arc::new(file),
+                    len,
+                });
                 if let (Some((cache, key)), Some(gen_at_open)) = (cache_entry, gen_at_open) {
                     cache.insert_if_fresh(key, Arc::clone(&file), gen_at_open).await;
                 }
-                file
+                file.file.clone()
             }
         };
 
         if length == 0 {
-            // Parity with StdBackend and the miss path (rustfs/backlog#1173): a
-            // zero-length read still rejects an offset past EOF. The miss path
-            // validated `meta.len() < end_offset` (end_offset == offset here), but
-            // a cache hit skipped it — so fstat the descriptor and match. This is
-            // a rare path (callers do not issue zero-length reads), so the one
-            // extra fstat is negligible.
-            match file.metadata() {
-                Ok(meta) if offset_u64 > meta.len() => return Err(DiskError::FileCorrupt),
-                Ok(_) => {}
-                Err(e) => return Err(DiskError::from(e)),
-            }
             return Ok(Bytes::new());
         }
 
@@ -21407,11 +21437,10 @@ mod test {
 
     /// Zero-length read bounds parity on the cache-HIT path (backlog#1173/#1180).
     /// A `length == 0` read past EOF must be rejected identically whether the
-    /// descriptor is freshly opened (miss path) or served from the cache: the
-    /// cache-hit branch fstats the descriptor to reproduce the miss path's
-    /// `offset > len` check instead of returning empty unconditionally. Seeds
-    /// the cache with a normal read so the zero-length reads are hits, then pins
-    /// that UringBackend and StdBackend agree on every case.
+    /// descriptor is freshly opened (miss path) or served from the cache. Seeds
+    /// the cache with a normal read so the zero-length reads reuse the same
+    /// open-time size snapshot, then pins that UringBackend and StdBackend agree
+    /// on every case.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread")]
     async fn uring_zero_length_read_bounds_match_std_on_cache_hit() {
