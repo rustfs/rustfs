@@ -1924,6 +1924,38 @@ async fn scanner_startup_uses_primary_and_backup_usage_floor() {
 }
 
 #[tokio::test]
+async fn scanner_usage_floor_keeps_valid_primary_when_backup_has_no_identity() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let mut primary = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    primary.scanner_epoch = Some(8);
+    primary.scanner_cycle = Some(100);
+    let backup = DataUsageInfo {
+        scanner_epoch: Some(9),
+        scanner_cycle: Some(101),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+
+    for (path, usage) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), primary), (backup_path.as_str(), backup)] {
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, path),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
+        );
+    }
+
+    assert_eq!(
+        persisted_usage_floor(store)
+            .await
+            .expect("valid primary should remain authoritative"),
+        PersistedUsageFloor {
+            next_cycle: 101,
+            leader_epoch: 8,
+        }
+    );
+}
+
+#[tokio::test]
 async fn scanner_usage_floor_recovers_from_incomplete_v2_primary_using_fenced_backup() {
     let store = Arc::new(MemoryConfigStore::default());
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());

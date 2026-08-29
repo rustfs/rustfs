@@ -1393,7 +1393,6 @@ pub(super) async fn persisted_usage_floor_for_startup(
                     // This is still persisted state, so it must not enable a
                     // missing-state bootstrap.  Continue to a legacy pair in
                     // case it contains a complete, fenced snapshot.
-                    any_found = false;
                 } else {
                     let backup_epoch = usage.scanner_epoch.unwrap_or_default();
                     // A backup write from an older leader may complete after the
