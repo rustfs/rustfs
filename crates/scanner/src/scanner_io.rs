@@ -582,6 +582,9 @@ pub(crate) enum ScannerCycleDeferReason {
     /// operation. This can occur even when the configured budget fits the
     /// nominal TTL because lease acquisition consumed part of the window.
     PublicationLeaseDeadlineExceeded,
+    /// A remote lease could not be released after the persistence attempt.
+    /// Keep the cycle deferred because the peer may still admit movement.
+    PublicationLeaseReleaseFailed,
 }
 
 impl ScannerCycleDeferReason {
@@ -591,6 +594,7 @@ impl ScannerCycleDeferReason {
             Self::DataMovement => "data_movement",
             Self::PublicationLeaseBudgetExceeded => "publication_lease_budget_exceeded",
             Self::PublicationLeaseDeadlineExceeded => "publication_lease_deadline_exceeded",
+            Self::PublicationLeaseReleaseFailed => "publication_lease_release_failed",
         }
     }
 }

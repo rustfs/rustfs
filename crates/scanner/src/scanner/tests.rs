@@ -3394,6 +3394,44 @@ async fn coordinator_does_not_put_after_remote_generation_flip() {
 }
 
 #[tokio::test]
+async fn coordinator_classifies_an_expired_publication_lease() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(complete_usage_with_bucket_count(
+            Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            1,
+        ))
+        .await
+        .expect("usage snapshot should enqueue");
+    drop(sender);
+
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("test instant should support a one-second subtraction");
+    let outcome =
+        store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
+            CancellationToken::new(),
+            store.clone(),
+            receiver,
+            None,
+            Some(DataUsagePersistBaseline {
+                data: None,
+                revision: DataUsageCacheRevision::Missing,
+            }),
+            ScannerPublicationFence::new(None, Some(expired), None),
+            || async { false },
+        )
+        .await;
+
+    assert_eq!(
+        outcome,
+        DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
+    );
+    assert!(store.put_counts.lock().await.is_empty(), "expired lease must prevent a PUT");
+}
+
+#[tokio::test]
 #[serial]
 async fn test_deferred_usage_save_keeps_last_real_save_metric() {
     let metrics = global_metrics();
@@ -4446,6 +4484,7 @@ fn scanner_cycle_cache_floor_stays_pending_during_deferred_usage_publication() {
         ScannerCycleDeferReason::ActivityBaselineUnavailable,
         ScannerCycleDeferReason::PublicationLeaseBudgetExceeded,
         ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded,
+        ScannerCycleDeferReason::PublicationLeaseReleaseFailed,
     ] {
         let deferred = DataUsagePersistOutcome::Deferred(reason);
         assert_eq!(
@@ -4631,6 +4670,10 @@ fn scanner_publication_lease_budget_has_a_strict_ttl_boundary() {
     assert_eq!(
         ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded.as_str(),
         "publication_lease_deadline_exceeded"
+    );
+    assert_eq!(
+        ScannerCycleDeferReason::PublicationLeaseReleaseFailed.as_str(),
+        "publication_lease_release_failed"
     );
 }
 

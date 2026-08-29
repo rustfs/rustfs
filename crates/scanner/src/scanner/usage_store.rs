@@ -225,7 +225,7 @@ where
             data_usage_info.scanner_epoch = Some(leader_epoch);
         }
         if remote_lease_expired(remote_lease_deadline) {
-            outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+            outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded);
             break 'updates;
         }
         if let Some(expected_epoch) = expected_publication_epoch
@@ -497,7 +497,7 @@ where
                 break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             }
             if remote_lease_expired(remote_lease_deadline) {
-                break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+                break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded);
             }
 
             let done_save = Metrics::time(Metric::SaveUsage);
@@ -510,7 +510,7 @@ where
                 };
                 if remote_lease_expired(remote_lease_deadline) {
                     done_save();
-                    break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+                    break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded);
                 }
                 save_config_shared_with_preconditions_and_lease_fence(
                     storeapi.clone(),

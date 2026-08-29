@@ -1662,14 +1662,17 @@ async fn run_data_scanner_cycle_with_budget(
         .is_some_and(|(_, grants)| grants.iter().any(|grant| !grant.lease.is_valid()));
     if let Some((notification_system, grants)) = remote_publication_leases.take() {
         let release_result = notification_system.release_scanner_publication_leases(grants).await;
-        if lease_expired || release_result.is_err() {
+        let lease_release_failed = release_result.is_err();
+        if lease_expired || lease_release_failed {
             // A lease that expired or could not be released is never treated
             // as a successful authoritative publication. The peer may have
             // admitted movement immediately after the lease ended.
             usage_persist_outcome = if usage_persist_outcome == DataUsagePersistOutcome::Failed {
                 DataUsagePersistOutcome::Failed
+            } else if lease_release_failed {
+                DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseReleaseFailed)
             } else {
-                DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+                DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
             };
         }
     }
