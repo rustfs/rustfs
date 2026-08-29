@@ -2937,8 +2937,9 @@ use usage_store::*;
 
 pub use activity::scanner_topology_digest;
 pub(crate) use activity::{
-    ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement, probe_scanner_activity, scanner_activity_allows_usage_publication,
-    scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest, scanner_dirty_usage_acknowledgements,
+    ScannerActivitySnapshot, ScannerDirtyUsageAcknowledgement, await_scanner_publication_activity, probe_scanner_activity,
+    scanner_activity_allows_usage_publication, scanner_activity_publication_lease_targets, scanner_activity_snapshot_digest,
+    scanner_dirty_usage_acknowledgements,
 };
 pub(crate) use activity::{ScannerCycleOutcome, scanner_cycle_outcome_with_pending_maintenance};
 #[cfg(test)]
