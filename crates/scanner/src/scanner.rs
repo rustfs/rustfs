@@ -108,6 +108,10 @@ const CLEAN_IDLE_BACKOFF_FACTOR: u32 = 2;
 /// unavailable peer cannot drive a tight retry loop.
 const SCANNER_RETRY_BASE_INTERVAL: Duration = Duration::from_secs(5);
 const SCANNER_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Keep a structurally complete scan in memory while its cluster publication
+/// proof is temporarily unavailable. The short cap makes recovery prompt
+/// without turning an unavailable peer into another namespace scan loop.
+const SCANNER_PUBLICATION_PROOF_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 /// A transient backend outage remains self-healing after the short retry
 /// budget is exhausted, but the probe is intentionally sparse until storage
 /// recovers or an operator reset wakes the scanner.
@@ -142,6 +146,13 @@ static SCANNER_CYCLE_RECOVERY_WAKE: LazyLock<Notify> = LazyLock::new(Notify::new
 
 fn remote_publication_lease_fence_targets_are_required(target_count: usize, grants_present: bool, fence_present: bool) -> bool {
     target_count > 0 && (!grants_present || !fence_present)
+}
+
+fn data_usage_persist_outcome_after_lease_failure(outcome: DataUsagePersistOutcome) -> DataUsagePersistOutcome {
+    match outcome {
+        DataUsagePersistOutcome::Failed | DataUsagePersistOutcome::NoUpdate => outcome,
+        _ => DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+    }
 }
 
 pub(super) fn notify_scanner_cycle_recovery_wake() {
@@ -1462,7 +1473,16 @@ async fn run_data_scanner_cycle_with_budget(
         {
             Some(ScannerCycleDeferReason::DataMovement)
         }
-        Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
+        Ok(result) => {
+            let publication_proof_ctx = cycle_budget.token();
+            final_data_usage_publication_defer_reason(
+                &publication_proof_ctx,
+                cycle_info.current,
+                storeapi.as_ref(),
+                result.status,
+            )
+            .await
+        }
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
     let publication_deferred = publication_defer_reason.is_some();
@@ -1485,15 +1505,23 @@ async fn run_data_scanner_cycle_with_budget(
         // allowing the peer to admit movement while a local PUT is in flight.
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     } else if let Some(notification_system) = storeapi.notification_system() {
-        match notification_system
-            .acquire_scanner_publication_leases(remote_publication_lease_targets.clone())
-            .await
-        {
-            Ok(grants) => {
+        let publication_proof_ctx = cycle_budget.token();
+        let lease_result = await_scanner_publication_proof(
+            &publication_proof_ctx,
+            cycle_info.current,
+            "lease_acquire",
+            || notification_system.acquire_scanner_publication_leases(remote_publication_lease_targets.clone()),
+            |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
+        )
+        .await;
+        match lease_result {
+            ScannerPublicationProofWait::Ready(grants) => {
                 remote_publication_leases = Some((notification_system, grants));
                 None
             }
-            Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+            ScannerPublicationProofWait::Rejected(_) | ScannerPublicationProofWait::Cancelled => {
+                Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+            }
         }
     } else {
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
@@ -1546,24 +1574,33 @@ async fn run_data_scanner_cycle_with_budget(
         .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
         .or(publication_defer_reason);
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
+    let cycle_stopped_before_persist = cycle_budget.token().is_cancelled();
     let remote_lease_probe = remote_publication_leases
         .as_ref()
         .map(|(notification_system, grants)| (Arc::clone(notification_system), grants.clone()));
-    let mut usage_persist_outcome = match publication_defer_reason {
-        Some(reason) => {
-            drop(receiver);
-            DataUsagePersistOutcome::Deferred(reason)
-        }
-        None => {
-            // ScannerIO emits its complete or observational update only after
-            // all set workers finish. Persist after the final activity fence;
-            // this also avoids blocking the scanner on a denied publication.
-            let storeapi_clone = storeapi.clone();
-            let ctx_clone = ctx.clone();
-            let route_probe_store = storeapi.clone();
-            let remote_lease_fence = remote_lease_fence.clone();
-            let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
-                store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
+    let mut usage_persist_outcome = if cycle_stopped_before_persist {
+        // The retained candidate belongs to this cycle budget and leader
+        // context. Drop it without turning an intentional stop into another
+        // activity deferral; the existing cancellation/budget paths below
+        // decide whether to stop or persist a partial cursor.
+        drop(receiver);
+        DataUsagePersistOutcome::NoUpdate
+    } else {
+        match publication_defer_reason {
+            Some(reason) => {
+                drop(receiver);
+                DataUsagePersistOutcome::Deferred(reason)
+            }
+            None => {
+                // ScannerIO emits its complete or observational update only after
+                // all set workers finish. Persist after the final activity fence;
+                // this also avoids blocking the scanner on a denied publication.
+                let storeapi_clone = storeapi.clone();
+                let ctx_clone = ctx.clone();
+                let route_probe_store = storeapi.clone();
+                let remote_lease_fence = remote_lease_fence.clone();
+                let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
+                    store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
                     ctx_clone,
                     storeapi_clone,
                     receiver,
@@ -1591,46 +1628,47 @@ async fn run_data_scanner_cycle_with_budget(
                     },
                 )
                 .await
-            }));
-            match wait_for_data_usage_persist_task(ctx, &mut usage_persist_task, usage_persist_timeout).await {
-                DataUsagePersistTaskResult::Completed(outcome) => outcome,
-                DataUsagePersistTaskResult::JoinFailed(err) => {
-                    error!(
-                        target: "rustfs::scanner",
-                        event = EVENT_SCANNER_PERSIST_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_RUNTIME,
-                        cycle = cycle_info.current,
-                        state = "usage_persist_task_failed",
-                        error = %err,
-                        "Scanner data usage persistence task failed"
-                    );
-                    DataUsagePersistOutcome::Failed
-                }
-                DataUsagePersistTaskResult::Cancelled => {
-                    debug!(
-                        target: "rustfs::scanner",
-                        event = EVENT_SCANNER_PERSIST_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_RUNTIME,
-                        cycle = cycle_info.current,
-                        state = "usage_persist_task_cancelled",
-                        "Scanner data usage persistence task cancelled"
-                    );
-                    DataUsagePersistOutcome::Failed
-                }
-                DataUsagePersistTaskResult::TimedOut => {
-                    error!(
-                        target: "rustfs::scanner",
-                        event = EVENT_SCANNER_PERSIST_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_RUNTIME,
-                        cycle = cycle_info.current,
-                        timeout = ?usage_persist_timeout,
-                        state = "usage_persist_task_timed_out",
-                        "Scanner data usage persistence task timed out"
-                    );
-                    DataUsagePersistOutcome::Failed
+                }));
+                match wait_for_data_usage_persist_task(ctx, &mut usage_persist_task, usage_persist_timeout).await {
+                    DataUsagePersistTaskResult::Completed(outcome) => outcome,
+                    DataUsagePersistTaskResult::JoinFailed(err) => {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            cycle = cycle_info.current,
+                            state = "usage_persist_task_failed",
+                            error = %err,
+                            "Scanner data usage persistence task failed"
+                        );
+                        DataUsagePersistOutcome::Failed
+                    }
+                    DataUsagePersistTaskResult::Cancelled => {
+                        debug!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            cycle = cycle_info.current,
+                            state = "usage_persist_task_cancelled",
+                            "Scanner data usage persistence task cancelled"
+                        );
+                        DataUsagePersistOutcome::Failed
+                    }
+                    DataUsagePersistTaskResult::TimedOut => {
+                        error!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            cycle = cycle_info.current,
+                            timeout = ?usage_persist_timeout,
+                            state = "usage_persist_task_timed_out",
+                            "Scanner data usage persistence task timed out"
+                        );
+                        DataUsagePersistOutcome::Failed
+                    }
                 }
             }
         }
@@ -1644,11 +1682,10 @@ async fn run_data_scanner_cycle_with_budget(
             // A lease that expired or could not be released is never treated
             // as a successful authoritative publication. The peer may have
             // admitted movement immediately after the lease ended.
-            usage_persist_outcome = if usage_persist_outcome == DataUsagePersistOutcome::Failed {
-                DataUsagePersistOutcome::Failed
-            } else {
-                DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
-            };
+            // No metadata write was attempted after the cycle budget or
+            // shutdown token stopped the retained candidate. A release
+            // failure cannot invalidate a publication that never began.
+            usage_persist_outcome = data_usage_persist_outcome_after_lease_failure(usage_persist_outcome);
         }
     }
     let unresolved_heal_work = global_metrics().current_scan_cycle_has_unresolved_heal_work();
@@ -2720,6 +2757,8 @@ impl Drop for ScannerScanModeGuard {
 }
 
 async fn final_data_usage_publication_defer_reason(
+    ctx: &CancellationToken,
+    cycle: u64,
     storeapi: &ECStore,
     status: ScannerCycleStatus,
 ) -> Option<ScannerCycleDeferReason> {
@@ -2730,7 +2769,11 @@ async fn final_data_usage_publication_defer_reason(
             }
             if status == ScannerCycleStatus::Complete {
                 let distributed = storeapi.setup_is_dist_erasure().await;
-                match probe_scanner_activity(storeapi, distributed).await {
+                match await_scanner_publication_activity(ctx, cycle, "pre_persist", || {
+                    probe_scanner_activity(storeapi, distributed)
+                })
+                .await
+                {
                     Ok(snapshot) if scanner_activity_allows_usage_publication(&snapshot) => None,
                     Ok(_) => Some(ScannerCycleDeferReason::DataMovement),
                     Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),

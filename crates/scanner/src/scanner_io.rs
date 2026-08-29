@@ -241,16 +241,21 @@ fn classify_nsscanner_cycle(
     dirty_usage_status: DirtyUsageSnapshotStatus,
     activity_status: ScannerCycleActivityStatus,
 ) -> ScannerCycleStatus {
-    // The post-scan activity proof is required regardless of why the scan was
-    // incomplete.  Returning Incomplete first would apply the long ordinary
-    // retry/backoff path to an unverifiable publication and could acknowledge
-    // a cycle without a movement-generation proof.
+    // Cancellation and the cycle budget are authoritative stop conditions.
+    // Incomplete cycles publish no usage and acknowledge no dirty state, so
+    // preserving that outcome cannot bypass the activity proof. It also keeps
+    // a publication-proof wait that reaches its deadline from being mistaken
+    // for a fresh availability deferral and immediately re-walking the tree.
+    if budget_elapsed || cancelled {
+        return ScannerCycleStatus::Incomplete;
+    }
+    // Outside an explicit stop condition, an unavailable post-scan proof must
+    // remain deferred even when other work was partial. Otherwise the ordinary
+    // incomplete path could hide the cluster-fencing failure.
     if activity_status == ScannerCycleActivityStatus::Unverified {
         return ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
     }
-    if budget_elapsed
-        || cancelled
-        || !matches!(bucket_scan_status, ScannerBucketScanStatus::Complete)
+    if !matches!(bucket_scan_status, ScannerBucketScanStatus::Complete)
         || dirty_usage_status == DirtyUsageSnapshotStatus::Unverified
     {
         return ScannerCycleStatus::Incomplete;
@@ -315,26 +320,42 @@ async fn scanner_cycle_activity_status(
     store: &ECStore,
     distributed: bool,
     before: &crate::scanner::ScannerActivitySnapshot,
+    ctx: &CancellationToken,
+    cycle: u64,
+    retain_completed_candidate: bool,
 ) -> (ScannerCycleActivityStatus, Vec<(String, String, u64)>) {
-    match crate::scanner::probe_scanner_activity(store, distributed).await {
+    let activity = if retain_completed_candidate {
+        crate::scanner::await_scanner_publication_activity(ctx, cycle, "postscan", || {
+            crate::scanner::probe_scanner_activity(store, distributed)
+        })
+        .await
+    } else {
+        crate::scanner::probe_scanner_activity(store, distributed).await
+    };
+
+    match activity {
         Ok(after) => {
             let status = if after == *before {
                 ScannerCycleActivityStatus::Unchanged
             } else {
                 ScannerCycleActivityStatus::Changed
             };
-            (status, crate::scanner::scanner_activity_publication_lease_targets(&after))
+            let lease_targets = crate::scanner::scanner_activity_publication_lease_targets(&after);
+            (status, lease_targets)
         }
         Err(err) => {
-            warn!(
-                target: "rustfs::scanner::io",
-                event = EVENT_SCANNER_SET_STATE,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_IO,
-                state = "cycle_activity_probe_failed",
-                error = %err,
-                "Scanner cycle activity verification failed"
-            );
+            if !retain_completed_candidate {
+                warn!(
+                    target: "rustfs::scanner::io",
+                    event = EVENT_SCANNER_SET_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_IO,
+                    state = "cycle_activity_probe_failed",
+                    cycle,
+                    error = %err,
+                    "Scanner cycle activity verification failed"
+                );
+            }
             (ScannerCycleActivityStatus::Unverified, Vec::new())
         }
     }

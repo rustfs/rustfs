@@ -862,6 +862,23 @@ fn unverified_activity_defers_partial_and_floor_cycles() {
     );
 }
 
+#[test]
+fn cancelled_publication_proof_preserves_budget_and_cancel_outcomes() {
+    for (budget_elapsed, cancelled) in [(true, false), (false, true)] {
+        assert_eq!(
+            classify_nsscanner_cycle(
+                true,
+                budget_elapsed,
+                cancelled,
+                ScannerBucketScanStatus::Complete,
+                DirtyUsageSnapshotStatus::Current,
+                ScannerCycleActivityStatus::Unverified,
+            ),
+            ScannerCycleStatus::Incomplete
+        );
+    }
+}
+
 #[tokio::test]
 async fn structurally_complete_superseded_cycles_publish_without_claiming_convergence() {
     let (updates, mut receiver) = mpsc::channel(2);

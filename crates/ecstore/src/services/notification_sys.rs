@@ -1483,9 +1483,20 @@ impl NotificationSys {
             futures.push(async move {
                 let client = client.ok_or_else(|| Error::other(format!("scanner activity peer[{idx}] is unreachable")))?;
                 let host = client.grid_host.clone();
-                scanner_activity_with_timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, &host, client.scanner_activity())
-                    .await
-                    .map(|activity| (host, activity))
+                let activity_client = client.clone();
+                let retry_client = client.clone();
+                scanner_activity_with_reconnect_retry(
+                    SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                    &host,
+                    move || {
+                        let client = activity_client.clone();
+                        async move { client.scanner_activity().await }
+                    },
+                    move || async move { retry_client.prepare_retry().await },
+                    PeerRestClient::is_network_like_error,
+                )
+                .await
+                .map(|activity| (host, activity))
             });
         }
 
@@ -1962,6 +1973,50 @@ where
         .map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
 }
 
+async fn scanner_activity_with_reconnect_retry<Activity, ActivityFuture, Retry, RetryFuture, Retryable>(
+    timeout_duration: Duration,
+    host: &str,
+    mut activity: Activity,
+    retry: Retry,
+    retryable: Retryable,
+) -> Result<ScannerPeerActivity>
+where
+    Activity: FnMut() -> ActivityFuture,
+    ActivityFuture: Future<Output = Result<ScannerPeerActivity>>,
+    Retry: FnOnce() -> RetryFuture,
+    RetryFuture: Future<Output = ()>,
+    Retryable: FnOnce(&Error) -> bool,
+{
+    let result = timeout(timeout_duration, async {
+        match activity().await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(first_error) => {
+                if !retryable(&first_error) {
+                    return Err(first_error);
+                }
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    state = "scanner_activity_reconnect",
+                    peer = host,
+                    error = %first_error,
+                    "notification capability probe reconnect"
+                );
+                retry().await;
+                activity().await
+            }
+        }
+    })
+    .await;
+
+    result.map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
+}
+
+pub fn scanner_peer_transport_error_message_is_retryable(error: &str) -> bool {
+    crate::cluster::rpc::client::message_has_network_needle(error)
+}
+
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 async fn call_peer_with_timeout<F, Fut>(
     timeout_dur: Duration,
@@ -2422,6 +2477,7 @@ fn aggregate_scanner_dirty_usage_acknowledgement_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn remote_version_state_fleet_proof_rejects_stale_or_mismatched_membership() {
@@ -2880,6 +2936,115 @@ mod tests {
 
         assert!(err.to_string().contains("timed out"));
         assert!(err.to_string().contains("peer-1"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_activity_reconnect_stays_within_the_original_probe_deadline() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let reconnects = Arc::new(AtomicUsize::new(0));
+        let activity_attempts = attempts.clone();
+        let retry_reconnects = reconnects.clone();
+        let started_at = tokio::time::Instant::now();
+
+        let err = scanner_activity_with_reconnect_retry(
+            Duration::from_millis(5),
+            "peer-1",
+            move || {
+                let attempt = activity_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err(Error::RemoteClientUnavailable("peer peer-1 is temporarily offline".to_string()))
+                    } else {
+                        std::future::pending::<Result<ScannerPeerActivity>>().await
+                    }
+                }
+            },
+            move || async move {
+                retry_reconnects.fetch_add(1, Ordering::SeqCst);
+            },
+            PeerRestClient::is_network_like_error,
+        )
+        .await
+        .expect_err("a stalled retry must remain inside the first attempt's deadline");
+
+        assert!(err.to_string().contains("timed out"));
+        assert!(err.to_string().contains("peer-1"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(reconnects.load(Ordering::SeqCst), 1);
+        assert_eq!(started_at.elapsed(), Duration::from_millis(5));
+    }
+
+    #[tokio::test]
+    async fn scanner_activity_probe_reconnects_once_within_the_probe_deadline() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let reconnects = Arc::new(AtomicUsize::new(0));
+        let activity_attempts = attempts.clone();
+        let retry_reconnects = reconnects.clone();
+        let expected = ScannerPeerActivity {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            namespace_generation: 1,
+            maintenance_generation: 2,
+            protocol_version: 7,
+            topology_digest: Some([3; 32]),
+            data_movement_active: Some(false),
+            dirty_usage_generation: Some(4),
+            dirty_usage_pending: Some(false),
+            movement_generation: Some(5),
+            publication_blocked: Some(false),
+        };
+        let activity_snapshot = expected.clone();
+
+        let snapshot = scanner_activity_with_reconnect_retry(
+            Duration::from_secs(1),
+            "peer-1",
+            move || {
+                let attempt = activity_attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err(Error::RemoteClientUnavailable("peer peer-1 is temporarily offline".to_string()))
+                    } else {
+                        Ok(activity_snapshot.clone())
+                    }
+                }
+            },
+            move || async move {
+                retry_reconnects.fetch_add(1, Ordering::SeqCst);
+            },
+            PeerRestClient::is_network_like_error,
+        )
+        .await
+        .expect("a quick offline failure should reconnect and retry once");
+
+        assert_eq!(snapshot, expected);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(reconnects.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn scanner_activity_probe_does_not_reconnect_for_application_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let reconnects = Arc::new(AtomicUsize::new(0));
+        let activity_attempts = attempts.clone();
+        let retry_reconnects = reconnects.clone();
+
+        let err = scanner_activity_with_reconnect_retry(
+            Duration::from_secs(1),
+            "peer-1",
+            move || {
+                activity_attempts.fetch_add(1, Ordering::SeqCst);
+                async { Err(Error::NotImplemented) }
+            },
+            move || async move {
+                retry_reconnects.fetch_add(1, Ordering::SeqCst);
+            },
+            PeerRestClient::is_network_like_error,
+        )
+        .await
+        .expect_err("an application error must remain visible without reconnecting");
+
+        assert!(matches!(err, Error::NotImplemented));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(reconnects.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -151,12 +151,18 @@ impl ScannerIOCycle for ECStore {
                     ScannerCycleResult::new(ScannerCycleStatus::Incomplete, None).with_publication_epoch(publication_epoch)
                 );
             }
-            let (activity_status, remote_publication_lease_targets) =
-                scanner_cycle_activity_status(self, distributed, &activity_before).await;
             let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
+            let retain_completed_candidate = bucket_plan_complete
+                && !budget.budget_elapsed()
+                && !ctx.is_cancelled()
+                && dirty_usage_status == DirtyUsageSnapshotStatus::Current;
+            let (activity_status, remote_publication_lease_targets) =
+                scanner_cycle_activity_status(self, distributed, &activity_before, &ctx, want_cycle, retain_completed_candidate)
+                    .await;
+            let budget_elapsed = budget.budget_elapsed();
             let status = classify_nsscanner_cycle(
                 true,
-                false,
+                budget_elapsed,
                 ctx.is_cancelled(),
                 ScannerBucketScanStatus::Complete,
                 dirty_usage_status,
@@ -402,8 +408,6 @@ impl ScannerIOCycle for ECStore {
         let budget_elapsed = budget.budget_elapsed();
         let dirty_usage_status = dirty_usage_snapshot_status(&dirty_usage_snapshot);
         let dirty_usage_current = dirty_usage_status == DirtyUsageSnapshotStatus::Current;
-        let (activity_status, remote_publication_lease_targets) =
-            scanner_cycle_activity_status(self, distributed, &activity_before).await;
         let all_bucket_names = all_buckets.iter().map(|bucket| bucket.name.clone()).collect::<Vec<_>>();
         let completed_usage = completed_data_usage_info(
             &results,
@@ -429,6 +433,15 @@ impl ScannerIOCycle for ECStore {
             })
             .flatten();
         let structurally_complete_snapshot = result.is_ok() && completed_all_sets && completed_usage.is_some();
+        let retain_completed_candidate = structurally_complete_snapshot
+            && !budget_elapsed
+            && !ctx.is_cancelled()
+            && bucket_scan_status == ScannerBucketScanStatus::Complete
+            && dirty_usage_status == DirtyUsageSnapshotStatus::Current;
+        let (activity_status, remote_publication_lease_targets) =
+            scanner_cycle_activity_status(self, distributed, &activity_before, &ctx, want_cycle, retain_completed_candidate)
+                .await;
+        let budget_elapsed = budget.budget_elapsed();
         let cycle_status = classify_nsscanner_cycle(
             structurally_complete_snapshot,
             budget_elapsed,

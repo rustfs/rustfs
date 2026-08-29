@@ -108,6 +108,146 @@ impl ScannerRetryBackoff {
     }
 }
 
+pub(crate) fn scanner_publication_proof_retry_delay(consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(31);
+    let multiplier = 1u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    SCANNER_RETRY_BASE_INTERVAL
+        .saturating_mul(multiplier)
+        .min(SCANNER_PUBLICATION_PROOF_RETRY_MAX_INTERVAL)
+}
+
+pub(crate) fn scanner_publication_activity_error_is_retryable(error: &str) -> bool {
+    crate::storage_api::scanner_peer_transport_error_message_is_retryable(error)
+}
+
+pub(crate) fn scanner_publication_lease_error_is_retryable(error: &str) -> bool {
+    scanner_publication_activity_error_is_retryable(error)
+        || error.ends_with("scanner publication lease capacity is exhausted")
+        || error.ends_with("scanner publication lease response arrived after its safety window")
+}
+
+pub(crate) enum ScannerPublicationProofWait<T, E> {
+    Ready(T),
+    Rejected(E),
+    Cancelled,
+}
+
+pub(crate) async fn await_scanner_publication_proof<T, E, F, Fut, Retryable>(
+    ctx: &CancellationToken,
+    cycle: u64,
+    stage: &'static str,
+    mut proof: F,
+    retryable: Retryable,
+) -> ScannerPublicationProofWait<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+    Retryable: Fn(&E) -> bool,
+{
+    let started_at = Instant::now();
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        if ctx.is_cancelled() {
+            return ScannerPublicationProofWait::Cancelled;
+        }
+
+        match proof().await {
+            Ok(value) => {
+                if consecutive_failures > 0 {
+                    info!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_CYCLE_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        state = "publication_proof_recovered",
+                        cycle,
+                        stage,
+                        attempts = consecutive_failures.saturating_add(1),
+                        pending_duration = ?started_at.elapsed(),
+                        "Scanner publication proof recovered"
+                    );
+                }
+                return ScannerPublicationProofWait::Ready(value);
+            }
+            Err(err) if !retryable(&err) => {
+                warn!(
+                    target: "rustfs::scanner",
+                    event = EVENT_SCANNER_CYCLE_STATE,
+                    component = LOG_COMPONENT_SCANNER,
+                    subsystem = LOG_SUBSYSTEM_RUNTIME,
+                    state = "publication_proof_rejected",
+                    cycle,
+                    stage,
+                    error = %err,
+                    "Scanner publication proof failed with a non-retryable cluster state"
+                );
+                return ScannerPublicationProofWait::Rejected(err);
+            }
+            Err(err) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let retry_delay = scanner_publication_proof_retry_delay(consecutive_failures);
+                if consecutive_failures == 1 || consecutive_failures.is_multiple_of(20) {
+                    warn!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_CYCLE_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        state = "publication_proof_pending",
+                        cycle,
+                        stage,
+                        attempt = consecutive_failures,
+                        retry_delay = ?retry_delay,
+                        error = %err,
+                        "Scanner retained a completed scan while publication proof is unavailable"
+                    );
+                } else {
+                    debug!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_CYCLE_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        state = "publication_proof_retry",
+                        cycle,
+                        stage,
+                        attempt = consecutive_failures,
+                        retry_delay = ?retry_delay,
+                        error = %err,
+                        "Scanner publication activity proof retry scheduled"
+                    );
+                }
+
+                tokio::select! {
+                    _ = ctx.cancelled() => return ScannerPublicationProofWait::Cancelled,
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+            }
+        }
+    }
+}
+
+pub(crate) async fn await_scanner_publication_activity<F, Fut>(
+    ctx: &CancellationToken,
+    cycle: u64,
+    stage: &'static str,
+    probe: F,
+) -> Result<ScannerActivitySnapshot, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<ScannerActivitySnapshot, String>>,
+{
+    match await_scanner_publication_proof(ctx, cycle, stage, probe, |err: &String| {
+        scanner_publication_activity_error_is_retryable(err)
+    })
+    .await
+    {
+        ScannerPublicationProofWait::Ready(snapshot) => Ok(snapshot),
+        ScannerPublicationProofWait::Rejected(err) => Err(err),
+        ScannerPublicationProofWait::Cancelled => Err(format!("scanner publication activity proof was cancelled during {stage}")),
+    }
+}
+
 impl Default for ScannerCleanIdleBackoff {
     fn default() -> Self {
         Self { interval_multiplier: 1 }
