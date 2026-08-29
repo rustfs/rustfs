@@ -1970,7 +1970,11 @@ where
 {
     timeout(timeout_duration, activity)
         .await
-        .map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
+        .map_err(|_| scanner_activity_timeout_error(host, timeout_duration))?
+}
+
+fn scanner_activity_timeout_error(host: &str, timeout_duration: Duration) -> Error {
+    Error::RemoteClientUnavailable(format!("scanner activity peer {host} timed out after {timeout_duration:?}"))
 }
 
 async fn scanner_activity_with_reconnect_retry<Activity, ActivityFuture, Retry, RetryFuture, Retryable>(
@@ -2010,7 +2014,7 @@ where
     })
     .await;
 
-    result.map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
+    result.map_err(|_| scanner_activity_timeout_error(host, timeout_duration))?
 }
 
 pub fn scanner_peer_transport_error_message_is_retryable(error: &str) -> bool {
@@ -2934,6 +2938,7 @@ mod tests {
         .await
         .expect_err("a stalled peer must not block scanner scheduling");
 
+        assert!(matches!(err, Error::RemoteClientUnavailable(_)));
         assert!(err.to_string().contains("timed out"));
         assert!(err.to_string().contains("peer-1"));
     }
@@ -2967,6 +2972,7 @@ mod tests {
         .await
         .expect_err("a stalled retry must remain inside the first attempt's deadline");
 
+        assert!(matches!(err, Error::RemoteClientUnavailable(_)));
         assert!(err.to_string().contains("timed out"));
         assert!(err.to_string().contains("peer-1"));
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
