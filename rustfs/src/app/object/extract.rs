@@ -656,7 +656,7 @@ impl DefaultObjectUsecase {
                 req_info.object = Some(fpath.clone());
                 req_info.version_id = None;
             }
-            let entry_size = f.header().size().unwrap_or_default();
+            let entry_size = f.effective_size();
             validate_put_object_extract_entry_size(&fpath, entry_size, extract_limits)?;
             total_unpacked_size = total_unpacked_size
                 .checked_add(entry_size)

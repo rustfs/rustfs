@@ -2273,6 +2273,7 @@ mod tests {
         let s3_config = rustfs_s3_config();
 
         assert!(s3_config.normalize_forward_slash_path);
+        assert!(s3_config.normalize_content_length);
         assert!(s3_config.enable_sig_v2);
         assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "s3"));
         assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "sts"));
