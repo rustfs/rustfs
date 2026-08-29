@@ -36,7 +36,7 @@ permissions:
 # Only one test at a time: both this and the pool-expansion workflow mutate
 # the same test environment, so they share one concurrency group.
 concurrency:
-  group: rustfs-pool-expansion-test
+  group: rustfs-shared-functional-tests
   cancel-in-progress: false
 
 defaults:

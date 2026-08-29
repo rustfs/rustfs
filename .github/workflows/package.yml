@@ -224,7 +224,7 @@ jobs:
           ZIP_FILE=$(find ./binary-artifact -name "*.zip" -type f | head -1)
           if [[ -z "$ZIP_FILE" ]]; then
             echo "❌ No binary artifact found"
-            ls -la ./binary-artifact/ || true
+            find ./binary-artifact -mindepth 1 -maxdepth 1 -print 2>/dev/null || true
             exit 1
           fi
 
@@ -239,7 +239,7 @@ jobs:
           fi
 
           chmod +x ./bin/rustfs
-          ls -lh ./bin/rustfs
+          stat --printf='%n %s bytes\n' ./bin/rustfs
           echo "✅ Binary extracted"
 
       - name: Build DEB package
@@ -336,7 +336,7 @@ jobs:
           fakeroot dpkg-deb --build "${PKG_DIR}"
 
           DEB_FILE="${PKG_DIR}.deb"
-          ls -lh "$DEB_FILE"
+          stat --printf='%n %s bytes\n' "$DEB_FILE"
           echo "deb_file=$DEB_FILE" >> "$GITHUB_OUTPUT"
           echo "✅ DEB built: $DEB_FILE"
 
@@ -410,13 +410,14 @@ jobs:
             LICENSE=/usr/share/doc/rustfs/LICENSE \
             README.md=/usr/share/doc/rustfs/README.md
 
-          RPM_FILE=$(ls -1 rustfs-*.rpm 2>/dev/null | head -1)
+            RPM_FILE=$(find . -maxdepth 1 -type f -name 'rustfs-*.rpm' -print | head -1)
+            RPM_FILE="${RPM_FILE#./}"
           if [[ -z "$RPM_FILE" ]]; then
             echo "❌ RPM build failed"
             exit 1
           fi
 
-          ls -lh "$RPM_FILE"
+          stat --printf='%n %s bytes\n' "$RPM_FILE"
           echo "rpm_file=$RPM_FILE" >> "$GITHUB_OUTPUT"
           echo "✅ RPM built: $RPM_FILE"
 
@@ -552,11 +553,13 @@ jobs:
       - name: Print summary
         shell: bash
         run: |
-          echo "## 📦 Package Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Version | \`${{ needs.resolve.outputs.version }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Build Type | ${{ needs.resolve.outputs.build_type }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Build Run | #${{ needs.resolve.outputs.build_run_id }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Package Status | ${{ needs.package.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## 📦 Package Summary"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Version | \`${{ needs.resolve.outputs.version }}\` |"
+            echo "| Build Type | ${{ needs.resolve.outputs.build_type }} |"
+            echo "| Build Run | #${{ needs.resolve.outputs.build_run_id }} |"
+            echo "| Package Status | ${{ needs.package.result }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,4 +1,4 @@
-name: RustFS Functional Test Suite (S3/KMS/tier/pool/heal)
+name: RustFS Pool Expansion / Heal Test
 
 on:
   workflow_dispatch:
@@ -46,7 +46,7 @@ on:
         type: boolean
         default: true
   workflow_run:
-    # Run after the nightly build completes: S3 -> KMS -> tier -> pool -> heal.
+    # Run after the nightly build completes: pool expansion -> heal.
     workflows: ["Nightly GNU Build"]
     types: [completed]
 
@@ -57,7 +57,7 @@ permissions:
 # environment (vm000/vm001/vm002), so concurrent runs must not clobber each
 # other. Jobs inside a run are chained with needs to serialize them.
 concurrency:
-  group: rustfs-pool-expansion-test
+  group: rustfs-shared-functional-tests
   cancel-in-progress: false
 
 defaults:
@@ -75,181 +75,11 @@ env:
   RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
 
 jobs:
-  # All test scripts live in rustfs/auto-testing; rustfs stores only this
-  # workflow. Each job checks out auto-testing before running.
-
-  s3-compat-test:
-    name: S3 compatibility test
-    runs-on: smoke-testing
-    timeout-minutes: 240
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    steps:
-      - name: Checkout auto-testing scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: rustfs/auto-testing
-          ref: main
-          path: auto-testing
-          persist-credentials: false
-          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
-
-      - name: Run S3 compatibility suite
-        run: |
-          chmod +x auto-testing/rustfs-s3-compat-test.sh
-          ARGS=(--all-topologies -y --log-file /tmp/rustfs-s3-compat.log)
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          elif [ -n "${{ inputs.rustfs_version }}" ]; then
-            ARGS+=(--version "${{ inputs.rustfs_version }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs-s3-compat-test.sh "${ARGS[@]}"
-
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: rustfs-s3-compat-${{ github.run_id }}
-          path: |
-            /tmp/rustfs-s3-compat*.log
-          if-no-files-found: warn
-
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "RustFS S3 compatibility suite failed"
-          echo "See the uploaded log artifact for details."
-
-  kms-test:
-    name: KMS test (after S3)
-    runs-on: smoke-testing
-    timeout-minutes: 360
-    needs: s3-compat-test
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
-    steps:
-      - name: Checkout auto-testing scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: rustfs/auto-testing
-          ref: main
-          path: auto-testing
-          persist-credentials: false
-          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
-
-      - name: Ensure docker (Vault container)
-        run: |
-          if ! command -v docker >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y docker.io
-          fi
-          sudo systemctl enable --now docker
-          docker info >/dev/null 2>&1 || sudo docker info >/dev/null 2>&1
-
-      - name: Run KMS suite
-        run: |
-          chmod +x auto-testing/rustfs-kms-test.sh
-          ARGS=(--all-topologies --backends local,vault-kv2 -y --log-file /tmp/rustfs-kms.log)
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          elif [ -n "${{ inputs.rustfs_version }}" ]; then
-            ARGS+=(--version "${{ inputs.rustfs_version }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs-kms-test.sh "${ARGS[@]}"
-
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: rustfs-kms-test-${{ github.run_id }}
-          path: |
-            /tmp/rustfs-kms*.log
-          if-no-files-found: warn
-
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "RustFS KMS suite failed"
-          echo "See the uploaded log artifact for details."
-
-  tier-test:
-    name: Tier / event / audit test (after KMS)
-    runs-on: smoke-testing
-    timeout-minutes: 360
-    needs: kms-test
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
-    steps:
-      - name: Checkout auto-testing scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: rustfs/auto-testing
-          ref: main
-          path: auto-testing
-          persist-credentials: false
-          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
-
-      - name: Ensure MQTT broker + clients (event notification tests)
-        run: |
-          if ! command -v mosquitto_sub >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y mosquitto mosquitto-clients
-          fi
-          # Make restart deterministic on shared runners: stop any previous
-          # mosquitto instance/process and drop stale config first.
-          sudo systemctl stop mosquitto 2>/dev/null || true
-          sudo pkill -f mosquitto 2>/dev/null || true
-          sleep 1
-          sudo rm -f /etc/mosquitto/conf.d/rustfs-test.conf
-          sudo mkdir -p /etc/mosquitto/conf.d
-          printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/rustfs-test.conf >/dev/null
-          sudo systemctl reset-failed mosquitto 2>/dev/null || true
-          sudo systemctl start mosquitto
-          sleep 2
-          if ! ss -tln 2>/dev/null | grep -q ':1883'; then
-            echo "=== mosquitto status ==="
-            sudo systemctl status mosquitto --no-pager | head -20 || true
-            echo "=== mosquitto journal ==="
-            sudo journalctl -u mosquitto -n 30 --no-pager || true
-            echo "mosquitto not listening on 1883"
-            exit 1
-          fi
-
-      - name: Run tier / event / audit suite
-        run: |
-          chmod +x auto-testing/rustfs-tier-test.sh
-          ARGS=(--all-topologies -y --log-file /tmp/rustfs-tier.log)
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          elif [ -n "${{ inputs.rustfs_version }}" ]; then
-            ARGS+=(--version "${{ inputs.rustfs_version }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs-tier-test.sh "${ARGS[@]}"
-
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: rustfs-tier-test-${{ github.run_id }}
-          path: |
-            /tmp/rustfs-tier*.log
-          if-no-files-found: warn
-
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "RustFS tier/event/audit suite failed"
-          echo "See the uploaded log artifact for details."
-
   pool-expansion-test:
-    name: Pool expansion / decommission test (after tier)
+    name: Pool expansion / decommission test
     runs-on: smoke-testing
     timeout-minutes: 360
-    needs: tier-test
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -391,7 +221,7 @@ jobs:
 
       - name: Run heal test (write -> outage -> heal -> verify)
         run: |
-          ARGS=(--steps 3,4,5,6,7 -y \
+          ARGS=(--steps "3,4,5,6,7" -y \
             --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
             --stop-node-gb "${{ inputs.stop_node_gb || '15' }}" \
             --warp-stop-gb "${{ inputs.warp_stop_gb || '40' }}" \
