@@ -92,7 +92,9 @@ pub(crate) use rustfs_ecstore::api::event::{EventArgs as EcstoreEventArgs, send_
 pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
 };
-pub(crate) use rustfs_ecstore::api::object::SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY;
+pub(crate) use rustfs_ecstore::api::object::{
+    SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitState,
+};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::rebalance::{
     RebalStatus as EcstoreRebalStatus, RebalanceInfo as EcstoreRebalanceInfo, RebalanceMeta as EcstoreRebalanceMeta,
@@ -106,9 +108,9 @@ pub(crate) use rustfs_ecstore::api::runtime::{
     setup_is_erasure_sd as ecstore_is_erasure_sd,
 };
 pub(crate) use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
+pub(crate) use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::storage::init_local_disks_with_instance_ctx as ecstore_init_local_disks_with_instance_ctx;
-pub(crate) use rustfs_ecstore::api::storage::{ECStore as EcstoreStore, SCANNER_PUBLICATION_LEASE_TTL_MS};
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
@@ -125,7 +127,7 @@ pub(crate) mod owner {
         EcstoreNsScannerOpenRequest, EcstoreObjectLockConfiguration, EcstoreObjectOpts, EcstoreReplicationConfigurationExt,
         EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
         EcstoreVersioningApi, EcstoreVersioningConfiguration, SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY,
-        SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerReplicationHealObject, ScannerReplicationHealResult,
+        ScannerPublicationCommitScope, ScannerPublicationCommitState, ScannerReplicationHealObject, ScannerReplicationHealResult,
         ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_expiry_state_handle,
         ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config, ecstore_get_object_lock_config,
         ecstore_get_replication_config, ecstore_invalidate_admin_data_usage_snapshot_cache,

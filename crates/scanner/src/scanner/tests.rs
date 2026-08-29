@@ -352,6 +352,7 @@ struct MemoryConfigStore {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     revisions: Mutex<HashMap<String, u64>>,
     insert_after_gets: Mutex<HashMap<String, Vec<u8>>>,
+    delayed_gets: Mutex<HashMap<String, Duration>>,
     non_regular_objects: Mutex<HashSet<String>>,
     fail_put_number: Mutex<HashMap<String, usize>>,
     object_not_found_put_number: Mutex<HashMap<String, usize>>,
@@ -399,6 +400,9 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         _opts: &ObjectOptions,
     ) -> EcstoreResult<GetObjectReader> {
         let key = memory_config_key(bucket, object);
+        if let Some(delay) = self.delayed_gets.lock().await.remove(&key) {
+            tokio::time::sleep(delay).await;
+        }
         let inserted_data = self.insert_after_gets.lock().await.remove(&key);
         let data = {
             let mut objects = self.objects.lock().await;
@@ -3533,6 +3537,47 @@ async fn coordinator_classifies_an_expired_publication_lease() {
 }
 
 #[tokio::test]
+async fn backup_sync_checks_the_lease_deadline_after_a_slow_backup_read() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_path = DATA_USAGE_OBJ_NAME_PATH.as_str();
+    let backup_path = format!("{primary_path}.bkp");
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, primary_path);
+    let backup_key = memory_config_key(RUSTFS_META_BUCKET, &backup_path);
+    let primary = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    store
+        .objects
+        .lock()
+        .await
+        .insert(primary_key, serde_json::to_vec(&primary).expect("primary usage snapshot should encode"));
+    store
+        .delayed_gets
+        .lock()
+        .await
+        .insert(backup_key.clone(), Duration::from_millis(20));
+
+    // The primary read is allowed to start, but the backup read consumes the
+    // remaining lease window. The second deadline check must prevent a stale
+    // backup PUT after that window has elapsed.
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_millis(5))
+        .expect("test deadline should support a five-millisecond window");
+    let result = sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
+        &CancellationToken::new(),
+        store.clone(),
+        None,
+        Some(deadline),
+        None,
+    )
+    .await;
+
+    assert!(scanner_publication_epoch_changed(
+        &result.expect_err("an expired backup lease must defer publication")
+    ));
+    assert!(!store.objects.lock().await.contains_key(&backup_key));
+    assert_eq!(store.put_counts.lock().await.get(&backup_key), None);
+}
+
+#[tokio::test]
 #[serial]
 async fn test_deferred_usage_save_keeps_last_real_save_metric() {
     let metrics = global_metrics();
@@ -4583,7 +4628,6 @@ fn scanner_cycle_cache_floor_stays_pending_during_deferred_usage_publication() {
     for reason in [
         ScannerCycleDeferReason::DataMovement,
         ScannerCycleDeferReason::ActivityBaselineUnavailable,
-        ScannerCycleDeferReason::PublicationLeaseBudgetExceeded,
         ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded,
         ScannerCycleDeferReason::PublicationLeaseReleaseFailed,
     ] {
@@ -4755,29 +4799,6 @@ fn data_usage_persist_wait_covers_cache_retries_and_backup() {
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
 
-#[test]
-fn scanner_publication_lease_budget_has_a_strict_ttl_boundary() {
-    let ttl = Duration::from_millis(SCANNER_PUBLICATION_LEASE_TTL_MS);
-
-    assert!(scanner_publication_lease_budget_allows_persistence(
-        ttl.saturating_sub(Duration::from_millis(1))
-    ));
-    assert!(!scanner_publication_lease_budget_allows_persistence(ttl));
-    assert!(!scanner_publication_lease_budget_allows_persistence(ttl + Duration::from_millis(1)));
-    assert_eq!(
-        ScannerCycleDeferReason::PublicationLeaseBudgetExceeded.as_str(),
-        "publication_lease_budget_exceeded"
-    );
-    assert_eq!(
-        ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded.as_str(),
-        "publication_lease_deadline_exceeded"
-    );
-    assert_eq!(
-        ScannerCycleDeferReason::PublicationLeaseReleaseFailed.as_str(),
-        "publication_lease_release_failed"
-    );
-}
-
 #[tokio::test]
 async fn data_usage_persist_wait_aborts_when_scanner_is_cancelled() {
     let ctx = CancellationToken::new();
@@ -4805,6 +4826,29 @@ async fn data_usage_persist_wait_aborts_after_timeout() {
 
     assert!(matches!(result, DataUsagePersistTaskResult::TimedOut));
     assert!(task.is_finished());
+}
+
+#[tokio::test(start_paused = true)]
+async fn data_usage_persist_timeout_drops_owned_task_without_a_late_commit() {
+    let ctx = CancellationToken::new();
+    let commit_started = Arc::new(AtomicBool::new(false));
+    let commit_started_by_task = commit_started.clone();
+    let task_ready = Arc::new(tokio::sync::Notify::new());
+    let task_ready_by_task = task_ready.clone();
+    let mut task = AbortOnDropHandle::new(tokio::spawn(async move {
+        task_ready_by_task.notify_one();
+        std::future::pending::<()>().await;
+        commit_started_by_task.store(true, Ordering::Release);
+        DataUsagePersistOutcome::Saved
+    }));
+    task_ready.notified().await;
+
+    let result = wait_for_data_usage_persist_task(&ctx, &mut task, Duration::from_secs(1)).await;
+
+    assert!(matches!(result, DataUsagePersistTaskResult::TimedOut));
+    assert!(task.is_finished(), "the timed-out persistence task must be drained before return");
+    tokio::task::yield_now().await;
+    assert!(!commit_started.load(Ordering::Acquire), "an owned task must not commit after its timeout");
 }
 
 #[tokio::test(start_paused = true)]
