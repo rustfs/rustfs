@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::compress_index::{Index, TryGetIndex};
-use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
+use crate::{BadDigest, EtagResolvable, HashReaderDetector, HashReaderMut};
 use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
 use std::pin::Pin;
@@ -89,7 +89,13 @@ where
                     && *checksum != etag
                 {
                     error!("Checksum mismatch, expected={:?}, actual={:?}", checksum, etag);
-                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Checksum mismatch")));
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        BadDigest {
+                            expected_md5: checksum.clone(),
+                            calculated_md5: etag,
+                        },
+                    )));
                 }
             }
         }
@@ -255,6 +261,7 @@ mod tests {
     async fn test_etag_reader_checksum_mismatch() {
         let data = b"checksum test data";
         let wrong_checksum = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        let calculated_md5 = hex_simd::encode_to_string(Md5::digest(data), hex_simd::AsciiCase::Lower);
         let reader = BufReader::new(&data[..]);
         let mut etag_reader = EtagReader::new(reader, Some(wrong_checksum.clone()));
 
@@ -262,5 +269,11 @@ mod tests {
         // Verification failed, should return InvalidData error
         let err = etag_reader.read_to_end(&mut buf).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let digest = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<BadDigest>())
+            .expect("checksum mismatch should preserve the BadDigest type");
+        assert_eq!(digest.expected_md5, wrong_checksum);
+        assert_eq!(digest.calculated_md5, calculated_md5);
     }
 }
