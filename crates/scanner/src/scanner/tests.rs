@@ -1924,6 +1924,116 @@ async fn scanner_startup_uses_primary_and_backup_usage_floor() {
 }
 
 #[tokio::test]
+async fn scanner_usage_floor_recovers_from_incomplete_v2_primary_using_fenced_backup() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+
+    // This shape is valid JSON from an interrupted v2 publication, but it is
+    // not a durable baseline because the snapshot is incomplete. It must not
+    // be converted into an empty floor.
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    backup.scanner_epoch = Some(7);
+    backup.scanner_cycle = Some(103);
+
+    for (path, usage) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), primary), (backup_path.as_str(), backup)] {
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, path),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
+        );
+    }
+
+    assert_eq!(
+        persisted_usage_floor(store)
+            .await
+            .expect("valid backup should recover the usage floor"),
+        PersistedUsageFloor {
+            next_cycle: 104,
+            leader_epoch: 7,
+        }
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_does_not_bootstrap_over_incomplete_v2_primary() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&primary).expect("usage snapshot should encode"),
+    );
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("an existing incomplete primary must remain fail-closed");
+    assert!(err.to_string().contains("no authoritative baseline"));
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_rejects_backup_older_than_incomplete_v2_primary() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    backup.scanner_epoch = Some(6);
+    backup.scanner_cycle = Some(10_000);
+
+    for (path, usage) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), primary), (backup_path.as_str(), backup)] {
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, path),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
+        );
+    }
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("an older backup must not cross the incomplete primary epoch fence");
+    assert!(err.to_string().contains("no authoritative baseline"));
+}
+
+#[tokio::test]
+async fn scanner_leadership_fencing_recovers_incomplete_v2_primary_from_backup() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let primary = serde_json::to_vec(&DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    })
+    .expect("incomplete usage snapshot should encode");
+    let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    backup.scanner_epoch = Some(7);
+    backup.scanner_cycle = Some(103);
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, &backup_path),
+        serde_json::to_vec(&backup).expect("backup usage snapshot should encode"),
+    );
+
+    let recovered = usage_snapshot_for_epoch_fence(store, Some(&primary), false)
+        .await
+        .expect("a valid backup should provide the fencing baseline")
+        .expect("the fencing baseline should be present");
+    assert_eq!(recovered.scanner_epoch, Some(7));
+    assert_eq!(recovered.scanner_cycle, Some(103));
+}
+
+#[tokio::test]
 async fn scanner_usage_floor_ignores_older_backup_after_primary_epoch_fence() {
     let store = Arc::new(MemoryConfigStore::default());
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
