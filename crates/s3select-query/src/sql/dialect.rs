@@ -185,6 +185,13 @@ mod tests {
     }
 
     #[test]
+    fn test_supports_partiql_paths() {
+        let dialect = RustFsDialect;
+
+        assert!(dialect.supports_partiql(), "RustFsDialect should support JSON source paths");
+    }
+
+    #[test]
     fn test_identifier_validation_comprehensive() {
         let dialect = RustFsDialect;
 
