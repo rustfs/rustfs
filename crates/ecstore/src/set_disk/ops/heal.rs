@@ -34,9 +34,76 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
 const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
 const HEAL_RENAME_INCOMPLETE: &str = "heal rename incomplete";
+const READ_REPAIR_DATA_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 #[cfg(test)]
 static HEAL_RENAME_FAILURES: std::sync::Mutex<Vec<(String, String, usize)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct ReadRepairCommitPause {
+    bucket: String,
+    object: String,
+    arrived: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static READ_REPAIR_COMMIT_PAUSES: std::sync::Mutex<Vec<ReadRepairCommitPause>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+struct ReadRepairCommitPauseScope {
+    bucket: String,
+    object: String,
+}
+
+#[cfg(test)]
+impl ReadRepairCommitPauseScope {
+    fn install(bucket: &str, object: &str) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        READ_REPAIR_COMMIT_PAUSES
+            .lock()
+            .expect("read-repair commit pause registry should not poison")
+            .push(ReadRepairCommitPause {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                arrived: arrived.clone(),
+                release: release.clone(),
+            });
+        (
+            Self {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+            },
+            arrived,
+            release,
+        )
+    }
+}
+
+#[cfg(test)]
+impl Drop for ReadRepairCommitPauseScope {
+    fn drop(&mut self) {
+        READ_REPAIR_COMMIT_PAUSES
+            .lock()
+            .expect("read-repair commit pause registry should not poison")
+            .retain(|pause| pause.bucket != self.bucket || pause.object != self.object);
+    }
+}
+
+#[cfg(test)]
+async fn pause_read_repair_before_commit(bucket: &str, object: &str) {
+    let pause = READ_REPAIR_COMMIT_PAUSES
+        .lock()
+        .expect("read-repair commit pause registry should not poison")
+        .iter()
+        .find(|pause| pause.bucket == bucket && pause.object == object)
+        .map(|pause| (pause.arrived.clone(), pause.release.clone()));
+    if let Some((arrived, release)) = pause {
+        arrived.notify_one();
+        release.notified().await;
+    }
+}
 
 #[cfg(test)]
 struct HealRenameFailureScope {
@@ -175,6 +242,34 @@ struct RecoverableMetaCandidate {
     file_info: FileInfo,
     data_count: usize,
     local_payload: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct ReadRepairCommitFingerprint {
+    identity: [u8; 32],
+}
+
+impl ReadRepairCommitFingerprint {
+    fn from_file_info(fi: &FileInfo) -> Self {
+        Self {
+            identity: SetDisks::file_info_quorum_hash(fi),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HealObjectLockKind {
+    Read,
+    Write,
+}
+
+impl HealObjectLockKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -449,6 +544,107 @@ impl SetDisks {
         Box::pin(self.heal_object_with_explicit_version_regen(bucket, object, version_id, opts, true)).await
     }
 
+    async fn read_repair_commit_fingerprint(
+        &self,
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+    ) -> disk::error::Result<ReadRepairCommitFingerprint> {
+        let (parts_metadata, errs, _) = Self::read_all_fileinfo_observed(
+            disks,
+            "",
+            bucket,
+            object,
+            version_id,
+            true,
+            false,
+            false,
+            true,
+            self.default_parity_count,
+        )
+        .await?;
+        let (read_quorum, _) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)?;
+        let read_quorum = usize::try_from(read_quorum).map_err(|_| DiskError::ErasureReadQuorum)?;
+        let (_, quorum_mod_time, quorum_etag) = Self::list_online_disks(disks, &parts_metadata, &errs, read_quorum);
+        let mut latest_meta = Self::pick_valid_fileinfo(&parts_metadata, quorum_mod_time, quorum_etag, read_quorum)?;
+        Self::hydrate_selected_fileinfo_part_checksums(&mut latest_meta)?;
+        Ok(ReadRepairCommitFingerprint::from_file_info(&latest_meta))
+    }
+
+    async fn acquire_heal_object_lock(
+        &self,
+        bucket: &str,
+        object: &str,
+        kind: HealObjectLockKind,
+    ) -> disk::error::Result<rustfs_lock::NamespaceLockGuard> {
+        let ns_lock = self
+            .new_ns_lock(bucket, object)
+            .await
+            .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
+        let lock_result = match kind {
+            HealObjectLockKind::Read => ns_lock.get_read_lock(get_lock_acquire_timeout()).await,
+            HealObjectLockKind::Write => ns_lock.get_write_lock(get_lock_acquire_timeout()).await,
+        };
+        lock_result.map_err(|e| {
+            self.map_namespace_lock_error(bucket, object, kind.as_str(), e)
+                .narrow_to_disk()
+                .unwrap_or_else(DiskError::other)
+        })
+    }
+
+    async fn acquire_revalidated_read_repair_commit_lock(
+        &self,
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        expected_fingerprint: ReadRepairCommitFingerprint,
+    ) -> disk::error::Result<Option<rustfs_lock::NamespaceLockGuard>> {
+        #[cfg(test)]
+        pause_read_repair_before_commit(bucket, object).await;
+
+        let write_lock_wait_start = std::time::Instant::now();
+        let guard = self
+            .acquire_heal_object_lock(bucket, object, HealObjectLockKind::Write)
+            .await?;
+        let write_lock_wait_ms = u64::try_from(write_lock_wait_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        let revalidation_start = std::time::Instant::now();
+        let current_fingerprint = self.read_repair_commit_fingerprint(disks, bucket, object, version_id).await?;
+        let revalidation_duration_ms = u64::try_from(revalidation_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        if current_fingerprint == expected_fingerprint {
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state = "read_repair_commit_revalidated",
+                bucket,
+                object,
+                version_id,
+                write_lock_wait_ms,
+                revalidation_duration_ms,
+                "Read-repair heal revalidated metadata before rename"
+            );
+            Ok(Some(guard))
+        } else {
+            warn!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state = "read_repair_commit_stale",
+                bucket,
+                object,
+                version_id,
+                write_lock_wait_ms,
+                revalidation_duration_ms,
+                "Read-repair heal abandoned stale metadata before rename"
+            );
+            Ok(None)
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn heal_object_with_explicit_version_regen(
         &self,
@@ -480,18 +676,36 @@ impl SetDisks {
             ..Default::default()
         };
 
+        let read_repair_uses_shared_lock = opts.read_repair && !opts.no_lock;
+        // Read-repair heals are triggered by successful reads of still-readable
+        // objects. Keep readers flowing during the long reconstruction phase;
+        // take the write lock only for the final verify-and-rename fence.
+        let mut _read_repair_read_lock_guard = if read_repair_uses_shared_lock {
+            let guard = self
+                .acquire_heal_object_lock(bucket, object, HealObjectLockKind::Read)
+                .await?;
+            debug!(
+                event = EVENT_SET_DISK_HEAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                state = "read_repair_shared_data_lock",
+                bucket,
+                object,
+                version_id,
+                "Read-repair heal using shared namespace lock for data phase"
+            );
+            Some(guard)
+        } else {
+            None
+        };
+
         // Bound, not `_`: this guard must live to the end of the scope. A bare
         // `_` would drop it here and release the namespace write lock.
-        let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self
-                .new_ns_lock(bucket, object)
-                .await
-                .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
-            Some(ns_lock.get_write_lock(get_lock_acquire_timeout()).await.map_err(|e| {
-                self.map_namespace_lock_error(bucket, object, "write", e)
-                    .narrow_to_disk()
-                    .unwrap_or_else(DiskError::other)
-            })?)
+        let _write_lock_guard = if !opts.no_lock && !read_repair_uses_shared_lock {
+            Some(
+                self.acquire_heal_object_lock(bucket, object, HealObjectLockKind::Write)
+                    .await?,
+            )
         } else {
             None
         };
@@ -791,6 +1005,10 @@ impl SetDisks {
                                 );
                             }
 
+                            if read_repair_uses_shared_lock {
+                                return Ok((result, Some(cannot_heal_err)));
+                            }
+
                             // `disks_with_all_parts` normalizes conflicting entries
                             // in `parts_metadata` to defaults. Re-read only before
                             // destructive cleanup so the guard sees every original
@@ -952,6 +1170,9 @@ impl SetDisks {
                         // For a regular object a missing data_dir means the latest metadata is
                         // corrupt; fail this object's heal with a clear error instead of building
                         // part paths under a nil UUID directory.
+                        let read_repair_commit_fingerprint =
+                            read_repair_uses_shared_lock.then(|| ReadRepairCommitFingerprint::from_file_info(&latest_meta));
+
                         let data_dir = match latest_meta.data_dir {
                             Some(data_dir) => data_dir,
                             None => {
@@ -1111,7 +1332,16 @@ impl SetDisks {
                                     );
                                     writer_failure_warned = true;
                                 }
-                                if let Err(e) = erasure.heal(&mut writers, readers, part.size, &prefer).await {
+                                let heal_part = erasure.heal(&mut writers, readers, part.size, &prefer);
+                                let heal_part_result = if read_repair_uses_shared_lock {
+                                    match tokio::time::timeout(READ_REPAIR_DATA_PHASE_TIMEOUT, heal_part).await {
+                                        Ok(result) => result,
+                                        Err(_) => Err(DiskError::Timeout),
+                                    }
+                                } else {
+                                    heal_part.await
+                                };
+                                if let Err(e) = heal_part_result {
                                     // Don't leak the partially-written healed shards in
                                     // .rustfs/tmp when heal fails midway (backlog#799 B20).
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
@@ -1187,6 +1417,32 @@ impl SetDisks {
                                 );
                             }
                         }
+                        let _read_repair_write_lock_guard = if let Some(expected_fingerprint) = read_repair_commit_fingerprint {
+                            drop(_read_repair_read_lock_guard.take());
+                            match self
+                                .acquire_revalidated_read_repair_commit_lock(
+                                    &disks,
+                                    bucket,
+                                    object,
+                                    version_id,
+                                    expected_fingerprint,
+                                )
+                                .await
+                            {
+                                Ok(Some(guard)) => Some(guard),
+                                Ok(None) => {
+                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    return Ok((result, Some(DiskError::Timeout)));
+                                }
+                                Err(err) => {
+                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    return Err(err);
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
                         // Rename from tmp location to the actual location.
                         // MinIO stops on the first RenameData error. RustFS intentionally
                         // continues per target, but reports any residue after all attempts
@@ -2377,7 +2633,10 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
 
 #[cfg(test)]
 mod heal_result_report_tests {
-    use super::{DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, SetDisks, heal_writer_error_summary};
+    use super::{
+        DanglingCheckPartsFailure, DanglingDeleteFailure, DanglingDeleteSafety, ReadRepairCommitFingerprint,
+        ReadRepairCommitPauseScope, SetDisks, heal_writer_error_summary,
+    };
     use super::{HEAL_RENAME_INCOMPLETE, HealRenameFailureScope, HealWriterFailureScope};
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
@@ -2412,6 +2671,40 @@ mod heal_result_report_tests {
         assert!(!super::metadata_less_part_file("part."));
         assert!(!super::metadata_less_part_file("part.x"));
         assert!(!super::metadata_less_part_file("xl.meta"));
+    }
+
+    #[test]
+    fn read_repair_commit_fingerprint_tracks_commit_identity_only() {
+        let data_dir = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("data dir should parse");
+        let mut base = meta_regen_test_fileinfo("object.bin", data_dir, 42, 0);
+        base.volume = "bucket-a".to_string();
+        base.metadata.insert("etag".to_string(), "etag-a".to_string());
+
+        let mut observed = base.clone();
+        observed.idx = 3;
+        observed.fresh = true;
+        observed.num_versions = 7;
+        observed.erasure.index = base.erasure.index.saturating_add(1);
+        observed.successor_mod_time = Some(OffsetDateTime::from_unix_timestamp(43).expect("timestamp should parse"));
+
+        assert!(
+            ReadRepairCommitFingerprint::from_file_info(&base) == ReadRepairCommitFingerprint::from_file_info(&observed),
+            "read-observation and disk-local fields must not make an unchanged object look stale"
+        );
+
+        let mut overwritten = base.clone();
+        overwritten.data_dir = Some(Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("data dir should parse"));
+        assert!(
+            ReadRepairCommitFingerprint::from_file_info(&base) != ReadRepairCommitFingerprint::from_file_info(&overwritten),
+            "a new committed data directory must abort the stale read-repair commit"
+        );
+
+        let mut metadata_changed = base.clone();
+        metadata_changed.metadata.insert("etag".to_string(), "etag-b".to_string());
+        assert!(
+            ReadRepairCommitFingerprint::from_file_info(&base) != ReadRepairCommitFingerprint::from_file_info(&metadata_changed),
+            "metadata changes must abort the stale read-repair commit"
+        );
     }
 
     #[derive(Clone, Default)]
@@ -3981,78 +4274,159 @@ mod heal_result_report_tests {
         assert_eq!(survivor.size, 1024 * 1024, "survivor size must be intact");
     }
 
-    // HS-12 (backlog#1874): unversioned overwrite commits race a Deep heal on
-    // the same object. The overwrite's post-commit tail deletes the replaced
-    // data dir without the ns lock (object.rs commit tail), which is exactly
-    // the intersection the audit flagged: the heal must tolerate the tail race
-    // (retryable outcome) and every committed overwrite must survive — the
-    // final current version is exactly the last payload written.
     #[tokio::test]
     #[serial_test::serial]
-    async fn heal_racing_unversioned_overwrites_preserves_the_last_commit() {
+    async fn read_repair_commit_aborts_when_object_changes_before_final_rename() {
         let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
-        let bucket = "heal-race-put-overwrite";
+        let bucket = "read-repair-stale-commit";
         let object = "object.bin";
         set.make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
 
-        const ROUNDS: usize = 8;
-        const PAYLOAD_SIZE: usize = 256 * 1024;
-        let mut last_etag = String::new();
-        for round in 0..ROUNDS {
-            // Give the heal something to rebuild on alternating rounds: remove a
-            // shard of the current data dir right before the race.
-            if round % 2 == 1 {
-                let current = disks[2]
-                    .read_version("", bucket, object, "", &ReadOptions::default())
-                    .await
-                    .expect("current metadata should be readable");
-                if let Some(data_dir) = current.data_dir {
-                    let shard = temp_dirs[3]
-                        .path()
-                        .join(bucket)
-                        .join(object)
-                        .join(data_dir.to_string())
-                        .join("part.1");
-                    if shard.exists() {
-                        tokio::fs::remove_file(&shard)
-                            .await
-                            .expect("shard damage should be injectable mid-race");
-                    }
-                }
-            }
+        const PAYLOAD_SIZE: usize = 1024 * 1024;
+        let mut initial_reader = PutObjReader::from_vec(vec![0x11; PAYLOAD_SIZE]);
+        set.put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .await
+            .expect("initial object should be written");
 
-            let payload = vec![round as u8; PAYLOAD_SIZE];
-            let mut put_reader = PutObjReader::from_vec(payload);
-            let put_opts = ObjectOptions::default();
-            let heal_opts = HealOpts {
-                scan_mode: HealScanMode::Deep,
-                ..Default::default()
-            };
-            let (put_res, heal_res) = tokio::join!(
-                set.put_object(bucket, object, &mut put_reader, &put_opts),
-                set.heal_object(bucket, object, "", &heal_opts),
-            );
-            let put_info = put_res.expect("overwrite must succeed under lock serialization");
-            last_etag = put_info.etag.clone().unwrap_or_default();
-            // Heal outcome is unconstrained (may hit the tail race and report a
-            // retryable error); the invariant is checked on the end state.
-            drop(heal_res);
-        }
+        let current = disks[2]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("current metadata should be readable");
+        let data_dir = current.data_dir.expect("non-inline object should have a data dir");
+        let missing_part = temp_dirs
+            .iter()
+            .map(|dir| dir.path().join(bucket).join(object).join(data_dir.to_string()).join("part.1"))
+            .find(|part| part.is_file())
+            .expect("part.1 should exist on at least one erasure disk");
+        tokio::fs::remove_file(missing_part)
+            .await
+            .expect("shard damage should force read-repair data work");
+
+        let (_pause, arrived, release) = ReadRepairCommitPauseScope::install(bucket, object);
+        let heal_set = set.clone();
+        let heal_task = tokio::spawn(async move {
+            heal_set
+                .heal_object(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        read_repair: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived.notified())
+            .await
+            .expect("read-repair should reach the final commit fence");
+
+        let mut overwrite_reader = PutObjReader::from_vec(vec![0x22; PAYLOAD_SIZE]);
+        let overwrite = set
+            .put_object(bucket, object, &mut overwrite_reader, &ObjectOptions::default())
+            .await
+            .expect("overwrite should commit while read-repair waits before final fence");
+        release.notify_one();
+
+        let (_result, err) = tokio::time::timeout(std::time::Duration::from_secs(5), heal_task)
+            .await
+            .expect("read-repair should finish after release")
+            .expect("read-repair task should join")
+            .expect("stale read-repair should report a typed retryable error");
+        assert_eq!(err, Some(DiskError::Timeout));
 
         let final_info = set
             .get_object_info(bucket, object, &ObjectOptions::default())
             .await
-            .expect("object must remain readable after the race loop");
-        assert_eq!(
-            final_info.size, PAYLOAD_SIZE as i64,
-            "final current version must be the last committed overwrite"
-        );
-        assert_eq!(
-            final_info.etag.unwrap_or_default(),
-            last_etag,
-            "the racing heal loop must never leave a stale or resurrected current version"
-        );
+            .expect("object must remain readable after stale read-repair abort");
+        assert_eq!(final_info.etag, overwrite.etag);
+    }
+
+    // HS-12 (backlog#1874): unversioned overwrite commits race a Deep heal on
+    // the same object. The overwrite's post-commit tail deletes the replaced
+    // data dir without the ns lock (object.rs commit tail), which is exactly
+    // the intersection the audit flagged: the heal must tolerate the tail race
+    // (retryable outcome) and every committed overwrite must survive — the
+    // final current version is exactly the last payload written. Also cover the
+    // read-repair path, which reconstructs under a shared data-phase lock and
+    // revalidates before the final rename.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_racing_unversioned_overwrites_preserves_the_last_commit() {
+        for read_repair in [false, true] {
+            let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let bucket = if read_repair {
+                "read-repair-race-put-overwrite"
+            } else {
+                "heal-race-put-overwrite"
+            };
+            let object = "object.bin";
+            set.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created");
+
+            const ROUNDS: usize = 8;
+            const PAYLOAD_SIZE: usize = 256 * 1024;
+            let mut last_etag = String::new();
+            for round in 0..ROUNDS {
+                // Give the heal something to rebuild on alternating rounds: remove a
+                // shard of the current data dir right before the race.
+                if round % 2 == 1 {
+                    let current = disks[2]
+                        .read_version("", bucket, object, "", &ReadOptions::default())
+                        .await
+                        .expect("current metadata should be readable");
+                    if let Some(data_dir) = current.data_dir {
+                        let shard = temp_dirs[3]
+                            .path()
+                            .join(bucket)
+                            .join(object)
+                            .join(data_dir.to_string())
+                            .join("part.1");
+                        if shard.exists() {
+                            tokio::fs::remove_file(&shard)
+                                .await
+                                .expect("shard damage should be injectable mid-race");
+                        }
+                    }
+                }
+
+                let payload = vec![round as u8; PAYLOAD_SIZE];
+                let mut put_reader = PutObjReader::from_vec(payload);
+                let put_opts = ObjectOptions::default();
+                let heal_opts = HealOpts {
+                    scan_mode: HealScanMode::Deep,
+                    read_repair,
+                    ..Default::default()
+                };
+                let (put_res, heal_res) = tokio::join!(
+                    set.put_object(bucket, object, &mut put_reader, &put_opts),
+                    set.heal_object(bucket, object, "", &heal_opts),
+                );
+                let put_info = put_res.expect("overwrite must succeed under lock serialization");
+                last_etag = put_info.etag.clone().unwrap_or_default();
+                // Heal outcome is unconstrained (may hit the tail race and report a
+                // retryable error); the invariant is checked on the end state.
+                drop(heal_res);
+            }
+
+            let final_info = set
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("object must remain readable after the race loop");
+            assert_eq!(
+                final_info.size, PAYLOAD_SIZE as i64,
+                "final current version must be the last committed overwrite"
+            );
+            assert_eq!(
+                final_info.etag.unwrap_or_default(),
+                last_etag,
+                "the racing heal loop must never leave a stale or resurrected current version"
+            );
+        }
     }
 }

@@ -1723,6 +1723,7 @@ mod tests {
             scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Normal,
             update_parity: false,
             no_lock: true,
+            read_repair: false,
             pool: Some(1),
             set: Some(0),
         };
@@ -2600,6 +2601,7 @@ mod tests {
                 scan_mode: HealScanMode::Deep,
                 update_parity: false,
                 no_lock: true,
+                read_repair: false,
                 pool: Some(1),
                 set: Some(2),
             },

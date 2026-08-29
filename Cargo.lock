@@ -9825,6 +9825,7 @@ name = "rustfs-heal-contracts"
 version = "1.0.0-rc.4"
 dependencies = [
  "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]

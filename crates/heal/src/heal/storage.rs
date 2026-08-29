@@ -689,6 +689,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             scan_mode: HealScanMode::Deep,
             update_parity: true,
             no_lock: false,
+            read_repair: false,
             pool: None,
             set: None,
         };
