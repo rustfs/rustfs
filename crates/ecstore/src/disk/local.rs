@@ -3982,7 +3982,7 @@ impl FdCache {
         if self.generation.load(Ordering::Acquire) != gen_at_open {
             return;
         }
-        self.cache.insert(key.clone(), file).await;
+        self.cache.insert(key.clone(), entry).await;
         if self.generation.load(Ordering::Acquire) != gen_at_open {
             self.cache.invalidate(&key).await;
         }
