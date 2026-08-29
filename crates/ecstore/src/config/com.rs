@@ -800,8 +800,19 @@ where
             if log_error {
                 error!("save_config_with_opts: err: {:?}, file: {}", err, file);
             }
-            Err(err)
+            Err(map_system_metadata_write_error(err, file))
         }
+    }
+}
+
+/// A system metadata volume outage must remain retryable instead of being
+/// exposed as the user-facing bucket-not-found response.
+pub(crate) fn map_system_metadata_write_error(err: Error, file: &str) -> Error {
+    match err {
+        Error::BucketNotFound(_) | Error::VolumeNotFound => {
+            Error::InsufficientWriteQuorum(RUSTFS_META_BUCKET.to_string(), file.to_string())
+        }
+        other => other,
     }
 }
 
@@ -2796,14 +2807,14 @@ mod tests {
     use super::{
         SERVER_CONFIG_LOCK, ServerConfigSnapshot, apply_dynamic_config_for_sub_sys_with, build_scalar_config_object,
         config_task_join_error, configs_semantically_equal, decode_server_config_blob, encode_server_config_blob,
-        heal_config_descriptor, is_standard_object_server_config, lookup_configs, new_and_save_server_config, read_config,
-        read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty, read_config_with_metadata,
-        read_config_without_migrate, read_server_config_snapshot, save_server_config, save_server_config_snapshot,
-        save_server_config_snapshot_with_generation, server_config_transaction_lock_path, should_warn_ignored_scalar_section,
-        storage_class_kvs_mut,
+        heal_config_descriptor, is_standard_object_server_config, lookup_configs, map_system_metadata_write_error,
+        new_and_save_server_config, read_config, read_config_no_lock_preserve_empty_with_metadata, read_config_preserve_empty,
+        read_config_with_metadata, read_config_without_migrate, read_server_config_snapshot, save_config_with_opts_inner,
+        save_server_config, save_server_config_snapshot, save_server_config_snapshot_with_generation,
+        server_config_transaction_lock_path, should_warn_ignored_scalar_section, storage_class_kvs_mut,
     };
     use crate::config::{audit, heal, notify, oidc, scanner};
-    use crate::disk::endpoint::Endpoint;
+    use crate::disk::{RUSTFS_META_BUCKET, endpoint::Endpoint};
     use crate::error::{Error, Result};
     use crate::layout::endpoints::SetupType;
     use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
@@ -2834,6 +2845,72 @@ mod tests {
         let rendered = config_task_join_error("server config write", join_error).to_string();
         assert!(rendered.contains("panicked"));
         assert!(!rendered.contains("do-not-expose-payload"));
+    }
+
+    #[test]
+    fn system_metadata_volume_failures_map_to_retryable_write_errors() {
+        for error in [Error::VolumeNotFound, Error::BucketNotFound(RUSTFS_META_BUCKET.to_string())] {
+            assert_eq!(
+                map_system_metadata_write_error(error, "buckets/example/.metadata.bin"),
+                Error::InsufficientWriteQuorum(RUSTFS_META_BUCKET.to_string(), "buckets/example/.metadata.bin".to_string())
+            );
+        }
+
+        let other = Error::other("metadata encoding failed");
+        assert_eq!(map_system_metadata_write_error(other.clone(), "buckets/example/.metadata.bin"), other);
+    }
+
+    #[derive(Debug, Default)]
+    struct MetadataWriteStore {
+        error: Option<Error>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for MetadataWriteStore {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _range: Option<Self::RangeSpec>,
+            _headers: Self::HeaderMap,
+            _opts: &Self::ObjectOptions,
+        ) -> core::result::Result<Self::GetObjectReader, Self::Error> {
+            Err(Error::FileNotFound)
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut Self::PutObjectReader,
+            _opts: &Self::ObjectOptions,
+        ) -> core::result::Result<Self::ObjectInfo, Self::Error> {
+            Err(self.error.clone().expect("test store error should be configured"))
+        }
+    }
+
+    #[tokio::test]
+    async fn save_config_preserves_retryable_system_volume_errors() {
+        let store = Arc::new(MetadataWriteStore {
+            error: Some(Error::BucketNotFound(RUSTFS_META_BUCKET.to_string())),
+        });
+        let error =
+            save_config_with_opts_inner(store, "buckets/example/.metadata.bin", Vec::new(), &ObjectOptions::default(), false)
+                .await
+                .expect_err("missing metadata volume must fail");
+
+        assert_eq!(
+            error,
+            Error::InsufficientWriteQuorum(RUSTFS_META_BUCKET.to_string(), "buckets/example/.metadata.bin".to_string())
+        );
     }
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;

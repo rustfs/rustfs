@@ -89,7 +89,10 @@ use tokio::io::AsyncWriteExt;
 const ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE: &str = "RUSTFS_GET_MID_SIZE_STREAMING_ENABLE";
 const DEFAULT_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE: bool = true;
 const GET_MID_SIZE_STREAMING_MIN_SIZE: usize = 128 * 1024 + 1;
-const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 1024 * 1024;
+// Exclude 1 MiB from the bounded mid-size reader until it has a demonstrated
+// high-concurrency performance envelope; existing codec/legacy gates decide
+// which established reader handles the object.
+const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 512 * 1024;
 
 fn is_get_mid_size_streaming_enabled() -> bool {
     #[cfg(test)]
@@ -8408,19 +8411,33 @@ mod mid_size_streaming_gate_tests {
 
     #[test]
     #[serial]
-    fn mid_size_streaming_includes_one_mib_and_rejects_larger_objects() {
-        let (object_info, fi) = plain_metadata(1024 * 1024);
+    fn mid_size_streaming_stops_at_512kib_and_rejects_one_mib() {
+        let (object_info, fi) = plain_metadata(512 * 1024);
         assert_eq!(
             get_mid_size_streaming_object_size_with_flags(&None, &object_info, &fi, &ObjectOptions::default(), true, true, true),
-            Some(1024 * 1024)
+            Some(512 * 1024)
         );
 
-        let (large_info, large_fi) = plain_metadata(1024 * 1024 + 1);
+        let (large_info, large_fi) = plain_metadata(512 * 1024 + 1);
         assert_eq!(
             get_mid_size_streaming_object_size_with_flags(
                 &None,
                 &large_info,
                 &large_fi,
+                &ObjectOptions::default(),
+                true,
+                true,
+                true
+            ),
+            None
+        );
+
+        let (one_mib_info, one_mib_fi) = plain_metadata(1024 * 1024);
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(
+                &None,
+                &one_mib_info,
+                &one_mib_fi,
                 &ObjectOptions::default(),
                 true,
                 true,
@@ -9795,6 +9812,57 @@ mod inline_put_commit_path_tests {
                 assert!(
                     crate::set_disk::coding::decode_reader::test_single_inflight_construction_count() > single_inflight_before,
                     "mid-size get_object_reader wiring must construct SingleInFlight"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn get_object_reader_routes_one_mib_away_from_mid_size_reader() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "one-mib-legacy-reader";
+        let object = "object.bin";
+        let payload = vec![0x5a; 1024 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+        let storage_class = temp_env::with_var(INLINE_BLOCK_ENV, Some("1KiB"), || lookup_config_for_pools(&KVS::new(), &[4]))
+            .expect("test storage class should resolve");
+        set_disks.set_test_storage_class_config(storage_class);
+
+        let mut writer = PutObjReader::from_vec(payload.clone());
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("off")),
+                (rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true")),
+            ],
+            async {
+                set_disks
+                    .put_object(bucket, object, &mut writer, &ObjectOptions::default())
+                    .await
+                    .expect("1 MiB fixture should commit");
+
+                crate::set_disk::reset_test_get_object_reader_path();
+                let mut reader = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("1 MiB legacy GET should succeed");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("1 MiB legacy reader should stream");
+
+                assert_eq!(restored, payload);
+                assert_eq!(
+                    crate::set_disk::test_get_object_reader_path_id(),
+                    8,
+                    "1 MiB must bypass mid-size and use legacy duplex when codec rollout is off"
                 );
             },
         )
