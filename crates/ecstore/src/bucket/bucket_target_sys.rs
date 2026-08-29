@@ -2366,6 +2366,21 @@ impl TargetClient {
         }
     }
 
+    pub async fn abort_multipart_upload(&self, bucket: &str, object: &str, upload_id: &str) -> Result<(), S3ClientError> {
+        match self
+            .client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(object)
+            .upload_id(upload_id)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub async fn remove_object(
         &self,
         bucket: &str,
