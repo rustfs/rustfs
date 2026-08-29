@@ -578,7 +578,7 @@ pub(crate) async fn prepare_bucket_usage_for_namespace_change(
     guard: Option<&rustfs_lock::NamespaceLockGuard>,
 ) -> Result<(), Error> {
     ensure_bucket_namespace_guard(guard, bucket, "data usage cache cleanup")?;
-    let _ = USAGE_MEMORY_GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(1)));
+    let _ = USAGE_MEMORY_GENERATION.try_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(1)));
     live_bucket_usage_cache().invalidate(bucket).await;
     clear_bucket_usage_memory(bucket, guard).await?;
 

@@ -545,6 +545,16 @@ impl TierCandidateMutation {
         }
     }
 
+    /// `force` as supplied by the caller, or `false` for `Edit` (credential rebind never
+    /// accepts a force override). Used to gate the lifecycle-config reference check, which
+    /// unlike the persisted/physical-object reference checks is meant to be force-bypassable.
+    fn force(&self) -> bool {
+        match self {
+            Self::Add(_, force) | Self::Remove(_, force) | Self::Clear(force) => *force,
+            Self::Edit(_, _) => false,
+        }
+    }
+
     fn explicit_tier_name(&self) -> Option<&str> {
         match self {
             Self::Add(config, _) => Some(&config.name),
@@ -727,6 +737,7 @@ impl TierReferenceProofStore for ECStore {
 async fn ensure_no_authoritative_tier_object_references<S>(
     api: Arc<S>,
     affected_targets: &[TierMutationIntentTarget],
+    force: bool,
 ) -> std::result::Result<(), AdminError>
 where
     S: TierReferenceProofStore,
@@ -739,12 +750,13 @@ where
     if targets.is_empty() {
         return Ok(());
     }
-    ensure_no_authoritative_target_references(api, &targets).await
+    ensure_no_authoritative_target_references(api, &targets, force).await
 }
 
 async fn ensure_no_authoritative_target_references<S>(
     api: Arc<S>,
     targets: &[TierMutationIntentTarget],
+    force: bool,
 ) -> std::result::Result<(), AdminError>
 where
     S: TierReferenceProofStore,
@@ -754,7 +766,13 @@ where
         .await
         .map_err(tier_reference_proof_admin_error)?;
     for bucket in buckets {
-        ensure_no_authoritative_lifecycle_references(api.as_ref(), &bucket.name, targets).await?;
+        // The lifecycle-config check only warns about a *future* transition attempt against
+        // this tier name, not an existing object/journal/transaction reference — unlike those,
+        // it is meant to be bypassable with `force`, mirroring `TierConfigMgr::remove()`'s
+        // `!force` gate on its own `driver.in_use()` probe (rustfs/backlog#2077).
+        if !force {
+            ensure_no_authoritative_lifecycle_references(api.as_ref(), &bucket.name, targets).await?;
+        }
         let mut marker = None;
         let mut version_marker = None;
         loop {
@@ -1651,7 +1669,7 @@ impl TierOperationLease {
     ) -> std::result::Result<Self, AdminError> {
         inner
             .active_leases
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_add(1))
             .map_err(|_| {
                 let mut err = ERR_TIER_INVALID_CONFIG.clone();
                 err.message = "Remote tier operation lease capacity exhausted".to_string();
@@ -1670,7 +1688,7 @@ impl Drop for TierOperationLease {
         let result = self
             .inner
             .active_leases
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_sub(1));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| active.checked_sub(1));
         match result {
             Ok(1) => self.inner.drained.notify_one(),
             Ok(_) => {}
@@ -3325,6 +3343,7 @@ impl TierConfigMgr {
                         )));
                     }
                     let explicit_tier_name = mutation.explicit_tier_name().map(str::to_string);
+                    let mutation_force = mutation.force();
                     let current_for_targets = TierConfigMgr {
                         driver_cache: HashMap::new(),
                         tiers: candidate
@@ -3357,7 +3376,7 @@ impl TierConfigMgr {
                     let affected_targets =
                         build_tier_mutation_affected_targets(mutation_kind, proof_targets, &current_for_targets, &candidate)
                             .map_err(TierConfigUpdateError::Publish)?;
-                    ensure_no_authoritative_tier_object_references(api.clone(), &affected_targets)
+                    ensure_no_authoritative_tier_object_references(api.clone(), &affected_targets, mutation_force)
                         .await
                         .map_err(TierConfigUpdateError::Publish)?;
                     let coordinator_intent =
@@ -11909,7 +11928,7 @@ mod tests {
                 let should_pause =
                     match barrier
                         .matches_before_pause
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
                     {
                         Ok(_) => false,
                         Err(_) => barrier.armed.swap(false, Ordering::SeqCst),
@@ -12180,6 +12199,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_remove_and_save_bypasses_lifecycle_only_reference() {
+        // rustfs/rustfs#6832: reproduces the admin RemoveTier path (not just the lower-level
+        // reference-proof function) for a tier with zero transitioned objects but a lifecycle
+        // rule still pointing at it — the exact shape of
+        // `test_manual_transition_async_tier_failure_reports_terminal_partial` in e2e_test,
+        // which force-removes a tier a lifecycle rule still references to simulate a
+        // decommissioned backend.
+        let store = Arc::new(CasConfigStore::default());
+        let tier = build_rustfs_tier("COLD-A");
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), tier.clone_with_credentials());
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("reference proof fixture should persist");
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("move-current".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: Some(1),
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                }]),
+            }],
+        };
+        // CasConfigStore::list_bucket derives its fake bucket listing from listed_versions, so
+        // a bucket with a lifecycle rule but zero objects still needs a decoy entry to be
+        // visible to the reference-proof walk at all (mirrors production, where list_bucket
+        // enumerates real buckets independent of their contents).
+        store.add_listed_version(ObjectInfo {
+            bucket: "photos".to_string(),
+            name: "safe.txt".to_string(),
+            ..Default::default()
+        });
+        store.add_lifecycle_config("photos", config);
+
+        let manager = TierConfigMgr::new();
+        manager.write().await.tiers.insert("COLD-A".to_string(), tier);
+        TierConfigMgr::remove_and_save_with(&manager, store.clone(), "COLD-A", true)
+            .await
+            .expect("force remove must bypass a lifecycle-config-only reference");
+
+        assert!(!manager.read().await.tiers.contains_key("COLD-A"));
+        assert!(
+            !load_tier_config_for_update(store)
+                .await
+                .expect("config should still reload")
+                .0
+                .tiers
+                .contains_key("COLD-A"),
+            "force removal must persist the empty candidate"
+        );
+    }
+
+    #[tokio::test]
     async fn zero_reference_proof_blocks_clear_before_config_save() {
         let store = Arc::new(CasConfigStore::default());
         let tier_a = build_rustfs_tier("COLD-A");
@@ -12244,7 +12327,7 @@ mod tests {
             "COLD-A",
             Some(replacement_identity),
         ));
-        ensure_no_authoritative_tier_object_references(store.clone(), std::slice::from_ref(&target))
+        ensure_no_authoritative_tier_object_references(store.clone(), std::slice::from_ref(&target), false)
             .await
             .expect("references already written with the new destination identity should not block rebind");
 
@@ -12254,7 +12337,7 @@ mod tests {
             "COLD-A",
             Some(current_identity),
         ));
-        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(store, &[target], false)
             .await
             .expect_err("references to the old destination identity must block rebind");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
@@ -12297,7 +12380,7 @@ mod tests {
         });
         store.add_lifecycle_config("photos", config);
 
-        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(store, &[target], false)
             .await
             .expect_err("lifecycle rule should block deletion");
 
@@ -12342,7 +12425,7 @@ mod tests {
         });
         store.add_lifecycle_config("photos", config);
 
-        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(store, &[target], false)
             .await
             .expect_err("lifecycle rule should block deletion");
 
@@ -12352,7 +12435,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_reference_proof_force_true_skips_lifecycle_reference_check() {
+        // rustfs/rustfs#6832: force=true must bypass a lifecycle-config-only reference,
+        // mirroring the existing `!force` gate on `TierConfigMgr::remove()`'s own
+        // `driver.in_use()` probe. It must NOT bypass real object/journal/transaction
+        // references — those stay force-immune and are covered separately below.
+        let current = build_rustfs_tier("COLD-A");
+        let current_identity = tier_backend_identity(&current).expect("current identity should encode");
+        let target = TierMutationIntentTarget {
+            tier_name: "COLD-A".to_string(),
+            old_backend_identity: Some(current_identity),
+            new_backend_identity: None,
+        };
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("move-current".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: Some(1),
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("COLD-A")),
+                }]),
+            }],
+        };
+        let store = Arc::new(CasConfigStore::default());
+        store.add_listed_version(ObjectInfo {
+            bucket: "photos".to_string(),
+            name: "safe.txt".to_string(),
+            ..Default::default()
+        });
+        store.add_lifecycle_config("photos", config);
+
+        ensure_no_authoritative_tier_object_references(store, &[target], true)
+            .await
+            .expect("force=true must bypass a lifecycle-config-only reference");
+    }
+
+    #[tokio::test]
     async fn zero_reference_proof_blocks_persisted_journal_transaction_and_free_version_references() {
+        // All three sub-checks below pass `force: true` to pin that physical/persisted
+        // references stay force-immune post rustfs/rustfs#6832 (only the lifecycle-config
+        // check, covered by `zero_reference_proof_force_true_skips_lifecycle_reference_check`
+        // above, is meant to be force-bypassable).
         let current = build_rustfs_tier("COLD-A");
         let current_identity = tier_backend_identity(&current).expect("current identity should encode");
         let replacement = build_azure_tier("account-a");
@@ -12381,9 +12513,9 @@ mod tests {
                     .expect("journal record should encode"),
             )
             .await;
-        let err = ensure_no_authoritative_tier_object_references(journal_store, std::slice::from_ref(&target))
+        let err = ensure_no_authoritative_tier_object_references(journal_store, std::slice::from_ref(&target), true)
             .await
-            .expect_err("unfinished delete journal for the old backend must block rebind");
+            .expect_err("unfinished delete journal for the old backend must block rebind even with force");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
         assert!(err.message.contains(TIER_DELETE_JOURNAL_PREFIX), "{}", err.message);
 
@@ -12419,9 +12551,9 @@ mod tests {
                 transaction.encode().expect("transaction record should encode"),
             )
             .await;
-        let err = ensure_no_authoritative_tier_object_references(transaction_store, std::slice::from_ref(&target))
+        let err = ensure_no_authoritative_tier_object_references(transaction_store, std::slice::from_ref(&target), true)
             .await
-            .expect_err("unfinished transition transaction for the old backend must block rebind");
+            .expect_err("unfinished transition transaction for the old backend must block rebind even with force");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
         assert!(err.message.contains(TRANSITION_TRANSACTION_RECORD_PREFIX), "{}", err.message);
 
@@ -12429,13 +12561,13 @@ mod tests {
         let mut free_version = transitioned_tier_object("photos", "2026/free-version.jpg", "COLD-A", Some(current_identity));
         free_version.transitioned_object.status = "pending".to_string();
         free_version.transitioned_object.free_version = true;
-        ensure_no_authoritative_tier_object_references(free_version_store.clone(), std::slice::from_ref(&target))
+        ensure_no_authoritative_tier_object_references(free_version_store.clone(), std::slice::from_ref(&target), true)
             .await
             .expect("empty free-version fixture should permit rebind");
         free_version_store.add_listed_version(free_version);
-        let err = ensure_no_authoritative_tier_object_references(free_version_store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(free_version_store, &[target], true)
             .await
-            .expect_err("recoverable free version for the old backend must block rebind");
+            .expect_err("recoverable free version for the old backend must block rebind even with force");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
         assert!(err.message.contains("photos/2026/free-version.jpg"), "{}", err.message);
     }
@@ -12459,7 +12591,7 @@ mod tests {
         }
         store.omit_truncated_reference_marker();
 
-        let err = ensure_no_authoritative_tier_object_references(store, &[target])
+        let err = ensure_no_authoritative_tier_object_references(store, &[target], false)
             .await
             .expect_err("truncated authoritative reference scan without a marker must fail closed");
         assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);

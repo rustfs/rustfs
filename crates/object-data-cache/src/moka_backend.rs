@@ -590,7 +590,7 @@ impl MokaBackend {
         // the synchronization, so relaxed ordering is sufficient here.
         let generation = match self
             .next_generation
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
         {
             Ok(previous) => previous + 1,
             Err(_) => return leader.finish(ObjectDataCacheFillResult::SkippedIdentityOverflow),

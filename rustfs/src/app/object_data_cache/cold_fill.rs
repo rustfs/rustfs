@@ -226,7 +226,7 @@ impl ColdFillCoordinator {
 
         if self
             .active_sessions
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 (current < MAX_ACTIVE_SESSIONS).then_some(current + 1)
             })
             .is_err()
@@ -238,7 +238,7 @@ impl ColdFillCoordinator {
 
         let session_id = match self
             .next_session_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_add(1))
         {
             Ok(session_id) => session_id,
             Err(_) => {
@@ -298,7 +298,7 @@ impl ColdFillCoordinator {
     fn reserve_global_waiter(&self) -> bool {
         let result = self
             .global_waiters
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 (current < MAX_GLOBAL_WAITERS).then_some(current + 1)
             });
         if let Ok(previous) = result {

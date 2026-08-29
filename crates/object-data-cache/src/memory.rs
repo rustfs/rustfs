@@ -192,7 +192,7 @@ impl MemorySnapshotCell {
         }
         if self
             .pending_release
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| pending.checked_add(bytes))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| pending.checked_add(bytes))
             .is_err()
         {
             self.release_accounting_failed.store(true, Ordering::Release);

@@ -395,7 +395,7 @@ async fn pause_multipart_commit(bucket: &str, object: &str, pause: MultipartComm
         }
     };
     if let Some(barrier) = barrier
-        && let Ok(previous) = barrier.arrivals.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        && let Ok(previous) = barrier.arrivals.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
             (current < barrier.expected_arrivals).then_some(current + 1)
         })
     {
