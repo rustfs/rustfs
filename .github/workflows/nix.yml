@@ -27,6 +27,7 @@ on:
     paths:
       - 'flake.nix'
       - 'flake.lock'
+      - 'nix/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/nix.yml'
@@ -36,6 +37,7 @@ on:
     paths:
       - 'flake.nix'
       - 'flake.lock'
+      - 'nix/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/nix.yml'
