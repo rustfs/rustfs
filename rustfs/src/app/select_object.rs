@@ -67,6 +67,11 @@ enum SelectProducerOutcome {
     ReceiverClosed,
 }
 
+struct SelectEventChannel {
+    tx: mpsc::Sender<S3Result<SelectObjectContentEvent>>,
+    terminal_permit: mpsc::OwnedPermit<S3Result<SelectObjectContentEvent>>,
+}
+
 trait SelectSnapshotFence {
     fn ensure_snapshot_valid(&self) -> S3Result<()>;
 }
@@ -124,8 +129,7 @@ pub async fn execute_select_object_content(
     spawn_traced(async move {
         send_select_events_until_deadline(
             output,
-            tx,
-            terminal_permit,
+            SelectEventChannel { tx, terminal_permit },
             validation,
             input_metrics,
             query_deadline,
@@ -140,15 +144,19 @@ pub async fn execute_select_object_content(
 
 async fn send_select_events_until_deadline<L: SelectSnapshotFence>(
     output: SendableRecordBatchStream,
-    tx: mpsc::Sender<S3Result<SelectObjectContentEvent>>,
-    terminal_permit: mpsc::OwnedPermit<S3Result<SelectObjectContentEvent>>,
+    event_channel: SelectEventChannel,
     validation: SelectValidation,
     input_metrics: Arc<SelectInputMetrics>,
     deadline: Instant,
     timeout_seconds: u64,
     snapshot_lease: L,
 ) {
-    let outcome = match timeout_at(deadline, send_select_events(output, &tx, validation, input_metrics, &snapshot_lease)).await {
+    let outcome = match timeout_at(
+        deadline,
+        send_select_events(output, &event_channel.tx, validation, input_metrics, &snapshot_lease),
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(_) => SelectProducerOutcome::Terminal(Err(map_query_error_to_s3(
             SelectError::QueryTimeout {
@@ -158,7 +166,7 @@ async fn send_select_events_until_deadline<L: SelectSnapshotFence>(
         ))),
     };
     if let SelectProducerOutcome::Terminal(event) = outcome {
-        terminal_permit.send(event);
+        event_channel.terminal_permit.send(event);
     }
     drop(snapshot_lease);
 }
@@ -890,8 +898,7 @@ mod tests {
         let (lease, lease_released) = lease_drop_signal();
         let producer = tokio::spawn(send_select_events_until_deadline(
             output,
-            tx,
-            terminal_permit,
+            SelectEventChannel { tx, terminal_permit },
             csv_validation(),
             Arc::new(SelectInputMetrics::default()),
             Instant::now() + std::time::Duration::from_secs(1),
@@ -1116,8 +1123,7 @@ mod tests {
         let (lease, lease_released) = lease_drop_signal();
         let producer = tokio::spawn(send_select_events_until_deadline(
             output,
-            tx,
-            terminal_permit,
+            SelectEventChannel { tx, terminal_permit },
             csv_validation(),
             Arc::new(SelectInputMetrics::default()),
             Instant::now() + std::time::Duration::from_secs(1),
@@ -1472,8 +1478,7 @@ mod tests {
         let (lease, lease_released) = lease_drop_signal();
         let producer = send_select_events_until_deadline(
             output,
-            tx,
-            terminal_permit,
+            SelectEventChannel { tx, terminal_permit },
             csv_validation(),
             Arc::new(SelectInputMetrics::default()),
             Instant::now() + std::time::Duration::from_secs(1),
