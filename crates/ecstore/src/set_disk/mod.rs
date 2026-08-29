@@ -2525,6 +2525,7 @@ fn record_get_object_reader_path_observation(
             GET_OBJECT_PATH_CODEC_STREAMING => 5,
             GET_OBJECT_PATH_REMOTE_TRANSITION => 6,
             GET_OBJECT_PATH_EMPTY => 7,
+            GET_OBJECT_PATH_LEGACY_DUPLEX => 8,
             _ => 255,
         },
         Ordering::Relaxed,
