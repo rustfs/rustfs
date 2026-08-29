@@ -82,9 +82,30 @@ pub(super) async fn usage_snapshot_for_epoch_fence(
     primary: Option<&[u8]>,
     allow_bootstrap_pending: bool,
 ) -> Result<Option<DataUsageInfo>, ScannerError> {
+    // A partially written v2 primary is not itself a baseline, but a durable
+    // companion may still provide one after an interrupted upgrade. Keep the
+    // primary epoch as a fence while checking those companions; malformed
+    // bytes and bootstrap markers retain their fail-closed behavior.
+    let mut invalid_primary_epoch = None;
     if let Some(primary) = primary {
-        return decode_usage_snapshot_for_epoch_fence(primary, DATA_USAGE_OBJ_NAME_PATH.as_str(), allow_bootstrap_pending)
-            .map(Some);
+        let usage: DataUsageInfo = serde_json::from_slice(primary).map_err(|err| {
+            ScannerError::Other(format!(
+                "failed to decode scanner usage epoch fence from {}: {err}",
+                DATA_USAGE_OBJ_NAME_PATH.as_str()
+            ))
+        })?;
+        if data_usage_info_has_persisted_baseline_identity(&usage)
+            || (allow_bootstrap_pending && data_usage_info_is_bootstrap_pending(&usage))
+        {
+            return Ok(Some(usage));
+        }
+        if data_usage_info_is_bootstrap_pending(&usage) {
+            return Err(ScannerError::Other(format!(
+                "scanner usage epoch fence from {} has no persisted baseline identity",
+                DATA_USAGE_OBJ_NAME_PATH.as_str()
+            )));
+        }
+        invalid_primary_epoch = usage.scanner_epoch;
     }
 
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -92,7 +113,10 @@ pub(super) async fn usage_snapshot_for_epoch_fence(
         .await
         .map_err(|err| ScannerError::Other(format!("failed to read scanner usage epoch fence backup: {err}")))?;
     if let Some(backup) = backup.as_deref() {
-        return decode_usage_snapshot_for_epoch_fence(backup, &backup_path, false).map(Some);
+        let usage = decode_usage_snapshot_for_epoch_fence(backup, &backup_path, false)?;
+        if invalid_primary_epoch.is_none_or(|epoch| usage.scanner_epoch.unwrap_or_default() >= epoch) {
+            return Ok(Some(usage));
+        }
     }
 
     for path in [
@@ -103,7 +127,10 @@ pub(super) async fn usage_snapshot_for_epoch_fence(
             .await
             .map_err(|err| ScannerError::Other(format!("failed to read legacy scanner usage epoch fence: {err}")))?;
         if let Some(legacy) = legacy.as_deref() {
-            return decode_usage_snapshot_for_epoch_fence(legacy, &path, false).map(Some);
+            let usage = decode_usage_snapshot_for_epoch_fence(legacy, &path, false)?;
+            if invalid_primary_epoch.is_none_or(|epoch| usage.scanner_epoch.unwrap_or_default() >= epoch) {
+                return Ok(Some(usage));
+            }
         }
     }
     // A missing usage snapshot is an uninitialized state, not an empty

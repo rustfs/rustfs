@@ -40,6 +40,84 @@ pub(super) struct DataUsagePersistBaseline {
     pub(super) revision: DataUsageCacheRevision,
 }
 
+/// Read the bytes used as the baseline for a usage publication while keeping
+/// the v2 primary revision as the CAS fence. During an interrupted upgrade the
+/// primary can be valid JSON without a baseline identity; in that case a
+/// same-or-newer durable companion may still be used, but an older legacy
+/// snapshot must not cross the primary's epoch fence.
+pub(super) async fn read_data_usage_persist_baseline(
+    storeapi: Arc<impl ScannerObjectIO>,
+) -> Result<DataUsagePersistBaseline, EcstoreError> {
+    let (primary, revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await?;
+    let Some(primary) = primary else {
+        for path in [
+            format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+            LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+            format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        ] {
+            let (candidate, _) = read_config_with_revision(storeapi.clone(), &path).await?;
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            let Ok(usage) = serde_json::from_slice::<DataUsageInfo>(&candidate) else {
+                continue;
+            };
+            if data_usage_info_has_persisted_baseline_identity(&usage) {
+                return Ok(DataUsagePersistBaseline {
+                    data: Some(Bytes::from(candidate)),
+                    revision,
+                });
+            }
+        }
+        return Ok(DataUsagePersistBaseline { data: None, revision });
+    };
+
+    let Ok(primary_info) = serde_json::from_slice::<DataUsageInfo>(&primary) else {
+        // Preserve the original bytes and revision. A completed scan may
+        // replace the invalid primary under this CAS fence; an observation
+        // will still reject it below because it has no verifiable identity.
+        return Ok(DataUsagePersistBaseline {
+            data: Some(Bytes::from(primary)),
+            revision,
+        });
+    };
+    if data_usage_info_has_persisted_baseline_identity(&primary_info) || data_usage_info_is_bootstrap_pending(&primary_info) {
+        return Ok(DataUsagePersistBaseline {
+            data: Some(Bytes::from(primary)),
+            revision,
+        });
+    }
+
+    let invalid_primary_epoch = primary_info.scanner_epoch;
+    for path in [
+        format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+    ] {
+        let (candidate, _) = read_config_with_revision(storeapi.clone(), &path).await?;
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let Ok(usage) = serde_json::from_slice::<DataUsageInfo>(&candidate) else {
+            continue;
+        };
+        let candidate_epoch = usage.scanner_epoch.unwrap_or_default();
+        if data_usage_info_has_persisted_baseline_identity(&usage)
+            && invalid_primary_epoch.is_none_or(|epoch| candidate_epoch >= epoch)
+        {
+            return Ok(DataUsagePersistBaseline {
+                data: Some(Bytes::from(candidate)),
+                revision,
+            });
+        }
+    }
+
+    Ok(DataUsagePersistBaseline {
+        data: Some(Bytes::from(primary)),
+        revision,
+    })
+}
+
 /// Short-lived publication inputs captured for one usage persistence attempt.
 /// Keeping the movement epoch, lease deadline, and target fence together makes
 /// it explicit that they are one proof rather than independent options.
@@ -225,7 +303,7 @@ where
             data_usage_info.scanner_epoch = Some(leader_epoch);
         }
         if remote_lease_expired(remote_lease_deadline) {
-            outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+            outcome = DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded);
             break 'updates;
         }
         if let Some(expected_epoch) = expected_publication_epoch
@@ -281,8 +359,8 @@ where
             publication_epoch = Some(read_epoch);
             let authoritative_data = match next_baseline.as_ref() {
                 Some(baseline) => baseline.data.clone(),
-                None => match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
-                    Ok((data, _)) => data.map(Bytes::from),
+                None => match read_data_usage_persist_baseline(storeapi.clone()).await {
+                    Ok(baseline) => baseline.data,
                     Err(err) => {
                         error!(
                             target: "rustfs::scanner",
@@ -497,7 +575,7 @@ where
                 break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
             }
             if remote_lease_expired(remote_lease_deadline) {
-                break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+                break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded);
             }
 
             let done_save = Metrics::time(Metric::SaveUsage);
@@ -510,7 +588,7 @@ where
                 };
                 if remote_lease_expired(remote_lease_deadline) {
                     done_save();
-                    break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+                    break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded);
                 }
                 save_config_shared_with_preconditions_and_lease_fence(
                     storeapi.clone(),

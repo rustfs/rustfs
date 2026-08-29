@@ -1205,6 +1205,10 @@ fn data_usage_persist_timeout() -> Duration {
     DataUsageCache::persistence_timeout()
 }
 
+fn scanner_publication_lease_budget_allows_persistence(timeout: Duration) -> bool {
+    timeout < Duration::from_millis(SCANNER_PUBLICATION_LEASE_TTL_MS)
+}
+
 #[cfg(not(test))]
 const SCANNER_CYCLE_EPOCH_FENCE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -1416,13 +1420,10 @@ async fn run_data_scanner_cycle_with_budget(
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
     };
-    let usage_persist_baseline_result = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await;
+    let usage_persist_baseline_result = read_data_usage_persist_baseline(storeapi.clone()).await;
     drop(baseline_publication_guard);
     let usage_persist_baseline = match usage_persist_baseline_result {
-        Ok((data, revision)) => DataUsagePersistBaseline {
-            data: data.map(Bytes::from),
-            revision,
-        },
+        Ok(baseline) => baseline,
         Err(err) => {
             error!(
                 target: "rustfs::scanner",
@@ -1462,10 +1463,23 @@ async fn run_data_scanner_cycle_with_budget(
         {
             Some(ScannerCycleDeferReason::DataMovement)
         }
+        // A complete walk can still be retained as an observational snapshot
+        // when only the final activity proof was unavailable.  It must not
+        // block the observation receiver: the authoritative publication
+        // fence remains enforced by the usage store and the cycle is advanced
+        // as partial without acknowledging dirty usage.
+        Ok(result)
+            if result.has_observational_snapshot()
+                && matches!(
+                    result.status,
+                    ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+                ) =>
+        {
+            None
+        }
         Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
-    let publication_deferred = publication_defer_reason.is_some();
     let publication_epoch = scan_result.as_ref().ok().and_then(ScannerCycleResult::publication_epoch);
     let remote_publication_lease_targets = if publication_defer_reason.is_none() {
         scan_result
@@ -1479,11 +1493,11 @@ async fn run_data_scanner_cycle_with_budget(
     let mut remote_publication_leases = None;
     let remote_lease_defer_reason = if remote_publication_lease_targets.is_empty() {
         None
-    } else if usage_persist_timeout >= Duration::from_millis(SCANNER_PUBLICATION_LEASE_TTL_MS) {
+    } else if !scanner_publication_lease_budget_allows_persistence(usage_persist_timeout) {
         // The lease is intentionally fixed-duration and has no renewal path.
         // Refuse a persistence budget that could outlive it instead of
         // allowing the peer to admit movement while a local PUT is in flight.
-        Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        Some(ScannerCycleDeferReason::PublicationLeaseBudgetExceeded)
     } else if let Some(notification_system) = storeapi.notification_system() {
         match notification_system
             .acquire_scanner_publication_leases(remote_publication_lease_targets.clone())
@@ -1543,8 +1557,13 @@ async fn run_data_scanner_cycle_with_budget(
         .or(remote_lease_defer_reason)
         .or(remote_lease_fence_defer_reason);
     let publication_defer_reason = (!remote_lease_covers_persistence)
-        .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        .then_some(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
         .or(publication_defer_reason);
+    // Include reasons discovered while acquiring or validating remote leases.
+    // In particular, the static budget gate above is reached after the scan
+    // result is classified, so computing this flag earlier would suppress its
+    // deferred metric.
+    let publication_deferred = publication_defer_reason.is_some();
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let remote_lease_probe = remote_publication_leases
         .as_ref()
@@ -1640,14 +1659,17 @@ async fn run_data_scanner_cycle_with_budget(
         .is_some_and(|(_, grants)| grants.iter().any(|grant| !grant.lease.is_valid()));
     if let Some((notification_system, grants)) = remote_publication_leases.take() {
         let release_result = notification_system.release_scanner_publication_leases(grants).await;
-        if lease_expired || release_result.is_err() {
+        let lease_release_failed = release_result.is_err();
+        if lease_expired || lease_release_failed {
             // A lease that expired or could not be released is never treated
             // as a successful authoritative publication. The peer may have
             // admitted movement immediately after the lease ended.
             usage_persist_outcome = if usage_persist_outcome == DataUsagePersistOutcome::Failed {
                 DataUsagePersistOutcome::Failed
+            } else if lease_release_failed {
+                DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseReleaseFailed)
             } else {
-                DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+                DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
             };
         }
     }
@@ -2803,12 +2825,7 @@ fn finalize_scanner_cycle_result(
     scan_cycle_result: crate::scanner_io::ScannerCycleResult,
     usage_persist_outcome: DataUsagePersistOutcome,
 ) -> (ScannerCycleOutcome, bool, Vec<ScannerDirtyUsageAcknowledgement>) {
-    let completion_outcome = scanner_cycle_completion_outcome(
-        scan_cycle_result.status,
-        usage_persist_outcome,
-        scan_cycle_result.has_dirty_usage_to_acknowledge(),
-        scan_cycle_result.has_failed_dirty_usage(),
-    );
+    let completion_outcome = scanner_cycle_completion_outcome_for_result(&scan_cycle_result, usage_persist_outcome);
     let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work();
     let durable_complete_snapshot = scan_cycle_result.status == ScannerCycleStatus::Complete
         && matches!(
@@ -2821,6 +2838,34 @@ fn finalize_scanner_cycle_result(
         Vec::new()
     };
     (completion_outcome, pending_maintenance_work, remote_dirty_usage_acknowledgements)
+}
+
+fn scanner_cycle_completion_outcome_for_result(
+    scan_cycle_result: &crate::scanner_io::ScannerCycleResult,
+    usage_persist_outcome: DataUsagePersistOutcome,
+) -> ScannerCycleOutcome {
+    let has_dirty_usage = scan_cycle_result.has_dirty_usage_to_acknowledge();
+    let has_failed_dirty_usage = scan_cycle_result.has_failed_dirty_usage();
+    if scan_cycle_result.has_observational_snapshot()
+        && matches!(
+            scan_cycle_result.status,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        )
+    {
+        return match usage_persist_outcome {
+            DataUsagePersistOutcome::Saved
+            | DataUsagePersistOutcome::AlreadyDurable
+            | DataUsagePersistOutcome::PriorCycleDurable
+            | DataUsagePersistOutcome::Current
+                if !has_failed_dirty_usage =>
+            {
+                ScannerCycleOutcome::Partial
+            }
+            DataUsagePersistOutcome::Deferred(reason) => ScannerCycleOutcome::Deferred(reason),
+            _ => ScannerCycleOutcome::Failed,
+        };
+    }
+    scanner_cycle_completion_outcome(scan_cycle_result.status, usage_persist_outcome, has_dirty_usage, has_failed_dirty_usage)
 }
 
 /// Decide whether an incoming usage snapshot must be skipped as stale, given the local
