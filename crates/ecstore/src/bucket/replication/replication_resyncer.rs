@@ -54,11 +54,12 @@ use super::replication_storage_boundary::{
 };
 use super::replication_target_boundary::{
     ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions,
-    ReplicationTargetStore, SsecPassthroughCapability, SsecPassthroughGate, TargetClient, is_replication_target_offline_error,
-    replication_action_for_target_head, replication_complete_multipart_options, replication_delete_marker_purge_remove_options,
-    replication_delete_remove_options, replication_force_delete_remove_options, replication_object_is_ssec_encrypted,
-    replication_put_object_header_size, replication_put_object_options, replication_target_head_is_newer_null_version,
-    resolve_read_api_version_id, ssec_passthrough_evidence_present, ssec_passthrough_gate, version_identity_drifted,
+    ReplicationTargetStore, S3ClientError, SsecPassthroughCapability, SsecPassthroughGate, TargetClient,
+    is_replication_target_offline_error, replication_action_for_target_head, replication_complete_multipart_options,
+    replication_delete_marker_purge_remove_options, replication_delete_remove_options, replication_force_delete_remove_options,
+    replication_object_is_ssec_encrypted, replication_put_object_header_size, replication_put_object_options,
+    replication_target_head_is_newer_null_version, resolve_read_api_version_id, ssec_passthrough_evidence_present,
+    ssec_passthrough_gate, version_identity_drifted,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -2978,11 +2979,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         };
 
         if ReplicationTargetStore::target_is_offline(&tgt_client).await {
-            debug!(
+            // The object is reported FAILED here, so this must be as loud as a
+            // per-object put_object failure or the key never reaches the logs.
+            warn!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                 bucket = %bucket,
+                object = %object,
                 arn = %tgt_client.arn,
                 reason = "target_offline",
                 endpoint = %tgt_client.to_url(),
@@ -3039,6 +3043,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                         bucket = %bucket,
+                        object = %object,
                         arn = %tgt_client.arn,
                         error = %e,
                         reason = "object_reader_unavailable",
@@ -3070,6 +3075,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                     bucket = %bucket,
+                    object = %object,
                     arn = %tgt_client.arn,
                     error = %e,
                     reason = "actual_size_unavailable",
@@ -3095,6 +3101,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                 bucket = %bucket,
+                object = %object,
                 arn = %tgt_client.arn,
                 reason = "target_bucket_empty",
                 "Skipping replication object target"
@@ -3157,6 +3164,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                                 bucket = %bucket,
+                                object = %object,
                                 arn = %tgt_client.arn,
                                 operation = "head_object_fallback",
                                 error = %e2,
@@ -3172,6 +3180,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                         bucket = %bucket,
+                        object = %object,
                         arn = %tgt_client.arn,
                         operation = "head_object",
                         error = %e,
@@ -3201,6 +3210,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                     bucket = %bucket,
+                    object = %object,
                     arn = %tgt_client.arn,
                     operation = "build_put_options",
                     error = %e,
@@ -3470,11 +3480,14 @@ fn replicate_all_target_info(roi: &ReplicateObjectInfo, tgt_client: &TargetClien
 
 /// Log and notify that replication was skipped because the target is offline.
 fn note_replicate_all_target_offline(roi: &ReplicateObjectInfo, bucket: &str, tgt_client: &TargetClient) {
-    debug!(
+    // The object is reported FAILED here, so this must be as loud as a
+    // per-object put_object failure or the key never reaches the logs.
+    warn!(
         event = EVENT_RESYNC_RUNTIME_SKIPPED,
         component = LOG_COMPONENT_ECSTORE,
         subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
         bucket = %bucket,
+        object = %roi.name,
         arn = %tgt_client.arn,
         target = %tgt_client.to_url(),
         reason = "target_offline",
@@ -3512,6 +3525,7 @@ fn note_replicate_all_reader_unavailable(roi: &ReplicateObjectInfo, bucket: &str
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
             bucket = %bucket,
+            object = %roi.name,
             arn = %tgt_client.arn,
             error = %e,
             reason = "object_reader_unavailable",
@@ -3535,6 +3549,7 @@ fn note_replicate_all_size_unavailable(bucket: &str, tgt_client: &TargetClient, 
         component = LOG_COMPONENT_ECSTORE,
         subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
         bucket = %bucket,
+        object = %object_info.name,
         arn = %tgt_client.arn,
         error = %e,
         reason = "actual_size_unavailable",
@@ -3557,6 +3572,7 @@ fn note_replicate_all_target_bucket_empty(bucket: &str, tgt_client: &TargetClien
         component = LOG_COMPONENT_ECSTORE,
         subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
         bucket = %bucket,
+        object = %object_info.name,
         arn = %tgt_client.arn,
         reason = "target_bucket_empty",
         "Skipped replication because target bucket is empty"
@@ -3765,6 +3781,7 @@ async fn resolve_replicate_all_action(
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                             bucket = %bucket,
+                            object = %object,
                             arn = %tgt_client.arn,
                             error = %e2,
                             reason = "head_object_fallback_failed",
@@ -3795,6 +3812,7 @@ async fn resolve_replicate_all_action(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
                     bucket = %bucket,
+                    object = %object,
                     arn = %tgt_client.arn,
                     error = %e,
                     reason = "head_object_failed",
@@ -3838,6 +3856,7 @@ fn fail_replicate_all_put_options(
         component = LOG_COMPONENT_ECSTORE,
         subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
         bucket = %bucket,
+        object = %object_info.name,
         arn = %tgt_client.arn,
         operation = "build_put_options",
         error = %e,
@@ -3962,20 +3981,13 @@ struct MultipartReplicationContext<'a, S: ReplicationObjectIO> {
 }
 
 async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartReplicationContext<'_, S>) -> std::io::Result<()> {
-    let MultipartReplicationContext {
-        storage,
-        cli,
-        src_bucket,
-        dst_bucket,
-        object,
-        object_info,
-        obj_opts,
-        arn,
-        put_opts,
-    } = ctx;
     let mut attempts = 1;
     let upload_id = loop {
-        match cli.create_multipart_upload(dst_bucket, object, &put_opts).await {
+        match ctx
+            .cli
+            .create_multipart_upload(ctx.dst_bucket, ctx.object, &ctx.put_opts)
+            .await
+        {
             Ok(id) => {
                 break id;
             }
@@ -3991,6 +4003,71 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
             }
         }
     };
+
+    let cli = ctx.cli.clone();
+    let dst_bucket = ctx.dst_bucket;
+    let object = ctx.object;
+    let arn = ctx.arn;
+
+    let result = replicate_multipart_parts_and_complete(ctx, &upload_id).await;
+    abort_multipart_on_failure(result, dst_bucket, object, &upload_id, arn, || async {
+        cli.abort_multipart_upload(dst_bucket, object, &upload_id).await
+    })
+    .await
+}
+
+/// Best-effort abort of the target-side multipart upload once the transfer has
+/// failed past CreateMultipartUpload; without it every failed attempt leaves an
+/// invisible incomplete upload on the target that keeps billing for its parts.
+/// The abort outcome never replaces the transfer error: an abort failure is
+/// only logged and `result` is returned as-is.
+async fn abort_multipart_on_failure<F, Fut>(
+    result: std::io::Result<()>,
+    dst_bucket: &str,
+    object: &str,
+    upload_id: &str,
+    arn: &str,
+    abort: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), S3ClientError>>,
+{
+    if result.is_ok() {
+        return result;
+    }
+    if let Err(abort_err) = abort().await {
+        warn!(
+            event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            target_bucket = %dst_bucket,
+            object = %object,
+            arn = %arn,
+            upload_id = %upload_id,
+            operation = "abort_multipart_upload",
+            error = %abort_err,
+            "Replication target operation failed"
+        );
+    }
+    result
+}
+
+async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
+    ctx: MultipartReplicationContext<'_, S>,
+    upload_id: &str,
+) -> std::io::Result<()> {
+    let MultipartReplicationContext {
+        storage,
+        cli,
+        src_bucket,
+        dst_bucket,
+        object,
+        object_info,
+        obj_opts,
+        arn,
+        put_opts,
+    } = ctx;
 
     let mut uploaded_parts: Vec<CompletedPart> = Vec::new();
 
@@ -4030,7 +4107,7 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
             .put_object_part(
                 dst_bucket,
                 object,
-                &upload_id,
+                upload_id,
                 part_plan.part_number,
                 part_plan.part_size,
                 byte_stream,
@@ -4055,7 +4132,7 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
         .complete_multipart_upload(
             dst_bucket,
             object,
-            &upload_id,
+            upload_id,
             uploaded_parts,
             &replication_complete_multipart_options(
                 actual_size,
@@ -5167,5 +5244,43 @@ mod tests {
         assert!(resync_state_accepts_update(&TargetReplicationResyncStatus::default(), &matching));
         assert!(resync_state_accepts_update(&current, &matching));
         assert!(!resync_state_accepts_update(&current, &stale));
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_on_failure_skips_abort_when_transfer_succeeded() {
+        let aborted = Arc::new(AtomicBool::new(false));
+        let flag = aborted.clone();
+
+        let result = abort_multipart_on_failure(Ok(()), "dst-bucket", "obj", "upload-1", "arn:dest", move || async move {
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert!(!aborted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_on_failure_aborts_and_keeps_transfer_error() {
+        let aborted = Arc::new(AtomicBool::new(false));
+        let flag = aborted.clone();
+
+        // The abort itself failing must not mask the transfer error.
+        let result = abort_multipart_on_failure(
+            Err(std::io::Error::other("transfer failed")),
+            "dst-bucket",
+            "obj",
+            "upload-1",
+            "arn:dest",
+            move || async move {
+                flag.store(true, Ordering::SeqCst);
+                Err(S3ClientError::new("abort failed"))
+            },
+        )
+        .await;
+
+        assert!(aborted.load(Ordering::SeqCst));
+        assert_eq!(result.unwrap_err().to_string(), "transfer failed");
     }
 }
