@@ -1553,6 +1553,9 @@ pub enum ControlPlaneErrorCode {
     /// The peer answered but its storage/IAM layer is not initialized yet
     /// (legacy string form: "errServerNotInitialized").
     ControlPlaneErrorNotInitialized = 1,
+    /// The peer rejected a control-plane request before changing durable state.
+    /// error_info carries the actionable validation reason.
+    ControlPlaneErrorInvalidArgument = 2,
 }
 impl ControlPlaneErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1563,6 +1566,7 @@ impl ControlPlaneErrorCode {
         match self {
             Self::ControlPlaneErrorUnspecified => "CONTROL_PLANE_ERROR_UNSPECIFIED",
             Self::ControlPlaneErrorNotInitialized => "CONTROL_PLANE_ERROR_NOT_INITIALIZED",
+            Self::ControlPlaneErrorInvalidArgument => "CONTROL_PLANE_ERROR_INVALID_ARGUMENT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1570,6 +1574,7 @@ impl ControlPlaneErrorCode {
         match value {
             "CONTROL_PLANE_ERROR_UNSPECIFIED" => Some(Self::ControlPlaneErrorUnspecified),
             "CONTROL_PLANE_ERROR_NOT_INITIALIZED" => Some(Self::ControlPlaneErrorNotInitialized),
+            "CONTROL_PLANE_ERROR_INVALID_ARGUMENT" => Some(Self::ControlPlaneErrorInvalidArgument),
             _ => None,
         }
     }
