@@ -167,10 +167,10 @@ jobs:
           {
             echo "# RustFS nightly build performance testing report"
             echo ""
-            echo "- **日期**: ${DATE}"
+            echo "- **Date**: ${DATE}"
             echo "- **Run**: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo "- **触发方式**: ${{ github.event_name }}"
-            echo "- **安装包**: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+            echo "- **Trigger**: ${{ github.event_name }}"
+            echo "- **Package**: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
             echo ""
             cat "${SUMMARY}"
           } > /tmp/rustfs-perf-report.md
