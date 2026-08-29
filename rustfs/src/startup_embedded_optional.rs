@@ -16,15 +16,17 @@ use crate::{
     config::Config,
     init::{init_buffer_profile_system, init_kms_system},
     startup_audit::init_event_notifier_and_audit,
+    storage_api::startup::services::ECStore,
 };
+use std::sync::Arc;
 use tracing::warn;
 
 const LOG_COMPONENT_EMBEDDED: &str = "embedded";
 const LOG_SUBSYSTEM_EMBEDDED: &str = "embedded";
 const EVENT_EMBEDDED_OPTIONAL_SERVICE_SKIPPED: &str = "embedded_optional_service_skipped";
 
-pub(crate) async fn init_embedded_optional_service_runtime(config: &Config) {
-    if let Err(err) = init_kms_system(config).await {
+pub(crate) async fn init_embedded_optional_service_runtime(config: &Config, store: Arc<ECStore>) {
+    if let Err(err) = init_kms_system(config, store).await {
         log_embedded_optional_service_skipped("kms", err);
     }
 

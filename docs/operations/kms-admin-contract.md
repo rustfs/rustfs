@@ -10,6 +10,7 @@ The wire prefix is `/rustfs/admin/v3`. Request and response field names for the 
 | `POST /kms/reconfigure` | `kms:Configure` / high | no | supported | supported | none |
 | `POST /kms/start` | `kms:ServiceControl` / high | no | supported | supported | none |
 | `POST /kms/stop` | `kms:ServiceControl` / high | no | supported | supported | none |
+| `POST /kms/reload` | `kms:ServiceControl` / high | no | pending | pending | Re-reads the cluster-persisted configuration without resubmitting secrets; response reuses the configure shape. |
 | `GET /kms/config` | `kms:Configure` / sensitive | no | no | supported | Redact operational paths before display. |
 | `POST /kms/clear-cache` | `kms:ClearCache` / high | no | no | supported | Keep the current `{status,message}` response stable. |
 | `POST /kms/keys` | `kms:Configure` / high | no | supported | supported | none |
@@ -52,7 +53,7 @@ One case is deliberately an error rather than a report: a listing that covered t
 
 ## Server-side snapshot coverage
 
-The merged #5626 producer snapshots cover the nine modern/legacy key response types and the metadata response type served by `kms_keys.rs` and `kms_key_metadata.rs`: create, describe, list, generate-data-key, delete, cancel-deletion, update-description, tag, and untag. The four dynamic responses served verbatim by `kms_dynamic.rs` are covered in `crates/kms/src/snapshots/`: configure, start, stop, and the `service-status` response.
+The merged #5626 producer snapshots cover the nine modern/legacy key response types and the metadata response type served by `kms_keys.rs` and `kms_key_metadata.rs`: create, describe, list, generate-data-key, delete, cancel-deletion, update-description, tag, and untag. The four dynamic responses served verbatim by `kms_dynamic.rs` are covered in `crates/kms/src/snapshots/`: configure, start, stop, and the `service-status` response. `POST /kms/reload` serves the same `ConfigureKmsResponse` type the configure snapshot pins; it adds no new wire shape.
 
 `POST /kms/clear-cache` now has a named `KmsClearCacheResponse` and a producer snapshot beside the others; its serialized bytes are unchanged from the inline JSON it replaced.
 
@@ -60,7 +61,7 @@ The remaining wire-shape gaps are intentionally documented rather than duplicate
 
 ## Client handoff gaps
 
-The `rc` client currently has status, key list/status/create/delete/cancel-deletion, configure/reconfigure/start/restart/stop, and diagnostic/roundtrip entry points. It has no lifecycle enable/disable/rotate, key metadata, or backup/restore commands. The console currently calls service-status, configure/reconfigure/start/stop/config, clear-cache, status, and the modern key CRUD routes. It has no lifecycle, metadata, or backup/restore UI. These pending cells are delivery items for `rustfs/cli` and `rustfs/console`; they are not implemented in this repository. A read-only issue search on 2026-08-02 found no matching KMS issue in either client repository, so the client handoff still needs issue creation there.
+The `rc` client currently has status, key list/status/create/delete/cancel-deletion, configure/reconfigure/start/restart/stop, and diagnostic/roundtrip entry points. It has no lifecycle enable/disable/rotate, key metadata, backup/restore, or reload commands; `POST /kms/reload` is the recovery path when a restarted server reports not-configured while a persisted configuration exists, so it is a client delivery item alongside the lifecycle gaps. The console currently calls service-status, configure/reconfigure/start/stop/config, clear-cache, status, and the modern key CRUD routes. It has no lifecycle, metadata, or backup/restore UI. These pending cells are delivery items for `rustfs/cli` and `rustfs/console`; they are not implemented in this repository. A read-only issue search on 2026-08-02 found no matching KMS issue in either client repository, so the client handoff still needs issue creation there.
 
 `POST /kms/generate-data-key` is deliberately marked “do not expose” for both clients: its response contains a base64 plaintext data key. `GET /kms/config` and backup status/restore responses contain operational paths and identifiers, not key material, but still require UI/CLI redaction and confirmation handling.
 

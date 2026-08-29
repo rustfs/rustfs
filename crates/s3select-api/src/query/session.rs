@@ -231,7 +231,7 @@ impl QueryExecutionTrackerInner {
 
     fn mark_timed_out(&self) -> Option<u8> {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 (state < EXECUTION_FINISHED).then_some(EXECUTION_TIMED_OUT)
             })
             .ok()

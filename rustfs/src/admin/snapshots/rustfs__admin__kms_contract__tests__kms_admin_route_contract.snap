@@ -173,6 +173,12 @@ expression: kms_route_contract()
   },
   {
     "method": "POST",
+    "path": "/rustfs/admin/v3/kms/reload",
+    "action": "kms:ServiceControl",
+    "risk": "High"
+  },
+  {
+    "method": "POST",
     "path": "/rustfs/admin/v3/kms/restore",
     "action": "kms:Restore",
     "risk": "High"

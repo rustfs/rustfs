@@ -210,6 +210,7 @@ async fn heal_object_marks_missing_shard_disk_dirty_for_capacity_manager() {
         scan_mode: HealScanMode::Deep,
         update_parity: true,
         no_lock: false,
+        read_repair: false,
         pool: None,
         set: None,
     };

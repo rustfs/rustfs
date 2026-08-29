@@ -490,7 +490,7 @@ impl ExpiryStats {
     }
 
     fn add_nonnegative(counter: &AtomicI64, delta: i64) {
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(delta).max(0)));
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(delta).max(0)));
     }
 
     fn increment_missed_expiry_tasks(&self) {

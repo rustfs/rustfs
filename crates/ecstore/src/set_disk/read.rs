@@ -1370,6 +1370,7 @@ impl SetDisks {
             prefer_data_blocks_first_reader_setup,
             get_codec_streaming_metrics_path(),
             false,
+            false,
         )
         .await
     }
@@ -1408,6 +1409,7 @@ impl SetDisks {
             prefer_data_blocks_first_reader_setup,
             GET_OBJECT_PATH_MID_SIZE_STREAMING,
             true,
+            true,
         )
         .await
     }
@@ -1428,6 +1430,7 @@ impl SetDisks {
         prefer_data_blocks_first_reader_setup: bool,
         metrics_path: &'static str,
         allow_inplace_legacy_fallback: bool,
+        single_inflight: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         let erasure = erasure_cache.get_for_file_info(fi)?;
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
@@ -1451,6 +1454,7 @@ impl SetDisks {
                 metrics_object_class,
                 metrics_size_bucket,
                 prefer_data_blocks_first_reader_setup,
+                single_inflight,
                 // Single-part objects keep the whole-request fallback: a degraded
                 // sole part is detected before any byte streams, so the caller can
                 // still hand the request to the legacy duplex path unchanged.
@@ -1504,6 +1508,7 @@ impl SetDisks {
             metrics_object_class,
             metrics_size_bucket,
             false,
+            false,
             // The first part stays eager and keeps the whole-request fallback:
             // if part 1 is already degraded, the entire GET drops to the legacy
             // duplex path before a single byte is streamed (semantics unchanged).
@@ -1551,6 +1556,7 @@ impl SetDisks {
                     ctx.metrics_object_class,
                     ctx.metrics_size_bucket,
                     false,
+                    false,
                     // backlog#879: later parts have already streamed earlier bytes,
                     // so a whole-request fallback is impossible here. Degrade this
                     // part in place to a legacy per-part decode reader instead of
@@ -1584,6 +1590,7 @@ impl SetDisks {
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
+        single_inflight: bool,
         allow_inplace_legacy_fallback: bool,
         metrics_path: &'static str,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
@@ -1704,11 +1711,23 @@ impl SetDisks {
         .with_deferred_parity_handles(deferred_stripe_handles)
         .with_deferred_parity_reopeners(deferred_reopeners);
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
-        let reader =
-            coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?;
-        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
-            coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
-        )))
+        let reader = if single_inflight {
+            coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
+                source,
+                engine,
+                part_length,
+                metrics_path,
+            )?
+        } else {
+            coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?
+        };
+        if single_inflight {
+            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(reader)))
+        } else {
+            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
+                coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
+            )))
+        }
     }
 }
 
@@ -4876,6 +4895,7 @@ mod tests {
             "test-size-bucket",
             false,
             false,
+            false,
             get_codec_streaming_metrics_path(),
         )
         .await;
@@ -4895,6 +4915,7 @@ mod tests {
             false,
             "test-object-class",
             "test-size-bucket",
+            false,
             false,
             false,
             get_codec_streaming_metrics_path(),

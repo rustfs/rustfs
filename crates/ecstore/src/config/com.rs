@@ -2361,6 +2361,7 @@ where
         scan_mode: HealScanMode::Deep,
         update_parity: false,
         no_lock: false,
+        read_repair: false,
         pool: None,
         set: None,
     };

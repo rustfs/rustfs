@@ -1,0 +1,172 @@
+name: RustFS Tier Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      rustfs_version:
+        description: 'RustFS release tag to test (e.g. 1.0.0-rc.4-preview.1)'
+        required: false
+        default: '1.0.0-rc.4-preview.1'
+      package_url:
+        description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
+        required: false
+        type: string
+  workflow_run:
+    # Strict shared-environment order: run after KMS test succeeds.
+    workflows: ["RustFS KMS Test"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustfs-shared-functional-tests
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+  RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+jobs:
+  tier-test:
+    runs-on: smoke-testing
+    timeout-minutes: 420
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          openssl version
+          df -h /data | tail -1
+
+      - name: Cleanup environment (before)
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
+            '
+          done
+
+      - name: Ensure MQTT broker + clients
+        run: |
+          if ! command -v mosquitto_sub >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y mosquitto mosquitto-clients
+          fi
+          sudo mkdir -p /etc/mosquitto/conf.d
+          printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/rustfs-test.conf >/dev/null
+          sudo systemctl restart mosquitto
+          sleep 2
+          ss -tln 2>/dev/null | grep -q ':1883' || { echo 'mosquitto not listening on 1883'; exit 1; }
+
+      - name: Run tier suite
+        id: test
+        env:
+          LOG_FILE: /tmp/rustfs-tier.log
+        run: |
+          set -euo pipefail
+          chmod +x auto-testing/rustfs-tier-test.sh
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          ARGS=(--all-topologies -y --log-file "${LOG_FILE}")
+          if [ -n "${PACKAGE_URL}" ]; then
+            ARGS+=(--package-url "${PACKAGE_URL}")
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            ARGS+=(--version "${RUSTFS_VERSION}")
+          else
+            ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
+          fi
+          ./auto-testing/rustfs-tier-test.sh "${ARGS[@]}"
+
+      - name: Generate report
+        if: always()
+        env:
+          LOG_FILE: /tmp/rustfs-tier.log
+          REPORT_FILE: /tmp/rustfs-tier-report.md
+        run: |
+          set -euo pipefail
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          fi
+          {
+            echo "# RustFS tier test report"
+            echo ""
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Package: ${PACKAGE_SOURCE}"
+            echo ""
+            echo "## Log tail"
+            echo '```text'
+            tail -n 200 "${LOG_FILE}" || true
+            echo '```'
+          } | tee "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload report and logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-tier-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-tier.log
+            /tmp/rustfs-tier-report.md
+          if-no-files-found: warn
+
+      - name: Cleanup environment (after)
+        if: always()
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
+            '
+          done
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS tier suite failed"
+          echo "See the uploaded report and log artifacts for details."

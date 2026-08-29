@@ -176,7 +176,7 @@ impl Default for ForegroundReadGuard {
 impl Drop for ForegroundReadGuard {
     fn drop(&mut self) {
         let _ =
-            SCANNER_FOREGROUND_STREAM_READS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+            SCANNER_FOREGROUND_STREAM_READS.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
     }
 }
 
@@ -206,7 +206,7 @@ impl ScannerRuntimeGuard {
 
 impl Drop for ScannerRuntimeGuard {
     fn drop(&mut self) {
-        let _ = SCANNER_RUNTIME_INSTANCES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+        let _ = SCANNER_RUNTIME_INSTANCES.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
     }
 }
 
@@ -217,8 +217,8 @@ fn reset_scanner_runtime_instances_for_test() {
 
 impl Drop for ScannerActivityGuard {
     fn drop(&mut self) {
-        let _ = SCANNER_ACTIVE_WORK_UNITS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(1)));
+        let _ =
+            SCANNER_ACTIVE_WORK_UNITS.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(1)));
     }
 }
 
@@ -499,7 +499,7 @@ pub(crate) async fn runtime_tier_registry() -> TierRegistrySnapshot {
 
 fn next_tier_registry_generation() -> u64 {
     TIER_REGISTRY_GENERATION
-        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| Some(current.saturating_add(1)))
+        .try_update(Ordering::AcqRel, Ordering::Relaxed, |current| Some(current.saturating_add(1)))
         .unwrap_or(u64::MAX)
 }
 

@@ -347,6 +347,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/kms/configure"),
         admin_route(Method::POST, "/v3/kms/start"),
         admin_route(Method::POST, "/v3/kms/stop"),
+        admin_route(Method::POST, "/v3/kms/reload"),
         admin_route(Method::GET, "/v3/kms/service-status"),
         admin_route(Method::POST, "/v3/kms/reconfigure"),
         admin_route(Method::POST, "/v3/kms/keys"),
@@ -1313,6 +1314,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/kms/create-key"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/key/create"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/configure"));
+    assert_route(&router, Method::POST, &admin_path("/v3/kms/reload"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/status"));
     assert_route(&router, Method::GET, &admin_path("/v3/kms/key/status"));

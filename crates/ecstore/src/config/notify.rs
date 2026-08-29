@@ -26,6 +26,12 @@ use std::sync::LazyLock;
 
 /// The default configuration collection of webhooks，
 /// Initialized only once during the program life cycle, enabling high-performance lazy loading.
+///
+/// This table has no `batch_size`/`max_retry`/`retry_interval`/`http_timeout` keys, unlike
+/// [`crate::config::audit::DEFAULT_AUDIT_WEBHOOK_KVS`] — matching MinIO upstream, whose
+/// `internal/config/notify/parse.go` `DefaultWebhookKVS` (bucket event notifications) also
+/// omits them while `internal/logger/config.go`'s `DefaultAuditWebhookKVS` carries them.
+/// Intentional, not a copy/paste gap (backlog#2054).
 pub static DEFAULT_NOTIFY_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
@@ -83,6 +89,12 @@ pub static DEFAULT_NOTIFY_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
 });
 
 /// MQTT's default configuration collection
+///
+/// `MQTT_QOS`/`MQTT_KEEP_ALIVE_INTERVAL`/`MQTT_RECONNECT_INTERVAL` default to `"0"`/`"0s"`/`"0s"`
+/// here, matching MinIO's `DefaultMQTTKVS` in `internal/config/notify/parse.go`
+/// byte-for-byte — this table is a faithful port. [`crate::config::audit::DEFAULT_AUDIT_MQTT_KVS`]
+/// uses stronger, RustFS-original defaults instead (MinIO has no MQTT audit target to compare
+/// against); that divergence is intentional, not a copy/paste gap (backlog#2054).
 pub static DEFAULT_NOTIFY_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {

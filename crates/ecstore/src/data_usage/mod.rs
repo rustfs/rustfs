@@ -578,7 +578,7 @@ pub(crate) async fn prepare_bucket_usage_for_namespace_change(
     guard: Option<&rustfs_lock::NamespaceLockGuard>,
 ) -> Result<(), Error> {
     ensure_bucket_namespace_guard(guard, bucket, "data usage cache cleanup")?;
-    let _ = USAGE_MEMORY_GENERATION.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(1)));
+    let _ = USAGE_MEMORY_GENERATION.try_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(1)));
     live_bucket_usage_cache().invalidate(bucket).await;
     clear_bucket_usage_memory(bucket, guard).await?;
 
@@ -1161,9 +1161,43 @@ fn select_admin_data_usage_snapshot(
         authoritative.usage_snapshot_converged = Some(true);
     }
     match observed {
+        Some(observed)
+            if observed.usage_snapshot_partial
+                && authoritative.is_complete_bucket_usage_snapshot()
+                && observed_data_usage_is_newer(&observed, &authoritative) =>
+        {
+            (merge_partial_observation_for_admin(authoritative, observed), true)
+        }
         Some(observed) if observed_data_usage_is_newer(&observed, &authoritative) => (observed, true),
         _ => (authoritative, authoritative_format),
     }
+}
+
+fn merge_partial_observation_for_admin(mut authoritative: DataUsageInfo, observed: DataUsageInfo) -> DataUsageInfo {
+    for (bucket, usage) in observed.buckets_usage {
+        authoritative.buckets_usage.insert(bucket, usage);
+    }
+
+    authoritative.last_update = observed.last_update;
+    authoritative.scanner_cycle = observed.scanner_cycle;
+    authoritative.scanner_epoch = observed.scanner_epoch;
+    authoritative.usage_snapshot_complete = false;
+    authoritative.usage_snapshot_partial = true;
+    authoritative.usage_snapshot_converged = Some(false);
+    authoritative.usage_snapshot_authoritative_baseline = observed.usage_snapshot_authoritative_baseline;
+    authoritative.usage_snapshot_set_states = observed.usage_snapshot_set_states;
+    authoritative.usage_snapshot_bootstrap_pending = false;
+    authoritative.buckets_count = authoritative.buckets_usage.len() as u64;
+    authoritative.bucket_sizes = authoritative
+        .buckets_usage
+        .iter()
+        .map(|(bucket, usage)| (bucket.clone(), usage.size))
+        .collect();
+    authoritative.replication_info.clear();
+    authoritative.tier_stats = None;
+    authoritative.unknown_tier_stats = None;
+    authoritative.calculate_totals();
+    authoritative
 }
 
 async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
@@ -3215,6 +3249,108 @@ mod tests {
         let (selected, _) = select_admin_data_usage_snapshot(authoritative, true, Some(partial));
         assert!(selected.usage_snapshot_partial);
         assert_eq!(selected.buckets_usage.get("bucket").map(|usage| usage.size), Some(100));
+    }
+
+    #[test]
+    fn partial_admin_observation_preserves_authoritative_cold_buckets() {
+        let baseline_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut authoritative = data_usage_info_for_test("cold", 152_318, 80 * 1024 * 1024 * 1024, baseline_time);
+        authoritative.scanner_epoch = Some(4);
+        authoritative.scanner_cycle = Some(10);
+        authoritative.buckets_usage.insert(
+            "hot".to_string(),
+            BucketUsageInfo {
+                objects_count: 3_000,
+                versions_count: 3_000,
+                size: 400 * 1024 * 1024,
+                ..Default::default()
+            },
+        );
+        authoritative.buckets_count = 2;
+        authoritative.bucket_sizes = authoritative
+            .buckets_usage
+            .iter()
+            .map(|(bucket, usage)| (bucket.clone(), usage.size))
+            .collect();
+        authoritative.calculate_totals();
+        authoritative.replication_info.insert(
+            "stale-target".to_string(),
+            BucketTargetUsageInfo {
+                replicated_size: 400 * 1024 * 1024,
+                replicated_count: 3_000,
+                ..Default::default()
+            },
+        );
+        authoritative.tier_stats = Some(rustfs_data_usage::AllTierStats {
+            tiers: HashMap::from([(
+                "WARM".to_string(),
+                rustfs_data_usage::TierStats {
+                    total_size: 80 * 1024 * 1024 * 1024,
+                    num_versions: 152_318,
+                    num_objects: 152_318,
+                },
+            )]),
+        });
+
+        let mut observed = DataUsageInfo {
+            last_update: Some(baseline_time + Duration::from_secs(1)),
+            scanner_epoch: Some(4),
+            scanner_cycle: Some(11),
+            usage_snapshot_complete: false,
+            usage_snapshot_partial: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(authoritative.snapshot_identity()),
+            usage_snapshot_set_states: vec![rustfs_data_usage::DataUsageSnapshotSetState {
+                pool_index: 0,
+                set_index: 0,
+                scanner_cycle: Some(11),
+                scanner_epoch: Some(4),
+                scan_plan_digest: Some([1; 32]),
+                complete: true,
+                tombstone: false,
+            }],
+            ..Default::default()
+        };
+        observed.buckets_usage.insert(
+            "hot".to_string(),
+            BucketUsageInfo {
+                objects_count: 34,
+                versions_count: 34,
+                size: 8 * 1024 * 1024,
+                ..Default::default()
+            },
+        );
+        observed.buckets_count = 1;
+        observed.bucket_sizes.insert("hot".to_string(), 8 * 1024 * 1024);
+        observed.calculate_totals();
+
+        let (selected, current_format) = select_admin_data_usage_snapshot(authoritative, true, Some(observed));
+
+        assert!(current_format);
+        assert!(!selected.usage_snapshot_complete);
+        assert!(selected.usage_snapshot_partial);
+        assert!(selected.is_valid_partial_snapshot());
+        assert_eq!(selected.usage_snapshot_converged, Some(false));
+        assert_eq!(selected.buckets_count, 2);
+        assert_eq!(
+            selected
+                .buckets_usage
+                .get("cold")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((152_318, 80 * 1024 * 1024 * 1024))
+        );
+        assert_eq!(
+            selected
+                .buckets_usage
+                .get("hot")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((34, 8 * 1024 * 1024))
+        );
+        assert_eq!(selected.objects_total_count, 152_352);
+        assert_eq!(selected.objects_total_size, 80 * 1024 * 1024 * 1024 + 8 * 1024 * 1024);
+        assert!(selected.replication_info.is_empty());
+        assert!(selected.tier_stats.is_none());
+        assert!(selected.unknown_tier_stats.is_none());
     }
 
     #[tokio::test]

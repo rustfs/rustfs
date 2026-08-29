@@ -259,6 +259,25 @@ impl KmsServiceManager {
         (state.status.clone(), config)
     }
 
+    /// Publish an initialization failure when no usable KMS state exists yet.
+    ///
+    /// Startup configuration discovery happens outside this crate. Recording
+    /// its failure here keeps status truthful without allowing a late failure
+    /// to replace an already configured or running service.
+    pub async fn record_initialization_error(&self, message: impl Into<String>) {
+        let _guard = self.lifecycle_mutex.lock().await;
+        let current = self.state.load_full();
+        if current.config.is_some() || current.current_service.is_some() {
+            return;
+        }
+
+        self.state.store(Arc::new(RuntimeState {
+            config: None,
+            status: KmsServiceStatus::Error(message.into()),
+            current_service: None,
+        }));
+    }
+
     fn redact_config(config: &mut KmsConfig) {
         if let BackendConfig::Static(static_config) = &mut config.backend_config {
             use zeroize::Zeroize;
@@ -847,6 +866,39 @@ mod tests {
         assert_eq!(manager.get_status().await, KmsServiceStatus::NotConfigured);
         assert!(manager.get_config().await.is_none());
         assert!(manager.get_encryption_service().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn initialization_error_is_visible_until_configuration_succeeds() {
+        let manager = KmsServiceManager::new();
+
+        manager
+            .record_initialization_error("persisted configuration could not be loaded")
+            .await;
+
+        assert_eq!(
+            manager.get_status().await,
+            KmsServiceStatus::Error("persisted configuration could not be loaded".to_string())
+        );
+        assert!(manager.get_config().await.is_none());
+
+        manager
+            .configure(static_config("key-a", 0x11))
+            .await
+            .expect("configure after startup failure");
+        assert_eq!(manager.get_status().await, KmsServiceStatus::Configured);
+    }
+
+    #[tokio::test]
+    async fn initialization_error_never_replaces_a_running_service() {
+        let manager = KmsServiceManager::new();
+        manager.configure(static_config("key-a", 0x11)).await.expect("configure");
+        manager.start().await.expect("start");
+
+        manager.record_initialization_error("late startup failure").await;
+
+        assert_eq!(manager.get_status().await, KmsServiceStatus::Running);
+        assert!(manager.get_encryption_service().await.is_some());
     }
 
     #[tokio::test]

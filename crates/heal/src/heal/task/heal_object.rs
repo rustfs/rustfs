@@ -158,13 +158,22 @@ impl HealTask {
             scan_mode: self.options.scan_mode,
             update_parity: self.options.update_parity,
             no_lock: self.options.no_lock,
+            read_repair: self.source == HealRequestSource::ReadRepair,
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
 
-        let heal_result = self
-            .await_with_control(self.storage.heal_object(bucket, object, version_id, &heal_opts))
-            .await;
+        let heal_fut = self.storage.heal_object(bucket, object, version_id, &heal_opts);
+        let heal_result = if self.source == HealRequestSource::ReadRepair {
+            let result = heal_fut.await;
+            if self.cancel_token.is_cancelled() {
+                Err(Error::TaskCancelled)
+            } else {
+                result
+            }
+        } else {
+            self.await_with_control(heal_fut).await
+        };
 
         match heal_result {
             Ok((result, error)) => {
@@ -375,6 +384,7 @@ impl HealTask {
             scan_mode: HealScanMode::Deep,
             update_parity: true,
             no_lock: self.options.no_lock,
+            read_repair: false,
             pool: None,
             set: None,
         };

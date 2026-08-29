@@ -237,7 +237,7 @@ impl DefaultAdminUsecase {
     /// namespace still contains, carries no usable information and is dropped
     /// exactly as before.
     fn narrow_data_usage_snapshot_to_measured_buckets(info: &mut DataUsageInfo, buckets: impl IntoIterator<Item = String>) {
-        if !info.is_complete_bucket_usage_snapshot() {
+        if !info.is_complete_bucket_usage_snapshot() && !info.is_valid_partial_snapshot() {
             *info = DataUsageInfo::default();
             return;
         }
@@ -758,6 +758,28 @@ mod tests {
         info.usage_snapshot_complete = false;
         DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-a".to_string()]);
         assert_eq!(info, DataUsageInfo::default());
+
+        // A structurally valid partial admin view can still carry useful
+        // conservative totals.
+        let mut info = measured("bucket-a");
+        info.usage_snapshot_complete = false;
+        info.usage_snapshot_partial = true;
+        info.usage_snapshot_converged = Some(false);
+        info.scanner_cycle = Some(11);
+        info.scanner_epoch = Some(4);
+        info.usage_snapshot_set_states = vec![rustfs_data_usage::DataUsageSnapshotSetState {
+            pool_index: 0,
+            set_index: 0,
+            scanner_cycle: Some(11),
+            scanner_epoch: Some(4),
+            scan_plan_digest: Some([1; 32]),
+            complete: true,
+            tombstone: false,
+        }];
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-a".to_string()]);
+        assert_eq!(info.usage_snapshot_converged, Some(false));
+        assert_eq!(info.buckets_count, 1);
+        assert_eq!(info.objects_total_count, 7);
 
         // An empty namespace with an empty snapshot stays a confirmed zero.
         let mut info = DataUsageInfo {
