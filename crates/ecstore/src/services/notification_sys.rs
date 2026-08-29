@@ -1995,9 +1995,7 @@ async fn scanner_activity_with_retry(client: &PeerRestClient, host: &str) -> Res
         Ok(result) => result,
         Err(_) => {
             client.evict_connection().await;
-            Err(Error::other(format!(
-                "scanner activity peer {host} timed out after retry ({SCANNER_ACTIVITY_PROBE_TIMEOUT:?})"
-            )))
+            Err(Error::Timeout)
         }
     }
 }
