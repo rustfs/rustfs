@@ -60,9 +60,10 @@ pub const REPLICATION_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &[
     "Destination.ReplicationTime",
 ];
 
-// v2: disableProxy moved from unsupported to writable (per-target read-proxy
-// opt-out is accepted by set-remote-target and the `proxy` update op).
-pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 2;
+// v3: temporary-credential fields are advertised as read-only historical
+// metadata. They remain decodable for MinIO and persisted-data compatibility,
+// but set-remote-target rejects them until refresh and rotation are supported.
+pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 3;
 
 pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     "sourcebucket",
@@ -89,6 +90,8 @@ pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     // (contract v2; previously only importable via MinIO bucket-targets.json).
     "disableProxy",
 ];
+
+pub const REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &["credentials.sessionToken", "credentials.expiration"];
 
 pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["edge", "edgeSyncBeforeExpiry"];
 

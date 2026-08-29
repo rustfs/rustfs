@@ -24,8 +24,9 @@ use crate::admin::runtime_sources::{
     DefaultAdminUsecase, QueryServerInfoRequest, current_endpoints_handle, default_admin_usecase, object_store_from_req,
 };
 use crate::admin::storage_api::bucket::replication::{
-    REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
-    REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+    REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_UNSUPPORTED_FIELDS,
+    REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
+    REPLICATION_WRITABLE_FIELDS,
 };
 use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
@@ -730,6 +731,15 @@ impl ReplicationCapabilities {
                         state: ReplicationFieldState::Supported,
                     })
                     .chain(
+                        REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS
+                            .iter()
+                            .copied()
+                            .map(|name| ReplicationFieldCapability {
+                                name,
+                                state: ReplicationFieldState::ReadOnlyHistorical,
+                            }),
+                    )
+                    .chain(
                         REMOTE_TARGET_UNSUPPORTED_FIELDS
                             .iter()
                             .copied()
@@ -1296,9 +1306,8 @@ mod tests {
         assert_eq!(response.summary.manual_transition_jobs.state, CapabilityState::Supported);
         assert_eq!(response.replication.contract_version, 1);
         assert_eq!(response.replication.bucket_replication.contract_version, 1);
-        // v2: disableProxy moved from unsupported to writable (per-target
-        // read-proxy opt-out reached the admin API).
-        assert_eq!(response.replication.remote_targets.contract_version, 2);
+        // v3: temporary-credential fields are explicitly historical-only.
+        assert_eq!(response.replication.remote_targets.contract_version, 3);
         assert_eq!(response.replication.bucket_replication.status.state, CapabilityState::Supported);
         assert_eq!(response.replication.remote_targets.status.state, CapabilityState::Supported);
         assert_eq!(
@@ -1347,6 +1356,17 @@ mod tests {
                 .iter()
                 .any(|field| field.name == "healthCheckDuration" && field.state == super::ReplicationFieldState::Supported)
         );
+        for name in ["credentials.sessionToken", "credentials.expiration"] {
+            assert!(
+                response
+                    .replication
+                    .remote_targets
+                    .fields
+                    .iter()
+                    .any(|field| field.name == name && field.state == super::ReplicationFieldState::ReadOnlyHistorical),
+                "remote target field {name} must be advertised as historical-only"
+            );
+        }
         assert_eq!(response.manual_transition_jobs.contract_version, 1);
         assert_eq!(response.manual_transition_jobs.status.state, CapabilityState::Supported);
         assert_eq!(response.manual_transition_jobs.modes, ["enqueue_only", "async"]);
@@ -1408,7 +1428,7 @@ mod tests {
         assert_eq!(value["summary"]["manual_transition_jobs"]["state"], "supported");
         assert_eq!(value["replication"]["contract_version"], 1);
         assert_eq!(value["replication"]["bucket_replication"]["contract_version"], 1);
-        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 2);
+        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 3);
         assert_eq!(value["replication"]["bucket_replication"]["status"]["state"], "supported");
         assert_eq!(value["replication"]["remote_targets"]["status"]["state"], "supported");
         assert_eq!(
@@ -1443,6 +1463,16 @@ mod tests {
                 .iter()
                 .any(|field| field["name"] == "healthCheckDuration" && field["state"] == "supported")
         );
+        for name in ["credentials.sessionToken", "credentials.expiration"] {
+            assert!(
+                value["replication"]["remote_targets"]["fields"]
+                    .as_array()
+                    .expect("remote target fields should be an array")
+                    .iter()
+                    .any(|field| field["name"] == name && field["state"] == "read_only_historical"),
+                "serialized remote target field {name} must be historical-only"
+            );
+        }
         assert_eq!(value["manual_transition_jobs"]["contract_version"], 1);
         assert_eq!(value["manual_transition_jobs"]["status"]["state"], "supported");
         assert_eq!(value["manual_transition_jobs"]["modes"], json!(["enqueue_only", "async"]));

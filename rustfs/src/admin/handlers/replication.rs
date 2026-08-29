@@ -23,9 +23,9 @@ use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
 use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_UNSUPPORTED_FIELDS;
-#[cfg(test)]
-use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_WRITABLE_FIELDS;
 use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
+#[cfg(test)]
+use crate::admin::storage_api::bucket::replication::{REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS};
 use crate::admin::storage_api::bucket::target::{
     BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
 };
@@ -1504,10 +1504,10 @@ impl Operation for ReplicationMrfHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetCredentialsRequest, RemoteTargetRequest,
-        ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params,
-        parse_remote_target_update_ops, render_mrf_backlog, render_replication_diff, unique_replication_peers,
-        validate_remote_target_tls_settings,
+        REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+        RemoteTargetCredentialsRequest, RemoteTargetRequest, ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp,
+        build_mrf_response, extract_query_params, parse_remote_target_update_ops, render_mrf_backlog, render_replication_diff,
+        unique_replication_peers, validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::{BucketTarget, Credentials as TargetCredentials, LatencyStat};
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -2104,12 +2104,20 @@ mod tests {
 
     #[test]
     fn remote_target_request_rejects_unimplemented_fields() {
-        for (field, value) in [
-            ("credentials.session_token", serde_json::json!("session-token")),
-            ("credentials.expiration", serde_json::json!("2026-01-01T00:00:00Z")),
-            ("api", serde_json::json!("s3v2")),
-            ("edge", serde_json::json!(true)),
-            ("edgeSyncBeforeExpiry", serde_json::json!(true)),
+        for (field, value, historical_field) in [
+            (
+                "credentials.session_token",
+                serde_json::json!("session-token"),
+                Some("credentials.sessionToken"),
+            ),
+            (
+                "credentials.expiration",
+                serde_json::json!("2026-01-01T00:00:00Z"),
+                Some("credentials.expiration"),
+            ),
+            ("api", serde_json::json!("s3v2"), None),
+            ("edge", serde_json::json!(true), None),
+            ("edgeSyncBeforeExpiry", serde_json::json!(true), None),
         ] {
             let mut request = valid_remote_target_request();
             if let Some((credential_field, credential_name)) = field.split_once('.') {
@@ -2125,6 +2133,12 @@ mod tests {
 
             assert!(err.to_string().contains(field));
             assert!(err.to_string().contains("not supported by this RustFS version"));
+            if let Some(historical_field) = historical_field {
+                assert!(
+                    REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS.contains(&historical_field),
+                    "rejected field {field} must be advertised as historical-only"
+                );
+            }
         }
     }
 
@@ -2500,6 +2514,17 @@ mod tests {
 
     #[test]
     fn remote_target_capability_fields_do_not_overlap() {
+        for field in REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS {
+            assert!(
+                !REMOTE_TARGET_WRITABLE_FIELDS.contains(field),
+                "remote target field {field} cannot be both historical-only and writable"
+            );
+            assert!(
+                !REMOTE_TARGET_UNSUPPORTED_FIELDS.contains(field),
+                "remote target field {field} cannot be both historical-only and unsupported"
+            );
+        }
+
         for field in REMOTE_TARGET_UNSUPPORTED_FIELDS {
             assert!(
                 !REMOTE_TARGET_WRITABLE_FIELDS.contains(field),
