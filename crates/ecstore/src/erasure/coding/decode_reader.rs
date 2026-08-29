@@ -27,6 +27,8 @@ use std::io;
 use std::io::ErrorKind;
 use std::pin::Pin;
 use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -37,6 +39,14 @@ const ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: &str = "RUSTFS_GET_CODEC_STRE
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: usize = 2;
 const FILL_POLICY_SINGLE_INFLIGHT: &str = "single_inflight";
 const FILL_POLICY_DUAL_INFLIGHT: &str = "dual_inflight";
+
+#[cfg(test)]
+static SINGLE_INFLIGHT_CONSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn test_single_inflight_construction_count() -> u64 {
+    SINGLE_INFLIGHT_CONSTRUCTIONS.load(Ordering::Relaxed)
+}
 
 type FillTask = oneshot::Receiver<FillResult>;
 
@@ -153,6 +163,23 @@ where
         metrics_path: &'static str,
     ) -> io::Result<Self> {
         Self::new_with_fill_policy_inner(source, engine, total_length, metrics_path, FillPolicy::from_env())
+    }
+
+    /// Construct the bounded reader without lookahead.
+    ///
+    /// Mid-size GETs are latency-sensitive and are already gated to a single
+    /// plain part. Keeping one stripe in flight avoids retaining a second
+    /// decoded output buffer while preserving the same source, reconstruction,
+    /// bitrot and cancellation semantics as the general streaming reader.
+    pub(crate) fn new_single_inflight_with_metrics_path(
+        source: S,
+        engine: E,
+        total_length: usize,
+        metrics_path: &'static str,
+    ) -> io::Result<Self> {
+        #[cfg(test)]
+        SINGLE_INFLIGHT_CONSTRUCTIONS.fetch_add(1, Ordering::Relaxed);
+        Self::new_with_fill_policy_inner(source, engine, total_length, metrics_path, FillPolicy::SingleInFlight)
     }
 
     fn new_with_fill_policy_inner(
@@ -602,7 +629,8 @@ where
 
         loop {
             if self.output_pos < self.output_buf.len() {
-                if self.prefetched_bufs.len() < self.fill_policy.max_inflight()
+                if self.fill_policy == FillPolicy::DualInFlight
+                    && self.prefetched_bufs.len() < self.fill_policy.max_inflight()
                     && self.prefetch_error.is_none()
                     && self.remaining > 0
                     && let Poll::Ready(result) = self.poll_prefetch(cx)
@@ -1621,6 +1649,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn single_inflight_reader_reads_full_body_without_lookahead() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..96u8).collect::<Vec<_>>();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let mut source = source_from_data(&erasure, &data, &[]);
+        source.read_count = Some(Arc::clone(&read_count));
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_single_inflight_with_metrics_path(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+        )
+        .expect("single-inflight reader should be constructed");
+        let mut decoded = Vec::new();
+
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("single-inflight reader should decode the complete body");
+
+        assert_eq!(decoded, data);
+        assert_eq!(
+            read_count.load(Ordering::SeqCst),
+            3,
+            "single-inflight must not read ahead after the final stripe"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_inflight_reader_preserves_partial_reads() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..83u8).collect::<Vec<_>>();
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let mut reader = ErasureDecodeReader::new_single_inflight_with_metrics_path(
+            source_from_data(&erasure, &data, &[]),
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+        )
+        .expect("single-inflight reader should be constructed");
+        let mut decoded = Vec::with_capacity(data.len());
+        let mut chunk = [0u8; 3];
+
+        loop {
+            let read = reader.read(&mut chunk).await.expect("partial read should succeed");
+            if read == 0 {
+                break;
+            }
+            decoded.extend_from_slice(&chunk[..read]);
+        }
+
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn single_inflight_reader_does_not_prefetch_before_output_is_drained() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..96u8).collect::<Vec<_>>();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let mut source = source_from_data(&erasure, &data, &[]);
+        source.read_count = Some(Arc::clone(&read_count));
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_single_inflight_with_metrics_path(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+        )
+        .expect("single-inflight reader should be constructed");
+        let mut first = [0u8; 3];
+
+        reader
+            .read_exact(&mut first)
+            .await
+            .expect("first partial read should succeed");
+
+        assert_eq!(
+            read_count.load(Ordering::SeqCst),
+            1,
+            "single-inflight must not prefetch while output remains"
+        );
+        assert_eq!(&first, &data[..3]);
+    }
+
+    #[tokio::test]
+    async fn single_inflight_reader_reconstructs_degraded_body() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..97u16).map(|value| value as u8).collect::<Vec<_>>();
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let mut reader = ErasureDecodeReader::new_single_inflight_with_metrics_path(
+            source_from_data(&erasure, &data, &[1]),
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+        )
+        .expect("single-inflight reader should be constructed");
+        let mut decoded = Vec::new();
+
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("a readable degraded stripe should be reconstructed");
+
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn single_inflight_reader_surfaces_error_after_buffered_body() {
+        let erasure = Erasure::new(4, 2, 32);
+        let first_stripe = (0..32u8).collect::<Vec<_>>();
+        let first_state = source_from_data(&erasure, &first_stripe, &[])
+            .stripes
+            .pop_front()
+            .expect("first stripe should exist");
+        let source = VecStripeSource {
+            stripes: VecDeque::from([
+                first_state,
+                StripeReadState::from_parts(Vec::new(), Vec::new(), erasure.data_shards),
+            ]),
+            read_quorum: erasure.data_shards,
+            read_count: None,
+        };
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_single_inflight_with_metrics_path(
+            source,
+            engine,
+            first_stripe.len() + 1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+        )
+        .expect("single-inflight reader should be constructed");
+        let mut decoded = Vec::new();
+
+        let error = reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect_err("short source error should be returned after buffered bytes");
+
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert_eq!(decoded, first_stripe);
+    }
+
+    #[tokio::test]
     async fn erasure_decode_reader_stops_at_eof_for_empty_object() {
         let erasure = Erasure::new(4, 2, 32);
         let source = source_from_data(&erasure, &[], &[]);
@@ -1882,14 +2053,9 @@ mod tests {
         };
         let engine = LegacyEcDecodeEngine::new(Erasure::new(1, 0, 32));
         let task = tokio::spawn(async move {
-            let mut reader = ErasureDecodeReader::new_with_fill_policy(
-                source,
-                engine,
-                1,
-                GET_OBJECT_PATH_CODEC_STREAMING,
-                FillPolicy::SingleInFlight,
-            )
-            .expect("reader should be constructed");
+            let mut reader =
+                ErasureDecodeReader::new_single_inflight_with_metrics_path(source, engine, 1, GET_OBJECT_PATH_CODEC_STREAMING)
+                    .expect("reader should be constructed");
             let mut first_read = [0u8; 1];
             let _ = reader.read(&mut first_read).await;
         });
@@ -2226,7 +2392,7 @@ mod tests {
             engine,
             data.len(),
             GET_OBJECT_PATH_CODEC_STREAMING,
-            FillPolicy::SingleInFlight,
+            FillPolicy::DualInFlight,
         )
         .expect("reader should be constructed");
         let mut first_read = [0u8; 1];
@@ -2235,13 +2401,11 @@ mod tests {
 
         assert_eq!(read, first_read.len());
         assert_eq!(first_read[0], data[0]);
-        timeout(Duration::from_secs(1), async {
-            while read_count.load(Ordering::SeqCst) < 2 {
-                yield_now().await;
-            }
-        })
-        .await
-        .expect("reader should start reading the next stripe before the current output buffer is fully consumed");
+        assert_eq!(
+            read_count.load(Ordering::SeqCst),
+            2,
+            "dual-inflight reader should prefetch the next stripe before returning the first byte"
+        );
     }
 
     #[tokio::test]
