@@ -25,6 +25,8 @@ use super::{
     session::QueryAdmission,
 };
 
+pub type DispatchedQuery = (Query, Output);
+
 #[async_trait]
 pub trait QueryDispatcher: Send + Sync {
     // fn create_query_id(&self) -> QueryId;
@@ -41,6 +43,18 @@ pub trait QueryDispatcher: Send + Sync {
         self.execute_query(query).await
     }
 
+    async fn dispatch_query(&self, query: &Query) -> QueryResult<DispatchedQuery> {
+        let execution_query = query.for_execution();
+        let output = self.execute_query(&execution_query).await?;
+        Ok((execution_query, output))
+    }
+
+    async fn dispatch_query_admitted(&self, query: &Query, admission: QueryAdmission) -> QueryResult<DispatchedQuery> {
+        let execution_query = query.for_execution();
+        let output = self.execute_query_admitted(&execution_query, admission).await?;
+        Ok((execution_query, output))
+    }
+
     async fn build_logical_plan(&self, query_state_machine: Arc<QueryStateMachine>) -> QueryResult<Option<Plan>>;
 
     async fn execute_logical_plan(&self, logical_plan: Plan, query_state_machine: Arc<QueryStateMachine>) -> QueryResult<Output>;
@@ -52,4 +66,186 @@ pub trait QueryDispatcher: Send + Sync {
     // fn running_query_status(&self) -> Vec<QueryStatus>;
 
     // fn cancel_query(&self, id: &QueryId);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::Context;
+    use parking_lot::Mutex;
+    use s3s::dto::{
+        CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentInput,
+        SelectObjectContentRequest,
+    };
+
+    #[derive(Default)]
+    struct DefaultDispatchDispatcher {
+        executed_metrics: Mutex<Vec<Arc<crate::SelectInputMetrics>>>,
+    }
+
+    #[async_trait]
+    impl QueryDispatcher for DefaultDispatchDispatcher {
+        async fn execute_query(&self, query: &Query) -> QueryResult<Output> {
+            self.executed_metrics.lock().push(Arc::clone(query.input_metrics()));
+            Ok(Output::Nil(()))
+        }
+
+        async fn build_logical_plan(&self, _query_state_machine: Arc<QueryStateMachine>) -> QueryResult<Option<Plan>> {
+            unreachable!("default dispatch test does not plan queries")
+        }
+
+        async fn execute_logical_plan(
+            &self,
+            _logical_plan: Plan,
+            _query_state_machine: Arc<QueryStateMachine>,
+        ) -> QueryResult<Output> {
+            unreachable!("default dispatch test does not execute plans")
+        }
+
+        async fn build_query_state_machine(&self, _query: Query) -> QueryResult<Arc<QueryStateMachine>> {
+            unreachable!("default dispatch test does not build state machines")
+        }
+    }
+
+    #[derive(Default)]
+    struct DistinctAdmittedDispatcher {
+        plain_metrics: Mutex<Vec<Arc<crate::SelectInputMetrics>>>,
+        admitted_metrics: Mutex<Vec<Arc<crate::SelectInputMetrics>>>,
+        fail_plain: bool,
+        fail_admitted: bool,
+    }
+
+    #[async_trait]
+    impl QueryDispatcher for DistinctAdmittedDispatcher {
+        async fn execute_query(&self, query: &Query) -> QueryResult<Output> {
+            self.plain_metrics.lock().push(Arc::clone(query.input_metrics()));
+            if self.fail_plain {
+                Err(crate::QueryError::Cancel)
+            } else {
+                Ok(Output::Nil(()))
+            }
+        }
+
+        async fn execute_query_admitted(&self, query: &Query, _admission: QueryAdmission) -> QueryResult<Output> {
+            self.admitted_metrics.lock().push(Arc::clone(query.input_metrics()));
+            if self.fail_admitted {
+                Err(crate::QueryError::Cancel)
+            } else {
+                Ok(Output::Nil(()))
+            }
+        }
+
+        async fn build_logical_plan(&self, _query_state_machine: Arc<QueryStateMachine>) -> QueryResult<Option<Plan>> {
+            unreachable!("dispatch routing test does not plan queries")
+        }
+
+        async fn execute_logical_plan(
+            &self,
+            _logical_plan: Plan,
+            _query_state_machine: Arc<QueryStateMachine>,
+        ) -> QueryResult<Output> {
+            unreachable!("dispatch routing test does not execute plans")
+        }
+
+        async fn build_query_state_machine(&self, _query: Query) -> QueryResult<Arc<QueryStateMachine>> {
+            unreachable!("dispatch routing test does not build state machines")
+        }
+    }
+
+    fn test_query() -> Query {
+        let input = SelectObjectContentInput {
+            bucket: "bucket".to_string(),
+            expected_bucket_owner: None,
+            key: "input.csv".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: "SELECT * FROM S3Object".to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput::default()),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        };
+        Query::new(Context { input: Arc::new(input) }, "SELECT * FROM S3Object".to_string())
+    }
+
+    #[tokio::test]
+    async fn plain_dispatch_propagates_override_errors() {
+        let dispatcher = DistinctAdmittedDispatcher {
+            fail_plain: true,
+            ..Default::default()
+        };
+
+        let error = match dispatcher.dispatch_query(&test_query()).await {
+            Err(error) => error,
+            Ok(_) => panic!("plain override error should propagate"),
+        };
+        assert!(matches!(error, crate::QueryError::Cancel));
+        assert_eq!(dispatcher.plain_metrics.lock().len(), 1);
+        assert!(dispatcher.admitted_metrics.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_dispatch_methods_use_distinct_execution_metrics() {
+        let dispatcher = DefaultDispatchDispatcher::default();
+        let query = test_query();
+
+        let (first, _) = dispatcher
+            .dispatch_query(&query)
+            .await
+            .expect("first dispatch should execute");
+        let (second, _) = dispatcher
+            .dispatch_query(&query)
+            .await
+            .expect("second dispatch should execute");
+        let (admitted, _) = dispatcher
+            .dispatch_query_admitted(&query, QueryAdmission::unmanaged())
+            .await
+            .expect("admitted dispatch should execute");
+        let executed_metrics = dispatcher.executed_metrics.lock();
+
+        assert!(!Arc::ptr_eq(first.input_metrics(), second.input_metrics()));
+        assert!(!Arc::ptr_eq(first.input_metrics(), admitted.input_metrics()));
+        assert!(Arc::ptr_eq(first.input_metrics(), &executed_metrics[0]));
+        assert!(Arc::ptr_eq(second.input_metrics(), &executed_metrics[1]));
+        assert!(Arc::ptr_eq(admitted.input_metrics(), &executed_metrics[2]));
+    }
+
+    #[tokio::test]
+    async fn admitted_dispatch_uses_the_admitted_override_and_propagates_errors() {
+        let dispatcher = DistinctAdmittedDispatcher::default();
+        let query = test_query();
+
+        let (dispatched, _) = dispatcher
+            .dispatch_query_admitted(&query, QueryAdmission::unmanaged())
+            .await
+            .expect("admitted dispatch should execute through its override");
+        assert!(dispatcher.plain_metrics.lock().is_empty());
+        {
+            let admitted_metrics = dispatcher.admitted_metrics.lock();
+            assert_eq!(admitted_metrics.len(), 1);
+            assert!(Arc::ptr_eq(dispatched.input_metrics(), &admitted_metrics[0]));
+        }
+
+        let failing = DistinctAdmittedDispatcher {
+            fail_admitted: true,
+            ..Default::default()
+        };
+        let error = match failing.dispatch_query_admitted(&query, QueryAdmission::unmanaged()).await {
+            Err(error) => error,
+            Ok(_) => panic!("admitted override error should propagate"),
+        };
+        assert!(matches!(error, crate::QueryError::Cancel));
+        assert!(failing.plain_metrics.lock().is_empty());
+        assert_eq!(failing.admitted_metrics.lock().len(), 1);
+    }
 }

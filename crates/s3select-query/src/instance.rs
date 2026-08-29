@@ -69,15 +69,15 @@ where
     }
 
     async fn execute(&self, query: &Query) -> QueryResult<QueryHandle> {
-        let result = self.query_dispatcher.execute_query(query).await?;
+        let (query, result) = self.query_dispatcher.dispatch_query(query).await?;
 
-        Ok(QueryHandle::new(query.clone(), result))
+        Ok(QueryHandle::new(query, result))
     }
 
     async fn execute_admitted(&self, query: &Query, admission: QueryAdmission) -> QueryResult<QueryHandle> {
-        let result = self.query_dispatcher.execute_query_admitted(query, admission).await?;
+        let (query, result) = self.query_dispatcher.dispatch_query_admitted(query, admission).await?;
 
-        Ok(QueryHandle::new(query.clone(), result))
+        Ok(QueryHandle::new(query, result))
     }
 
     async fn build_query_state_machine(&self, query: Query) -> QueryResult<QueryStateMachineRef> {
@@ -247,8 +247,19 @@ pub async fn make_rustfsms_with_components(
 mod tests {
     use std::sync::Arc;
 
+    use async_trait::async_trait;
     use datafusion::{arrow::util::pretty, assert_batches_eq};
-    use rustfs_s3select_api::query::{Context, Query};
+    use parking_lot::Mutex;
+    use rustfs_s3select_api::{
+        QueryResult, SelectInputMetrics,
+        query::{
+            Context, Query,
+            dispatcher::QueryDispatcher,
+            execution::{Output, QueryStateMachine},
+            logical_planner::Plan,
+        },
+        server::dbms::DatabaseManagerSystem,
+    };
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, FieldDelimiter, FileHeaderInfo, InputSerialization, OutputSerialization,
         RecordDelimiter, SelectObjectContentInput, SelectObjectContentRequest,
@@ -257,9 +268,65 @@ mod tests {
     use crate::get_global_db;
 
     use super::{
-        DEFAULT_MAX_CONCURRENT_QUERIES, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_QUERY_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS,
+        DEFAULT_MAX_CONCURRENT_QUERIES, DEFAULT_MEMORY_LIMIT_BYTES, DEFAULT_QUERY_TIMEOUT_SECS, MAX_QUERY_TIMEOUT_SECS, RustFSms,
         S3SelectRuntimeConfig, bounded_u64_from_env_value, bounded_usize_from_env_value, target_partitions_from_env_value,
     };
+
+    #[derive(Default)]
+    struct FreshMetricsDispatcher {
+        executed_metrics: Mutex<Vec<Arc<SelectInputMetrics>>>,
+    }
+
+    #[async_trait]
+    impl QueryDispatcher for FreshMetricsDispatcher {
+        async fn execute_query(&self, query: &Query) -> QueryResult<Output> {
+            self.executed_metrics.lock().push(Arc::clone(query.input_metrics()));
+            Ok(Output::Nil(()))
+        }
+
+        async fn build_logical_plan(&self, _query_state_machine: Arc<QueryStateMachine>) -> QueryResult<Option<Plan>> {
+            unreachable!("fresh metrics test does not plan queries")
+        }
+
+        async fn execute_logical_plan(
+            &self,
+            _logical_plan: Plan,
+            _query_state_machine: Arc<QueryStateMachine>,
+        ) -> QueryResult<Output> {
+            unreachable!("fresh metrics test does not execute plans")
+        }
+
+        async fn build_query_state_machine(&self, _query: Query) -> QueryResult<Arc<QueryStateMachine>> {
+            unreachable!("fresh metrics test does not build state machines")
+        }
+    }
+
+    fn metrics_test_query() -> Query {
+        let expression = "SELECT * FROM S3Object";
+        let input = SelectObjectContentInput {
+            bucket: "bucket".to_string(),
+            expected_bucket_owner: None,
+            key: "input.csv".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: expression.to_string(),
+                expression_type: ExpressionType::from_static(ExpressionType::SQL),
+                input_serialization: InputSerialization {
+                    csv: Some(CSVInput::default()),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    csv: Some(CSVOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        };
+        Query::new(Context { input: Arc::new(input) }, expression.to_string())
+    }
 
     #[test]
     fn parses_target_partitions_from_env_value() {
@@ -289,6 +356,26 @@ mod tests {
         assert_eq!(bounded_u64_from_env_value(Some("0"), 300, MAX_QUERY_TIMEOUT_SECS), 300);
         assert_eq!(bounded_u64_from_env_value(Some("86401"), 300, MAX_QUERY_TIMEOUT_SECS), 300);
         assert_eq!(bounded_u64_from_env_value(None, 300, MAX_QUERY_TIMEOUT_SECS), 300);
+    }
+
+    #[tokio::test]
+    async fn repeated_execute_returns_the_fresh_dispatched_query_metrics() {
+        let dispatcher = Arc::new(FreshMetricsDispatcher::default());
+        let db = RustFSms {
+            query_dispatcher: Arc::clone(&dispatcher),
+        };
+        let query = metrics_test_query();
+
+        let first = db.execute(&query).await.expect("first execution should succeed");
+        let second = db.execute(&query).await.expect("second execution should succeed");
+        let executed_metrics = dispatcher.executed_metrics.lock();
+
+        assert_eq!(executed_metrics.len(), 2);
+        assert!(Arc::ptr_eq(first.query().input_metrics(), &executed_metrics[0]));
+        assert!(Arc::ptr_eq(second.query().input_metrics(), &executed_metrics[1]));
+        assert!(!Arc::ptr_eq(first.query().input_metrics(), second.query().input_metrics()));
+        assert!(!Arc::ptr_eq(first.query().input_metrics(), query.input_metrics()));
+        assert!(!Arc::ptr_eq(second.query().input_metrics(), query.input_metrics()));
     }
 
     #[tokio::test]
