@@ -22,7 +22,8 @@ use std::sync::{Arc, LazyLock, RwLock};
 use self::heal_info::{BackgroundHealInfoReadStatus, read_background_heal_info_with_epoch, save_background_heal_info_for_epoch};
 use crate::data_usage_define::{
     BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH, DATA_USAGE_OBSERVED_OBJ_NAME_PATH,
-    DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_revision, read_config_with_revision,
+    DATA_USAGE_RECOVERY_PATH, DataUsageCache, DataUsageCacheRevision, LEGACY_DATA_USAGE_OBJ_NAME_PATH, read_config_revision,
+    read_config_with_revision,
 };
 use crate::runtime_config::{
     ScannerRuntimeConfig, ScannerRuntimeConfigSource, refresh_scanner_runtime_config_from_global, scanner_bitrot_cycle,
@@ -292,6 +293,14 @@ fn record_scanner_leader_lock_state(state: &'static str) {
         "state" => state
     )
     .increment(1);
+}
+
+async fn finish_scanner_leader_iteration(lock_lost: bool, state: &'static str, error: String) {
+    reset_scanner_cycle_schedule();
+    let liveness_already_recorded = lock_lost && !global_metrics().report().await.leader_lock_held_by_this_process;
+    if !liveness_already_recorded {
+        global_metrics().record_scanner_leader_liveness(state, false, error).await;
+    }
 }
 
 #[cfg(test)]
@@ -760,6 +769,13 @@ fn prepare_cycle_for_usage_floor_bootstrap(
                 *cycle_info = CurrentCycle::default();
             }
             (true, usage_floor.leader_epoch == 0)
+        }
+        PersistedUsageFloorStartup::RecoveredLegacyEmptyFence => {
+            // The legacy empty fence proves only its leader epoch, not
+            // namespace coverage. Restart coverage from zero while retaining
+            // that epoch as the lower bound for the next leadership claim.
+            *cycle_info = CurrentCycle::default();
+            (true, true)
         }
     }
 }
@@ -2240,6 +2256,7 @@ async fn run_data_scanner_with_maintenance_state(
     {
         let Some((features, generation)) = detect_stable_scanner_maintenance_features(&ctx, &storeapi).await else {
             global_metrics().set_cycle(None).await;
+            finish_scanner_leader_iteration(false, "stopped", String::new()).await;
             return Ok(());
         };
         maintenance_features = features;
@@ -2266,16 +2283,19 @@ async fn run_data_scanner_with_maintenance_state(
             } => (cycle, leader_epoch, revision),
             ScannerCycleStateStartup::Blocked => {
                 global_metrics().set_cycle(None).await;
+                finish_scanner_leader_iteration(false, "stopped", String::new()).await;
                 return Ok(());
             }
             ScannerCycleStateStartup::Transient(err) => {
                 global_metrics().set_cycle(None).await;
+                finish_scanner_leader_iteration(false, "stopped", String::new()).await;
                 return Err(err);
             }
         };
     let (usage_floor, usage_floor_startup) = match persisted_usage_floor_for_startup(storeapi.clone(), true).await {
         Ok(result) => result,
         Err(err) => {
+            let error = err.to_string();
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
@@ -2286,7 +2306,9 @@ async fn run_data_scanner_with_maintenance_state(
                 error = %err,
                 "Scanner stopped because the persisted usage floor could not be loaded"
             );
+            record_scanner_usage_floor_failure(error.clone());
             global_metrics().set_cycle(None).await;
+            finish_scanner_leader_iteration(false, "usage_floor_load_failed", error).await;
             return Ok(());
         }
     };
@@ -2294,10 +2316,13 @@ async fn run_data_scanner_with_maintenance_state(
         prepare_cycle_for_usage_floor_bootstrap(&mut cycle_info, usage_floor, usage_floor_startup);
     apply_persisted_usage_floor(&mut cycle_info, &mut leader_epoch, usage_floor);
     match usage_floor_startup {
-        PersistedUsageFloorStartup::Authoritative | PersistedUsageFloorStartup::BootstrapPending => {}
+        PersistedUsageFloorStartup::Authoritative
+        | PersistedUsageFloorStartup::BootstrapPending
+        | PersistedUsageFloorStartup::RecoveredLegacyEmptyFence => {}
         PersistedUsageFloorStartup::Missing => {
             if ctx.is_cancelled() || guard.is_lock_lost() {
                 global_metrics().set_cycle(None).await;
+                finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
                 return Ok(());
             }
 
@@ -2322,10 +2347,12 @@ async fn run_data_scanner_with_maintenance_state(
                         "Scanner stopped because the usage baseline bootstrap could not be initialized"
                     );
                     global_metrics().set_cycle(None).await;
+                    finish_scanner_leader_iteration(false, "usage_floor_bootstrap_failed", err.to_string()).await;
                     return Ok(());
                 }
                 None => {
                     global_metrics().set_cycle(None).await;
+                    finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
                     return Ok(());
                 }
             }
@@ -2334,6 +2361,7 @@ async fn run_data_scanner_with_maintenance_state(
 
     if ctx.is_cancelled() || guard.is_lock_lost() {
         global_metrics().set_cycle(None).await;
+        finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
         return Ok(());
     }
     let claim_ctx = ctx.child_token();
@@ -2355,6 +2383,7 @@ async fn run_data_scanner_with_maintenance_state(
     if guard.is_lock_lost() {
         record_scanner_leader_lock_lost("Scanner leader lock lost while claiming the leadership epoch").await;
         global_metrics().set_cycle(None).await;
+        finish_scanner_leader_iteration(true, "lost", String::new()).await;
         return Ok(());
     }
     if !leadership_claimed {
@@ -2367,10 +2396,26 @@ async fn run_data_scanner_with_maintenance_state(
             state = "epoch_claim_failed",
             "Scanner stopped because the leadership epoch could not be claimed"
         );
-        global_metrics()
-            .record_scanner_leader_liveness("epoch_claim_failed", false, "leadership epoch claim failed")
-            .await;
         global_metrics().set_cycle(None).await;
+        finish_scanner_leader_iteration(false, "epoch_claim_failed", "leadership epoch claim failed".to_string()).await;
+        return Ok(());
+    }
+    if usage_floor_startup == PersistedUsageFloorStartup::RecoveredLegacyEmptyFence
+        && let Err(err) = complete_legacy_empty_usage_floor_recovery(storeapi.clone(), leader_epoch).await
+    {
+        let error = err.to_string();
+        warn!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            state = "usage_floor_recovery_cleanup_deferred",
+            path = %DATA_USAGE_RECOVERY_PATH.as_str(),
+            error = %err,
+            "Scanner usage floor recovery marker cleanup was deferred"
+        );
+        global_metrics().set_cycle(None).await;
+        finish_scanner_leader_iteration(false, "usage_floor_recovery_pending", error).await;
         return Ok(());
     }
 
@@ -2382,6 +2427,7 @@ async fn run_data_scanner_with_maintenance_state(
         if guard.is_lock_lost() {
             record_scanner_leader_lock_lost("Scanner leader lock lost before the initial cycle").await;
             global_metrics().set_cycle(None).await;
+            finish_scanner_leader_iteration(true, "lost", String::new()).await;
             return Ok(());
         }
         let cycle_ctx = ctx.child_token();
@@ -2405,10 +2451,12 @@ async fn run_data_scanner_with_maintenance_state(
             ScannerCycleWaitOutcome::LockLost => {
                 record_scanner_leader_lock_lost("Scanner leader lock lost during the initial cycle").await;
                 global_metrics().set_cycle(None).await;
+                finish_scanner_leader_iteration(true, "lost", String::new()).await;
                 return Ok(());
             }
             ScannerCycleWaitOutcome::Cancelled => {
                 global_metrics().set_cycle(None).await;
+                finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
                 return Ok(());
             }
             ScannerCycleWaitOutcome::Deadline { worker_stopped } => {
@@ -2425,6 +2473,7 @@ async fn run_data_scanner_with_maintenance_state(
                     &mut guard,
                 )
                 .await;
+                finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
                 return Ok(());
             }
         };
@@ -2434,6 +2483,7 @@ async fn run_data_scanner_with_maintenance_state(
         if guard.is_lock_lost() {
             record_scanner_leader_lock_lost("Scanner leader lock lost during the initial cycle").await;
             global_metrics().set_cycle(None).await;
+            finish_scanner_leader_iteration(true, "lost", String::new()).await;
             return Ok(());
         }
         let runtime_config = resolve_scanner_runtime_config();
@@ -2666,10 +2716,12 @@ async fn run_data_scanner_with_maintenance_state(
             ScannerCycleWaitOutcome::LockLost => {
                 record_scanner_leader_lock_lost("Scanner leader lock lost during a scanner cycle").await;
                 global_metrics().set_cycle(None).await;
+                finish_scanner_leader_iteration(true, "lost", String::new()).await;
                 return Ok(());
             }
             ScannerCycleWaitOutcome::Cancelled => {
                 global_metrics().set_cycle(None).await;
+                finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
                 return Ok(());
             }
             ScannerCycleWaitOutcome::Deadline { worker_stopped } => {
@@ -2686,6 +2738,7 @@ async fn run_data_scanner_with_maintenance_state(
                     &mut guard,
                 )
                 .await;
+                finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
                 return Ok(());
             }
         };
@@ -2771,10 +2824,7 @@ async fn run_data_scanner_with_maintenance_state(
     }
 
     global_metrics().set_cycle(None).await;
-    reset_scanner_cycle_schedule();
-    if !guard.is_lock_lost() {
-        global_metrics().record_scanner_leader_liveness("stopped", false, "").await;
-    }
+    finish_scanner_leader_iteration(guard.is_lock_lost(), "stopped", String::new()).await;
 
     debug!(
         target: "rustfs::scanner",
