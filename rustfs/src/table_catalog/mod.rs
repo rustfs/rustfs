@@ -101,6 +101,7 @@ pub(crate) const TABLE_RESOURCE_MARKER_VERSION: u16 = 1;
 )]
 pub(crate) const TABLE_METADATA_POINTER_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
+pub(crate) const TABLE_RENAME_INTENT_VERSION: u16 = 1;
 pub(crate) const TABLE_WAREHOUSE_INDEX_STATE_VERSION: u16 = 2;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
@@ -166,6 +167,7 @@ const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
 const WAREHOUSE_INDEX_ROOT: &str = "warehouse-index";
 const WAREHOUSE_INDEX_STATE_FILE: &str = "state.json";
+const TABLE_RENAME_ROOT: &str = "renames";
 const WAREHOUSE_INDEX_MAX_PREFIX_DEPTH: usize = 64;
 const EXTERNAL_CATALOG_ROOT: &str = "external-catalog";
 const EXTERNAL_CATALOG_BRIDGE_FILE: &str = "bridge.json";

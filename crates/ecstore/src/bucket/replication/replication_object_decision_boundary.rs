@@ -23,5 +23,5 @@ pub(crate) use rustfs_replication::{
     delete_replication_object_opts, heal_uses_delete_replication_path, is_object_lock_denied_delete,
     is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome, replication_etags_match,
     replication_multipart_complete_actual_size, replication_multipart_part_plan, resync_existing_delete_replication_info,
-    resync_target_for_object, should_retry_delete_marker_purge, target_delete_version_id,
+    resync_target_for_object, should_retry_delete_marker_purge, single_part_replica_etag_mismatch, target_delete_version_id,
 };
