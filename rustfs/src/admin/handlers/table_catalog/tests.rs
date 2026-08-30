@@ -10797,7 +10797,7 @@ async fn namespace_helpers_call_catalog_store() {
 #[tokio::test]
 #[serial_test::serial]
 async fn namespace_property_handler_updates_object_backed_catalog_and_maps_errors() {
-    use rustfs_storage_api::{BucketOperations as _, MakeBucketOptions};
+    use crate::admin::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 
     temp_env::async_with_vars(
         [(
