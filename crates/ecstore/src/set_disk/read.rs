@@ -89,6 +89,8 @@ use super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT;
 #[cfg(test)]
 use super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE;
 #[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE;
+#[cfg(test)]
 use super::ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE;
 #[cfg(test)]
 use super::ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH;
@@ -125,6 +127,8 @@ use super::is_get_metadata_data_read_early_stop_enabled;
 use super::is_get_metadata_early_stop_bounded_fanout_enabled;
 #[cfg(test)]
 use super::is_get_metadata_early_stop_enabled;
+#[cfg(test)]
+use super::is_get_metadata_two_phase_read_plan_enabled;
 #[cfg(test)]
 use super::is_version_early_stop_enabled;
 #[cfg(test)]
@@ -4265,6 +4269,19 @@ mod tests {
                 assert!(is_get_metadata_early_stop_bounded_fanout_enabled());
             },
         );
+    }
+
+    #[test]
+    fn two_phase_read_plan_gate_defaults_off_and_honors_override() {
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, None::<&str>, || {
+            assert!(!is_get_metadata_two_phase_read_plan_enabled());
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true"), || {
+            assert!(is_get_metadata_two_phase_read_plan_enabled());
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("false"), || {
+            assert!(!is_get_metadata_two_phase_read_plan_enabled());
+        });
     }
 
     #[test]

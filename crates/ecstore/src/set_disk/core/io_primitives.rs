@@ -49,10 +49,11 @@ use super::super::{
     capacity_scope_from_disks, coding, collect_inline_data_shard_fileinfos_by_index_or_reason, current_dirty_generation, debug,
     disk, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info, inline_erasure_shard_file_offset,
     inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found, is_get_metadata_data_read_early_stop_enabled,
-    is_get_metadata_early_stop_bounded_fanout_enabled, is_get_metadata_early_stop_enabled, is_object_dangling,
-    is_version_early_stop_enabled, issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure,
-    merge_file_meta_versions, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs, reduce_write_quorum_errs,
-    send_heal_request_with_admission, should_prevent_write, to_object_err, try_read_inline_data_shards_direct, warn,
+    is_get_metadata_early_stop_bounded_fanout_enabled, is_get_metadata_early_stop_enabled,
+    is_get_metadata_two_phase_read_plan_enabled, is_object_dangling, is_version_early_stop_enabled, issue3031_diag_enabled,
+    join_all, join_errs, log_multipart_write_quorum_failure, merge_file_meta_versions, path_join_buf, record_global_dirty_scope,
+    reduce_read_quorum_errs, reduce_write_quorum_errs, send_heal_request_with_admission, should_prevent_write, to_object_err,
+    try_read_inline_data_shards_direct, warn,
 };
 #[cfg(test)]
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
@@ -1081,6 +1082,50 @@ fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Op
         return Some(GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_SIZE);
     }
     None
+}
+
+fn non_inline_data_read_candidate_is_safe(
+    candidate: &FileInfo,
+    parts_metadata: &[FileInfo],
+    disks: &[Option<DiskStore>],
+) -> bool {
+    if candidate.inline_data()
+        || candidate.is_compressed()
+        || candidate.is_remote()
+        || candidate
+            .metadata
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
+        || candidate.parts.len() != 1
+    {
+        return false;
+    }
+    let Ok(erasure) = coding::Erasure::try_new_with_options(
+        candidate.erasure.data_blocks,
+        candidate.erasure.parity_blocks,
+        candidate.erasure.block_size,
+        candidate.uses_legacy_checksum,
+    ) else {
+        return false;
+    };
+    // The regular reader setup can reconstruct missing data shards from any
+    // `data_shards` matching metadata entries. Requiring every data slot here
+    // would unnecessarily wait for one slow data disk even when parity and
+    // the remaining data shards already form a read quorum.
+    let mut available_shards = vec![false; erasure.data_shards + erasure.parity_shards];
+    for ((file_info, disk), &erasure_index) in parts_metadata
+        .iter()
+        .zip(disks.iter())
+        .zip(candidate.erasure.distribution.iter())
+    {
+        if erasure_index == 0 || erasure_index > available_shards.len() || disk.is_none() {
+            continue;
+        }
+        if metadata_early_stop_candidate_matches(file_info, candidate) && file_info.erasure.index == erasure_index {
+            available_shards[erasure_index - 1] = true;
+        }
+    }
+    available_shards.into_iter().filter(|present| *present).count() >= erasure.data_shards
 }
 
 fn data_read_inline_missing_shards_are_pending(
@@ -2869,6 +2914,7 @@ impl SetDisks {
                 read_data,
                 healing,
                 incl_free_versions,
+                read_data && is_get_metadata_two_phase_read_plan_enabled(),
                 default_parity_count,
                 allow_coalescing,
             )
@@ -3008,6 +3054,7 @@ impl SetDisks {
         read_data: bool,
         healing: bool,
         incl_free_versions: bool,
+        allow_non_inline_data_read_early_stop: bool,
         default_parity_count: usize,
         allow_coalescing: bool,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
@@ -3096,6 +3143,8 @@ impl SetDisks {
                             && read_data
                             && !force_full_wait
                             && let Some(reason) = data_read_early_stop_inline_candidate_miss_reason(&file_info)
+                            && !(allow_non_inline_data_read_early_stop
+                                && reason == GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE)
                         {
                             force_full_wait = true;
                             final_miss_reason_override.get_or_insert(reason);
@@ -3126,6 +3175,12 @@ impl SetDisks {
             {
                 let should_return_early = if read_data {
                     match accumulator.candidate.as_ref() {
+                        Some(candidate)
+                            if allow_non_inline_data_read_early_stop
+                                && non_inline_data_read_candidate_is_safe(candidate, &ress, disks) =>
+                        {
+                            true
+                        }
                         Some(candidate) => match data_read_early_stop_inline_body_miss_reason(
                             bucket.as_ref(),
                             object.as_ref(),
