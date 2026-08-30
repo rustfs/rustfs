@@ -128,7 +128,7 @@ use super::is_get_metadata_early_stop_bounded_fanout_enabled;
 #[cfg(test)]
 use super::is_get_metadata_early_stop_enabled;
 #[cfg(test)]
-use super::is_get_metadata_two_phase_read_plan_enabled;
+use super::is_get_metadata_non_inline_data_read_early_stop_enabled;
 #[cfg(test)]
 use super::is_version_early_stop_enabled;
 #[cfg(test)]
@@ -4272,15 +4272,16 @@ mod tests {
     }
 
     #[test]
-    fn two_phase_read_plan_gate_defaults_off_and_honors_override() {
+    #[serial(body_cache_hook)]
+    fn non_inline_data_read_early_stop_gate_defaults_off_and_honors_override() {
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, None::<&str>, || {
-            assert!(!is_get_metadata_two_phase_read_plan_enabled());
+            assert!(!is_get_metadata_non_inline_data_read_early_stop_enabled());
         });
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true"), || {
-            assert!(is_get_metadata_two_phase_read_plan_enabled());
+            assert!(is_get_metadata_non_inline_data_read_early_stop_enabled());
         });
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("false"), || {
-            assert!(!is_get_metadata_two_phase_read_plan_enabled());
+            assert!(!is_get_metadata_non_inline_data_read_early_stop_enabled());
         });
     }
 
