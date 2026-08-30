@@ -13,6 +13,43 @@
 // limitations under the License.
 
 use datafusion::sql::sqlparser::ast::Statement;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonPathSegment {
+    Key { name: String, quoted: bool },
+    Index(usize),
+    ArrayWildcard,
+    ObjectWildcard,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JsonSource {
+    path: Arc<[JsonPathSegment]>,
+    scalar_column: Option<String>,
+}
+
+impl JsonSource {
+    pub fn new(path: Vec<JsonPathSegment>, scalar_column: Option<String>) -> Self {
+        Self {
+            path: path.into(),
+            scalar_column,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_path(path: Vec<JsonPathSegment>) -> Self {
+        Self::new(path, None)
+    }
+
+    pub fn path(&self) -> &[JsonPathSegment] {
+        &self.path
+    }
+
+    pub fn scalar_column(&self) -> Option<&str> {
+        self.scalar_column.as_deref()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtStatement {

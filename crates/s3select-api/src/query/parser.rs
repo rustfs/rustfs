@@ -34,6 +34,10 @@ impl Dialect for RustFsDialect {
     fn supports_group_by_expr(&self) -> bool {
         true
     }
+
+    fn supports_partiql(&self) -> bool {
+        true
+    }
 }
 
 pub trait Parser {

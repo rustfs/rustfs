@@ -27,6 +27,9 @@ use std::time::Duration;
 const BUCKET: &str = "test-sql-bucket";
 const CSV_OBJECT: &str = "test-data.csv";
 const JSON_OBJECT: &str = "test-data.json";
+const JSON_DOCUMENT_OBJECT: &str = "nested-data.json";
+const JSON_ROOT_ARRAY_OBJECT: &str = "root-array.json";
+const JSON_ROOT_SCALAR_ARRAY_OBJECT: &str = "root-scalars.json";
 const SELECT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -72,6 +75,51 @@ async fn upload_test_json(client: &Client) -> TestResult<()> {
         .send()
         .await?;
     Ok(())
+}
+
+async fn upload_nested_json_document(client: &Client) -> TestResult<()> {
+    let json_data = r#"{"departments":[{"employees":[{"name":"Alice","active":true},{"name":"Bob","active":false}]},{"employees":[{"name":"Charlie","active":true}]}]}"#;
+
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(JSON_DOCUMENT_OBJECT)
+        .body(Bytes::from_static(json_data.as_bytes()).into())
+        .send()
+        .await?;
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(JSON_ROOT_ARRAY_OBJECT)
+        .body(Bytes::from_static(br#"[{"name":"Alice"},{"name":"Bob"}]"#).into())
+        .send()
+        .await?;
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(JSON_ROOT_SCALAR_ARRAY_OBJECT)
+        .body(Bytes::from_static(b"[1,2]").into())
+        .send()
+        .await?;
+    Ok(())
+}
+
+async fn select_json_document(client: &Client, key: &str, expression: &str) -> TestResult<String> {
+    let response = client
+        .select_object_content()
+        .bucket(BUCKET)
+        .key(key)
+        .expression(expression)
+        .expression_type(ExpressionType::Sql)
+        .input_serialization(
+            InputSerialization::builder()
+                .json(JsonInput::builder().set_type(Some(JsonType::Document)).build())
+                .build(),
+        )
+        .output_serialization(OutputSerialization::builder().json(JsonOutput::builder().build()).build())
+        .send()
+        .await?;
+    process_select_response(response).await
 }
 
 async fn process_select_response(
@@ -362,6 +410,107 @@ async fn test_select_object_content_json_basic() -> TestResult<()> {
     assert!(result_str.contains("30"));
     assert!(result_str.contains("35"));
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_select_object_content_nested_json_source_path() -> TestResult<()> {
+    let (_env, client) = create_test_environment().await?;
+    setup_test_bucket(&client).await?;
+    upload_nested_json_document(&client).await?;
+
+    let result = select_json_document(
+        &client,
+        JSON_DOCUMENT_OBJECT,
+        "SELECT e.name FROM S3Object[*].departments[*].employees[*] AS e WHERE e.active = true",
+    )
+    .await?;
+    let names: Vec<String> = result
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| -> TestResult<String> {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            Ok(value["name"].as_str().ok_or("missing name field")?.to_string())
+        })
+        .collect::<TestResult<_>>()?;
+
+    assert_eq!(names, vec!["Alice", "Charlie"]);
+
+    let terminal_scalars = select_json_document(
+        &client,
+        JSON_DOCUMENT_OBJECT,
+        "SELECT NAME FROM S3Object[*].DEPARTMENTS[*].employees[*].NAME",
+    )
+    .await?;
+    let scalar_names: Vec<String> = terminal_scalars
+        .lines()
+        .map(|line| -> TestResult<String> {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            Ok(value["name"].as_str().ok_or("missing scalar name field")?.to_string())
+        })
+        .collect::<TestResult<_>>()?;
+    assert_eq!(scalar_names, vec!["Alice", "Bob", "Charlie"]);
+
+    let aliased_scalars = select_json_document(
+        &client,
+        JSON_DOCUMENT_OBJECT,
+        "SELECT v FROM S3Object[*].departments[*].employees[*].name AS v",
+    )
+    .await?;
+    let aliased_names: Vec<String> = aliased_scalars
+        .lines()
+        .map(|line| -> TestResult<String> {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            Ok(value["v"].as_str().ok_or("missing aliased scalar field")?.to_string())
+        })
+        .collect::<TestResult<_>>()?;
+    assert_eq!(aliased_names, vec!["Alice", "Bob", "Charlie"]);
+
+    let root_array = select_json_document(&client, JSON_ROOT_ARRAY_OBJECT, "SELECT c.name FROM S3Object[*][*] AS c").await?;
+    let root_names: Vec<String> = root_array
+        .lines()
+        .map(|line| -> TestResult<String> {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            Ok(value["name"].as_str().ok_or("missing root-array name field")?.to_string())
+        })
+        .collect::<TestResult<_>>()?;
+    assert_eq!(root_names, vec!["Alice", "Bob"]);
+
+    let root_index = select_json_document(&client, JSON_ROOT_ARRAY_OBJECT, "SELECT c.name FROM S3Object[*][0] AS c").await?;
+    let root_index_value: serde_json::Value = serde_json::from_str(root_index.trim())?;
+    assert_eq!(root_index_value["name"], "Alice");
+
+    let root_scalars = select_json_document(&client, JSON_ROOT_SCALAR_ARRAY_OBJECT, "SELECT V FROM S3Object AS V").await?;
+    let scalar_values: Vec<i64> = root_scalars
+        .lines()
+        .map(|line| -> TestResult<i64> {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            Ok(value["v"].as_i64().ok_or("missing root scalar value")?)
+        })
+        .collect::<TestResult<_>>()?;
+    assert_eq!(scalar_values, vec![1, 2]);
+
+    let implicit_root_scalars =
+        select_json_document(&client, JSON_ROOT_SCALAR_ARRAY_OBJECT, "SELECT S3Object FROM S3Object").await?;
+    let implicit_scalar_values: Vec<i64> = implicit_root_scalars
+        .lines()
+        .map(|line| -> TestResult<i64> {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            Ok(value["s3object"].as_i64().ok_or("missing implicit root scalar value")?)
+        })
+        .collect::<TestResult<_>>()?;
+    assert_eq!(implicit_scalar_values, vec![1, 2]);
+
+    let quoted_root_scalars =
+        select_json_document(&client, JSON_ROOT_SCALAR_ARRAY_OBJECT, "SELECT \"S3Object\" FROM \"S3Object\"").await?;
+    let quoted_scalar_values: Vec<i64> = quoted_root_scalars
+        .lines()
+        .map(|line| -> TestResult<i64> {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            Ok(value["S3Object"].as_i64().ok_or("missing quoted root scalar value")?)
+        })
+        .collect::<TestResult<_>>()?;
+    assert_eq!(quoted_scalar_values, vec![1, 2]);
     Ok(())
 }
 
