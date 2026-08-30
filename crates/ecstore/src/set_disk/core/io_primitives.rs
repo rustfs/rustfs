@@ -3657,6 +3657,7 @@ pub(in crate::set_disk) struct RenameTailOutcome {
 pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     write_quorum: usize,
     scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
+    scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3667,7 +3668,16 @@ impl<'a> RenameDataFenceOptions<'a> {
         Self {
             write_quorum,
             scanner_publication_lease_tokens,
+            scanner_publication_commit_scope: None,
         }
+    }
+
+    pub(in crate::set_disk) fn with_publication_scope(
+        mut self,
+        scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    ) -> Self {
+        self.scanner_publication_commit_scope = scanner_publication_commit_scope;
+        self
     }
 }
 
@@ -3776,6 +3786,37 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     if needs_heal {
         submit(request).await;
     }
+}
+
+async fn run_scanner_publication_delete_owner<F, Fut>(
+    scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    operation: F,
+) -> disk::error::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = disk::error::Result<()>> + Send + 'static,
+{
+    if scope.is_none() {
+        return operation().await;
+    }
+    if let Some(scope) = scope.as_ref() {
+        scope.attach_mutation_owner();
+    }
+    tokio::spawn(async move {
+        let result = operation().await;
+        if let Some(scope) = scope.as_ref() {
+            if result.is_ok() {
+                let _ = scope.mark_committed();
+            } else {
+                // A failed quorum does not prove that no replica committed;
+                // keep the permit indeterminate for supervisor reconciliation.
+                let _ = scope.mark_indeterminate();
+            }
+        }
+        result
+    })
+    .await
+    .map_err(|_| DiskError::other("scanner publication delete owner failed"))?
 }
 
 impl SetDisks {
@@ -3995,6 +4036,7 @@ impl SetDisks {
         let RenameDataFenceOptions {
             write_quorum,
             scanner_publication_lease_tokens,
+            scanner_publication_commit_scope: _scanner_publication_commit_scope,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4352,6 +4394,7 @@ impl SetDisks {
         let RenameDataFenceOptions {
             write_quorum,
             scanner_publication_lease_tokens,
+            scanner_publication_commit_scope,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4383,11 +4426,15 @@ impl SetDisks {
         let fanout_src_object = src_object.clone();
         let fanout_dst_bucket = dst_bucket.clone();
         let fanout_dst_object = dst_object.clone();
+        let fanout_publication_scope = scanner_publication_commit_scope.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
         // completed disk mutations. Per-disk futures stay ordered in `join_all`,
         // preserving slot-indexed quorum and convergence accounting without a
         // scheduler task for every disk.
         let fanout = tokio::spawn(async move {
+            // Keep the storage-owned movement permit attached to the actual
+            // fan-out owner, even if the caller future is cancelled.
+            let _fanout_publication_scope = fanout_publication_scope;
             let successful_rename_completion_rank =
                 rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
             let futures = fanout_disks
@@ -4401,6 +4448,7 @@ impl SetDisks {
                     let dst_object = fanout_dst_object.clone();
                     let dst_bucket = fanout_dst_bucket.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
+                    let publication_scope = scanner_publication_commit_scope.clone();
 
                     std::panic::AssertUnwindSafe(async move {
                         // Test-only introspection guard: counts this operation as
@@ -4431,6 +4479,13 @@ impl SetDisks {
 
                         if let Some(err) = Self::rename_injected_error(&dst_object, i) {
                             return Err(err);
+                        }
+
+                        if let Some(scope) = publication_scope.as_ref()
+                            && !scope.can_commit()
+                        {
+                            let _ = scope.mark_indeterminate();
+                            return Err(DiskError::other("scanner publication commit scope deadline or cancellation reached"));
                         }
 
                         let disk_wait_started = rustfs_io_metrics::put_stage_timer();
@@ -5841,7 +5896,8 @@ impl SetDisks {
 
     #[cfg(test)]
     pub(in crate::set_disk) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> disk::error::Result<()> {
-        self.delete_prefix_with_scanner_publication_lease(bucket, prefix, None).await
+        self.delete_prefix_with_scanner_publication_lease(bucket, prefix, None, None)
+            .await
     }
 
     /// Delete a prefix with an optional per-remote-disk scanner publication
@@ -5852,6 +5908,7 @@ impl SetDisks {
         bucket: &str,
         prefix: &str,
         scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
+        scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     ) -> disk::error::Result<()> {
         let disks = self.get_disks_internal().await;
         let write_quorum = disks.len() / 2 + 1;
@@ -5860,11 +5917,21 @@ impl SetDisks {
         let mut futures = Vec::with_capacity(disks.len());
 
         for (disk_op, scanner_publication_lease_token) in disks.iter().zip(fanout_fence_tokens) {
+            let disk_op = disk_op.clone();
             let bucket = bucket.to_string();
             let prefix = prefix.to_string();
+            let scanner_publication_commit_scope = scanner_publication_commit_scope.clone();
             futures.push(async move {
                 if let Some(disk) = disk_op {
-                    disk.delete_with_scanner_publication_lease(
+                    if let Some(scope) = scanner_publication_commit_scope.as_ref()
+                        && !scope.can_commit()
+                    {
+                        return Err(DiskError::other("scanner publication delete scope cannot commit"));
+                    }
+                    let external_guard = scanner_publication_commit_scope
+                        .as_ref()
+                        .map(|scope| Arc::new(scope.clone()) as Arc<dyn Send + Sync>);
+                    disk.delete_with_scanner_publication_lease_and_guard(
                         &bucket,
                         &prefix,
                         DeleteOptions {
@@ -5873,6 +5940,7 @@ impl SetDisks {
                             ..Default::default()
                         },
                         scanner_publication_lease_token,
+                        external_guard,
                     )
                     .await
                 } else {
@@ -5881,7 +5949,10 @@ impl SetDisks {
             });
         }
 
-        Self::reduce_delete_prefix_results(join_all(futures).await, write_quorum)
+        run_scanner_publication_delete_owner(scanner_publication_commit_scope, move || async move {
+            Self::reduce_delete_prefix_results(join_all(futures).await, write_quorum)
+        })
+        .await
     }
 
     /// Scan a single disk's copy of `prefix` and decide whether it is an orphan
@@ -6808,6 +6879,63 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn scanner_delete_owner_survives_waiter_cancellation() {
+        let movement_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let movement_permit = movement_gate.clone().read_owned().await;
+        let scope = crate::object_api::ScannerPublicationCommitScope::new_storage_owned(
+            7,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            Vec::new(),
+            movement_permit,
+        );
+        scope.try_begin().expect("delete scope should enter flight");
+        let scope_guard = crate::object_api::ScannerPublicationCommitScopeGuard::new(scope.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(run_scanner_publication_delete_owner(Some(scope.clone()), move || async move {
+            started_tx.send(()).expect("delete owner should start");
+            release_rx.await.expect("delete owner should be released");
+            finished_tx.send(()).expect("delete owner should finish");
+            Ok(())
+        }));
+        started_rx.await.expect("delete owner should run");
+        drop(scope_guard);
+        waiter.abort();
+        assert_eq!(
+            scope.state(),
+            crate::object_api::ScannerPublicationCommitState::InFlight,
+            "caller cancellation must not classify an owned delete as indeterminate"
+        );
+
+        let mut movement_writer = Box::pin(movement_gate.write_owned());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut movement_writer)
+                .await
+                .is_err(),
+            "movement transition must remain fenced while delete owner drains"
+        );
+        release_tx.send(()).expect("delete owner should remain alive");
+        finished_rx.await.expect("delete owner should drain");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if scope.state() == crate::object_api::ScannerPublicationCommitState::Committed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete owner should report a terminal result");
+        assert!(
+            scope.release_movement_permit().await,
+            "terminal delete should release its movement permit"
+        );
+        movement_writer.await;
+    }
 
     #[test]
     fn write_precondition_lookup_errors_fail_closed_unless_absence_is_known() {

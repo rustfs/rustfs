@@ -1483,7 +1483,7 @@ impl NotificationSys {
             futures.push(async move {
                 let client = client.ok_or_else(|| Error::other(format!("scanner activity peer[{idx}] is unreachable")))?;
                 let host = client.grid_host.clone();
-                scanner_activity_with_timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, &host, client.scanner_activity())
+                scanner_activity_with_retry(&client, &host)
                     .await
                     .map(|activity| (host, activity))
             });
@@ -1960,6 +1960,50 @@ where
     timeout(timeout_duration, activity)
         .await
         .map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
+}
+
+/// Classify transport-only activity failures without treating an answered
+/// peer's application error as an outage.
+pub fn scanner_peer_transport_error_message_is_retryable(error: &str) -> bool {
+    crate::cluster::rpc::client::message_has_network_needle(error)
+}
+
+fn scanner_activity_should_retry(first_error: Option<&Error>, timed_out: bool) -> bool {
+    timed_out || first_error.is_some_and(PeerRestClient::is_network_like_error)
+}
+
+/// Retry one activity probe after a bounded reconnect when the first attempt
+/// failed at the transport boundary.  A peer that answered with an invalid or
+/// incompatible activity response is not retried here: it must remain a hard
+/// fail-closed result for the all-peer publication proof.
+async fn scanner_activity_with_retry(client: &PeerRestClient, host: &str) -> Result<ScannerPeerActivity> {
+    let first = timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_activity()).await;
+    let should_retry = match &first {
+        Ok(Ok(_)) => false,
+        Ok(Err(err)) => scanner_activity_should_retry(Some(err), false),
+        Err(_) => scanner_activity_should_retry(None, true),
+    };
+
+    match first {
+        Ok(Ok(activity)) => return Ok(activity),
+        Ok(Err(err)) if !should_retry => return Err(err),
+        Ok(Err(err)) => {
+            debug!(peer = host, error = %err, "scanner activity probe failed on first transport attempt; reconnecting");
+            client.prepare_retry().await;
+        }
+        Err(_) => {
+            debug!(peer = host, timeout = ?SCANNER_ACTIVITY_PROBE_TIMEOUT, "scanner activity probe timed out on first attempt; reconnecting");
+            client.prepare_retry().await;
+        }
+    }
+
+    match timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_activity()).await {
+        Ok(result) => result,
+        Err(_) => {
+            client.evict_connection().await;
+            Err(Error::Timeout)
+        }
+    }
 }
 
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
@@ -2880,6 +2924,20 @@ mod tests {
 
         assert!(err.to_string().contains("timed out"));
         assert!(err.to_string().contains("peer-1"));
+    }
+
+    #[test]
+    fn scanner_activity_retry_only_reconnects_transport_failures() {
+        assert!(scanner_activity_should_retry(None, true));
+        assert!(scanner_activity_should_retry(Some(&Error::other("connection refused")), false));
+        assert!(!scanner_activity_should_retry(
+            Some(&Error::other("peer returned an invalid scanner activity response proof")),
+            false
+        ));
+        assert!(!scanner_activity_should_retry(
+            Some(&Error::from(tonic::Status::internal("peer rejected activity"))),
+            false
+        ));
     }
 
     #[tokio::test]

@@ -176,6 +176,34 @@ fn pool_meta_v3_writer_enabled() -> bool {
     )
 }
 
+fn ensure_decommission_ledger_persistence_supported_for(
+    version: u16,
+    v2_writer_enabled: bool,
+    v3_writer_enabled: bool,
+) -> Result<()> {
+    if matches!(version, POOL_META_VERSION | POOL_META_GENERATION_VERSION) || v2_writer_enabled || v3_writer_enabled {
+        return Ok(());
+    }
+
+    Err(Error::InvalidArgument(
+        "decommission".to_string(),
+        "pool-metadata-version".to_string(),
+        format!(
+            "durable unresolved-entry recovery requires pool metadata V2 or V3; enable both {} and {} only after every reader and writer supports V2",
+            rustfs_config::ENV_POOL_META_V2_WRITE,
+            rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED,
+        ),
+    ))
+}
+
+fn ensure_decommission_ledger_persistence_supported(pool_meta: &PoolMeta) -> Result<()> {
+    ensure_decommission_ledger_persistence_supported_for(
+        pool_meta.version,
+        pool_meta_v2_writer_enabled(),
+        pool_meta_v3_writer_enabled(),
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct DecommissionCanceler {
     operation: Arc<DecommissionOperation>,
@@ -2027,6 +2055,7 @@ pub(crate) async fn pause_pool_activation_after_durable_save<S>(pool: &Arc<S>, f
 #[cfg(test)]
 struct PoolActivationStartProbeState {
     kind: PoolActivationStartKind,
+    preflight_side_effect_attempted: std::sync::atomic::AtomicBool,
     attempted: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }
@@ -2045,6 +2074,7 @@ impl PoolActivationStartProbe {
     pub(crate) fn install(kind: PoolActivationStartKind) -> Self {
         let state = Arc::new(PoolActivationStartProbeState {
             kind,
+            preflight_side_effect_attempted: std::sync::atomic::AtomicBool::new(false),
             attempted: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         });
@@ -2060,6 +2090,14 @@ impl PoolActivationStartProbe {
         while !self.state.attempted.load(Ordering::Acquire) {
             self.state.notify.notified().await;
         }
+    }
+
+    pub(crate) fn preflight_side_effect_was_attempted(&self) -> bool {
+        self.state.preflight_side_effect_attempted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn activation_was_attempted(&self) -> bool {
+        self.state.attempted.load(Ordering::Acquire)
     }
 }
 
@@ -2087,6 +2125,21 @@ pub(crate) fn observe_pool_activation_start_attempt(kind: PoolActivationStartKin
     for state in probes {
         state.attempted.store(true, Ordering::Release);
         state.notify.notify_one();
+    }
+}
+
+#[cfg(test)]
+fn observe_pool_activation_preflight_side_effect_attempt(kind: PoolActivationStartKind) {
+    let probes = POOL_ACTIVATION_START_PROBES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .expect("pool activation start probe should not be poisoned")
+        .iter()
+        .filter(|state| state.kind == kind)
+        .cloned()
+        .collect::<Vec<_>>();
+    for state in probes {
+        state.preflight_side_effect_attempted.store(true, Ordering::Release);
     }
 }
 
@@ -6189,6 +6242,7 @@ impl ECStore {
     ) -> Result<()> {
         {
             let mut pool_meta = self.pool_meta.write().await;
+            ensure_decommission_ledger_persistence_supported(&pool_meta)?;
             record_decommission_unresolved_entry(&mut pool_meta, idx, generation, entry)?;
         }
         self.save_current_pool_meta(&[idx])
@@ -6339,6 +6393,7 @@ impl ECStore {
         }
 
         ensure_decommission_start_pool_states(&latest_pool_meta, indices)?;
+        ensure_decommission_ledger_persistence_supported(&latest_pool_meta)?;
 
         let previous_pool_meta = latest_pool_meta.clone();
         let first_idx = indices.first().copied();
@@ -7040,10 +7095,14 @@ impl ECStore {
         save_guard.ensure_write_safe("decommission cannot be scheduled while pool metadata requires recovery")?;
         let indices = {
             let pool_meta = self.pool_meta.read().await;
-            resumable_decommission_queue_indices(&pool_meta)
+            let indices = resumable_decommission_queue_indices(&pool_meta)
                 .into_iter()
                 .filter(|idx| indices.contains(idx))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            if !indices.is_empty() {
+                ensure_decommission_ledger_persistence_supported(&pool_meta)?;
+            }
+            indices
         };
         if indices.is_empty() {
             return Ok(Vec::new());
@@ -9299,8 +9358,11 @@ impl ECStore {
         {
             let pool_meta = self.pool_meta.read().await;
             ensure_decommission_start_pool_states(&pool_meta, &indices)?;
+            ensure_decommission_ledger_persistence_supported(&pool_meta)?;
         }
 
+        #[cfg(test)]
+        observe_pool_activation_preflight_side_effect_attempt(PoolActivationStartKind::Decommission);
         let decom_buckets = self.get_buckets_to_decommission().await?;
 
         let mut healed_buckets = HashSet::with_capacity(decom_buckets.len());
@@ -10858,8 +10920,96 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn decommission_v1_start_preflights_reject_before_metadata_writes() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let baseline = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("baseline pool metadata should be readable");
+        assert_eq!(baseline.meta.version, POOL_META_V1_VERSION);
+        *store.pool_meta.write().await = baseline.meta.clone();
+        let start_probe = PoolActivationStartProbe::install(PoolActivationStartKind::Decommission);
+        let err = store
+            .start_decommission(vec![0])
+            .await
+            .expect_err("the initial V1 start preflight must reject before side effects");
+        assert!(matches!(err, Error::InvalidArgument(..)));
+        assert!(
+            !start_probe.preflight_side_effect_was_attempted(),
+            "V1 rejection must precede bucket listing, healing, and metadata-bucket creation"
+        );
+        assert!(
+            !start_probe.activation_was_attempted(),
+            "V1 rejection must not enter the authoritative activation save"
+        );
+        let after_early_rejection = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("early rejection must leave durable pool metadata readable");
+        assert_eq!(after_early_rejection.canonical, baseline.canonical);
+        assert!(
+            store
+                .pool_meta
+                .read()
+                .await
+                .pools
+                .iter()
+                .all(|pool| pool.decommission.is_none())
+        );
+        assert!(store.decommission_cancelers.read().await.iter().all(Option::is_none));
+        store
+            .ensure_pool_meta_side_effects_safe("V1 start preflight")
+            .await
+            .expect("a deterministic start rejection must not latch recovery");
+        drop(start_probe);
+
+        let err = store
+            .save_current_pool_meta_for_decommission_start(
+                &[0],
+                vec![(
+                    0,
+                    PoolSpaceInfo {
+                        free: 50,
+                        total: 100,
+                        used: 50,
+                    },
+                )],
+                Vec::new(),
+            )
+            .await
+            .expect_err("the authoritative V1 start preflight must reject before saving");
+        assert!(matches!(err, Error::InvalidArgument(..)));
+
+        let after_authoritative_rejection = load_pool_meta_replicas(store.pools.clone(), true)
+            .await
+            .expect("authoritative rejection must leave durable pool metadata readable");
+        assert_eq!(after_authoritative_rejection.canonical, baseline.canonical);
+        assert!(
+            after_authoritative_rejection
+                .meta
+                .pools
+                .iter()
+                .all(|pool| pool.decommission.is_none())
+        );
+        assert!(
+            store
+                .pool_meta
+                .read()
+                .await
+                .pools
+                .iter()
+                .all(|pool| pool.decommission.is_none())
+        );
+        assert!(store.decommission_cancelers.read().await.iter().all(Option::is_none));
+        store
+            .ensure_pool_meta_side_effects_safe("authoritative V1 start preflight")
+            .await
+            .expect("an authoritative capability rejection must not latch recovery");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn decommission_activation_fence_loss_after_durable_save_blocks_publication() {
         let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
         let barrier = PoolActivationDurableSaveBarrier::install(&store.pools[0]);
         let start_store = Arc::clone(&store);
         let start_task = tokio::spawn(async move {
@@ -10914,6 +11064,7 @@ mod tests {
     #[serial_test::serial]
     async fn decommission_activation_adopts_canonical_commit_after_replica_failure() {
         let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        crate::services::rebalance::promote_test_pool_meta_to_v2(&store).await;
         let barrier = PoolActivationDurableSaveBarrier::install(&store.pools[0]);
         let start_store = Arc::clone(&store);
         let start_task = tokio::spawn(async move {
@@ -11224,6 +11375,35 @@ mod tests {
         assert!(!pool_meta_v3_writer_enabled_for(true, false));
         assert!(!pool_meta_v3_writer_enabled_for(false, true));
         assert!(pool_meta_v3_writer_enabled_for(true, true));
+    }
+
+    #[test]
+    fn decommission_ledger_persistence_requires_an_observed_or_confirmed_format() {
+        for (version, v2_enabled, v3_enabled, expected) in [
+            (POOL_META_V1_VERSION, false, false, false),
+            (POOL_META_V1_VERSION, true, false, true),
+            (POOL_META_V1_VERSION, false, true, true),
+            (POOL_META_VERSION, false, false, true),
+            (super::POOL_META_GENERATION_VERSION, false, false, true),
+        ] {
+            let result = super::ensure_decommission_ledger_persistence_supported_for(version, v2_enabled, v3_enabled);
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "unexpected capability result for pool metadata version {version}"
+            );
+        }
+
+        let half_confirmed_v2 = pool_meta_v2_writer_enabled_for(true, false);
+        let half_confirmed_v3 = pool_meta_v3_writer_enabled_for(false, true);
+        let err = super::ensure_decommission_ledger_persistence_supported_for(
+            POOL_META_V1_VERSION,
+            half_confirmed_v2,
+            half_confirmed_v3,
+        )
+        .expect_err("half-enabled rollout gates must not admit decommission");
+        assert!(matches!(err, Error::InvalidArgument(..)));
+        assert!(err.to_string().contains("durable unresolved-entry recovery"));
     }
 
     #[test]
@@ -14495,6 +14675,113 @@ mod pools_tests {
     }
 
     #[tokio::test]
+    async fn test_v1_unresolved_ledger_rejection_keeps_live_state_and_write_gate_safe() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let status = decommission_test_pool_status(
+            0,
+            Some(PoolDecommissionInfo {
+                start_time: Some(generation),
+                ..Default::default()
+            }),
+        );
+        let last_update = status.last_update;
+        let store = decommission_worker_test_store(
+            PoolMeta {
+                version: POOL_META_V1_VERSION,
+                pools: vec![status],
+                ..Default::default()
+            },
+            vec![None],
+        );
+        let entry = DecommissionUnresolvedEntry {
+            bucket: "bucket-a".to_string(),
+            object: "directory/".to_string(),
+            pool_index: 0,
+            set_index: 0,
+            source_generation: generation,
+            candidate_count: 1,
+            disk_error_count: 0,
+            observed_at: generation,
+            reason: "metadata_resolution_failed".to_string(),
+        };
+
+        let err = store
+            .persist_decommission_unresolved_entry(0, generation, entry)
+            .await
+            .expect_err("V1 must reject the ledger before changing live state");
+
+        assert!(matches!(err, Error::InvalidArgument(..)));
+        let pool_meta = store.pool_meta.read().await;
+        let status = &pool_meta.pools[0];
+        assert_eq!(status.last_update, last_update);
+        assert!(
+            status
+                .decommission
+                .as_ref()
+                .expect("active decommission metadata should remain present")
+                .unresolved_entries
+                .is_empty()
+        );
+        drop(pool_meta);
+        store
+            .pool_meta_save_gate
+            .lock()
+            .await
+            .ensure_write_safe("V1 unresolved-entry preflight")
+            .expect("a deterministic capability rejection must not latch recovery");
+    }
+
+    #[tokio::test]
+    async fn test_v1_runtime_recovery_rejects_worker_but_keeps_cancel_persistable() {
+        let generation = OffsetDateTime::UNIX_EPOCH;
+        let store = decommission_worker_test_store(
+            PoolMeta {
+                version: POOL_META_V1_VERSION,
+                pools: vec![decommission_test_pool_status(
+                    0,
+                    Some(PoolDecommissionInfo {
+                        start_time: Some(generation),
+                        ..Default::default()
+                    }),
+                )],
+                ..Default::default()
+            },
+            vec![None],
+        );
+
+        let err = store
+            .reserve_decommission_routines(&CancellationToken::new(), &[0])
+            .await
+            .err()
+            .expect("V1 recovery must not install a worker that cannot persist an unresolved ledger");
+        assert!(matches!(err, Error::InvalidArgument(..)));
+        assert!(store.decommission_cancelers.read().await[0].is_none());
+
+        let save_called = Arc::new(AtomicBool::new(false));
+        store
+            .decommission_cancel_with_owner_and_save(0, None, {
+                let save_called = save_called.clone();
+                move |snapshot, _| async move {
+                    snapshot.encode_config_data_for_v2_gate(false)?;
+                    save_called.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await
+            .expect("a rejected V1 recovery must remain cancelable without restart");
+
+        assert!(save_called.load(Ordering::SeqCst));
+        let pool_meta = store.pool_meta.read().await;
+        let info = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("cancel metadata should remain present");
+        assert!(info.canceled);
+        assert!(!info.failed);
+        assert!(!info.complete);
+    }
+
+    #[tokio::test]
     async fn test_decommission_transition_waits_without_registered_canceler() {
         let store = decommission_worker_test_store(PoolMeta::default(), vec![None]);
         let operation_gate = store.ctx.data_movement_operation_gate();
@@ -17487,6 +17774,7 @@ mod pools_tests {
     #[tokio::test]
     async fn test_runtime_recovery_reserves_the_startup_resumable_queue() {
         let meta = PoolMeta {
+            version: super::POOL_META_VERSION,
             pools: vec![
                 decommission_test_pool_status(
                     0,
@@ -17544,6 +17832,7 @@ mod pools_tests {
     #[tokio::test]
     async fn test_runtime_recovery_does_not_reserve_behind_active_predecessor() {
         let meta = PoolMeta {
+            version: super::POOL_META_VERSION,
             pools: vec![
                 decommission_test_pool_status(
                     0,

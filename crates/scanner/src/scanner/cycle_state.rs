@@ -1327,6 +1327,13 @@ pub(super) async fn persisted_usage_floor_for_startup(
     let mut floor = PersistedUsageFloor::default();
     let mut found_any = false;
     let mut bootstrap_pending = false;
+    // A valid JSON object without a baseline identity is not a floor and must
+    // never be treated as an empty one.  It can, however, be a partially
+    // written v2 primary left behind during an upgrade.  Keep its epoch as a
+    // fence while looking for a durable companion snapshot; if no companion
+    // is new enough, the caller still fails closed below.
+    let mut invalid_baseline_path: Option<String> = None;
+    let mut invalid_baseline_epoch: Option<u64> = None;
     let update_floor = |floor: &mut PersistedUsageFloor, usage: &DataUsageInfo, path: &str| -> Result<(), ScannerError> {
         floor.leader_epoch = floor.leader_epoch.max(usage.scanner_epoch.unwrap_or_default());
         if let Some(completed_cycle) = usage.scanner_cycle {
@@ -1340,6 +1347,7 @@ pub(super) async fn persisted_usage_floor_for_startup(
     };
     for primary_path in [DATA_USAGE_OBJ_NAME_PATH.as_str(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()] {
         let backup_path = format!("{primary_path}.bkp");
+        let is_v2_path = primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str();
         let primary_epoch = match read_config_with_revision(storeapi.clone(), primary_path).await {
             Ok((Some(data), _)) => {
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
@@ -1353,13 +1361,20 @@ pub(super) async fn persisted_usage_floor_for_startup(
                     update_floor(&mut floor, &usage, primary_path)?;
                     None
                 } else if !data_usage_info_has_persisted_baseline_identity(&usage) {
-                    return Err(ScannerError::Other(format!(
-                        "scanner usage floor from {primary_path} has no persisted baseline identity"
-                    )));
+                    invalid_baseline_path.get_or_insert_with(|| primary_path.to_string());
+                    invalid_baseline_epoch = invalid_baseline_epoch.max(usage.scanner_epoch);
+                    None
                 } else {
                     let epoch = usage.scanner_epoch.unwrap_or_default();
-                    update_floor(&mut floor, &usage, primary_path)?;
-                    Some(epoch)
+                    // A legacy snapshot may be structurally valid but older
+                    // than an incomplete v2 snapshot left by a newer leader.
+                    // Do not let that candidate regress the startup floor.
+                    if !is_v2_path && invalid_baseline_epoch.is_some_and(|fenced_epoch| epoch < fenced_epoch) {
+                        None
+                    } else {
+                        update_floor(&mut floor, &usage, primary_path)?;
+                        Some(epoch)
+                    }
                 }
             }
             Ok((None, _)) => None,
@@ -1377,21 +1392,26 @@ pub(super) async fn persisted_usage_floor_for_startup(
                         "scanner usage bootstrap conflicts with a persisted backup".to_string(),
                     ));
                 }
-                any_found = true;
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {backup_path}: {err}"))
                 })?;
                 if !data_usage_info_has_persisted_baseline_identity(&usage) {
-                    return Err(ScannerError::Other(format!(
-                        "scanner usage floor from {backup_path} has no persisted baseline identity"
-                    )));
-                }
-                let backup_epoch = usage.scanner_epoch.unwrap_or_default();
-                // A backup write from an older leader may complete after the
-                // primary epoch has been fenced. It must not advance the startup
-                // floor unless its epoch is at least as new as the primary.
-                if primary_epoch.is_none_or(|epoch| backup_epoch >= epoch) {
-                    update_floor(&mut floor, &usage, &backup_path)?;
+                    invalid_baseline_path.get_or_insert_with(|| backup_path.clone());
+                    invalid_baseline_epoch = invalid_baseline_epoch.max(usage.scanner_epoch);
+                    // This is still persisted state, so it must not enable a
+                    // missing-state bootstrap.  Continue to a legacy pair in
+                    // case it contains a complete, fenced snapshot.
+                } else {
+                    let backup_epoch = usage.scanner_epoch.unwrap_or_default();
+                    // A backup write from an older leader may complete after the
+                    // primary epoch has been fenced. It must not advance the startup
+                    // floor unless its epoch is at least as new as the primary.
+                    if primary_epoch.is_none_or(|epoch| backup_epoch >= epoch)
+                        && invalid_baseline_epoch.is_none_or(|epoch| backup_epoch >= epoch)
+                    {
+                        update_floor(&mut floor, &usage, &backup_path)?;
+                        any_found = true;
+                    }
                 }
             }
             Ok((None, _)) => {}
@@ -1413,6 +1433,11 @@ pub(super) async fn persisted_usage_floor_for_startup(
     }
 
     if !found_any && !bootstrap_pending {
+        if let Some(path) = invalid_baseline_path {
+            return Err(ScannerError::Other(format!(
+                "persisted scanner usage floor from {path} has no authoritative baseline or newer valid backup"
+            )));
+        }
         if !allow_missing_for_bootstrap {
             return Err(ScannerError::Other(
                 "persisted scanner usage floor has no authoritative baseline".to_string(),
