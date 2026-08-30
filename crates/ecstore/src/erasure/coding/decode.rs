@@ -2299,6 +2299,7 @@ impl Erasure {
         written: &mut usize,
         ret_err: &mut Option<std::io::Error>,
         stage_metrics_enabled: bool,
+        require_surplus_source: bool,
     ) -> StripeFlow
     where
         W: AsyncWrite + Send + Sync + Unpin,
@@ -2336,7 +2337,12 @@ impl Erasure {
         // missing data shard and an extra source shard was available, verify
         // the reconstructed data against that source before streaming bytes.
         let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        if let Err(e) = self.decode_data_with_reconstruction_verification(shards) {
+        let decode_result = if require_surplus_source {
+            self.decode_data_with_reconstruction_verification_for_lockstep(shards)
+        } else {
+            self.decode_data_with_reconstruction_verification(shards)
+        };
+        if let Err(e) = decode_result {
             record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
             let reason = GetObjectFailureReason::DecodeError;
             error!(
@@ -2547,6 +2553,7 @@ impl Erasure {
                         // `shards` are borrowed again below. In the `Stop` case that
                         // drop is what cancels the still-in-flight prefetch read.
                         let (flow, next): (Option<StripeFlow>, Option<StripeReadOutput>) = {
+                            let require_surplus_source = reader.demand_bound_lockstep;
                             let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
                             let emit_fut = self.emit_decoded_stripe(
                                 writer,
@@ -2557,6 +2564,7 @@ impl Erasure {
                                 &mut written,
                                 &mut ret_err,
                                 stage_metrics_enabled,
+                                require_surplus_source,
                             );
                             tokio::pin!(read_fut);
                             tokio::pin!(emit_fut);
@@ -2604,6 +2612,7 @@ impl Erasure {
                                 &mut written,
                                 &mut ret_err,
                                 stage_metrics_enabled,
+                                reader.demand_bound_lockstep,
                             )
                             .await
                         {
@@ -2643,6 +2652,7 @@ impl Erasure {
                         &mut written,
                         &mut ret_err,
                         stage_metrics_enabled,
+                        reader.demand_bound_lockstep,
                     )
                     .await
                 {
@@ -5304,6 +5314,58 @@ mod tests {
         assert_eq!(written, BLOCK_SIZE);
         assert_eq!(output.len(), BLOCK_SIZE);
         assert!(error.is_none(), "a failed disposable hedge must not fail a recovered stripe: {error:?}");
+    }
+
+    /// Rollout guard for backlog#1308: when a data shard and the first parity
+    /// hedge both fail, the gate-on path must not settle at decode quorum and
+    /// emit an unverified body. The second parity can restore decode quorum but
+    /// cannot provide the extra source required for reconstruction verification,
+    /// so the stripe must fail before exposing bytes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_data_shards_only_gate_data_and_parity_failure_fails_before_output() {
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, Some("true"))], async {
+            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+            let payload = (0..BLOCK_SIZE).map(|value| value as u8).collect::<Vec<_>>();
+            let shards = erasure.encode_data(&payload).expect("test payload should encode");
+            let shard_size = erasure.shard_size();
+
+            let readers = vec![
+                Some(BitrotReader::new(TestShardReader::TimedOut, shard_size, HashAlgorithm::None, false)),
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(shards[1].to_vec())),
+                    shard_size,
+                    HashAlgorithm::None,
+                    false,
+                )),
+                Some(BitrotReader::new(
+                    TestShardReader::TerminalFileNotFound,
+                    shard_size,
+                    HashAlgorithm::None,
+                    false,
+                )),
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(shards[3].to_vec())),
+                    shard_size,
+                    HashAlgorithm::None,
+                    false,
+                )),
+            ];
+
+            let mut output = Vec::new();
+            let (written, error) = erasure.decode(&mut output, readers, 0, payload.len(), payload.len()).await;
+
+            assert_eq!(written, 0, "an unverified stripe must not report body bytes");
+            assert!(output.is_empty(), "an unverified stripe must not expose a clean short body");
+            let error = error.expect("data plus parity loss must fail closed");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("insufficient source shards"));
+        })
+        .await;
     }
 
     /// Lockstep verification-quorum regression (backlog#1156). When a data shard is
