@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::SelectObjectSnapshot;
-use crate::query::Context;
+use crate::query::{Context, Query};
 use crate::{QueryError, QueryResult, object_store::EcObjectStore};
+use crate::{SelectInputMetrics, SelectObjectSnapshot};
 use datafusion::{
     arrow::{
         array::{Int32Array, StringArray},
@@ -314,7 +314,7 @@ impl SessionCtxFactory {
     }
 
     pub async fn create_session_ctx(&self, context: &Context) -> QueryResult<SessionCtx> {
-        self.create_session_ctx_inner(context, None, None, DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES)
+        self.create_session_ctx_inner(context, None, None, None, DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES)
             .await
     }
 
@@ -324,7 +324,7 @@ impl SessionCtxFactory {
         query_tracker: QueryExecutionTracker,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionCtx> {
-        self.create_session_ctx_inner(context, None, Some(query_tracker), memory_limit_bytes)
+        self.create_session_ctx_inner(context, None, Some(query_tracker), None, memory_limit_bytes)
             .await
     }
 
@@ -335,8 +335,24 @@ impl SessionCtxFactory {
         query_tracker: QueryExecutionTracker,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionCtx> {
-        self.create_session_ctx_inner(context, Some(snapshot), Some(query_tracker), memory_limit_bytes)
+        self.create_session_ctx_inner(context, Some(snapshot), Some(query_tracker), None, memory_limit_bytes)
             .await
+    }
+
+    pub async fn create_session_ctx_for_query_with_tracker_and_memory_limit(
+        &self,
+        query: &Query,
+        query_tracker: QueryExecutionTracker,
+        memory_limit_bytes: usize,
+    ) -> QueryResult<SessionCtx> {
+        self.create_session_ctx_inner(
+            query.context(),
+            query.snapshot().cloned(),
+            Some(query_tracker),
+            Some(Arc::clone(query.input_metrics())),
+            memory_limit_bytes,
+        )
+        .await
     }
 
     async fn create_session_ctx_inner(
@@ -344,10 +360,11 @@ impl SessionCtxFactory {
         context: &Context,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Option<Arc<SelectInputMetrics>>,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionCtx> {
         let df_session_ctx = self
-            .build_df_session_context(context, snapshot, query_tracker.clone(), memory_limit_bytes)
+            .build_df_session_context(context, snapshot, query_tracker.clone(), input_metrics, memory_limit_bytes)
             .await?;
 
         Ok(SessionCtx {
@@ -362,6 +379,7 @@ impl SessionCtxFactory {
         context: &Context,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Option<Arc<SelectInputMetrics>>,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionContext> {
         let path = format!("s3://{}", context.input.bucket);
@@ -383,7 +401,12 @@ impl SessionCtxFactory {
             .is_some_and(|delimiter| delimiter.len() == 2 && delimiter.as_bytes() != b"\r\n");
         let scan_range_requires_single_file_scan =
             context.input.request.scan_range.is_some() && context.input.request.input_serialization.parquet.is_none();
-        let config = if custom_two_byte_record_delimiter || scan_range_requires_single_file_scan {
+        let metered_input_requires_single_file_scan =
+            input_metrics.is_some() && context.input.request.input_serialization.parquet.is_none();
+        let config = if custom_two_byte_record_delimiter
+            || scan_range_requires_single_file_scan
+            || metered_input_requires_single_file_scan
+        {
             config.with_repartition_file_scans(false)
         } else {
             config
@@ -438,11 +461,16 @@ impl SessionCtxFactory {
 
             df_session_state.with_object_store(&store_url, store).build()
         } else {
+            let input_metrics = input_metrics.unwrap_or_else(|| Arc::new(SelectInputMetrics::default()));
             let store: EcObjectStore = match query_tracker {
-                Some(query_tracker) => {
-                    EcObjectStore::new_with_query_tracker(context.input.clone(), memory_pool, query_tracker, snapshot)
-                }
-                None => EcObjectStore::new_with_memory_pool(context.input.clone(), memory_pool, snapshot),
+                Some(query_tracker) => EcObjectStore::new_with_query_tracker(
+                    context.input.clone(),
+                    memory_pool,
+                    query_tracker,
+                    input_metrics,
+                    snapshot,
+                ),
+                None => EcObjectStore::new_with_memory_pool(context.input.clone(), memory_pool, input_metrics, snapshot),
             }
             .map_err(|err| QueryError::Datafusion {
                 source: Box::new(DataFusionError::External(Box::new(err))),
@@ -588,6 +616,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metered_csv_and_json_inputs_disable_file_repartitioning() {
+        let factory = SessionCtxFactory::new(true).with_target_partitions(3);
+        let csv_context = test_context();
+        let mut json_context = test_context();
+        let json_request = &mut Arc::make_mut(&mut json_context.input).request;
+        json_request.input_serialization.csv = None;
+        json_request.input_serialization.json = Some(JSONInput::default());
+
+        for context in [&csv_context, &json_context] {
+            let session = factory
+                .create_session_ctx_inner(
+                    context,
+                    None,
+                    None,
+                    Some(Arc::new(SelectInputMetrics::default())),
+                    DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+                )
+                .await
+                .expect("metered session should be created");
+
+            assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+        }
+    }
+
+    #[tokio::test]
     async fn parquet_scan_range_keeps_file_repartitioning() {
         let mut context = test_context();
         let request = &mut Arc::make_mut(&mut context.input).request;
@@ -702,7 +755,7 @@ mod tests {
     async fn session_factory_applies_memory_limit() {
         let factory = SessionCtxFactory::new(true);
         let session = factory
-            .create_session_ctx_inner(&test_context(), None, None, 1024)
+            .create_session_ctx_inner(&test_context(), None, None, None, 1024)
             .await
             .expect("session should be created with a bounded memory pool");
 

@@ -42,7 +42,7 @@ use rustfs_s3select_api::{
     query::{
         Query,
         ast::ExtStatement,
-        dispatcher::QueryDispatcher,
+        dispatcher::{DispatchedQuery, QueryDispatcher},
         execution::{Output, QueryStateMachine},
         function::FuncMetaManagerRef,
         logical_planner::{LogicalPlanner, Plan},
@@ -120,7 +120,7 @@ impl Drop for QueryPhaseGuard<'_> {
 #[async_trait]
 impl QueryDispatcher for SimpleQueryDispatcher {
     async fn execute_query(&self, query: &Query) -> QueryResult<Output> {
-        self.execute_query_inner(query, None).await
+        self.execute_query_inner(query, None).await.map(|(_, output)| output)
     }
 
     fn try_reserve_query(&self) -> QueryResult<QueryAdmission> {
@@ -133,6 +133,16 @@ impl QueryDispatcher for SimpleQueryDispatcher {
     }
 
     async fn execute_query_admitted(&self, query: &Query, admission: QueryAdmission) -> QueryResult<Output> {
+        self.execute_query_inner(query, Some(admission))
+            .await
+            .map(|(_, output)| output)
+    }
+
+    async fn dispatch_query(&self, query: &Query) -> QueryResult<DispatchedQuery> {
+        self.execute_query_inner(query, None).await
+    }
+
+    async fn dispatch_query_admitted(&self, query: &Query, admission: QueryAdmission) -> QueryResult<DispatchedQuery> {
         self.execute_query_inner(query, Some(admission)).await
     }
 
@@ -171,11 +181,12 @@ impl QueryDispatcher for SimpleQueryDispatcher {
                 };
 
                 let logical_plan = self
-                    .statement_to_logical_plan(stmt, &logical_planner, query_state_machine)
+                    .statement_to_logical_plan(stmt, &logical_planner, Arc::clone(&query_state_machine))
                     .await?;
                 Ok(logical_plan)
             })
             .await?;
+        query_state_machine.query.input_metrics().reset();
         if !query_tracker.mark_planned(&self.query_execution_owner) {
             drop(logical_plan);
             return Err(self.query_tracker_error(&query_tracker));
@@ -212,19 +223,21 @@ impl QueryDispatcher for SimpleQueryDispatcher {
     }
 
     async fn build_query_state_machine(&self, query: Query) -> QueryResult<Arc<QueryStateMachine>> {
-        self.build_query_state_machine_inner(query, None).await
+        self.build_query_state_machine_inner(query.for_execution(), None).await
     }
 }
 
 impl SimpleQueryDispatcher {
-    async fn execute_query_inner(&self, query: &Query, admission: Option<QueryAdmission>) -> QueryResult<Output> {
-        let query_state_machine = self.build_query_state_machine_inner(query.clone(), admission).await?;
+    async fn execute_query_inner(&self, query: &Query, admission: Option<QueryAdmission>) -> QueryResult<DispatchedQuery> {
+        let query_state_machine = self.build_query_state_machine_inner(query.for_execution(), admission).await?;
+        let execution_query = query_state_machine.query.clone();
         let logical_plan = self.build_logical_plan(Arc::clone(&query_state_machine)).await?;
         let Some(logical_plan) = logical_plan else {
-            return Ok(Output::Nil(()));
+            return Ok((execution_query, Output::Nil(())));
         };
 
-        self.execute_logical_plan(logical_plan, query_state_machine).await
+        let output = self.execute_logical_plan(logical_plan, query_state_machine).await?;
+        Ok((execution_query, output))
     }
 
     async fn build_query_state_machine_inner(
@@ -256,29 +269,17 @@ impl SimpleQueryDispatcher {
             self.query_timeout.as_secs(),
         );
         let phase_guard = QueryPhaseGuard::new(&query_tracker, &self.query_execution_owner);
-        let session = if let Some(snapshot) = query.snapshot().cloned() {
-            self.run_with_query_deadline(
+        let session = self
+            .run_with_query_deadline(
                 &query_tracker,
                 self.session_factory
-                    .create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
-                        query.context(),
-                        snapshot,
+                    .create_session_ctx_for_query_with_tracker_and_memory_limit(
+                        &query,
                         query_tracker.clone(),
                         self.memory_limit_bytes,
                     ),
             )
-            .await?
-        } else {
-            self.run_with_query_deadline(
-                &query_tracker,
-                self.session_factory.create_session_ctx_with_tracker_and_memory_limit(
-                    query.context(),
-                    query_tracker.clone(),
-                    self.memory_limit_bytes,
-                ),
-            )
-            .await?
-        };
+            .await?;
         if !query_tracker.mark_admitted(&self.query_execution_owner) {
             drop(session);
             return Err(self.query_tracker_error(&query_tracker));
@@ -1703,6 +1704,55 @@ mod tests {
 
         drop(output);
         assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn reused_query_gets_execution_local_input_metrics() {
+        let admission = Arc::new(Semaphore::new(2));
+        let (dispatcher, input) = test_dispatcher(Arc::clone(&admission), Duration::from_secs(300));
+        let query = Query::new(QueryContext { input }, "SELECT * FROM S3Object".to_string());
+
+        let first = dispatcher
+            .build_query_state_machine(query.clone())
+            .await
+            .expect("first execution state");
+        let second = dispatcher
+            .build_query_state_machine(query)
+            .await
+            .expect("second execution state");
+
+        assert!(!Arc::ptr_eq(first.query.input_metrics(), second.query.input_metrics()));
+        drop((first, second));
+        assert_eq!(admission.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatching_a_reused_query_returns_execution_local_input_metrics() {
+        let env = snapshot_test_env().await;
+        let mut input = test_input();
+        input.bucket = "s3select-reused-query-metrics".to_string();
+        input.key = "input.csv".to_string();
+        let input = Arc::new(input);
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, b"name\nAlice\n".to_vec())
+            .await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+
+        let (first_query, first_output) = dispatcher.dispatch_query(&query).await.expect("first dispatch should start");
+        let (second_query, second_output) = dispatcher.dispatch_query(&query).await.expect("second dispatch should start");
+
+        assert!(!Arc::ptr_eq(first_query.input_metrics(), second_query.input_metrics()));
+        assert!(!Arc::ptr_eq(query.input_metrics(), first_query.input_metrics()));
+        assert!(!Arc::ptr_eq(query.input_metrics(), second_query.input_metrics()));
+        drop((first_output, second_output));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
