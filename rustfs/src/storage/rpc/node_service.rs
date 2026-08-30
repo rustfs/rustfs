@@ -133,10 +133,6 @@ fn verify_node_signal_body<T: CanonicalMutationBody>(request: &Request<T>, opera
         .map_err(|err| Status::permission_denied(format!("{operation} authentication failed: {err}")))
 }
 
-fn verify_node_lock_body<T: CanonicalMutationBody>(request: &Request<T>, operation: &'static str) -> Result<(), Status> {
-    verify_node_mutation_body(request, operation)
-}
-
 fn start_decommission_failure_response(err: Error) -> StartDecommissionResponse {
     match err {
         Error::InvalidArgument(_, _, reason) => StartDecommissionResponse {
@@ -1360,22 +1356,22 @@ impl Node for NodeService {
     }
 
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
-        verify_node_lock_body(&request, "lock")?;
+        verify_node_mutation_body(&request, "lock")?;
         self.handle_lock(request).await
     }
 
     async fn un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
-        verify_node_lock_body(&request, "unlock")?;
+        verify_node_mutation_body(&request, "unlock")?;
         self.handle_un_lock(request).await
     }
 
     async fn force_un_lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
-        verify_node_lock_body(&request, "force unlock")?;
+        verify_node_mutation_body(&request, "force unlock")?;
         self.handle_force_un_lock(request).await
     }
 
     async fn refresh(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
-        verify_node_lock_body(&request, "refresh lock")?;
+        verify_node_mutation_body(&request, "refresh lock")?;
         self.handle_refresh(request).await
     }
 
@@ -1383,7 +1379,7 @@ impl Node for NodeService {
         &self,
         request: Request<BatchGenerallyLockRequest>,
     ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
-        verify_node_lock_body(&request, "lock batch")?;
+        verify_node_mutation_body(&request, "lock batch")?;
         self.handle_lock_batch(request).await
     }
 
@@ -1391,7 +1387,7 @@ impl Node for NodeService {
         &self,
         request: Request<BatchGenerallyLockRequest>,
     ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
-        verify_node_lock_body(&request, "unlock batch")?;
+        verify_node_mutation_body(&request, "unlock batch")?;
         self.handle_un_lock_batch(request).await
     }
 
