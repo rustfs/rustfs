@@ -2299,6 +2299,7 @@ impl Erasure {
         written: &mut usize,
         ret_err: &mut Option<std::io::Error>,
         stage_metrics_enabled: bool,
+        require_surplus_source: bool,
     ) -> StripeFlow
     where
         W: AsyncWrite + Send + Sync + Unpin,
@@ -2336,7 +2337,12 @@ impl Erasure {
         // missing data shard and an extra source shard was available, verify
         // the reconstructed data against that source before streaming bytes.
         let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        if let Err(e) = self.decode_data_with_reconstruction_verification(shards) {
+        let decode_result = if require_surplus_source {
+            self.decode_data_with_reconstruction_verification_for_lockstep(shards)
+        } else {
+            self.decode_data_with_reconstruction_verification(shards)
+        };
+        if let Err(e) = decode_result {
             record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
             let reason = GetObjectFailureReason::DecodeError;
             error!(
@@ -2547,6 +2553,7 @@ impl Erasure {
                         // `shards` are borrowed again below. In the `Stop` case that
                         // drop is what cancels the still-in-flight prefetch read.
                         let (flow, next): (Option<StripeFlow>, Option<StripeReadOutput>) = {
+                            let require_surplus_source = reader.demand_bound_lockstep;
                             let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
                             let emit_fut = self.emit_decoded_stripe(
                                 writer,
@@ -2557,6 +2564,7 @@ impl Erasure {
                                 &mut written,
                                 &mut ret_err,
                                 stage_metrics_enabled,
+                                require_surplus_source,
                             );
                             tokio::pin!(read_fut);
                             tokio::pin!(emit_fut);
@@ -2604,6 +2612,7 @@ impl Erasure {
                                 &mut written,
                                 &mut ret_err,
                                 stage_metrics_enabled,
+                                reader.demand_bound_lockstep,
                             )
                             .await
                         {
@@ -2643,6 +2652,7 @@ impl Erasure {
                         &mut written,
                         &mut ret_err,
                         stage_metrics_enabled,
+                        reader.demand_bound_lockstep,
                     )
                     .await
                 {

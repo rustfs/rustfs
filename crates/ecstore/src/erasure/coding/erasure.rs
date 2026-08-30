@@ -933,9 +933,24 @@ impl Erasure {
     }
 
     pub(crate) fn decode_data_with_reconstruction_verification(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        self.decode_data_with_reconstruction_verification_policy(shards, false)
+    }
+
+    pub(crate) fn decode_data_with_reconstruction_verification_for_lockstep(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+    ) -> io::Result<()> {
+        self.decode_data_with_reconstruction_verification_policy(shards, true)
+    }
+
+    fn decode_data_with_reconstruction_verification_policy(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+        require_surplus_source: bool,
+    ) -> io::Result<()> {
         let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
         let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
-        if missing_data_source && available_shards == self.data_shards {
+        if require_surplus_source && missing_data_source && available_shards == self.data_shards {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "insufficient source shards to verify reconstructed data",
@@ -1885,7 +1900,7 @@ mod tests {
             shards[erasure.total_shard_count() - 1] = None;
 
             let err = erasure
-                .decode_data_with_reconstruction_verification(&mut shards)
+                .decode_data_with_reconstruction_verification_for_lockstep(&mut shards)
                 .expect_err("verified decode must reject an exact decode quorum");
 
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
