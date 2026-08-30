@@ -24,6 +24,7 @@ use crate::runtime::sources as runtime_sources;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_credential_types::provider::{ProvideCredentials, error::CredentialsError, future};
 use aws_sdk_s3::config::Region as SdkRegion;
+use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
@@ -39,6 +40,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Tagging as SdkTagging;
 use aws_sdk_s3::types::{
     ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
+    ServerSideEncryption,
 };
 use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
 use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
@@ -1071,7 +1073,8 @@ impl BucketTargetSys {
             .endpoint_url(endpoint.clone())
             .credentials_provider(SharedCredentialsProvider::new(RemoteTargetCredentialsProvider { credentials: creds }))
             .region(SdkRegion::new(target.region.clone()))
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .request_checksum_calculation(replication_request_checksum_calculation());
 
         if should_force_path_style(target) {
             config_builder = config_builder.force_path_style(true);
@@ -1365,6 +1368,25 @@ fn loopback_replication_targets_allowed() -> bool {
     std::env::var(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV)
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false)
+}
+
+const REPLICATION_STREAMING_CHECKSUMS_ENV: &str = "RUSTFS_REPLICATION_STREAMING_CHECKSUMS";
+
+/// Streaming trailer checksums make the SDK frame request bodies as
+/// `aws-chunked`; a target that does not decode that framing stores the frames
+/// verbatim, silently corrupting every replica while the transfer itself
+/// succeeds (#6853). Plain signed payloads are the compatible default; the env
+/// knob restores trailer checksums for fleets whose targets are all known to
+/// decode them.
+fn replication_request_checksum_calculation() -> RequestChecksumCalculation {
+    if std::env::var(REPLICATION_STREAMING_CHECKSUMS_ENV)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+    {
+        RequestChecksumCalculation::WhenSupported
+    } else {
+        RequestChecksumCalculation::WhenRequired
+    }
 }
 
 fn validate_replication_target_endpoint(url: &Url) -> Result<(), OutboundUrlError> {
@@ -1744,6 +1766,17 @@ impl Default for AdvancedPutOptions {
             replication_validity_check: false,
         }
     }
+}
+
+/// The subset of the target's PutObject response replication audits.
+#[derive(Debug, Clone)]
+pub struct RemotePutObjectResponse {
+    /// Version id the target assigned (`x-amz-version-id`).
+    pub version_id: Option<String>,
+    /// ETag of what the target stored; `None` when the target withheld it or
+    /// when its encryption mode (SSE-KMS / SSE-C) makes it incomparable to
+    /// the source ETag. `None` is therefore "not decidable", never evidence.
+    pub etag: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2291,7 +2324,9 @@ impl TargetClient {
 
     /// On success returns the version id the target assigned (from
     /// `x-amz-version-id`), letting callers audit the version-identity
-    /// contract — a target that adopts the source version echoes it back.
+    /// contract — a target that adopts the source version echoes it back —
+    /// together with the ETag of what the target actually stored, so callers
+    /// can detect a target that persisted transformed bytes (#6853).
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -2299,7 +2334,7 @@ impl TargetClient {
         size: i64,
         body: ByteStream,
         opts: &PutObjectOptions,
-    ) -> Result<Option<String>, S3ClientError> {
+    ) -> Result<RemotePutObjectResponse, S3ClientError> {
         let mut headers = opts.header();
 
         let builder = self.client.put_object();
@@ -2334,7 +2369,25 @@ impl TargetClient {
             .send()
             .await
         {
-            Ok(output) => Ok(output.version_id().map(ToOwned::to_owned)),
+            Ok(output) => {
+                // Under SSE-KMS/DSSE or SSE-C the target's ETag is not the MD5
+                // of the stored plaintext, so it cannot be compared against the
+                // source ETag; withhold it rather than let a caller conclude
+                // corruption from an opaque value.
+                let etag_comparable = output.sse_customer_algorithm().is_none()
+                    && !matches!(
+                        output.server_side_encryption(),
+                        Some(ServerSideEncryption::AwsKms) | Some(ServerSideEncryption::AwsKmsDsse)
+                    );
+                Ok(RemotePutObjectResponse {
+                    version_id: output.version_id().map(ToOwned::to_owned),
+                    etag: if etag_comparable {
+                        output.e_tag().map(ToOwned::to_owned)
+                    } else {
+                        None
+                    },
+                })
+            }
             Err(e) => match e {
                 SdkError::ServiceError(service_err) => {
                     let err = service_err.into_err();
@@ -2673,6 +2726,145 @@ mod tests {
         }
     }
 
+    type RecordedHeaders = Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
+    /// Records full request headers and answers with canned response headers,
+    /// for asserting wire framing and response parsing.
+    #[derive(Clone, Debug)]
+    struct RecordingHeaderConnector {
+        request_headers: RecordedHeaders,
+        response_headers: Vec<(String, String)>,
+    }
+
+    impl SmithyHttpConnector for RecordingHeaderConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.request_headers
+                .lock()
+                .expect("recorded header lock should not be poisoned")
+                .push(
+                    request
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                );
+            let mut response = HttpResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(200_u16).expect("200 should be a valid response status"),
+                SdkBody::empty(),
+            );
+            for (name, value) in &self.response_headers {
+                response.headers_mut().insert(name.clone(), value.clone());
+            }
+            HttpConnectorFuture::ready(Ok(response))
+        }
+    }
+
+    fn header_recording_target_client(response_headers: Vec<(String, String)>) -> (TargetClient, RecordedHeaders) {
+        let request_headers: RecordedHeaders = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(RecordingHeaderConnector {
+            request_headers: Arc::clone(&request_headers),
+            response_headers,
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let client = s3_client_for_test(443, Some(http_client));
+        (
+            TargetClient {
+                endpoint: "https://localhost:443".to_string(),
+                credentials: None,
+                bucket: "target-bucket".to_string(),
+                storage_class: String::new(),
+                disable_proxy: false,
+                arn: "arn:rustfs:replication:us-east-1:target:bucket".to_string(),
+                reset_id: String::new(),
+                secure: true,
+                health_check_duration: Duration::from_secs(5),
+                replicate_sync: false,
+                client: Arc::new(client),
+            },
+            request_headers,
+        )
+    }
+
+    fn streaming_test_body(payload: &'static [u8]) -> ByteStream {
+        let stream = tokio_util::io::ReaderStream::new(std::io::Cursor::new(payload));
+        let body = http_body_util::StreamBody::new(futures::StreamExt::map(stream, |r| r.map(http_body::Frame::data)));
+        ByteStream::new(SdkBody::from_body_1_x(body))
+    }
+
+    #[test]
+    fn replication_checksums_default_to_plain_payloads() {
+        assert!(matches!(
+            replication_request_checksum_calculation(),
+            RequestChecksumCalculation::WhenRequired
+        ));
+    }
+
+    #[tokio::test]
+    async fn replication_put_object_sends_plain_signed_payloads_by_default() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &PutObjectOptions::default())
+            .await
+            .expect("recorded put_object should succeed");
+
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let headers = &recorded[0];
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        // The #6853 regression shape: trailer checksums force aws-chunked
+        // framing, which a non-decoding target stores verbatim as the object.
+        assert_eq!(header("x-amz-trailer"), None, "streaming uploads must not carry a trailer checksum");
+        assert!(
+            header("content-encoding").is_none_or(|v| !v.contains("aws-chunked")),
+            "streaming uploads must not be aws-chunked framed"
+        );
+        assert_eq!(header("x-amz-decoded-content-length"), None);
+        assert_eq!(header("content-length"), Some("4"));
+    }
+
+    #[tokio::test]
+    async fn put_object_returns_the_etag_the_target_stored() {
+        let (client, _) =
+            header_recording_target_client(vec![("etag".to_string(), "\"9a0364b9e99bb480dd25e1f0284c8555\"".to_string())]);
+        let response = client
+            .put_object(
+                "target-bucket",
+                "object",
+                4,
+                ByteStream::from_static(b"data"),
+                &PutObjectOptions::default(),
+            )
+            .await
+            .expect("recorded put_object should succeed");
+        assert_eq!(response.etag.as_deref(), Some("\"9a0364b9e99bb480dd25e1f0284c8555\""));
+    }
+
+    #[tokio::test]
+    async fn put_object_withholds_the_etag_under_target_side_kms() {
+        let (client, _) = header_recording_target_client(vec![
+            ("etag".to_string(), "\"9a0364b9e99bb480dd25e1f0284c8555\"".to_string()),
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+        ]);
+        let response = client
+            .put_object(
+                "target-bucket",
+                "object",
+                4,
+                ByteStream::from_static(b"data"),
+                &PutObjectOptions::default(),
+            )
+            .await
+            .expect("recorded put_object should succeed");
+        assert!(
+            response.etag.is_none(),
+            "a KMS-encrypted replica's etag is not the content MD5 and must be withheld"
+        );
+    }
+
     #[derive(Clone, Debug)]
     struct RecordingAuthConnector {
         signed_requests: Arc<std::sync::Mutex<Vec<(bool, bool)>>>,
@@ -2969,7 +3161,10 @@ mod tests {
             .credentials_provider(SharedCredentialsProvider::new(credentials))
             .region(SdkRegion::new("us-east-1"))
             .force_path_style(true)
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            // Mirror the production remote-target builder so recorded requests
+            // exercise the same checksum/framing behavior (#6853).
+            .request_checksum_calculation(replication_request_checksum_calculation());
         if let Some(http_client) = http_client {
             config = config.http_client(http_client);
         }
