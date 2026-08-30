@@ -22,7 +22,7 @@ use futures::StreamExt;
 use http::{HeaderMap, StatusCode, header::RANGE};
 use rustfs_s3select_api::{
     QueryError, SelectError, SelectInputMetrics,
-    object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
+    object_store::{INVALID_SCAN_RANGE_MESSAGE, is_noop_scan_range, validate_scan_range_bounds},
     query::{Context, Query},
 };
 use rustfs_s3select_query::instance::s3_select_query_timeout;
@@ -44,6 +44,8 @@ const RECORDS_CHUNK_TARGET: usize = 128 * 1024;
 const DATA_SOURCE_PATH_UNSUPPORTED_CODE: &str = "DataSourcePathUnsupported";
 const INVALID_QUERY_CODE: &str = "InvalidQuery";
 const PARSE_SELECT_FAILURE_CODE: &str = "ParseSelectFailure";
+const INVALID_REQUEST_PARAMETER_MESSAGE: &str =
+    "The value of a parameter in the SelectRequest element is invalid. Check the service API documentation and try again.";
 const BUSY_MESSAGE: &str = "The service is unavailable. Try again later.";
 const EMPTY_SELECT_EXPRESSION_MESSAGE: &str = "empty SQL expression";
 const SLOW_DOWN_MESSAGE: &str = "Reduce your request rate.";
@@ -103,7 +105,11 @@ pub async fn execute_select_object_content(
     )
     .await
     .map_err(|_| select_query_timeout_error(query_timeout.as_secs()))??;
-    validate_scan_range_for_object_size(&input.request, snapshot.logical_size())?;
+    let object_size = snapshot.logical_size();
+    validate_scan_range_for_object_size(&input.request, object_size)?;
+    if object_size == 0 && is_compressed_input(&input.request.input_serialization) {
+        return Err(map_select_error_to_s3(&SelectError::TruncatedInput));
+    }
     let snapshot = Arc::new(snapshot);
     let query =
         Query::new_with_snapshot(Context { input: input.clone() }, input.request.expression.clone(), Arc::clone(&snapshot));
@@ -262,7 +268,14 @@ fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectCo
     }
 
     normalize_input_serialization(&mut input.request.input_serialization)?;
+    let compressed_input = is_compressed_input(&input.request.input_serialization);
+    if compressed_input && input.request.scan_range.as_ref().is_some_and(is_noop_scan_range) {
+        input.request.scan_range = None;
+    }
     validate_scan_range(&input.request)?;
+    if compressed_input && input.request.scan_range.is_some() {
+        return Err(map_select_error_to_s3(&SelectError::UnsupportedScanRangeInput));
+    }
 
     let output_format = normalize_output_serialization(&mut input.request.output_serialization)?;
     if input.request.expression.trim().is_empty() {
@@ -284,6 +297,13 @@ fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectCo
     })
 }
 
+fn is_compressed_input(input: &InputSerialization) -> bool {
+    input
+        .compression_type
+        .as_ref()
+        .is_some_and(|compression| compression.as_str() != CompressionType::NONE)
+}
+
 fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()> {
     let format_count =
         usize::from(input.csv.is_some()) + usize::from(input.json.is_some()) + usize::from(input.parquet.is_some());
@@ -298,15 +318,19 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
         match compression.as_str() {
             CompressionType::NONE => {}
             CompressionType::GZIP | CompressionType::BZIP2 => {
-                return Err(s3_error!(
-                    NotImplemented,
-                    "SelectObjectContent currently supports only uncompressed input"
-                ));
+                if input.parquet.is_some() {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InvalidRequestParameter,
+                        INVALID_REQUEST_PARAMETER_MESSAGE,
+                    ));
+                }
             }
             _ => return Err(map_select_error_to_s3(&SelectError::InvalidCompressionFormat)),
         }
     }
-    input.compression_type = Some(CompressionType::from_static(CompressionType::NONE));
+    input
+        .compression_type
+        .get_or_insert_with(|| CompressionType::from_static(CompressionType::NONE));
 
     if let Some(csv) = input.csv.as_mut() {
         if csv.allow_quoted_record_delimiter.unwrap_or(false) {
@@ -667,11 +691,16 @@ fn map_query_error_to_s3(err: QueryError) -> S3Error {
 fn map_select_error_to_s3(err: &SelectError) -> S3Error {
     match err {
         SelectError::InvalidCompressionFormat => S3Error::with_message(S3ErrorCode::InvalidCompressionFormat, err.to_string()),
+        SelectError::InvalidCompressionFormatForObject { .. } => {
+            S3Error::with_message(S3ErrorCode::InvalidCompressionFormat, err.to_string())
+        }
         SelectError::InvalidDataSource => S3Error::with_message(S3ErrorCode::InvalidDataSource, err.to_string()),
         SelectError::TruncatedInput => S3Error::with_message(S3ErrorCode::TruncatedInput, err.to_string()),
+        SelectError::UnsupportedScanRangeInput => S3Error::with_message(S3ErrorCode::UnsupportedScanRangeInput, err.to_string()),
         SelectError::CsvParsingError => S3Error::with_message(S3ErrorCode::CSVParsingError, err.to_string()),
         SelectError::JsonParsingError => S3Error::with_message(S3ErrorCode::JSONParsingError, err.to_string()),
         SelectError::ParquetParsingError => S3Error::with_message(S3ErrorCode::ParquetParsingError, err.to_string()),
+        SelectError::OverMaxRecordSize => S3Error::with_message(S3ErrorCode::OverMaxRecordSize, err.to_string()),
         SelectError::ParseSelectFailure { message } => custom_bad_request(PARSE_SELECT_FAILURE_CODE, message.clone()),
         SelectError::InvalidQuery => custom_bad_request(INVALID_QUERY_CODE, err.to_string()),
         SelectError::InvalidDataType => S3Error::with_message(S3ErrorCode::InvalidDataType, err.to_string()),
@@ -995,8 +1024,20 @@ mod tests {
                 S3ErrorCode::InvalidCompressionFormat,
                 StatusCode::BAD_REQUEST,
             ),
+            (
+                SelectError::InvalidCompressionFormatForObject {
+                    compression: CompressionType::GZIP,
+                },
+                S3ErrorCode::InvalidCompressionFormat,
+                StatusCode::BAD_REQUEST,
+            ),
             (SelectError::InvalidDataSource, S3ErrorCode::InvalidDataSource, StatusCode::BAD_REQUEST),
             (SelectError::TruncatedInput, S3ErrorCode::TruncatedInput, StatusCode::BAD_REQUEST),
+            (
+                SelectError::UnsupportedScanRangeInput,
+                S3ErrorCode::UnsupportedScanRangeInput,
+                StatusCode::BAD_REQUEST,
+            ),
             (SelectError::CsvParsingError, S3ErrorCode::CSVParsingError, StatusCode::BAD_REQUEST),
             (SelectError::JsonParsingError, S3ErrorCode::JSONParsingError, StatusCode::BAD_REQUEST),
             (
@@ -1004,6 +1045,7 @@ mod tests {
                 S3ErrorCode::ParquetParsingError,
                 StatusCode::BAD_REQUEST,
             ),
+            (SelectError::OverMaxRecordSize, S3ErrorCode::OverMaxRecordSize, StatusCode::BAD_REQUEST),
             (
                 SelectError::ParseSelectFailure {
                     message: "invalid SELECT expression".to_string(),
@@ -1372,6 +1414,12 @@ mod tests {
         assert_eq!(compression_status, StatusCode::BAD_REQUEST);
         assert!(compression_body.contains("<Code>InvalidCompressionFormat</Code>"));
         assert!(compression_body.contains("<Message>"));
+
+        let scan_range_error = map_select_error_to_s3(&SelectError::UnsupportedScanRangeInput);
+        let (scan_range_status, scan_range_body) = http_xml_error(scan_range_error).await;
+        assert_eq!(scan_range_status, StatusCode::BAD_REQUEST);
+        assert!(scan_range_body.contains("<Code>UnsupportedScanRangeInput</Code>"));
+        assert!(scan_range_body.contains("<Message>Scan range queries are not supported on this type of object.</Message>"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1623,6 +1671,89 @@ mod tests {
                 .map(|value| value.as_str()),
             Some(CompressionType::NONE)
         );
+    }
+
+    #[test]
+    fn validate_preserves_supported_compression_for_csv_and_json_lines() {
+        for compression in [CompressionType::GZIP, CompressionType::BZIP2] {
+            let mut csv_input = base_input();
+            csv_input.request.input_serialization.compression_type = Some(CompressionType::from_static(compression));
+            validate_select_request(&HeaderMap::new(), &mut csv_input).expect("compressed CSV should be accepted");
+            assert_eq!(
+                csv_input
+                    .request
+                    .input_serialization
+                    .compression_type
+                    .as_ref()
+                    .map(|value| value.as_str()),
+                Some(compression)
+            );
+
+            let mut json_input = base_input();
+            json_input.request.input_serialization.csv = None;
+            json_input.request.input_serialization.json = Some(JSONInput {
+                type_: Some(JSONType::from_static(JSONType::LINES)),
+            });
+            json_input.request.input_serialization.compression_type = Some(CompressionType::from_static(compression));
+            validate_select_request(&HeaderMap::new(), &mut json_input).expect("compressed JSON LINES should be accepted");
+            assert_eq!(
+                json_input
+                    .request
+                    .input_serialization
+                    .compression_type
+                    .as_ref()
+                    .map(|value| value.as_str()),
+                Some(compression)
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_parquet_compression_with_select_request_error() {
+        let mut input = base_input();
+        input.request.input_serialization.csv = None;
+        input.request.input_serialization.parquet = Some(ParquetInput {});
+        input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+
+        let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("compressed Parquet must fail");
+
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequestParameter);
+        assert_eq!(error.message(), Some(INVALID_REQUEST_PARAMETER_MESSAGE));
+    }
+
+    #[test]
+    fn validate_normalizes_noop_compressed_scan_range_and_rejects_real_ranges() {
+        let mut noop = base_input();
+        noop.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        noop.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: None,
+        });
+        validate_select_request(&HeaderMap::new(), &mut noop).expect("zero-start full scan should be normalized");
+        assert!(noop.request.scan_range.is_none());
+
+        let mut ranged = base_input();
+        ranged.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        ranged.request.scan_range = Some(ScanRange {
+            start: Some(1),
+            end: None,
+        });
+        let error = validate_select_request(&HeaderMap::new(), &mut ranged)
+            .expect_err("compressed input with an effective ScanRange must fail before object I/O");
+        assert_eq!(error.code(), &S3ErrorCode::UnsupportedScanRangeInput);
+        assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(error.message(), Some("Scan range queries are not supported on this type of object."));
+
+        let mut malformed = base_input();
+        malformed.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        malformed.request.scan_range = Some(ScanRange {
+            start: Some(10),
+            end: Some(1),
+        });
+        let error = validate_select_request(&HeaderMap::new(), &mut malformed)
+            .expect_err("malformed ScanRange must fail before compression compatibility validation");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequestParameter);
+        assert_eq!(error.message(), Some(INVALID_SCAN_RANGE_MESSAGE));
     }
 
     #[test]

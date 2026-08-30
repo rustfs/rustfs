@@ -23,6 +23,7 @@ use datafusion::{
 use std::{error::Error as StdError, fmt::Display};
 use thiserror::Error;
 
+mod input_stream;
 mod metrics;
 pub mod object_store;
 pub mod query;
@@ -79,6 +80,9 @@ pub enum SelectError {
     #[error("The file is not in a supported compression format. Only GZIP and BZIP2 are supported.")]
     InvalidCompressionFormat,
 
+    #[error("{compression} is not applicable to the queried object. Please correct the request and try again.")]
+    InvalidCompressionFormatForObject { compression: &'static str },
+
     #[error("The data source type is not valid. Only CSV, JSON, and Parquet are supported.")]
     InvalidDataSource,
 
@@ -86,6 +90,9 @@ pub enum SelectError {
         "Object decompression failed. Check that the object is properly compressed using the format specified in the request."
     )]
     TruncatedInput,
+
+    #[error("Scan range queries are not supported on this type of object.")]
+    UnsupportedScanRangeInput,
 
     #[error("An error occurred while parsing the CSV file. Check the file and try again.")]
     CsvParsingError,
@@ -95,6 +102,9 @@ pub enum SelectError {
 
     #[error("An error occurred while parsing the Parquet file. Check the file and try again.")]
     ParquetParsingError,
+
+    #[error("The length of a record in the input or result is greater than the maxCharsPerRecord limit of 1 MB.")]
+    OverMaxRecordSize,
 
     #[error("{message}")]
     ParseSelectFailure { message: String },
