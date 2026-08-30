@@ -126,6 +126,27 @@ pub fn should_retry_delete_marker_purge(dobj: &DeletedObject) -> bool {
     dobj.delete_marker_version_id.is_some()
 }
 
+/// True when the target denied a replicated delete because object-lock
+/// retention or a legal hold protects that version on the replica (its
+/// deletion gate answers `AccessDenied` with the lock reason, and a
+/// replication request carries no governance bypass, rustfs#6850). Retrying
+/// cannot succeed until the lock itself lapses, so callers treat this as a
+/// policy denial rather than a transient fault.
+///
+/// The reason text is the RustFS deletion-gate wording; a MinIO/AWS peer
+/// phrases its WORM denial differently and simply stays unclassified — the
+/// caller then falls back to plain retry behavior, never a wrong state.
+pub fn is_object_lock_denied_delete(code: Option<&str>, message: Option<&str>) -> bool {
+    if !matches!(code, Some("AccessDenied")) {
+        return false;
+    }
+    let Some(message) = message else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("retention") || message.contains("legal hold")
+}
+
 fn admitted_target_arns_from_replication_state(state: &ReplicationState) -> Vec<String> {
     let mut target_arns = state.targets.keys().cloned().collect::<Vec<_>>();
     target_arns.extend(state.purge_targets.keys().cloned());
@@ -237,9 +258,9 @@ mod tests {
 
     use super::{
         DeletedObjectReplicationInfo, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
-        delete_replication_creates_marker, is_retryable_delete_replication_head_error, is_version_delete_replication,
-        replicate_delete_outcome, resync_existing_delete_replication_info, should_retry_delete_marker_purge,
-        target_delete_version_id,
+        delete_replication_creates_marker, is_object_lock_denied_delete, is_retryable_delete_replication_head_error,
+        is_version_delete_replication, replicate_delete_outcome, resync_existing_delete_replication_info,
+        should_retry_delete_marker_purge, target_delete_version_id,
     };
     use crate::storage_api::DeletedObject;
     use crate::{
@@ -614,5 +635,25 @@ mod tests {
         let mut corrupt = state.clone();
         corrupt.target_delete_marker_version_ids_corrupt = true;
         assert_eq!(delete_marker_purge_version_id(Some(&corrupt), arn, source), None);
+    }
+
+    #[test]
+    fn object_lock_denied_delete_is_recognized_by_code_and_reason() {
+        // The peer's deletion gate answers AccessDenied with the lock reason.
+        assert!(is_object_lock_denied_delete(
+            Some("AccessDenied"),
+            Some("Object is under GOVERNANCE retention and cannot be deleted until 2026-09-01T00:00:00Z")
+        ));
+        assert!(is_object_lock_denied_delete(
+            Some("AccessDenied"),
+            Some("Object has a legal hold and cannot be deleted. Remove the legal hold first.")
+        ));
+
+        // A plain policy denial (misconfigured replicator) is not a lock denial.
+        assert!(!is_object_lock_denied_delete(Some("AccessDenied"), Some("Access Denied.")));
+        assert!(!is_object_lock_denied_delete(Some("AccessDenied"), None));
+        // Other errors mentioning retention must not match.
+        assert!(!is_object_lock_denied_delete(Some("InternalError"), Some("retention lookup failed")));
+        assert!(!is_object_lock_denied_delete(None, Some("legal hold")));
     }
 }
