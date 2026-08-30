@@ -218,7 +218,7 @@ fn same_user_defined_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
 /// excluded. The selected winner still carries the chosen pool's layout, while
 /// the remaining read-visible fields must agree before the pool index can
 /// provide a deterministic tie-break.
-fn same_latest_object_info_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
+pub(super) fn same_latest_object_info_identity(left: &ObjectInfo, right: &ObjectInfo) -> bool {
     let same_read_surface = left.bucket == right.bucket
         && left.name == right.name
         && left.is_dir == right.is_dir
@@ -277,6 +277,14 @@ fn same_latest_object_info_identity(left: &ObjectInfo, right: &ObjectInfo) -> bo
     }
 }
 
+pub(super) fn validate_prepared_pool_refetch_identity(expected: &ObjectInfo, refetched: &ObjectInfo) -> Result<()> {
+    if same_latest_object_info_identity(expected, refetched) {
+        Ok(())
+    } else {
+        Err(Error::ErasureReadQuorum)
+    }
+}
+
 #[cfg(test)]
 pub(super) fn resolve_latest_object_info_candidates(
     candidates: Vec<LatestObjectInfoCandidate>,
@@ -328,7 +336,11 @@ pub(super) fn resolve_latest_object_info_candidates_with_pool_state(
             return Err(Error::ErasureReadQuorum);
         }
 
-        return Ok((winner_info.clone(), winner.idx));
+        let winner = latest_candidates.swap_remove(0);
+        let Some(winner_info) = winner.info else {
+            return Err(Error::ErasureReadQuorum);
+        };
+        return Ok((winner_info, winner.idx));
     }
 
     for candidate in candidates {
@@ -346,6 +358,23 @@ pub(super) fn resolve_latest_object_info_candidates_with_pool_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_pool_refetch_identity_fails_closed_on_generation_change() {
+        let expected = ObjectInfo {
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(10).expect("test timestamp should be valid")),
+            version_id: Some(uuid::Uuid::from_u128(1)),
+            etag: Some("etag-a".to_string()),
+            ..Default::default()
+        };
+        let mut refetched = expected.clone();
+        refetched.etag = Some("etag-b".to_string());
+
+        let error = validate_prepared_pool_refetch_identity(&expected, &refetched)
+            .expect_err("refetched metadata from a changed generation must fail closed");
+
+        assert_eq!(error, Error::ErasureReadQuorum);
+    }
 
     #[test]
     fn rebalance_delete_result_preserves_precondition_failed() {

@@ -109,7 +109,10 @@ static USAGE_MEMORY_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// strictly tighter than beta.11 (usage treated as 0) and strictly more
 /// available than a blanket 503. The fallback applies to any window without
 /// authoritative usage, not only pre-v2 upgrades; the values always come from
-/// the last persisted scanner output. Loads go through the TTL-bounded
+/// the last persisted scanner output — pre-discard sizes of the
+/// authoritative snapshot first, backfilled per bucket from the observed
+/// (nonconverged) snapshot for buckets no authoritative cycle has covered
+/// yet (issue #6852). Loads go through the TTL-bounded
 /// snapshot cache, so the quota path adds at most one backend read per
 /// [`DATA_USAGE_CACHE_TTL_SECS`] window. Returns `None` for buckets absent
 /// from every persisted snapshot — those still fail closed.
@@ -168,7 +171,7 @@ fn fresh_cached_data_usage_snapshot(
 
 fn cache_data_usage_snapshot_result(
     cache: &mut Option<CachedDataUsageSnapshot>,
-    result: Result<(DataUsageInfo, HashMap<String, u64>), Error>,
+    result: Result<LoadedUsageBaseline, Error>,
     loaded_at: tokio::time::Instant,
     refresh_generation: u64,
     current_generation: u64,
@@ -178,7 +181,19 @@ fn cache_data_usage_snapshot_result(
     }
 
     Some(match result {
-        Ok((info, degraded_baseline)) => {
+        Ok(LoadedUsageBaseline {
+            info,
+            mut degraded_baseline,
+            observed_unavailable,
+        }) => {
+            // A flaky observed read must not shrink quota coverage for a TTL
+            // window: carry the previous refresh's baseline entries forward,
+            // letting the fresh (authoritative) values win where they exist.
+            if observed_unavailable && let Some(previous) = cache.as_ref() {
+                for (bucket, size) in &previous.degraded_baseline {
+                    degraded_baseline.entry(bucket.clone()).or_insert(*size);
+                }
+            }
             *cache = Some(CachedDataUsageSnapshot {
                 info: Some(info.clone()),
                 loaded_at,
@@ -1113,24 +1128,78 @@ async fn load_data_usage_snapshot(store: Arc<ECStore>) -> Result<(DataUsageInfo,
 /// Load data usage info from backend storage
 #[instrument(skip(store))]
 pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
-    Ok(load_data_usage_from_backend_with_baseline(store).await?.0)
+    Ok(load_data_usage_from_backend_with_baseline(store).await?.info)
+}
+
+/// One refresh of the persisted usage snapshot plus the quota-admission
+/// baseline derived from it.
+struct LoadedUsageBaseline {
+    info: DataUsageInfo,
+    degraded_baseline: HashMap<String, u64>,
+    /// True when the observed snapshot could not be read (a transport error,
+    /// not absence): the cached loader then carries the previous refresh's
+    /// baseline entries forward instead of shrinking quota coverage for a
+    /// whole TTL window over one flaky read.
+    observed_unavailable: bool,
 }
 
 /// Like [`load_data_usage_from_backend`], but also returns the pre-discard
 /// per-bucket sizes so the cached loader can retain them as the degraded
 /// quota-admission baseline (issue #5716).
-async fn load_data_usage_from_backend_with_baseline(store: Arc<ECStore>) -> Result<(DataUsageInfo, HashMap<String, u64>), Error> {
-    let (data_usage_info, source) = load_data_usage_snapshot(store).await?;
-    Ok(normalize_loaded_data_usage(data_usage_info, source.is_authoritative()).await)
+async fn load_data_usage_from_backend_with_baseline(store: Arc<ECStore>) -> Result<LoadedUsageBaseline, Error> {
+    let (loaded_snapshot, source) = load_data_usage_snapshot(store.clone()).await?;
+    // The observed-newness gate below compares against the snapshot as
+    // persisted, before normalization demotes or discards anything.
+    let authoritative_as_persisted = loaded_snapshot.clone();
+    let (info, mut degraded_baseline) = normalize_loaded_data_usage(loaded_snapshot, source.is_authoritative()).await;
+
+    // A bucket without a converged scanner cycle behind it — a freshly joined
+    // replica whose every cycle is superseded by the sustained replication
+    // write stream, or a bucket created after the last converged cycle on a
+    // busy site (#6852) — has no authoritative size, and quota admission
+    // fails its writes closed indefinitely. The observed (nonconverged)
+    // snapshot those superseded cycles still publish is the only grounded
+    // usage in that window, so it backfills buckets the loaded baseline does
+    // not cover; a value already in the baseline always wins. The newness
+    // gate ties the observation to this exact authoritative snapshot, so a
+    // stale observed object left behind by an earlier incarnation (e.g. a
+    // deleted and recreated bucket) cannot inject ghost usage. Loads sit
+    // behind the same TTL cache as the snapshot itself, so this adds at most
+    // one backend read per TTL window.
+    let mut observed_unavailable = false;
+    match load_observed_data_usage_snapshot(store).await {
+        Ok(Some(observed)) if observed_data_usage_is_newer(&observed, &authoritative_as_persisted) => {
+            backfill_degraded_baseline_from_observed(&mut degraded_baseline, &observed);
+        }
+        Ok(_) => {}
+        Err(_) => observed_unavailable = true,
+    }
+
+    Ok(LoadedUsageBaseline {
+        info,
+        degraded_baseline,
+        observed_unavailable,
+    })
 }
 
-async fn load_observed_data_usage_snapshot(store: Arc<ECStore>) -> Option<DataUsageInfo> {
+/// Fill quota-baseline gaps from an observed (nonconverged) snapshot without
+/// overriding any bucket the authoritative baseline already covers.
+fn backfill_degraded_baseline_from_observed(degraded_baseline: &mut HashMap<String, u64>, observed: &DataUsageInfo) {
+    for (bucket, usage) in &observed.buckets_usage {
+        degraded_baseline.entry(bucket.clone()).or_insert(usage.size);
+    }
+}
+
+/// `Ok(None)` means the observed snapshot is absent or invalid (a settled
+/// answer); `Err` means it could not be read at all, so the caller may keep
+/// using what it learned from a previous read.
+async fn load_observed_data_usage_snapshot(store: Arc<ECStore>) -> Result<Option<DataUsageInfo>, Error> {
     let data = match read_config_preserve_empty(store, &DATA_USAGE_OBSERVED_OBJ_NAME_PATH).await {
         Ok(data) => data,
-        Err(Error::ConfigNotFound) => return None,
+        Err(Error::ConfigNotFound) => return Ok(None),
         Err(err) => {
             record_usage_snapshot_failure("read_observed", DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), &err);
-            return None;
+            return Err(err);
         }
     };
 
@@ -1139,7 +1208,7 @@ async fn load_observed_data_usage_snapshot(store: Arc<ECStore>) -> Option<DataUs
             if info.usage_snapshot_converged == Some(false)
                 && (info.is_complete_bucket_usage_snapshot() || info.is_valid_partial_snapshot()) =>
         {
-            Some(info)
+            Ok(Some(info))
         }
         Ok(_) => {
             error!(
@@ -1150,11 +1219,11 @@ async fn load_observed_data_usage_snapshot(store: Arc<ECStore>) -> Option<DataUs
                 object = %DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
                 "observed data usage snapshot was not a structurally complete nonconverged view"
             );
-            None
+            Ok(None)
         }
         Err(err) => {
             record_usage_snapshot_decode_failure("parse_observed", DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), &err);
-            None
+            Ok(None)
         }
     }
 }
@@ -1212,7 +1281,9 @@ fn merge_partial_observation_for_admin(mut authoritative: DataUsageInfo, observe
 
 async fn load_admin_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
     let (authoritative, source) = load_data_usage_snapshot(store.clone()).await?;
-    let observed = load_observed_data_usage_snapshot(store).await;
+    // For the one-shot admin view a failed observed read degrades to "no
+    // observation", same as before the read was fallible.
+    let observed = load_observed_data_usage_snapshot(store).await.ok().flatten();
     let (selected, selected_is_current_format) =
         select_admin_data_usage_snapshot(authoritative, source.is_authoritative(), observed);
     Ok(normalize_loaded_data_usage(selected, selected_is_current_format).await.0)
@@ -1375,7 +1446,11 @@ pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> R
         let refresh_generation = admin_data_usage_snapshot_generation();
         let result = load_admin_data_usage_from_backend(store.clone())
             .await
-            .map(|info| (info, HashMap::new()));
+            .map(|info| LoadedUsageBaseline {
+                info,
+                degraded_baseline: HashMap::new(),
+                observed_unavailable: false,
+            });
         let loaded_at = tokio::time::Instant::now();
         let mut cache = admin_data_usage_snapshot_cache().write().await;
         if let Some(result) = cache_data_usage_snapshot_result(
@@ -2526,6 +2601,37 @@ mod tests {
     use std::sync::Arc;
     use tokio::{io::AsyncReadExt, sync::Mutex};
 
+    #[test]
+    fn observed_snapshot_only_backfills_baseline_gaps() {
+        let mut baseline = HashMap::from([("covered".to_string(), 111_u64)]);
+        let observed = DataUsageInfo {
+            buckets_usage: HashMap::from([
+                (
+                    "covered".to_string(),
+                    BucketUsageInfo {
+                        size: 999,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "replica-only".to_string(),
+                    BucketUsageInfo {
+                        size: 42,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        backfill_degraded_baseline_from_observed(&mut baseline, &observed);
+
+        // The authoritative value must win; only the uncovered bucket (#6852:
+        // a replica that never landed a converged cycle) is filled in.
+        assert_eq!(baseline.get("covered"), Some(&111));
+        assert_eq!(baseline.get("replica-only"), Some(&42));
+    }
+
     #[derive(Debug, Default)]
     struct UsageCasState {
         object: Option<(Vec<u8>, u64)>,
@@ -3479,7 +3585,11 @@ mod tests {
 
         let first = cache_data_usage_snapshot_result(
             &mut cache,
-            Ok((expected, HashMap::new())),
+            Ok(LoadedUsageBaseline {
+                info: expected,
+                degraded_baseline: HashMap::new(),
+                observed_unavailable: false,
+            }),
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
@@ -3496,6 +3606,38 @@ mod tests {
 
     #[test]
     #[serial]
+    fn unavailable_observed_read_keeps_previous_baseline_coverage() {
+        let loaded_at = tokio::time::Instant::now();
+        let refresh_generation = data_usage_snapshot_generation();
+        let mut cache = Some(CachedDataUsageSnapshot {
+            info: Some(data_usage_info_for_test("bucket", 1, 42, SystemTime::UNIX_EPOCH)),
+            loaded_at,
+            degraded_baseline: HashMap::from([("observed-only".to_string(), 7_u64), ("covered".to_string(), 1)]),
+        });
+
+        cache_data_usage_snapshot_result(
+            &mut cache,
+            Ok(LoadedUsageBaseline {
+                info: data_usage_info_for_test("bucket", 1, 42, SystemTime::UNIX_EPOCH),
+                degraded_baseline: HashMap::from([("covered".to_string(), 2_u64)]),
+                observed_unavailable: true,
+            }),
+            loaded_at,
+            refresh_generation,
+            data_usage_snapshot_generation(),
+        )
+        .expect("an uninterrupted refresh should populate the cache")
+        .expect("successful load must be returned");
+
+        let baseline = &cache.as_ref().expect("cache must be populated").degraded_baseline;
+        // The bucket only the (now unreadable) observed snapshot covered must
+        // survive the refresh; the freshly loaded value wins where it exists.
+        assert_eq!(baseline.get("observed-only"), Some(&7));
+        assert_eq!(baseline.get("covered"), Some(&2));
+    }
+
+    #[test]
+    #[serial]
     fn cache_invalidation_during_refresh_prevents_stale_snapshot_resurrection() {
         let loaded_at = tokio::time::Instant::now();
         let refresh_generation = data_usage_snapshot_generation();
@@ -3508,7 +3650,11 @@ mod tests {
 
         let stale_result = cache_data_usage_snapshot_result(
             &mut cache,
-            Ok((data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH), HashMap::new())),
+            Ok(LoadedUsageBaseline {
+                info: data_usage_info_for_test("stale", 1, 42, SystemTime::UNIX_EPOCH),
+                degraded_baseline: HashMap::new(),
+                observed_unavailable: false,
+            }),
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),

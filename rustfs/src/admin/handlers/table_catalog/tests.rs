@@ -438,7 +438,7 @@ fn catalog_config_response_lists_standard_rest_endpoints() {
             .endpoints
             .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties")
     );
-    assert!(!response.endpoints.contains(&"POST /v1/{prefix}/tables/rename"));
+    assert!(response.endpoints.contains(&"POST /v1/{prefix}/tables/rename"));
     assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
     assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
     assert_eq!(response.admin_discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
@@ -11120,6 +11120,7 @@ async fn seed_object_table_for_metadata_maintenance(
             warehouse_root: format!("s3://{bucket}/"),
             state: crate::table_catalog::TableCatalogEntryState::Active,
             properties: BTreeMap::new(),
+            active_rename_id: None,
             created_at: None,
             updated_at: None,
         })
