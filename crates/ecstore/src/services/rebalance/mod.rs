@@ -112,6 +112,17 @@ pub(crate) async fn test_two_pool_stores_with_isolated_node_contexts(
 }
 
 #[cfg(test)]
+pub(crate) async fn promote_test_pool_meta_to_v2(store: &std::sync::Arc<crate::store::ECStore>) {
+    let mut pool_meta = store.pool_meta.read().await.clone();
+    pool_meta.version = crate::core::pools::POOL_META_VERSION;
+    pool_meta
+        .save(store.pools.clone())
+        .await
+        .expect("test pool metadata should be promoted to V2");
+    *store.pool_meta.write().await = pool_meta;
+}
+
+#[cfg(test)]
 async fn test_two_pool_stores_with_contexts(
     rebalance_meta: Option<RebalanceMeta>,
     isolate_node_contexts: bool,

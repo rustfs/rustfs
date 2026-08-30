@@ -30,6 +30,9 @@ enum ControlPlaneErrorCode {
   // The peer answered but its storage/IAM layer is not initialized yet
   // (legacy string form: "errServerNotInitialized").
   CONTROL_PLANE_ERROR_NOT_INITIALIZED = 1;
+  // The peer rejected a control-plane request before changing durable state.
+  // error_info carries the actionable validation reason.
+  CONTROL_PLANE_ERROR_INVALID_ARGUMENT = 2;
 }
 
 message PingRequest {

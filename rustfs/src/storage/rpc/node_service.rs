@@ -123,6 +123,21 @@ fn verify_node_mutation_body<T: CanonicalMutationBody>(request: &Request<T>, ope
         .map_err(|err| Status::permission_denied(format!("{operation} authentication failed: {err}")))
 }
 
+fn start_decommission_failure_response(err: Error) -> StartDecommissionResponse {
+    match err {
+        Error::InvalidArgument(_, _, reason) => StartDecommissionResponse {
+            success: false,
+            error_info: Some(reason),
+            error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32),
+        },
+        err => StartDecommissionResponse {
+            success: false,
+            error_info: Some(err.to_string()),
+            error_code: None,
+        },
+    }
+}
+
 fn supports_dynamic_config_rpc(sub_system: &str) -> bool {
     NOTIFY_SUB_SYSTEMS.contains(&sub_system)
         || matches!(
@@ -2334,11 +2349,7 @@ impl Node for NodeService {
                 success: true,
                 error_info: None,
             })),
-            Err(err) => Ok(Response::new(StartDecommissionResponse {
-                error_code: None,
-                success: false,
-                error_info: Some(err.to_string()),
-            })),
+            Err(err) => Ok(Response::new(start_decommission_failure_response(err))),
         }
     }
 
@@ -2456,7 +2467,7 @@ mod tests {
         initialize_heal_topology_fingerprint, initialize_heal_topology_fingerprint_with_probe, legacy_scanner_activity_response,
         make_heal_control_server, make_heal_control_server_with_cache, make_server, make_server_for_context,
         make_tier_mutation_control_server_for_context, previous_scanner_activity_response, remove_heal_control_replay,
-        scanner_activity_response_v7, stop_rebalance_response,
+        scanner_activity_response_v7, start_decommission_failure_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
@@ -2479,14 +2490,14 @@ mod tests {
     use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, BatchGenerallyLockRequest, CancelDecommissionRequest, CheckPartsRequest,
-        ClearDecommissionRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest, DeletePolicyRequest,
-        DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest, DeleteVersionsRequest,
-        DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest, GetAllBucketStatsRequest,
-        GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest, GetMetacacheListingRequest,
-        GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
-        GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest, HealControlRequest,
-        ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
-        LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+        ClearDecommissionRequest, ControlPlaneErrorCode, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
+        DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest,
+        DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest,
+        GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
+        GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
+        GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
+        HealBucketRequest, HealControlRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest,
+        LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
         MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
         ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
@@ -2574,6 +2585,20 @@ mod tests {
                 "NodeService RPC {method} has unsupported auth-policy {policy:?}",
             );
         }
+    }
+
+    #[test]
+    fn start_decommission_failure_response_preserves_invalid_argument_reason() {
+        let reason = "durable unresolved-entry recovery requires pool metadata V2 or V3";
+        let response = start_decommission_failure_response(Error::InvalidArgument(
+            "decommission".to_string(),
+            "pool-metadata-version".to_string(),
+            reason.to_string(),
+        ));
+
+        assert!(!response.success);
+        assert_eq!(response.error_info.as_deref(), Some(reason));
+        assert_eq!(response.error_code, Some(ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32));
     }
 
     struct HealControlMockStorage;
