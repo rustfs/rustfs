@@ -5076,6 +5076,140 @@ fn superseded_retry_backoff_grows_from_the_default_cycle() {
     }
 }
 
+#[test]
+fn publication_proof_retry_backoff_reaches_its_short_cap() {
+    for (failures, expected) in [(1, 5), (2, 10), (3, 20), (4, 30), (20, 30)] {
+        assert_eq!(scanner_publication_proof_retry_delay(failures), Duration::from_secs(expected));
+    }
+}
+
+#[test]
+fn publication_proof_retry_classifies_availability_without_masking_protocol_errors() {
+    for error in [
+        "peer node3 is temporarily offline",
+        "scanner activity peer node3 timed out after 5s",
+        "transport error: connection refused",
+    ] {
+        assert!(scanner_publication_activity_error_is_retryable(error), "{error}");
+    }
+
+    for error in [
+        "scanner activity peer node3 uses protocol 6, expected 7",
+        "scanner activity peer node3 has a different storage topology",
+        "scanner activity peer node3 omitted its movement generation",
+        "duplicate scanner activity peer: node3",
+        "scanner activity peer[2] is unreachable",
+        "scanner publication lease peer node3 is unavailable",
+    ] {
+        assert!(!scanner_publication_activity_error_is_retryable(error), "{error}");
+    }
+}
+
+#[test]
+fn publication_lease_retry_preserves_only_recoverable_candidates() {
+    for error in [
+        "scanner publication lease acquisition failed: scanner publication lease capacity is exhausted",
+        "scanner publication lease acquisition failed: scanner publication lease response arrived after its safety window",
+        "scanner publication lease acquisition failed: peer node3 is temporarily offline",
+    ] {
+        assert!(scanner_publication_lease_error_is_retryable(error), "{error}");
+    }
+
+    for error in [
+        "scanner publication lease acquisition failed: scanner publication lease generation is stale",
+        "scanner publication lease acquisition failed: peer returned a different scanner publication lease session",
+        "scanner publication lease acquisition failed: scanner publication lease is blocked by data movement",
+        "scanner publication lease acquisition failed: peer returned an invalid scanner publication lease proof",
+    ] {
+        assert!(!scanner_publication_lease_error_is_retryable(error), "{error}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_proof_retains_candidate_until_activity_recovers() {
+    let ctx = CancellationToken::new();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = attempts.clone();
+    let started_at = Instant::now();
+
+    let snapshot = await_scanner_publication_activity(&ctx, 17, "postscan", move || {
+        let attempt = probe_attempts.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if attempt == 0 {
+                Err("peer temporarily offline".to_string())
+            } else {
+                Ok(ScannerActivitySnapshot::new())
+            }
+        }
+    })
+    .await
+    .expect("a retained publication candidate should survive one transient probe failure");
+
+    assert!(snapshot.is_empty());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(started_at.elapsed(), Duration::from_secs(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_proof_does_not_retry_a_protocol_mismatch() {
+    let ctx = CancellationToken::new();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = attempts.clone();
+
+    let err = await_scanner_publication_activity(&ctx, 17, "postscan", move || {
+        probe_attempts.fetch_add(1, Ordering::SeqCst);
+        async { Err("scanner activity peer node3 uses protocol 6, expected 7".to_string()) }
+    })
+    .await
+    .expect_err("a protocol mismatch must not be hidden behind availability retries");
+
+    assert!(err.contains("uses protocol"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn publication_proof_stops_waiting_when_the_cycle_is_cancelled() {
+    let ctx = CancellationToken::new();
+    ctx.cancel();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = attempts.clone();
+
+    let err = await_scanner_publication_activity(&ctx, 17, "postscan", move || {
+        probe_attempts.fetch_add(1, Ordering::SeqCst);
+        async { Ok(ScannerActivitySnapshot::new()) }
+    })
+    .await
+    .expect_err("a cancelled cycle must release its retained publication candidate");
+
+    assert!(err.contains("cancelled"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_proof_releases_candidate_when_cancelled_during_backoff() {
+    let ctx = CancellationToken::new();
+    let cancel_ctx = ctx.clone();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = attempts.clone();
+    let started_at = Instant::now();
+
+    let cancel = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cancel_ctx.cancel();
+    });
+    let err = await_scanner_publication_activity(&ctx, 17, "postscan", move || {
+        probe_attempts.fetch_add(1, Ordering::SeqCst);
+        async { Err("peer temporarily offline".to_string()) }
+    })
+    .await
+    .expect_err("cycle cancellation must release a candidate waiting to retry publication proof");
+    cancel.await.expect("cancellation task should complete");
+
+    assert!(err.contains("cancelled"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(started_at.elapsed(), Duration::from_secs(1));
+}
+
 #[tokio::test(start_paused = true)]
 async fn corrupt_cycle_state_backoff_uses_virtual_clock() {
     let mut backoff = ScannerRetryBackoff::default();

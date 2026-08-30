@@ -35,6 +35,13 @@ const DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 const DEFAULT_SMALL_EAGER_PUT_MAX_SIZE_BYTES: usize = 512 * 1024;
 
+/// Keep the eager buffer bounded as concurrent PUTs rise. The thresholds are
+/// deliberately conservative: tiny objects remain eager, while bursty
+/// traffic sheds larger per-request allocations before memory pressure builds.
+const SMALL_EAGER_CONCURRENCY_SOFT_LIMIT: usize = 64;
+const SMALL_EAGER_CONCURRENCY_HARD_LIMIT: usize = 128;
+const MIN_DYNAMIC_SMALL_EAGER_PUT_MAX_SIZE_BYTES: i64 = 128 * 1024;
+
 // Keep bounded conditional writes eager through the historical 1 MiB boundary
 // so the old object remains readable until the replacement body is complete.
 const CONDITIONAL_SMALL_EAGER_PUT_MAX_SIZE_BYTES: i64 = 1024 * 1024;
@@ -492,6 +499,7 @@ fn zero_copy_eager_put_max_size_bytes() -> i64 {
     i64::try_from(configured).unwrap_or(i64::MAX)
 }
 
+#[cfg(test)]
 fn should_use_small_eager_put_path(
     size: i64,
     headers: &HeaderMap,
@@ -553,6 +561,23 @@ fn small_eager_put_max_size_bytes() -> i64 {
     i64::try_from(configured).unwrap_or(i64::MAX)
 }
 
+fn dynamic_small_eager_put_max_size_bytes(concurrent_put_requests: usize) -> i64 {
+    let configured = small_eager_put_max_size_bytes();
+    if configured <= MIN_DYNAMIC_SMALL_EAGER_PUT_MAX_SIZE_BYTES {
+        return configured;
+    }
+    let adjusted = if concurrent_put_requests > SMALL_EAGER_CONCURRENCY_HARD_LIMIT {
+        configured / 4
+    } else if concurrent_put_requests > SMALL_EAGER_CONCURRENCY_SOFT_LIMIT {
+        configured / 2
+    } else {
+        configured
+    };
+
+    adjusted.max(MIN_DYNAMIC_SMALL_EAGER_PUT_MAX_SIZE_BYTES)
+}
+
+#[cfg(test)]
 fn select_put_path(
     size: i64,
     headers: &HeaderMap,
@@ -560,8 +585,26 @@ fn select_put_path(
     should_compress: bool,
     is_extract: bool,
 ) -> (&'static str, &'static str, bool, bool) {
+    select_put_path_with_concurrency(size, headers, server_side_encryption_requested, should_compress, is_extract, 0)
+}
+
+fn select_put_path_with_concurrency(
+    size: i64,
+    headers: &HeaderMap,
+    server_side_encryption_requested: bool,
+    should_compress: bool,
+    is_extract: bool,
+    concurrent_put_requests: usize,
+) -> (&'static str, &'static str, bool, bool) {
     let use_empty_or_small_eager_put_path = size == 0
-        || should_use_small_eager_put_path(size, headers, server_side_encryption_requested, should_compress, is_extract);
+        || should_use_small_eager_put_path_with_max_size(
+            size,
+            headers,
+            server_side_encryption_requested,
+            should_compress,
+            is_extract,
+            dynamic_small_eager_put_max_size_bytes(concurrent_put_requests),
+        );
     let zero_copy_eager_put_path_status =
         zero_copy_eager_put_path_status(size, headers, server_side_encryption_requested, should_compress, is_extract);
     let use_zero_copy_eager_put_path = zero_copy_eager_put_path_status == PUT_EAGER_STATUS_ELIGIBLE;
@@ -1104,7 +1147,14 @@ impl DefaultObjectUsecase {
         }
 
         let (put_path, zero_copy_eager_put_path_status, use_zero_copy_eager_put_path, use_empty_or_small_eager_put_path) =
-            select_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+            select_put_path_with_concurrency(
+                size,
+                &req.headers,
+                server_side_encryption_requested,
+                should_compress,
+                false,
+                concurrent_put_requests,
+            );
         if use_zero_copy_eager_put_path {
             counter!(buffered_write::ATTEMPTS_TOTAL).increment(1);
             histogram!(buffered_write::ATTEMPT_SIZE_BYTES).record(size as f64);
@@ -2418,6 +2468,27 @@ mod tests {
 
         assert!(!should_use_small_eager_put_path(0, &headers, false, false, false));
         assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
+    }
+
+    #[test]
+    fn dynamic_small_eager_threshold_sheds_memory_only_above_concurrency_limits() {
+        assert_eq!(dynamic_small_eager_put_max_size_bytes(0), 512 * 1024);
+        assert_eq!(dynamic_small_eager_put_max_size_bytes(SMALL_EAGER_CONCURRENCY_SOFT_LIMIT), 512 * 1024);
+        assert_eq!(dynamic_small_eager_put_max_size_bytes(SMALL_EAGER_CONCURRENCY_SOFT_LIMIT + 1), 256 * 1024);
+        assert_eq!(dynamic_small_eager_put_max_size_bytes(SMALL_EAGER_CONCURRENCY_HARD_LIMIT + 1), 128 * 1024);
+    }
+
+    #[test]
+    fn dynamic_small_eager_threshold_preserves_tiny_objects_under_pressure() {
+        let headers = HeaderMap::new();
+
+        let (path, _, _, small_eager) = select_put_path_with_concurrency(128 * 1024, &headers, false, false, false, 256);
+        assert_eq!(path, "small_eager");
+        assert!(small_eager);
+
+        let (path, _, _, small_eager) = select_put_path_with_concurrency(256 * 1024, &headers, false, false, false, 256);
+        assert_eq!(path, "streaming");
+        assert!(!small_eager);
     }
 
     #[test]

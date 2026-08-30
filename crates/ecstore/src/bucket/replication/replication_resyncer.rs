@@ -102,6 +102,7 @@ const BACKGROUND_WALKDIR_TIMEOUT: TokioDuration = TokioDuration::from_secs(60);
 const ENV_REPL_RESYNC_MAX_JOBS: &str = "RUSTFS_REPL_RESYNC_MAX_JOBS";
 const DEFAULT_REPL_RESYNC_MAX_JOBS: usize = 2;
 const MAX_REPL_RESYNC_MAX_JOBS: usize = 32;
+const TARGET_CLIENT_UNAVAILABLE_ERROR: &str = "replication target client is unavailable";
 use uuid::Uuid;
 
 const EVENT_RESYNC_STATUS_UPDATE_SKIPPED: &str = "replication_resync_status_update_skipped";
@@ -1847,19 +1848,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                 reason = "target_client_missing",
                 "Skipping replication delete because target client is unavailable"
             );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: ObjectInfo {
-                    bucket: bucket.clone(),
-                    name: dobj.delete_object.object_name.clone(),
-                    version_id,
-                    delete_marker: dobj.delete_object.delete_marker,
-                    ..Default::default()
-                },
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
+            rinfos.targets.push(unavailable_delete_target_info(&dobj, &tgt_entry.arn));
             continue;
         };
 
@@ -2584,6 +2573,32 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     all_succeeded
 }
 
+fn unavailable_delete_target_info(dobj: &DeletedObjectReplicationInfo, arn: &str) -> ReplicatedTargetInfo {
+    let mut rinfo = dobj
+        .delete_object
+        .replication_state
+        .as_ref()
+        .map(|state| state.target_state(arn))
+        .unwrap_or_else(|| ReplicatedTargetInfo {
+            arn: arn.to_string(),
+            ..Default::default()
+        });
+    rinfo.op_type = dobj.op_type;
+    if is_version_delete_replication(&dobj.delete_object) {
+        if rinfo.version_purge_status != VersionPurgeStatusType::Complete {
+            rinfo.version_purge_status = VersionPurgeStatusType::Failed;
+            rinfo.error = Some(TARGET_CLIENT_UNAVAILABLE_ERROR.to_string());
+        }
+    } else if rinfo.prev_replication_status == ReplicationStatusType::Completed && dobj.op_type != ReplicationType::ExistingObject
+    {
+        rinfo.replication_status = ReplicationStatusType::Completed;
+    } else {
+        rinfo.replication_status = ReplicationStatusType::Failed;
+        rinfo.error = Some(TARGET_CLIENT_UNAVAILABLE_ERROR.to_string());
+    }
+    rinfo
+}
+
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
     let version_id = if let Some(version_id) = &dobj.delete_object.delete_marker_version_id {
         version_id.to_owned()
@@ -2796,6 +2811,10 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
     };
 
     let mut join_set = JoinSet::new();
+    let mut rinfos = ReplicatedInfos {
+        replication_timestamp: Some(OffsetDateTime::now_utc()),
+        targets: Vec::with_capacity(tgt_arns.len()),
+    };
 
     for arn in tgt_arns {
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &arn).await else {
@@ -2803,7 +2822,8 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
             // stays unreachable would flood the log from the replication hot path. The
             // condition is reported once per pass by the site-replication reconciler and
             // once per rebuild by `update_all_targets`, which is where an operator can act
-            // on it; the per-object event below still records each dropped object.
+            // on it; the FAILED state below preserves retry visibility and the
+            // aggregate result emits the user-visible failure event once.
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2812,15 +2832,9 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
                 object = %object,
                 arn = %arn,
                 reason = "target_client_missing",
-                "Replication rule has no bucket target for its destination ARN; object not replicated"
+                "Replication target client unavailable"
             );
-            send_local_event(EventArgs {
-                event_name: EventName::ObjectReplicationNotTracked.to_string(),
-                bucket_name: bucket.clone(),
-                object: roi.to_object_info(),
-                user_agent: "Internal: [Replication]".to_string(),
-                ..Default::default()
-            });
+            rinfos.targets.push(unavailable_object_target_info(&roi, &arn));
             continue;
         };
 
@@ -2834,11 +2848,6 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
             }
         });
     }
-
-    let mut rinfos = ReplicatedInfos {
-        replication_timestamp: Some(OffsetDateTime::now_utc()),
-        targets: Vec::with_capacity(join_set.len()),
-    };
 
     while let Some(result) = join_set.join_next().await {
         match result {
@@ -2943,6 +2952,23 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
     }
 
     (merged_state, state_persisted)
+}
+
+fn unavailable_object_target_info(roi: &ReplicateObjectInfo, arn: &str) -> ReplicatedTargetInfo {
+    ReplicatedTargetInfo {
+        arn: arn.to_string(),
+        size: roi.actual_size,
+        replication_action: if roi.op_type == ReplicationType::Object {
+            ReplicationAction::All
+        } else {
+            ReplicationAction::Metadata
+        },
+        op_type: roi.op_type,
+        replication_status: ReplicationStatusType::Failed,
+        prev_replication_status: roi.target_replication_status(arn),
+        error: Some(TARGET_CLIENT_UNAVAILABLE_ERROR.to_string()),
+        ..Default::default()
+    }
 }
 
 trait ReplicateObjectInfoExt {
@@ -4157,6 +4183,88 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
 #[cfg(test)]
 mod tests {
     use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
+
+    #[test]
+    fn unavailable_object_target_is_persisted_as_failed() {
+        let arn = "arn:object-target";
+        let roi = ReplicateObjectInfo {
+            actual_size: 42,
+            op_type: ReplicationType::Object,
+            replication_status_internal: Some(format!("{arn}=PENDING;")),
+            ..Default::default()
+        };
+
+        let target_info = unavailable_object_target_info(&roi, arn);
+        let merged = get_replication_state(
+            &ReplicatedInfos {
+                replication_timestamp: Some(OffsetDateTime::now_utc()),
+                targets: vec![target_info.clone()],
+            },
+            &ReplicationState::default(),
+            None,
+        );
+
+        assert_eq!(target_info.replication_status, ReplicationStatusType::Failed);
+        assert_eq!(target_info.prev_replication_status, ReplicationStatusType::Pending);
+        assert_eq!(target_info.replication_action, ReplicationAction::All);
+        assert_eq!(target_info.error.as_deref(), Some(TARGET_CLIENT_UNAVAILABLE_ERROR));
+        assert_eq!(merged.targets.get(arn), Some(&ReplicationStatusType::Failed));
+    }
+
+    #[test]
+    fn unavailable_delete_target_is_failed_without_overwriting_completed_state() {
+        let arn = "arn:delete-target";
+        let mut previous_state = ReplicationState::default();
+        previous_state.targets.insert(arn.to_string(), ReplicationStatusType::Pending);
+        let mut dobj = DeletedObjectReplicationInfo {
+            delete_object: ReplicationDeletedObject {
+                delete_marker: true,
+                replication_state: Some(previous_state),
+                ..Default::default()
+            },
+            op_type: ReplicationType::Delete,
+            ..Default::default()
+        };
+
+        let failed = unavailable_delete_target_info(&dobj, arn);
+        assert_eq!(failed.replication_status, ReplicationStatusType::Failed);
+        assert_eq!(failed.prev_replication_status, ReplicationStatusType::Pending);
+        assert_eq!(failed.error.as_deref(), Some(TARGET_CLIENT_UNAVAILABLE_ERROR));
+
+        dobj.delete_object
+            .replication_state
+            .as_mut()
+            .expect("previous state should exist")
+            .targets
+            .insert(arn.to_string(), ReplicationStatusType::Completed);
+        let completed = unavailable_delete_target_info(&dobj, arn);
+        assert_eq!(completed.replication_status, ReplicationStatusType::Completed);
+        assert!(completed.error.is_none());
+    }
+
+    #[test]
+    fn unavailable_version_purge_target_is_persisted_as_failed() {
+        let arn = "arn:purge-target";
+        let mut previous_state = ReplicationState::default();
+        previous_state
+            .purge_targets
+            .insert(arn.to_string(), VersionPurgeStatusType::Pending);
+        let dobj = DeletedObjectReplicationInfo {
+            delete_object: ReplicationDeletedObject {
+                version_id: Some(Uuid::new_v4()),
+                replication_state: Some(previous_state),
+                ..Default::default()
+            },
+            op_type: ReplicationType::Delete,
+            ..Default::default()
+        };
+
+        let target_info = unavailable_delete_target_info(&dobj, arn);
+
+        assert_eq!(target_info.version_purge_status, VersionPurgeStatusType::Failed);
+        assert_eq!(target_info.error.as_deref(), Some(TARGET_CLIENT_UNAVAILABLE_ERROR));
+    }
+
     fn resync_target_state(resync_id: &str, status: ResyncStatusType, replicated_count: i64) -> TargetReplicationResyncStatus {
         TargetReplicationResyncStatus {
             resync_id: resync_id.to_string(),

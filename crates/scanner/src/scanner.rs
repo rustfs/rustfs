@@ -1547,15 +1547,23 @@ async fn run_data_scanner_cycle_with_budget(
     let remote_lease_defer_reason = if remote_publication_lease_targets.is_empty() {
         None
     } else if let Some(notification_system) = storeapi.notification_system() {
-        match notification_system
-            .acquire_scanner_publication_leases(remote_publication_lease_targets.clone())
-            .await
-        {
-            Ok(grants) => {
+        let publication_proof_ctx = cycle_budget.token();
+        let lease_result = await_scanner_publication_proof(
+            &publication_proof_ctx,
+            cycle_info.current,
+            "lease_acquire",
+            || notification_system.acquire_scanner_publication_leases(remote_publication_lease_targets.clone()),
+            |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
+        )
+        .await;
+        match lease_result {
+            ScannerPublicationProofWait::Ready(grants) => {
                 remote_publication_leases = Some((notification_system, grants));
                 None
             }
-            Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+            ScannerPublicationProofWait::Rejected(_) | ScannerPublicationProofWait::Cancelled => {
+                Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+            }
         }
     } else {
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
