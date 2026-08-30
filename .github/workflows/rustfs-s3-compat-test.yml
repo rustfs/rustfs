@@ -44,22 +44,10 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           repository: rustfs/auto-testing
-          ref: main
+          ref: 9874ab5
           path: auto-testing
           persist-credentials: false
           token: ${{ secrets.PF_TESTING_GH_TOKEN }}
-
-      - name: Patch auto-testing temp file paths
-        run: |
-          set -euo pipefail
-          # Use per-run TEST_TMP files instead of shared /tmp/s3c-* paths.
-          # This prevents permission collisions from stale files created by
-          # previous jobs/users on shared self-hosted runners.
-          perl -0pi -e 's#/tmp/(s3c-[A-Za-z0-9._-]+)#\$\{TEST_TMP\}/$1#g' auto-testing/rustfs-s3-compat-test.sh
-          if grep -nE '/tmp/s3c-[A-Za-z0-9._-]+' auto-testing/rustfs-s3-compat-test.sh; then
-            echo "unexpected hardcoded /tmp/s3c-* path(s) remain"
-            exit 1
-          fi
 
       - name: Show environment
         run: |
