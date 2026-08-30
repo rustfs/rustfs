@@ -1108,20 +1108,24 @@ fn non_inline_data_read_candidate_is_safe(
     ) else {
         return false;
     };
-    let mut data_shards = vec![false; erasure.data_shards];
+    // The regular reader setup can reconstruct missing data shards from any
+    // `data_shards` matching metadata entries. Requiring every data slot here
+    // would unnecessarily wait for one slow data disk even when parity and
+    // the remaining data shards already form a read quorum.
+    let mut available_shards = vec![false; erasure.data_shards + erasure.parity_shards];
     for ((file_info, disk), &erasure_index) in parts_metadata
         .iter()
         .zip(disks.iter())
         .zip(candidate.erasure.distribution.iter())
     {
-        if erasure_index == 0 || erasure_index > erasure.data_shards || disk.is_none() {
+        if erasure_index == 0 || erasure_index > available_shards.len() || disk.is_none() {
             continue;
         }
         if metadata_early_stop_candidate_matches(file_info, candidate) && file_info.erasure.index == erasure_index {
-            data_shards[erasure_index - 1] = true;
+            available_shards[erasure_index - 1] = true;
         }
     }
-    data_shards.into_iter().all(|present| present)
+    available_shards.into_iter().filter(|present| *present).count() >= erasure.data_shards
 }
 
 fn data_read_inline_missing_shards_are_pending(
