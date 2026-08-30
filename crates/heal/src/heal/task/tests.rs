@@ -706,9 +706,26 @@ enum MockHealObjectOutcome {
     OkWithOtherError(&'static str),
     ErrOther(&'static str),
     DanglingGraceDeferred,
+    UnavailableDrive(DriveState),
     RetryableReadQuorum,
     RetryableSlowDown,
     PermanentOther(&'static str),
+}
+
+fn unavailable_drive_heal_result(state: DriveState) -> (HealResultItem, Option<Error>) {
+    (
+        HealResultItem {
+            after: Infos {
+                drives: vec![HealDriveInfo {
+                    endpoint: "remote-target".to_string(),
+                    state: state.to_string(),
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        },
+        None,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -813,6 +830,7 @@ impl HealStorageAPI for MockStorage {
                         "dangling object deletion deferred by heal grace window; retry_after_secs=3599; grace_secs=3600",
                     ))),
                 )),
+                MockHealObjectOutcome::UnavailableDrive(state) => Ok(unavailable_drive_heal_result(state)),
                 MockHealObjectOutcome::RetryableReadQuorum => Err(Error::Storage(EcstoreError::InsufficientReadQuorum(
                     bucket.to_string(),
                     object.to_string(),
@@ -833,6 +851,7 @@ impl HealStorageAPI for MockStorage {
                         "dangling object deletion deferred by heal grace window; retry_after_secs=3599; grace_secs=3600",
                     ))),
                 )),
+                MockHealObjectOutcome::UnavailableDrive(state) => Ok(unavailable_drive_heal_result(state)),
                 MockHealObjectOutcome::OkWithOtherError(message) => Ok((HealResultItem::default(), Some(Error::other(message)))),
                 MockHealObjectOutcome::ErrOther(message) | MockHealObjectOutcome::PermanentOther(message) => {
                     Err(Error::other(message))
@@ -1447,6 +1466,46 @@ async fn test_recursive_bucket_heal_retries_only_retryable_objects() {
     assert_eq!(progress.objects_scanned, 2);
     assert_eq!(progress.objects_healed, 2);
     assert_eq!(progress.objects_failed, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_retries_when_recreate_target_is_unavailable() {
+    for state in [DriveState::Offline, DriveState::Faulty] {
+        let state_name = state.to_string();
+        let storage = Arc::new(MockStorage::default());
+        storage
+            .heal_object_outcomes
+            .lock()
+            .unwrap()
+            .insert("object-a".to_string(), VecDeque::from([MockHealObjectOutcome::UnavailableDrive(state)]));
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.heal_bucket("bucket-a")
+            .await
+            .expect("an unavailable recreate target should be retried after it returns");
+
+        assert_eq!(
+            storage.heal_object_calls.lock().unwrap().as_slice(),
+            ["object-a".to_string(), "object-b".to_string(), "object-a".to_string()],
+            "unexpected calls for unavailable state {state_name}"
+        );
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_scanned, 2, "unexpected scanned count for state {state_name}");
+        assert_eq!(progress.objects_healed, 2, "unexpected healed count for state {state_name}");
+        assert_eq!(progress.objects_failed, 0, "unexpected failed count for state {state_name}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
