@@ -627,8 +627,7 @@ dependencies = [
 [[package]]
 name = "astral-tokio-tar"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f2e989b33246fe9240d39accf4dd9a01e0b6c1f3ce9dd095e0a47fa02505523"
+source = "git+https://github.com/cxymds/tokio-tar.git?rev=603756478b7668436e464519c77ccac22a99ba96#603756478b7668436e464519c77ccac22a99ba96"
 dependencies = [
  "futures-core",
  "libc",

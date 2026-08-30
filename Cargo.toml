@@ -232,7 +232,9 @@ tokio-postgres-rustls = "0.14.0"
 # Utilities and Tools
 anyhow = "1.0.104"
 arc-swap = "1.9.2"
-astral-tokio-tar = "0.7.0"
+# RUSTFS_COMPAT_TODO(tokio-tar-extension-limits): replace the fork pin with an
+# upstream release after astral-sh/tokio-tar#118 lands.
+astral-tokio-tar = { git = "https://github.com/cxymds/tokio-tar.git", rev = "603756478b7668436e464519c77ccac22a99ba96" }
 atoi = "3.1.0"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.11.0" }
