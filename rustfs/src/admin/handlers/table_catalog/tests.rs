@@ -10628,6 +10628,19 @@ fn table_credential_scope_rejects_cross_bucket_or_unsafe_prefix() {
 }
 
 #[test]
+fn table_credential_scope_accepts_entry_relative_metadata_location() {
+    let mut entry = table_entry_for_credentials();
+    entry.metadata_location = "s3://warehouse/tables/table-id/metadata/v1.metadata.json".to_string();
+
+    let scope = table_credential_scope(&entry).expect("entry-relative metadata should remain vendable");
+
+    assert_eq!(scope.metadata_object, "tables/table-id/metadata/v1.metadata.json");
+    assert_eq!(scope.metadata_scope_prefix, "s3://warehouse/tables/table-id/metadata/v1.metadata.json");
+    table_credential_session_policy(&entry, &scope.warehouse_object_prefix, &scope.metadata_object)
+        .expect("entry-relative metadata should produce a credential policy");
+}
+
+#[test]
 fn vended_credential_delegation_requires_an_exact_comma_separated_token() {
     let mut headers = HeaderMap::new();
     assert!(!requests_vended_credentials(&headers));

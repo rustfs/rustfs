@@ -2496,7 +2496,9 @@ fn table_credential_scope(entry: &crate::table_catalog::TableEntry) -> S3Result<
     let namespace = crate::table_catalog::Namespace::parse(&entry.namespace).map_err(|_| persisted_metadata_error("table"))?;
     let table =
         crate::table_catalog::IdentifierSegment::parse(entry.table.clone()).map_err(|_| persisted_metadata_error("table"))?;
-    if !crate::table_catalog::is_valid_table_metadata_location(&namespace, &table, &metadata_object) {
+    if crate::table_catalog::is_reserved_table_object_key(&metadata_object)
+        && !crate::table_catalog::is_valid_table_metadata_location(&namespace, &table, &metadata_object)
+    {
         return Err(persisted_metadata_error("table"));
     }
     let metadata_scope_prefix = table_metadata_location_for_client(&entry.table_bucket, &entry.metadata_location);
