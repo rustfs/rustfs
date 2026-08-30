@@ -361,6 +361,7 @@ struct MemoryConfigStore {
     cancel_after_interleaving_puts: Mutex<HashMap<String, CancellationToken>>,
     cancel_after_successful_puts: Mutex<HashMap<String, (usize, CancellationToken)>>,
     replace_after_successful_puts: Mutex<HashMap<String, (usize, Vec<u8>)>>,
+    error_after_commit_deletes: Mutex<HashSet<String>>,
     put_counts: Mutex<HashMap<String, usize>>,
     publication_admission_blocked: AtomicBool,
     block_publication_after_admissions: AtomicUsize,
@@ -1959,6 +1960,562 @@ async fn scanner_usage_floor_keeps_valid_primary_when_backup_has_no_identity() {
     );
 }
 
+fn rc3_legacy_empty_usage_fence(epoch: Option<u64>) -> Vec<u8> {
+    // Pinned field set emitted by rc.3 after DeleteBucket synthesized a
+    // default v2 usage primary. Leadership added scanner_epoch separately.
+    const RC3_EMPTY_USAGE_FENCE: &str = r#"{
+        "total_capacity":0,
+        "total_used_capacity":0,
+        "total_free_capacity":0,
+        "last_update":{"secs_since_epoch":1,"nanos_since_epoch":0},
+        "objects_total_count":0,
+        "versions_total_count":0,
+        "delete_markers_total_count":0,
+        "objects_total_size":0,
+        "replication_info":{},
+        "buckets_count":0,
+        "buckets_usage":{},
+        "usage_snapshot_complete":false,
+        "bucket_sizes":{},
+        "disk_usage_status":[]
+    }"#;
+    let mut value =
+        serde_json::from_str::<serde_json::Value>(RC3_EMPTY_USAGE_FENCE).expect("pinned rc.3 empty usage fence should decode");
+    let fields = value
+        .as_object_mut()
+        .expect("legacy empty usage fence should be a JSON object");
+    if let Some(epoch) = epoch {
+        fields.insert("scanner_epoch".to_string(), serde_json::Value::from(epoch));
+    }
+    serde_json::to_vec(&value).expect("rc.3 legacy empty usage fence fixture should encode")
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovers_rc3_empty_fences_and_restarts_from_zero() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let backup_key = memory_config_key(RUSTFS_META_BUCKET, &backup_path);
+    store
+        .objects
+        .lock()
+        .await
+        .insert(primary_key.clone(), rc3_legacy_empty_usage_fence(Some(7)));
+    store
+        .objects
+        .lock()
+        .await
+        .insert(backup_key, rc3_legacy_empty_usage_fence(None));
+    store.revisions.lock().await.insert(primary_key, 1);
+
+    let (floor, startup) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("rc.3 empty usage fences should enter recovery");
+    assert_eq!(
+        floor,
+        PersistedUsageFloor {
+            next_cycle: 0,
+            leader_epoch: 7,
+        }
+    );
+    assert_eq!(startup, PersistedUsageFloorStartup::RecoveredLegacyEmptyFence);
+
+    let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("recovered usage bootstrap should be persisted");
+    let pending = serde_json::from_slice::<DataUsageInfo>(&primary).expect("recovered usage bootstrap should decode");
+    assert!(data_usage_info_is_bootstrap_pending(&pending));
+    assert_eq!(pending.scanner_epoch, Some(7));
+    assert!(read_config(store.clone(), DATA_USAGE_RECOVERY_PATH.as_str()).await.is_ok());
+
+    let (restart_floor, restart_state) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("recovery marker should survive a restart before leadership claim");
+    assert_eq!(restart_floor.leader_epoch, 7);
+    assert_eq!(restart_state, PersistedUsageFloorStartup::RecoveredLegacyEmptyFence);
+    let mut cycle = CurrentCycle {
+        current: 41,
+        next: 42,
+        ..Default::default()
+    };
+    assert_eq!(
+        prepare_cycle_for_usage_floor_bootstrap(&mut cycle, restart_floor, restart_state),
+        (true, true)
+    );
+    assert_eq!(cycle.current, 0);
+    assert_eq!(cycle.next, 0);
+    assert!(cycle.cycle_completed.is_empty());
+
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut leader_epoch = restart_floor.leader_epoch;
+    assert!(
+        claim_scanner_leadership(
+            &CancellationToken::new(),
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut leader_epoch,
+            true,
+            true,
+        )
+        .await
+    );
+    assert_eq!(leader_epoch, 8);
+    complete_legacy_empty_usage_floor_recovery(store.clone(), leader_epoch)
+        .await
+        .expect("leadership claim should retire the recovery marker");
+    assert!(matches!(
+        read_config(store.clone(), DATA_USAGE_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+    let (claimed_floor, claimed_state) = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect("claimed bootstrap should remain restartable");
+    assert_eq!(claimed_floor.leader_epoch, 8);
+    assert_eq!(claimed_state, PersistedUsageFloorStartup::BootstrapPending);
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovery_preserves_newer_authoritative_companion_floor() {
+    for companion_path in [
+        format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.clone(),
+    ] {
+        let store = Arc::new(MemoryConfigStore::default());
+        let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        store
+            .objects
+            .lock()
+            .await
+            .insert(primary_key.clone(), rc3_legacy_empty_usage_fence(Some(7)));
+        store.revisions.lock().await.insert(primary_key, 1);
+        persisted_usage_floor_for_startup(store.clone(), true)
+            .await
+            .expect("legacy empty primary should enter recovery");
+
+        let mut companion = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+        companion.scanner_epoch = Some(8);
+        companion.scanner_cycle = Some(11);
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, &companion_path),
+            serde_json::to_vec(&companion).expect("authoritative companion should encode"),
+        );
+        if companion_path.ends_with(".bkp") {
+            let mut stale_legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+            stale_legacy.scanner_epoch = Some(6);
+            stale_legacy.scanner_cycle = Some(10);
+            store.objects.lock().await.insert(
+                memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+                serde_json::to_vec(&stale_legacy).expect("stale legacy companion should encode"),
+            );
+        } else {
+            let mut stale_backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+            stale_backup.scanner_epoch = Some(6);
+            stale_backup.scanner_cycle = Some(10);
+            store.objects.lock().await.insert(
+                memory_config_key(RUSTFS_META_BUCKET, &format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str())),
+                serde_json::to_vec(&stale_backup).expect("stale legacy backup should encode"),
+            );
+        }
+
+        let (floor, state) = persisted_usage_floor_for_startup(store, true)
+            .await
+            .expect("a newer authoritative companion should advance the recovery floor");
+        assert_eq!(floor.leader_epoch, 8, "unexpected companion path: {companion_path}");
+        assert_eq!(floor.next_cycle, 12, "unexpected companion path: {companion_path}");
+        assert_eq!(state, PersistedUsageFloorStartup::RecoveredLegacyEmptyFence);
+    }
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovery_fences_non_authoritative_legacy_backup() {
+    for partial_backup in [false, true] {
+        let store = Arc::new(MemoryConfigStore::default());
+        let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        store
+            .objects
+            .lock()
+            .await
+            .insert(primary_key.clone(), rc3_legacy_empty_usage_fence(Some(7)));
+        store.revisions.lock().await.insert(primary_key, 1);
+        persisted_usage_floor_for_startup(store.clone(), true)
+            .await
+            .expect("legacy empty primary should enter recovery");
+
+        let mut legacy_primary = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+        legacy_primary.scanner_epoch = Some(8);
+        legacy_primary.scanner_cycle = Some(11);
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+            serde_json::to_vec(&legacy_primary).expect("legacy primary should encode"),
+        );
+        let backup_path = format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let backup = if partial_backup {
+            serde_json::to_vec(&DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+                scanner_epoch: Some(9),
+                buckets_count: 1,
+                ..Default::default()
+            })
+            .expect("partial legacy backup should encode")
+        } else {
+            rc3_legacy_empty_usage_fence(Some(9))
+        };
+        store
+            .objects
+            .lock()
+            .await
+            .insert(memory_config_key(RUSTFS_META_BUCKET, &backup_path), backup);
+
+        if partial_backup {
+            let err = persisted_usage_floor_for_startup(store, true)
+                .await
+                .expect_err("a partial noncanonical backup must remain fail-closed");
+            assert!(err.to_string().contains("conflicts with persisted usage state"));
+        } else {
+            let (floor, state) = persisted_usage_floor_for_startup(store, true)
+                .await
+                .expect("an exact empty backup should contribute its epoch fence");
+            assert_eq!(floor.leader_epoch, 9);
+            assert_eq!(floor.next_cycle, 12);
+            assert_eq!(state, PersistedUsageFloorStartup::RecoveredLegacyEmptyFence);
+        }
+    }
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovery_resumes_after_marker_only_crash_point() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let original = rc3_legacy_empty_usage_fence(Some(7));
+    store.objects.lock().await.insert(primary_key.clone(), original.clone());
+    store.revisions.lock().await.insert(primary_key.clone(), 1);
+    store.fail_put_number.lock().await.insert(primary_key, 1);
+
+    persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect_err("injected primary CAS failure should leave recovery pending");
+    assert!(read_config(store.clone(), DATA_USAGE_RECOVERY_PATH.as_str()).await.is_ok());
+    assert_eq!(
+        read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("legacy primary should remain after the failed CAS"),
+        original
+    );
+
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("the durable marker should resume the primary conversion");
+    assert_eq!(floor.leader_epoch, 7);
+    assert_eq!(state, PersistedUsageFloorStartup::RecoveredLegacyEmptyFence);
+    let recovered = read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("recovered bootstrap should replace the legacy primary");
+    assert!(data_usage_info_is_bootstrap_pending(
+        &serde_json::from_slice(&recovered).expect("recovered bootstrap should decode")
+    ));
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovery_reconciles_marker_post_commit_error() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let marker_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_RECOVERY_PATH.as_str());
+    store
+        .objects
+        .lock()
+        .await
+        .insert(primary_key.clone(), rc3_legacy_empty_usage_fence(Some(7)));
+    store.revisions.lock().await.insert(primary_key, 1);
+    store.error_after_commit_put_number.lock().await.insert(marker_key, 1);
+
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("a committed recovery marker should reconcile after an ambiguous error");
+    assert_eq!(floor.leader_epoch, 7);
+    assert_eq!(state, PersistedUsageFloorStartup::RecoveredLegacyEmptyFence);
+    assert!(read_config(store, DATA_USAGE_RECOVERY_PATH.as_str()).await.is_ok());
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovery_reconciles_marker_delete_post_commit_error() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    store
+        .objects
+        .lock()
+        .await
+        .insert(primary_key.clone(), rc3_legacy_empty_usage_fence(Some(7)));
+    store.revisions.lock().await.insert(primary_key, 1);
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("legacy empty primary should enter recovery");
+    let mut cycle = CurrentCycle::default();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut leader_epoch = floor.leader_epoch;
+    let (allow_pending, reset_on_conflict) = prepare_cycle_for_usage_floor_bootstrap(&mut cycle, floor, state);
+    assert!(
+        claim_scanner_leadership(
+            &CancellationToken::new(),
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut leader_epoch,
+            allow_pending,
+            reset_on_conflict,
+        )
+        .await
+    );
+    store
+        .error_after_commit_deletes
+        .lock()
+        .await
+        .insert(memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_RECOVERY_PATH.as_str()));
+
+    complete_legacy_empty_usage_floor_recovery(store.clone(), leader_epoch)
+        .await
+        .expect("a committed marker delete should reconcile after an ambiguous error");
+    assert!(matches!(
+        read_config(store, DATA_USAGE_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+    assert_eq!(scanner_cycle_recovery_status().state, "healthy");
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_usage_floor_recovery_retry_budget_uses_marker_epoch_identity() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    store
+        .objects
+        .lock()
+        .await
+        .insert(primary_key.clone(), rc3_legacy_empty_usage_fence(Some(7)));
+    store.revisions.lock().await.insert(primary_key.clone(), 1);
+    persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("legacy empty primary should enter recovery");
+    assert!(record_scanner_cycle_recovery_retry(3));
+    let first_detected = scanner_cycle_recovery_status().first_detected_at_unix_secs;
+
+    let primary = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("recovered bootstrap should exist");
+    let mut pending = serde_json::from_slice::<DataUsageInfo>(&primary).expect("recovered bootstrap should decode");
+    pending.scanner_epoch = Some(8);
+    store.objects.lock().await.insert(
+        primary_key.clone(),
+        serde_json::to_vec(&pending).expect("claimed bootstrap should encode"),
+    );
+    *store.revisions.lock().await.entry(primary_key).or_insert(1) += 1;
+
+    let (floor, state) = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect("claimed bootstrap should retain its recovery identity");
+    assert_eq!(floor.leader_epoch, 8);
+    assert_eq!(state, PersistedUsageFloorStartup::RecoveredLegacyEmptyFence);
+    let status = scanner_cycle_recovery_status();
+    assert_eq!(status.leader_epoch, Some(7));
+    assert_eq!(status.retry_count, 3);
+    assert_eq!(status.first_detected_at_unix_secs, first_detected);
+    clear_legacy_empty_usage_floor_recovery_status();
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_rejects_noncanonical_empty_fence() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let mut value = serde_json::from_slice::<serde_json::Value>(&rc3_legacy_empty_usage_fence(Some(7)))
+        .expect("legacy fixture should decode");
+    value
+        .as_object_mut()
+        .expect("legacy fixture should be an object")
+        .insert("future_field".to_string(), serde_json::Value::Bool(true));
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&value).expect("noncanonical fixture should encode"),
+    );
+
+    let err = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect_err("unknown legacy fields must not be recovered as an empty baseline");
+    assert!(err.to_string().contains("no authoritative baseline"));
+    assert!(matches!(
+        read_config(store, DATA_USAGE_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_rejects_zero_or_exhausted_empty_fence_epoch() {
+    for epoch in [0, u64::MAX - 1, u64::MAX] {
+        let store = Arc::new(MemoryConfigStore::default());
+        let primary = rc3_legacy_empty_usage_fence(Some(epoch));
+        store
+            .objects
+            .lock()
+            .await
+            .insert(memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()), primary.clone());
+
+        persisted_usage_floor_for_startup(store.clone(), true)
+            .await
+            .expect_err("an unclaimable legacy epoch must remain fail-closed");
+        assert_eq!(
+            read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+                .await
+                .expect("rejected legacy floor should remain unchanged"),
+            primary
+        );
+        assert!(matches!(
+            read_config(store, DATA_USAGE_RECOVERY_PATH.as_str()).await,
+            Err(EcstoreError::ConfigNotFound)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovery_does_not_overwrite_concurrent_authoritative_snapshot() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    store
+        .objects
+        .lock()
+        .await
+        .insert(primary_key.clone(), rc3_legacy_empty_usage_fence(Some(7)));
+    store.revisions.lock().await.insert(primary_key.clone(), 1);
+    let mut authoritative = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    authoritative.scanner_epoch = Some(8);
+    authoritative.scanner_cycle = Some(11);
+    let authoritative = serde_json::to_vec(&authoritative).expect("authoritative usage should encode");
+    store
+        .interleaving_puts
+        .lock()
+        .await
+        .insert(primary_key, (1, authoritative.clone()));
+
+    persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect_err("recovery CAS must lose to a concurrent authoritative snapshot");
+    assert_eq!(
+        read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("concurrent authoritative usage should remain"),
+        authoritative
+    );
+
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("the concurrent authoritative snapshot should win on retry");
+    assert_eq!(floor.leader_epoch, 8);
+    assert_eq!(floor.next_cycle, 12);
+    assert_eq!(state, PersistedUsageFloorStartup::Authoritative);
+    assert!(matches!(
+        read_config(store, DATA_USAGE_RECOVERY_PATH.as_str()).await,
+        Err(EcstoreError::ConfigNotFound)
+    ));
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovery_rejects_concurrent_authoritative_epoch_regression() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    store
+        .objects
+        .lock()
+        .await
+        .insert(primary_key.clone(), rc3_legacy_empty_usage_fence(Some(7)));
+    store.revisions.lock().await.insert(primary_key.clone(), 1);
+    let mut stale = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    stale.scanner_epoch = Some(6);
+    stale.scanner_cycle = Some(11);
+    let stale = serde_json::to_vec(&stale).expect("stale authoritative usage should encode");
+    store.interleaving_puts.lock().await.insert(primary_key, (1, stale.clone()));
+
+    persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect_err("recovery CAS must lose to the concurrent writer");
+    let retry_error = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect_err("the recovery marker must fence an older authoritative winner");
+    assert!(retry_error.to_string().contains("older than the required recovery fence"));
+    assert_eq!(
+        read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .expect("stale concurrent snapshot should not be rewritten without a new scan"),
+        stale
+    );
+    assert!(read_config(store, DATA_USAGE_RECOVERY_PATH.as_str()).await.is_ok());
+}
+
+#[test]
+#[serial]
+fn scanner_usage_floor_failure_is_exposed_and_cleared() {
+    record_scanner_usage_floor_failure("persisted usage floor is invalid".to_string());
+    let blocked = scanner_cycle_recovery_status();
+    assert_eq!(blocked.path, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    assert_eq!(blocked.state, "usage_floor_load_failed");
+    assert_eq!(blocked.classification.as_deref(), Some("usage_floor_load_failed"));
+    assert!(blocked.retryable);
+    assert_eq!(blocked.reason.as_deref(), Some("persisted usage floor is invalid"));
+    let first_detected = blocked.first_detected_at_unix_secs;
+
+    assert!(record_scanner_cycle_recovery_retry(2));
+    record_scanner_usage_floor_failure("persisted usage floor remains invalid".to_string());
+    let retried = scanner_cycle_recovery_status();
+    assert_eq!(retried.retry_count, 2);
+    assert_eq!(retried.first_detected_at_unix_secs, first_detected);
+
+    clear_scanner_usage_floor_failure();
+    let healthy = scanner_cycle_recovery_status();
+    assert_eq!(healthy.state, "healthy");
+    assert_eq!(healthy.path, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+    assert_eq!(healthy.classification, None);
+}
+
+#[test]
+#[serial]
+fn scanner_usage_floor_recovery_stays_retryable_until_claim_cleanup() {
+    record_legacy_empty_usage_floor_recovery_pending(7);
+    let pending = scanner_cycle_recovery_status();
+    assert_eq!(pending.state, "usage_floor_recovery_pending");
+    assert_eq!(pending.classification.as_deref(), Some("legacy_empty_usage_floor"));
+    assert_eq!(pending.leader_epoch, Some(7));
+    assert!(pending.retryable);
+    assert_eq!(pending.quarantine_path.as_deref(), Some(DATA_USAGE_RECOVERY_PATH.as_str()));
+    let first_detected = pending.first_detected_at_unix_secs;
+
+    assert!(record_scanner_cycle_recovery_retry(3));
+    record_legacy_empty_usage_floor_recovery_pending(7);
+    let retried = scanner_cycle_recovery_status();
+    assert_eq!(retried.retry_count, 3);
+    assert_eq!(retried.first_detected_at_unix_secs, first_detected);
+
+    clear_legacy_empty_usage_floor_recovery_status();
+    assert_eq!(scanner_cycle_recovery_status().state, "healthy");
+}
+
+#[tokio::test]
+#[serial]
+async fn scanner_usage_floor_failure_clears_stale_leader_liveness() {
+    record_scanner_cycle_schedule_role("leader");
+    global_metrics().record_scanner_leader_liveness("acquired", true, "").await;
+
+    finish_scanner_leader_iteration(false, "usage_floor_load_failed", "invalid floor".to_string()).await;
+
+    assert_eq!(scanner_cycle_schedule_status().execution_role, "unknown");
+    let report = global_metrics().report().await;
+    assert_eq!(report.leader_lock_state, "usage_floor_load_failed");
+    assert!(!report.leader_lock_held_by_this_process);
+    assert_eq!(report.leader_lock_last_error, "invalid floor");
+
+    global_metrics().record_scanner_leader_liveness("acquired", true, "").await;
+    finish_scanner_leader_iteration(true, "stopped", "lock lost before classification".to_string()).await;
+    let report = global_metrics().report().await;
+    assert_eq!(report.leader_lock_state, "stopped");
+    assert!(!report.leader_lock_held_by_this_process);
+    assert_eq!(report.leader_lock_last_error, "lock lost before classification");
+}
+
 #[tokio::test]
 async fn scanner_usage_floor_recovers_from_incomplete_v2_primary_using_fenced_backup() {
     let store = Arc::new(MemoryConfigStore::default());
@@ -2039,7 +2596,7 @@ async fn scanner_usage_floor_rejects_backup_older_than_incomplete_v2_primary() {
     let err = persisted_usage_floor_for_startup(store, true)
         .await
         .expect_err("an older backup must not cross the incomplete primary epoch fence");
-    assert!(err.to_string().contains("no authoritative baseline"));
+    assert!(err.to_string().contains("older than the required recovery fence"));
 }
 
 #[tokio::test]
@@ -2067,7 +2624,7 @@ async fn scanner_usage_floor_rejects_older_legacy_primary_after_incomplete_v2_pr
     let err = persisted_usage_floor_for_startup(store, true)
         .await
         .expect_err("an older legacy baseline must not cross the incomplete v2 epoch fence");
-    assert!(err.to_string().contains("no authoritative baseline"));
+    assert!(err.to_string().contains("older than the required recovery fence"));
 }
 
 #[tokio::test]
@@ -2646,6 +3203,11 @@ impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
         }
         objects.remove(&key);
         revisions.remove(&key);
+        drop(revisions);
+        drop(objects);
+        if self.error_after_commit_deletes.lock().await.remove(&key) {
+            return Err(EcstoreError::other("injected delete error after commit"));
+        }
         Ok(ObjectInfo::default())
     }
 
