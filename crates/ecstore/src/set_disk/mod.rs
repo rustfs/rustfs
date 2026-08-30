@@ -773,10 +773,11 @@ const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
 
-// Two-phase metadata/read-plan rollout (backlog#1309). The first phase reads
-// metadata without inline payloads and only fetches inline data from the
-// selected data-shard slots. Keep this opt-in until the Linux multi-node
-// slow-tail and small-inline cost gates are complete.
+// Opt-in non-inline data-read quorum early-stop rollout (backlog#1309). The
+// existing metadata fanout still reads data-bearing metadata; this gate only
+// permits a safe plain single-part candidate to stop before the full fanout.
+// Keep it opt-in until the Linux multi-node slow-tail and small-inline cost
+// gates are complete. The environment name is retained for compatibility.
 const ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE: &str = "RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE: bool = false;
 
@@ -1037,14 +1038,19 @@ mod prepared_get_object_metadata_tests {
     const READ_VERSION_BARRIER_GUARD: std::time::Duration = std::time::Duration::from_secs(10);
 
     fn object_with_initial_data_shards(bucket: &str, prefix: &str) -> String {
+        object_with_initial_data_shards_for_geometry(bucket, prefix, 4, 2)
+    }
+
+    fn object_with_initial_data_shards_for_geometry(bucket: &str, prefix: &str, total_disks: usize, parity: usize) -> String {
         (0..1000)
             .map(|index| format!("{prefix}-{index}.bin"))
             .find(|name| {
-                let order = bounded_metadata_fanout_order(bucket, name, 4, 2);
-                let distribution = FileInfo::new(&[bucket, name].join("/"), 2, 2).erasure.distribution;
-                let mut seen = [false; 2];
-                for disk_index in order.into_iter().take(3) {
-                    if let Some(block_index @ 1..=2) = distribution.get(disk_index).copied() {
+                let order = bounded_metadata_fanout_order(bucket, name, total_disks, parity);
+                let data = total_disks.saturating_sub(parity);
+                let distribution = FileInfo::new(&[bucket, name].join("/"), data, parity).erasure.distribution;
+                let mut seen = vec![false; data];
+                for disk_index in order.into_iter().take(total_disks.saturating_sub(parity).saturating_add(1)) {
+                    if let Some(block_index) = distribution.get(disk_index).copied().filter(|index| *index <= data) {
                         seen[block_index - 1] = true;
                     }
                 }
@@ -1177,9 +1183,9 @@ mod prepared_get_object_metadata_tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
-    async fn two_phase_read_plan_uses_metadata_only_for_non_inline_get() {
+    async fn non_inline_data_read_early_stop_uses_quorum_plan() {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
-        let bucket = "two-phase-read-plan";
+        let bucket = "non-inline-read-plan";
         let object = object_with_initial_data_shards(bucket, "non-inline-object");
         let payload = vec![0x5a; 2 * 1024 * 1024];
         let opts = ObjectOptions {
@@ -1209,17 +1215,17 @@ mod prepared_get_object_metadata_tests {
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
                     .await
-                    .expect("two-phase GET reader should open");
+                    .expect("quorum GET reader should open");
                 let mut restored = Vec::new();
                 reader
                     .stream
                     .read_to_end(&mut restored)
                     .await
-                    .expect("two-phase GET body should stream");
+                    .expect("quorum GET body should stream");
                 assert_eq!(restored, payload);
                 assert!(
                     calls.total(disk_call_counters::KIND_READ_VERSION) < 4,
-                    "non-inline two-phase GET should stop metadata fanout at a quorum"
+                    "non-inline quorum GET should retain a reconstruction reserve"
                 );
             },
         )
@@ -1228,11 +1234,62 @@ mod prepared_get_object_metadata_tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
-    async fn two_phase_read_plan_preserves_inline_early_stop_path() {
+    async fn non_inline_data_read_early_stop_keeps_reserve_on_unequal_layout() {
+        let (_dirs, set_disks) = make_local_set_disks(6, 2).await;
+        let bucket = "non-inline-read-reserve";
+        let object = object_with_initial_data_shards_for_geometry(bucket, "reserve-object", 6, 2);
+        let payload = vec![0x5a; 2 * 1024 * 1024];
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(&object);
+                let mut reader = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("quorum GET reader should open");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("quorum GET body should stream");
+                assert_eq!(restored, payload);
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    5,
+                    "the unequal layout should schedule exactly one reserve beyond its data quorum"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn non_inline_data_read_early_stop_preserves_inline_path() {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
-        let bucket = "two-phase-read-plan-inline";
+        let bucket = "non-inline-read-plan-inline";
         let object = object_with_initial_data_shards(bucket, "inline-object");
-        let payload = b"two-phase inline payload".repeat(256);
+        let payload = b"quorum inline payload".repeat(256);
         let opts = ObjectOptions {
             no_lock: true,
             ..Default::default()
@@ -1259,13 +1316,13 @@ mod prepared_get_object_metadata_tests {
                 let mut reader = set_disks
                     .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
                     .await
-                    .expect("two-phase inline GET reader should open");
+                    .expect("inline GET reader should open");
                 let mut restored = Vec::new();
                 reader
                     .stream
                     .read_to_end(&mut restored)
                     .await
-                    .expect("two-phase inline GET body should stream");
+                    .expect("inline GET body should stream");
                 assert_eq!(restored, payload);
                 assert_eq!(
                     test_get_object_reader_path_id(),
@@ -1276,6 +1333,69 @@ mod prepared_get_object_metadata_tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn non_inline_data_read_early_stop_does_not_add_inline_fanout_on_unequal_layout() {
+        let (_dirs, set_disks) = make_local_set_disks(6, 2).await;
+        let bucket = "inline-read-plan-unequal";
+        let object = object_with_initial_data_shards_for_geometry(bucket, "inline-object", 6, 2);
+        let payload = b"inline quorum payload".repeat(256);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("inline object should be written");
+
+        let read_once = |enabled: bool| {
+            let set_disks = Arc::clone(&set_disks);
+            let bucket = bucket.to_string();
+            let object = object.clone();
+            let payload = payload.clone();
+            let opts = opts.clone();
+            async move {
+                temp_env::async_with_vars(
+                    [
+                        (
+                            "RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE",
+                            Some(if enabled { "true" } else { "false" }),
+                        ),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                    ],
+                    async {
+                        let calls = disk_call_counters::observe(&object);
+                        let mut reader = set_disks
+                            .get_object_reader(&bucket, &object, None, HeaderMap::new(), &opts)
+                            .await
+                            .expect("inline GET reader should open");
+                        let mut restored = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut restored)
+                            .await
+                            .expect("inline GET body should stream");
+                        assert_eq!(restored, payload);
+                        calls.total(disk_call_counters::KIND_READ_VERSION)
+                    },
+                )
+                .await
+            }
+        };
+
+        let gate_off_calls = read_once(false).await;
+        let gate_on_calls = read_once(true).await;
+        assert_eq!(gate_on_calls, gate_off_calls, "inline gate must not add reserve fanout");
     }
 
     #[test]
@@ -2024,7 +2144,7 @@ fn is_get_metadata_data_read_early_stop_enabled() -> bool {
     }
 }
 
-fn is_get_metadata_two_phase_read_plan_enabled() -> bool {
+fn is_get_metadata_non_inline_data_read_early_stop_enabled() -> bool {
     #[cfg(test)]
     {
         rustfs_utils::get_env_bool(

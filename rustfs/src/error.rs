@@ -86,6 +86,14 @@ impl ApiError {
         }
     }
 
+    pub fn service_unavailable() -> Self {
+        ApiError {
+            code: S3ErrorCode::ServiceUnavailable,
+            message: Self::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+            source: None,
+        }
+    }
+
     pub fn invalid_request(message: impl std::fmt::Display) -> Self {
         ApiError {
             code: S3ErrorCode::InvalidRequest,
