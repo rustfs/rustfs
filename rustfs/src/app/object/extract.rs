@@ -1521,33 +1521,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_tar_member_name_starting_with_zip_magic_is_not_misdetected() {
-        let path = "PK\u{3}\u{4}-member.txt";
-        let mut builder = Builder::new(Vec::new());
-        let mut header = Header::new_gnu();
-        header.set_size(0);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, path, &b""[..])
-            .await
-            .expect("raw TAR fixture should accept the control-byte member name");
-        let bytes = builder.into_inner().await.expect("raw TAR fixture should finalize");
-        assert_eq!(&bytes[..4], b"PK\x03\x04");
+    async fn raw_tar_member_names_starting_with_codec_magic_are_not_misdetected() {
+        let cases = [
+            ("PK\u{3}\u{4}-member.txt", b"PK\x03\x04".as_slice()),
+            ("BZh9-report.txt", b"BZh9".as_slice()),
+            ("\u{4}\"M\u{18}-report.txt", b"\x04\x22\x4d\x18".as_slice()),
+        ];
 
-        let (format, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(bytes))
-            .await
-            .expect("raw TAR prefix should be inspected");
-        assert_eq!(format, CompressionFormat::Tar);
-        let decoder = format.get_decoder(sniffed).expect("raw TAR decoder should be created");
-        let mut archive = Archive::new(decoder);
-        let mut entries = archive.entries().expect("raw TAR entry stream should be created");
-        let entry = entries
-            .next()
-            .await
-            .expect("raw TAR should contain its first member")
-            .expect("raw TAR member should parse");
+        for (path, expected_prefix) in cases {
+            let mut builder = Builder::new(Vec::new());
+            let mut header = Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, &b""[..])
+                .await
+                .expect("raw TAR fixture should accept the codec-like member name");
+            let bytes = builder.into_inner().await.expect("raw TAR fixture should finalize");
+            assert_eq!(&bytes[..expected_prefix.len()], expected_prefix);
 
-        assert_eq!(entry.path_bytes().expect("raw TAR member path should parse").as_ref(), path.as_bytes());
+            let (format, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(bytes))
+                .await
+                .expect("raw TAR prefix should be inspected");
+            assert_eq!(format, CompressionFormat::Tar, "member path={path:?}");
+            let decoder = format.get_decoder(sniffed).expect("raw TAR decoder should be created");
+            let mut archive = Archive::new(decoder);
+            let mut entries = archive.entries().expect("raw TAR entry stream should be created");
+            let entry = entries
+                .next()
+                .await
+                .expect("raw TAR should contain its first member")
+                .expect("raw TAR member should parse");
+
+            assert_eq!(entry.path_bytes().expect("raw TAR member path should parse").as_ref(), path.as_bytes());
+        }
     }
 
     #[tokio::test]

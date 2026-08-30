@@ -36,6 +36,7 @@ const CHECKSUM_SIZE: usize = 4;
 const CHUNK_HEADER_LEN: usize = 4;
 const ENCRYPTED_PADDING_MULTIPLE: usize = 256;
 const MIN_INDEX_SIZE: usize = 8 << 20;
+const MAX_READY_READS_PER_POLL: usize = 64;
 
 pin_project! {
     #[derive(Debug)]
@@ -134,6 +135,7 @@ where
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
+        let mut ready_reads = 0usize;
 
         if *this.pos < this.buffer.len() {
             let to_copy = min(buf.remaining(), this.buffer.len() - *this.pos);
@@ -151,6 +153,11 @@ where
         }
 
         while this.temp_buffer.len() < *this.block_size {
+            if ready_reads >= MAX_READY_READS_PER_POLL {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
             let remaining = *this.block_size - this.temp_buffer.len();
             let mut read_buf = ReadBuf::new(&mut this.read_buffer[..remaining]);
             match this.inner.as_mut().poll_read(cx, &mut read_buf) {
@@ -158,6 +165,7 @@ where
                     return Poll::Pending;
                 }
                 Poll::Ready(Ok(())) => {
+                    ready_reads += 1;
                     let n = read_buf.filled().len();
                     if n == 0 {
                         break;
@@ -262,7 +270,7 @@ where
 {
     pub fn new(inner: R, _compression_algorithm: CompressionAlgorithm) -> Self {
         Self {
-            inner: S2Decoder::new_at_chunk_boundary(inner),
+            inner: S2Decoder::new_at_legacy_chunk_boundary(inner),
         }
     }
 }
@@ -357,8 +365,51 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::pin::Pin;
-    use std::task::{Context, Poll};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Context, Poll, Wake, Waker};
     use tokio::io::AsyncReadExt;
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct AlwaysReadyOneByte {
+        bytes: Vec<u8>,
+        position: usize,
+        read_calls: Arc<AtomicUsize>,
+    }
+
+    impl AlwaysReadyOneByte {
+        fn new(bytes: Vec<u8>, read_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                bytes,
+                position: 0,
+                read_calls,
+            }
+        }
+    }
+
+    impl AsyncRead for AlwaysReadyOneByte {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            if self.position == self.bytes.len() || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let byte = self.bytes[self.position];
+            self.position += 1;
+            buf.put_slice(&[byte]);
+            Poll::Ready(Ok(()))
+        }
+    }
 
     struct PendingAfterBytes<R> {
         inner: R,
@@ -446,6 +497,24 @@ mod tests {
     }
 
     #[test]
+    fn s2_compress_reader_yields_after_ready_read_budget() {
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let source = AlwaysReadyOneByte::new(vec![b'x'; MAX_READY_READS_PER_POLL + 1], read_calls.clone());
+        let mut reader = CompressReader::new(source, CompressionAlgorithm::default());
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake_counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut output = [0u8; 1];
+        let mut read_buf = ReadBuf::new(&mut output);
+
+        assert!(Pin::new(&mut reader).poll_read(&mut cx, &mut read_buf).is_pending());
+        assert!(read_buf.filled().is_empty());
+        assert_eq!(read_calls.load(Ordering::Relaxed), MAX_READY_READS_PER_POLL);
+        assert_eq!(reader.temp_buffer.len(), MAX_READY_READS_PER_POLL);
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn s2_compress_reader_normalizes_non_decodable_block_sizes() {
         let zero = CompressReader::with_block_size(Cursor::new(Vec::<u8>::new()), 0, CompressionAlgorithm::default());
         assert_eq!(zero.block_size, DEFAULT_BLOCK_SIZE);
@@ -475,6 +544,26 @@ mod tests {
             .read_to_end(&mut actual)
             .await
             .expect("paired decoder should accept maximum S2 block");
+        assert_eq!(actual, plaintext);
+    }
+
+    #[tokio::test]
+    async fn s2_decompress_reader_accepts_legacy_block_above_writer_limit() {
+        let plaintext = vec![b'x'; MAX_S2_DECOMPRESSED_BLOCK_SIZE + 1];
+        let mut encoder = S2BlockEncoder::new();
+        let mut fixture = MAGIC_CHUNK.to_vec();
+        fixture.extend_from_slice(
+            &build_s2_chunk(&plaintext, &mut encoder).expect("the pre-cap writer format should encode a block just above 4 MiB"),
+        );
+        assert_eq!(fixture[MAGIC_CHUNK.len()], CHUNK_TYPE_COMPRESSED_DATA);
+
+        let mut decompressor = DecompressReader::new(Cursor::new(fixture), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor
+            .read_to_end(&mut actual)
+            .await
+            .expect("legacy rio-v2 blocks above the current writer limit should remain readable");
+
         assert_eq!(actual, plaintext);
     }
 

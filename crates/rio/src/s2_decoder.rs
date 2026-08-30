@@ -34,6 +34,8 @@ const MAX_READY_READS_PER_POLL: usize = 64;
 const MAX_CHUNKS_PER_POLL: usize = 64;
 const MAX_INPUT_BYTES_PER_POLL: usize = 256 * 1024;
 const MAX_SNAPPY_DECOMPRESSED_BLOCK_SIZE: usize = 64 << 10;
+const MAX_FRAMED_CHUNK_SIZE: usize = (1 << 24) - 1;
+const MAX_LEGACY_S2_DECOMPRESSED_BLOCK_SIZE: usize = 1 << 24;
 
 // This is checksum size + klauspost/s2 MaxEncodedLen(4 MiB).
 // MaxEncodedLen adds a four-byte varint and four-byte literal header. The Go
@@ -55,10 +57,17 @@ enum FrameMode {
 }
 
 impl FrameMode {
-    fn max_decompressed_block_size(self) -> usize {
+    fn max_compressed_chunk_size(self, s2_limit: usize) -> usize {
+        match self {
+            Self::Snappy => MAX_S2_COMPRESSED_CHUNK_SIZE,
+            Self::Uninitialized | Self::S2 | Self::MidstreamS2 => s2_limit,
+        }
+    }
+
+    fn max_decompressed_block_size(self, s2_limit: usize) -> usize {
         match self {
             Self::Snappy => MAX_SNAPPY_DECOMPRESSED_BLOCK_SIZE,
-            Self::Uninitialized | Self::S2 | Self::MidstreamS2 => MAX_S2_DECOMPRESSED_BLOCK_SIZE,
+            Self::Uninitialized | Self::S2 | Self::MidstreamS2 => s2_limit,
         }
     }
 }
@@ -82,12 +91,19 @@ pin_project! {
         reading_chunk: bool,
         skipping_chunk: bool,
         frame_mode: FrameMode,
+        max_s2_compressed_chunk_size: usize,
+        max_s2_decompressed_block_size: usize,
     }
 }
 
 impl<R> S2Decoder<R> {
     pub fn new(inner: R) -> Self {
-        Self::with_frame_mode(inner, FrameMode::Uninitialized)
+        Self::with_limits(
+            inner,
+            FrameMode::Uninitialized,
+            MAX_S2_COMPRESSED_CHUNK_SIZE,
+            MAX_S2_DECOMPRESSED_BLOCK_SIZE,
+        )
     }
 
     /// Create a decoder positioned at a trusted S2 data-chunk boundary.
@@ -96,10 +112,35 @@ impl<R> S2Decoder<R> {
     /// consumers should use [`S2Decoder::new`] so a missing identifier remains
     /// an error.
     pub fn new_at_chunk_boundary(inner: R) -> Self {
-        Self::with_frame_mode(inner, FrameMode::MidstreamS2)
+        Self::with_limits(
+            inner,
+            FrameMode::MidstreamS2,
+            MAX_S2_COMPRESSED_CHUNK_SIZE,
+            MAX_S2_DECOMPRESSED_BLOCK_SIZE,
+        )
     }
 
-    fn with_frame_mode(inner: R, frame_mode: FrameMode) -> Self {
+    /// Create a bounded decoder for rio-v2 data written before its block-size
+    /// API was capped at 4 MiB.
+    ///
+    /// This compatibility mode accepts decoded S2 blocks up to 16 MiB and an
+    /// encoded chunk up to the format's 24-bit framing limit. New streams and
+    /// general S2 consumers should use the stricter constructors above.
+    pub fn new_at_legacy_chunk_boundary(inner: R) -> Self {
+        Self::with_limits(
+            inner,
+            FrameMode::MidstreamS2,
+            MAX_FRAMED_CHUNK_SIZE,
+            MAX_LEGACY_S2_DECOMPRESSED_BLOCK_SIZE,
+        )
+    }
+
+    fn with_limits(
+        inner: R,
+        frame_mode: FrameMode,
+        max_s2_compressed_chunk_size: usize,
+        max_s2_decompressed_block_size: usize,
+    ) -> Self {
         Self {
             inner,
             output: Vec::new(),
@@ -115,6 +156,8 @@ impl<R> S2Decoder<R> {
             reading_chunk: false,
             skipping_chunk: false,
             frame_mode,
+            max_s2_compressed_chunk_size,
+            max_s2_decompressed_block_size,
         }
     }
 
@@ -226,11 +269,15 @@ where
                 let invalid_length = match *this.chunk_type {
                     CHUNK_TYPE_STREAM_IDENTIFIER => *this.chunk_len != S2_MAGIC_BODY.len(),
                     CHUNK_TYPE_COMPRESSED_DATA => {
-                        *this.chunk_len < CHECKSUM_SIZE || *this.chunk_len > MAX_S2_COMPRESSED_CHUNK_SIZE
+                        *this.chunk_len < CHECKSUM_SIZE
+                            || *this.chunk_len > this.frame_mode.max_compressed_chunk_size(*this.max_s2_compressed_chunk_size)
                     }
                     CHUNK_TYPE_UNCOMPRESSED_DATA => {
                         *this.chunk_len < CHECKSUM_SIZE
-                            || *this.chunk_len - CHECKSUM_SIZE > this.frame_mode.max_decompressed_block_size()
+                            || *this.chunk_len - CHECKSUM_SIZE
+                                > this
+                                    .frame_mode
+                                    .max_decompressed_block_size(*this.max_s2_decompressed_block_size)
                     }
                     _ if skippable => false,
                     _ => {
@@ -323,7 +370,8 @@ where
                         this.output,
                         chunk,
                         *this.chunk_type == CHUNK_TYPE_COMPRESSED_DATA,
-                        this.frame_mode.max_decompressed_block_size(),
+                        this.frame_mode
+                            .max_decompressed_block_size(*this.max_s2_decompressed_block_size),
                     ) {
                         this.output.clear();
                         *this.output_pos = 0;
@@ -661,6 +709,25 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("exceeds limit"));
+    }
+
+    #[tokio::test]
+    async fn legacy_chunk_boundary_mode_rejects_blocks_above_compatibility_limit() {
+        let mut chunk = vec![0u8; CHECKSUM_SIZE];
+        append_uvarint(&mut chunk, MAX_LEGACY_S2_DECOMPRESSED_BLOCK_SIZE + 1);
+        let mut fixture = Vec::new();
+        append_chunk(&mut fixture, CHUNK_TYPE_COMPRESSED_DATA, &chunk);
+
+        let mut decoder = S2Decoder::new_at_legacy_chunk_boundary(Cursor::new(fixture));
+        let mut output = Vec::new();
+        let err = decoder
+            .read_to_end(&mut output)
+            .await
+            .expect_err("legacy compatibility must remain bounded before allocation");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("limit=16777216"));
+        assert!(output.is_empty());
     }
 
     #[tokio::test]
