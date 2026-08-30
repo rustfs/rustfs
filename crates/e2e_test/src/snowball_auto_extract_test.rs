@@ -102,6 +102,13 @@ mod tests {
         Ok(encoded)
     }
 
+    async fn build_gzip_archive_with_invalid_crc() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut encoded = gzip_member(&build_test_archive().await?)?;
+        let crc_offset = encoded.len().checked_sub(8).expect("gzip fixture must contain a trailer");
+        encoded[crc_offset] ^= 1;
+        Ok(encoded)
+    }
+
     fn append_raw_tar_entry_with_type(archive: &mut Vec<u8>, path: &[u8], data: &[u8], entry_type: u8) {
         assert!(path.len() <= 100, "raw TAR fixture path must fit in the name field");
         let mut header = [0u8; 512];
@@ -367,6 +374,34 @@ mod tests {
 
         let object = client.get_object().bucket(bucket).key("root.txt").send().await?;
         assert_eq!(object.body.collect().await?.into_bytes().as_ref(), b"root payload\n");
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_rejects_gzip_crc_error_when_ignore_errors_enabled() -> Result<(), Box<dyn Error + Send + Sync>>
+    {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-gzip-crc-ignore-errors";
+        client.create_bucket().bucket(bucket).send().await?;
+        let err = client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar.gz")
+            .metadata("Snowball-Auto-Extract", "true")
+            .metadata("Minio-Snowball-Ignore-Errors", "true")
+            .body(ByteStream::from(build_gzip_archive_with_invalid_crc().await?))
+            .send()
+            .await
+            .expect_err("gzip integrity failures must remain fatal under ignore-errors");
+
+        assert_eq!(err.into_service_error().code(), Some("InvalidArgument"));
 
         env.stop_server();
         Ok(())

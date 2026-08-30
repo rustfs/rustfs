@@ -215,10 +215,14 @@ async fn build_single_member_archive(
     Ok(builder.into_inner().await?.into_inner())
 }
 
-fn encode_unsigned_aws_chunked_with_sha256_trailer(decoded: &[u8]) -> Vec<u8> {
+fn sha256_base64(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
 
-    let checksum = base64_simd::STANDARD.encode_to_string(Sha256::digest(decoded));
+    base64_simd::STANDARD.encode_to_string(Sha256::digest(data))
+}
+
+fn encode_unsigned_aws_chunked_with_sha256_trailer(decoded: &[u8]) -> Vec<u8> {
+    let checksum = sha256_base64(decoded);
     let mut encoded = format!("{:x}\r\n", decoded.len()).into_bytes();
     encoded.extend_from_slice(decoded);
     encoded.extend_from_slice(b"\r\n0\r\n\r\n");
@@ -349,6 +353,70 @@ async fn snowball_streaming_unsigned_trailer_rejects_forged_signature() -> Resul
         .expect_err("a forged streaming request must not publish a Snowball member");
     assert_eq!(absent.raw_response().map(|response| response.status().as_u16()), Some(404));
     assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+
+    env.stop_server();
+    Ok(())
+}
+
+/// Snowball must consume the complete aws-chunked body before reading the
+/// trailing checksum exported by s3s into the PutObject response.
+#[tokio::test]
+async fn snowball_streaming_unsigned_trailer_returns_sha256_checksum() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    let archive_key = "valid-streaming-snowball.tar";
+    let member_key = "streaming-checksum-member.txt";
+    let member_body = b"valid streaming Snowball payload";
+    let archive = build_single_member_archive(member_key, member_body).await?;
+    let expected_checksum = sha256_base64(&archive);
+    let decoded_content_length = archive.len().to_string();
+    let encoded_body = encode_unsigned_aws_chunked_with_sha256_trailer(&archive);
+    let path = format!("/{BUCKET}/{archive_key}");
+
+    let signer = SigV4::new(&env);
+    let extra_signed_headers = [
+        ("content-encoding", "aws-chunked"),
+        ("x-amz-decoded-content-length", decoded_content_length.as_str()),
+        ("x-amz-meta-snowball-auto-extract", "true"),
+        ("x-amz-sdk-checksum-algorithm", "SHA256"),
+        ("x-amz-trailer", "x-amz-checksum-sha256"),
+    ];
+    let headers = signer.sign_with_extra_headers("PUT", &path, "", UNSIGNED_PAYLOAD_TRAILER, &extra_signed_headers);
+
+    let response = local_http_client()
+        .put(format!("{}{}", env.url, path))
+        .header("authorization", &headers.authorization)
+        .header("content-encoding", "aws-chunked")
+        .header("x-amz-content-sha256", &headers.content_sha256)
+        .header("x-amz-date", &headers.amz_date)
+        .header("x-amz-decoded-content-length", &decoded_content_length)
+        .header("x-amz-meta-snowball-auto-extract", "true")
+        .header("x-amz-sdk-checksum-algorithm", "SHA256")
+        .header("x-amz-trailer", "x-amz-checksum-sha256")
+        .body(encoded_body)
+        .send()
+        .await?;
+    let status = response.status();
+    let response_checksum = response
+        .headers()
+        .get("x-amz-checksum-sha256")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let response_body = response.text().await?;
+    assert_eq!(status.as_u16(), 200, "valid streaming Snowball PUT failed, body:\n{response_body}");
+    assert_eq!(response_checksum.as_deref(), Some(expected_checksum.as_str()));
+
+    let member = env
+        .create_s3_client()
+        .get_object()
+        .bucket(BUCKET)
+        .key(member_key)
+        .send()
+        .await?;
+    let stored = member.body.collect().await?.into_bytes();
+    assert_eq!(stored.as_ref(), member_body);
 
     env.stop_server();
     Ok(())

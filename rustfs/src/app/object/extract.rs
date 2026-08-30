@@ -177,6 +177,58 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
 }
 
 pin_project! {
+    struct ExtractMemberReadTracker {
+        #[pin]
+        inner: HashReader,
+        failed: Arc<AtomicBool>,
+    }
+}
+
+impl AsyncRead for ExtractMemberReadTracker {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.project();
+        match this.inner.poll_read(cx, buf) {
+            Poll::Ready(Err(err)) => {
+                this.failed.store(true, Ordering::Release);
+                Poll::Ready(Err(err))
+            }
+            other => other,
+        }
+    }
+}
+
+impl rustfs_rio::EtagResolvable for ExtractMemberReadTracker {
+    fn try_resolve_etag(&mut self) -> Option<String> {
+        rustfs_rio::EtagResolvable::try_resolve_etag(&mut self.inner)
+    }
+}
+
+impl rustfs_rio::HashReaderDetector for ExtractMemberReadTracker {}
+
+impl rustfs_rio::TryGetIndex for ExtractMemberReadTracker {
+    fn try_get_index(&self) -> Option<&rustfs_rio::Index> {
+        rustfs_rio::TryGetIndex::try_get_index(&self.inner)
+    }
+}
+
+fn track_extract_member_read_errors(reader: HashReader) -> std::io::Result<(HashReader, Arc<AtomicBool>)> {
+    let size = reader.size();
+    let actual_size = reader.actual_size();
+    let failed = Arc::new(AtomicBool::new(false));
+    let tracker = ExtractMemberReadTracker {
+        inner: reader,
+        failed: failed.clone(),
+    };
+    let mut tracked = HashReader::from_reader(tracker, HashReader::SIZE_PRESERVE_LAYER, actual_size, None, None, false)?;
+    tracked.update_params(size, actual_size, None);
+    Ok((tracked, failed))
+}
+
+fn should_ignore_extract_member_write_error(ignore_errors: bool, member_read_failed: &AtomicBool) -> bool {
+    ignore_errors && !member_read_failed.load(Ordering::Acquire)
+}
+
+pin_project! {
     struct ExtractDecodedLimitReader<R> {
         #[pin]
         inner: R,
@@ -1244,6 +1296,7 @@ impl DefaultObjectUsecase {
                 opts.user_defined.extend(encryption_metadata);
             }
             hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
+            let (hrd, member_read_failed) = track_extract_member_read_errors(hrd).map_err(ApiError::from)?;
             opts.user_defined.extend(metadata);
 
             // Each extracted member is an independent user write and joins
@@ -1274,10 +1327,19 @@ impl DefaultObjectUsecase {
             let cache_adapter = self.object_data_cache();
             let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &fpath).await;
 
-            let (obj_info, backfilled_old_current_size) = store
+            let (obj_info, backfilled_old_current_size) = match store
                 .put_object_with_old_current_size(&bucket, &fpath, &mut reader, &opts)
                 .await
-                .map_err(ApiError::from)?;
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    if should_ignore_extract_member_write_error(extract_options.ignore_errors, &member_read_failed) {
+                        warn!(error = %e, "Archive object write skipped due to ignore-errors");
+                        continue;
+                    }
+                    return Err(ApiError::from(e).into());
+                }
+            };
             let extract_versioned = BucketVersioningSys::prefix_enabled(&bucket, &fpath).await;
             let post_commit_error = match quota_accounting_object_size(&obj_info, extract_quota_enabled) {
                 Ok(committed_size) => {
@@ -1349,12 +1411,6 @@ impl DefaultObjectUsecase {
             sha256: input.checksum_sha256,
             crc64nvme: input.checksum_crc64nvme,
         };
-        apply_trailing_checksums(
-            input.checksum_algorithm.as_ref().map(|a| a.as_str()),
-            &req.trailing_headers,
-            &mut checksums,
-        );
-
         warn!(
             "put object extract checksum_crc32={:?}, checksum_crc32c={:?}, checksum_sha1={:?}, checksum_sha256={:?}, checksum_crc64nvme={:?}",
             checksums.crc32, checksums.crc32c, checksums.sha1, checksums.sha256, checksums.crc64nvme,
@@ -1377,6 +1433,11 @@ impl DefaultObjectUsecase {
             }
             state.etag.as_ref().map(|etag| to_s3s_etag(etag))
         };
+        apply_trailing_checksums(
+            input.checksum_algorithm.as_ref().map(|a| a.as_str()),
+            &req.trailing_headers,
+            &mut checksums,
+        );
 
         let output = PutObjectOutput {
             e_tag: archive_etag,
@@ -2282,6 +2343,30 @@ mod tests {
             .await
             .expect_err("decoded stream over the limit must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn extract_member_read_tracker_keeps_integrity_errors_fatal_under_ignore_errors() {
+        struct FailingReader;
+
+        impl AsyncRead for FailingReader {
+            fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "member decoder failed")))
+            }
+        }
+
+        let reader = HashReader::from_stream(FailingReader, 1, 1, None, None, false).unwrap();
+        let (mut tracked, failed) = track_extract_member_read_errors(reader).unwrap();
+        let mut output = Vec::new();
+        let err = tracked.read_to_end(&mut output).await.unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(failed.load(Ordering::Acquire));
+        assert!(!should_ignore_extract_member_write_error(true, &failed));
+
+        let storage_only_failure = AtomicBool::new(false);
+        assert!(should_ignore_extract_member_write_error(true, &storage_only_failure));
+        assert!(!should_ignore_extract_member_write_error(false, &storage_only_failure));
     }
 
     #[tokio::test]
