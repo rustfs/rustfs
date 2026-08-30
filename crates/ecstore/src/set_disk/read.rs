@@ -432,7 +432,12 @@ impl SetDisks {
             .await?;
 
         if !metadata_snapshot.fi().inline_data() {
-            return Ok(metadata_snapshot);
+            if Self::metadata_snapshot_covers_all_data_shards(&metadata_snapshot) {
+                return Ok(metadata_snapshot);
+            }
+            return self
+                .get_object_fileinfo_gated_inner(bucket, object, opts, true, true, allow_read_version_coalescing)
+                .await;
         }
 
         let (mut fi, mut parts_metadata, mut online_disks) = metadata_snapshot.into_owned();
@@ -547,6 +552,36 @@ impl SetDisks {
         }
 
         Ok(GetObjectFileInfo::owned(fi, parts_metadata, online_disks))
+    }
+
+    fn metadata_snapshot_covers_all_data_shards(snapshot: &GetObjectFileInfo) -> bool {
+        let fi = snapshot.fi();
+        let Ok(erasure) = coding::Erasure::try_new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        ) else {
+            return false;
+        };
+        let mut data_shards = vec![false; erasure.data_shards];
+        for ((file_info, disk), &erasure_index) in snapshot
+            .parts_metadata()
+            .iter()
+            .zip(snapshot.online_disks())
+            .zip(fi.erasure.distribution.iter())
+        {
+            if erasure_index == 0 || erasure_index > erasure.data_shards || disk.is_none() {
+                continue;
+            }
+            if metadata_early_stop_candidate_matches(file_info, fi)
+                && file_info.erasure.index == erasure_index
+                && file_info.name == fi.name
+            {
+                data_shards[erasure_index - 1] = true;
+            }
+        }
+        data_shards.into_iter().all(|present| present)
     }
 
     /// Like `get_object_fileinfo`, but `allow_early_stop=false` forces the full
