@@ -773,6 +773,13 @@ const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
 
+// Two-phase metadata/read-plan rollout (backlog#1309). The first phase reads
+// metadata without inline payloads and only fetches inline data from the
+// selected data-shard slots. Keep this opt-in until the Linux multi-node
+// slow-tail and small-inline cost gates are complete.
+const ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE: &str = "RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE";
+const DEFAULT_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE: bool = false;
+
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = true;
 
@@ -1166,6 +1173,109 @@ mod prepared_get_object_metadata_tests {
             4,
             "reader construction must consume prepared metadata instead of repeating the fanout"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn two_phase_read_plan_uses_metadata_only_for_non_inline_get() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "two-phase-read-plan";
+        let object = object_with_initial_data_shards(bucket, "non-inline-object");
+        let payload = vec![0x5a; 2 * 1024 * 1024];
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(&object);
+                reset_test_get_object_reader_path();
+                let mut reader = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("two-phase GET reader should open");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("two-phase GET body should stream");
+                assert_eq!(restored, payload);
+                assert!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION) < 4,
+                    "non-inline two-phase GET should stop metadata fanout at a quorum"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn two_phase_read_plan_preserves_inline_early_stop_path() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "two-phase-read-plan-inline";
+        let object = object_with_initial_data_shards(bucket, "inline-object");
+        let payload = b"two-phase inline payload".repeat(256);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("inline object should be written");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(&object);
+                let mut reader = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("two-phase inline GET reader should open");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("two-phase inline GET body should stream");
+                assert_eq!(restored, payload);
+                assert_eq!(
+                    test_get_object_reader_path_id(),
+                    3,
+                    "inline GET should retain the direct inline reader path"
+                );
+                assert!(calls.total(disk_call_counters::KIND_READ_VERSION) <= 4);
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -1909,6 +2019,26 @@ fn is_get_metadata_data_read_early_stop_enabled() -> bool {
             rustfs_utils::get_env_bool(
                 ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
                 DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE,
+            )
+        })
+    }
+}
+
+fn is_get_metadata_two_phase_read_plan_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE,
+            DEFAULT_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE,
+                DEFAULT_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE,
             )
         })
     }
