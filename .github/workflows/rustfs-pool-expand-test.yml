@@ -46,7 +46,7 @@ on:
         type: boolean
         default: true
   workflow_run:
-    # Strict shared-environment order: run after tier test succeeds.
+    # Strict shared-environment order: run after tier test completes.
     workflows: ["RustFS Tier Test"]
     types: [completed]
 
@@ -75,11 +75,97 @@ env:
   RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
 
 jobs:
+  heal-test:
+    name: Heal test
+    runs-on: smoke-testing
+    timeout-minutes: 480
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run' }}
+    steps:
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          openssl version
+          df -h /data | tail -1
+
+      - name: Reset test environment (before)
+        if: ${{ inputs.cleanup_before != 'false' }}
+        run: |
+          chmod +x auto-testing/rustfs_heal_test.sh
+          ./auto-testing/rustfs_heal_test.sh --reset -y
+
+      - name: Install RustFS package & start cluster
+        run: |
+          ARGS=(--steps "1,2" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
+
+      - name: Preflight checks
+        run: |
+          ARGS=(--preflight --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
+
+      - name: Run heal test (write -> outage -> heal -> verify)
+        run: |
+          ARGS=(--steps "3,4,5,6,7" -y \
+            --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
+            --stop-node-gb "${{ inputs.stop_node_gb || '15' }}" \
+            --warp-stop-gb "${{ inputs.warp_stop_gb || '40' }}" \
+            --log-file /tmp/rustfs-heal-test.log)
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-heal-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-heal-test.log
+            /tmp/rustfs-warp.*.log
+          if-no-files-found: warn
+
+      - name: Reset test environment (after)
+        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        run: |
+          ./auto-testing/rustfs_heal_test.sh --reset -y
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS heal test failed"
+          echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+          echo "See the uploaded log artifact for details."
+
+  # Pool expansion runs after heal regardless of heal outcome.
   pool-expansion-test:
     name: Pool expansion / decommission test
     runs-on: smoke-testing
     timeout-minutes: 360
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs: heal-test
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') }}
     steps:
       - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -101,10 +187,10 @@ jobs:
       - name: Reset test environment (before)
         if: ${{ inputs.cleanup_before != 'false' }}
         run: |
-          chmod +x auto-testing/rustfs_pool_expand.sh
-          ./auto-testing/rustfs_pool_expand.sh --reset -y
+          chmod +x auto-testing/rustfs_heal_test.sh
+          ./auto-testing/rustfs_heal_test.sh --reset -y
 
-      - name: Install RustFS package & start first pool
+      - name: Install RustFS package & start cluster
         run: |
           ARGS=(--steps "1,2,3" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
           if [ -n "${{ inputs.package_url }}" ]; then
@@ -173,83 +259,4 @@ jobs:
         run: |
           echo "RustFS pool expansion test failed"
           echo "Package source: ${{ inputs.package_url || inputs.rustfs_version || 'nightly (R2 latest)' }}"
-          echo "See the uploaded log artifact for details."
-
-  # Heal regression runs after the pool test regardless of its outcome: a pool
-  # failure must be reported (it makes the run red) but must not block heal.
-  heal-test:
-    name: Heal test (after pool test)
-    runs-on: smoke-testing
-    timeout-minutes: 480
-    needs: pool-expansion-test
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
-    steps:
-      - name: Checkout auto-testing scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: rustfs/auto-testing
-          ref: main
-          path: auto-testing
-          persist-credentials: false
-          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
-
-      - name: Reset test environment (before)
-        if: ${{ inputs.cleanup_before != 'false' }}
-        run: |
-          chmod +x auto-testing/rustfs_heal_test.sh
-          ./auto-testing/rustfs_heal_test.sh --reset -y
-
-      - name: Install RustFS package & start cluster
-        run: |
-          ARGS=(--steps "1,2" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
-
-      - name: Preflight checks
-        run: |
-          ARGS=(--preflight --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
-
-      - name: Run heal test (write -> outage -> heal -> verify)
-        run: |
-          ARGS=(--steps "3,4,5,6,7" -y \
-            --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
-            --stop-node-gb "${{ inputs.stop_node_gb || '15' }}" \
-            --warp-stop-gb "${{ inputs.warp_stop_gb || '40' }}" \
-            --log-file /tmp/rustfs-heal-test.log)
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
-
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: rustfs-heal-test-${{ github.run_id }}
-          path: |
-            /tmp/rustfs-heal-test.log
-            /tmp/rustfs-warp.*.log
-          if-no-files-found: warn
-
-      - name: Reset test environment (after)
-        if: ${{ always() && inputs.cleanup_after != 'false' }}
-        run: |
-          ./auto-testing/rustfs_heal_test.sh --reset -y
-
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "RustFS heal test failed"
           echo "See the uploaded log artifact for details."

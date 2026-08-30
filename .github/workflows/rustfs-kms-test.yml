@@ -12,7 +12,7 @@ on:
         required: false
         type: string
   workflow_run:
-    # Strict shared-environment order: run after S3 compatibility test succeeds.
+    # Strict shared-environment order: run after S3 compatibility test completes.
     workflows: ["RustFS S3 Compatibility Test"]
     types: [completed]
 
@@ -40,7 +40,7 @@ jobs:
     runs-on: smoke-testing
     continue-on-error: true
     timeout-minutes: 420
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run' }}
     steps:
       - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
