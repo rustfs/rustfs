@@ -15,6 +15,9 @@
 //! Snowball auto-extract (PutObject x-amz-meta-snowball-auto-extract) path.
 
 use super::*;
+use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecision;
+use futures::stream::FuturesUnordered;
+use std::collections::HashSet;
 
 // One logical member can be preceded by local PAX, GNU long-name, and GNU
 // long-link records. Count all four physical headers without rejecting that
@@ -240,8 +243,12 @@ fn track_extract_member_read_errors(reader: HashReader) -> std::io::Result<(Hash
     Ok((tracked, failed))
 }
 
-fn should_ignore_extract_member_write_error(ignore_errors: bool, member_read_failed: &AtomicBool) -> bool {
-    ignore_errors && !member_read_failed.load(Ordering::Acquire)
+fn classify_extract_member_write_error(error: S3Error, member_read_failed: &AtomicBool) -> ExtractCommitError {
+    if member_read_failed.load(Ordering::Acquire) {
+        ExtractCommitError::Fatal(error)
+    } else {
+        ExtractCommitError::StorageWrite(error)
+    }
 }
 
 pin_project! {
@@ -340,7 +347,433 @@ const EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES: usize = 8 * 1024;
 const EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES: usize = 2 * 1024;
 const EXTRACT_MAX_EFFECTIVE_PAX_FIELDS: usize = 4096;
 const EXTRACT_MAX_EXPANDED_PAX_METADATA_BYTES: u64 = 128 * 1024 * 1024;
+const EXTRACT_SMALL_MEMBER_MAX_BYTES: usize = 64 * 1024;
+const EXTRACT_BATCH_MAX_MEMBERS: usize = 16;
+const EXTRACT_BATCH_MAX_STAGING_BYTES: usize = 2 * 1024 * 1024;
+const EXTRACT_MEMBER_CONTEXT_OVERHEAD_BYTES: usize = 512;
+const EXTRACT_METADATA_ENTRY_OVERHEAD_BYTES: usize = 64;
+const EXTRACT_NOTIFICATION_BATCH_QUEUE: usize = 4;
+const ENV_RUSTFS_SNOWBALL_EXTRACT_MAX_INFLIGHT: &str = "RUSTFS_SNOWBALL_EXTRACT_MAX_INFLIGHT";
 const TAR_TYPEFLAG_OFFSET: usize = 156;
+
+fn put_object_extract_max_inflight() -> usize {
+    static MAX_INFLIGHT: OnceLock<usize> = OnceLock::new();
+    *MAX_INFLIGHT.get_or_init(|| {
+        normalize_put_object_extract_max_inflight(rustfs_utils::get_env_usize(
+            ENV_RUSTFS_SNOWBALL_EXTRACT_MAX_INFLIGHT,
+            EXTRACT_BATCH_MAX_MEMBERS,
+        ))
+    })
+}
+
+fn normalize_put_object_extract_max_inflight(value: usize) -> usize {
+    value.clamp(1, EXTRACT_BATCH_MAX_MEMBERS)
+}
+
+struct ExtractPutRequestGuard {
+    inner: PutObjectGuard,
+    succeeded: bool,
+}
+
+impl ExtractPutRequestGuard {
+    fn new() -> Self {
+        Self {
+            inner: PutObjectGuard::new(),
+            succeeded: false,
+        }
+    }
+
+    fn finish_ok(&mut self) {
+        self.succeeded = true;
+    }
+}
+
+impl Drop for ExtractPutRequestGuard {
+    fn drop(&mut self) {
+        if self.succeeded {
+            self.inner.finish_ok();
+        } else {
+            self.inner.finish_err();
+        }
+    }
+}
+
+struct ExtractStagedBody {
+    reader: Option<super::put::PooledBufferReader>,
+}
+
+impl ExtractStagedBody {
+    fn empty() -> Self {
+        Self { reader: None }
+    }
+}
+
+impl AsyncRead for ExtractStagedBody {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, target: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let Some(reader) = self.reader.as_mut() else {
+            return Poll::Ready(Ok(()));
+        };
+        Pin::new(reader).poll_read(cx, target)
+    }
+}
+
+async fn stage_extract_member_body<R>(body: &mut R, size: usize) -> S3Result<ExtractStagedBody>
+where
+    R: AsyncRead + Unpin,
+{
+    if size == 0 {
+        return Ok(ExtractStagedBody::empty());
+    }
+
+    let pool = get_concurrency_manager().bytes_pool();
+    let mut buffer = pool.acquire_buffer(size).await;
+    super::put::read_small_put_body_into(body, &mut *buffer, size).await?;
+    Ok(ExtractStagedBody {
+        reader: Some(super::put::PooledBufferReader::new(buffer, size)),
+    })
+}
+
+fn checked_extract_member_staging_weight(path: &str, size: usize, opts: &ObjectOptions) -> S3Result<usize> {
+    let body_reservation = if size == 0 { 0 } else { EXTRACT_SMALL_MEMBER_MAX_BYTES };
+    // The authorization request is dropped before staging. Account the two
+    // retained key copies plus all dynamic maps frozen into ObjectOptions;
+    // the fixed allowance covers the remaining options/write-plan handles.
+    let mut total = body_reservation
+        .checked_add(
+            path.len()
+                .checked_mul(2)
+                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball prepared member path size overflowed"))?,
+        )
+        .and_then(|bytes| bytes.checked_add(EXTRACT_MEMBER_CONTEXT_OVERHEAD_BYTES))
+        .ok_or_else(|| s3_error!(InvalidArgument, "Snowball prepared member size overflowed"))?;
+    for metadata in std::iter::once(&opts.user_defined).chain(opts.eval_metadata.iter()) {
+        for (name, value) in metadata {
+            total = total
+                .checked_add(name.len())
+                .and_then(|bytes| bytes.checked_add(value.len()))
+                .and_then(|bytes| bytes.checked_add(EXTRACT_METADATA_ENTRY_OVERHEAD_BYTES))
+                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball prepared member size overflowed"))?;
+        }
+    }
+    Ok(total)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtractBatchAction {
+    Stage,
+    FlushThenStage,
+    SerialBarrier,
+}
+
+#[derive(Debug, Default)]
+struct ExtractBatchState {
+    keys: HashSet<String>,
+    staging_bytes: usize,
+}
+
+impl ExtractBatchState {
+    fn action(
+        &self,
+        key: &str,
+        member_size: usize,
+        staging_weight: usize,
+        max_inflight: usize,
+        durable_quota: bool,
+    ) -> ExtractBatchAction {
+        if durable_quota
+            || max_inflight <= 1
+            || member_size > EXTRACT_SMALL_MEMBER_MAX_BYTES
+            || staging_weight > EXTRACT_BATCH_MAX_STAGING_BYTES
+        {
+            return ExtractBatchAction::SerialBarrier;
+        }
+
+        if self.keys.contains(key)
+            || self.keys.len() >= max_inflight
+            || self
+                .staging_bytes
+                .checked_add(staging_weight)
+                .is_none_or(|bytes| bytes > EXTRACT_BATCH_MAX_STAGING_BYTES)
+        {
+            ExtractBatchAction::FlushThenStage
+        } else {
+            ExtractBatchAction::Stage
+        }
+    }
+
+    fn record(&mut self, key: &str, staging_weight: usize) {
+        debug_assert!(!self.keys.contains(key));
+        self.keys.insert(key.to_string());
+        self.staging_bytes = self.staging_bytes.saturating_add(staging_weight);
+    }
+
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.staging_bytes = 0;
+    }
+}
+
+struct ExtractPreparedMember {
+    archive_seq: usize,
+    key: String,
+    size: i64,
+    actual_size: i64,
+    body: ExtractStagedBody,
+    write_plan: WritePlan,
+    opts: ObjectOptions,
+    replication: ReplicateDecision,
+    staging_permit: OwnedSemaphorePermit,
+}
+
+struct ExtractCommitContext {
+    store: Arc<ECStore>,
+    cache_adapter: Arc<ObjectDataCacheAdapter>,
+    bucket: String,
+    quota_enabled: bool,
+    request_context: request_context::RequestContext,
+    req_params: HashMap<String, String>,
+    host: String,
+    port: u16,
+    user_agent: String,
+    wrote_any_entry: AtomicBool,
+}
+
+struct ExtractCommitSuccess {
+    event: rustfs_notify::EventArgs,
+    post_commit_error: Option<S3Error>,
+}
+
+enum ExtractCommitError {
+    StorageWrite(S3Error),
+    Fatal(S3Error),
+}
+
+impl From<ApiError> for ExtractCommitError {
+    fn from(error: ApiError) -> Self {
+        Self::Fatal(error.into())
+    }
+}
+
+impl ExtractCommitError {
+    fn into_unignored(self, ignore_errors: bool) -> Option<S3Error> {
+        match self {
+            Self::StorageWrite(error) if ignore_errors => {
+                warn!(error = %error, "Archive object write skipped due to ignore-errors");
+                None
+            }
+            Self::StorageWrite(error) | Self::Fatal(error) => Some(error),
+        }
+    }
+}
+
+struct ExtractCommitOutcome {
+    archive_seq: usize,
+    event: Option<rustfs_notify::EventArgs>,
+    error: Option<ExtractCommitError>,
+}
+
+async fn commit_extract_member_inner<R>(
+    context: Arc<ExtractCommitContext>,
+    key: String,
+    size: i64,
+    actual_size: i64,
+    body: R,
+    write_plan: WritePlan,
+    opts: ObjectOptions,
+    replication: ReplicateDecision,
+    staging_permit: Option<OwnedSemaphorePermit>,
+) -> Result<ExtractCommitSuccess, ExtractCommitError>
+where
+    R: AsyncRead + Send + Sync + Unpin + 'static,
+{
+    let hrd = HashReader::from_stream(body, size, actual_size, None, None, false).map_err(ApiError::from)?;
+    let hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
+    let (hrd, member_read_failed) = track_extract_member_read_errors(hrd).map_err(ApiError::from)?;
+    let mut reader = PutObjReader::new(hrd);
+    let _ = invalidate_object_data_cache_before_mutation(&context.cache_adapter, &context.bucket, &key).await;
+
+    let (obj_info, backfilled_old_current_size) = match context
+        .store
+        .put_object_with_old_current_size(&context.bucket, &key, &mut reader, &opts)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let error: S3Error = ApiError::from(error).into();
+            return Err(classify_extract_member_write_error(error, &member_read_failed));
+        }
+    };
+    drop(reader);
+    drop(staging_permit);
+
+    let extract_versioned = opts.versioned;
+    let post_commit_error = match quota_accounting_object_size(&obj_info, context.quota_enabled) {
+        Ok(committed_size) => {
+            match previous_current_size_from_backfill(backfilled_old_current_size) {
+                Some(previous_current_size) => {
+                    if extract_versioned {
+                        record_bucket_object_version_write_memory(&context.bucket, previous_current_size, committed_size).await;
+                    } else {
+                        record_bucket_object_write_memory(&context.bucket, previous_current_size, committed_size).await;
+                    }
+                }
+                None => {
+                    record_bucket_object_write_unknown_previous_memory(&context.bucket, committed_size, extract_versioned).await;
+                }
+            }
+            None
+        }
+        Err(err) => Some(err),
+    };
+    let _ = invalidate_object_data_cache_after_put_success(&context.cache_adapter, &context.bucket, &key).await;
+
+    if replication.replicate_any() {
+        schedule_object_replication(obj_info.clone(), context.store.clone(), replication).await;
+    }
+
+    if !context.wrote_any_entry.swap(true, Ordering::AcqRel) {
+        rustfs_scanner::record_dirty_usage_bucket(&context.bucket);
+    }
+
+    let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
+    let output = PutObjectOutput {
+        e_tag,
+        ..Default::default()
+    };
+    let actual_version_id = extract_notification_version_id(obj_info.version_id, opts.versioned, opts.version_suspended);
+    let mut event_object = convert_ecstore_object_info(obj_info);
+    event_object.version_id = (!actual_version_id.is_empty()).then_some(actual_version_id.clone());
+    let event = rustfs_notify::EventArgs {
+        event_name: put_event_name_for_post_object(false),
+        bucket_name: context.bucket.clone(),
+        object: event_object,
+        req_params: context.req_params.clone(),
+        resp_elements: build_event_resp_elements(&S3Response::new(output), &context.request_context.request_id),
+        version_id: actual_version_id,
+        host: context.host.clone(),
+        port: context.port,
+        user_agent: context.user_agent.clone(),
+    };
+
+    Ok(ExtractCommitSuccess {
+        event,
+        post_commit_error,
+    })
+}
+
+async fn commit_extract_member<R>(
+    context: Arc<ExtractCommitContext>,
+    archive_seq: usize,
+    key: String,
+    size: i64,
+    actual_size: i64,
+    body: R,
+    write_plan: WritePlan,
+    opts: ObjectOptions,
+    replication: ReplicateDecision,
+    staging_permit: Option<OwnedSemaphorePermit>,
+) -> ExtractCommitOutcome
+where
+    R: AsyncRead + Send + Sync + Unpin + 'static,
+{
+    let _commit_permit = match get_concurrency_manager().acquire_snowball_member_commit().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ExtractCommitOutcome {
+                archive_seq,
+                event: None,
+                error: Some(ExtractCommitError::Fatal(s3_error!(
+                    InternalError,
+                    "Snowball member commit admission closed"
+                ))),
+            };
+        }
+    };
+
+    match commit_extract_member_inner(context, key, size, actual_size, body, write_plan, opts, replication, staging_permit).await
+    {
+        Ok(success) => ExtractCommitOutcome {
+            archive_seq,
+            event: Some(success.event),
+            error: success.post_commit_error.map(ExtractCommitError::Fatal),
+        },
+        Err(error) => ExtractCommitOutcome {
+            archive_seq,
+            event: None,
+            error: Some(error),
+        },
+    }
+}
+
+async fn finish_extract_outcomes(
+    mut outcomes: Vec<ExtractCommitOutcome>,
+    notification_tx: &tokio::sync::mpsc::Sender<Vec<rustfs_notify::EventArgs>>,
+    ignore_errors: bool,
+) -> S3Result<()> {
+    outcomes.sort_by_key(|outcome| outcome.archive_seq);
+    let mut events = Vec::with_capacity(outcomes.len());
+    let mut earliest_error = None;
+    for outcome in outcomes {
+        if let Some(event) = outcome.event {
+            events.push(event);
+        }
+        let error = outcome.error.and_then(|error| error.into_unignored(ignore_errors));
+        if earliest_error.is_none() {
+            earliest_error = error;
+        }
+    }
+    if !events.is_empty() {
+        let _ = notification_tx.send(events).await;
+    }
+    match earliest_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+async fn drain_extract_commits<F>(mut commits: FuturesUnordered<F>) -> Vec<ExtractCommitOutcome>
+where
+    F: std::future::Future<Output = ExtractCommitOutcome>,
+{
+    let mut outcomes = Vec::with_capacity(commits.len());
+    while let Some(outcome) = commits.next().await {
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
+async fn flush_extract_batch(
+    batch: &mut Vec<ExtractPreparedMember>,
+    batch_state: &mut ExtractBatchState,
+    context: &Arc<ExtractCommitContext>,
+    notification_tx: &tokio::sync::mpsc::Sender<Vec<rustfs_notify::EventArgs>>,
+    ignore_errors: bool,
+) -> S3Result<()> {
+    if batch.is_empty() {
+        batch_state.clear();
+        return Ok(());
+    }
+
+    let mut commits = FuturesUnordered::new();
+    for member in batch.drain(..) {
+        commits.push(commit_extract_member(
+            context.clone(),
+            member.archive_seq,
+            member.key,
+            member.size,
+            member.actual_size,
+            member.body,
+            member.write_plan,
+            member.opts,
+            member.replication,
+            Some(member.staging_permit),
+        ));
+    }
+    batch_state.clear();
+
+    let outcomes = drain_extract_commits(commits).await;
+    finish_extract_outcomes(outcomes, notification_tx, ignore_errors).await
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PutObjectExtractOptions {
@@ -1433,6 +1866,25 @@ impl DefaultObjectUsecase {
                 u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
             )
             .await?;
+        let _put_admission = match get_concurrency_manager()
+            .admit_put_object(size)
+            .await
+            .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
+        {
+            ForegroundWriteAdmission::Disabled => None,
+            ForegroundWriteAdmission::Admitted(permit) => {
+                counter!("rustfs.put_object.foreground_admission.total", "result" => "admitted").increment(1);
+                Some(permit)
+            }
+            ForegroundWriteAdmission::Rejected => {
+                counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
+                return Err(s3_error!(
+                    SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate"
+                ));
+            }
+        };
+        let mut put_request_guard = ExtractPutRequestGuard::new();
 
         // Apply adaptive buffer sizing based on file size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
@@ -1503,7 +1955,15 @@ impl DefaultObjectUsecase {
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
         let user_agent = get_request_user_agent(&req.headers);
-        let mut wrote_any_entry = false;
+        let (notification_tx, mut notification_rx) =
+            tokio::sync::mpsc::channel::<Vec<rustfs_notify::EventArgs>>(EXTRACT_NOTIFICATION_BATCH_QUEUE);
+        spawn_background_with_context(Some(request_context.clone()), async move {
+            while let Some(events) = notification_rx.recv().await {
+                for event in events {
+                    notify.notify(event).await;
+                }
+            }
+        });
         let mut extracted_entry_count = 0usize;
         let mut resource_total_size = 0u64;
         let mut legacy_quota_growth = 0u64;
@@ -1512,31 +1972,85 @@ impl DefaultObjectUsecase {
         let mut total_expanded_pax_metadata = 0u64;
         let object_lock_config_snapshot = store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?;
         let object_lock_config_state = object_lock_config_snapshot.state();
+        let commit_context = Arc::new(ExtractCommitContext {
+            store,
+            cache_adapter: self.object_data_cache(),
+            bucket: bucket.clone(),
+            quota_enabled: extract_quota_enabled,
+            request_context,
+            req_params,
+            host,
+            port,
+            user_agent,
+            wrote_any_entry: AtomicBool::new(false),
+        });
+        let durable_quota = extract_quota_check
+            .as_ref()
+            .is_some_and(|result| result.uses_durable_reservations);
+        let max_inflight = put_object_extract_max_inflight();
+        let mut batch = Vec::with_capacity(max_inflight);
+        let mut batch_state = ExtractBatchState::default();
+
+        macro_rules! extract_try {
+            ($expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let error: S3Error = error.into();
+                        if let Err(batch_error) = flush_extract_batch(
+                            &mut batch,
+                            &mut batch_state,
+                            &commit_context,
+                            &notification_tx,
+                            extract_options.ignore_errors,
+                        )
+                        .await
+                        {
+                            return Err(batch_error);
+                        }
+                        return Err(error);
+                    }
+                }
+            };
+        }
 
         while let Some(entry) = entries.next().await {
             let mut f = match entry {
                 Ok(f) => f,
-                Err(e) => {
-                    error!(error = %e, "Archive entry read failed");
-                    return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", e));
+                Err(error) => {
+                    error!(error = %error, "Archive entry read failed");
+                    if let Err(batch_error) = flush_extract_batch(
+                        &mut batch,
+                        &mut batch_state,
+                        &commit_context,
+                        &notification_tx,
+                        extract_options.ignore_errors,
+                    )
+                    .await
+                    {
+                        return Err(batch_error);
+                    }
+                    return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", error));
                 }
             };
             extracted_entry_count = extracted_entry_count.saturating_add(1);
-            validate_put_object_extract_entry_count(extracted_entry_count, extract_limits)?;
+            extract_try!(validate_put_object_extract_entry_count(extracted_entry_count, extract_limits,));
             let entry_size = f.effective_size();
-            validate_put_object_extract_entry_size("archive member", entry_size, extract_limits)?;
-            resource_total_size = resource_total_size
-                .checked_add(entry_size)
-                .ok_or_else(|| s3_error!(InvalidArgument, "Archive total unpacked size overflowed while processing entries"))?;
-            validate_put_object_extract_total_size(resource_total_size, extract_limits)?;
-            count_extract_entry_pax_metadata(
-                &mut f,
-                &mut total_pax_metadata_size,
-                &mut total_pax_metadata_records,
-                extract_limits,
-            )
-            .await
-            .map_err(ExtractEntryError::into_s3_error)?;
+            extract_try!(validate_put_object_extract_entry_size("archive member", entry_size, extract_limits,));
+            resource_total_size = extract_try!(resource_total_size.checked_add(entry_size).ok_or_else(|| {
+                s3_error!(InvalidArgument, "Archive total unpacked size overflowed while processing entries")
+            }));
+            extract_try!(validate_put_object_extract_total_size(resource_total_size, extract_limits,));
+            extract_try!(
+                count_extract_entry_pax_metadata(
+                    &mut f,
+                    &mut total_pax_metadata_size,
+                    &mut total_pax_metadata_records,
+                    extract_limits,
+                )
+                .await
+                .map_err(ExtractEntryError::into_s3_error)
+            );
 
             let archive_entry_type = f.header().entry_type();
             let entry_kind = classify_extract_entry_type(archive_entry_type);
@@ -1544,14 +2058,14 @@ impl DefaultObjectUsecase {
                 ExtractEntryKind::Skip => continue,
                 ExtractEntryKind::Directory | ExtractEntryKind::Object => {}
             }
-            validate_extract_special_entry_size(archive_entry_type, entry_size)?;
+            extract_try!(validate_extract_special_entry_size(archive_entry_type, entry_size));
 
             let (fpath, is_dir) = {
-                let path_bytes = f.path_bytes().map_err(map_extract_archive_error)?;
+                let path_bytes = extract_try!(f.path_bytes().map_err(map_extract_archive_error));
                 let path = match strict_extract_entry_path(path_bytes.as_ref()) {
                     Ok(path) => path,
-                    Err(err) => {
-                        err.ignore_or_return(extract_options.ignore_errors)?;
+                    Err(error) => {
+                        extract_try!(error.ignore_or_return(extract_options.ignore_errors));
                         continue;
                     }
                 };
@@ -1564,19 +2078,35 @@ impl DefaultObjectUsecase {
                 }
                 let fpath = match normalize_extract_entry_key(path, extract_options.prefix.as_deref(), is_dir) {
                     Ok(fpath) => fpath,
-                    Err(err) => {
-                        ExtractEntryError::Recoverable(err).ignore_or_return(extract_options.ignore_errors)?;
+                    Err(error) => {
+                        extract_try!(ExtractEntryError::Recoverable(error).ignore_or_return(extract_options.ignore_errors));
                         continue;
                     }
                 };
                 (fpath, is_dir)
             };
 
-            if let Err(err) = validate_extract_member_key(&fpath, extract_limits) {
-                err.ignore_or_return(extract_options.ignore_errors)?;
+            if let Err(error) = validate_extract_member_key(&fpath, extract_limits) {
+                extract_try!(error.ignore_or_return(extract_options.ignore_errors));
                 continue;
             }
-            validate_table_catalog_object_mutation(&bucket, &fpath).await?;
+            if batch_state.keys.contains(&fpath)
+                || durable_quota
+                || max_inflight <= 1
+                || (!is_dir && entry_size > EXTRACT_SMALL_MEMBER_MAX_BYTES as u64)
+            {
+                extract_try!(
+                    flush_extract_batch(
+                        &mut batch,
+                        &mut batch_state,
+                        &commit_context,
+                        &notification_tx,
+                        extract_options.ignore_errors,
+                    )
+                    .await
+                );
+            }
+            extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);
 
             let mut auth_req = S3Request {
                 input: PutObjectInput::default(),
@@ -1590,20 +2120,21 @@ impl DefaultObjectUsecase {
                 trailing_headers: auth_trailing_headers.clone(),
             };
             {
-                let req_info = req_info_mut(&mut auth_req)?;
+                let req_info = extract_try!(req_info_mut(&mut auth_req));
                 req_info.bucket = Some(bucket.clone());
                 req_info.object = Some(fpath.clone());
                 req_info.version_id = None;
             }
-            let mut size =
-                i64::try_from(entry_size).map_err(|_| s3_error!(InvalidArgument, "Archive entry size does not fit into i64"))?;
+            let mut size = extract_try!(
+                i64::try_from(entry_size).map_err(|_| s3_error!(InvalidArgument, "Archive entry size does not fit into i64"))
+            );
             // mtime 0 or a negative GNU base-256 value means "unset". xl.meta
             // also cannot represent the Unix epoch as an object mod_time, so
             // those cases fall back to the upload time (rustfs#4842).
-            let archive_entry_mod_time = extract_archive_entry_mod_time(f.header())?;
+            let archive_entry_mod_time = extract_try!(extract_archive_entry_mod_time(f.header()));
             let mut metadata = HashMap::new();
             let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
-            apply_put_request_metadata(
+            extract_try!(apply_put_request_metadata(
                 &mut metadata,
                 &member_request_headers,
                 &fpath,
@@ -1616,25 +2147,27 @@ impl DefaultObjectUsecase {
                 website_redirect_location.clone(),
                 tagging.clone(),
                 storage_class.clone(),
-            )?;
-            apply_bucket_default_lock_retention(
+            ));
+            extract_try!(apply_bucket_default_lock_retention(
                 &bucket,
                 object_lock_config_state,
                 &mut metadata,
                 has_explicit_object_lock_retention,
-            )?;
-            let mut opts = put_opts_with_replication_authorization(
-                &bucket,
-                &fpath,
-                outer_version_id.clone(),
-                &member_request_headers,
-                metadata.clone(),
-                replication_authorized,
-            )
-            .await
-            .map_err(ApiError::from)?;
+            ));
+            let mut opts = extract_try!(
+                put_opts_with_replication_authorization(
+                    &bucket,
+                    &fpath,
+                    outer_version_id.clone(),
+                    &member_request_headers,
+                    metadata.clone(),
+                    replication_authorized,
+                )
+                .await
+                .map_err(ApiError::from)
+            );
             if let Some(quota_check) = extract_quota_check.as_ref() {
-                apply_quota_admission(&mut opts, quota_check)?;
+                extract_try!(apply_quota_admission(&mut opts, quota_check));
             }
             opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
             opts.object_lock_config_snapshot = Some(Arc::clone(&object_lock_config_snapshot));
@@ -1649,37 +2182,48 @@ impl DefaultObjectUsecase {
             .await
             {
                 Ok(authorization) => authorization,
-                Err(err) => {
-                    err.ignore_or_return(extract_options.ignore_errors)?;
+                Err(error) => {
+                    extract_try!(error.ignore_or_return(extract_options.ignore_errors));
                     continue;
                 }
             };
-            total_expanded_pax_metadata = total_expanded_pax_metadata
-                .checked_add(pax_authorization.expanded_metadata_bytes)
-                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed"))?;
-            validate_extract_expanded_pax_metadata_total(total_expanded_pax_metadata)?;
-            if let Some(quota_check) = extract_quota_check.as_ref() {
-                let next_legacy_quota_growth = legacy_quota_growth
-                    .checked_add(extract_entry_quota_growth(
-                        if is_dir { ExtractEntryKind::Directory } else { entry_kind },
-                        entry_size,
-                    ))
+            total_expanded_pax_metadata = extract_try!(
+                total_expanded_pax_metadata
+                    .checked_add(pax_authorization.expanded_metadata_bytes)
                     .ok_or_else(|| {
-                        object_s3_error(S3ErrorCode::InvalidArgument, "Archive quota growth overflowed while processing entries")
-                    })?;
-                ensure_legacy_archive_size_within_quota(quota_check, next_legacy_quota_growth)?;
+                        object_s3_error(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed")
+                    })
+            );
+            extract_try!(validate_extract_expanded_pax_metadata_total(total_expanded_pax_metadata,));
+            if let Some(quota_check) = extract_quota_check.as_ref() {
+                let next_legacy_quota_growth = extract_try!(
+                    legacy_quota_growth
+                        .checked_add(extract_entry_quota_growth(
+                            if is_dir { ExtractEntryKind::Directory } else { entry_kind },
+                            entry_size,
+                        ))
+                        .ok_or_else(|| {
+                            object_s3_error(
+                                S3ErrorCode::InvalidArgument,
+                                "Archive quota growth overflowed while processing entries",
+                            )
+                        })
+                );
+                extract_try!(ensure_legacy_archive_size_within_quota(quota_check, next_legacy_quota_growth,));
                 legacy_quota_growth = next_legacy_quota_growth;
             }
             for (name, value) in &pax_authorization.headers {
-                auth_req.headers.try_insert(name.clone(), value.clone()).map_err(|_| {
+                extract_try!(auth_req.headers.try_insert(name.clone(), value.clone()).map_err(|_| {
                     object_s3_error(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
-                })?;
+                }));
             }
             let explicit_version_id = pax_authorization.version_id.as_deref().or(outer_version_id.as_deref());
-            let authorization_version_id = explicit_version_id
-                .map(|version_id| apply_extract_version_id(version_id, &mut opts))
-                .transpose()?;
-            req_info_mut(&mut auth_req)?.version_id = authorization_version_id;
+            let authorization_version_id = extract_try!(
+                explicit_version_id
+                    .map(|version_id| apply_extract_version_id(version_id, &mut opts))
+                    .transpose()
+            );
+            extract_try!(req_info_mut(&mut auth_req)).version_id = authorization_version_id;
             let effective_object_lock_legal_hold_status = pax_authorization
                 .object_lock_legal_hold_status
                 .clone()
@@ -1701,19 +2245,20 @@ impl DefaultObjectUsecase {
                 explicit_version_id,
                 opts.delete_marker_replication_status() == ReplicationStatusType::Replica,
             );
-            authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await?;
+            extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await);
             if iam_requirements.tagging {
-                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectTaggingAction)).await?;
+                extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectTaggingAction)).await);
             }
             if iam_requirements.retention {
-                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+                extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectRetentionAction)).await);
             }
             if iam_requirements.legal_hold {
-                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+                extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await);
             }
             if iam_requirements.replication {
-                authorize_request(&mut auth_req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
+                extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::ReplicateObjectAction)).await);
             }
+            drop(auth_req);
             if archive_entry_mod_time.is_some() {
                 opts.mod_time = archive_entry_mod_time;
             }
@@ -1723,69 +2268,51 @@ impl DefaultObjectUsecase {
             if is_dir {
                 size = 0;
             }
-
             let actual_size = size;
-
             let should_compress =
                 !is_dir && is_disk_compressible(&HeaderMap::new(), &fpath) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64;
-
             let mut write_plan = WritePlan::new();
-            let mut hrd = if is_dir {
-                HashReader::from_stream(std::io::Cursor::new(Vec::new()), size, actual_size, None, None, false)
-                    .map_err(ApiError::from)?
-            } else if should_compress {
+            if should_compress {
                 let algorithm = CompressionAlgorithm::default();
                 insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
-
-                let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;
                 write_plan = write_plan.with_compression(algorithm);
-                hrd
-            } else {
-                HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?
-            };
-            apply_put_request_object_lock_opts(
+            }
+            extract_try!(apply_put_request_object_lock_opts(
                 &bucket,
                 object_lock_config_state,
                 effective_object_lock_legal_hold_status,
                 effective_object_lock_mode,
                 effective_object_lock_retain_until_date,
                 &mut opts,
-            )?;
-            if let Some(material) = sse_encryption(EncryptionRequest {
-                bucket: &bucket,
-                key: &fpath,
-                server_side_encryption: effective_sse.clone(),
-                ssekms_key_id: effective_kms_key_id.clone(),
-                ssekms_context: extract_ssekms_context_from_headers(&req.headers)?,
-                sse_customer_algorithm: sse_customer_algorithm.clone(),
-                sse_customer_key: sse_customer_key.clone(),
-                sse_customer_key_md5: sse_customer_key_md5.clone(),
-                content_size: actual_size,
-                principal: extract_principal.as_ref(),
-            })
-            .await?
-            {
+            ));
+            if let Some(material) = extract_try!(
+                sse_encryption(EncryptionRequest {
+                    bucket: &bucket,
+                    key: &fpath,
+                    server_side_encryption: effective_sse.clone(),
+                    ssekms_key_id: effective_kms_key_id.clone(),
+                    ssekms_context: extract_try!(extract_ssekms_context_from_headers(&req.headers)),
+                    sse_customer_algorithm: sse_customer_algorithm.clone(),
+                    sse_customer_key: sse_customer_key.clone(),
+                    sse_customer_key_md5: sse_customer_key_md5.clone(),
+                    content_size: actual_size,
+                    principal: extract_principal.as_ref(),
+                })
+                .await
+            ) {
                 effective_sse = Some(material.server_side_encryption.clone());
                 effective_kms_key_id = material.kms_key_id.clone();
-
                 write_plan = write_plan.with_encryption(material.write_encryption(None));
-
-                let encryption_metadata = encryption_material_to_metadata(&material)?;
+                let encryption_metadata = extract_try!(encryption_material_to_metadata(&material));
                 metadata.extend(encryption_metadata.clone());
                 opts.user_defined.extend(encryption_metadata);
             }
-            hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
-            let (hrd, member_read_failed) = track_extract_member_read_errors(hrd).map_err(ApiError::from)?;
             opts.user_defined.extend(metadata);
 
-            // Each extracted member is an independent user write and joins
-            // bucket replication like a regular PUT (MinIO PutObjectExtract
-            // parity). One immutable decision drives both the pending metadata
-            // and the post-commit schedule below, same contract as the PUT path
-            // (https://github.com/rustfs/backlog/issues/1320); inbound replica
-            // writes are declined inside `must_replicate_object`.
-            let dsc = must_replicate_object(
+            // One immutable decision drives both the pending metadata and the
+            // post-commit schedule, matching the regular PUT contract.
+            let replication = must_replicate_object(
                 &bucket,
                 &fpath,
                 &opts.user_defined,
@@ -1794,99 +2321,133 @@ impl DefaultObjectUsecase {
                 opts.clone(),
             )
             .await;
-            if dsc.replicate_any() {
+            if replication.replicate_any() {
                 insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
                 insert_str(
                     &mut opts.user_defined,
                     SUFFIX_REPLICATION_STATUS,
-                    dsc.pending_status().unwrap_or_default(),
+                    replication.pending_status().unwrap_or_default(),
                 );
             }
 
-            let mut reader = PutObjReader::new(hrd);
-            let cache_adapter = self.object_data_cache();
-            let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &fpath).await;
+            let member_size = extract_try!(
+                usize::try_from(size).map_err(|_| s3_error!(InvalidArgument, "Snowball member size does not fit into usize"))
+            );
+            let staging_weight = extract_try!(checked_extract_member_staging_weight(&fpath, member_size, &opts));
+            let action = batch_state.action(&fpath, member_size, staging_weight, max_inflight, durable_quota);
 
-            let (obj_info, backfilled_old_current_size) = match store
-                .put_object_with_old_current_size(&bucket, &fpath, &mut reader, &opts)
-                .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    if should_ignore_extract_member_write_error(extract_options.ignore_errors, &member_read_failed) {
-                        warn!(error = %e, "Archive object write skipped due to ignore-errors");
-                        continue;
-                    }
-                    return Err(ApiError::from(e).into());
-                }
-            };
-            let extract_versioned = BucketVersioningSys::prefix_enabled(&bucket, &fpath).await;
-            let post_commit_error = match quota_accounting_object_size(&obj_info, extract_quota_enabled) {
-                Ok(committed_size) => {
-                    match previous_current_size_from_backfill(backfilled_old_current_size) {
-                        Some(previous_current_size) => {
-                            if extract_versioned {
-                                record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-                            } else {
-                                record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
-                            }
-                        }
-                        None => {
-                            record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, extract_versioned).await;
-                        }
-                    }
-                    None
-                }
-                Err(err) => Some(err),
-            };
-            let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &fpath).await;
-
-            // Reuse the per-entry pre-commit decision (see `dsc` above) so the
-            // persisted pending marker and the schedule always agree.
-            if dsc.replicate_any() {
-                schedule_object_replication(obj_info.clone(), store.clone(), dsc).await;
+            if matches!(action, ExtractBatchAction::FlushThenStage | ExtractBatchAction::SerialBarrier) {
+                extract_try!(
+                    flush_extract_batch(
+                        &mut batch,
+                        &mut batch_state,
+                        &commit_context,
+                        &notification_tx,
+                        extract_options.ignore_errors,
+                    )
+                    .await
+                );
             }
 
-            if !wrote_any_entry {
-                rustfs_scanner::record_dirty_usage_bucket(&bucket);
-                wrote_any_entry = true;
+            if action == ExtractBatchAction::SerialBarrier {
+                // Large and durable-quota members retain the legacy streaming
+                // path. Await inline so the TAR Entry never enters a batch or
+                // a detached task before the producer advances the archive.
+                let outcome = if is_dir {
+                    drop(f);
+                    commit_extract_member(
+                        commit_context.clone(),
+                        extracted_entry_count,
+                        fpath,
+                        size,
+                        actual_size,
+                        std::io::Cursor::new(Vec::new()),
+                        write_plan,
+                        opts,
+                        replication,
+                        None,
+                    )
+                    .await
+                } else {
+                    commit_extract_member(
+                        commit_context.clone(),
+                        extracted_entry_count,
+                        fpath,
+                        size,
+                        actual_size,
+                        f,
+                        write_plan,
+                        opts,
+                        replication,
+                        None,
+                    )
+                    .await
+                };
+                extract_try!(finish_extract_outcomes(vec![outcome], &notification_tx, extract_options.ignore_errors,).await);
+                continue;
             }
 
-            let _manager = get_concurrency_manager();
-            let _fpath_clone = fpath.clone();
-            let _bucket_clone = bucket.clone();
-            let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
-
-            let output = PutObjectOutput {
-                e_tag,
-                ..Default::default()
+            let staging_permits = extract_try!(
+                u32::try_from(staging_weight)
+                    .map_err(|_| s3_error!(InvalidArgument, "Snowball prepared member size exceeds semaphore capacity"))
+            );
+            let staging_permit = if batch.is_empty() {
+                extract_try!(
+                    get_concurrency_manager()
+                        .acquire_snowball_staging_bytes(staging_permits)
+                        .await
+                        .map_err(|_| s3_error!(InternalError, "Snowball staging admission closed"))
+                )
+            } else if let Some(permit) = get_concurrency_manager().try_acquire_snowball_staging_bytes(staging_permits) {
+                permit
+            } else {
+                extract_try!(
+                    flush_extract_batch(
+                        &mut batch,
+                        &mut batch_state,
+                        &commit_context,
+                        &notification_tx,
+                        extract_options.ignore_errors,
+                    )
+                    .await
+                );
+                extract_try!(
+                    get_concurrency_manager()
+                        .acquire_snowball_staging_bytes(staging_permits)
+                        .await
+                        .map_err(|_| s3_error!(InternalError, "Snowball staging admission closed"))
+                )
             };
 
-            let actual_version_id = extract_notification_version_id(obj_info.version_id, opts.versioned, opts.version_suspended);
-            let mut event_object = convert_ecstore_object_info(obj_info.clone());
-            event_object.version_id = (!actual_version_id.is_empty()).then_some(actual_version_id.clone());
-
-            let event_args = rustfs_notify::EventArgs {
-                event_name: put_event_name_for_post_object(false),
-                bucket_name: bucket.clone(),
-                object: event_object,
-                req_params: req_params.clone(),
-                resp_elements: build_event_resp_elements(&S3Response::new(output.clone()), &request_context.request_id),
-                version_id: actual_version_id,
-                host: host.clone(),
-                port,
-                user_agent: user_agent.clone(),
+            let body = if is_dir {
+                drop(f);
+                ExtractStagedBody::empty()
+            } else {
+                extract_try!(stage_extract_member_body(&mut f, member_size).await)
             };
-
-            let notify = notify.clone();
-            spawn_background_with_context(Some(request_context.clone()), async move {
-                notify.notify(event_args).await;
+            batch_state.record(&fpath, staging_weight);
+            batch.push(ExtractPreparedMember {
+                archive_seq: extracted_entry_count,
+                key: fpath,
+                size,
+                actual_size,
+                body,
+                write_plan,
+                opts,
+                replication,
+                staging_permit,
             });
-
-            if let Some(err) = post_commit_error {
-                return Err(err);
-            }
         }
+        extract_try!(
+            flush_extract_batch(
+                &mut batch,
+                &mut batch_state,
+                &commit_context,
+                &notification_tx,
+                extract_options.ignore_errors,
+            )
+            .await
+        );
 
         let mut checksums = PutObjectChecksums {
             crc32: input.checksum_crc32,
@@ -1937,6 +2498,7 @@ impl DefaultObjectUsecase {
         };
         let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
+        put_request_guard.finish_ok();
         result
     }
 }
@@ -1948,6 +2510,271 @@ mod tests {
     use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
+
+    #[test]
+    fn snowball_max_inflight_has_a_serial_compatibility_floor_and_bounded_ceiling() {
+        assert_eq!(normalize_put_object_extract_max_inflight(0), 1);
+        assert_eq!(normalize_put_object_extract_max_inflight(1), 1);
+        assert_eq!(normalize_put_object_extract_max_inflight(usize::MAX), EXTRACT_BATCH_MAX_MEMBERS);
+    }
+
+    #[test]
+    fn snowball_batch_state_flushes_on_duplicates_limits_and_serial_barriers() {
+        let mut state = ExtractBatchState::default();
+        assert_eq!(
+            state.action("first", 4096, 8192, EXTRACT_BATCH_MAX_MEMBERS, false),
+            ExtractBatchAction::Stage
+        );
+        state.record("first", 8192);
+        assert_eq!(
+            state.action("first", 4096, 8192, EXTRACT_BATCH_MAX_MEMBERS, false),
+            ExtractBatchAction::FlushThenStage
+        );
+        assert_eq!(
+            state.action("large", EXTRACT_SMALL_MEMBER_MAX_BYTES + 1, 8192, EXTRACT_BATCH_MAX_MEMBERS, false,),
+            ExtractBatchAction::SerialBarrier
+        );
+        assert_eq!(
+            state.action("quota", 4096, 8192, EXTRACT_BATCH_MAX_MEMBERS, true),
+            ExtractBatchAction::SerialBarrier
+        );
+        assert_eq!(state.action("compat", 4096, 8192, 1, false), ExtractBatchAction::SerialBarrier);
+        assert_eq!(
+            state.action(
+                "exact-small-boundary",
+                EXTRACT_SMALL_MEMBER_MAX_BYTES,
+                8192,
+                EXTRACT_BATCH_MAX_MEMBERS,
+                false,
+            ),
+            ExtractBatchAction::Stage
+        );
+        assert_eq!(
+            state.action(
+                "oversized-context",
+                4096,
+                EXTRACT_BATCH_MAX_STAGING_BYTES + 1,
+                EXTRACT_BATCH_MAX_MEMBERS,
+                false,
+            ),
+            ExtractBatchAction::SerialBarrier
+        );
+
+        state.clear();
+        state.staging_bytes = EXTRACT_BATCH_MAX_STAGING_BYTES - 1024;
+        assert_eq!(
+            state.action("exact-memory", 4096, 1024, EXTRACT_BATCH_MAX_MEMBERS, false),
+            ExtractBatchAction::Stage
+        );
+        assert_eq!(
+            state.action("memory", 4096, 2048, EXTRACT_BATCH_MAX_MEMBERS, false),
+            ExtractBatchAction::FlushThenStage
+        );
+
+        state.clear();
+        for index in 0..EXTRACT_BATCH_MAX_MEMBERS {
+            state.record(&format!("key-{index}"), 1);
+        }
+        assert_eq!(
+            state.action("overflow", 1, 1, EXTRACT_BATCH_MAX_MEMBERS, false),
+            ExtractBatchAction::FlushThenStage
+        );
+    }
+
+    #[test]
+    fn snowball_staging_weight_includes_body_capacity_path_and_frozen_metadata() {
+        let mut opts = ObjectOptions::default();
+        opts.user_defined.insert("x-amz-meta-one".to_string(), "value".to_string());
+        opts.eval_metadata = Some(HashMap::from([("auth-view".to_string(), "retained".to_string())]));
+        let path = "prefix/object";
+        let weight = checked_extract_member_staging_weight(path, 1, &opts).expect("valid metadata must have a weight");
+        assert_eq!(
+            weight,
+            EXTRACT_SMALL_MEMBER_MAX_BYTES
+                + EXTRACT_MEMBER_CONTEXT_OVERHEAD_BYTES
+                + (2 * path.len())
+                + "x-amz-meta-one".len()
+                + "value".len()
+                + EXTRACT_METADATA_ENTRY_OVERHEAD_BYTES
+                + "auth-view".len()
+                + "retained".len()
+                + EXTRACT_METADATA_ENTRY_OVERHEAD_BYTES
+        );
+        let empty_weight =
+            checked_extract_member_staging_weight(path, 0, &ObjectOptions::default()).expect("empty member must have a weight");
+        assert_eq!(empty_weight, EXTRACT_MEMBER_CONTEXT_OVERHEAD_BYTES + (2 * path.len()));
+    }
+
+    #[tokio::test]
+    async fn snowball_staging_rejects_truncated_and_oversized_member_bodies() {
+        let mut truncated = std::io::Cursor::new(b"ab".to_vec());
+        let error = stage_extract_member_body(&mut truncated, 3)
+            .await
+            .err()
+            .expect("a truncated TAR member must fail staging");
+        assert_eq!(error.code(), &S3ErrorCode::IncompleteBody);
+
+        let mut oversized = std::io::Cursor::new(b"abc".to_vec());
+        let error = stage_extract_member_body(&mut oversized, 2)
+            .await
+            .err()
+            .expect("a TAR member longer than its declared size must fail staging");
+        assert_eq!(error.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn snowball_staging_consumes_each_tar_entry_before_advancing() {
+        let mut builder = Builder::new(Vec::new());
+        for (path, payload) in [("first", b"first-body".as_slice()), ("second", b"second-body".as_slice())] {
+            let mut header = Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, std::io::Cursor::new(payload))
+                .await
+                .expect("TAR member must append");
+        }
+        let archive_bytes = builder.into_inner().await.expect("TAR fixture must finalize");
+        let mut archive = Archive::new(std::io::Cursor::new(archive_bytes));
+        let mut entries = archive.entries().expect("TAR entries must open");
+
+        let mut first = entries
+            .next()
+            .await
+            .expect("first entry must exist")
+            .expect("first entry must parse");
+        let mut staged = stage_extract_member_body(&mut first, "first-body".len())
+            .await
+            .expect("first body must stage");
+        let mut staged_bytes = Vec::new();
+        staged.read_to_end(&mut staged_bytes).await.expect("staged body must read");
+        assert_eq!(staged_bytes, b"first-body");
+        drop(first);
+
+        let mut second = entries
+            .next()
+            .await
+            .expect("second entry must exist")
+            .expect("second entry must parse");
+        let mut second_bytes = Vec::new();
+        second.read_to_end(&mut second_bytes).await.expect("second body must read");
+        assert_eq!(second_bytes, b"second-body");
+        drop(second);
+        drop(entries);
+        assert!(archive.into_inner().is_ok(), "no TAR entry may escape the sequential producer");
+    }
+
+    #[tokio::test]
+    async fn snowball_batch_error_selection_uses_archive_order() {
+        let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(1);
+        let outcomes = vec![
+            ExtractCommitOutcome {
+                archive_seq: 2,
+                event: None,
+                error: Some(ExtractCommitError::Fatal(s3_error!(InvalidArgument, "later"))),
+            },
+            ExtractCommitOutcome {
+                archive_seq: 1,
+                event: None,
+                error: Some(ExtractCommitError::Fatal(s3_error!(NoSuchKey, "earlier"))),
+            },
+        ];
+        let error = finish_extract_outcomes(outcomes, &notification_tx, false)
+            .await
+            .expect_err("the earliest archive error must be returned");
+        assert_eq!(error.code(), &S3ErrorCode::NoSuchKey);
+    }
+
+    #[tokio::test]
+    async fn snowball_batch_notifications_follow_archive_order() {
+        let (notification_tx, mut notification_rx) = tokio::sync::mpsc::channel(1);
+        let outcomes = vec![
+            ExtractCommitOutcome {
+                archive_seq: 2,
+                event: Some(EventArgsBuilder::default().version_id("second").build()),
+                error: None,
+            },
+            ExtractCommitOutcome {
+                archive_seq: 1,
+                event: Some(EventArgsBuilder::default().version_id("first").build()),
+                error: None,
+            },
+        ];
+        finish_extract_outcomes(outcomes, &notification_tx, false)
+            .await
+            .expect("successful outcomes must be accepted");
+        let events = notification_rx
+            .recv()
+            .await
+            .expect("one ordered notification batch must be queued");
+        assert_eq!(
+            events.iter().map(|event| event.version_id.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[tokio::test]
+    async fn snowball_ignore_errors_skips_storage_write_failure_and_keeps_later_success() {
+        let (notification_tx, mut notification_rx) = tokio::sync::mpsc::channel(1);
+        let outcomes = vec![
+            ExtractCommitOutcome {
+                archive_seq: 1,
+                event: None,
+                error: Some(ExtractCommitError::StorageWrite(s3_error!(InternalError, "injected write failure"))),
+            },
+            ExtractCommitOutcome {
+                archive_seq: 2,
+                event: Some(EventArgsBuilder::default().version_id("later-success").build()),
+                error: None,
+            },
+        ];
+
+        finish_extract_outcomes(outcomes, &notification_tx, true)
+            .await
+            .expect("ignore-errors must skip a storage-only write failure");
+        let events = notification_rx.recv().await.expect("the later success must still notify");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].version_id, "later-success");
+    }
+
+    #[tokio::test]
+    async fn snowball_ignore_errors_never_skips_reader_or_other_fatal_failures() {
+        let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(1);
+        let outcomes = vec![ExtractCommitOutcome {
+            archive_seq: 1,
+            event: None,
+            error: Some(ExtractCommitError::Fatal(s3_error!(IncompleteBody, "injected reader failure"))),
+        }];
+
+        let error = finish_extract_outcomes(outcomes, &notification_tx, true)
+            .await
+            .expect_err("ignore-errors must not hide reader, codec, length, resource, or post-commit failures");
+        assert_eq!(error.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn snowball_commit_drain_waits_for_every_outcome() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let commits = (1..=3)
+            .map(|archive_seq| {
+                let completed = completed.clone();
+                async move {
+                    tokio::task::yield_now().await;
+                    completed.fetch_add(1, Ordering::Relaxed);
+                    ExtractCommitOutcome {
+                        archive_seq,
+                        event: None,
+                        error: (archive_seq == 2).then(|| ExtractCommitError::Fatal(s3_error!(InvalidArgument, "injected"))),
+                    }
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        let outcomes = drain_extract_commits(commits).await;
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(completed.load(Ordering::Relaxed), 3);
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.error.is_some()).count(), 1);
+    }
 
     #[test]
     fn archive_format_uses_only_the_ambiguous_zlib_extension_as_a_fallback() {
@@ -3294,11 +4121,18 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(failed.load(Ordering::Acquire));
-        assert!(!should_ignore_extract_member_write_error(true, &failed));
+        let classified = classify_extract_member_write_error(s3_error!(IncompleteBody), &failed)
+            .into_unignored(true)
+            .expect("a reader-backed store error must remain fatal");
+        assert_eq!(classified.code(), &S3ErrorCode::IncompleteBody);
 
         let storage_only_failure = AtomicBool::new(false);
-        assert!(should_ignore_extract_member_write_error(true, &storage_only_failure));
-        assert!(!should_ignore_extract_member_write_error(false, &storage_only_failure));
+        assert!(
+            classify_extract_member_write_error(s3_error!(InternalError), &storage_only_failure)
+                .into_unignored(true)
+                .is_none(),
+            "a storage-only write failure may be ignored"
+        );
     }
 
     #[tokio::test]
