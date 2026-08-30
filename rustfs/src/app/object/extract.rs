@@ -40,41 +40,133 @@ pin_project! {
         #[pin]
         inner: R,
         md5: Md5,
+        expected_length: u64,
+        bytes_read: u64,
+        pending_final_byte: Option<u8>,
+        validating_eof: bool,
         finished: bool,
-        etag: Arc<Mutex<Option<String>>>,
+        state: Arc<Mutex<ExtractArchiveUploadState>>,
     }
 }
 
+#[derive(Debug, Default)]
+struct ExtractArchiveUploadState {
+    etag: Option<String>,
+    body_complete: bool,
+}
+
 impl<R> ExtractArchiveEtagReader<R> {
-    fn new(inner: R, etag: Arc<Mutex<Option<String>>>) -> Self {
+    fn new(inner: R, expected_length: u64, state: Arc<Mutex<ExtractArchiveUploadState>>) -> Self {
         Self {
             inner,
             md5: Md5::new(),
+            expected_length,
+            bytes_read: 0,
+            pending_final_byte: None,
+            validating_eof: expected_length == 0,
             finished: false,
-            etag,
+            state,
         }
     }
 }
 
 impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.project();
-        let before = buf.filled().len();
-        match this.inner.poll_read(cx, buf) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => {
-                let filled = &buf.filled()[before..];
-                if !filled.is_empty() {
-                    this.md5.update(filled);
-                } else if !*this.finished {
-                    *this.finished = true;
-                    if let Ok(mut etag) = this.etag.lock() {
-                        *etag = Some(hex_simd::encode_to_string(this.md5.clone().finalize(), hex_simd::AsciiCase::Lower));
+        let mut this = self.project();
+        if buf.remaining() == 0 || *this.finished {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            if *this.validating_eof {
+                let mut probe = [0u8; 1];
+                let mut probe_buf = ReadBuf::new(&mut probe);
+                match this.inner.as_mut().poll_read(cx, &mut probe_buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Ok(())) if !probe_buf.filled().is_empty() => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "archive body exceeded expected Content-Length",
+                        )));
+                    }
+                    Poll::Ready(Ok(())) => {
+                        if let Ok(mut state) = this.state.lock()
+                            && !state.body_complete
+                        {
+                            state.etag =
+                                Some(hex_simd::encode_to_string(this.md5.clone().finalize(), hex_simd::AsciiCase::Lower));
+                            state.body_complete = true;
+                        }
+                        *this.validating_eof = false;
+                        *this.finished = true;
+                        if let Some(final_byte) = this.pending_final_byte.take() {
+                            buf.put_slice(&[final_byte]);
+                        }
+                        return Poll::Ready(Ok(()));
                     }
                 }
-                Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+
+            let remaining = *this.expected_length - *this.bytes_read;
+            if remaining == 1 {
+                let mut final_byte = [0u8; 1];
+                let mut final_buf = ReadBuf::new(&mut final_byte);
+                match this.inner.as_mut().poll_read(cx, &mut final_buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Ok(())) if final_buf.filled().is_empty() => {
+                        let remaining = i64::try_from(*this.expected_length - *this.bytes_read)
+                            .expect("archive Content-Length originated as i64");
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            rustfs_rio::IncompleteBody { remaining },
+                        )));
+                    }
+                    Poll::Ready(Ok(())) => {
+                        this.md5.update(final_buf.filled());
+                        *this.bytes_read = match this.bytes_read.checked_add(1) {
+                            Some(bytes_read) => bytes_read,
+                            None => return Poll::Ready(Err(std::io::Error::other("archive read length overflow"))),
+                        };
+                        *this.pending_final_byte = Some(final_buf.filled()[0]);
+                        *this.validating_eof = true;
+                        continue;
+                    }
+                }
+            }
+
+            let max_read = usize::try_from(remaining - 1).unwrap_or(usize::MAX).min(buf.remaining());
+            let read = {
+                let target = buf.initialize_unfilled_to(max_read);
+                let mut limited_buf = ReadBuf::new(target);
+                match this.inner.as_mut().poll_read(cx, &mut limited_buf) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(Ok(())) if limited_buf.filled().is_empty() => {
+                        let remaining = i64::try_from(*this.expected_length - *this.bytes_read)
+                            .expect("archive Content-Length originated as i64");
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            rustfs_rio::IncompleteBody { remaining },
+                        )));
+                    }
+                    Poll::Ready(Ok(())) => {
+                        this.md5.update(limited_buf.filled());
+                        limited_buf.filled().len()
+                    }
+                }
+            };
+            let read = match u64::try_from(read) {
+                Ok(read) => read,
+                Err(_) => return Poll::Ready(Err(std::io::Error::other("archive read length exceeds u64"))),
+            };
+            *this.bytes_read = match this.bytes_read.checked_add(read) {
+                Some(bytes_read) => bytes_read,
+                None => return Poll::Ready(Err(std::io::Error::other("archive read length overflow"))),
+            };
+            buf.advance(usize::try_from(read).expect("read length originated as usize"));
+            return Poll::Ready(Ok(()));
         }
     }
 }
@@ -244,8 +336,16 @@ pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: boo
     rustfs_utils::path::normalize_extract_entry_key(path, prefix, is_dir).map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
 }
 
-fn map_extract_archive_error(err: impl std::fmt::Display) -> S3Error {
-    s3_error!(InvalidArgument, "Failed to process archive entry: {}", err)
+fn map_extract_archive_error(err: std::io::Error) -> S3Error {
+    let message = err.to_string();
+    let api_error = ApiError::from(err);
+    if matches!(api_error.code, S3ErrorCode::BadDigest | S3ErrorCode::IncompleteBody) {
+        return api_error.into();
+    }
+
+    let mut archive_error = s3_error!(InvalidArgument, "Failed to process archive entry: {}", message);
+    archive_error.set_source(Box::new(api_error));
+    archive_error
 }
 
 #[derive(Debug)]
@@ -255,7 +355,6 @@ enum ExtractEntryError {
 }
 
 impl ExtractEntryError {
-    #[cfg(test)]
     fn into_s3_error(self) -> S3Error {
         match self {
             Self::Fatal(err) | Self::Recoverable(err) => err,
@@ -308,6 +407,22 @@ fn extract_entry_quota_growth(disposition: ExtractEntryDisposition, entry_size: 
         ExtractEntryDisposition::File => entry_size,
         ExtractEntryDisposition::Directory | ExtractEntryDisposition::FormatSkip => 0,
     }
+}
+
+fn extract_archive_entry_mod_time(header: &tokio_tar::Header) -> S3Result<Option<OffsetDateTime>> {
+    let modified_at_secs = header.mtime().map_err(map_extract_archive_error)?;
+    // GNU base-256 represents negative values with an all-sign-extended first
+    // byte. MinIO treats non-positive mtimes as unset, while the tar parser's
+    // unsigned API exposes `-1` as `u64::MAX`.
+    if modified_at_secs == 0 || header.as_old().mtime[0] == 0xff {
+        return Ok(None);
+    }
+
+    let modified_at_secs = i64::try_from(modified_at_secs)
+        .map_err(|_| s3_error!(InvalidArgument, "Archive entry modification time is out of range"))?;
+    OffsetDateTime::from_unix_timestamp(modified_at_secs)
+        .map(Some)
+        .map_err(|_| s3_error!(InvalidArgument, "Archive entry modification time is out of range"))
 }
 
 fn strict_extract_entry_path(path: &[u8]) -> Result<&str, ExtractEntryError> {
@@ -368,6 +483,36 @@ struct ExtractEntryPaxAuthorization {
     object_lock_retain_until_date: Option<Timestamp>,
 }
 
+async fn count_extract_entry_pax_metadata<R>(
+    entry: &mut tokio_tar::Entry<Archive<R>>,
+    total_pax_metadata_size: &mut u64,
+    limits: ArchiveLimits,
+) -> Result<(), ExtractEntryError>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    let Some(extensions) = entry
+        .pax_extensions()
+        .await
+        .map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?
+    else {
+        return Ok(());
+    };
+
+    let mut entry_pax_metadata_size = 0u64;
+    for ext in extensions {
+        let ext = ext.map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
+        record_extract_pax_metadata_bytes(
+            &mut entry_pax_metadata_size,
+            total_pax_metadata_size,
+            ext.key_bytes().len(),
+            ext.value_bytes().len(),
+            limits,
+        )?;
+    }
+    Ok(())
+}
+
 async fn apply_extract_entry_pax_extensions<R>(
     entry: &mut tokio_tar::Entry<Archive<R>>,
     bucket: &str,
@@ -375,8 +520,6 @@ async fn apply_extract_entry_pax_extensions<R>(
     object_lock_config_state: &metadata_sys::ObjectLockConfigState,
     metadata: &mut HashMap<String, String>,
     opts: &mut ObjectOptions,
-    total_pax_metadata_size: &mut u64,
-    limits: ArchiveLimits,
 ) -> Result<ExtractEntryPaxAuthorization, ExtractEntryError>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -391,22 +534,14 @@ where
 
     let mut pax_headers = HeaderMap::new();
     let mut pax_version_id = None;
-    let mut entry_pax_metadata_size = 0u64;
     for ext in extensions {
         let ext = ext.map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
-        record_extract_pax_metadata_bytes(
-            &mut entry_pax_metadata_size,
-            total_pax_metadata_size,
-            ext.key_bytes().len(),
-            ext.value_bytes().len(),
-            limits,
-        )?;
         let key = ext
             .key()
-            .map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
-        let value = ext
-            .value()
-            .map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
+            .map_err(|err| ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Failed to process archive PAX key: {}", err)))?;
+        let value = ext.value().map_err(|err| {
+            ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Failed to process archive PAX value: {}", err))
+        })?;
 
         if let Some(meta_key) = key.strip_prefix("minio.metadata.") {
             if !meta_key.is_empty() {
@@ -530,17 +665,8 @@ where
     R: AsyncRead + Send + Unpin + 'static,
 {
     let mut total_pax_metadata_size = 0;
-    apply_extract_entry_pax_extensions(
-        entry,
-        bucket,
-        object_name,
-        object_lock_config_state,
-        metadata,
-        opts,
-        &mut total_pax_metadata_size,
-        ArchiveLimits::default(),
-    )
-    .await
+    count_extract_entry_pax_metadata(entry, &mut total_pax_metadata_size, ArchiveLimits::default()).await?;
+    apply_extract_entry_pax_extensions(entry, bucket, object_name, object_lock_config_state, metadata, opts).await
 }
 
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
@@ -774,10 +900,15 @@ impl DefaultObjectUsecase {
             return Err(ApiError::from(err).into());
         }
 
-        let archive_etag = Arc::new(Mutex::new(None));
+        let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?;
+        let archive_upload_state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
         let extract_limits = put_object_extract_limits();
         let decoder = CompressionFormat::from_extension(&ext)
-            .get_decoder(ExtractArchiveEtagReader::new(archive_reader, archive_etag.clone()))
+            .get_decoder(ExtractArchiveEtagReader::new(
+                archive_reader,
+                expected_archive_length,
+                archive_upload_state.clone(),
+            ))
             .map_err(|e| {
                 error!(error = ?e, "Archive decoder creation failed");
                 s3_error!(InvalidArgument, "get_decoder err")
@@ -840,12 +971,18 @@ impl DefaultObjectUsecase {
                 .checked_add(entry_size)
                 .ok_or_else(|| s3_error!(InvalidArgument, "Archive total unpacked size overflowed while processing entries"))?;
             validate_put_object_extract_total_size(resource_total_size, extract_limits)?;
+            count_extract_entry_pax_metadata(&mut f, &mut total_pax_metadata_size, extract_limits)
+                .await
+                .map_err(ExtractEntryError::into_s3_error)?;
 
             let entry_type = classify_extract_entry_type(f.header().entry_type());
             if entry_type == ExtractEntryDisposition::FormatSkip {
                 continue;
             }
             let is_dir = entry_type == ExtractEntryDisposition::Directory;
+            if is_dir && extract_options.ignore_dirs {
+                continue;
+            }
             let fpath = {
                 let path_bytes = f.path_bytes().map_err(map_extract_archive_error)?;
                 let path = match strict_extract_entry_path(path_bytes.as_ref()) {
@@ -886,20 +1023,10 @@ impl DefaultObjectUsecase {
             }
             let mut size =
                 i64::try_from(entry_size).map_err(|_| s3_error!(InvalidArgument, "Archive entry size does not fit into i64"))?;
-            // mtime 0 means "unset" in tar headers, and xl.meta cannot represent an
-            // epoch mod_time anyway (0 nanos decodes as no-mod_time, making the version
-            // unreadable — rustfs#4842), so fall back to the upload time instead.
-            let modified_at_secs = f.header().mtime().map_err(map_extract_archive_error)?;
-            let archive_entry_mod_time = if modified_at_secs == 0 {
-                None
-            } else {
-                let modified_at_secs = i64::try_from(modified_at_secs)
-                    .map_err(|_| s3_error!(InvalidArgument, "Archive entry modification time is out of range"))?;
-                Some(
-                    OffsetDateTime::from_unix_timestamp(modified_at_secs)
-                        .map_err(|_| s3_error!(InvalidArgument, "Archive entry modification time is out of range"))?,
-                )
-            };
+            // mtime 0 or a negative GNU base-256 value means "unset". xl.meta
+            // also cannot represent the Unix epoch as an object mod_time, so
+            // those cases fall back to the upload time (rustfs#4842).
+            let archive_entry_mod_time = extract_archive_entry_mod_time(f.header())?;
             let mut metadata = HashMap::new();
             let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
             apply_put_request_metadata(
@@ -944,8 +1071,6 @@ impl DefaultObjectUsecase {
                 object_lock_config_state,
                 &mut metadata,
                 &mut opts,
-                &mut total_pax_metadata_size,
-                extract_limits,
             )
             .await
             {
@@ -998,10 +1123,6 @@ impl DefaultObjectUsecase {
             debug!("Extracting file: {}, size: {} bytes", fpath, size);
 
             if is_dir {
-                if extract_options.ignore_dirs {
-                    debug!("Skipping directory entry during archive extract: {}", fpath);
-                    continue;
-                }
                 size = 0;
             }
 
@@ -1181,11 +1302,15 @@ impl DefaultObjectUsecase {
         tokio::io::copy(&mut decoder, &mut tokio::io::sink())
             .await
             .map_err(map_extract_archive_error)?;
-        let archive_etag = archive_etag
-            .lock()
-            .ok()
-            .and_then(|etag| etag.clone())
-            .map(|etag| to_s3s_etag(&etag));
+        let archive_etag = {
+            let state = archive_upload_state
+                .lock()
+                .map_err(|_| s3_error!(InternalError, "Archive upload state lock was poisoned"))?;
+            if !state.body_complete {
+                return Err(s3_error!(UnexpectedContent, "Archive decoder did not consume the complete request body"));
+            }
+            state.etag.as_ref().map(|etag| to_s3s_etag(etag))
+        };
 
         let output = PutObjectOutput {
             e_tag: archive_etag,
@@ -1226,6 +1351,134 @@ mod tests {
         record.push(b'\n');
         assert_eq!(record.len(), len);
         record
+    }
+
+    async fn entry_with_local_pax(record: &[u8], entry_type: EntryType) -> tokio_tar::Entry<Archive<std::io::Cursor<Vec<u8>>>> {
+        let mut builder = Builder::new(std::io::Cursor::new(Vec::new()));
+        let mut extension = Header::new_ustar();
+        extension.set_size(record.len() as u64);
+        extension.set_entry_type(EntryType::XHeader);
+        builder
+            .append_data(&mut extension, "pax", record)
+            .await
+            .expect("local PAX fixture should be appended");
+
+        let mut member = Header::new_ustar();
+        member.set_size(0);
+        member.set_entry_type(entry_type);
+        if entry_type == EntryType::Symlink {
+            member.set_link_name("target").expect("symlink fixture should have a target");
+        }
+        builder
+            .append_data(&mut member, "member", std::io::Cursor::new(Vec::new()))
+            .await
+            .expect("member fixture should be appended");
+
+        let bytes = builder
+            .into_inner()
+            .await
+            .expect("fixture builder should finish")
+            .into_inner();
+        let mut archive = Archive::new(std::io::Cursor::new(bytes));
+        let mut entries = archive.entries().expect("fixture archive should be iterable");
+        entries
+            .next()
+            .await
+            .expect("fixture should contain a logical member")
+            .expect("fixture member should parse")
+    }
+
+    #[tokio::test]
+    async fn archive_etag_reader_validates_raw_eof_before_returning_final_byte() {
+        let payload = b"decoder-consumed-exact-body".to_vec();
+        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let mut reader = ExtractArchiveEtagReader::new(
+            std::io::Cursor::new(payload.clone()),
+            u64::try_from(payload.len()).expect("fixture length must fit u64"),
+            state.clone(),
+        );
+        let mut output = Vec::new();
+
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("exact body should validate through raw EOF");
+
+        assert_eq!(output, payload);
+        let expected_etag = hex_simd::encode_to_string(Md5::digest(&payload), hex_simd::AsciiCase::Lower);
+        let state = state.lock().expect("archive state lock must remain healthy");
+        assert!(state.body_complete);
+        assert_eq!(state.etag.as_deref(), Some(expected_etag.as_str()));
+    }
+
+    #[tokio::test]
+    async fn archive_etag_reader_rejects_short_and_overlong_bodies() {
+        let payload = b"body-length-fixture".to_vec();
+
+        let short_state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let mut short = ExtractArchiveEtagReader::new(
+            std::io::Cursor::new(payload.clone()),
+            u64::try_from(payload.len() + 1).expect("fixture length must fit u64"),
+            short_state.clone(),
+        );
+        let short_err = short
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("short body must be rejected");
+        assert_eq!(short_err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            !short_state
+                .lock()
+                .expect("archive state lock must remain healthy")
+                .body_complete
+        );
+
+        let overlong_state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let mut overlong = ExtractArchiveEtagReader::new(
+            std::io::Cursor::new(payload.clone()),
+            u64::try_from(payload.len() - 1).expect("fixture length must fit u64"),
+            overlong_state.clone(),
+        );
+        let overlong_err = overlong
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("overlong body must be rejected");
+        assert_eq!(overlong_err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            !overlong_state
+                .lock()
+                .expect("archive state lock must remain healthy")
+                .body_complete
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_etag_reader_validates_content_md5_before_completion() {
+        let payload = b"archive-with-wrong-content-md5".to_vec();
+        let expected_length = i64::try_from(payload.len()).expect("fixture length must fit i64");
+        let hash_reader = HashReader::from_stream(
+            std::io::Cursor::new(payload),
+            expected_length,
+            expected_length,
+            Some("00000000000000000000000000000000".to_string()),
+            None,
+            false,
+        )
+        .expect("hash reader should be created");
+        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let mut reader = ExtractArchiveEtagReader::new(
+            hash_reader,
+            u64::try_from(expected_length).expect("fixture length must fit u64"),
+            state.clone(),
+        );
+
+        let err = reader
+            .read_to_end(&mut Vec::new())
+            .await
+            .expect_err("Content-MD5 must be checked before upload completion");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!state.lock().expect("archive state lock must remain healthy").body_complete);
     }
 
     #[tokio::test]
@@ -1799,6 +2052,26 @@ mod tests {
     }
 
     #[test]
+    fn archive_mod_time_treats_negative_gnu_base256_as_unset() {
+        let mut header = Header::new_gnu();
+        header.as_old_mut().mtime.fill(0xff);
+
+        assert_eq!(
+            extract_archive_entry_mod_time(&header).expect("negative GNU mtime should be accepted"),
+            None
+        );
+    }
+
+    #[test]
+    fn archive_mod_time_keeps_malformed_octal_fatal() {
+        let mut header = Header::new_ustar();
+        header.as_old_mut().mtime.fill(b'9');
+
+        let err = extract_archive_entry_mod_time(&header).expect_err("malformed octal mtime must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
     fn pax_metadata_budget_is_fatal_even_with_ignore_errors() {
         let limits = ArchiveLimits {
             max_pax_metadata_size: 3,
@@ -1810,6 +2083,56 @@ mod tests {
             .expect_err("PAX metadata over the resource budget must fail");
         assert!(!err.is_recoverable());
         assert!(err.ignore_or_return(true).is_err(), "ignore-errors must not bypass resource limits");
+    }
+
+    #[tokio::test]
+    async fn pax_metadata_budget_counts_format_skipped_members() {
+        let record = pax_record("comment", b"oversized-symlink-metadata");
+        let mut entry = entry_with_local_pax(&record, EntryType::Symlink).await;
+        let limits = ArchiveLimits {
+            max_pax_metadata_size: 8,
+            ..ArchiveLimits::default()
+        };
+        let mut total_size = 0;
+
+        let err = count_extract_entry_pax_metadata(&mut entry, &mut total_size, limits)
+            .await
+            .expect_err("format-skipped members must still consume the PAX budget");
+
+        assert!(!err.is_recoverable());
+        assert!(err.ignore_or_return(true).is_err());
+    }
+
+    #[tokio::test]
+    async fn pax_metadata_budget_precedes_recoverable_semantic_errors() {
+        let invalid_key = "minio.metadata.x-amz-meta-owner";
+        let mut record = pax_record(invalid_key, b"\0");
+        record.extend(pax_record("comment", b"oversized-tail"));
+        let mut entry = entry_with_local_pax(&record, EntryType::Regular).await;
+
+        let semantic_err = apply_extract_entry_pax_extensions(
+            &mut entry,
+            "bucket",
+            "member",
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            &mut HashMap::new(),
+            &mut ObjectOptions::default(),
+        )
+        .await
+        .expect_err("NUL metadata value should be a recoverable member error");
+        assert!(semantic_err.is_recoverable());
+
+        let limits = ArchiveLimits {
+            max_pax_metadata_size: u64::try_from(invalid_key.len() + 1).expect("fixture size must fit u64"),
+            ..ArchiveLimits::default()
+        };
+        let mut total_size = 0;
+        let budget_err = count_extract_entry_pax_metadata(&mut entry, &mut total_size, limits)
+            .await
+            .expect_err("the oversized tail must be counted before ignore-errors can skip the member");
+
+        assert!(!budget_err.is_recoverable());
+        assert!(budget_err.ignore_or_return(true).is_err());
     }
 
     #[tokio::test]

@@ -106,11 +106,31 @@ impl CompressionFormat {
         let reader = BufReader::new(input);
 
         let decoder: Box<dyn AsyncRead + Send + Unpin + 'static> = match self {
-            CompressionFormat::Gzip => Box::new(GzipDecoder::new(reader)),
-            CompressionFormat::Bzip2 => Box::new(BzDecoder::new(reader)),
-            CompressionFormat::Zlib => Box::new(ZlibDecoder::new(reader)),
-            CompressionFormat::Xz => Box::new(XzDecoder::new(reader)),
-            CompressionFormat::Zstd => Box::new(ZstdDecoder::new(reader)),
+            CompressionFormat::Gzip => {
+                let mut decoder = GzipDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Bzip2 => {
+                let mut decoder = BzDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Zlib => {
+                let mut decoder = ZlibDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Xz => {
+                let mut decoder = XzDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Zstd => {
+                let mut decoder = ZstdDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
             CompressionFormat::Tar => Box::new(reader),
             CompressionFormat::Zip => {
                 return Err(ZipError::UnsupportedFormat {
@@ -164,6 +184,30 @@ mod tests {
         decoder.read_to_end(&mut decoded).await.expect("gzip decode should succeed");
 
         assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_consumes_concatenated_gzip_members() {
+        async fn gzip_member(payload: &[u8]) -> Vec<u8> {
+            let mut encoder = GzipEncoder::new(Vec::new());
+            encoder.write_all(payload).await.expect("gzip encode should succeed");
+            encoder.shutdown().await.expect("gzip encoder shutdown should succeed");
+            encoder.into_inner()
+        }
+
+        let mut encoded = gzip_member(b"first-").await;
+        encoded.extend(gzip_member(b"second").await);
+        let mut decoder = CompressionFormat::Gzip
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("gzip decoder should be created");
+        let mut decoded = Vec::new();
+
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("concatenated gzip members should decode");
+
+        assert_eq!(decoded, b"first-second");
     }
 
     #[tokio::test]

@@ -17,8 +17,9 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
+    use flate2::{Compression, write::GzEncoder};
     use std::error::Error;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
 
     async fn build_test_archive() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
         let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
@@ -73,6 +74,32 @@ mod tests {
         let mut archive = build_test_archive().await?;
         archive[0] ^= 1;
         Ok(archive)
+    }
+
+    async fn build_archive_with_negative_gnu_mtime() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+        let mut header = tokio_tar::Header::new_gnu();
+        header.set_size(b"negative-mtime-body".len() as u64);
+        header.set_mode(0o644);
+        header.as_old_mut().mtime.fill(0xff);
+        builder
+            .append_data(&mut header, "negative-mtime.txt", Cursor::new(b"negative-mtime-body".as_slice()))
+            .await?;
+        Ok(builder.into_inner().await?.into_inner())
+    }
+
+    fn gzip_member(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload)?;
+        Ok(encoder.finish()?)
+    }
+
+    async fn build_concatenated_gzip_archive() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let archive = build_test_archive().await?;
+        let split_at = archive.len() / 2;
+        let mut encoded = gzip_member(&archive[..split_at])?;
+        encoded.extend(gzip_member(&archive[split_at..])?);
+        Ok(encoded)
     }
 
     fn append_raw_tar_entry_with_type(archive: &mut Vec<u8>, path: &[u8], data: &[u8], entry_type: u8) {
@@ -288,6 +315,85 @@ mod tests {
             .expect_err("directory marker should be skipped when ignore-dirs=true");
         let service_err = err.into_service_error();
         assert_eq!(service_err.code(), Some("NotFound"));
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_accepts_negative_gnu_mtime() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-negative-mtime";
+        client.create_bucket().bucket(bucket).send().await?;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .body(ByteStream::from(build_archive_with_negative_gnu_mtime().await?))
+            .send()
+            .await?;
+
+        let object = client.get_object().bucket(bucket).key("negative-mtime.txt").send().await?;
+        assert_eq!(object.body.collect().await?.into_bytes().as_ref(), b"negative-mtime-body");
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_consumes_concatenated_gzip_members() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-concatenated-gzip";
+        client.create_bucket().bucket(bucket).send().await?;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar.gz")
+            .metadata("Snowball-Auto-Extract", "true")
+            .body(ByteStream::from(build_concatenated_gzip_archive().await?))
+            .send()
+            .await?;
+
+        let object = client.get_object().bucket(bucket).key("root.txt").send().await?;
+        assert_eq!(object.body.collect().await?.into_bytes().as_ref(), b"root payload\n");
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_rejects_mismatched_content_md5() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-content-md5";
+        client.create_bucket().bucket(bucket).send().await?;
+        let err = client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .content_md5("AAAAAAAAAAAAAAAAAAAAAA==")
+            .body(ByteStream::from(build_test_archive().await?))
+            .send()
+            .await
+            .expect_err("mismatched Content-MD5 must fail after the raw body reaches EOF");
+
+        assert_eq!(err.into_service_error().code(), Some("BadDigest"));
 
         env.stop_server();
         Ok(())
