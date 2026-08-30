@@ -60,9 +60,7 @@ pub const REPLICATION_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &[
     "Destination.ReplicationTime",
 ];
 
-// v3: temporary-credential fields are advertised as read-only historical
-// metadata. They remain decodable for MinIO and persisted-data compatibility,
-// but set-remote-target rejects them until refresh and rotation are supported.
+// v3: remote targets accept temporary credential session tokens and expiry.
 pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 3;
 
 pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
@@ -70,6 +68,8 @@ pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     "endpoint",
     "credentials.accessKey",
     "credentials.secretKey",
+    "credentials.sessionToken",
+    "credentials.expiration",
     "targetbucket",
     "secure",
     "path",
@@ -90,8 +90,6 @@ pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     // (contract v2; previously only importable via MinIO bucket-targets.json).
     "disableProxy",
 ];
-
-pub const REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &["credentials.sessionToken", "credentials.expiration"];
 
 pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["edge", "edgeSyncBeforeExpiry"];
 
