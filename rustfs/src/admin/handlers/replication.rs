@@ -23,9 +23,9 @@ use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
 use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_UNSUPPORTED_FIELDS;
-use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
 #[cfg(test)]
-use crate::admin::storage_api::bucket::replication::{REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS};
+use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_WRITABLE_FIELDS;
+use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
 use crate::admin::storage_api::bucket::target::{
     BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
 };
@@ -56,13 +56,6 @@ use tracing::{debug, error, info, warn};
 use url::Host;
 
 const SUPPORTED_REMOTE_TARGET_API: &str = "s3v4";
-
-/// Go encodes the zero `time.Time` as the year-1 instant
-/// (`0001-01-01T00:00:00Z`, possibly re-encoded with an offset); no real
-/// credential expiry lives in year 1, so any such timestamp means "unset".
-fn is_go_zero_time(timestamp: Timestamp) -> bool {
-    timestamp.to_zoned(jiff::tz::TimeZone::UTC).year() == 1
-}
 
 /// Field groups a `set-remote-target?update=true` request may modify, mirroring
 /// MinIO's `TargetUpdateType` / `GetTargetUpdateOps` query contract: the update
@@ -250,7 +243,7 @@ impl RemoteTargetRequest {
 
     fn into_bucket_target(self) -> S3Result<BucketTarget> {
         self.validate_connection_fields()?;
-        self.into_bucket_target_common()
+        self.into_bucket_target_common(true)
     }
 
     /// Partial-update parse: only the field groups named by `ops` are validated;
@@ -259,41 +252,16 @@ impl RemoteTargetRequest {
         if self.arn.trim().is_empty() {
             return Err(s3_error!(InvalidRequest, "arn is required for update"));
         }
-        if ops.contains(&TargetUpdateOp::Credentials) {
+        let replacing_credentials = ops.contains(&TargetUpdateOp::Credentials);
+        if replacing_credentials {
             self.validate_connection_fields()?;
         }
-        self.into_bucket_target_common()
+        self.into_bucket_target_common(replacing_credentials)
     }
 
-    fn into_bucket_target_common(self) -> S3Result<BucketTarget> {
+    fn into_bucket_target_common(self, validate_credentials: bool) -> S3Result<BucketTarget> {
         if !self.target_type.is_valid() {
             return Err(s3_error!(InvalidRequest, "type is invalid"));
-        }
-
-        if self
-            .credentials
-            .session_token
-            .as_deref()
-            .is_some_and(|token| !token.trim().is_empty())
-        {
-            return Err(s3_error!(
-                InvalidRequest,
-                "remote target field credentials.session_token is not supported by this RustFS version"
-            ));
-        }
-
-        // Go's `omitempty` never elides a zero `time.Time`, so every madmin
-        // marshal carries `"expiration":"0001-01-01T00:00:00Z"`; only a real
-        // (non-year-1) expiry means the client wants expiring credentials.
-        if self
-            .credentials
-            .expiration
-            .is_some_and(|expiration| !is_go_zero_time(expiration))
-        {
-            return Err(s3_error!(
-                InvalidRequest,
-                "remote target field credentials.expiration is not supported by this RustFS version"
-            ));
         }
 
         if !self.api.is_empty() && self.api != SUPPORTED_REMOTE_TARGET_API {
@@ -317,9 +285,17 @@ impl RemoteTargetRequest {
         }
 
         let mut credentials = TargetCredentials::from(self.credentials);
-        // Past the check above the expiration can only be the zero-value
-        // sentinel, i.e. "no expiration" — never persist it.
-        credentials.expiration = None;
+        credentials.expiration = credentials.effective_expiration();
+        if validate_credentials && credentials.expiration.is_some() && credentials.effective_session_token().is_none() {
+            return Err(s3_error!(InvalidRequest, "credentials.expiration requires credentials.session_token"));
+        }
+        if validate_credentials
+            && credentials
+                .expiration
+                .is_some_and(|expiration| expiration <= Timestamp::now())
+        {
+            return Err(s3_error!(InvalidRequest, "credentials.expiration must be in the future"));
+        }
 
         Ok(BucketTarget {
             source_bucket: self.source_bucket,
@@ -1504,10 +1480,10 @@ impl Operation for ReplicationMrfHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
-        RemoteTargetCredentialsRequest, RemoteTargetRequest, ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp,
-        build_mrf_response, extract_query_params, parse_remote_target_update_ops, render_mrf_backlog, render_replication_diff,
-        unique_replication_peers, validate_remote_target_tls_settings,
+        REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetCredentialsRequest, RemoteTargetRequest,
+        ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params,
+        parse_remote_target_update_ops, render_mrf_backlog, render_replication_diff, unique_replication_peers,
+        validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::{BucketTarget, Credentials as TargetCredentials, LatencyStat};
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -2104,27 +2080,13 @@ mod tests {
 
     #[test]
     fn remote_target_request_rejects_unimplemented_fields() {
-        for (field, value, historical_field) in [
-            (
-                "credentials.session_token",
-                serde_json::json!("session-token"),
-                Some("credentials.sessionToken"),
-            ),
-            (
-                "credentials.expiration",
-                serde_json::json!("2026-01-01T00:00:00Z"),
-                Some("credentials.expiration"),
-            ),
-            ("api", serde_json::json!("s3v2"), None),
-            ("edge", serde_json::json!(true), None),
-            ("edgeSyncBeforeExpiry", serde_json::json!(true), None),
+        for (field, value) in [
+            ("api", serde_json::json!("s3v2")),
+            ("edge", serde_json::json!(true)),
+            ("edgeSyncBeforeExpiry", serde_json::json!(true)),
         ] {
             let mut request = valid_remote_target_request();
-            if let Some((credential_field, credential_name)) = field.split_once('.') {
-                request[credential_field][credential_name] = value;
-            } else {
-                request[field] = value;
-            }
+            request[field] = value;
             let request: RemoteTargetRequest =
                 serde_json::from_value(request).expect("unsupported field should still deserialize");
             let err = request
@@ -2133,13 +2095,84 @@ mod tests {
 
             assert!(err.to_string().contains(field));
             assert!(err.to_string().contains("not supported by this RustFS version"));
-            if let Some(historical_field) = historical_field {
-                assert!(
-                    REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS.contains(&historical_field),
-                    "rejected field {field} must be advertised as historical-only"
-                );
-            }
         }
+    }
+
+    #[test]
+    fn remote_target_request_accepts_temporary_credentials() {
+        let mut request = valid_remote_target_request();
+        request["credentials"]["sessionToken"] = serde_json::json!("session-token");
+        request["credentials"]["expiration"] = serde_json::json!("2099-01-01T00:00:00Z");
+
+        let target = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("temporary credentials should deserialize")
+            .into_bucket_target()
+            .expect("unexpired temporary credentials should be accepted");
+        let credentials = target.credentials.expect("credentials should be preserved");
+
+        assert_eq!(credentials.session_token.as_deref(), Some("session-token"));
+        assert_eq!(
+            serde_json::to_value(credentials.expiration.expect("expiration should be preserved"))
+                .expect("expiration should serialize"),
+            serde_json::json!("2099-01-01T00:00:00Z")
+        );
+        for field in ["credentials.sessionToken", "credentials.expiration"] {
+            assert!(REMOTE_TARGET_WRITABLE_FIELDS.contains(&field));
+        }
+    }
+
+    #[test]
+    fn remote_target_request_accepts_session_token_without_expiration() {
+        let mut request = valid_remote_target_request();
+        request["credentials"]["session_token"] = serde_json::json!("session-token");
+
+        let target = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("temporary credentials should deserialize")
+            .into_bucket_target()
+            .expect("a session token without a reported expiration should remain compatible");
+
+        assert_eq!(
+            target
+                .credentials
+                .as_ref()
+                .and_then(|credentials| credentials.session_token.as_deref()),
+            Some("session-token")
+        );
+        assert!(target.credentials.and_then(|credentials| credentials.expiration).is_none());
+    }
+
+    #[test]
+    fn remote_target_request_rejects_expiration_without_session_token() {
+        let mut request = valid_remote_target_request();
+        request["credentials"]["expiration"] = serde_json::json!("2099-01-01T00:00:00Z");
+
+        let err = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("request should deserialize")
+            .into_bucket_target()
+            .expect_err("an expiring credential bundle requires a session token");
+
+        assert!(
+            err.to_string()
+                .contains("credentials.expiration requires credentials.session_token")
+        );
+    }
+
+    #[test]
+    fn remote_target_request_rejects_expired_temporary_credentials_without_leaking_secrets() {
+        let mut request = valid_remote_target_request();
+        request["credentials"]["secretKey"] = serde_json::json!("secret-must-not-leak");
+        request["credentials"]["sessionToken"] = serde_json::json!("session-token-must-not-leak");
+        request["credentials"]["expiration"] = serde_json::json!("2000-01-01T00:00:00Z");
+
+        let err = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect("request should deserialize")
+            .into_bucket_target()
+            .expect_err("expired credentials must fail before persistence");
+        let message = err.to_string();
+
+        assert!(message.contains("credentials.expiration must be in the future"));
+        assert!(!message.contains("secret-must-not-leak"));
+        assert!(!message.contains("session-token-must-not-leak"));
     }
 
     #[test]
@@ -2193,6 +2226,32 @@ mod tests {
     }
 
     #[test]
+    fn non_credential_update_accepts_redacted_temporary_credential_round_trip() {
+        // list-remote-targets redacts both the secret and session token but
+        // intentionally retains the non-secret expiration. mc echoes that
+        // shape on a sync-only update; the credentials group is not applied.
+        let body = serde_json::json!({
+            "endpoint": "192.168.1.10:9000",
+            "credentials": {
+                "accessKey": "access",
+                "expiration": "2099-01-01T00:00:00Z"
+            },
+            "targetbucket": "target",
+            "arn": "arn:rustfs:replication:us-east-1:dep:target",
+            "type": "replication",
+            "replicationSync": true
+        });
+
+        let target = serde_json::from_value::<RemoteTargetRequest>(body)
+            .expect("redacted mc round-trip should deserialize")
+            .into_update_bucket_target(&[TargetUpdateOp::Sync])
+            .expect("a sync-only update must ignore the redacted credential group");
+
+        assert!(target.replication_sync);
+        assert!(target.credentials.and_then(|credentials| credentials.expiration).is_some());
+    }
+
+    #[test]
     fn remote_target_request_ignores_client_supplied_latency() {
         // Latency is a server-measured runtime stat; mc echoes the
         // list-remote-targets nanosecond values back on update, while the
@@ -2236,22 +2295,6 @@ mod tests {
             Some("")
         );
         assert!(!target.ca_cert_pem.is_empty());
-    }
-
-    #[test]
-    fn remote_target_request_validation_does_not_echo_credential_values() {
-        let mut request = valid_remote_target_request();
-        request["credentials"]["session_token"] = serde_json::json!("session-token-must-not-leak");
-
-        let request: RemoteTargetRequest = serde_json::from_value(request).expect("request should deserialize");
-        let err = request
-            .into_bucket_target()
-            .expect_err("session tokens must be rejected before persistence");
-        let message = err.to_string();
-
-        assert!(message.contains("credentials.session_token"));
-        assert!(!message.contains("session-token-must-not-leak"));
-        assert!(!message.contains("secret"));
     }
 
     #[test]
@@ -2514,17 +2557,6 @@ mod tests {
 
     #[test]
     fn remote_target_capability_fields_do_not_overlap() {
-        for field in REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS {
-            assert!(
-                !REMOTE_TARGET_WRITABLE_FIELDS.contains(field),
-                "remote target field {field} cannot be both historical-only and writable"
-            );
-            assert!(
-                !REMOTE_TARGET_UNSUPPORTED_FIELDS.contains(field),
-                "remote target field {field} cannot be both historical-only and unsupported"
-            );
-        }
-
         for field in REMOTE_TARGET_UNSUPPORTED_FIELDS {
             assert!(
                 !REMOTE_TARGET_WRITABLE_FIELDS.contains(field),
