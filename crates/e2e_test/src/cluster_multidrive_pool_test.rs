@@ -76,6 +76,28 @@ async fn cluster_multidrive_single_pool_smoke() -> TestResult {
     Ok(())
 }
 
+/// 4 nodes x 4 drives, single pool: exercise the maximum local erasure layout
+/// supported by the cluster harness. This remains in the nightly lane because
+/// it starts four real server processes and sixteen data directories.
+#[tokio::test]
+async fn cluster_four_node_four_drive_single_pool_smoke() -> TestResult {
+    crate::common::init_logging();
+
+    let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(4, 4)).await?;
+
+    let volumes = cluster.rustfs_volumes_arg();
+    assert_eq!(volumes.split(' ').count(), 16, "expected 16 explicit endpoints, got: {volumes}");
+    assert!(!volumes.contains('{'), "single-pool layout must not use ellipses: {volumes}");
+    assert!(cluster.nodes.iter().all(|node| node.data_dirs.len() == 4));
+
+    cluster.start().await?;
+    cluster.create_test_bucket(BUCKET).await?;
+
+    let payload = vec![0x3Cu8; 1024 * 1024];
+    put_get_roundtrip(&cluster, "multidrive-4/object", &payload).await?;
+    Ok(())
+}
+
 /// Two single-node pools, 2 drives each: the multi-pool layout boots and
 /// round-trips. Every pool is a distinct erasure pool (`pool_idx` 0 and 1).
 #[tokio::test]
