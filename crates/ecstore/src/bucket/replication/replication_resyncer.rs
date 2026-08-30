@@ -96,7 +96,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 const BACKGROUND_WALKDIR_TIMEOUT: TokioDuration = TokioDuration::from_secs(60);
 const ENV_REPL_RESYNC_MAX_JOBS: &str = "RUSTFS_REPL_RESYNC_MAX_JOBS";
@@ -112,6 +112,7 @@ const EVENT_REPLICATION_DELETE_SKIPPED: &str = "replication_delete_skipped";
 const EVENT_REPLICATION_FORCE_DELETE_SKIPPED: &str = "replication_force_delete_skipped";
 const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
+const EVENT_REPLICATION_ABORT_RETRY_RESOLVED: &str = "replication_abort_retry_resolved";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
 const EVENT_DELETE_MARKER_PURGE_FAILED: &str = "replication_delete_marker_purge_failed";
 const EVENT_DELETE_MARKER_PURGE_MRF: &str = "replication_delete_marker_purge_mrf";
@@ -4036,10 +4037,112 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
     let arn = ctx.arn;
 
     let result = replicate_multipart_parts_and_complete(ctx, &upload_id).await;
-    abort_multipart_on_failure(result, dst_bucket, object, &upload_id, arn, || async {
-        cli.abort_multipart_upload(dst_bucket, object, &upload_id).await
-    })
+    abort_multipart_on_failure(
+        result,
+        dst_bucket,
+        object,
+        &upload_id,
+        arn,
+        || async { cli.abort_multipart_upload(dst_bucket, object, &upload_id).await },
+        || {
+            schedule_replication_abort_retry(
+                cli.clone(),
+                dst_bucket.to_string(),
+                object.to_string(),
+                upload_id.clone(),
+                arn.to_string(),
+            )
+        },
+    )
     .await
+}
+
+const REPLICATION_ABORT_RETRY_ATTEMPTS: u32 = 5;
+const REPLICATION_ABORT_RETRY_INITIAL_DELAY_SECS: u64 = 30;
+
+/// The immediate abort usually fails for the same reason the transfer did —
+/// the target is unreachable — and MRF only retries the *object*: every replay
+/// mints a fresh upload id, so a failed abort would leak its upload on the
+/// target forever (#6854). Retry the abort on a detached, bounded backoff
+/// (~30s..8m) so it lands once the target comes back; an upload the target no
+/// longer knows counts as cleaned up.
+fn schedule_replication_abort_retry(cli: Arc<TargetClient>, dst_bucket: String, object: String, upload_id: String, arn: String) {
+    tokio::spawn(async move {
+        let mut delay_secs = REPLICATION_ABORT_RETRY_INITIAL_DELAY_SECS;
+        for attempt in 1..=REPLICATION_ABORT_RETRY_ATTEMPTS {
+            tokio::time::sleep(tokio::time::Duration::from_secs(delay_secs)).await;
+            delay_secs = delay_secs.saturating_mul(2);
+
+            match cli.abort_multipart_upload(&dst_bucket, &object, &upload_id).await {
+                Ok(()) => {
+                    info!(
+                        event = EVENT_REPLICATION_ABORT_RETRY_RESOLVED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        target_bucket = %dst_bucket,
+                        object = %object,
+                        arn = %arn,
+                        upload_id = %upload_id,
+                        operation = "abort_multipart_upload_retry",
+                        attempt,
+                        "Replication abort retry cleaned up the orphaned upload"
+                    );
+                    return;
+                }
+                Err(err) if target_upload_already_removed(&err) => {
+                    info!(
+                        event = EVENT_REPLICATION_ABORT_RETRY_RESOLVED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        target_bucket = %dst_bucket,
+                        object = %object,
+                        arn = %arn,
+                        upload_id = %upload_id,
+                        operation = "abort_multipart_upload_retry",
+                        attempt,
+                        "Replication abort retry found the upload already removed"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    warn!(
+                        event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        target_bucket = %dst_bucket,
+                        object = %object,
+                        arn = %arn,
+                        upload_id = %upload_id,
+                        operation = "abort_multipart_upload_retry",
+                        attempt,
+                        error = %err,
+                        "Replication target operation failed"
+                    );
+                }
+            }
+        }
+
+        // Terminal: the upload id stays in the log so an operator can reap it
+        // with list-multipart-uploads/abort by hand (the #6840 contract).
+        warn!(
+            event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            target_bucket = %dst_bucket,
+            object = %object,
+            arn = %arn,
+            upload_id = %upload_id,
+            operation = "abort_multipart_upload_retry",
+            result = "gave_up",
+            "Replication abort retries exhausted; the incomplete upload remains on the target"
+        );
+    });
+}
+
+/// AWS answers an abort for an unknown upload with `NoSuchUpload`; that means
+/// the orphan is gone (aborted elsewhere or expired), which is the goal state.
+fn target_upload_already_removed(err: &S3ClientError) -> bool {
+    err.code.as_deref() == Some("NoSuchUpload")
 }
 
 /// Best-effort abort of the target-side multipart upload once the transfer has
@@ -4047,17 +4150,19 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 /// invisible incomplete upload on the target that keeps billing for its parts.
 /// The abort outcome never replaces the transfer error: an abort failure is
 /// only logged and `result` is returned as-is.
-async fn abort_multipart_on_failure<F, Fut>(
+async fn abort_multipart_on_failure<F, Fut, R>(
     result: std::io::Result<()>,
     dst_bucket: &str,
     object: &str,
     upload_id: &str,
     arn: &str,
     abort: F,
+    schedule_abort_retry: R,
 ) -> std::io::Result<()>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<(), S3ClientError>>,
+    R: FnOnce(),
 {
     if result.is_ok() {
         return result;
@@ -4075,6 +4180,9 @@ where
             error = %abort_err,
             "Replication target operation failed"
         );
+        if !target_upload_already_removed(&abort_err) {
+            schedule_abort_retry();
+        }
     }
     result
 }
@@ -5358,23 +5466,39 @@ mod tests {
     async fn abort_multipart_on_failure_skips_abort_when_transfer_succeeded() {
         let aborted = Arc::new(AtomicBool::new(false));
         let flag = aborted.clone();
+        let retry_scheduled = Arc::new(AtomicBool::new(false));
+        let retry_flag = retry_scheduled.clone();
 
-        let result = abort_multipart_on_failure(Ok(()), "dst-bucket", "obj", "upload-1", "arn:dest", move || async move {
-            flag.store(true, Ordering::SeqCst);
-            Ok(())
-        })
+        let result = abort_multipart_on_failure(
+            Ok(()),
+            "dst-bucket",
+            "obj",
+            "upload-1",
+            "arn:dest",
+            move || async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            move || retry_flag.store(true, Ordering::SeqCst),
+        )
         .await;
 
         assert!(result.is_ok());
         assert!(!aborted.load(Ordering::SeqCst));
+        assert!(!retry_scheduled.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
     async fn abort_multipart_on_failure_aborts_and_keeps_transfer_error() {
         let aborted = Arc::new(AtomicBool::new(false));
         let flag = aborted.clone();
+        let retry_scheduled = Arc::new(AtomicBool::new(false));
+        let retry_flag = retry_scheduled.clone();
 
-        // The abort itself failing must not mask the transfer error.
+        // The abort itself failing must not mask the transfer error, and a
+        // failed abort must hand the upload id to the retry schedule (#6854):
+        // the object itself is re-replicated under a fresh upload id, so
+        // nothing else will ever abort this one.
         let result = abort_multipart_on_failure(
             Err(std::io::Error::other("transfer failed")),
             "dst-bucket",
@@ -5385,10 +5509,34 @@ mod tests {
                 flag.store(true, Ordering::SeqCst);
                 Err(S3ClientError::new("abort failed"))
             },
+            move || retry_flag.store(true, Ordering::SeqCst),
         )
         .await;
 
         assert!(aborted.load(Ordering::SeqCst));
+        assert!(retry_scheduled.load(Ordering::SeqCst));
+        assert_eq!(result.unwrap_err().to_string(), "transfer failed");
+    }
+
+    #[tokio::test]
+    async fn abort_multipart_on_failure_does_not_retry_a_gone_upload() {
+        let retry_scheduled = Arc::new(AtomicBool::new(false));
+        let retry_flag = retry_scheduled.clone();
+
+        let result = abort_multipart_on_failure(
+            Err(std::io::Error::other("transfer failed")),
+            "dst-bucket",
+            "obj",
+            "upload-1",
+            "arn:dest",
+            || async { Err(S3ClientError::with_metadata("gone", None, Some("NoSuchUpload".to_string()), None)) },
+            move || retry_flag.store(true, Ordering::SeqCst),
+        )
+        .await;
+
+        // NoSuchUpload means the orphan no longer exists; retrying would only
+        // produce noise.
+        assert!(!retry_scheduled.load(Ordering::SeqCst));
         assert_eq!(result.unwrap_err().to_string(), "transfer failed");
     }
 }
