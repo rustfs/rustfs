@@ -1817,16 +1817,21 @@ impl ECStore {
             let metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
             (metadata, pool)
         } else {
-            let (metadata, pool_idx) = self.prepare_latest_object_metadata_with_idx(bucket, &object, &opts).await?;
-            if let Some(error) = latest_object_access_delete_marker_error(bucket, &object, metadata.object_info(), &opts) {
-                return Err(error);
-            }
-            let pool = self
-                .pools
-                .get(pool_idx)
-                .cloned()
-                .ok_or_else(|| Error::other(format!("resolved GET pool index {pool_idx} is out of bounds")))?;
-            (metadata, pool)
+            // Keep the large multi-pool selection future off the caller stack.
+            // Debug builds otherwise exceed the common 2 MiB worker stack.
+            Box::pin(async {
+                let (metadata, pool_idx) = self.prepare_latest_object_metadata_with_idx(bucket, &object, &opts).await?;
+                if let Some(error) = latest_object_access_delete_marker_error(bucket, &object, metadata.object_info(), &opts) {
+                    return Err(error);
+                }
+                let pool = self
+                    .pools
+                    .get(pool_idx)
+                    .cloned()
+                    .ok_or_else(|| Error::other(format!("resolved GET pool index {pool_idx} is out of bounds")))?;
+                Ok((metadata, pool))
+            })
+            .await?
         };
 
         Ok(PreparedGetObjectReader {
@@ -2518,13 +2523,18 @@ impl ECStore {
                 .get_object_reader(bucket, object.as_ref(), range, h, &opts)
                 .await?
         } else {
-            let (metadata, idx) = self.prepare_latest_object_metadata_with_idx(bucket, &object, &opts).await?;
-            if let Some(error) = latest_object_access_delete_marker_error(bucket, &object, metadata.object_info(), &opts) {
-                return Err(error);
-            }
-            self.pools[idx]
-                .get_object_reader_with_prepared_metadata(bucket, object.as_ref(), range, h, &opts, metadata)
-                .await?
+            // Keep selection plus prepared-open state off the caller stack.
+            // Debug builds otherwise exceed the common 2 MiB worker stack.
+            Box::pin(async {
+                let (metadata, idx) = self.prepare_latest_object_metadata_with_idx(bucket, &object, &opts).await?;
+                if let Some(error) = latest_object_access_delete_marker_error(bucket, &object, metadata.object_info(), &opts) {
+                    return Err(error);
+                }
+                self.pools[idx]
+                    .get_object_reader_with_prepared_metadata(bucket, object.as_ref(), range, h, &opts, metadata)
+                    .await
+            })
+            .await?
         };
 
         Ok(Self::attach_read_lock_guard(reader, read_lock_guard))
