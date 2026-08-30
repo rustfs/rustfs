@@ -3304,6 +3304,16 @@ impl SetDisks {
             }
 
             let pending_responses = join_set.len();
+            // Inline verification can still depend on a missing data shard;
+            // issue one immediate spare when only that shard remains. The
+            // non-inline path keeps its delayed hedge below to avoid healthy
+            // reads paying speculative I/O before the candidate is classified.
+            let should_hedge_single_pending_inline_read = read_data
+                && !force_full_wait
+                && !defer_pending_inline_data_shard
+                && pending_responses == 1
+                && non_inline_candidate_eligible != Some(true)
+                && accumulator.can_still_reach_early_stop_with_pending(pending_responses);
             // A non-inline plan must retain one extra matching shard as a
             // reconstruction reserve. Schedule that reserve only after the
             // candidate is known to be eligible, so inline GETs do not pay an
@@ -3313,7 +3323,11 @@ impl SetDisks {
                 && accumulator
                     .candidate_read_reserve_target()
                     .is_some_and(|reserve_target| scheduled_count < reserve_target || pending_responses == 0);
-            if bounded_fanout && !force_full_wait && needs_non_inline_read_reserve && next_fanout_index < disks.len() {
+            if bounded_fanout
+                && !force_full_wait
+                && (needs_non_inline_read_reserve || should_hedge_single_pending_inline_read)
+                && next_fanout_index < disks.len()
+            {
                 let disk_index = fanout_order[next_fanout_index];
                 if let Some(disk) = disks.get(disk_index).cloned() {
                     spawn_read_version(&mut join_set, disk_index, disk);
