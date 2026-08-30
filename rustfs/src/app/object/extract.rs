@@ -309,6 +309,19 @@ const SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER: &str = "snowball-ignore-dirs";
 
 const SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER: &str = "snowball-ignore-errors";
 
+const SNOWBALL_STORED_TRANSPORT_KEYS_LOWER: &[&str] = &[
+    "snowball-auto-extract",
+    "snowball-prefix",
+    "snowball-ignore-dirs",
+    "snowball-ignore-errors",
+    "minio-snowball-prefix",
+    "minio-snowball-ignore-dirs",
+    "minio-snowball-ignore-errors",
+    "rustfs-snowball-prefix",
+    "rustfs-snowball-ignore-dirs",
+    "rustfs-snowball-ignore-errors",
+];
+
 const SNOWBALL_PREFIX_HEADER_KEYS: &[&str] = &[AMZ_MINIO_SNOWBALL_PREFIX, AMZ_SNOWBALL_PREFIX, AMZ_RUSTFS_SNOWBALL_PREFIX];
 
 const SNOWBALL_IGNORE_DIRS_HEADER_KEYS: &[&str] = &[
@@ -323,6 +336,12 @@ const SNOWBALL_IGNORE_ERRORS_HEADER_KEYS: &[&str] = &[
     AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS,
 ];
 
+const EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES: usize = 8 * 1024;
+const EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES: usize = 2 * 1024;
+const EXTRACT_MAX_EFFECTIVE_PAX_FIELDS: usize = 4096;
+const EXTRACT_MAX_EXPANDED_PAX_METADATA_BYTES: u64 = 128 * 1024 * 1024;
+const TAR_TYPEFLAG_OFFSET: usize = 156;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PutObjectExtractOptions {
     prefix: Option<String>,
@@ -330,11 +349,142 @@ struct PutObjectExtractOptions {
     ignore_errors: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtractEntryKind {
+    Directory,
+    Object,
+    Skip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExtractNormalizedVersion {
+    storage_id: String,
+    authorization_id: String,
+    requires_versioning: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExtractPaxOverrides {
+    headers: HeaderMap,
+    header_bytes: usize,
+    user_metadata_bytes: usize,
+    version_id: Option<String>,
+}
+
 fn header_value_is_true(headers: &HeaderMap, key: &str) -> bool {
     headers
         .get(key)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+}
+
+fn classify_extract_entry_type(entry_type: tokio_tar::EntryType) -> ExtractEntryKind {
+    if entry_type.is_dir() {
+        ExtractEntryKind::Directory
+    } else if entry_type.is_file()
+        || entry_type.is_character_special()
+        || entry_type.is_block_special()
+        || entry_type.is_fifo()
+        || entry_type.is_gnu_sparse()
+    {
+        // `EntryType::Regular` covers both POSIX TypeReg and the legacy NUL
+        // TypeRegA marker. MinIO materializes zero-sized device and FIFO
+        // members as empty objects instead of recreating filesystem nodes.
+        ExtractEntryKind::Object
+    } else {
+        // Links, contiguous files, PAX extension carrier records, and unknown
+        // typeflags are archive control/filesystem semantics, not S3 objects.
+        // In particular, MinIO does not inherit global PAX metadata into later
+        // Snowball members.
+        ExtractEntryKind::Skip
+    }
+}
+
+fn is_header_only_special_entry(entry_type: tokio_tar::EntryType) -> bool {
+    entry_type.is_character_special() || entry_type.is_block_special() || entry_type.is_fifo()
+}
+
+fn validate_extract_special_entry_size(entry_type: tokio_tar::EntryType, size: u64) -> S3Result<()> {
+    if is_header_only_special_entry(entry_type) && size != 0 {
+        return Err(s3_error!(InvalidArgument, "Snowball special archive member declares a non-zero body"));
+    }
+    Ok(())
+}
+
+fn is_legacy_null_directory(header: &tokio_tar::Header, path: &str) -> bool {
+    header.as_bytes()[TAR_TYPEFLAG_OFFSET] == b'\0' && path.as_bytes().ends_with(b"/")
+}
+
+fn is_snowball_transport_header(key: &str) -> bool {
+    if key.eq_ignore_ascii_case(AMZ_SNOWBALL_EXTRACT) || key.eq_ignore_ascii_case(AMZ_SNOWBALL_EXTRACT_COMPAT) {
+        return true;
+    }
+
+    if is_exact_snowball_meta_key(key, SNOWBALL_PREFIX_HEADER_KEYS)
+        || is_exact_snowball_meta_key(key, SNOWBALL_IGNORE_DIRS_HEADER_KEYS)
+        || is_exact_snowball_meta_key(key, SNOWBALL_IGNORE_ERRORS_HEADER_KEYS)
+    {
+        return true;
+    }
+
+    let key = key.to_ascii_lowercase();
+    if SNOWBALL_STORED_TRANSPORT_KEYS_LOWER.contains(&key.as_str()) {
+        return true;
+    }
+
+    key.starts_with(AMZ_META_PREFIX_LOWER)
+        && (key.ends_with(SNOWBALL_PREFIX_SUFFIX_LOWER)
+            || key.ends_with(SNOWBALL_IGNORE_DIRS_SUFFIX_LOWER)
+            || key.ends_with(SNOWBALL_IGNORE_ERRORS_SUFFIX_LOWER))
+}
+
+fn snowball_member_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut member_headers = headers.clone();
+    let transport_headers: Vec<_> = member_headers
+        .keys()
+        .filter(|name| is_snowball_transport_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in transport_headers {
+        member_headers.remove(name);
+    }
+    member_headers
+}
+
+fn normalize_extract_version_id(value: &str) -> S3Result<ExtractNormalizedVersion> {
+    let value = value.trim();
+    if value == "null" {
+        return Ok(ExtractNormalizedVersion {
+            storage_id: Uuid::nil().to_string(),
+            authorization_id: "null".to_string(),
+            requires_versioning: false,
+        });
+    }
+
+    let version_id = Uuid::parse_str(value).map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball PAX version ID"))?;
+    let version_id = version_id.to_string();
+    Ok(ExtractNormalizedVersion {
+        storage_id: version_id.clone(),
+        authorization_id: version_id,
+        requires_versioning: true,
+    })
+}
+
+fn apply_extract_version_id(value: &str, opts: &mut ObjectOptions) -> S3Result<String> {
+    let normalized = normalize_extract_version_id(value)?;
+    if normalized.requires_versioning && !opts.versioned {
+        return Err(s3_error!(InvalidArgument, "Snowball version ID requires bucket versioning to be enabled"));
+    }
+    opts.version_id = Some(normalized.storage_id);
+    Ok(normalized.authorization_id)
+}
+
+fn extract_notification_version_id(version_id: Option<Uuid>, versioned: bool, version_suspended: bool) -> String {
+    match version_id {
+        Some(version_id) if !version_id.is_nil() => version_id.to_string(),
+        Some(_) if versioned || version_suspended => "null".to_string(),
+        _ => String::new(),
+    }
 }
 
 pub(super) fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
@@ -421,6 +571,10 @@ fn map_extract_archive_error(err: std::io::Error) -> S3Error {
     archive_error
 }
 
+fn map_extract_pax_text_error(err: impl std::fmt::Display) -> S3Error {
+    s3_error!(InvalidArgument, "Failed to decode archive PAX metadata: {}", err)
+}
+
 #[derive(Debug)]
 enum ExtractEntryError {
     Fatal(S3Error),
@@ -447,38 +601,10 @@ impl ExtractEntryError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExtractEntryDisposition {
-    File,
-    Directory,
-    FormatSkip,
-}
-
-fn classify_extract_entry_type(entry_type: tokio_tar::EntryType) -> ExtractEntryDisposition {
-    use tokio_tar::EntryType;
-
-    match entry_type {
-        EntryType::Regular | EntryType::Char | EntryType::Block | EntryType::Fifo | EntryType::GNUSparse => {
-            ExtractEntryDisposition::File
-        }
-        EntryType::Directory => ExtractEntryDisposition::Directory,
-        EntryType::Link
-        | EntryType::Symlink
-        | EntryType::GNULongName
-        | EntryType::GNULongLink
-        | EntryType::Continuous
-        | EntryType::XGlobalHeader
-        | EntryType::XHeader
-        | EntryType::SolarisXHeader
-        | EntryType::Other(_) => ExtractEntryDisposition::FormatSkip,
-        _ => ExtractEntryDisposition::FormatSkip,
-    }
-}
-
-fn extract_entry_quota_growth(disposition: ExtractEntryDisposition, entry_size: u64) -> u64 {
-    match disposition {
-        ExtractEntryDisposition::File => entry_size,
-        ExtractEntryDisposition::Directory | ExtractEntryDisposition::FormatSkip => 0,
+fn extract_entry_quota_growth(kind: ExtractEntryKind, entry_size: u64) -> u64 {
+    match kind {
+        ExtractEntryKind::Object => entry_size,
+        ExtractEntryKind::Directory | ExtractEntryKind::Skip => 0,
     }
 }
 
@@ -591,12 +717,398 @@ fn record_extract_pax_metadata_record(
     Ok(())
 }
 
+fn is_extract_user_metadata_header(name: &http::HeaderName) -> bool {
+    ["x-amz-meta-", "x-minio-meta-", "x-rustfs-meta-"]
+        .iter()
+        .any(|prefix| name.as_str().starts_with(prefix))
+}
+
+fn extract_pax_header_bytes(name: &http::HeaderName, value: &HeaderValue) -> usize {
+    name.as_str().len().saturating_add(value.as_bytes().len())
+}
+
+fn validate_extract_pax_header_budget(headers: &HeaderMap) -> S3Result<()> {
+    if headers.len() > EXTRACT_MAX_EFFECTIVE_PAX_FIELDS {
+        return Err(s3_error!(InvalidArgument, "Snowball PAX metadata field count exceeds limit"));
+    }
+
+    let mut header_bytes = 0usize;
+    let mut user_metadata_bytes = 0usize;
+    for (name, value) in headers {
+        let field_bytes = extract_pax_header_bytes(name, value);
+        header_bytes = header_bytes
+            .checked_add(field_bytes)
+            .ok_or_else(|| s3_error!(InvalidArgument, "Snowball PAX metadata size overflowed"))?;
+        if is_extract_user_metadata_header(name) {
+            user_metadata_bytes = user_metadata_bytes
+                .checked_add(field_bytes)
+                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball PAX user metadata size overflowed"))?;
+        }
+    }
+
+    if header_bytes > EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES {
+        return Err(s3_error!(InvalidArgument, "Snowball PAX metadata exceeds effective size limit"));
+    }
+    if user_metadata_bytes > EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES {
+        return Err(s3_error!(InvalidArgument, "Snowball PAX user metadata exceeds effective size limit"));
+    }
+    Ok(())
+}
+
+fn try_insert_extract_header(headers: &mut HeaderMap, name: http::HeaderName, value: HeaderValue) -> S3Result<()> {
+    headers
+        .try_insert(name, value)
+        .map(|_| ())
+        .map_err(|_| s3_error!(InvalidArgument, "Snowball PAX metadata field count exceeds header capacity"))
+}
+
+fn replace_extract_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> S3Result<()> {
+    let value =
+        HeaderValue::from_str(value).map_err(|_| s3_error!(InvalidArgument, "Invalid canonical Snowball PAX metadata value"))?;
+    let name = http::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| s3_error!(InvalidArgument, "Invalid canonical Snowball PAX metadata header"))?;
+    try_insert_extract_header(headers, name, value)
+}
+
+fn extract_pax_metadata_delta_bytes(baseline: &HashMap<String, String>, metadata: &HashMap<String, String>) -> S3Result<u64> {
+    metadata
+        .iter()
+        .filter(|(key, value)| baseline.get(*key) != Some(*value))
+        .try_fold(0u64, |total, (key, value)| {
+            let field_bytes = key
+                .len()
+                .checked_add(value.len())
+                .and_then(|size| u64::try_from(size).ok())
+                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball expanded PAX metadata size overflowed"))?;
+            total
+                .checked_add(field_bytes)
+                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball expanded PAX metadata size overflowed"))
+        })
+}
+
+fn validate_extract_expanded_pax_metadata_total(total: u64) -> S3Result<()> {
+    if total > EXTRACT_MAX_EXPANDED_PAX_METADATA_BYTES {
+        return Err(s3_error!(InvalidArgument, "Snowball expanded PAX metadata exceeds archive limit"));
+    }
+    Ok(())
+}
+
+impl ExtractPaxOverrides {
+    fn overlay_record(&mut self, key: &str, value: &str) -> S3Result<()> {
+        if key == "minio.versionId" {
+            if value.is_empty() {
+                self.version_id = None;
+            } else {
+                self.version_id = Some(normalize_extract_version_id(value)?.authorization_id);
+            }
+            return Ok(());
+        }
+
+        let Some(meta_key) = key.strip_prefix("minio.metadata.") else {
+            return Ok(());
+        };
+        if meta_key.is_empty() {
+            return Ok(());
+        }
+
+        let name = http::HeaderName::from_bytes(meta_key.as_bytes())
+            .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball PAX metadata header"))?;
+        if is_snowball_transport_header(name.as_str()) {
+            return Ok(());
+        }
+        if value.is_empty() {
+            if let Some(previous) = self.headers.remove(&name) {
+                let previous_bytes = extract_pax_header_bytes(&name, &previous);
+                self.header_bytes = self.header_bytes.saturating_sub(previous_bytes);
+                if is_extract_user_metadata_header(&name) {
+                    self.user_metadata_bytes = self.user_metadata_bytes.saturating_sub(previous_bytes);
+                }
+            }
+            return Ok(());
+        }
+        let header_value =
+            HeaderValue::from_str(value).map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball PAX metadata value"))?;
+
+        let previous_bytes = self
+            .headers
+            .get(&name)
+            .map(|previous| extract_pax_header_bytes(&name, previous))
+            .unwrap_or_default();
+        let next_bytes = extract_pax_header_bytes(&name, &header_value);
+        let next_header_bytes = self
+            .header_bytes
+            .checked_sub(previous_bytes)
+            .and_then(|bytes| bytes.checked_add(next_bytes))
+            .ok_or_else(|| s3_error!(InvalidArgument, "Snowball PAX metadata size overflowed"))?;
+        if next_header_bytes > EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES {
+            return Err(s3_error!(InvalidArgument, "Snowball PAX metadata exceeds effective size limit"));
+        }
+
+        let next_user_metadata_bytes = if is_extract_user_metadata_header(&name) {
+            self.user_metadata_bytes
+                .checked_sub(previous_bytes)
+                .and_then(|bytes| bytes.checked_add(next_bytes))
+                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball PAX user metadata size overflowed"))?
+        } else {
+            self.user_metadata_bytes
+        };
+        if next_user_metadata_bytes > EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES {
+            return Err(s3_error!(InvalidArgument, "Snowball PAX user metadata exceeds effective size limit"));
+        }
+        if !self.headers.contains_key(&name) && self.headers.len() >= EXTRACT_MAX_EFFECTIVE_PAX_FIELDS {
+            return Err(s3_error!(InvalidArgument, "Snowball PAX metadata field count exceeds limit"));
+        }
+
+        try_insert_extract_header(&mut self.headers, name, header_value)?;
+        self.header_bytes = next_header_bytes;
+        self.user_metadata_bytes = next_user_metadata_bytes;
+        Ok(())
+    }
+}
+
+async fn overlay_extract_pax_extensions<R>(
+    entry: &mut tokio_tar::Entry<Archive<R>>,
+    overrides: &mut ExtractPaxOverrides,
+) -> S3Result<()>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    let Some(extensions) = entry.pax_extensions().await.map_err(map_extract_archive_error)? else {
+        return Ok(());
+    };
+
+    for ext in extensions {
+        let ext = ext.map_err(map_extract_archive_error)?;
+        let key = ext.key().map_err(map_extract_pax_text_error)?;
+        let value = ext.value().map_err(map_extract_pax_text_error)?;
+        overrides.overlay_record(key, value)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct ExtractEntryPaxAuthorization {
     headers: HeaderMap,
+    version_id: Option<String>,
     object_lock_legal_hold_status: Option<ObjectLockLegalHoldStatus>,
     object_lock_mode: Option<ObjectLockMode>,
     object_lock_retain_until_date: Option<Timestamp>,
+    expanded_metadata_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ExtractMemberIamRequirements {
+    tagging: bool,
+    retention: bool,
+    legal_hold: bool,
+    replication: bool,
+}
+
+fn extract_member_iam_requirements(
+    metadata: &HashMap<String, String>,
+    object_lock_legal_hold_status: Option<&ObjectLockLegalHoldStatus>,
+    object_lock_mode: Option<&ObjectLockMode>,
+    object_lock_retain_until_date: Option<&Timestamp>,
+    explicit_version_id: Option<&str>,
+    replica: bool,
+) -> ExtractMemberIamRequirements {
+    ExtractMemberIamRequirements {
+        tagging: metadata.contains_key(AMZ_OBJECT_TAGGING),
+        retention: object_lock_mode.is_some() || object_lock_retain_until_date.is_some(),
+        legal_hold: object_lock_legal_hold_status.is_some(),
+        replication: explicit_version_id.is_some() || replica,
+    }
+}
+
+fn apply_extract_pax_overrides(
+    overrides: &ExtractPaxOverrides,
+    bucket: &str,
+    object_name: &str,
+    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
+    metadata: &mut HashMap<String, String>,
+    opts: &mut ObjectOptions,
+) -> S3Result<ExtractEntryPaxAuthorization> {
+    let baseline_metadata = metadata.clone();
+    let mut canonical_headers = overrides.headers.clone();
+    let normalized_version = overrides
+        .version_id
+        .as_deref()
+        .map(normalize_extract_version_id)
+        .transpose()?;
+    if let Some(version) = normalized_version.as_ref() {
+        opts.version_id = Some(version.storage_id.clone());
+    }
+
+    let storage_class = canonical_headers
+        .get(AMZ_STORAGE_CLASS)
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::trim)
+                .map(str::to_owned)
+                .map_err(|_| s3_error!(InvalidStorageClass))
+        })
+        .transpose()?;
+    if let Some(storage_class) = storage_class.as_deref() {
+        if !is_valid_storage_class(storage_class) {
+            return Err(s3_error!(InvalidStorageClass));
+        }
+        replace_extract_header(&mut canonical_headers, AMZ_STORAGE_CLASS, storage_class)?;
+    }
+
+    let tagging = canonical_headers
+        .get("x-amz-tagging")
+        .map(|value| {
+            let value = value
+                .to_str()
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball object tagging value"))?;
+            crate::app::storage_api::object_usecase::s3_api::tagging::parse_copy_object_tags(value)
+        })
+        .transpose()?;
+    if let Some(tagging) = tagging.as_deref() {
+        replace_extract_header(&mut canonical_headers, "x-amz-tagging", tagging)?;
+    }
+
+    let object_lock_mode = canonical_headers
+        .get(AMZ_OBJECT_LOCK_MODE_LOWER)
+        .map(|value| {
+            let value = value
+                .to_str()
+                .map(str::trim)
+                .map(str::to_ascii_uppercase)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode"))?;
+            match value.as_str() {
+                ObjectLockMode::GOVERNANCE => Ok(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
+                ObjectLockMode::COMPLIANCE => Ok(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE)),
+                _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode")),
+            }
+        })
+        .transpose()?;
+    if let Some(mode) = object_lock_mode.as_ref() {
+        replace_extract_header(&mut canonical_headers, AMZ_OBJECT_LOCK_MODE_LOWER, mode.as_str())?;
+    }
+
+    let object_lock_retain_until_date = canonical_headers
+        .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+        .map(|value| {
+            let value = value
+                .to_str()
+                .map(str::trim)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))?;
+            Timestamp::parse(TimestampFormat::DateTime, value)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
+        })
+        .transpose()?;
+    if let Some(retain_until_date) = object_lock_retain_until_date.as_ref() {
+        let formatted = OffsetDateTime::from(retain_until_date.clone())
+            .to_offset(time::UtcOffset::UTC)
+            .format(&Rfc3339)
+            .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))?;
+        replace_extract_header(&mut canonical_headers, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, &formatted)?;
+    }
+
+    let object_lock_legal_hold_status = canonical_headers
+        .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
+        .map(|value| {
+            let value = value
+                .to_str()
+                .map(str::trim)
+                .map(str::to_ascii_uppercase)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status"))?;
+            match value.as_str() {
+                ObjectLockLegalHoldStatus::ON => Ok(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
+                ObjectLockLegalHoldStatus::OFF => Ok(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+                _ => Err(s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status")),
+            }
+        })
+        .transpose()?;
+    if let Some(status) = object_lock_legal_hold_status.as_ref() {
+        replace_extract_header(&mut canonical_headers, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, status.as_str())?;
+    }
+
+    let replica = canonical_headers
+        .get(AMZ_BUCKET_REPLICATION_STATUS)
+        .map(|value| {
+            let value = value
+                .to_str()
+                .map(str::trim)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball replication status"))?;
+            if value.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()) {
+                Ok(true)
+            } else {
+                Err(s3_error!(InvalidArgument, "Invalid Snowball replication status"))
+            }
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if replica {
+        replace_extract_header(
+            &mut canonical_headers,
+            AMZ_BUCKET_REPLICATION_STATUS,
+            ReplicationStatusType::Replica.as_str(),
+        )?;
+    }
+
+    validate_extract_pax_header_budget(&canonical_headers)?;
+
+    for (name, value) in &canonical_headers {
+        let value = value
+            .to_str()
+            .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball PAX metadata value"))?;
+        preserve_unclassified_user_metadata(metadata, name.as_str(), value);
+    }
+
+    let mut authorization_headers = HeaderMap::new();
+    for name in [
+        AMZ_STORAGE_CLASS,
+        "x-amz-tagging",
+        AMZ_OBJECT_LOCK_MODE_LOWER,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+    ] {
+        if let Some(value) = canonical_headers.get(name) {
+            try_insert_extract_header(&mut authorization_headers, http::HeaderName::from_static(name), value.clone())?;
+        }
+    }
+
+    let mut metadata_headers = canonical_headers;
+    metadata_headers.remove("x-amz-tagging");
+    metadata_headers.remove(AMZ_OBJECT_LOCK_MODE_LOWER);
+    metadata_headers.remove(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER);
+    metadata_headers.remove(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER);
+    metadata_headers.remove(AMZ_BUCKET_REPLICATION_STATUS);
+
+    if let Some(tagging) = tagging {
+        metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tagging);
+    }
+
+    extract_metadata_from_mime_with_object_name(&metadata_headers, metadata, false, Some(object_name));
+    if replica {
+        metadata.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS));
+        metadata.insert(
+            AMZ_BUCKET_REPLICATION_STATUS.to_string(),
+            ReplicationStatusType::Replica.as_str().to_string(),
+        );
+        opts.set_replica_status(ReplicationStatusType::Replica);
+    }
+    if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
+        bucket,
+        object_lock_config_state,
+        object_lock_legal_hold_status.clone(),
+        object_lock_mode.clone(),
+        object_lock_retain_until_date.clone(),
+    )? {
+        metadata.extend(object_lock_metadata);
+    }
+    let expanded_metadata_bytes = extract_pax_metadata_delta_bytes(&baseline_metadata, metadata)?;
+
+    Ok(ExtractEntryPaxAuthorization {
+        headers: authorization_headers,
+        version_id: normalized_version.map(|version| version.authorization_id),
+        object_lock_legal_hold_status,
+        object_lock_mode,
+        object_lock_retain_until_date,
+        expanded_metadata_bytes,
+    })
 }
 
 async fn count_extract_entry_pax_metadata<R>(
@@ -643,138 +1155,12 @@ async fn apply_extract_entry_pax_extensions<R>(
 where
     R: AsyncRead + Send + Unpin + 'static,
 {
-    let Some(extensions) = entry
-        .pax_extensions()
+    let mut overrides = ExtractPaxOverrides::default();
+    overlay_extract_pax_extensions(entry, &mut overrides)
         .await
-        .map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?
-    else {
-        return Ok(ExtractEntryPaxAuthorization::default());
-    };
-
-    let mut pax_headers = HeaderMap::new();
-    let mut pax_version_id = None;
-    for ext in extensions {
-        let ext = ext.map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
-        let key = ext.key().map_err(|err| {
-            ExtractEntryError::Fatal(object_s3_error(
-                S3ErrorCode::InvalidArgument,
-                format!("Failed to process archive PAX key: {}", err),
-            ))
-        })?;
-        let value = ext.value().map_err(|err| {
-            ExtractEntryError::Fatal(object_s3_error(
-                S3ErrorCode::InvalidArgument,
-                format!("Failed to process archive PAX value: {}", err),
-            ))
-        })?;
-
-        if let Some(meta_key) = key.strip_prefix("minio.metadata.") {
-            if !meta_key.is_empty() {
-                let name = http::HeaderName::from_bytes(meta_key.as_bytes()).map_err(|_| {
-                    ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball PAX metadata header"))
-                })?;
-                let header_value = HeaderValue::from_str(value).map_err(|_| {
-                    ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball PAX metadata value"))
-                })?;
-                preserve_unclassified_user_metadata(metadata, name.as_str(), value);
-                pax_headers.insert(name, header_value);
-            }
-            continue;
-        }
-
-        if key == "minio.versionId" && !value.is_empty() {
-            if Uuid::parse_str(value).is_err() {
-                return Err(ExtractEntryError::Recoverable(s3_error!(
-                    InvalidArgument,
-                    "Invalid Snowball PAX version ID"
-                )));
-            }
-            pax_version_id = Some(value.to_string());
-        }
-    }
-
-    let has_replica_status = pax_headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS);
-    if let Some(value) = pax_headers.get(AMZ_BUCKET_REPLICATION_STATUS) {
-        let status = value
-            .to_str()
-            .map_err(|_| ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball replication status")))?;
-        if !status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()) {
-            return Err(ExtractEntryError::Recoverable(s3_error!(
-                InvalidArgument,
-                "Invalid Snowball replication status"
-            )));
-        }
-        pax_headers.insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
-    }
-
-    let authorization_headers = pax_headers.clone();
-
-    if let Some(value) = pax_headers.remove("x-amz-tagging") {
-        let value = value
-            .to_str()
-            .map_err(|_| ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball object tagging value")))?;
-        metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), value.to_owned());
-    }
-
-    let object_lock_mode = pax_headers
-        .remove(AMZ_OBJECT_LOCK_MODE_LOWER)
-        .map(|value| {
-            value
-                .to_str()
-                .map(|value| ObjectLockMode::from(value.to_string()))
-                .map_err(|_| ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode")))
-        })
-        .transpose()?;
-    let object_lock_retain_until_date = pax_headers
-        .remove(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
-        .map(|value| {
-            let value = value.to_str().map_err(|_| {
-                ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
-            })?;
-            OffsetDateTime::parse(value, &Rfc3339).map(Timestamp::from).map_err(|_| {
-                ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
-            })
-        })
-        .transpose()?;
-    let object_lock_legal_hold_status = pax_headers
-        .remove(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
-        .map(|value| {
-            value
-                .to_str()
-                .map(|value| ObjectLockLegalHoldStatus::from(value.to_string()))
-                .map_err(|_| {
-                    ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status"))
-                })
-        })
-        .transpose()?;
-    opts.version_id = pax_version_id;
-
-    extract_metadata_from_mime_with_object_name(&pax_headers, metadata, false, Some(object_name));
-    if has_replica_status {
-        metadata.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS));
-        metadata.insert(
-            AMZ_BUCKET_REPLICATION_STATUS.to_string(),
-            ReplicationStatusType::Replica.as_str().to_string(),
-        );
-    }
-    if let Some(object_lock_metadata) = build_put_like_object_lock_metadata(
-        bucket,
-        object_lock_config_state,
-        object_lock_legal_hold_status.clone(),
-        object_lock_mode.clone(),
-        object_lock_retain_until_date.clone(),
-    )
-    .map_err(ExtractEntryError::Recoverable)?
-    {
-        metadata.extend(object_lock_metadata);
-    }
-
-    Ok(ExtractEntryPaxAuthorization {
-        headers: authorization_headers,
-        object_lock_legal_hold_status,
-        object_lock_mode,
-        object_lock_retain_until_date,
-    })
+        .map_err(ExtractEntryError::Recoverable)?;
+    apply_extract_pax_overrides(&overrides, bucket, object_name, object_lock_config_state, metadata, opts)
+        .map_err(ExtractEntryError::Recoverable)
 }
 
 #[cfg(test)]
@@ -904,8 +1290,12 @@ impl DefaultObjectUsecase {
     async fn execute_put_object_extract_inner(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         let request_context = helper.request_context_or_from_request(&req);
+        let extract_options = resolve_put_object_extract_options(&req.headers)?;
+        let member_request_headers = snowball_member_headers(&req.headers);
         let auth_method = req.method.clone();
         let auth_uri = req.uri.clone();
+        // Authorization retains the complete signed request context. Snowball
+        // transport controls are filtered only at member metadata/storage boundaries.
         let auth_headers = req.headers.clone();
         let auth_extensions = req.extensions.clone();
         let auth_credentials = req.credentials.clone();
@@ -952,7 +1342,7 @@ impl DefaultObjectUsecase {
             ..
         } = input;
 
-        let event_version_id = version_id;
+        let outer_version_id = version_id;
         let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(&req.headers)?;
         let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
         let sse_customer_key = sse_customer_key.or(h_key);
@@ -1070,7 +1460,6 @@ impl DefaultObjectUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let extract_options = resolve_put_object_extract_options(&req.headers)?;
         let extract_quota_check = if let Some(metadata_sys) = self.bucket_metadata_sys() {
             let quota_checker = QuotaChecker::new(metadata_sys);
             let check_result =
@@ -1082,11 +1471,6 @@ impl DefaultObjectUsecase {
         let extract_quota_enabled = extract_quota_check
             .as_ref()
             .is_some_and(|result| result.quota_limit.is_some());
-        let version_id = match event_version_id {
-            Some(v) => v.to_string(),
-            None => String::new(),
-        };
-
         let notify = current_notify_interface_for_context(self.context.as_deref());
         let req_params = rustfs_targets::extract_params_header(&req.headers);
         let host = get_request_host(&req.headers);
@@ -1098,6 +1482,7 @@ impl DefaultObjectUsecase {
         let mut legacy_quota_growth = 0u64;
         let mut total_pax_metadata_size = 0u64;
         let mut total_pax_metadata_records = 0usize;
+        let mut total_expanded_pax_metadata = 0u64;
         let object_lock_config_snapshot = store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?;
         let object_lock_config_state = object_lock_config_snapshot.state();
 
@@ -1126,15 +1511,15 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ExtractEntryError::into_s3_error)?;
 
-            let entry_type = classify_extract_entry_type(f.header().entry_type());
-            if entry_type == ExtractEntryDisposition::FormatSkip {
-                continue;
+            let archive_entry_type = f.header().entry_type();
+            let entry_kind = classify_extract_entry_type(archive_entry_type);
+            match entry_kind {
+                ExtractEntryKind::Skip => continue,
+                ExtractEntryKind::Directory | ExtractEntryKind::Object => {}
             }
-            let is_dir = entry_type == ExtractEntryDisposition::Directory;
-            if is_dir && extract_options.ignore_dirs {
-                continue;
-            }
-            let fpath = {
+            validate_extract_special_entry_size(archive_entry_type, entry_size)?;
+
+            let (fpath, is_dir) = {
                 let path_bytes = f.path_bytes().map_err(map_extract_archive_error)?;
                 let path = match strict_extract_entry_path(path_bytes.as_ref()) {
                     Ok(path) => path,
@@ -1146,7 +1531,18 @@ impl DefaultObjectUsecase {
                 if is_empty_extract_entry_path(path) {
                     continue;
                 }
-                normalize_extract_entry_key(path, extract_options.prefix.as_deref(), is_dir)?
+                let is_dir = entry_kind == ExtractEntryKind::Directory || is_legacy_null_directory(f.header(), path);
+                if is_dir && extract_options.ignore_dirs {
+                    continue;
+                }
+                let fpath = match normalize_extract_entry_key(path, extract_options.prefix.as_deref(), is_dir) {
+                    Ok(fpath) => fpath,
+                    Err(err) => {
+                        ExtractEntryError::Recoverable(err).ignore_or_return(extract_options.ignore_errors)?;
+                        continue;
+                    }
+                };
+                (fpath, is_dir)
             };
 
             if let Err(err) = validate_extract_member_key(&fpath, extract_limits) {
@@ -1182,7 +1578,7 @@ impl DefaultObjectUsecase {
             let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
             apply_put_request_metadata(
                 &mut metadata,
-                &req.headers,
+                &member_request_headers,
                 &fpath,
                 cache_control.clone(),
                 content_disposition.clone(),
@@ -1203,8 +1599,8 @@ impl DefaultObjectUsecase {
             let mut opts = put_opts_with_replication_authorization(
                 &bucket,
                 &fpath,
-                None,
-                &req.headers,
+                outer_version_id.clone(),
+                &member_request_headers,
                 metadata.clone(),
                 replication_authorized,
             )
@@ -1231,9 +1627,16 @@ impl DefaultObjectUsecase {
                     continue;
                 }
             };
+            total_expanded_pax_metadata = total_expanded_pax_metadata
+                .checked_add(pax_authorization.expanded_metadata_bytes)
+                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball expanded PAX metadata size overflowed"))?;
+            validate_extract_expanded_pax_metadata_total(total_expanded_pax_metadata)?;
             if let Some(quota_check) = extract_quota_check.as_ref() {
                 let next_legacy_quota_growth = legacy_quota_growth
-                    .checked_add(extract_entry_quota_growth(entry_type, entry_size))
+                    .checked_add(extract_entry_quota_growth(
+                        if is_dir { ExtractEntryKind::Directory } else { entry_kind },
+                        entry_size,
+                    ))
                     .ok_or_else(|| {
                         object_s3_error(S3ErrorCode::InvalidArgument, "Archive quota growth overflowed while processing entries")
                     })?;
@@ -1241,21 +1644,16 @@ impl DefaultObjectUsecase {
                 legacy_quota_growth = next_legacy_quota_growth;
             }
             for (name, value) in &pax_authorization.headers {
-                auth_req.headers.insert(name.clone(), value.clone());
+                auth_req
+                    .headers
+                    .try_insert(name.clone(), value.clone())
+                    .map_err(|_| s3_error!(InvalidArgument, "Snowball IAM condition header capacity exceeded"))?;
             }
-            if let Some(version_id) = opts.version_id.as_ref() {
-                req_info_mut(&mut auth_req)?.version_id = Some(version_id.clone());
-            }
-            authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await?;
-            if pax_authorization.object_lock_mode.is_some() || pax_authorization.object_lock_retain_until_date.is_some() {
-                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
-            }
-            if pax_authorization.object_lock_legal_hold_status.is_some() {
-                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
-            }
-            if opts.version_id.is_some() || pax_authorization.headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS) {
-                authorize_request(&mut auth_req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
-            }
+            let explicit_version_id = pax_authorization.version_id.as_deref().or(outer_version_id.as_deref());
+            let authorization_version_id = explicit_version_id
+                .map(|version_id| apply_extract_version_id(version_id, &mut opts))
+                .transpose()?;
+            req_info_mut(&mut auth_req)?.version_id = authorization_version_id;
             let effective_object_lock_legal_hold_status = pax_authorization
                 .object_lock_legal_hold_status
                 .clone()
@@ -1269,6 +1667,27 @@ impl DefaultObjectUsecase {
                 } else {
                     (object_lock_mode.clone(), object_lock_retain_until_date.clone())
                 };
+            let iam_requirements = extract_member_iam_requirements(
+                &metadata,
+                effective_object_lock_legal_hold_status.as_ref(),
+                effective_object_lock_mode.as_ref(),
+                effective_object_lock_retain_until_date.as_ref(),
+                explicit_version_id,
+                opts.delete_marker_replication_status() == ReplicationStatusType::Replica,
+            );
+            authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectAction)).await?;
+            if iam_requirements.tagging {
+                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectTaggingAction)).await?;
+            }
+            if iam_requirements.retention {
+                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectRetentionAction)).await?;
+            }
+            if iam_requirements.legal_hold {
+                authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await?;
+            }
+            if iam_requirements.replication {
+                authorize_request(&mut auth_req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
+            }
             if archive_entry_mod_time.is_some() {
                 opts.mod_time = archive_entry_mod_time;
             }
@@ -1417,13 +1836,17 @@ impl DefaultObjectUsecase {
                 ..Default::default()
             };
 
+            let actual_version_id = extract_notification_version_id(obj_info.version_id, opts.versioned, opts.version_suspended);
+            let mut event_object = convert_ecstore_object_info(obj_info.clone());
+            event_object.version_id = (!actual_version_id.is_empty()).then_some(actual_version_id.clone());
+
             let event_args = rustfs_notify::EventArgs {
                 event_name: put_event_name_for_post_object(false),
                 bucket_name: bucket.clone(),
-                object: convert_ecstore_object_info(obj_info.clone()),
+                object: event_object,
                 req_params: req_params.clone(),
                 resp_elements: build_event_resp_elements(&S3Response::new(output.clone()), &request_context.request_id),
-                version_id: version_id.clone(),
+                version_id: actual_version_id,
                 host: host.clone(),
                 port,
                 user_agent: user_agent.clone(),
@@ -1828,7 +2251,7 @@ mod tests {
                 (
                     authorization.object_lock_mode.is_some() || authorization.object_lock_retain_until_date.is_some(),
                     authorization.object_lock_legal_hold_status.is_some(),
-                    opts.version_id.is_some() || authorization.headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS),
+                    opts.version_id.is_some() || opts.delete_marker_replication_status() == ReplicationStatusType::Replica,
                 ),
                 expected,
                 "{case} must request only its own additional authorization"
@@ -1838,15 +2261,15 @@ mod tests {
                     assert!(authorization.headers.contains_key(AMZ_OBJECT_LOCK_MODE_LOWER));
                     assert!(authorization.headers.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
                 }
-                "legal-hold" => assert!(authorization.headers.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)),
+                "legal-hold" => {
+                    assert!(!authorization.headers.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
+                    assert!(authorization.object_lock_legal_hold_status.is_some());
+                }
                 "version-id" => assert_eq!(opts.version_id.as_deref(), Some(Uuid::nil().to_string().as_str())),
-                "replication-status" => assert_eq!(
-                    authorization
-                        .headers
-                        .get(AMZ_BUCKET_REPLICATION_STATUS)
-                        .and_then(|value| value.to_str().ok()),
-                    Some("REPLICA")
-                ),
+                "replication-status" => {
+                    assert!(!authorization.headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS));
+                    assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Replica);
+                }
                 _ => unreachable!(),
             }
         }
@@ -1866,6 +2289,7 @@ mod tests {
                 pax_record("minio.metadata.x-amz-replication-status", b"INVALID"),
             ),
             ("invalid-version-id", pax_record("minio.versionId", b"not-a-uuid")),
+            ("non-exact-null-version-id", pax_record("minio.versionId", b"NULL")),
         ];
         let state = metadata_sys::ObjectLockConfigState::Configured {
             config: ObjectLockConfiguration {
@@ -1966,7 +2390,43 @@ mod tests {
         assert!(authorization.object_lock_retain_until_date.is_some());
         assert!(authorization.object_lock_legal_hold_status.is_some());
         assert!(opts.version_id.is_some());
-        assert!(authorization.headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS));
+        assert!(!authorization.headers.contains_key(AMZ_BUCKET_REPLICATION_STATUS));
+        assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[test]
+    fn snowball_pax_retention_auth_view_normalizes_offset_to_same_instant() {
+        let mut overrides = ExtractPaxOverrides::default();
+        overrides
+            .overlay_record("minio.metadata.x-amz-object-lock-mode", "GOVERNANCE")
+            .expect("retention mode should parse");
+        overrides
+            .overlay_record("minio.metadata.x-amz-object-lock-retain-until-date", "2099-01-01T00:00:00-02:00")
+            .expect("offset retention date should parse");
+        let state = metadata_sys::ObjectLockConfigState::Configured {
+            config: ObjectLockConfiguration {
+                object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                rule: None,
+            },
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let mut metadata = HashMap::new();
+        let authorization =
+            apply_extract_pax_overrides(&overrides, "bucket", "object", &state, &mut metadata, &mut ObjectOptions::default())
+                .expect("valid offset retention should apply");
+
+        let auth_value = authorization
+            .headers
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+            .and_then(|value| value.to_str().ok())
+            .expect("IAM view should contain canonical retention date");
+        assert_eq!(auth_value, "2099-01-01T02:00:00Z");
+        let stored_value = metadata
+            .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
+            .expect("retention date should be persisted");
+        let auth_instant = OffsetDateTime::parse(auth_value, &Rfc3339).expect("canonical auth time should parse");
+        let stored_instant = OffsetDateTime::parse(stored_value, &Rfc3339).expect("stored retention time should parse");
+        assert_eq!(auth_instant, stored_instant);
     }
 
     #[tokio::test]
@@ -2036,8 +2496,324 @@ mod tests {
         .unwrap_err()
         .into_s3_error();
 
-        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
         assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
+    }
+
+    #[test]
+    fn snowball_entry_type_allowlist_matches_minio_object_semantics() {
+        for entry_type in [
+            EntryType::Regular,
+            EntryType::new(b'\0'),
+            EntryType::Char,
+            EntryType::Block,
+            EntryType::Fifo,
+            EntryType::GNUSparse,
+        ] {
+            assert_eq!(classify_extract_entry_type(entry_type), ExtractEntryKind::Object);
+        }
+        assert_eq!(classify_extract_entry_type(EntryType::Directory), ExtractEntryKind::Directory);
+        for entry_type in [
+            EntryType::Link,
+            EntryType::Symlink,
+            EntryType::Continuous,
+            EntryType::XGlobalHeader,
+            EntryType::XHeader,
+            EntryType::SolarisXHeader,
+            EntryType::Other(b'9'),
+        ] {
+            assert_eq!(classify_extract_entry_type(entry_type), ExtractEntryKind::Skip);
+        }
+    }
+
+    #[test]
+    fn snowball_legacy_null_regular_directory_uses_effective_path_suffix() {
+        let mut header = Header::new_old();
+        header.as_mut_bytes()[TAR_TYPEFLAG_OFFSET] = b'\0';
+
+        assert!(is_legacy_null_directory(&header, "directory/"));
+        assert!(!is_legacy_null_directory(&header, "object"));
+
+        header.set_entry_type(EntryType::Regular);
+        assert!(!is_legacy_null_directory(&header, "directory/"));
+    }
+
+    #[test]
+    fn snowball_special_members_require_zero_declared_size() {
+        for entry_type in [EntryType::Char, EntryType::Block, EntryType::Fifo] {
+            validate_extract_special_entry_size(entry_type, 0).expect("zero-sized special member should be accepted");
+            assert!(validate_extract_special_entry_size(entry_type, 1).is_err());
+        }
+        validate_extract_special_entry_size(EntryType::GNUSparse, 1).expect("GNU sparse members retain payload semantics");
+    }
+
+    #[test]
+    fn snowball_header_views_preserve_auth_context_and_filter_member_storage() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
+        headers.insert(AMZ_SNOWBALL_EXTRACT_COMPAT, HeaderValue::from_static("true"));
+        headers.insert(AMZ_MINIO_SNOWBALL_PREFIX, HeaderValue::from_static("prefix"));
+        headers.insert("x-amz-meta-acme-snowball-ignore-dirs", HeaderValue::from_static("true"));
+        headers.insert("snowball-auto-extract", HeaderValue::from_static("true"));
+        headers.insert("rustfs-snowball-ignore-errors", HeaderValue::from_static("true"));
+        headers.insert("x-amz-meta-owner", HeaderValue::from_static("alice"));
+        headers.insert("cache-control", HeaderValue::from_static("max-age=60"));
+
+        let auth_headers = headers.clone();
+        let member_headers = snowball_member_headers(&headers);
+
+        assert_eq!(auth_headers, headers, "IAM conditions must see every signed request header");
+        assert!(auth_headers.contains_key(AMZ_SNOWBALL_EXTRACT));
+        assert!(auth_headers.contains_key(AMZ_MINIO_SNOWBALL_PREFIX));
+        assert!(!member_headers.contains_key(AMZ_SNOWBALL_EXTRACT));
+        assert!(!member_headers.contains_key(AMZ_SNOWBALL_EXTRACT_COMPAT));
+        assert!(!member_headers.contains_key(AMZ_MINIO_SNOWBALL_PREFIX));
+        assert!(!member_headers.contains_key("x-amz-meta-acme-snowball-ignore-dirs"));
+        assert!(!member_headers.contains_key("snowball-auto-extract"));
+        assert!(!member_headers.contains_key("rustfs-snowball-ignore-errors"));
+        assert_eq!(member_headers.get("x-amz-meta-owner"), Some(&HeaderValue::from_static("alice")));
+        assert_eq!(member_headers.get("cache-control"), Some(&HeaderValue::from_static("max-age=60")));
+    }
+
+    #[test]
+    fn snowball_pax_tagging_reuses_put_tag_parser_and_validator() {
+        let mut valid = ExtractPaxOverrides::default();
+        valid
+            .overlay_record("minio.metadata.x-amz-tagging", "project=rustfs&label=snowball%20import")
+            .expect("encoded tags should fit in a PAX header");
+        let mut metadata = HashMap::new();
+        apply_extract_pax_overrides(
+            &valid,
+            "bucket",
+            "tagged.txt",
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            &mut metadata,
+            &mut ObjectOptions::default(),
+        )
+        .expect("valid object tags should be canonicalized");
+        assert_eq!(
+            metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str),
+            Some("project=rustfs&label=snowball+import")
+        );
+
+        let too_many = (0..11)
+            .map(|index| format!("k{index}=v{index}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        for (case, tagging) in [
+            ("duplicate", "project=rustfs&project=cli".to_string()),
+            ("bad-percent-encoding", "project=rustfs%ZZ".to_string()),
+            ("too-many", too_many),
+        ] {
+            let mut invalid = ExtractPaxOverrides::default();
+            invalid
+                .overlay_record("minio.metadata.x-amz-tagging", &tagging)
+                .expect("tag validation should happen at member application");
+            let err = apply_extract_pax_overrides(
+                &invalid,
+                "bucket",
+                "tagged.txt",
+                &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                &mut HashMap::new(),
+                &mut ObjectOptions::default(),
+            )
+            .expect_err("invalid PAX object tags must be rejected");
+            assert_eq!(err.code(), &S3ErrorCode::InvalidTag, "{case}");
+        }
+    }
+
+    #[test]
+    fn snowball_pax_auth_view_only_contains_applied_condition_fields() {
+        let mut overrides = ExtractPaxOverrides::default();
+        for (name, value) in [
+            ("user-agent", "trusted"),
+            ("authorization", "AWS4-HMAC-SHA256 injected"),
+            ("x-amz-server-side-encryption", "AES256"),
+            (AMZ_STORAGE_CLASS, "STANDARD"),
+            ("x-amz-tagging", "project=rustfs"),
+        ] {
+            overrides
+                .overlay_record(&format!("minio.metadata.{name}"), value)
+                .expect("test PAX metadata should parse");
+        }
+
+        let authorization = apply_extract_pax_overrides(
+            &overrides,
+            "bucket",
+            "object",
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            &mut HashMap::new(),
+            &mut ObjectOptions::default(),
+        )
+        .expect("allowed PAX metadata should apply");
+
+        assert_eq!(authorization.headers.len(), 2);
+        assert_eq!(authorization.headers.get(AMZ_STORAGE_CLASS), Some(&HeaderValue::from_static("STANDARD")));
+        assert_eq!(
+            authorization.headers.get("x-amz-tagging"),
+            Some(&HeaderValue::from_static("project=rustfs"))
+        );
+        for prohibited in ["user-agent", "authorization", "x-amz-server-side-encryption"] {
+            assert!(!authorization.headers.contains_key(prohibited));
+        }
+    }
+
+    #[test]
+    fn snowball_pax_rejects_invalid_storage_class() {
+        let mut overrides = ExtractPaxOverrides::default();
+        overrides
+            .overlay_record("minio.metadata.x-amz-storage-class", "INVALID")
+            .expect("storage class validation should happen after PAX parsing");
+
+        let err = apply_extract_pax_overrides(
+            &overrides,
+            "bucket",
+            "object",
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            &mut HashMap::new(),
+            &mut ObjectOptions::default(),
+        )
+        .expect_err("invalid PAX storage class must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+    }
+
+    #[test]
+    fn snowball_pax_enforces_effective_metadata_budgets_without_panicking() {
+        let header_name = "x-test";
+        let exact_header_value = "v".repeat(EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES - header_name.len());
+        let mut exact_headers = ExtractPaxOverrides::default();
+        exact_headers
+            .overlay_record(&format!("minio.metadata.{header_name}"), &exact_header_value)
+            .expect("exact effective header budget should be accepted");
+        assert_eq!(exact_headers.header_bytes, EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES);
+        assert!(
+            exact_headers
+                .overlay_record(
+                    &format!("minio.metadata.{header_name}"),
+                    &"v".repeat(EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES - header_name.len() + 1),
+                )
+                .is_err()
+        );
+
+        let user_name = "x-amz-meta-owner";
+        let exact_user_value = "u".repeat(EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES - user_name.len());
+        let mut exact_user_metadata = ExtractPaxOverrides::default();
+        exact_user_metadata
+            .overlay_record(&format!("minio.metadata.{user_name}"), &exact_user_value)
+            .expect("exact user metadata budget should be accepted");
+        assert_eq!(exact_user_metadata.user_metadata_bytes, EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES);
+        assert!(
+            exact_user_metadata
+                .overlay_record(
+                    &format!("minio.metadata.{user_name}"),
+                    &"u".repeat(EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES - user_name.len() + 1),
+                )
+                .is_err()
+        );
+
+        let mut many_fields = ExtractPaxOverrides::default();
+        let mut first_error = None;
+        for index in 0..EXTRACT_MAX_EFFECTIVE_PAX_FIELDS + 1 {
+            if let Err(err) = many_fields.overlay_record(&format!("minio.metadata.x-field-{index}"), "v") {
+                first_error = Some(err);
+                break;
+            }
+        }
+        assert!(first_error.is_some(), "bounded PAX state must reject before HeaderMap capacity");
+        assert!(many_fields.headers.len() < EXTRACT_MAX_EFFECTIVE_PAX_FIELDS);
+    }
+
+    #[test]
+    fn snowball_expanded_pax_metadata_total_accepts_exact_limit() {
+        validate_extract_expanded_pax_metadata_total(EXTRACT_MAX_EXPANDED_PAX_METADATA_BYTES)
+            .expect("exact expanded metadata limit should be accepted");
+        assert!(validate_extract_expanded_pax_metadata_total(EXTRACT_MAX_EXPANDED_PAX_METADATA_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn snowball_pax_metadata_precedence_is_outer_then_local() {
+        let mut local = ExtractPaxOverrides::default();
+        local
+            .overlay_record("minio.metadata.x-amz-meta-snowball-auto-extract", "true")
+            .expect("transport metadata should be ignored");
+        local
+            .overlay_record("minio.metadata.X-Amz-Meta-Owner", "local")
+            .expect("local owner metadata should parse");
+        local
+            .overlay_record("minio.metadata.x-amz-tagging", "classification=public")
+            .expect("local tags should parse");
+        let mut local_metadata = HashMap::from([("owner".to_string(), "outer".to_string())]);
+        let authorization = apply_extract_pax_overrides(
+            &local,
+            "bucket",
+            "local.txt",
+            &metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+            &mut local_metadata,
+            &mut ObjectOptions::default(),
+        )
+        .expect("local PAX metadata should apply");
+        assert_eq!(local_metadata.get("owner").map(String::as_str), Some("local"));
+        assert_eq!(local_metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str), Some("classification=public"));
+        assert!(!local_metadata.contains_key("snowball-auto-extract"));
+        assert!(!authorization.headers.contains_key(AMZ_SNOWBALL_EXTRACT));
+    }
+
+    #[test]
+    fn snowball_version_id_accepts_exact_null_and_requires_versioning_for_uuids() {
+        let mut unversioned = ObjectOptions::default();
+        assert_eq!(
+            apply_extract_version_id("null", &mut unversioned).expect("exact null should be accepted"),
+            "null"
+        );
+        assert_eq!(unversioned.version_id.as_deref(), Some(Uuid::nil().to_string().as_str()));
+        assert!(apply_extract_version_id("NULL", &mut ObjectOptions::default()).is_err());
+
+        let version_id = Uuid::new_v4().to_string();
+        assert!(apply_extract_version_id(&version_id, &mut ObjectOptions::default()).is_err());
+        let mut versioned = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_extract_version_id(&version_id, &mut versioned).expect("UUID should be accepted for a versioned key"),
+            version_id
+        );
+    }
+
+    #[test]
+    fn snowball_notification_version_id_follows_member_versioning_state() {
+        let nil = Some(Uuid::nil());
+        assert!(extract_notification_version_id(nil, false, false).is_empty());
+        assert_eq!(extract_notification_version_id(nil, true, false), "null");
+        assert_eq!(extract_notification_version_id(nil, false, true), "null");
+        assert!(extract_notification_version_id(None, true, false).is_empty());
+
+        let version_id = Uuid::new_v4();
+        assert_eq!(extract_notification_version_id(Some(version_id), true, false), version_id.to_string());
+    }
+
+    #[test]
+    fn snowball_iam_requirements_follow_final_member_state() {
+        let metadata = HashMap::from([(AMZ_OBJECT_TAGGING.to_string(), "project=snowball".to_string())]);
+        let legal_hold = ObjectLockLegalHoldStatus::from("ON".to_string());
+        let mode = ObjectLockMode::from("GOVERNANCE".to_string());
+        let retain_until = Timestamp::from(OffsetDateTime::now_utc());
+
+        assert_eq!(
+            extract_member_iam_requirements(&metadata, Some(&legal_hold), Some(&mode), Some(&retain_until), Some("null"), true,),
+            ExtractMemberIamRequirements {
+                tagging: true,
+                retention: true,
+                legal_hold: true,
+                replication: true,
+            }
+        );
+
+        let bucket_default_retention = HashMap::from([
+            (AMZ_OBJECT_LOCK_MODE_LOWER.to_string(), "COMPLIANCE".to_string()),
+            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_string(), "2099-01-01T00:00:00Z".to_string()),
+        ]);
+        assert!(!extract_member_iam_requirements(&bucket_default_retention, None, None, None, None, false,).retention);
     }
 
     #[test]
@@ -2278,8 +3054,8 @@ mod tests {
 
     #[test]
     fn classify_extract_entry_type_skips_links_extensions_and_continuous_entries() {
-        assert_eq!(classify_extract_entry_type(EntryType::Regular), ExtractEntryDisposition::File);
-        assert_eq!(classify_extract_entry_type(EntryType::Directory), ExtractEntryDisposition::Directory);
+        assert_eq!(classify_extract_entry_type(EntryType::Regular), ExtractEntryKind::Object);
+        assert_eq!(classify_extract_entry_type(EntryType::Directory), ExtractEntryKind::Directory);
         for entry_type in [
             EntryType::Link,
             EntryType::Symlink,
@@ -2289,7 +3065,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_extract_entry_type(entry_type),
-                ExtractEntryDisposition::FormatSkip,
+                ExtractEntryKind::Skip,
                 "{entry_type:?} must not be materialized as an object"
             );
         }
@@ -2297,9 +3073,9 @@ mod tests {
 
     #[test]
     fn extract_entry_quota_growth_counts_only_materialized_files() {
-        assert_eq!(extract_entry_quota_growth(ExtractEntryDisposition::File, 9), 9);
-        assert_eq!(extract_entry_quota_growth(ExtractEntryDisposition::Directory, 9), 0);
-        assert_eq!(extract_entry_quota_growth(ExtractEntryDisposition::FormatSkip, 9), 0);
+        assert_eq!(extract_entry_quota_growth(ExtractEntryKind::Object, 9), 9);
+        assert_eq!(extract_entry_quota_growth(ExtractEntryKind::Directory, 9), 0);
+        assert_eq!(extract_entry_quota_growth(ExtractEntryKind::Skip, 9), 0);
     }
 
     #[test]
