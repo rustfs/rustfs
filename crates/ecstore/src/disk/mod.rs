@@ -677,15 +677,20 @@ impl DiskAPI for Disk {
 }
 
 impl Disk {
-    pub(crate) async fn delete_with_scanner_publication_lease(
+    pub async fn delete_with_scanner_publication_lease_and_guard(
         &self,
         volume: &str,
         path: &str,
         opts: DeleteOptions,
         scanner_publication_lease_token: Option<Uuid>,
+        external_guard: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
         match self {
-            Disk::Local(local_disk) => local_disk.delete(volume, path, opts).await,
+            Disk::Local(local_disk) => {
+                local_disk
+                    .delete_with_publication_guard(volume, path, opts, external_guard)
+                    .await
+            }
             Disk::Remote(remote_disk) => {
                 remote_disk
                     .delete_with_scanner_publication_lease(volume, path, opts, scanner_publication_lease_token)
@@ -715,10 +720,33 @@ impl Disk {
         dst_path: &str,
         scanner_publication_lease_token: Option<Uuid>,
     ) -> Result<RenameDataResp> {
+        self.rename_data_borrowed_with_fence_and_guard(
+            src_volume,
+            src_path,
+            fi,
+            dst_volume,
+            dst_path,
+            scanner_publication_lease_token,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rename_data_borrowed_with_fence_and_guard(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        scanner_publication_lease_token: Option<Uuid>,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<RenameDataResp> {
         match self {
             Disk::Local(local_disk) => {
                 local_disk
-                    .rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+                    .rename_data_borrowed_with_guard(src_volume, src_path, fi, dst_volume, dst_path, external_guard)
                     .await
             }
             Disk::Remote(remote_disk) => {

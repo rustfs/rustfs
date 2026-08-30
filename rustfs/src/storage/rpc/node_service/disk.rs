@@ -33,6 +33,7 @@ use rustfs_io_metrics::internode_metrics::{
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
 use std::io::Cursor;
+use std::sync::Arc;
 use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::debug;
@@ -1230,37 +1231,40 @@ impl NodeService {
             // The target owns this read guard.  It must span the complete
             // disk rename, not merely the preflight, so a movement transition
             // cannot restart after validation and before rename linearization.
-            let _scanner_publication_lease_guard = if let Some(token) = scanner_publication_lease_token {
-                let Some(store) = self.resolve_object_store() else {
-                    return Ok(Response::new(RenameDataResponse {
-                        success: false,
-                        rename_data_resp: String::new(),
-                        rename_data_resp_bin: Vec::new().into(),
-                        error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
-                    }));
-                };
-                match store.acquire_scanner_publication_lease_guard(token).await {
-                    Ok(guard) => Some(guard),
-                    Err(err) => {
+            let scanner_publication_lease_guard: Option<Arc<dyn Send + Sync>> =
+                if let Some(token) = scanner_publication_lease_token {
+                    let Some(store) = self.resolve_object_store() else {
                         return Ok(Response::new(RenameDataResponse {
                             success: false,
                             rename_data_resp: String::new(),
                             rename_data_resp_bin: Vec::new().into(),
-                            error: Some(DiskError::other(err.to_string()).into()),
+                            error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
                         }));
+                    };
+                    match store.acquire_scanner_publication_lease_guard(token).await {
+                        Ok(guard) => Some(Arc::new(guard)),
+                        Err(err) => {
+                            return Ok(Response::new(RenameDataResponse {
+                                success: false,
+                                rename_data_resp: String::new(),
+                                rename_data_resp_bin: Vec::new().into(),
+                                error: Some(DiskError::other(err.to_string()).into()),
+                            }));
+                        }
                     }
-                }
-            } else {
-                None
-            };
+                } else {
+                    None
+                };
             let request_decoded_from_msgpack = decoded_file_info.from_msgpack;
             match disk
-                .rename_data(
+                .rename_data_borrowed_with_fence_and_guard(
                     &request.src_volume,
                     &request.src_path,
                     &decoded_file_info.value,
                     &request.dst_volume,
                     &request.dst_path,
+                    scanner_publication_lease_token,
+                    scanner_publication_lease_guard,
                 )
                 .await
             {
@@ -1641,26 +1645,36 @@ impl NodeService {
             // The target-side guard spans the complete delete operation. A
             // lease expiry or movement transition cannot occur between this
             // validation and the disk delete linearization point.
-            let _scanner_publication_lease_guard = if let Some(token) = scanner_publication_lease_token {
-                let Some(store) = self.resolve_object_store() else {
-                    return Ok(Response::new(DeleteResponse {
-                        success: false,
-                        error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
-                    }));
-                };
-                match store.acquire_scanner_publication_lease_guard(token).await {
-                    Ok(guard) => Some(guard),
-                    Err(err) => {
+            let scanner_publication_lease_guard: Option<Arc<dyn Send + Sync>> =
+                if let Some(token) = scanner_publication_lease_token {
+                    let Some(store) = self.resolve_object_store() else {
                         return Ok(Response::new(DeleteResponse {
                             success: false,
-                            error: Some(DiskError::other(err.to_string()).into()),
+                            error: Some(DiskError::other("scanner publication lease owner is unavailable").into()),
                         }));
+                    };
+                    match store.acquire_scanner_publication_lease_guard(token).await {
+                        Ok(guard) => Some(Arc::new(guard)),
+                        Err(err) => {
+                            return Ok(Response::new(DeleteResponse {
+                                success: false,
+                                error: Some(DiskError::other(err.to_string()).into()),
+                            }));
+                        }
                     }
-                }
-            } else {
-                None
-            };
-            match disk.delete(&request.volume, &request.path, options).await {
+                } else {
+                    None
+                };
+            match disk
+                .delete_with_scanner_publication_lease_and_guard(
+                    &request.volume,
+                    &request.path,
+                    options,
+                    scanner_publication_lease_token,
+                    scanner_publication_lease_guard,
+                )
+                .await
+            {
                 Ok(_) => Ok(Response::new(DeleteResponse {
                     success: true,
                     error: None,
