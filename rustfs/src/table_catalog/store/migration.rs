@@ -301,6 +301,11 @@ where
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
         };
         validate_table_bucket_entry_object(&self.paths, &bucket_path, &table_bucket_entry)?;
+        if table_bucket_entry.active_rename_id.is_some() {
+            return Err(TableCatalogStoreError::Conflict(format!(
+                "table bucket {table_bucket} has a table rename requiring recovery"
+            )));
+        }
 
         let mut namespaces = Vec::new();
         let mut tables = Vec::new();
@@ -343,6 +348,9 @@ where
                 )));
             };
             validate_table_entry_object(&self.paths, table_object, &table_entry)?;
+            if table_entry.state != TableCatalogEntryState::Active {
+                continue;
+            }
 
             for commit_object in self
                 .backend
@@ -595,9 +603,10 @@ where
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<TableCatalogBackingMigrationDryRunReport> {
-        if self.get_table_bucket(table_bucket).await?.is_none() {
+        let Some(table_bucket_entry) = self.get_table_bucket(table_bucket).await? else {
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
-        }
+        };
+        let rename_recovery_required = table_bucket_entry.active_rename_id.is_some();
         if let Some((global_fence, _)) = self
             .read_entry::<TableCatalogBackingMigrationGlobalFence>(
                 self.catalog_bucket(),
@@ -653,18 +662,19 @@ where
                 continue;
             };
             validate_table_entry_object(&self.paths, &object, &table)?;
+            if table.state != TableCatalogEntryState::Active {
+                continue;
+            }
             table_count = table_count.saturating_add(1);
             if !table_ids.insert(table.table_id.clone()) {
                 duplicate_table_identity = true;
             }
-            if table.state == TableCatalogEntryState::Active {
-                active_table_identifiers.insert((table.namespace.clone(), table.table.clone()));
-                let warehouse_prefix = table_warehouse_object_prefix(&table)?;
-                warehouse_prefix_owners
-                    .entry(warehouse_prefix)
-                    .and_modify(|count| *count = count.saturating_add(1))
-                    .or_insert(1);
-            }
+            active_table_identifiers.insert((table.namespace.clone(), table.table.clone()));
+            let warehouse_prefix = table_warehouse_object_prefix(&table)?;
+            warehouse_prefix_owners
+                .entry(warehouse_prefix)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
 
             let recovery = self.table_commit_recovery_report_for_entry(&table, 0).await?;
             commit_log_count = commit_log_count.saturating_add(recovery.commits.len());
@@ -711,33 +721,41 @@ where
         let table_view_identifier_collision_count = active_table_identifiers.intersection(&active_view_identifiers).count();
         let mut blockers = Vec::new();
         let mut recommended_actions = Vec::new();
+        if rename_recovery_required {
+            blockers.push(TableCatalogBackingMigrationBlocker::TableRenameRecoveryRequired);
+            recommended_actions.push(TableCatalogBackingMigrationAction::RunCatalogRecovery);
+        }
         if recovery_required_count > 0 {
             blockers.push(TableCatalogBackingMigrationBlocker::CommitRecoveryRequired);
         }
         if manual_review_count > 0 {
             blockers.push(TableCatalogBackingMigrationBlocker::CommitManualReviewRequired);
         }
-        if recovery_required_count > 0 || manual_review_count > 0 {
+        if (recovery_required_count > 0 || manual_review_count > 0)
+            && !recommended_actions.contains(&TableCatalogBackingMigrationAction::RunCatalogRecovery)
+        {
             recommended_actions.push(TableCatalogBackingMigrationAction::RunCatalogRecovery);
         }
         if !warehouse_index_ready {
             blockers.push(TableCatalogBackingMigrationBlocker::WarehouseIndexBackfillRequired);
             recommended_actions.push(TableCatalogBackingMigrationAction::BackfillWarehouseIndex);
         }
-        if conflicting_warehouse_prefix {
+        if conflicting_warehouse_prefix && !rename_recovery_required {
             blockers.push(TableCatalogBackingMigrationBlocker::DuplicateWarehousePrefix);
             recommended_actions.push(TableCatalogBackingMigrationAction::ReviewDuplicateWarehousePrefixes);
         }
-        if duplicate_table_identity {
+        if duplicate_table_identity && !rename_recovery_required {
             blockers.push(TableCatalogBackingMigrationBlocker::DuplicateTableIdentity);
             recommended_actions.push(TableCatalogBackingMigrationAction::ReviewDuplicateTableIdentities);
         }
-        if table_view_identifier_collision_count > 0 {
+        if table_view_identifier_collision_count > 0 && !rename_recovery_required {
             blockers.push(TableCatalogBackingMigrationBlocker::TableViewIdentifierCollision);
             recommended_actions.push(TableCatalogBackingMigrationAction::ReviewTableViewIdentifierCollisions);
         }
 
-        let mut status = if manual_review_count > 0
+        let mut status = if rename_recovery_required {
+            TableCatalogBackingMigrationStatus::RecoveryRequired
+        } else if manual_review_count > 0
             || conflicting_warehouse_prefix
             || duplicate_table_identity
             || table_view_identifier_collision_count > 0

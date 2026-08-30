@@ -642,12 +642,26 @@ impl TestCatalogObjectBackend {
         let mut state = self.state.lock().await;
         let key = (bucket.to_string(), object.to_string());
         let next_attempt = state.put_attempts.get(&key).copied().unwrap_or_default() + 1;
+        Self::pause_put_attempt_unlocked(&mut state, key, next_attempt)
+    }
+
+    pub(crate) async fn pause_put_attempt(&self, bucket: &str, object: &str, attempt: usize) -> TestCatalogObjectPause {
+        let mut state = self.state.lock().await;
+        let key = (bucket.to_string(), object.to_string());
+        Self::pause_put_attempt_unlocked(&mut state, key, attempt)
+    }
+
+    fn pause_put_attempt_unlocked(
+        state: &mut TestCatalogObjectState,
+        key: (String, String),
+        attempt: usize,
+    ) -> TestCatalogObjectPause {
         let pause = TestCatalogObjectPause::default();
         state
             .pause_put_attempts
             .entry(key)
             .or_default()
-            .insert(next_attempt, pause.clone());
+            .insert(attempt, pause.clone());
         pause
     }
 
