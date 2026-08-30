@@ -1180,8 +1180,8 @@ mod prepared_get_object_metadata_tests {
     async fn two_phase_read_plan_uses_metadata_only_for_non_inline_get() {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
         let bucket = "two-phase-read-plan";
-        let object = "non-inline-object.bin";
-        let payload = vec![0x5a; 256 * 1024];
+        let object = object_with_initial_data_shards(bucket, "non-inline-object");
+        let payload = vec![0x5a; 2 * 1024 * 1024];
         let opts = ObjectOptions {
             no_lock: true,
             ..Default::default()
@@ -1193,7 +1193,7 @@ mod prepared_get_object_metadata_tests {
             .expect("bucket should be created");
         let mut put_reader = PutObjReader::from_vec(payload.clone());
         set_disks
-            .put_object(bucket, object, &mut put_reader, &opts)
+            .put_object(bucket, &object, &mut put_reader, &opts)
             .await
             .expect("object should be written");
 
@@ -1204,9 +1204,10 @@ mod prepared_get_object_metadata_tests {
                 ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
             ],
             async {
-                let calls = disk_call_counters::observe(object);
+                let calls = disk_call_counters::observe(&object);
+                reset_test_get_object_reader_path();
                 let mut reader = set_disks
-                    .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
                     .await
                     .expect("two-phase GET reader should open");
                 let mut restored = Vec::new();
@@ -1227,7 +1228,7 @@ mod prepared_get_object_metadata_tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
-    async fn two_phase_read_plan_hydrates_only_inline_data_shards() {
+    async fn two_phase_read_plan_preserves_inline_early_stop_path() {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
         let bucket = "two-phase-read-plan-inline";
         let object = object_with_initial_data_shards(bucket, "inline-object");
@@ -1266,10 +1267,12 @@ mod prepared_get_object_metadata_tests {
                     .await
                     .expect("two-phase inline GET body should stream");
                 assert_eq!(restored, payload);
-                assert!(
-                    calls.total(disk_call_counters::KIND_READ_VERSION) <= 6,
-                    "inline two-phase GET should hydrate only the data-shard slots"
+                assert_eq!(
+                    test_get_object_reader_path_id(),
+                    3,
+                    "inline GET should retain the direct inline reader path"
                 );
+                assert!(calls.total(disk_call_counters::KIND_READ_VERSION) <= 4);
             },
         )
         .await;

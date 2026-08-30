@@ -19,9 +19,8 @@ use super::{
     ReadOptions, Result, SetDisks, StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
     build_inline_bitrot_readers_from_refs, collect_inline_data_shard_fileinfos_by_index, debug, error,
     get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
-    is_codec_streaming_multipart_enabled, is_get_metadata_two_phase_read_plan_enabled,
-    is_multipart_reader_setup_prefetch_enabled, object_fits_single_block, reduce_read_quorum_errs, to_object_err,
-    try_read_inline_data_shards_direct, warn,
+    is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
+    reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
 };
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
@@ -44,7 +43,6 @@ use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHa
 use crate::set_disk::coding;
 use crate::set_disk::runtime_sources;
 use crate::set_disk::shard_source::ShardReadCost;
-use futures::future::join_all;
 use std::{
     future::Future,
     io::IoSlice,
@@ -129,6 +127,8 @@ use super::is_get_metadata_data_read_early_stop_enabled;
 use super::is_get_metadata_early_stop_bounded_fanout_enabled;
 #[cfg(test)]
 use super::is_get_metadata_early_stop_enabled;
+#[cfg(test)]
+use super::is_get_metadata_two_phase_read_plan_enabled;
 #[cfg(test)]
 use super::is_version_early_stop_enabled;
 #[cfg(test)]
@@ -399,11 +399,6 @@ impl SetDisks {
     ) -> Result<GetObjectFileInfo> {
         let allow_read_version_coalescing = !crate::bucket::utils::is_meta_bucketname(bucket)
             && crate::runtime::global::get_metadata_read_version_coalescing_service_ready();
-        if read_data && caller_allows_early_stop && is_get_metadata_two_phase_read_plan_enabled() {
-            return self
-                .get_object_fileinfo_two_phase_read_plan(bucket, object, opts, allow_read_version_coalescing)
-                .await;
-        }
         self.get_object_fileinfo_gated_inner(
             bucket,
             object,
@@ -413,175 +408,6 @@ impl SetDisks {
             allow_read_version_coalescing,
         )
         .await
-    }
-
-    /// Resolve a safe metadata candidate first, then fetch inline payload only
-    /// from the data-shard slots required by that candidate. Non-inline
-    /// objects never need a second read-data fanout. Any identity, geometry,
-    /// or data-shard quorum mismatch falls back to the established full
-    /// read-data path before returning a snapshot.
-    async fn get_object_fileinfo_two_phase_read_plan(
-        &self,
-        bucket: &str,
-        object: &str,
-        opts: &ObjectOptions,
-        allow_read_version_coalescing: bool,
-    ) -> Result<GetObjectFileInfo> {
-        let metadata_snapshot = self
-            .get_object_fileinfo_gated_inner(bucket, object, opts, false, true, allow_read_version_coalescing)
-            .await?;
-
-        if !metadata_snapshot.fi().inline_data() {
-            if Self::metadata_snapshot_covers_all_data_shards(&metadata_snapshot) {
-                return Ok(metadata_snapshot);
-            }
-            return self
-                .get_object_fileinfo_gated_inner(bucket, object, opts, true, true, allow_read_version_coalescing)
-                .await;
-        }
-
-        let (mut fi, mut parts_metadata, mut online_disks) = metadata_snapshot.into_owned();
-        let Ok(erasure) = coding::Erasure::try_new_with_options(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-            fi.uses_legacy_checksum,
-        ) else {
-            return self
-                .get_object_fileinfo_gated_inner(bucket, object, opts, true, true, allow_read_version_coalescing)
-                .await;
-        };
-        let data_shards = erasure.data_shards;
-        if data_shards == 0 || fi.erasure.distribution.len() < self.set_drive_count {
-            return self
-                .get_object_fileinfo_gated_inner(bucket, object, opts, true, true, allow_read_version_coalescing)
-                .await;
-        }
-
-        let read_version = fi
-            .version_id
-            .filter(|version| !version.is_nil())
-            .map(|version| version.to_string())
-            .unwrap_or_default();
-        let read_opts = ReadOptions {
-            read_data: true,
-            incl_free_versions: opts.incl_free_versions,
-            healing: false,
-        };
-        let disks = self.disks.read().await.clone();
-        let mut read_tasks = Vec::with_capacity(data_shards);
-        let mut requested_data_shards = vec![false; data_shards];
-        let mut failed = false;
-
-        for (disk_index, disk) in disks.iter().enumerate() {
-            let Some(&erasure_index) = fi.erasure.distribution.get(disk_index) else {
-                failed = true;
-                break;
-            };
-            if erasure_index == 0 || erasure_index > data_shards {
-                continue;
-            }
-            let data_slot = erasure_index - 1;
-            if requested_data_shards[data_slot] {
-                failed = true;
-                break;
-            }
-            requested_data_shards[data_slot] = true;
-            let Some(disk) = disk.clone() else {
-                failed = true;
-                break;
-            };
-
-            let bucket = bucket.to_owned();
-            let object = object.to_owned();
-            let read_version = read_version.clone();
-            read_tasks.push(async move {
-                (
-                    disk_index,
-                    erasure_index,
-                    disk.clone(),
-                    disk.read_version("", &bucket, &object, &read_version, &read_opts).await,
-                )
-            });
-        }
-
-        if requested_data_shards.iter().any(|requested| !requested) {
-            failed = true;
-        }
-
-        let mut hydrated_data_shards = 0usize;
-        for (disk_index, erasure_index, disk, result) in join_all(read_tasks).await {
-            match result {
-                Ok(data_file_info)
-                    if data_file_info.erasure.index == erasure_index
-                        && metadata_early_stop_candidate_matches(&data_file_info, &fi)
-                        && data_file_info.data.as_ref().is_some_and(|data| !data.is_empty()) =>
-                {
-                    if let Some(slot) = parts_metadata.get_mut(disk_index) {
-                        *slot = data_file_info;
-                        hydrated_data_shards = hydrated_data_shards.saturating_add(1);
-                        if let Some(online_slot) = online_disks.get_mut(disk_index) {
-                            *online_slot = Some(disk);
-                        } else {
-                            failed = true;
-                        }
-                    } else {
-                        failed = true;
-                    }
-                }
-                _ => {
-                    failed = true;
-                }
-            }
-        }
-
-        if failed || hydrated_data_shards < data_shards {
-            return self
-                .get_object_fileinfo_gated_inner(bucket, object, opts, true, true, allow_read_version_coalescing)
-                .await;
-        }
-
-        fi.data = parts_metadata
-            .iter()
-            .filter(|file_info| file_info.erasure.index > 0 && file_info.erasure.index <= data_shards)
-            .find_map(|file_info| file_info.data.clone());
-        if fi.data.is_none() {
-            return self
-                .get_object_fileinfo_gated_inner(bucket, object, opts, true, true, allow_read_version_coalescing)
-                .await;
-        }
-
-        Ok(GetObjectFileInfo::owned(fi, parts_metadata, online_disks))
-    }
-
-    fn metadata_snapshot_covers_all_data_shards(snapshot: &GetObjectFileInfo) -> bool {
-        let fi = snapshot.fi();
-        let Ok(erasure) = coding::Erasure::try_new_with_options(
-            fi.erasure.data_blocks,
-            fi.erasure.parity_blocks,
-            fi.erasure.block_size,
-            fi.uses_legacy_checksum,
-        ) else {
-            return false;
-        };
-        let mut data_shards = vec![false; erasure.data_shards];
-        for ((file_info, disk), &erasure_index) in snapshot
-            .parts_metadata()
-            .iter()
-            .zip(snapshot.online_disks())
-            .zip(fi.erasure.distribution.iter())
-        {
-            if erasure_index == 0 || erasure_index > erasure.data_shards || disk.is_none() {
-                continue;
-            }
-            if metadata_early_stop_candidate_matches(file_info, fi)
-                && file_info.erasure.index == erasure_index
-                && file_info.name == fi.name
-            {
-                data_shards[erasure_index - 1] = true;
-            }
-        }
-        data_shards.into_iter().all(|present| present)
     }
 
     /// Like `get_object_fileinfo`, but `allow_early_stop=false` forces the full
