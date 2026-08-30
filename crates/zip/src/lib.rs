@@ -47,7 +47,10 @@ pub struct ArchiveLimits {
     pub max_entries: usize,
     pub max_entry_size: u64,
     pub max_total_unpacked_size: u64,
+    pub max_decoded_size: u64,
     pub max_path_length: usize,
+    pub max_pax_metadata_size: u64,
+    pub max_total_pax_metadata_size: u64,
     pub validate_entry_paths: bool,
 }
 
@@ -57,7 +60,10 @@ impl Default for ArchiveLimits {
             max_entries: 100_000,
             max_entry_size: 1_073_741_824,
             max_total_unpacked_size: 10_737_418_240,
+            max_decoded_size: 11_811_160_064,
             max_path_length: 1024,
+            max_pax_metadata_size: 1_048_576,
+            max_total_pax_metadata_size: 67_108_864,
             validate_entry_paths: true,
         }
     }

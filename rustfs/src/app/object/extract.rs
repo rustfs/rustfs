@@ -79,6 +79,52 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
     }
 }
 
+pin_project! {
+    struct ExtractDecodedLimitReader<R> {
+        #[pin]
+        inner: R,
+        remaining: u64,
+    }
+}
+
+impl<R> ExtractDecodedLimitReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self { inner, remaining: limit }
+    }
+}
+
+impl<R: AsyncRead> AsyncRead for ExtractDecodedLimitReader<R> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let mut this = self.project();
+        let allowed = this.remaining.saturating_add(1);
+        let max_read = usize::try_from(allowed).unwrap_or(usize::MAX).min(buf.remaining());
+        let read_len = {
+            let unfilled = buf.initialize_unfilled_to(max_read);
+            let mut limited = ReadBuf::new(unfilled);
+            match this.inner.as_mut().poll_read(cx, &mut limited) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Ok(())) => limited.filled().len(),
+            }
+        };
+        let read = u64::try_from(read_len).unwrap_or(u64::MAX);
+        if read > *this.remaining {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "archive decoded size exceeds limit",
+            )));
+        }
+
+        *this.remaining -= read;
+        buf.advance(read_len);
+        Poll::Ready(Ok(()))
+    }
+}
+
 const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
 
 #[cfg(test)]
@@ -202,6 +248,118 @@ fn map_extract_archive_error(err: impl std::fmt::Display) -> S3Error {
     s3_error!(InvalidArgument, "Failed to process archive entry: {}", err)
 }
 
+#[derive(Debug)]
+enum ExtractEntryError {
+    Fatal(S3Error),
+    Recoverable(S3Error),
+}
+
+impl ExtractEntryError {
+    #[cfg(test)]
+    fn into_s3_error(self) -> S3Error {
+        match self {
+            Self::Fatal(err) | Self::Recoverable(err) => err,
+        }
+    }
+
+    fn ignore_or_return(self, ignore_errors: bool) -> S3Result<()> {
+        match self {
+            Self::Recoverable(_) if ignore_errors => Ok(()),
+            Self::Fatal(err) | Self::Recoverable(err) => Err(err),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_recoverable(&self) -> bool {
+        matches!(self, Self::Recoverable(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtractEntryDisposition {
+    File,
+    Directory,
+    FormatSkip,
+}
+
+fn classify_extract_entry_type(entry_type: tokio_tar::EntryType) -> ExtractEntryDisposition {
+    use tokio_tar::EntryType;
+
+    match entry_type {
+        EntryType::Regular | EntryType::Char | EntryType::Block | EntryType::Fifo | EntryType::GNUSparse => {
+            ExtractEntryDisposition::File
+        }
+        EntryType::Directory => ExtractEntryDisposition::Directory,
+        EntryType::Link
+        | EntryType::Symlink
+        | EntryType::GNULongName
+        | EntryType::GNULongLink
+        | EntryType::Continuous
+        | EntryType::XGlobalHeader
+        | EntryType::XHeader
+        | EntryType::SolarisXHeader
+        | EntryType::Other(_) => ExtractEntryDisposition::FormatSkip,
+        _ => ExtractEntryDisposition::FormatSkip,
+    }
+}
+
+fn extract_entry_quota_growth(disposition: ExtractEntryDisposition, entry_size: u64) -> u64 {
+    match disposition {
+        ExtractEntryDisposition::File => entry_size,
+        ExtractEntryDisposition::Directory | ExtractEntryDisposition::FormatSkip => 0,
+    }
+}
+
+fn strict_extract_entry_path(path: &[u8]) -> Result<&str, ExtractEntryError> {
+    std::str::from_utf8(path)
+        .map_err(|_| ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Archive entry path must be valid UTF-8")))
+}
+
+fn is_empty_extract_entry_path(path: &str) -> bool {
+    path.is_empty() || path == "." || path == "./"
+}
+
+fn validate_extract_member_key(path: &str, limits: ArchiveLimits) -> Result<(), ExtractEntryError> {
+    validate_put_object_extract_entry_path(path, limits).map_err(ExtractEntryError::Recoverable)?;
+    validate_object_key(path, "PUT").map_err(ExtractEntryError::Recoverable)
+}
+
+fn record_extract_pax_metadata_bytes(
+    entry_size: &mut u64,
+    total_size: &mut u64,
+    key_size: usize,
+    value_size: usize,
+    limits: ArchiveLimits,
+) -> Result<(), ExtractEntryError> {
+    let record_size = key_size
+        .checked_add(value_size)
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| {
+            ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive PAX metadata size overflowed while processing entry"))
+        })?;
+    *entry_size = (*entry_size).checked_add(record_size).ok_or_else(|| {
+        ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive PAX metadata size overflowed while processing entry"))
+    })?;
+    *total_size = (*total_size)
+        .checked_add(record_size)
+        .ok_or_else(|| ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive total PAX metadata size overflowed")))?;
+
+    if *entry_size > limits.max_pax_metadata_size {
+        return Err(ExtractEntryError::Fatal(s3_error!(
+            InvalidArgument,
+            "Archive PAX metadata exceeds per-entry limit"
+        )));
+    }
+    if *total_size > limits.max_total_pax_metadata_size {
+        return Err(ExtractEntryError::Fatal(s3_error!(
+            InvalidArgument,
+            "Archive total PAX metadata exceeds limit"
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct ExtractEntryPaxAuthorization {
     headers: HeaderMap,
@@ -217,27 +375,47 @@ async fn apply_extract_entry_pax_extensions<R>(
     object_lock_config_state: &metadata_sys::ObjectLockConfigState,
     metadata: &mut HashMap<String, String>,
     opts: &mut ObjectOptions,
-) -> S3Result<ExtractEntryPaxAuthorization>
+    total_pax_metadata_size: &mut u64,
+    limits: ArchiveLimits,
+) -> Result<ExtractEntryPaxAuthorization, ExtractEntryError>
 where
     R: AsyncRead + Send + Unpin + 'static,
 {
-    let Some(extensions) = entry.pax_extensions().await.map_err(map_extract_archive_error)? else {
+    let Some(extensions) = entry
+        .pax_extensions()
+        .await
+        .map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?
+    else {
         return Ok(ExtractEntryPaxAuthorization::default());
     };
 
     let mut pax_headers = HeaderMap::new();
     let mut pax_version_id = None;
+    let mut entry_pax_metadata_size = 0u64;
     for ext in extensions {
-        let ext = ext.map_err(map_extract_archive_error)?;
-        let key = ext.key().map_err(map_extract_archive_error)?;
-        let value = ext.value().map_err(map_extract_archive_error)?;
+        let ext = ext.map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
+        record_extract_pax_metadata_bytes(
+            &mut entry_pax_metadata_size,
+            total_pax_metadata_size,
+            ext.key_bytes().len(),
+            ext.value_bytes().len(),
+            limits,
+        )?;
+        let key = ext
+            .key()
+            .map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
+        let value = ext
+            .value()
+            .map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
 
         if let Some(meta_key) = key.strip_prefix("minio.metadata.") {
             if !meta_key.is_empty() {
-                let name = http::HeaderName::from_bytes(meta_key.as_bytes())
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball PAX metadata header"))?;
-                let header_value = HeaderValue::from_str(value)
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball PAX metadata value"))?;
+                let name = http::HeaderName::from_bytes(meta_key.as_bytes()).map_err(|_| {
+                    ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball PAX metadata header"))
+                })?;
+                let header_value = HeaderValue::from_str(value).map_err(|_| {
+                    ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball PAX metadata value"))
+                })?;
                 preserve_unclassified_user_metadata(metadata, name.as_str(), value);
                 pax_headers.insert(name, header_value);
             }
@@ -246,7 +424,10 @@ where
 
         if key == "minio.versionId" && !value.is_empty() {
             if Uuid::parse_str(value).is_err() {
-                return Err(s3_error!(InvalidArgument, "Invalid Snowball PAX version ID"));
+                return Err(ExtractEntryError::Recoverable(s3_error!(
+                    InvalidArgument,
+                    "Invalid Snowball PAX version ID"
+                )));
             }
             pax_version_id = Some(value.to_string());
         }
@@ -256,9 +437,12 @@ where
     if let Some(value) = pax_headers.get(AMZ_BUCKET_REPLICATION_STATUS) {
         let status = value
             .to_str()
-            .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball replication status"))?;
+            .map_err(|_| ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball replication status")))?;
         if !status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()) {
-            return Err(s3_error!(InvalidArgument, "Invalid Snowball replication status"));
+            return Err(ExtractEntryError::Recoverable(s3_error!(
+                InvalidArgument,
+                "Invalid Snowball replication status"
+            )));
         }
         pax_headers.insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
     }
@@ -268,7 +452,7 @@ where
     if let Some(value) = pax_headers.remove("x-amz-tagging") {
         let value = value
             .to_str()
-            .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball object tagging value"))?;
+            .map_err(|_| ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball object tagging value")))?;
         metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), value.to_owned());
     }
 
@@ -278,18 +462,18 @@ where
             value
                 .to_str()
                 .map(|value| ObjectLockMode::from(value.to_string()))
-                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode"))
+                .map_err(|_| ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode")))
         })
         .transpose()?;
     let object_lock_retain_until_date = pax_headers
         .remove(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
         .map(|value| {
-            let value = value
-                .to_str()
-                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))?;
-            OffsetDateTime::parse(value, &Rfc3339)
-                .map(Timestamp::from)
-                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
+            let value = value.to_str().map_err(|_| {
+                ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
+            })?;
+            OffsetDateTime::parse(value, &Rfc3339).map(Timestamp::from).map_err(|_| {
+                ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
+            })
         })
         .transpose()?;
     let object_lock_legal_hold_status = pax_headers
@@ -298,7 +482,9 @@ where
             value
                 .to_str()
                 .map(|value| ObjectLockLegalHoldStatus::from(value.to_string()))
-                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status"))
+                .map_err(|_| {
+                    ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status"))
+                })
         })
         .transpose()?;
     opts.version_id = pax_version_id;
@@ -317,7 +503,9 @@ where
         object_lock_legal_hold_status.clone(),
         object_lock_mode.clone(),
         object_lock_retain_until_date.clone(),
-    )? {
+    )
+    .map_err(ExtractEntryError::Recoverable)?
+    {
         metadata.extend(object_lock_metadata);
     }
 
@@ -327,6 +515,32 @@ where
         object_lock_mode,
         object_lock_retain_until_date,
     })
+}
+
+#[cfg(test)]
+async fn apply_extract_entry_pax_extensions_for_test<R>(
+    entry: &mut tokio_tar::Entry<Archive<R>>,
+    bucket: &str,
+    object_name: &str,
+    object_lock_config_state: &metadata_sys::ObjectLockConfigState,
+    metadata: &mut HashMap<String, String>,
+    opts: &mut ObjectOptions,
+) -> Result<ExtractEntryPaxAuthorization, ExtractEntryError>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    let mut total_pax_metadata_size = 0;
+    apply_extract_entry_pax_extensions(
+        entry,
+        bucket,
+        object_name,
+        object_lock_config_state,
+        metadata,
+        opts,
+        &mut total_pax_metadata_size,
+        ArchiveLimits::default(),
+    )
+    .await
 }
 
 fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObjectExtractOptions> {
@@ -493,6 +707,14 @@ impl DefaultObjectUsecase {
             true,
         )?;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
+        let body = guard_put_object_body_read_timeout(
+            body,
+            &bucket,
+            &key,
+            &request_context.request_id,
+            content_length,
+            put_object_body_read_timeout(),
+        );
 
         let size = match content_length {
             Some(c) => c,
@@ -553,12 +775,14 @@ impl DefaultObjectUsecase {
         }
 
         let archive_etag = Arc::new(Mutex::new(None));
+        let extract_limits = put_object_extract_limits();
         let decoder = CompressionFormat::from_extension(&ext)
             .get_decoder(ExtractArchiveEtagReader::new(archive_reader, archive_etag.clone()))
             .map_err(|e| {
                 error!(error = ?e, "Archive decoder creation failed");
                 s3_error!(InvalidArgument, "get_decoder err")
             })?;
+        let decoder = ExtractDecodedLimitReader::new(decoder, extract_limits.max_decoded_size);
 
         let mut ar = Archive::new(decoder);
         let mut entries = ar.entries().map_err(|e| {
@@ -571,7 +795,6 @@ impl DefaultObjectUsecase {
         };
 
         let extract_options = resolve_put_object_extract_options(&req.headers)?;
-        let extract_limits = put_object_extract_limits();
         let extract_quota_check = if let Some(metadata_sys) = self.bucket_metadata_sys() {
             let quota_checker = QuotaChecker::new(metadata_sys);
             let check_result =
@@ -595,7 +818,9 @@ impl DefaultObjectUsecase {
         let user_agent = get_request_user_agent(&req.headers);
         let mut wrote_any_entry = false;
         let mut extracted_entry_count = 0usize;
-        let mut total_unpacked_size = 0u64;
+        let mut resource_total_size = 0u64;
+        let mut legacy_quota_growth = 0u64;
+        let mut total_pax_metadata_size = 0u64;
         let object_lock_config_snapshot = store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?;
         let object_lock_config_state = object_lock_config_snapshot.state();
 
@@ -603,40 +828,43 @@ impl DefaultObjectUsecase {
             let mut f = match entry {
                 Ok(f) => f,
                 Err(e) => {
-                    if extract_options.ignore_errors {
-                        warn!(error = %e, "Archive entry read skipped due to ignore-errors");
-                        continue;
-                    }
                     error!(error = %e, "Archive entry read failed");
                     return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", e));
                 }
             };
             extracted_entry_count = extracted_entry_count.saturating_add(1);
             validate_put_object_extract_entry_count(extracted_entry_count, extract_limits)?;
+            let entry_size = f.effective_size();
+            validate_put_object_extract_entry_size("archive member", entry_size, extract_limits)?;
+            resource_total_size = resource_total_size
+                .checked_add(entry_size)
+                .ok_or_else(|| s3_error!(InvalidArgument, "Archive total unpacked size overflowed while processing entries"))?;
+            validate_put_object_extract_total_size(resource_total_size, extract_limits)?;
 
-            let fpath = match f.path() {
-                Ok(path) => path,
-                Err(e) => {
-                    if extract_options.ignore_errors {
-                        warn!(error = %e, "Archive path decode skipped due to ignore-errors");
+            let entry_type = classify_extract_entry_type(f.header().entry_type());
+            if entry_type == ExtractEntryDisposition::FormatSkip {
+                continue;
+            }
+            let is_dir = entry_type == ExtractEntryDisposition::Directory;
+            let fpath = {
+                let path_bytes = f.path_bytes().map_err(map_extract_archive_error)?;
+                let path = match strict_extract_entry_path(path_bytes.as_ref()) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        err.ignore_or_return(extract_options.ignore_errors)?;
                         continue;
                     }
-                    return Err(s3_error!(InvalidArgument, "Failed to decode archive entry path"));
+                };
+                if is_empty_extract_entry_path(path) {
+                    continue;
                 }
+                normalize_extract_entry_key(path, extract_options.prefix.as_deref(), is_dir)?
             };
 
-            let is_dir = f.header().entry_type().is_dir();
-            let fpath = match normalize_extract_entry_key(&fpath.to_string_lossy(), extract_options.prefix.as_deref(), is_dir) {
-                Ok(fpath) => fpath,
-                Err(err) => {
-                    if extract_options.ignore_errors {
-                        warn!(error = %err, "Unsafe archive path skipped due to ignore-errors");
-                        continue;
-                    }
-                    return Err(err);
-                }
-            };
-            validate_put_object_extract_entry_path(&fpath, extract_limits)?;
+            if let Err(err) = validate_extract_member_key(&fpath, extract_limits) {
+                err.ignore_or_return(extract_options.ignore_errors)?;
+                continue;
+            }
             validate_table_catalog_object_mutation(&bucket, &fpath).await?;
 
             let mut auth_req = S3Request {
@@ -656,26 +884,22 @@ impl DefaultObjectUsecase {
                 req_info.object = Some(fpath.clone());
                 req_info.version_id = None;
             }
-            let entry_size = f.effective_size();
-            validate_put_object_extract_entry_size(&fpath, entry_size, extract_limits)?;
-            total_unpacked_size = total_unpacked_size
-                .checked_add(entry_size)
-                .ok_or_else(|| s3_error!(InvalidArgument, "Archive total unpacked size overflowed while processing entries"))?;
-            validate_put_object_extract_total_size(total_unpacked_size, extract_limits)?;
-            if let Some(quota_check) = extract_quota_check.as_ref() {
-                ensure_legacy_archive_size_within_quota(quota_check, total_unpacked_size)?;
-            }
             let mut size =
                 i64::try_from(entry_size).map_err(|_| s3_error!(InvalidArgument, "Archive entry size does not fit into i64"))?;
             // mtime 0 means "unset" in tar headers, and xl.meta cannot represent an
             // epoch mod_time anyway (0 nanos decodes as no-mod_time, making the version
             // unreadable — rustfs#4842), so fall back to the upload time instead.
-            let archive_entry_mod_time = f
-                .header()
-                .mtime()
-                .ok()
-                .filter(|&modified_at_secs| modified_at_secs > 0)
-                .and_then(|modified_at_secs| OffsetDateTime::from_unix_timestamp(modified_at_secs as i64).ok());
+            let modified_at_secs = f.header().mtime().map_err(map_extract_archive_error)?;
+            let archive_entry_mod_time = if modified_at_secs == 0 {
+                None
+            } else {
+                let modified_at_secs = i64::try_from(modified_at_secs)
+                    .map_err(|_| s3_error!(InvalidArgument, "Archive entry modification time is out of range"))?;
+                Some(
+                    OffsetDateTime::from_unix_timestamp(modified_at_secs)
+                        .map_err(|_| s3_error!(InvalidArgument, "Archive entry modification time is out of range"))?,
+                )
+            };
             let mut metadata = HashMap::new();
             let has_explicit_object_lock_retention = object_lock_mode.is_some() || object_lock_retain_until_date.is_some();
             apply_put_request_metadata(
@@ -713,9 +937,31 @@ impl DefaultObjectUsecase {
             }
             opts.expected_bucket_incarnation_id = expected_bucket_incarnation_id;
             opts.object_lock_config_snapshot = Some(Arc::clone(&object_lock_config_snapshot));
-            let pax_authorization =
-                apply_extract_entry_pax_extensions(&mut f, &bucket, &fpath, object_lock_config_state, &mut metadata, &mut opts)
-                    .await?;
+            let pax_authorization = match apply_extract_entry_pax_extensions(
+                &mut f,
+                &bucket,
+                &fpath,
+                object_lock_config_state,
+                &mut metadata,
+                &mut opts,
+                &mut total_pax_metadata_size,
+                extract_limits,
+            )
+            .await
+            {
+                Ok(authorization) => authorization,
+                Err(err) => {
+                    err.ignore_or_return(extract_options.ignore_errors)?;
+                    continue;
+                }
+            };
+            if let Some(quota_check) = extract_quota_check.as_ref() {
+                let next_legacy_quota_growth = legacy_quota_growth
+                    .checked_add(extract_entry_quota_growth(entry_type, entry_size))
+                    .ok_or_else(|| s3_error!(InvalidArgument, "Archive quota growth overflowed while processing entries"))?;
+                ensure_legacy_archive_size_within_quota(quota_check, next_legacy_quota_growth)?;
+                legacy_quota_growth = next_legacy_quota_growth;
+            }
             for (name, value) in &pax_authorization.headers {
                 auth_req.headers.insert(name.clone(), value.clone());
             }
@@ -841,33 +1087,29 @@ impl DefaultObjectUsecase {
             let cache_adapter = self.object_data_cache();
             let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &fpath).await;
 
-            let (obj_info, backfilled_old_current_size) = match store
+            let (obj_info, backfilled_old_current_size) = store
                 .put_object_with_old_current_size(&bucket, &fpath, &mut reader, &opts)
                 .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    if extract_options.ignore_errors {
-                        warn!(error = %e, "Archive object write skipped due to ignore-errors");
-                        continue;
-                    }
-                    return Err(ApiError::from(e).into());
-                }
-            };
-            let committed_size = quota_accounting_object_size(&obj_info, extract_quota_enabled)?;
+                .map_err(ApiError::from)?;
             let extract_versioned = BucketVersioningSys::prefix_enabled(&bucket, &fpath).await;
-            match previous_current_size_from_backfill(backfilled_old_current_size) {
-                Some(previous_current_size) => {
-                    if extract_versioned {
-                        record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-                    } else {
-                        record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+            let post_commit_error = match quota_accounting_object_size(&obj_info, extract_quota_enabled) {
+                Ok(committed_size) => {
+                    match previous_current_size_from_backfill(backfilled_old_current_size) {
+                        Some(previous_current_size) => {
+                            if extract_versioned {
+                                record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                            } else {
+                                record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                            }
+                        }
+                        None => {
+                            record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, extract_versioned).await;
+                        }
                     }
+                    None
                 }
-                None => {
-                    record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, extract_versioned).await;
-                }
-            }
+                Err(err) => Some(err),
+            };
             let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &fpath).await;
 
             // Reuse the per-entry pre-commit decision (see `dsc` above) so the
@@ -907,6 +1149,10 @@ impl DefaultObjectUsecase {
             spawn_background_with_context(Some(request_context.clone()), async move {
                 notify.notify(event_args).await;
             });
+
+            if let Some(err) = post_commit_error {
+                return Err(err);
+            }
         }
 
         let mut checksums = PutObjectChecksums {
@@ -961,6 +1207,7 @@ mod tests {
     use super::*;
     use http::{HeaderMap, HeaderName, HeaderValue};
     use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
+    use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
@@ -1009,9 +1256,10 @@ mod tests {
             updated_at: OffsetDateTime::now_utc(),
         };
 
-        let err = apply_extract_entry_pax_extensions(&mut entry, "bucket", "object", &state, &mut metadata, &mut opts)
+        let err = apply_extract_entry_pax_extensions_for_test(&mut entry, "bucket", "object", &state, &mut metadata, &mut opts)
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .into_s3_error();
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert_eq!(metadata.get(AMZ_OBJECT_LOCK_MODE_LOWER).map(String::as_str), Some("COMPLIANCE"));
@@ -1061,10 +1309,16 @@ mod tests {
             let mut entry = entries.next().await.unwrap().unwrap();
 
             let mut opts = ObjectOptions::default();
-            let authorization =
-                apply_extract_entry_pax_extensions(&mut entry, "bucket", "object", &state, &mut HashMap::new(), &mut opts)
-                    .await
-                    .unwrap();
+            let authorization = apply_extract_entry_pax_extensions_for_test(
+                &mut entry,
+                "bucket",
+                "object",
+                &state,
+                &mut HashMap::new(),
+                &mut opts,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(
                 (
@@ -1129,8 +1383,7 @@ mod tests {
             let mut archive = Archive::new(std::io::Cursor::new(builder.into_inner().await.unwrap()));
             let mut entries = archive.entries().unwrap();
             let mut entry = entries.next().await.unwrap().unwrap();
-
-            let err = apply_extract_entry_pax_extensions(
+            let err = apply_extract_entry_pax_extensions_for_test(
                 &mut entry,
                 "bucket",
                 "object",
@@ -1139,7 +1392,8 @@ mod tests {
                 &mut ObjectOptions::default(),
             )
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .into_s3_error();
 
             assert!(
                 err.code() == &S3ErrorCode::InvalidArgument || err.code() == &S3ErrorCode::MalformedXML,
@@ -1185,7 +1439,7 @@ mod tests {
         };
 
         let authorization =
-            apply_extract_entry_pax_extensions(&mut entry, "bucket", "object.txt", &state, &mut metadata, &mut opts)
+            apply_extract_entry_pax_extensions_for_test(&mut entry, "bucket", "object.txt", &state, &mut metadata, &mut opts)
                 .await
                 .unwrap();
 
@@ -1227,8 +1481,7 @@ mod tests {
         let mut entries = archive.entries().unwrap();
         let mut entry = entries.next().await.unwrap().unwrap();
         let mut metadata = HashMap::new();
-
-        let err = apply_extract_entry_pax_extensions(
+        let err = apply_extract_entry_pax_extensions_for_test(
             &mut entry,
             "bucket",
             "object",
@@ -1237,7 +1490,8 @@ mod tests {
             &mut ObjectOptions::default(),
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .into_s3_error();
 
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
@@ -1266,8 +1520,7 @@ mod tests {
             },
             updated_at: OffsetDateTime::now_utc(),
         };
-
-        let err = apply_extract_entry_pax_extensions(
+        let err = apply_extract_entry_pax_extensions_for_test(
             &mut entry,
             "bucket",
             "object",
@@ -1276,7 +1529,8 @@ mod tests {
             &mut ObjectOptions::default(),
         )
         .await
-        .unwrap_err();
+        .unwrap_err()
+        .into_s3_error();
 
         assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
         assert!(!metadata.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
@@ -1481,6 +1735,123 @@ mod tests {
 
         let err = validate_put_object_extract_entry_path("toolong-path", limits).unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn extract_entry_error_boundary_only_ignores_recoverable_members() {
+        let recoverable = ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "invalid member"));
+        recoverable
+            .ignore_or_return(true)
+            .expect("recoverable member should be skipped");
+
+        let recoverable = ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "invalid member"));
+        assert_eq!(
+            recoverable
+                .ignore_or_return(false)
+                .expect_err("recoverable member should fail without ignore-errors")
+                .code(),
+            &S3ErrorCode::InvalidArgument
+        );
+
+        let fatal = ExtractEntryError::Fatal(s3_error!(InvalidArgument, "invalid archive"));
+        assert_eq!(
+            fatal
+                .ignore_or_return(true)
+                .expect_err("fatal archive errors must ignore ignore-errors")
+                .code(),
+            &S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn strict_extract_entry_path_rejects_non_utf8_without_lossy_replacement() {
+        let invalid = strict_extract_entry_path(b"same-\xff-key").expect_err("non-UTF-8 member path must be rejected");
+        assert!(invalid.is_recoverable());
+        invalid
+            .ignore_or_return(true)
+            .expect("ignore-errors should skip an invalid member key");
+    }
+
+    #[test]
+    fn classify_extract_entry_type_skips_links_extensions_and_continuous_entries() {
+        assert_eq!(classify_extract_entry_type(EntryType::Regular), ExtractEntryDisposition::File);
+        assert_eq!(classify_extract_entry_type(EntryType::Directory), ExtractEntryDisposition::Directory);
+        for entry_type in [
+            EntryType::Link,
+            EntryType::Symlink,
+            EntryType::Continuous,
+            EntryType::XGlobalHeader,
+            EntryType::Other(b'V'),
+        ] {
+            assert_eq!(
+                classify_extract_entry_type(entry_type),
+                ExtractEntryDisposition::FormatSkip,
+                "{entry_type:?} must not be materialized as an object"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_entry_quota_growth_counts_only_materialized_files() {
+        assert_eq!(extract_entry_quota_growth(ExtractEntryDisposition::File, 9), 9);
+        assert_eq!(extract_entry_quota_growth(ExtractEntryDisposition::Directory, 9), 0);
+        assert_eq!(extract_entry_quota_growth(ExtractEntryDisposition::FormatSkip, 9), 0);
+    }
+
+    #[test]
+    fn pax_metadata_budget_is_fatal_even_with_ignore_errors() {
+        let limits = ArchiveLimits {
+            max_pax_metadata_size: 3,
+            ..ArchiveLimits::default()
+        };
+        let mut entry_size = 0;
+        let mut total_size = 0;
+        let err = record_extract_pax_metadata_bytes(&mut entry_size, &mut total_size, 2, 2, limits)
+            .expect_err("PAX metadata over the resource budget must fail");
+        assert!(!err.is_recoverable());
+        assert!(err.ignore_or_return(true).is_err(), "ignore-errors must not bypass resource limits");
+    }
+
+    #[tokio::test]
+    async fn extract_decoded_reader_enforces_exact_byte_limit() {
+        let mut exact = ExtractDecodedLimitReader::new(std::io::Cursor::new(b"1234"), 4);
+        let mut exact_bytes = Vec::new();
+        exact
+            .read_to_end(&mut exact_bytes)
+            .await
+            .expect("decoded stream at the limit should succeed");
+        assert_eq!(exact_bytes, b"1234");
+
+        let mut oversized = ExtractDecodedLimitReader::new(std::io::Cursor::new(b"12345"), 4);
+        let mut oversized_bytes = Vec::new();
+        let err = oversized
+            .read_to_end(&mut oversized_bytes)
+            .await
+            .expect_err("decoded stream over the limit must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn snowball_extract_body_guard_aborts_stalled_upload() {
+        let body = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
+        let mut guarded = guard_put_object_body_read_timeout(
+            body,
+            "test-bucket",
+            "archive.tar",
+            "snowball-timeout",
+            Some(512),
+            Duration::from_millis(1),
+        );
+
+        let err = guarded
+            .next()
+            .await
+            .expect("stalled Snowball body should yield an error")
+            .expect_err("stalled Snowball body must not hang");
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .expect("stall error should retain its I/O kind");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
