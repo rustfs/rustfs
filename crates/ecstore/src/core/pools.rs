@@ -7135,27 +7135,20 @@ impl ECStore {
         self.reserve_decommission_routines(rx, indices.as_slice()).await
     }
 
-    pub(crate) async fn spawn_decommission_routines(
-        &self,
-        store: Arc<ECStore>,
-        rx: CancellationToken,
-        indices: Vec<usize>,
-    ) -> Result<()> {
-        let index_cancelers = self.reserve_decommission_routines(&rx, indices.as_slice()).await?;
-        if !index_cancelers.is_empty() {
-            drop(spawn_decommission_index_cancelers(
-                store,
-                rx,
-                index_cancelers,
-                Arc::new(Semaphore::new(decommission_entry_concurrency_limit())),
-            ));
-        }
-
-        Ok(())
+    pub async fn spawn_missing_local_decommission_routines(self: &Arc<Self>) -> Result<()> {
+        self.spawn_missing_local_decommission_routines_with_token(CancellationToken::new())
+            .await
     }
 
-    pub async fn spawn_missing_local_decommission_routines(self: &Arc<Self>) -> Result<()> {
-        let rx = CancellationToken::new();
+    pub(crate) async fn has_active_local_decommission_worker(&self) -> bool {
+        let cancelers = self.decommission_cancelers.read().await;
+        has_active_decommission_canceler(cancelers.as_slice())
+    }
+
+    pub(crate) async fn spawn_missing_local_decommission_routines_with_token(
+        self: &Arc<Self>,
+        rx: CancellationToken,
+    ) -> Result<()> {
         let endpoints = self.endpoints();
         let index_cancelers = self.reserve_missing_local_decommission_routines(&rx, &endpoints).await?;
         if index_cancelers.is_empty() {
@@ -11132,10 +11125,16 @@ mod tests {
         assert!(replica_state.repair_write_safe);
 
         let worker_cancel = CancellationToken::new();
-        store
-            .spawn_decommission_routines(Arc::clone(&store), worker_cancel.clone(), vec![0])
+        let index_cancelers = store
+            .reserve_decommission_routines(&worker_cancel, &[0])
             .await
             .expect("the committed activation should admit its decommission worker");
+        drop(spawn_decommission_index_cancelers(
+            Arc::clone(&store),
+            worker_cancel.clone(),
+            index_cancelers,
+            Arc::new(Semaphore::new(decommission_entry_concurrency_limit())),
+        ));
         let admitted_cancel = store.decommission_cancelers.read().await[0]
             .clone()
             .expect("the admitted decommission worker should have a cancellation token");
