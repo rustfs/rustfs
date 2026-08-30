@@ -1218,6 +1218,10 @@ pub struct RustFSTestClusterEnvironment {
     /// Optional socket proxies used for the corresponding node's volume
     /// endpoints. Proxies must be installed before [`Self::start`].
     volume_proxy_addresses: Vec<Option<SocketAddr>>,
+    /// Fresh multi-pool layouts need one shared deployment identity before the
+    /// production startup gate can load the pool metadata. The harness performs
+    /// a one-pool bootstrap once, then starts the requested topology.
+    multi_pool_bootstrap_pending: bool,
 }
 
 impl RustFSTestClusterEnvironment {
@@ -1271,6 +1275,7 @@ impl RustFSTestClusterEnvironment {
         }
 
         let multidrive = topology.drives_per_node > 1;
+        let multi_pool_bootstrap_pending = topology.normalized_pools().len() > 1;
 
         let mut nodes = Vec::with_capacity(topology.node_count);
         for (i, &pool_idx) in pool_of_node.iter().enumerate() {
@@ -1320,6 +1325,7 @@ impl RustFSTestClusterEnvironment {
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
             volume_proxy_addresses: vec![None; node_count],
+            multi_pool_bootstrap_pending,
         })
     }
 
@@ -1468,8 +1474,31 @@ impl RustFSTestClusterEnvironment {
     /// * `Err(Box<dyn Error + Send + Sync>)` - An error if process spawning fails, TCP port readiness
     ///   times out, or cluster service readiness times out.
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let binary_path = rustfs_binary_path();
         let volumes_arg = self.build_volumes_arg();
+        if self.multi_pool_bootstrap_pending {
+            self.bootstrap_multi_pool_identity().await?;
+            self.multi_pool_bootstrap_pending = false;
+        }
+        self.start_with_volumes(&volumes_arg).await
+    }
+
+    /// Start all nodes with one explicit pool so fresh local drives receive a
+    /// shared format/deployment identity and durable `pool.bin` bootstrap
+    /// metadata. This is strictly a test-harness preparation step; production
+    /// startup validation remains unchanged. The requested multi-pool topology
+    /// is started only after this temporary bootstrap cluster is stopped.
+    async fn bootstrap_multi_pool_identity(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let bootstrap_volumes = self.build_single_pool_volumes_arg();
+        if let Err(err) = self.start_with_volumes(&bootstrap_volumes).await {
+            self.stop();
+            return Err(err);
+        }
+        self.stop();
+        Ok(())
+    }
+
+    async fn start_with_volumes(&mut self, volumes_arg: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
 
         for (i, node) in self.nodes.iter_mut().enumerate() {
             info!("Starting cluster node {} on {}", i, node.address);
@@ -1505,6 +1534,18 @@ impl RustFSTestClusterEnvironment {
         }
 
         Ok(())
+    }
+
+    fn build_single_pool_volumes_arg(&self) -> String {
+        self.nodes
+            .iter()
+            .enumerate()
+            .flat_map(|(node_idx, node)| {
+                let address = self.volume_address(node_idx);
+                node.data_dirs.iter().map(move |dir| format!("http://{}{}", address, dir))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Start one node process using the cluster's existing volume layout.
@@ -2076,6 +2117,7 @@ mod tests {
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
             volume_proxy_addresses: vec![None; node_count],
+            multi_pool_bootstrap_pending: false,
         }
     }
 
