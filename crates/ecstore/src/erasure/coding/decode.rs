@@ -574,6 +574,7 @@ pub(crate) struct ParallelReader<R> {
     read_timeout: Duration,
     verify_reconstruction: bool,
     locality_preference_enabled: bool,
+    demand_bound_lockstep: bool,
     // Request-scoped shard buffers keyed by shard index. Keeping ownership in
     // `ParallelReader` avoids dropping unused parity/backup slot buffers between stripes.
     buffers: ShardBufferPool,
@@ -585,10 +586,8 @@ pub(crate) struct ParallelReader<R> {
     // it to the current stripe when it is engaged mid-object (backlog#923).
     engaged: SmallVec<[bool; INLINE_SHARD_SLOTS]>,
     deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
-    // Copy-source hedges use a fresh deferred reader so cancelling a hedge
-    // never consumes the unopened reader reserved for a later stripe. The
-    // vector is empty for callers that do not provide a reopen factory (tests
-    // and the ordinary GET path retain the handle-based behavior).
+    // Demand-bound hedges use a fresh deferred reader so cancelling a hedge
+    // never consumes the unopened reader reserved for a later stripe.
     deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
     stripe_index: usize,
 }
@@ -777,9 +776,9 @@ where
         // reads all live readers on every stripe — the pre-backlog#923
         // behavior. With the gate on, only data slots start engaged; parity is
         // engaged on demand, stripe-aligned through its deferred handle.
-        let data_shards_only = get_lockstep_data_shards_only_enabled();
+        let demand_bound_lockstep = get_lockstep_data_shards_only_enabled();
         let engaged: SmallVec<_> = (0..readers.len())
-            .map(|index| !data_shards_only || index < e.data_shards)
+            .map(|index| !demand_bound_lockstep || index < e.data_shards)
             .collect();
         ParallelReader {
             readers,
@@ -793,6 +792,7 @@ where
             read_timeout,
             verify_reconstruction,
             locality_preference_enabled: get_shard_locality_preference_enabled(),
+            demand_bound_lockstep,
             buffers: ShardBufferPool::new(e.data_shards + e.parity_shards),
             stripe_state: None,
             engaged,
@@ -1275,7 +1275,7 @@ where
     /// realigned (no pending deferred handle) is likewise retired instead of
     /// being read out of position.
     async fn read_lockstep(&mut self, state: &mut StripeReadState) {
-        if matches!(decode_read_policy(), DecodeReadPolicy::DemandBound) {
+        if self.demand_bound_lockstep {
             self.read_lockstep_demand_bound(state).await;
             return;
         }
@@ -1531,17 +1531,18 @@ where
         }
     }
 
-    /// Demand-bound lockstep stripe read used by server-side copy sources.
+    /// Demand-bound data-shards-only lockstep stripe read.
     ///
     /// The ordinary lockstep path can cancel every in-flight reader once it
     /// has a quorum because all of its parity readers are already engaged.
-    /// Copy sources keep parity unopened until a data reader is missing.  A
-    /// hedge therefore has to race the deferred parity reads against the
-    /// original data reads and may retire the latter only after the parity has
-    /// produced an actual decode-plus-verification quorum.  The futures own
-    /// their readers so disjoint data/parity slots can be admitted while the
-    /// other group is still pending; dropping an abandoned future retires its
-    /// stream without leaving a borrowed slot behind.
+    /// Copy sources and the data-shards-only rollout gate keep parity unopened
+    /// until a data reader is missing. A hedge therefore has to race the
+    /// deferred parity reads against the original data reads and may retire the
+    /// latter only after parity has produced an actual decode-plus-verification
+    /// quorum. The futures own their readers so disjoint data/parity slots can
+    /// be admitted while the other group is still pending; dropping an
+    /// abandoned future retires its stream without leaving a borrowed slot
+    /// behind.
     async fn read_lockstep_demand_bound(&mut self, state: &mut StripeReadState) {
         let num_readers = self.readers.len();
         state.reset(num_readers, self.data_shards);
@@ -1576,14 +1577,14 @@ where
         let mut completed = 0usize;
         let mut failed = 0usize;
         let mut first_shard_recorded = false;
-        let mut active = vec![false; num_readers];
-        let mut temporary_parity = vec![false; num_readers];
+        let mut active: ActiveReaders = smallvec![false; num_readers];
+        let mut temporary_parity: ActiveReaders = smallvec![false; num_readers];
         // A deferred parity slot is attempted at most once per stripe. A
         // failed disposable hedge keeps its unopened reserve for the next
         // stripe, but must not be relaunched in a tight same-stripe retry
         // loop (which would defeat the bounded fan-out and amplify a remote
         // outage).
-        let mut attempted_parity = vec![false; num_readers];
+        let mut attempted_parity: ActiveReaders = smallvec![false; num_readers];
         // Once a data reader has returned an error (or was already missing at
         // setup), the loss is permanent for lockstep alignment. Use the
         // deferred handle and keep parity engaged across subsequent stripes;
@@ -4911,6 +4912,24 @@ mod tests {
     /// read timeout even though both parity readers were available to engage.
     #[tokio::test]
     async fn test_demand_bound_lockstep_hedges_to_deferred_parity_quorum() {
+        with_decode_read_policy(DecodeReadPolicy::DemandBound, assert_deferred_parity_hedges_slow_data()).await;
+    }
+
+    /// The ordinary GET rollout gate must use the same bounded parity race as
+    /// CopySource. Leaving it on the legacy lockstep loop deadlocks the hedge:
+    /// that loop waits for a parity success before cancelling the slow data
+    /// read, but does not admit deferred parity until after the data read ends.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_data_shards_only_gate_hedges_to_deferred_parity_quorum() {
+        temp_env::async_with_vars(
+            [(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, Some("true"))],
+            assert_deferred_parity_hedges_slow_data(),
+        )
+        .await;
+    }
+
+    async fn assert_deferred_parity_hedges_slow_data() {
         const NUM_SHARDS: usize = 1;
         const BLOCK_SIZE: usize = 64;
         const DATA_SHARDS: usize = 2;
@@ -4951,33 +4970,27 @@ mod tests {
         ];
 
         let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
-        let (bufs, errs, engaged, readers_remaining) = with_decode_read_policy(DecodeReadPolicy::DemandBound, async {
-            let mut parallel_reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
-                readers,
-                erasure,
-                0,
-                NUM_SHARDS * BLOCK_SIZE,
-                None,
-                vec![ShardReadCost::Unknown; DATA_SHARDS + PARITY_SHARDS],
-                Duration::from_secs(60),
-                true,
-            );
-            let (bufs, errs) = tokio::time::timeout(Duration::from_secs(2), parallel_reader.read())
-                .await
-                .expect("deferred parity must cover a hedged data shard without waiting for read_timeout");
-            (
-                bufs,
-                errs,
-                parallel_reader.engaged.clone(),
-                parallel_reader.readers.iter().map(Option::is_some).collect::<Vec<_>>(),
-            )
-        })
-        .await;
+        let mut parallel_reader = ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            erasure,
+            0,
+            NUM_SHARDS * BLOCK_SIZE,
+            None,
+            vec![ShardReadCost::Unknown; DATA_SHARDS + PARITY_SHARDS],
+            Duration::from_secs(60),
+            true,
+        );
+        let (bufs, errs) = tokio::time::timeout(Duration::from_secs(2), parallel_reader.read())
+            .await
+            .expect("deferred parity must cover a hedged data shard without waiting for read_timeout");
 
         assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
         assert_eq!(bufs.iter().filter(|buf| buf.is_some()).count(), DATA_SHARDS + 1);
-        assert_eq!(engaged.as_slice(), &[true, true, true, true]);
-        assert_eq!(readers_remaining, vec![false, true, true, true]);
+        assert_eq!(parallel_reader.engaged.as_slice(), &[true, true, true, true]);
+        assert_eq!(
+            parallel_reader.readers.iter().map(Option::is_some).collect::<Vec<_>>(),
+            vec![false, true, true, true]
+        );
     }
 
     /// A fast data failure must admit deferred parity immediately.  There is
@@ -5046,6 +5059,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_demand_bound_canceled_hedge_preserves_deferred_parity_for_next_stripe() {
+        with_decode_read_policy(
+            DecodeReadPolicy::DemandBound,
+            assert_canceled_hedge_preserves_deferred_parity_for_next_stripe(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_data_shards_only_gate_canceled_hedge_preserves_deferred_parity_for_next_stripe() {
+        temp_env::async_with_vars(
+            [(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, Some("true"))],
+            assert_canceled_hedge_preserves_deferred_parity_for_next_stripe(),
+        )
+        .await;
+    }
+
+    async fn assert_canceled_hedge_preserves_deferred_parity_for_next_stripe() {
         const BLOCK_SIZE: usize = 64;
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 2;
@@ -5094,7 +5125,7 @@ mod tests {
             Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo, false)),
         ];
 
-        let (first_parity_reserved, second_result) = with_decode_read_policy(DecodeReadPolicy::DemandBound, async {
+        let (first_parity_reserved, second_result) = {
             let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
             let mut parallel_reader = ParallelReader::new_with_metrics_path_read_timeout_and_reconstruction_verification(
                 readers,
@@ -5155,8 +5186,7 @@ mod tests {
                 parallel_reader.readers[2].is_some() && parallel_reader.readers[3].is_some(),
                 (third_buffers, third_errors),
             )
-        })
-        .await;
+        };
 
         assert!(first_parity_reserved);
         assert_eq!(parity_calls.load(Ordering::SeqCst), PARITY_SHARDS * 2);
