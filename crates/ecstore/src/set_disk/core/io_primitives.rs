@@ -1974,14 +1974,10 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         return;
     }
 
-    // Only CopySource uses disposable, stripe-aligned reopeners. Ordinary GET
-    // readers use the existing deferred handle and should not retain one
-    // heap-allocated closure (plus cloned path/disk state) for every parity
-    // slot.
-    let copy_source_demand_bound = matches!(
-        crate::set_disk::get_object_read_policy(),
-        crate::set_disk::GetObjectReadPolicy::CopySource
-    );
+    // Every demand-bound lockstep reader needs a disposable, stripe-aligned
+    // reopener. Otherwise a recovered slow data read can cancel and consume
+    // the only parity reserve needed by a later degraded stripe.
+    let demand_bound_lockstep = crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled();
 
     for idx in 0..disks.len() {
         if setup.attempted[idx] {
@@ -1996,7 +1992,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        let reopener = copy_source_demand_bound.then(|| {
+        let reopener = demand_bound_lockstep.then(|| {
             deferred_reader_reopener(
                 inline_data.clone(),
                 disk.clone(),
@@ -2037,7 +2033,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     // ready/error bookkeeping that quorum decisions rely on is left untouched.
     // Gate off (default): keep the eagerly opened parity readers exactly as
     // before — the lockstep path reads them on every stripe.
-    if !crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled() {
+    if !demand_bound_lockstep {
         return;
     }
     for idx in data_shards..disks.len() {
@@ -2049,7 +2045,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        let reopener = copy_source_demand_bound.then(|| {
+        let reopener = demand_bound_lockstep.then(|| {
             deferred_reader_reopener(
                 inline_data.clone(),
                 disk.clone(),

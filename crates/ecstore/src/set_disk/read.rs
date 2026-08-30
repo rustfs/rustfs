@@ -5564,9 +5564,10 @@ mod tests {
 
     /// backlog#923: with the data-shards-only lockstep gate on, every retained
     /// parity reader must be an unopened deferred reader carrying a stripe
-    /// handle, so the decode path can realign it to a mid-object stripe. With
-    /// the gate off (default), eagerly opened parity readers are kept exactly
-    /// as before and carry no handles.
+    /// handle and disposable reopener, so the decode path can realign it to a
+    /// mid-object stripe without consuming the later-stripe reserve. With the
+    /// gate off (default), eagerly opened parity readers are kept exactly as
+    /// before and carry neither.
     #[tokio::test]
     #[serial_test::serial]
     async fn bitrot_reader_setup_gates_parity_stripe_handle_conversion() {
@@ -5595,6 +5596,11 @@ mod tests {
                     enabled.is_some(),
                     "parity slot {idx} stripe handle must match the gate (enabled={enabled:?})"
                 );
+                assert_eq!(
+                    setup.deferred_reopeners[idx].is_some(),
+                    enabled.is_some(),
+                    "parity slot {idx} reopener must match the gate (enabled={enabled:?})"
+                );
             }
 
             if enabled.is_some() {
@@ -5617,13 +5623,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn bitrot_reader_setup_data_blocks_first_keeps_deferred_fallback_readers() {
-        let mut setup = setup_inline_bitrot_readers_with_env(
-            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
-            2,
-            2,
-            BitrotReaderSetupMode::ReadQuorum,
-            true,
+        let mut setup = temp_env::async_with_vars(
+            [("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("true"))],
+            setup_inline_bitrot_readers_with_env(
+                vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+                2,
+                2,
+                BitrotReaderSetupMode::ReadQuorum,
+                true,
+            ),
         )
         .await;
 
@@ -5631,6 +5641,8 @@ mod tests {
         assert_eq!(setup.available_shards(), 2);
         assert_eq!(setup.scheduled_shards(), 2);
         assert_eq!(setup.readers.iter().filter(|reader| reader.is_some()).count(), 4);
+        assert!(setup.deferred_reopeners[2].is_some());
+        assert!(setup.deferred_reopeners[3].is_some());
 
         let fallback_index = setup
             .attempted

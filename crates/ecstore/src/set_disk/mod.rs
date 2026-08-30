@@ -6371,6 +6371,7 @@ mod tests {
     use crate::object_api::BLOCK_SIZE_V2;
     use crate::object_api::ObjectInfo;
     use crate::set_disk::core::io_primitives::rename_fanout_barrier;
+    use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::{
         heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
         object::ObjectOperations as _,
@@ -12808,6 +12809,111 @@ mod tests {
                 .expect("reader drop must release its read lock")
                 .expect("replacement after cancellation should succeed");
         })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn multipart_streaming_get_blocks_overwrite_across_part_boundary() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH, Some("false")),
+            ],
+            async {
+                let set_disks = make_local_bucket_test_set_disks().await;
+                let bucket = "snapshot-multipart-overwrite";
+                let object = "object";
+                let part_size = usize::try_from(GLOBAL_MIN_PART_SIZE.as_u64()).expect("minimum part size should fit usize");
+                let first_part = vec![0x41; part_size];
+                let second_part = vec![0x42; part_size];
+                let replacement = vec![0x43; first_part.len() + second_part.len()];
+                let opts = ObjectOptions::default();
+
+                set_disks
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket should be created");
+                let upload = set_disks
+                    .new_multipart_upload(bucket, object, &opts)
+                    .await
+                    .expect("multipart upload should be created");
+                let mut completed_parts = Vec::with_capacity(2);
+                for (part_num, body) in [(1, &first_part), (2, &second_part)] {
+                    let mut reader = PutObjReader::from_vec(body.clone());
+                    let part = set_disks
+                        .put_object_part(bucket, object, &upload.upload_id, part_num, &mut reader, &opts)
+                        .await
+                        .expect("multipart part should be written");
+                    completed_parts.push(CompletePart {
+                        part_num,
+                        etag: part.etag,
+                        ..Default::default()
+                    });
+                }
+                let completed = Arc::clone(&set_disks)
+                    .complete_multipart_upload(bucket, object, &upload.upload_id, completed_parts, &opts)
+                    .await
+                    .expect("multipart upload should complete");
+                assert!(completed.is_multipart());
+
+                let mut snapshot = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("multipart snapshot reader should open");
+                let overwrite_set = Arc::clone(&set_disks);
+                let overwrite_opts = opts.clone();
+                let overwrite_body = replacement.clone();
+                let commit_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+                let overwrite = tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(overwrite_body);
+                    overwrite_set.put_object(bucket, object, &mut reader, &overwrite_opts).await
+                });
+                commit_barrier.wait_until_paused().await;
+                commit_barrier.release_and_wait_until_namespace_pending().await;
+                assert!(
+                    !commit_barrier.namespace_acquired(),
+                    "overwrite must wait for the multipart response's read lock"
+                );
+
+                let mut restored_first = vec![0; first_part.len()];
+                snapshot
+                    .stream
+                    .read_exact(&mut restored_first)
+                    .await
+                    .expect("the first multipart part should stream");
+                assert_eq!(restored_first, first_part);
+                assert!(
+                    !commit_barrier.namespace_acquired() && !overwrite.is_finished(),
+                    "overwrite must remain blocked at the first/second part boundary"
+                );
+
+                let mut restored_second = Vec::new();
+                snapshot
+                    .stream
+                    .read_to_end(&mut restored_second)
+                    .await
+                    .expect("the second multipart part should stream");
+                assert_eq!(restored_second, second_part);
+                tokio::time::timeout(Duration::from_secs(5), overwrite)
+                    .await
+                    .expect("overwrite should proceed after multipart EOF")
+                    .expect("overwrite task should join")
+                    .expect("overwrite should succeed");
+
+                let mut latest = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("replacement reader should open");
+                let mut latest_body = Vec::new();
+                latest
+                    .stream
+                    .read_to_end(&mut latest_body)
+                    .await
+                    .expect("replacement should stream");
+                assert_eq!(latest_body, replacement);
+            },
+        )
         .await;
     }
 
