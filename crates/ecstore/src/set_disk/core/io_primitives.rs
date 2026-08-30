@@ -3159,7 +3159,6 @@ impl SetDisks {
                     _ = tokio::time::sleep_until(deadline) => {
                         if bounded_fanout
                             && !force_full_wait
-                            && !defer_pending_inline_data_shard
                             && join_set.len() == 1
                             && non_inline_candidate_eligible == Some(true)
                             && !accumulator.candidate_has_read_reserve()
