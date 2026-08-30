@@ -948,10 +948,6 @@ pub fn is_err_data_movement_overwrite(err: &Error) -> bool {
     matches!(err, &StorageError::DataMovementOverwriteErr(_, _, _))
 }
 
-pub fn is_err_decommission_running(err: &Error) -> bool {
-    matches!(err, &StorageError::DecommissionAlreadyRunning)
-}
-
 #[allow(dead_code, reason = "predicate asserted by this file's tests (backlog#1823)")]
 pub fn is_err_rebalance_running(err: &Error) -> bool {
     matches!(err, &StorageError::RebalanceAlreadyRunning)
@@ -1347,9 +1343,6 @@ mod tests {
 
     #[test]
     fn test_error_running_state_helpers() {
-        assert!(is_err_decommission_running(&StorageError::DecommissionAlreadyRunning));
-        assert!(!is_err_decommission_running(&StorageError::RebalanceAlreadyRunning));
-
         assert!(is_err_rebalance_running(&StorageError::RebalanceAlreadyRunning));
         assert!(!is_err_rebalance_running(&StorageError::DecommissionAlreadyRunning));
         assert!(is_err_operation_canceled(&StorageError::OperationCanceled));
