@@ -2162,6 +2162,7 @@ dependencies = [
  "compression-core",
  "flate2",
  "liblzma",
+ "lz4",
  "memchr",
  "zstd",
  "zstd-safe",

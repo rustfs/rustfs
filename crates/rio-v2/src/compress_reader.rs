@@ -15,7 +15,9 @@
 use minlz::{Encoder as MinlzEncoder, crc::crc};
 use pin_project_lite::pin_project;
 use rand::RngExt;
-use rustfs_rio::{EtagResolvable, HashReaderDetector, HashReaderMut, Index, S2Decoder, TryGetIndex};
+use rustfs_rio::{
+    EtagResolvable, HashReaderDetector, HashReaderMut, Index, MAX_S2_DECOMPRESSED_BLOCK_SIZE, S2Decoder, TryGetIndex,
+};
 use rustfs_utils::CompressionAlgorithm;
 use std::cmp::min;
 use std::fmt;
@@ -85,7 +87,17 @@ where
         Self::with_block_size(inner, DEFAULT_BLOCK_SIZE, CompressionAlgorithm::default())
     }
 
+    /// Create an encoder with a caller-selected S2 block size.
+    ///
+    /// Zero selects the default. Larger values are capped at the maximum block
+    /// accepted by the paired decoder, preserving this infallible API without
+    /// allowing it to emit a stream that RustFS cannot read back.
     pub fn with_block_size(inner: R, block_size: usize, _compression_algorithm: CompressionAlgorithm) -> Self {
+        let block_size = if block_size == 0 {
+            DEFAULT_BLOCK_SIZE
+        } else {
+            block_size.min(MAX_S2_DECOMPRESSED_BLOCK_SIZE)
+        };
         Self {
             inner,
             buffer: Vec::new(),
@@ -249,7 +261,9 @@ where
     R: AsyncRead + Unpin + Send + Sync,
 {
     pub fn new(inner: R, _compression_algorithm: CompressionAlgorithm) -> Self {
-        Self { inner: S2Decoder::new(inner) }
+        Self {
+            inner: S2Decoder::new_at_chunk_boundary(inner),
+        }
     }
 }
 
@@ -427,6 +441,58 @@ mod tests {
         let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
         let mut actual = Vec::new();
         decompressor.read_to_end(&mut actual).await.expect("read decompressed data");
+
+        assert_eq!(actual, plaintext);
+    }
+
+    #[test]
+    fn s2_compress_reader_normalizes_non_decodable_block_sizes() {
+        let zero = CompressReader::with_block_size(Cursor::new(Vec::<u8>::new()), 0, CompressionAlgorithm::default());
+        assert_eq!(zero.block_size, DEFAULT_BLOCK_SIZE);
+
+        let oversized = CompressReader::with_block_size(
+            Cursor::new(Vec::<u8>::new()),
+            MAX_S2_DECOMPRESSED_BLOCK_SIZE + 1,
+            CompressionAlgorithm::default(),
+        );
+        assert_eq!(oversized.block_size, MAX_S2_DECOMPRESSED_BLOCK_SIZE);
+    }
+
+    #[tokio::test]
+    async fn s2_compress_reader_max_block_roundtrips_with_paired_decoder() {
+        let plaintext = pseudo_random_bytes(MAX_S2_DECOMPRESSED_BLOCK_SIZE);
+        let mut reader = CompressReader::with_block_size(
+            Cursor::new(plaintext.clone()),
+            MAX_S2_DECOMPRESSED_BLOCK_SIZE,
+            CompressionAlgorithm::default(),
+        );
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("read maximum S2 block");
+
+        let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor
+            .read_to_end(&mut actual)
+            .await
+            .expect("paired decoder should accept maximum S2 block");
+        assert_eq!(actual, plaintext);
+    }
+
+    #[tokio::test]
+    async fn s2_decompress_reader_accepts_an_indexed_headerless_tail() {
+        let plaintext = b"indexed-rio-v2-s2-tail-".repeat(32_768);
+        let mut reader = CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default());
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("read compressed data");
+        assert!(compressed.starts_with(MAGIC_CHUNK));
+
+        let mut decompressor =
+            DecompressReader::new(Cursor::new(compressed[MAGIC_CHUNK.len()..].to_vec()), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor
+            .read_to_end(&mut actual)
+            .await
+            .expect("indexed tail should decode without the stream header");
 
         assert_eq!(actual, plaintext);
     }

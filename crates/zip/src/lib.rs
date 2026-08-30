@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, Lz4Decoder, XzDecoder, ZlibDecoder, ZstdDecoder};
+use async_compression::{
+    tokio::bufread::{BzDecoder, GzipDecoder, Lz4Decoder, XzDecoder, ZlibDecoder, ZstdDecoder},
+    zstd::DParameter,
+};
 use rustfs_rio::S2Decoder;
 use std::io;
 use std::pin::Pin;
@@ -21,6 +24,19 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader, ReadBuf};
 
 const MAGIC_SNIFF_LEN: usize = 6;
+const SHARED_SKIPPABLE_FRAME_HEADER_LEN: usize = 8;
+const SNIFF_DISCARD_BUFFER_LEN: usize = 8 * 1024;
+const SNIFF_YIELD_AFTER_BYTES: usize = 64 * 1024;
+const SNIFF_YIELD_AFTER_FRAMES: usize = 64;
+
+// XZ declares its LZMA2 dictionary size before producing decoded bytes, so the
+// decoded-size guard cannot prevent that allocation. This accepts every
+// standard xz preset (the largest needs about 65 MiB to decode) while keeping
+// one Snowball decoder well below the multi-gigabyte archive budget.
+const XZ_DECODER_MEMORY_LIMIT_BYTES: u64 = 128_u64 * 1024 * 1024;
+// Match MinIO's Snowball decoder boundary so a frame cannot reserve an
+// oversized history window before the decoded-size guard observes any bytes.
+const ZSTD_DECODER_MAX_WINDOW_LOG: u32 = 24;
 
 pub type Result<T> = std::result::Result<T, ZipError>;
 
@@ -50,7 +66,9 @@ pub enum CompressionFormat {
 }
 
 /// Reader returned by [`CompressionFormat::sniff`]. It replays the bounded
-/// prefix consumed for detection before continuing with the original stream.
+/// prefix that identified the codec before continuing with the original
+/// stream. Codec-neutral leading skippable frames are consumed by `sniff` and
+/// intentionally omitted from the replayed stream.
 #[derive(Debug)]
 pub struct SniffedReader<R> {
     inner: R,
@@ -73,6 +91,67 @@ where
 
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
+}
+
+fn is_shared_skippable_magic(prefix: &[u8]) -> bool {
+    prefix.len() >= 4 && (0x50..=0x5f).contains(&prefix[0]) && prefix[1..4] == [0x2a, 0x4d, 0x18]
+}
+
+async fn inspect_read_prefix<R>(input: &mut R, prefix: &mut [u8; MAGIC_SNIFF_LEN]) -> Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut prefix_len = 0usize;
+    while prefix_len < prefix.len() {
+        let read = input.read(&mut prefix[prefix_len..]).await.map_err(ZipError::InspectStream)?;
+        if read == 0 {
+            break;
+        }
+        prefix_len += read;
+    }
+    Ok(prefix_len)
+}
+
+async fn inspect_read_fully<R>(input: &mut R, mut output: &mut [u8], truncated_message: &'static str) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    while !output.is_empty() {
+        let read = input.read(output).await.map_err(ZipError::InspectStream)?;
+        if read == 0 {
+            return Err(ZipError::InspectStream(io::Error::new(io::ErrorKind::UnexpectedEof, truncated_message)));
+        }
+        output = &mut output[read..];
+    }
+    Ok(())
+}
+
+async fn inspect_discard_fully<R>(
+    input: &mut R,
+    mut remaining: u64,
+    bytes_since_yield: &mut usize,
+    truncated_message: &'static str,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut discard = [0u8; SNIFF_DISCARD_BUFFER_LEN];
+    while remaining > 0 {
+        let to_read = usize::try_from(remaining).map_or(discard.len(), |remaining| remaining.min(discard.len()));
+        let read = input.read(&mut discard[..to_read]).await.map_err(ZipError::InspectStream)?;
+        if read == 0 {
+            return Err(ZipError::InspectStream(io::Error::new(io::ErrorKind::UnexpectedEof, truncated_message)));
+        }
+        let read_u64 =
+            u64::try_from(read).map_err(|_| ZipError::InspectStream(io::Error::other("skippable frame read size overflowed")))?;
+        remaining -= read_u64;
+        *bytes_since_yield = (*bytes_since_yield).saturating_add(read);
+        if *bytes_since_yield >= SNIFF_YIELD_AFTER_BYTES {
+            tokio::task::yield_now().await;
+            *bytes_since_yield = 0;
+        }
+    }
+    Ok(())
 }
 
 /// Archive guardrails. The values are carried here so every archive caller
@@ -143,17 +222,27 @@ impl CompressionFormat {
         }
     }
 
-    /// Detect a stream codec from a bounded prefix. Unknown bytes are a raw
-    /// TAR stream, matching MinIO Snowball behavior; object names and suffixes
-    /// do not participate in detection.
+    /// Detect a stream codec from an unambiguous bounded prefix. Ordinary
+    /// unknown bytes are a raw TAR stream, matching MinIO Snowball behavior;
+    /// the skippable-frame magic shared by Zstd and LZ4 remains
+    /// [`CompressionFormat::Unknown`] until [`Self::sniff`] sees a later frame.
+    /// Object names and suffixes do not participate in detection.
+    ///
+    /// Zlib deliberately has no magic match here: its two-byte header can also
+    /// be the start of a valid TAR member name. Callers preserving historical
+    /// zlib-by-extension behavior must apply that compatibility fallback only
+    /// after this method returns [`CompressionFormat::Tar`].
+    /// ZIP signatures are also left as TAR because stream ZIP decoding is not
+    /// supported and those bytes are valid at the start of a TAR member name.
     pub fn from_magic(prefix: &[u8]) -> Self {
         if prefix.starts_with(&[0x1f, 0x8b, 0x08]) {
             return Self::Gzip;
         }
-        if prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
-            || (prefix.len() >= 4 && (0x50..=0x5f).contains(&prefix[0]) && prefix[1..4] == [0x2a, 0x4d, 0x18])
-        {
+        if prefix.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
             return Self::Zstd;
+        }
+        if is_shared_skippable_magic(prefix) {
+            return Self::Unknown;
         }
         if prefix.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
             return Self::Lz4;
@@ -167,47 +256,61 @@ impl CompressionFormat {
         if prefix.starts_with(&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]) {
             return Self::Xz;
         }
-        if prefix.starts_with(b"PK\x03\x04") || prefix.starts_with(b"PK\x05\x06") || prefix.starts_with(b"PK\x07\x08") {
-            return Self::Zip;
-        }
-        if prefix.len() >= 2 {
-            let cmf = prefix[0];
-            let flg = prefix[1];
-            let header = u16::from(cmf) << 8 | u16::from(flg);
-            if cmf & 0x0f == 8 && cmf >> 4 <= 7 && header % 31 == 0 {
-                return Self::Zlib;
-            }
-        }
-
         Self::Tar
     }
 
-    /// Read at most [`MAGIC_SNIFF_LEN`] bytes to identify the codec and return
-    /// a reader that losslessly replays the inspected prefix.
+    /// Identify the codec and return a reader that replays the deciding prefix.
+    /// Leading skippable frames shared by the Zstd and LZ4 frame formats are
+    /// discarded with bounded memory until a non-skippable frame identifies
+    /// the decoder. The underlying reader still observes every discarded byte,
+    /// so callers can keep transport length and checksum accounting below this
+    /// boundary.
     pub async fn sniff<R>(mut input: R) -> Result<(Self, SniffedReader<R>)>
     where
         R: AsyncRead + Unpin,
     {
-        let mut prefix = [0u8; MAGIC_SNIFF_LEN];
-        let mut prefix_len = 0usize;
-        while prefix_len < prefix.len() {
-            let read = input.read(&mut prefix[prefix_len..]).await.map_err(ZipError::InspectStream)?;
-            if read == 0 {
-                break;
-            }
-            prefix_len += read;
-        }
+        let mut skipped_shared_frame = false;
+        let mut bytes_since_yield = 0usize;
+        let mut frames_since_yield = 0usize;
 
-        let format = Self::from_magic(&prefix[..prefix_len]);
-        Ok((
-            format,
-            SniffedReader {
-                inner: input,
-                prefix,
-                prefix_len,
-                prefix_pos: 0,
-            },
-        ))
+        loop {
+            let mut prefix = [0u8; MAGIC_SNIFF_LEN];
+            let prefix_len = inspect_read_prefix(&mut input, &mut prefix).await?;
+            if !is_shared_skippable_magic(&prefix[..prefix_len]) {
+                let mut format = Self::from_magic(&prefix[..prefix_len]);
+                if skipped_shared_frame && !matches!(format, Self::Zstd | Self::Lz4) {
+                    format = Self::Unknown;
+                }
+                return Ok((
+                    format,
+                    SniffedReader {
+                        inner: input,
+                        prefix,
+                        prefix_len,
+                        prefix_pos: 0,
+                    },
+                ));
+            }
+
+            skipped_shared_frame = true;
+            let mut header = [0u8; SHARED_SKIPPABLE_FRAME_HEADER_LEN];
+            header[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
+            inspect_read_fully(&mut input, &mut header[prefix_len..], "truncated shared Zstd/LZ4 skippable frame header").await?;
+            let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+            inspect_discard_fully(
+                &mut input,
+                u64::from(payload_len),
+                &mut bytes_since_yield,
+                "truncated shared Zstd/LZ4 skippable frame payload",
+            )
+            .await?;
+            frames_since_yield = frames_since_yield.saturating_add(1);
+            if frames_since_yield >= SNIFF_YIELD_AFTER_FRAMES {
+                tokio::task::yield_now().await;
+                bytes_since_yield = 0;
+                frames_since_yield = 0;
+            }
+        }
     }
 
     pub fn get_decoder<R>(&self, input: R) -> Result<Box<dyn AsyncRead + Send + Unpin>>
@@ -233,12 +336,12 @@ impl CompressionFormat {
                 Box::new(decoder)
             }
             CompressionFormat::Xz => {
-                let mut decoder = XzDecoder::new(reader);
+                let mut decoder = XzDecoder::with_mem_limit(reader, XZ_DECODER_MEMORY_LIMIT_BYTES);
                 decoder.multiple_members(true);
                 Box::new(decoder)
             }
             CompressionFormat::Zstd => {
-                let mut decoder = ZstdDecoder::new(reader);
+                let mut decoder = ZstdDecoder::with_params(reader, &[DParameter::window_log_max(ZSTD_DECODER_MAX_WINDOW_LOG)]);
                 decoder.multiple_members(true);
                 Box::new(decoder)
             }
@@ -270,9 +373,199 @@ impl CompressionFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_compression::tokio::write::{GzipEncoder, Lz4Encoder};
+    use async_compression::{
+        Level,
+        tokio::write::{GzipEncoder, Lz4Encoder, XzEncoder, ZstdEncoder},
+        zstd::CParameter,
+    };
+    use std::future::Future;
     use std::mem::size_of;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Wake, Waker};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    async fn encode_xz(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = XzEncoder::with_quality(Vec::new(), Level::Fastest);
+        encoder.write_all(payload).await.expect("XZ encode should succeed");
+        encoder.shutdown().await.expect("XZ encoder shutdown should succeed");
+        encoder.into_inner()
+    }
+
+    async fn encode_lz4(payload: &[u8]) -> Vec<u8> {
+        let mut encoder = Lz4Encoder::new(Vec::new());
+        encoder.write_all(payload).await.expect("LZ4 encode should succeed");
+        encoder.shutdown().await.expect("LZ4 encoder shutdown should succeed");
+        encoder.into_inner()
+    }
+
+    async fn encode_zstd_with_window(payload: &[u8], window_log: u32) -> Vec<u8> {
+        let mut encoder = ZstdEncoder::with_quality_and_params(
+            Vec::new(),
+            Level::Default,
+            &[CParameter::window_log(window_log), CParameter::content_size_flag(false)],
+        );
+        encoder.write_all(payload).await.expect("Zstd encode should succeed");
+        encoder.shutdown().await.expect("Zstd encoder shutdown should succeed");
+        encoder.into_inner()
+    }
+
+    fn shared_skippable_frame(variant: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(variant <= 0x0f);
+        let payload_len = u32::try_from(payload.len()).expect("test skippable payload should fit u32");
+        let mut frame = Vec::with_capacity(SHARED_SKIPPABLE_FRAME_HEADER_LEN + payload.len());
+        frame.extend_from_slice(&[0x50 + variant, 0x2a, 0x4d, 0x18]);
+        frame.extend_from_slice(&payload_len.to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    struct FragmentedReader {
+        bytes: Vec<u8>,
+        position: usize,
+        return_pending: bool,
+    }
+
+    impl FragmentedReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                position: 0,
+                return_pending: true,
+            }
+        }
+    }
+
+    impl AsyncRead for FragmentedReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, output: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if self.return_pending {
+                self.return_pending = false;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            if self.position >= self.bytes.len() || output.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let byte = self.bytes[self.position];
+            self.position += 1;
+            self.return_pending = true;
+            output.put_slice(&[byte]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct ErrorAfterBytes {
+        bytes: Vec<u8>,
+        position: usize,
+    }
+
+    impl AsyncRead for ErrorAfterBytes {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, output: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if self.position >= self.bytes.len() {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "sentinel inspect failure")));
+            }
+            let available = self.bytes.len() - self.position;
+            let to_copy = available.min(output.remaining());
+            output.put_slice(&self.bytes[self.position..self.position + to_copy]);
+            self.position += to_copy;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn assert_shared_skippable_round_trip(format: CompressionFormat, encoded: Vec<u8>, frames: &[Vec<u8>]) {
+        let mut stream = Vec::new();
+        for frame in frames {
+            stream.extend_from_slice(frame);
+        }
+        stream.extend_from_slice(&encoded);
+
+        let (detected, mut sniffed) = CompressionFormat::sniff(std::io::Cursor::new(stream.clone()))
+            .await
+            .expect("shared skippable prefix should be inspected");
+        assert_eq!(detected, format);
+        let mut replayed_prefix = [0u8; MAGIC_SNIFF_LEN];
+        sniffed
+            .read_exact(&mut replayed_prefix)
+            .await
+            .expect("deciding codec prefix should replay completely");
+        assert_eq!(replayed_prefix, encoded[..MAGIC_SNIFF_LEN]);
+
+        let (detected, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(stream))
+            .await
+            .expect("shared skippable prefix should be inspected for decoding");
+        let mut decoder = detected.get_decoder(sniffed).expect("detected decoder should be created");
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).await.expect("framed stream should decode");
+        assert_eq!(decoded, b"payload");
+    }
+
+    async fn assert_ready_sniff_yields(input: Vec<u8>, encoded_prefix: &[u8]) {
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake_counter.clone());
+        let mut sniff = Box::pin(CompressionFormat::sniff(std::io::Cursor::new(input)));
+        {
+            let mut cx = Context::from_waker(&waker);
+            assert!(sniff.as_mut().poll(&mut cx).is_pending(), "bounded inspection must yield");
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1, "yield must arrange another poll");
+
+        let (format, mut sniffed) = sniff.await.expect("inspection should resume after yielding");
+        assert_eq!(format, CompressionFormat::Lz4);
+        let mut replayed_prefix = [0u8; MAGIC_SNIFF_LEN];
+        sniffed
+            .read_exact(&mut replayed_prefix)
+            .await
+            .expect("deciding codec prefix should replay after yielding");
+        assert_eq!(replayed_prefix, encoded_prefix);
+    }
+
+    fn xz_crc32(bytes: &[u8]) -> u32 {
+        let mut crc = u32::MAX;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = 0_u32.wrapping_sub(crc & 1);
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    async fn xz_with_dictionary_property(payload: &[u8], dictionary_property: u8) -> Vec<u8> {
+        const XZ_STREAM_HEADER_LEN: usize = 12;
+
+        let mut encoded = encode_xz(payload).await;
+        assert_eq!(&encoded[..MAGIC_SNIFF_LEN], b"\xfd7zXZ\0");
+
+        let block_header_start = XZ_STREAM_HEADER_LEN;
+        let block_header_len = (usize::from(encoded[block_header_start]) + 1) * 4;
+        let block_header_crc_start = block_header_start + block_header_len - 4;
+        assert_eq!(block_header_len, 12, "default XZ fixture should use one compact LZMA2 filter header");
+        assert_eq!(
+            &encoded[block_header_start + 1..block_header_start + 4],
+            &[0x00, 0x21, 0x01],
+            "default XZ fixture should contain one LZMA2 filter with one property byte"
+        );
+
+        encoded[block_header_start + 4] = dictionary_property;
+        let block_header_crc = xz_crc32(&encoded[block_header_start..block_header_crc_start]).to_le_bytes();
+        encoded[block_header_crc_start..block_header_crc_start + 4].copy_from_slice(&block_header_crc);
+        encoded
+    }
 
     #[test]
     fn test_compression_format_from_extension() {
@@ -289,12 +582,13 @@ mod tests {
             (&[0x1f, 0x8b, 0x08, 0x00], CompressionFormat::Gzip),
             (b"BZh9", CompressionFormat::Bzip2),
             (&[0x28, 0xb5, 0x2f, 0xfd], CompressionFormat::Zstd),
-            (&[0x50, 0x2a, 0x4d, 0x18], CompressionFormat::Zstd),
+            (&[0x50, 0x2a, 0x4d, 0x18], CompressionFormat::Unknown),
             (&[0x04, 0x22, 0x4d, 0x18], CompressionFormat::Lz4),
             (&[0xff, 0x06, 0x00, 0x00], CompressionFormat::S2),
             (&[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00], CompressionFormat::Xz),
-            (&[0x78, 0x9c], CompressionFormat::Zlib),
-            (b"PK\x03\x04", CompressionFormat::Zip),
+            (&[0x78, 0x9c], CompressionFormat::Tar),
+            (&[0x78, 0x5e, b'o', b'b'], CompressionFormat::Tar),
+            (b"PK\x03\x04", CompressionFormat::Tar),
             (b"plain tar bytes", CompressionFormat::Tar),
         ];
 
@@ -365,6 +659,211 @@ mod tests {
         decoder.read_to_end(&mut decoded).await.expect("LZ4 decode should succeed");
 
         assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_sniff_skips_shared_frames_before_lz4_and_zstd() {
+        let lz4 = encode_lz4(b"payload").await;
+        assert_shared_skippable_round_trip(
+            CompressionFormat::Lz4,
+            lz4,
+            &[shared_skippable_frame(0, b""), shared_skippable_frame(15, b"lz4 metadata")],
+        )
+        .await;
+
+        let zstd = encode_zstd_with_window(b"payload", ZSTD_DECODER_MAX_WINDOW_LOG).await;
+        let large_metadata = vec![0x5a; SNIFF_YIELD_AFTER_BYTES + 1];
+        assert_shared_skippable_round_trip(
+            CompressionFormat::Zstd,
+            zstd,
+            &[shared_skippable_frame(3, &large_metadata), shared_skippable_frame(4, b"")],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sniff_rejects_truncated_shared_skippable_frames() {
+        let truncated_header = [0x50, 0x2a, 0x4d, 0x18, 0x04, 0x00];
+        let err = CompressionFormat::sniff(std::io::Cursor::new(truncated_header))
+            .await
+            .expect_err("truncated shared frame header must fail");
+        assert!(matches!(
+            err,
+            ZipError::InspectStream(ref source) if source.kind() == io::ErrorKind::UnexpectedEof
+        ));
+
+        let mut truncated_payload = shared_skippable_frame(0, b"abcd");
+        truncated_payload.truncate(truncated_payload.len() - 2);
+        let err = CompressionFormat::sniff(std::io::Cursor::new(truncated_payload))
+            .await
+            .expect_err("truncated shared frame payload must fail");
+        assert!(matches!(
+            err,
+            ZipError::InspectStream(ref source) if source.kind() == io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sniff_shared_frames_handles_fragmented_pending_reads() {
+        let encoded = encode_lz4(b"payload").await;
+        let mut input = Vec::new();
+        for variant in 0..=SNIFF_YIELD_AFTER_FRAMES {
+            input.extend_from_slice(&shared_skippable_frame(u8::try_from(variant % 16).expect("variant should fit u8"), b""));
+        }
+        input.extend_from_slice(&encoded);
+
+        let (format, sniffed) = CompressionFormat::sniff(FragmentedReader::new(input))
+            .await
+            .expect("fragmented shared frames should be inspected");
+        assert_eq!(format, CompressionFormat::Lz4);
+        let mut decoder = format.get_decoder(sniffed).expect("LZ4 decoder should be created");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("fragmented stream should decode");
+        assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_sniff_shared_frames_yields_at_frame_budget_with_ready_reader() {
+        let encoded = encode_lz4(b"payload").await;
+        let mut input = Vec::new();
+        for variant in 0..SNIFF_YIELD_AFTER_FRAMES {
+            let variant = u8::try_from(variant % 16).expect("variant should fit u8");
+            input.extend_from_slice(&shared_skippable_frame(variant, b""));
+        }
+        input.extend_from_slice(&encoded);
+
+        assert_ready_sniff_yields(input, &encoded[..MAGIC_SNIFF_LEN]).await;
+    }
+
+    #[tokio::test]
+    async fn test_sniff_shared_frame_yields_at_byte_budget_with_ready_reader() {
+        let encoded = encode_lz4(b"payload").await;
+        let metadata = vec![0x5a; SNIFF_YIELD_AFTER_BYTES];
+        let mut input = shared_skippable_frame(0, &metadata);
+        input.extend_from_slice(&encoded);
+
+        assert_ready_sniff_yields(input, &encoded[..MAGIC_SNIFF_LEN]).await;
+    }
+
+    #[tokio::test]
+    async fn test_sniff_shared_frame_preserves_underlying_read_error() {
+        let mut bytes = shared_skippable_frame(0, b"abcd");
+        bytes.truncate(bytes.len() - 2);
+        let err = CompressionFormat::sniff(ErrorAfterBytes { bytes, position: 0 })
+            .await
+            .expect_err("underlying read failure must escape inspection");
+
+        assert!(matches!(
+            err,
+            ZipError::InspectStream(ref source)
+                if source.kind() == io::ErrorKind::ConnectionReset && source.to_string() == "sentinel inspect failure"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_sniff_shared_frame_without_lz4_or_zstd_successor_is_unknown() {
+        let mut input = shared_skippable_frame(0, b"metadata");
+        input.extend_from_slice(b"raw tar bytes");
+
+        let (format, mut sniffed) = CompressionFormat::sniff(std::io::Cursor::new(input))
+            .await
+            .expect("complete shared frame should be inspectable");
+        assert_eq!(format, CompressionFormat::Unknown);
+        let mut replayed = Vec::new();
+        sniffed
+            .read_to_end(&mut replayed)
+            .await
+            .expect("successor bytes should replay");
+        assert_eq!(replayed, b"raw tar bytes");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_round_trips_xz_stream_with_memory_limit() {
+        let encoded = encode_xz(b"payload").await;
+        let (format, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(encoded))
+            .await
+            .expect("XZ magic should be inspected");
+        assert_eq!(format, CompressionFormat::Xz);
+
+        let mut decoder = format.get_decoder(sniffed).expect("XZ decoder should be created");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("XZ decode should succeed within the memory limit");
+
+        assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_rejects_xz_dictionary_over_memory_limit() {
+        const LZMA2_MAX_DICTIONARY_PROPERTY: u8 = 40;
+
+        let encoded = xz_with_dictionary_property(b"payload", LZMA2_MAX_DICTIONARY_PROPERTY).await;
+        let mut decoder = CompressionFormat::Xz
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("XZ decoder should be created before inspecting the stream header");
+        let mut decoded = Vec::new();
+        let err = decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect_err("hostile XZ dictionary request must exceed the decoder memory limit");
+
+        assert!(decoded.is_empty(), "decoder must reject the hostile dictionary before producing output");
+        assert!(
+            err.to_string().contains("memory limit"),
+            "hostile XZ dictionary should fail at the decoder memory boundary: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_accepts_xz_64_mib_dictionary() {
+        const LZMA2_64_MIB_DICTIONARY_PROPERTY: u8 = 28;
+
+        let encoded = xz_with_dictionary_property(b"payload", LZMA2_64_MIB_DICTIONARY_PROPERTY).await;
+        let mut decoder = CompressionFormat::Xz
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("XZ decoder should be created before inspecting the stream header");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("the memory limit must retain preset-9-compatible dictionary headroom");
+
+        assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_accepts_zstd_window_at_limit() {
+        let encoded = encode_zstd_with_window(b"payload", ZSTD_DECODER_MAX_WINDOW_LOG).await;
+        let mut decoder = CompressionFormat::Zstd
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("Zstd decoder should be created before inspecting the frame header");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("16 MiB Zstd windows must remain compatible");
+
+        assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_rejects_zstd_window_over_limit() {
+        let encoded = encode_zstd_with_window(b"payload", ZSTD_DECODER_MAX_WINDOW_LOG + 1).await;
+        let mut decoder = CompressionFormat::Zstd
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("Zstd decoder should be created before inspecting the frame header");
+        let mut decoded = Vec::new();
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect_err("Zstd windows larger than 16 MiB must be rejected");
+
+        assert!(decoded.is_empty(), "decoder must reject the oversized window before producing output");
     }
 
     #[tokio::test]

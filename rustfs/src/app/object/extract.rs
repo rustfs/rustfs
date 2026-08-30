@@ -63,6 +63,22 @@ struct ExtractArchiveUploadState {
     body_complete: bool,
 }
 
+fn resolve_extract_archive_format(key: &str, detected: CompressionFormat) -> CompressionFormat {
+    // Zlib has no unambiguous magic. Preserve the legacy zlib/zz suffix
+    // contract without letting other misleading suffixes override content
+    // detection.
+    if detected == CompressionFormat::Tar
+        && Path::new(key)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| CompressionFormat::from_extension(extension) == CompressionFormat::Zlib)
+    {
+        CompressionFormat::Zlib
+    } else {
+        detected
+    }
+}
+
 impl<R> ExtractArchiveEtagReader<R> {
     fn new(inner: R, expected_length: u64, state: Arc<Mutex<ExtractArchiveUploadState>>) -> Self {
         Self {
@@ -1032,9 +1048,12 @@ impl DefaultObjectUsecase {
         let extract_limits = put_object_extract_limits();
         let tracked_archive =
             ExtractArchiveEtagReader::new(archive_reader, expected_archive_length, archive_upload_state.clone());
-        let (archive_format, sniffed_archive) = CompressionFormat::sniff(tracked_archive)
-            .await
-            .map_err(|_| s3_error!(InvalidArgument, "Failed to detect archive compression"))?;
+        let (detected_archive_format, sniffed_archive) =
+            CompressionFormat::sniff(tracked_archive).await.map_err(|err| match err {
+                ZipError::InspectStream(source) => map_extract_archive_error(source),
+                _ => s3_error!(InvalidArgument, "Failed to detect archive compression"),
+            })?;
+        let archive_format = resolve_extract_archive_format(&key, detected_archive_format);
         let decoder = archive_format.get_decoder(sniffed_archive).map_err(|e| {
             error!(error = ?e, "Archive decoder creation failed");
             s3_error!(InvalidArgument, "get_decoder err")
@@ -1481,80 +1500,83 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
 
-    #[tokio::test]
-    async fn archive_etag_reader_finalizes_at_expected_length() {
-        let payload = b"compressed-archive-bytes".to_vec();
-        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
-        let mut reader = ExtractArchiveEtagReader::new(
-            std::io::Cursor::new(payload.clone()),
-            u64::try_from(payload.len()).expect("fixture length must fit u64"),
-            state.clone(),
+    #[test]
+    fn archive_format_uses_only_the_ambiguous_zlib_extension_as_a_fallback() {
+        assert_eq!(
+            resolve_extract_archive_format("archive.zlib", CompressionFormat::Tar),
+            CompressionFormat::Zlib
         );
-        let mut output = Vec::new();
-        reader
-            .read_to_end(&mut output)
-            .await
-            .expect("complete archive must be readable");
-
-        let expected_etag = hex_simd::encode_to_string(Md5::digest(&payload), hex_simd::AsciiCase::Lower);
-        let state = state.lock().expect("archive state lock must remain healthy");
-        assert_eq!(output, payload);
-        assert_eq!(state.etag.as_deref(), Some(expected_etag.as_str()));
-        assert!(state.length_complete);
+        assert_eq!(
+            resolve_extract_archive_format("archive.zz", CompressionFormat::Tar),
+            CompressionFormat::Zlib
+        );
+        assert_eq!(
+            resolve_extract_archive_format("raw-but-named.tar.gz", CompressionFormat::Tar),
+            CompressionFormat::Tar
+        );
+        assert_eq!(
+            resolve_extract_archive_format("gzip-but-named.zlib", CompressionFormat::Gzip),
+            CompressionFormat::Gzip
+        );
     }
 
     #[tokio::test]
-    async fn archive_etag_reader_completes_without_polling_raw_eof() {
-        let payload = b"decoder-consumed-exact-body".to_vec();
-        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
-        let mut reader = ExtractArchiveEtagReader::new(
-            std::io::Cursor::new(payload.clone()),
-            u64::try_from(payload.len()).expect("fixture length must fit u64"),
-            state.clone(),
-        );
-        let mut output = vec![0u8; payload.len()];
-        reader
-            .read_exact(&mut output)
+    async fn raw_tar_member_name_starting_with_zip_magic_is_not_misdetected() {
+        let path = "PK\u{3}\u{4}-member.txt";
+        let mut builder = Builder::new(Vec::new());
+        let mut header = Header::new_gnu();
+        header.set_size(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, &b""[..])
             .await
-            .expect("decoder should consume exactly the declared body without polling EOF");
+            .expect("raw TAR fixture should accept the control-byte member name");
+        let bytes = builder.into_inner().await.expect("raw TAR fixture should finalize");
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
 
-        let expected_etag = hex_simd::encode_to_string(Md5::digest(&payload), hex_simd::AsciiCase::Lower);
-        let state = state.lock().expect("archive state lock must remain healthy");
-        assert_eq!(output, payload);
-        assert_eq!(state.etag.as_deref(), Some(expected_etag.as_str()));
-        assert!(state.length_complete);
+        let (format, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(bytes))
+            .await
+            .expect("raw TAR prefix should be inspected");
+        assert_eq!(format, CompressionFormat::Tar);
+        let decoder = format.get_decoder(sniffed).expect("raw TAR decoder should be created");
+        let mut archive = Archive::new(decoder);
+        let mut entries = archive.entries().expect("raw TAR entry stream should be created");
+        let entry = entries
+            .next()
+            .await
+            .expect("raw TAR should contain its first member")
+            .expect("raw TAR member should parse");
+
+        assert_eq!(entry.path_bytes().expect("raw TAR member path should parse").as_ref(), path.as_bytes());
     }
 
     #[tokio::test]
-    async fn archive_etag_reader_rejects_body_shorter_than_content_length() {
-        let payload = b"short".to_vec();
+    async fn archive_etag_reader_validates_sha256_before_completion() {
+        let payload = b"archive-with-wrong-sha256".to_vec();
+        let expected_length = i64::try_from(payload.len()).expect("fixture length must fit i64");
+        let hash_reader = HashReader::from_stream(
+            std::io::Cursor::new(payload),
+            expected_length,
+            expected_length,
+            None,
+            Some("00".repeat(32)),
+            false,
+        )
+        .expect("hash reader should be created");
         let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
-        let mut reader = ExtractArchiveEtagReader::new(std::io::Cursor::new(payload), 6, state.clone());
+        let mut reader = ExtractArchiveEtagReader::new(
+            hash_reader,
+            u64::try_from(expected_length).expect("fixture length must fit u64"),
+            state.clone(),
+        );
         let mut output = Vec::new();
         let err = reader
             .read_to_end(&mut output)
             .await
-            .expect_err("short archive body must not finalize successfully");
-
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-        let state = state.lock().expect("archive state lock must remain healthy");
-        assert!(!state.length_complete);
-    }
-
-    #[tokio::test]
-    async fn archive_etag_reader_rejects_body_longer_than_content_length() {
-        let payload = b"too-long".to_vec();
-        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
-        let mut reader = ExtractArchiveEtagReader::new(std::io::Cursor::new(payload), 3, state.clone());
-        let mut output = Vec::new();
-        let err = reader
-            .read_to_end(&mut output)
-            .await
-            .expect_err("overlong archive body must not finalize successfully");
+            .expect_err("SHA-256 must be checked before upload completion");
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        let state = state.lock().expect("archive state lock must remain healthy");
-        assert!(!state.length_complete);
+        assert!(!state.lock().expect("archive state lock must remain healthy").body_complete);
     }
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {

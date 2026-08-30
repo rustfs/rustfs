@@ -23,7 +23,10 @@ use aws_sdk_s3::types::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
 use chrono::{Duration as ChronoDuration, Utc};
-use flate2::{Compression, write::GzEncoder};
+use flate2::{
+    Compression,
+    write::{GzEncoder, ZlibEncoder},
+};
 use http::HeaderValue;
 use http::header::{CONTENT_TYPE, HOST};
 use md5::{Digest as Md5Digest, Md5};
@@ -185,6 +188,12 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data).expect("gzip encoder should accept input");
     encoder.finish().expect("gzip encoder should finish")
+}
+
+fn zlib_bytes(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("zlib encoder should accept input");
+    encoder.finish().expect("zlib encoder should finish")
 }
 
 fn zstd_bytes(data: &[u8]) -> Vec<u8> {
@@ -5200,8 +5209,7 @@ async fn test_signed_put_object_extract_expands_tzst_archive() -> Result<(), Box
 
 #[tokio::test]
 async fn test_signed_put_object_extract_uses_magic_without_requiring_or_trusting_extension()
--> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5271,11 +5279,33 @@ async fn test_signed_put_object_extract_uses_magic_without_requiring_or_trusting
         .await?;
     assert_eq!(gzip.body.collect().await?.into_bytes().as_ref(), b"gzip-body");
 
+    let zlib_archive = zlib_bytes(&make_tar(&[("zlib-extension.txt", b"zlib-body")], &[]).await);
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key("bundle.zlib")
+        .body(ByteStream::from(zlib_archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let zlib = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key("zlib-extension.txt")
+        .send()
+        .await?;
+    assert_eq!(zlib.body.collect().await?.into_bytes().as_ref(), b"zlib-body");
+
     Ok(())
 }
 
 #[tokio::test]
-async fn test_signed_put_object_extract_rejects_invalid_archive_payload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_rejects_invalid_archive_payload() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
