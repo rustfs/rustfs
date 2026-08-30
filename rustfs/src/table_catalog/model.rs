@@ -39,6 +39,8 @@ pub(crate) fn table_bucket_marker_json() -> Result<Vec<u8>, serde_json::Error> {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogEntryState {
     Active,
+    /// Persisted only behind a rename intent so older readers reject the unknown state and fail closed.
+    Renaming,
     Deleting,
     Deleted,
 }
@@ -53,8 +55,38 @@ pub(crate) struct TableBucketEntry {
     pub state: TableCatalogEntryState,
     #[serde(default)]
     pub properties: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_rename_id: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableRenameIntentState {
+    Prepared,
+    SourceFenced,
+    DestinationWritten,
+    SourceTombstoned,
+    IndexPublished,
+    DestinationPublished,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableRenameIntent {
+    pub version: u16,
+    pub rename_id: String,
+    pub table_bucket: String,
+    pub source: TableEntry,
+    pub destination: TableEntry,
+    pub source_etag: String,
+    pub destination_etag: Option<String>,
+    pub warehouse_index_etag: String,
+    pub state: TableRenameIntentState,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1225,6 +1257,7 @@ pub(crate) enum TableCatalogBackingMigrationStep {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogBackingMigrationBlocker {
+    TableRenameRecoveryRequired,
     CommitRecoveryRequired,
     CommitManualReviewRequired,
     WarehouseIndexBackfillRequired,
