@@ -33,7 +33,7 @@ use super::replication_object_decision_boundary::{
     delete_replication_creates_marker, heal_uses_delete_replication_path, is_retryable_delete_replication_head_error,
     is_version_delete_replication, replicate_delete_outcome, replication_etags_match, replication_multipart_complete_actual_size,
     replication_multipart_part_plan, resync_existing_delete_replication_info, should_retry_delete_marker_purge,
-    target_delete_version_id,
+    single_part_replica_etag_mismatch, target_delete_version_id,
 };
 use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
 use super::replication_resync_boundary::ResyncStatusType;
@@ -54,7 +54,7 @@ use super::replication_storage_boundary::{
 };
 use super::replication_target_boundary::{
     ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions,
-    ReplicationTargetStore, S3ClientError, SsecPassthroughCapability, SsecPassthroughGate, TargetClient,
+    RemotePutObjectResponse, ReplicationTargetStore, S3ClientError, SsecPassthroughCapability, SsecPassthroughGate, TargetClient,
     is_replication_target_offline_error, replication_action_for_target_head, replication_complete_multipart_options,
     replication_delete_marker_purge_remove_options, replication_delete_remove_options, replication_force_delete_remove_options,
     replication_object_is_ssec_encrypted, replication_put_object_header_size, replication_put_object_options,
@@ -193,6 +193,53 @@ const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_id
 /// counts every drifting PUT), so a reconfigured target re-warning only
 /// after a restart is acceptable.
 static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<HashSet<String>>> = LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+const REPLICA_ETAG_VERIFY_ENV: &str = "RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY";
+
+/// Escape hatch for a target whose 32-hex ETags are legitimately not the
+/// content MD5 (e.g. a gateway hashing its own ciphertext without announcing
+/// SSE in the response) — such a target would otherwise fail every object.
+fn replica_etag_verification_enabled() -> bool {
+    std::env::var(REPLICA_ETAG_VERIFY_ENV)
+        .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))
+        .unwrap_or(true)
+}
+
+/// A 200 from the target is not proof the replica holds the source bytes: a
+/// target that stores a transformed payload (e.g. undecoded `aws-chunked`
+/// frames, #6853) returns the ETag of what it actually wrote. Reporting
+/// COMPLETED over such a replica is silent corruption, so a decidable
+/// mismatch fails the replication instead. An SSE-C ciphertext passthrough
+/// transfer is exempt: the wire bytes are ciphertext while the source ETag is
+/// the plaintext MD5, and that path has its own HEAD-back audit.
+fn verify_single_part_replica(
+    object_info: &ObjectInfo,
+    response: &RemotePutObjectResponse,
+    ciphertext_passthrough: bool,
+) -> std::result::Result<(), std::io::Error> {
+    if ciphertext_passthrough || !replica_etag_verification_enabled() {
+        return Ok(());
+    }
+    if single_part_replica_etag_mismatch(object_info.etag.as_deref(), response.etag.as_deref()) {
+        // The differing ETags go into the structured log; the error message
+        // stays constant so same-cause failures bucket together downstream.
+        warn!(
+            event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            bucket = %object_info.bucket,
+            object = %object_info.name,
+            source_etag = ?object_info.etag,
+            replica_etag = ?response.etag,
+            operation = "verify_replica_etag",
+            "Replication target operation failed"
+        );
+        return Err(std::io::Error::other(REPLICA_ETAG_MISMATCH_ERROR));
+    }
+    Ok(())
+}
+
+const REPLICA_ETAG_MISMATCH_ERROR: &str = "replica etag mismatch: the target persisted different bytes than were sent";
 
 fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &str, assigned_version_id: Option<&str>) {
     if !version_identity_drifted(source_version_id, assigned_version_id) {
@@ -3274,14 +3321,15 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             let result = tgt_client
                 .put_object(&tgt_client.bucket, &object, transfer_size, byte_stream, &put_opts)
                 .await
-                .map(|assigned_version_id| {
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .and_then(|response| {
                     audit_target_version_identity(
                         &tgt_client,
                         &put_opts.internal.source_version_id,
-                        assigned_version_id.as_deref(),
-                    )
-                })
-                .map_err(|e| std::io::Error::other(e.to_string()));
+                        response.version_id.as_deref(),
+                    );
+                    verify_single_part_replica(&object_info, &response, obj_opts.raw_data_movement_read)
+                });
             result.err()
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
@@ -3942,14 +3990,15 @@ async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
             .tgt_client
             .put_object(&ctx.tgt_client.bucket, ctx.object, ctx.transfer_size, byte_stream, &ctx.put_opts)
             .await
-            .map(|assigned_version_id| {
+            .map_err(|e| std::io::Error::other(e.to_string()))
+            .and_then(|response| {
                 audit_target_version_identity(
                     ctx.tgt_client,
                     &ctx.put_opts.internal.source_version_id,
-                    assigned_version_id.as_deref(),
-                )
-            })
-            .map_err(|e| std::io::Error::other(e.to_string()));
+                    response.version_id.as_deref(),
+                );
+                verify_single_part_replica(ctx.object_info, &response, ctx.obj_opts.raw_data_movement_read)
+            });
         result.err()
     }
 }
