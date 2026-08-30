@@ -51,6 +51,8 @@ pub struct ArchiveLimits {
     pub max_path_length: usize,
     pub max_pax_metadata_size: u64,
     pub max_total_pax_metadata_size: u64,
+    pub max_pax_metadata_records: usize,
+    pub max_total_pax_metadata_records: usize,
     pub validate_entry_paths: bool,
 }
 
@@ -64,6 +66,8 @@ impl Default for ArchiveLimits {
             max_path_length: 1024,
             max_pax_metadata_size: 1_048_576,
             max_total_pax_metadata_size: 67_108_864,
+            max_pax_metadata_records: 4_096,
+            max_total_pax_metadata_records: 100_000,
             validate_entry_paths: true,
         }
     }

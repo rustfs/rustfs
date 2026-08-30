@@ -16,6 +16,14 @@
 
 use super::*;
 
+// One logical member can be preceded by local PAX, GNU long-name, and GNU
+// long-link records. Count all four physical headers without rejecting that
+// compatible extension combination.
+const EXTRACT_ARCHIVE_PHYSICAL_ENTRY_MULTIPLIER: u64 = 4;
+// Sparse maps are metadata, so bound them independently of object byte quotas.
+const EXTRACT_ARCHIVE_MAX_SPARSE_ENTRIES: u64 = 4_096;
+const EXTRACT_ARCHIVE_MAX_SPARSE_CONTINUATION_BLOCKS: u64 = 256;
+
 fn ensure_legacy_archive_size_within_quota(result: &QuotaCheckResult, total_unpacked_size: u64) -> S3Result<()> {
     if result.uses_durable_reservations {
         return Ok(());
@@ -70,6 +78,13 @@ impl<R> ExtractArchiveEtagReader<R> {
     }
 }
 
+fn extract_archive_incomplete_body(remaining: u64) -> std::io::Error {
+    let Ok(remaining) = i64::try_from(remaining) else {
+        return std::io::Error::new(std::io::ErrorKind::InvalidData, "archive remaining body length exceeds i64");
+    };
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, rustfs_rio::IncompleteBody { remaining })
+}
+
 impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let mut this = self.project();
@@ -116,12 +131,7 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     Poll::Ready(Ok(())) if final_buf.filled().is_empty() => {
-                        let remaining = i64::try_from(*this.expected_length - *this.bytes_read)
-                            .expect("archive Content-Length originated as i64");
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            rustfs_rio::IncompleteBody { remaining },
-                        )));
+                        return Poll::Ready(Err(extract_archive_incomplete_body(*this.expected_length - *this.bytes_read)));
                     }
                     Poll::Ready(Ok(())) => {
                         this.md5.update(final_buf.filled());
@@ -137,19 +147,14 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
             }
 
             let max_read = usize::try_from(remaining - 1).unwrap_or(usize::MAX).min(buf.remaining());
-            let read = {
+            let read_len = {
                 let target = buf.initialize_unfilled_to(max_read);
                 let mut limited_buf = ReadBuf::new(target);
                 match this.inner.as_mut().poll_read(cx, &mut limited_buf) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     Poll::Ready(Ok(())) if limited_buf.filled().is_empty() => {
-                        let remaining = i64::try_from(*this.expected_length - *this.bytes_read)
-                            .expect("archive Content-Length originated as i64");
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            rustfs_rio::IncompleteBody { remaining },
-                        )));
+                        return Poll::Ready(Err(extract_archive_incomplete_body(*this.expected_length - *this.bytes_read)));
                     }
                     Poll::Ready(Ok(())) => {
                         this.md5.update(limited_buf.filled());
@@ -157,7 +162,7 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
                     }
                 }
             };
-            let read = match u64::try_from(read) {
+            let read = match u64::try_from(read_len) {
                 Ok(read) => read,
                 Err(_) => return Poll::Ready(Err(std::io::Error::other("archive read length exceeds u64"))),
             };
@@ -165,7 +170,7 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
                 Some(bytes_read) => bytes_read,
                 None => return Poll::Ready(Err(std::io::Error::other("archive read length overflow"))),
             };
-            buf.advance(usize::try_from(read).expect("read length originated as usize"));
+            buf.advance(read_len);
             return Poll::Ready(Ok(()));
         }
     }
@@ -475,6 +480,34 @@ fn record_extract_pax_metadata_bytes(
     Ok(())
 }
 
+fn record_extract_pax_metadata_record(
+    entry_records: &mut usize,
+    total_records: &mut usize,
+    limits: ArchiveLimits,
+) -> Result<(), ExtractEntryError> {
+    *entry_records = entry_records
+        .checked_add(1)
+        .ok_or_else(|| ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive PAX metadata record count overflowed")))?;
+    *total_records = total_records.checked_add(1).ok_or_else(|| {
+        ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive total PAX metadata record count overflowed"))
+    })?;
+
+    if *entry_records > limits.max_pax_metadata_records {
+        return Err(ExtractEntryError::Fatal(s3_error!(
+            InvalidArgument,
+            "Archive PAX metadata record count exceeds per-entry limit"
+        )));
+    }
+    if *total_records > limits.max_total_pax_metadata_records {
+        return Err(ExtractEntryError::Fatal(s3_error!(
+            InvalidArgument,
+            "Archive total PAX metadata record count exceeds limit"
+        )));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct ExtractEntryPaxAuthorization {
     headers: HeaderMap,
@@ -486,6 +519,7 @@ struct ExtractEntryPaxAuthorization {
 async fn count_extract_entry_pax_metadata<R>(
     entry: &mut tokio_tar::Entry<Archive<R>>,
     total_pax_metadata_size: &mut u64,
+    total_pax_metadata_records: &mut usize,
     limits: ArchiveLimits,
 ) -> Result<(), ExtractEntryError>
 where
@@ -500,8 +534,10 @@ where
     };
 
     let mut entry_pax_metadata_size = 0u64;
+    let mut entry_pax_metadata_records = 0usize;
     for ext in extensions {
         let ext = ext.map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
+        record_extract_pax_metadata_record(&mut entry_pax_metadata_records, total_pax_metadata_records, limits)?;
         record_extract_pax_metadata_bytes(
             &mut entry_pax_metadata_size,
             total_pax_metadata_size,
@@ -665,7 +701,14 @@ where
     R: AsyncRead + Send + Unpin + 'static,
 {
     let mut total_pax_metadata_size = 0;
-    count_extract_entry_pax_metadata(entry, &mut total_pax_metadata_size, ArchiveLimits::default()).await?;
+    let mut total_pax_metadata_records = 0;
+    count_extract_entry_pax_metadata(
+        entry,
+        &mut total_pax_metadata_size,
+        &mut total_pax_metadata_records,
+        ArchiveLimits::default(),
+    )
+    .await?;
     apply_extract_entry_pax_extensions(entry, bucket, object_name, object_lock_config_state, metadata, opts).await
 }
 
@@ -686,6 +729,23 @@ fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObject
 
 fn put_object_extract_limits() -> ArchiveLimits {
     ArchiveLimits::default()
+}
+
+fn build_put_object_extract_archive<R>(decoder: R, limits: ArchiveLimits) -> Archive<R>
+where
+    R: AsyncRead + Unpin,
+{
+    let max_physical_entries = u64::try_from(limits.max_entries)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(EXTRACT_ARCHIVE_PHYSICAL_ENTRY_MULTIPLIER);
+
+    tokio_tar::ArchiveBuilder::new(decoder)
+        .set_max_extension_entry_size(limits.max_pax_metadata_size)
+        .set_max_total_extension_size(limits.max_total_pax_metadata_size)
+        .set_max_physical_entries(max_physical_entries)
+        .set_max_sparse_entries(EXTRACT_ARCHIVE_MAX_SPARSE_ENTRIES)
+        .set_max_sparse_continuation_blocks(EXTRACT_ARCHIVE_MAX_SPARSE_CONTINUATION_BLOCKS)
+        .build()
 }
 
 fn validate_put_object_extract_entry_count(count: usize, limits: ArchiveLimits) -> S3Result<()> {
@@ -915,7 +975,7 @@ impl DefaultObjectUsecase {
             })?;
         let decoder = ExtractDecodedLimitReader::new(decoder, extract_limits.max_decoded_size);
 
-        let mut ar = Archive::new(decoder);
+        let mut ar = build_put_object_extract_archive(decoder, extract_limits);
         let mut entries = ar.entries().map_err(|e| {
             error!(error = ?e, "Archive entry listing failed");
             s3_error!(InvalidArgument, "get entries err")
@@ -952,6 +1012,7 @@ impl DefaultObjectUsecase {
         let mut resource_total_size = 0u64;
         let mut legacy_quota_growth = 0u64;
         let mut total_pax_metadata_size = 0u64;
+        let mut total_pax_metadata_records = 0usize;
         let object_lock_config_snapshot = store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?;
         let object_lock_config_state = object_lock_config_snapshot.state();
 
@@ -971,9 +1032,14 @@ impl DefaultObjectUsecase {
                 .checked_add(entry_size)
                 .ok_or_else(|| s3_error!(InvalidArgument, "Archive total unpacked size overflowed while processing entries"))?;
             validate_put_object_extract_total_size(resource_total_size, extract_limits)?;
-            count_extract_entry_pax_metadata(&mut f, &mut total_pax_metadata_size, extract_limits)
-                .await
-                .map_err(ExtractEntryError::into_s3_error)?;
+            count_extract_entry_pax_metadata(
+                &mut f,
+                &mut total_pax_metadata_size,
+                &mut total_pax_metadata_records,
+                extract_limits,
+            )
+            .await
+            .map_err(ExtractEntryError::into_s3_error)?;
 
             let entry_type = classify_extract_entry_type(f.header().entry_type());
             if entry_type == ExtractEntryDisposition::FormatSkip {
@@ -2085,6 +2151,68 @@ mod tests {
         assert!(err.ignore_or_return(true).is_err(), "ignore-errors must not bypass resource limits");
     }
 
+    #[test]
+    fn pax_metadata_record_budget_is_fatal_even_with_ignore_errors() {
+        let limits = ArchiveLimits {
+            max_pax_metadata_records: 1,
+            ..ArchiveLimits::default()
+        };
+        let mut entry_records = 0;
+        let mut total_records = 0;
+
+        record_extract_pax_metadata_record(&mut entry_records, &mut total_records, limits)
+            .expect("first PAX record should fit the budget");
+        let err = record_extract_pax_metadata_record(&mut entry_records, &mut total_records, limits)
+            .expect_err("second PAX record must exceed the per-entry budget");
+
+        assert!(!err.is_recoverable());
+        assert!(err.ignore_or_return(true).is_err(), "ignore-errors must not bypass record limits");
+
+        let limits = ArchiveLimits {
+            max_pax_metadata_records: 2,
+            max_total_pax_metadata_records: 1,
+            ..ArchiveLimits::default()
+        };
+        let mut first_entry_records = 0;
+        let mut second_entry_records = 0;
+        let mut total_records = 0;
+        record_extract_pax_metadata_record(&mut first_entry_records, &mut total_records, limits)
+            .expect("first archive PAX record should fit the total budget");
+        let err = record_extract_pax_metadata_record(&mut second_entry_records, &mut total_records, limits)
+            .expect_err("second archive PAX record must exceed the total budget");
+        assert!(!err.is_recoverable());
+    }
+
+    #[tokio::test]
+    async fn extract_archive_builder_rejects_oversized_extension_payload() {
+        let record = pax_record("comment", b"value");
+        let mut builder = Builder::new(Vec::new());
+        let mut extension = Header::new_ustar();
+        extension.set_entry_type(EntryType::XHeader);
+        extension.set_size(u64::try_from(record.len()).expect("fixture size must fit u64"));
+        extension.set_cksum();
+        builder
+            .append_data(&mut extension, "pax", record.as_slice())
+            .await
+            .expect("PAX extension fixture should be appended");
+        let bytes = builder.into_inner().await.expect("PAX extension fixture should finalize");
+        let limits = ArchiveLimits {
+            max_pax_metadata_size: u64::try_from(record.len() - 1).expect("fixture size must fit u64"),
+            ..ArchiveLimits::default()
+        };
+
+        let mut archive = build_put_object_extract_archive(std::io::Cursor::new(bytes), limits);
+        let err = archive
+            .entries()
+            .expect("archive entry stream should be created")
+            .next()
+            .await
+            .expect("extension header should produce a result")
+            .expect_err("dependency must reject the extension before buffering its payload");
+
+        assert_eq!(err.to_string(), "archive extension entry size limit exceeded");
+    }
+
     #[tokio::test]
     async fn pax_metadata_budget_counts_format_skipped_members() {
         let record = pax_record("comment", b"oversized-symlink-metadata");
@@ -2094,8 +2222,9 @@ mod tests {
             ..ArchiveLimits::default()
         };
         let mut total_size = 0;
+        let mut total_records = 0;
 
-        let err = count_extract_entry_pax_metadata(&mut entry, &mut total_size, limits)
+        let err = count_extract_entry_pax_metadata(&mut entry, &mut total_size, &mut total_records, limits)
             .await
             .expect_err("format-skipped members must still consume the PAX budget");
 
@@ -2127,7 +2256,8 @@ mod tests {
             ..ArchiveLimits::default()
         };
         let mut total_size = 0;
-        let budget_err = count_extract_entry_pax_metadata(&mut entry, &mut total_size, limits)
+        let mut total_records = 0;
+        let budget_err = count_extract_entry_pax_metadata(&mut entry, &mut total_size, &mut total_records, limits)
             .await
             .expect_err("the oversized tail must be counted before ignore-errors can skip the member");
 
