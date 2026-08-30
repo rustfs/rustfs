@@ -60,8 +60,9 @@ pub const REPLICATION_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &[
     "Destination.ReplicationTime",
 ];
 
-// v3: remote targets accept temporary credential session tokens and expiry.
-pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 3;
+// v4: temporary-credential fields moved from read-only historical metadata to
+// writable fields because remote targets now use them for request signing.
+pub const REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION: u32 = 4;
 
 pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     "sourcebucket",
@@ -90,6 +91,13 @@ pub const REMOTE_TARGET_WRITABLE_FIELDS: &[&str] = &[
     // (contract v2; previously only importable via MinIO bucket-targets.json).
     "disableProxy",
 ];
+
+/// Remote target fields that are readable for persisted-data compatibility but
+/// cannot be written through the admin API.
+///
+/// The empty slice remains public for source compatibility with consumers of
+/// the v3 capability API.
+pub const REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS: &[&str] = &[];
 
 pub const REMOTE_TARGET_UNSUPPORTED_FIELDS: &[&str] = &["edge", "edgeSyncBeforeExpiry"];
 

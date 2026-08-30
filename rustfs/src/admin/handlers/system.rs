@@ -24,8 +24,9 @@ use crate::admin::runtime_sources::{
     DefaultAdminUsecase, QueryServerInfoRequest, current_endpoints_handle, default_admin_usecase, object_store_from_req,
 };
 use crate::admin::storage_api::bucket::replication::{
-    REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
-    REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS, REPLICATION_WRITABLE_FIELDS,
+    REMOTE_TARGET_CAPABILITY_CONTRACT_VERSION, REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_UNSUPPORTED_FIELDS,
+    REMOTE_TARGET_WRITABLE_FIELDS, REPLICATION_CAPABILITY_CONTRACT_VERSION, REPLICATION_READ_ONLY_HISTORICAL_FIELDS,
+    REPLICATION_WRITABLE_FIELDS,
 };
 use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
@@ -730,6 +731,15 @@ impl ReplicationCapabilities {
                         state: ReplicationFieldState::Supported,
                     })
                     .chain(
+                        REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS
+                            .iter()
+                            .copied()
+                            .map(|name| ReplicationFieldCapability {
+                                name,
+                                state: ReplicationFieldState::ReadOnlyHistorical,
+                            }),
+                    )
+                    .chain(
                         REMOTE_TARGET_UNSUPPORTED_FIELDS
                             .iter()
                             .copied()
@@ -1296,8 +1306,8 @@ mod tests {
         assert_eq!(response.summary.manual_transition_jobs.state, CapabilityState::Supported);
         assert_eq!(response.replication.contract_version, 1);
         assert_eq!(response.replication.bucket_replication.contract_version, 1);
-        // v3: temporary-credential fields are writable and used for signing.
-        assert_eq!(response.replication.remote_targets.contract_version, 3);
+        // v4: temporary-credential fields moved from historical-only to writable.
+        assert_eq!(response.replication.remote_targets.contract_version, 4);
         assert_eq!(response.replication.bucket_replication.status.state, CapabilityState::Supported);
         assert_eq!(response.replication.remote_targets.status.state, CapabilityState::Supported);
         assert_eq!(
@@ -1418,7 +1428,7 @@ mod tests {
         assert_eq!(value["summary"]["manual_transition_jobs"]["state"], "supported");
         assert_eq!(value["replication"]["contract_version"], 1);
         assert_eq!(value["replication"]["bucket_replication"]["contract_version"], 1);
-        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 3);
+        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 4);
         assert_eq!(value["replication"]["bucket_replication"]["status"]["state"], "supported");
         assert_eq!(value["replication"]["remote_targets"]["status"]["state"], "supported");
         assert_eq!(
