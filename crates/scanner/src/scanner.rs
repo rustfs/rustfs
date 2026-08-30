@@ -751,15 +751,15 @@ fn prepare_cycle_for_usage_floor_bootstrap(
     cycle_info: &mut CurrentCycle,
     usage_floor: PersistedUsageFloor,
     startup: PersistedUsageFloorStartup,
-) -> (bool, bool) {
+) -> (bool, ScannerCycleResetPolicy) {
     match startup {
-        PersistedUsageFloorStartup::Authoritative => (false, false),
+        PersistedUsageFloorStartup::Authoritative => (false, ScannerCycleResetPolicy::None),
         PersistedUsageFloorStartup::Missing => {
             // Cycle progress without its corresponding usage floor cannot
             // prove namespace coverage. Restart from cycle zero while keeping
             // the separately fenced leader epoch monotonic.
             *cycle_info = CurrentCycle::default();
-            (true, true)
+            (true, ScannerCycleResetPolicy::ResetAll)
         }
         PersistedUsageFloorStartup::BootstrapPending => {
             // An unfenced marker may have been written before an upgrade's old
@@ -768,14 +768,25 @@ fn prepare_cycle_for_usage_floor_bootstrap(
             if usage_floor.leader_epoch == 0 {
                 *cycle_info = CurrentCycle::default();
             }
-            (true, usage_floor.leader_epoch == 0)
+            (
+                true,
+                if usage_floor.leader_epoch == 0 {
+                    ScannerCycleResetPolicy::ResetAll
+                } else {
+                    ScannerCycleResetPolicy::None
+                },
+            )
         }
         PersistedUsageFloorStartup::RecoveredLegacyEmptyFence => {
             // The legacy empty fence proves only its leader epoch, not
-            // namespace coverage. Restart coverage from zero while retaining
-            // that epoch as the lower bound for the next leadership claim.
-            *cycle_info = CurrentCycle::default();
-            (true, true)
+            // namespace coverage. Clear coverage while retaining the durable
+            // cycle number so surviving caches cannot force a regression.
+            let next = cycle_info.next;
+            *cycle_info = CurrentCycle {
+                next,
+                ..Default::default()
+            };
+            (true, ScannerCycleResetPolicy::ResetCoveragePreservingNext)
         }
     }
 }
@@ -1296,7 +1307,15 @@ where
     LockLost: Future<Output = ()>,
 {
     let fence_ctx = ctx.child_token();
-    let claim = claim_scanner_leadership(&fence_ctx, storeapi, cycle_info, cycle_revision, leader_epoch, false, false);
+    let claim = claim_scanner_leadership(
+        &fence_ctx,
+        storeapi,
+        cycle_info,
+        cycle_revision,
+        leader_epoch,
+        false,
+        ScannerCycleResetPolicy::None,
+    );
     tokio::pin!(claim);
     tokio::pin!(lock_lost);
     tokio::select! {
@@ -1792,8 +1811,18 @@ async fn run_data_scanner_cycle_with_budget(
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Failed;
     }
-    match scanner_cycle_pre_commit_outcome(scan_cycle_result.required_cycle_floor(), &usage_persist_outcome) {
+    let required_cycle_floor = scan_cycle_result.required_cycle_floor();
+    let pre_commit_outcome = scanner_cycle_pre_commit_outcome(required_cycle_floor, &usage_persist_outcome);
+    update_scanner_cache_cycle_recovery_status(
+        cycle_info.current,
+        leader_epoch,
+        required_cycle_floor,
+        pre_commit_outcome,
+        scan_cycle_result.status == ScannerCycleStatus::Complete,
+    );
+    match pre_commit_outcome {
         Some(ScannerCyclePreCommitOutcome::RecoverCacheCycle(required_cycle)) => {
+            record_scanner_cache_cycle_recovery_attempt();
             warn!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_CYCLE_STATE,
@@ -2312,7 +2341,7 @@ async fn run_data_scanner_with_maintenance_state(
             return Ok(());
         }
     };
-    let (allow_usage_floor_bootstrap_pending, reset_usage_floor_bootstrap_cycle_on_conflict) =
+    let (allow_usage_floor_bootstrap_pending, usage_floor_cycle_reset_policy) =
         prepare_cycle_for_usage_floor_bootstrap(&mut cycle_info, usage_floor, usage_floor_startup);
     apply_persisted_usage_floor(&mut cycle_info, &mut leader_epoch, usage_floor);
     match usage_floor_startup {
@@ -2374,7 +2403,7 @@ async fn run_data_scanner_with_maintenance_state(
             &mut cycle_revision,
             &mut leader_epoch,
             allow_usage_floor_bootstrap_pending,
-            reset_usage_floor_bootstrap_cycle_on_conflict,
+            usage_floor_cycle_reset_policy,
         ),
         guard.lock_lost_notified(),
     )
@@ -2899,6 +2928,26 @@ fn scanner_cycle_pre_commit_outcome(
     match usage_persist_outcome {
         DataUsagePersistOutcome::Deferred(reason) => Some(ScannerCyclePreCommitOutcome::Deferred(*reason)),
         _ => required_cycle_floor.map(ScannerCyclePreCommitOutcome::RecoverCacheCycle),
+    }
+}
+
+fn update_scanner_cache_cycle_recovery_status(
+    requested_cycle: u64,
+    leader_epoch: u64,
+    required_cycle_floor: Option<u64>,
+    pre_commit_outcome: Option<ScannerCyclePreCommitOutcome>,
+    cache_scope_complete: bool,
+) {
+    match (required_cycle_floor, pre_commit_outcome) {
+        (Some(required_cycle), _) => {
+            record_scanner_cache_cycle_ahead(requested_cycle, required_cycle, leader_epoch);
+        }
+        (None, Some(ScannerCyclePreCommitOutcome::Deferred(_))) => {
+            // A deferred scan may not have covered the cache that established
+            // the existing floor, so it cannot prove recovery is complete.
+        }
+        (None, _) if cache_scope_complete => clear_scanner_cache_cycle_ahead(),
+        (None, _) => {}
     }
 }
 

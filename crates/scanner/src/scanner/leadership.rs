@@ -21,6 +21,29 @@ pub(super) enum ScannerLeadershipClaimReconcile {
     Unchanged,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ScannerCycleResetPolicy {
+    None,
+    ResetAll,
+    ResetCoveragePreservingNext,
+}
+
+impl ScannerCycleResetPolicy {
+    fn apply(self, cycle_info: &mut CurrentCycle, attempted_next: u64) {
+        match self {
+            Self::None => {}
+            Self::ResetAll => *cycle_info = CurrentCycle::default(),
+            Self::ResetCoveragePreservingNext => {
+                let next = cycle_info.next.max(attempted_next);
+                *cycle_info = CurrentCycle {
+                    next,
+                    ..Default::default()
+                };
+            }
+        }
+    }
+}
+
 pub(super) async fn reconcile_scanner_leadership_claim(
     storeapi: Arc<impl ScannerObjectIO>,
     attempted: &[u8],
@@ -329,7 +352,7 @@ pub(super) async fn claim_scanner_leadership(
     revision: &mut DataUsageCacheRevision,
     persisted_epoch: &mut u64,
     allow_bootstrap_pending: bool,
-    reset_bootstrap_cycle_on_conflict: bool,
+    cycle_reset_policy: ScannerCycleResetPolicy,
 ) -> bool {
     for retry in 0..=SCANNER_PERSIST_CAS_RETRIES {
         if ctx.is_cancelled() {
@@ -347,6 +370,7 @@ pub(super) async fn claim_scanner_leadership(
             );
             return false;
         };
+        let attempted_next = cycle_info.next;
         let data = match encode_scanner_cycle_state(cycle_info, claimed_epoch) {
             Ok(data) => data,
             Err(err) => {
@@ -459,9 +483,7 @@ pub(super) async fn claim_scanner_leadership(
                         .await;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Changed) if retry < SCANNER_PERSIST_CAS_RETRIES => {
-                        if reset_bootstrap_cycle_on_conflict {
-                            *cycle_info = CurrentCycle::default();
-                        }
+                        cycle_reset_policy.apply(cycle_info, attempted_next);
                         continue;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Changed | ScannerLeadershipClaimReconcile::Unchanged) => {
@@ -517,17 +539,13 @@ pub(super) async fn claim_scanner_leadership(
                     Ok(ScannerLeadershipClaimReconcile::Changed)
                         if retry < SCANNER_PERSIST_CAS_RETRIES && !ctx.is_cancelled() =>
                     {
-                        if reset_bootstrap_cycle_on_conflict {
-                            *cycle_info = CurrentCycle::default();
-                        }
+                        cycle_reset_policy.apply(cycle_info, attempted_next);
                         continue;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Unchanged)
                         if precondition_failed && retry < SCANNER_PERSIST_CAS_RETRIES && !ctx.is_cancelled() =>
                     {
-                        if reset_bootstrap_cycle_on_conflict {
-                            *cycle_info = CurrentCycle::default();
-                        }
+                        cycle_reset_policy.apply(cycle_info, attempted_next);
                         continue;
                     }
                     Ok(ScannerLeadershipClaimReconcile::Changed | ScannerLeadershipClaimReconcile::Unchanged) => {

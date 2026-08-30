@@ -16,10 +16,11 @@ use super::heal_info::{classify_background_heal_read_error, decode_background_he
 use super::*;
 use crate::EcstoreResult;
 use crate::{
-    DATA_USAGE_BLOOM_RECOVERY_PATH, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints,
-    ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions,
-    ScannerPutObjReader as PutObjReader, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
-    init_local_disks_with_instance_ctx,
+    DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_CACHE_KEY_FORMAT, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT,
+    DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntry, DataUsageScanPlanDigest, Endpoint, EndpointServerPools,
+    Endpoints, InstanceContext, PoolEndpoints, ScannerGetObjectReader as GetObjectReader, ScannerObjectInfo as ObjectInfo,
+    ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader, init_bucket_metadata_sys_for_scanner_tests,
+    init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx,
 };
 use serial_test::serial;
 use std::collections::{HashMap, HashSet};
@@ -1991,7 +1992,7 @@ fn rc3_legacy_empty_usage_fence(epoch: Option<u64>) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn scanner_usage_floor_recovers_rc3_empty_fences_and_restarts_from_zero() {
+async fn scanner_usage_floor_recovers_rc3_empty_fences_and_preserves_cycle_number() {
     let store = Arc::new(MemoryConfigStore::default());
     let primary_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -2034,16 +2035,17 @@ async fn scanner_usage_floor_recovers_rc3_empty_fences_and_restarts_from_zero() 
     assert_eq!(restart_floor.leader_epoch, 7);
     assert_eq!(restart_state, PersistedUsageFloorStartup::RecoveredLegacyEmptyFence);
     let mut cycle = CurrentCycle {
-        current: 41,
-        next: 42,
-        ..Default::default()
+        current: 17_117,
+        next: 17_118,
+        cycle_completed: vec![Utc::now()],
+        started: Utc::now(),
     };
     assert_eq!(
         prepare_cycle_for_usage_floor_bootstrap(&mut cycle, restart_floor, restart_state),
-        (true, true)
+        (true, ScannerCycleResetPolicy::ResetCoveragePreservingNext)
     );
     assert_eq!(cycle.current, 0);
-    assert_eq!(cycle.next, 0);
+    assert_eq!(cycle.next, 17_118);
     assert!(cycle.cycle_completed.is_empty());
 
     let mut revision = DataUsageCacheRevision::Missing;
@@ -2056,11 +2058,70 @@ async fn scanner_usage_floor_recovers_rc3_empty_fences_and_restarts_from_zero() 
             &mut revision,
             &mut leader_epoch,
             true,
-            true,
+            ScannerCycleResetPolicy::ResetCoveragePreservingNext,
         )
         .await
     );
     assert_eq!(leader_epoch, 8);
+    assert_eq!(cycle.next, 17_118);
+    assert_eq!(cycle.current, 0);
+    assert!(cycle.cycle_completed.is_empty());
+
+    let source = DataUsageCacheSource::new(0, 0);
+    let scan_plan_digest = DataUsageScanPlanDigest([7; 32]);
+    for (cache_path, name) in [
+        (DATA_USAGE_CACHE_NAME.to_string(), DATA_USAGE_ROOT),
+        (format!("photos/{DATA_USAGE_CACHE_NAME}"), "photos"),
+    ] {
+        let mut historical = DataUsageCache::default();
+        historical.info.name = name.to_string();
+        historical.info.next_cycle = 17_118;
+        historical.info.leader_epoch = 7;
+        historical.info.source = Some(source);
+        historical.info.scan_plan_digest = Some(scan_plan_digest);
+        historical.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
+        historical.info.snapshot_complete = true;
+        historical.replace(name, "", DataUsageEntry::default());
+        historical
+            .save(store.clone(), &cache_path)
+            .await
+            .expect("historical scanner cache should persist through the storage path");
+
+        let mut recovered = DataUsageCache::default();
+        let revisions = recovered
+            .load_with_revisions(store.clone(), &cache_path)
+            .await
+            .expect("historical scanner cache should reload with CAS revisions");
+        assert_eq!(recovered.info.name, name);
+        assert_eq!(recovered.info.next_cycle, 17_118);
+        assert_eq!(recovered.info.leader_epoch, 7);
+        assert!(!recovered.cache.is_empty());
+
+        assert_eq!(
+            recovered.prepare_for_scan(name, cycle.next, leader_epoch, source, scan_plan_digest, true),
+            DataUsageCachePrepareOutcome::Reset,
+            "recovered cache should reset without a cycle regression: {cache_path}"
+        );
+        assert_eq!(recovered.info.next_cycle, 17_118);
+        assert_eq!(recovered.info.leader_epoch, 8);
+        assert!(!recovered.info.snapshot_complete);
+        assert!(recovered.cache.is_empty());
+
+        recovered
+            .save_with_revisions(store.clone(), &cache_path, &revisions)
+            .await
+            .expect("reset scanner cache should persist with its loaded revisions");
+        let mut persisted_reset = DataUsageCache::default();
+        persisted_reset
+            .load(store.clone(), &cache_path)
+            .await
+            .expect("persisted reset scanner cache should reload");
+        assert_eq!(persisted_reset.info.name, name);
+        assert_eq!(persisted_reset.info.next_cycle, 17_118);
+        assert_eq!(persisted_reset.info.leader_epoch, 8);
+        assert!(!persisted_reset.info.snapshot_complete);
+        assert!(persisted_reset.cache.is_empty());
+    }
     complete_legacy_empty_usage_floor_recovery(store.clone(), leader_epoch)
         .await
         .expect("leadership claim should retire the recovery marker");
@@ -2253,7 +2314,7 @@ async fn scanner_usage_floor_recovery_reconciles_marker_delete_post_commit_error
     let mut cycle = CurrentCycle::default();
     let mut revision = DataUsageCacheRevision::Missing;
     let mut leader_epoch = floor.leader_epoch;
-    let (allow_pending, reset_on_conflict) = prepare_cycle_for_usage_floor_bootstrap(&mut cycle, floor, state);
+    let (allow_pending, cycle_reset_policy) = prepare_cycle_for_usage_floor_bootstrap(&mut cycle, floor, state);
     assert!(
         claim_scanner_leadership(
             &CancellationToken::new(),
@@ -2262,7 +2323,7 @@ async fn scanner_usage_floor_recovery_reconciles_marker_delete_post_commit_error
             &mut revision,
             &mut leader_epoch,
             allow_pending,
-            reset_on_conflict,
+            cycle_reset_policy,
         )
         .await
     );
@@ -2491,6 +2552,53 @@ fn scanner_usage_floor_recovery_stays_retryable_until_claim_cleanup() {
     assert_eq!(retried.first_detected_at_unix_secs, first_detected);
 
     clear_legacy_empty_usage_floor_recovery_status();
+    assert_eq!(scanner_cycle_recovery_status().state, "healthy");
+}
+
+#[test]
+#[serial]
+fn scanner_cache_cycle_ahead_is_visible_until_a_later_scan_clears_it() {
+    record_scanner_cache_cycle_ahead(0, 17_118, 8);
+    let pending = scanner_cycle_recovery_status();
+    assert_eq!(pending.state, "cache_cycle_ahead");
+    assert_eq!(pending.classification.as_deref(), Some("cache_cycle_ahead"));
+    assert_eq!(pending.generation, Some(17_118));
+    assert_eq!(pending.leader_epoch, Some(8));
+    assert!(pending.retryable);
+    assert_eq!(pending.max_retries, 0);
+    assert_eq!(
+        pending.reason.as_deref(),
+        Some("persisted scanner cache cycle 17118 is ahead of requested cycle 0")
+    );
+    let first_detected = pending.first_detected_at_unix_secs;
+
+    record_scanner_cache_cycle_ahead(0, 17_118, 8);
+    let observed_again = scanner_cycle_recovery_status();
+    assert_eq!(observed_again.retry_count, 0);
+    assert_eq!(observed_again.first_detected_at_unix_secs, first_detected);
+
+    assert!(record_scanner_cycle_recovery_retry(4));
+    assert_eq!(scanner_cycle_recovery_status().retry_count, 0);
+
+    record_scanner_cache_cycle_recovery_attempt();
+    record_scanner_cache_cycle_recovery_attempt();
+    let retried = scanner_cycle_recovery_status();
+    assert_eq!(retried.retry_count, 2);
+    assert!(retried.retryable);
+
+    update_scanner_cache_cycle_recovery_status(
+        0,
+        8,
+        None,
+        Some(ScannerCyclePreCommitOutcome::Deferred(ScannerCycleDeferReason::DataMovement)),
+        false,
+    );
+    assert_eq!(scanner_cycle_recovery_status().classification.as_deref(), Some("cache_cycle_ahead"));
+
+    update_scanner_cache_cycle_recovery_status(17_118, 8, None, None, false);
+    assert_eq!(scanner_cycle_recovery_status().classification.as_deref(), Some("cache_cycle_ahead"));
+
+    update_scanner_cache_cycle_recovery_status(17_118, 8, None, None, true);
     assert_eq!(scanner_cycle_recovery_status().state, "healthy");
 }
 
@@ -2946,7 +3054,7 @@ fn missing_usage_floor_discards_unfenced_cycle_progress() {
 
     assert_eq!(
         prepare_cycle_for_usage_floor_bootstrap(&mut cycle, PersistedUsageFloor::default(), PersistedUsageFloorStartup::Missing,),
-        (true, true)
+        (true, ScannerCycleResetPolicy::ResetAll)
     );
     assert_eq!(cycle.next, 0);
     assert_eq!(cycle.current, 0);
@@ -2959,7 +3067,7 @@ fn missing_usage_floor_discards_unfenced_cycle_progress() {
             PersistedUsageFloor::default(),
             PersistedUsageFloorStartup::BootstrapPending,
         ),
-        (true, true)
+        (true, ScannerCycleResetPolicy::ResetAll)
     );
     assert_eq!(cycle.next, 0);
 }
@@ -2980,7 +3088,7 @@ fn fenced_usage_bootstrap_retains_partial_cycle_progress() {
             },
             PersistedUsageFloorStartup::BootstrapPending,
         ),
-        (true, false)
+        (true, ScannerCycleResetPolicy::None)
     );
     assert_eq!(cycle.next, 12);
 
@@ -2993,7 +3101,7 @@ fn fenced_usage_bootstrap_retains_partial_cycle_progress() {
             },
             PersistedUsageFloorStartup::Authoritative,
         ),
-        (false, false)
+        (false, ScannerCycleResetPolicy::None)
     );
     assert_eq!(cycle.next, 12);
 }
@@ -3024,7 +3132,7 @@ async fn missing_usage_floor_rebuilds_persisted_cycle_before_leadership_claim() 
         .await
         .expect("stably missing usage floor should admit a bootstrap marker");
     assert_eq!(startup, PersistedUsageFloorStartup::Missing);
-    let (allow_bootstrap_pending, reset_bootstrap_cycle_on_conflict) =
+    let (allow_bootstrap_pending, cycle_reset_policy) =
         prepare_cycle_for_usage_floor_bootstrap(&mut cycle_info, usage_floor, startup);
     apply_persisted_usage_floor(&mut cycle_info, &mut persisted_epoch, usage_floor);
     initialize_usage_baseline_bootstrap(store.clone())
@@ -3039,7 +3147,7 @@ async fn missing_usage_floor_rebuilds_persisted_cycle_before_leadership_claim() 
             &mut cycle_revision,
             &mut persisted_epoch,
             allow_bootstrap_pending,
-            reset_bootstrap_cycle_on_conflict,
+            cycle_reset_policy,
         )
         .await
     );
@@ -3402,7 +3510,18 @@ async fn test_leadership_claim_preserves_usage_epoch_floor_across_old_epoch_conf
     );
 
     let mut persisted_epoch = 8;
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
+    assert!(
+        claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
 
     let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
         .await
@@ -3440,7 +3559,18 @@ async fn unfenced_usage_bootstrap_discards_old_epoch_conflict_progress() {
     );
 
     let mut persisted_epoch = 1;
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, true, true).await);
+    assert!(
+        claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            true,
+            ScannerCycleResetPolicy::ResetAll,
+        )
+        .await
+    );
 
     let state = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
         .await
@@ -3448,6 +3578,84 @@ async fn unfenced_usage_bootstrap_discards_old_epoch_conflict_progress() {
     let (claimed_cycle, claimed_epoch) = decode_scanner_cycle_state(&state).expect("claimed cycle state should decode");
     assert_eq!(claimed_cycle.next, 0);
     assert_eq!(claimed_epoch, 2);
+}
+
+#[tokio::test]
+async fn recovered_usage_bootstrap_claim_conflicts_preserve_the_highest_cycle_number() {
+    for winner_next in [42_u64, 20_000] {
+        let store = Arc::new(MemoryConfigStore::default());
+        let ctx = CancellationToken::new();
+        let mut revision = DataUsageCacheRevision::Missing;
+        let mut cycle = CurrentCycle {
+            next: 12,
+            ..Default::default()
+        };
+        assert!(persist_scanner_cycle_state(&ctx, store.clone(), &mut cycle, &mut revision, 1).await);
+        seed_usage_snapshot_for_leadership_claim(&store).await;
+
+        cycle = CurrentCycle {
+            current: 17_117,
+            next: 17_118,
+            cycle_completed: vec![Utc::now()],
+            started: Utc::now(),
+        };
+        let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
+        let winner = CurrentCycle {
+            current: winner_next.saturating_sub(1),
+            next: winner_next,
+            cycle_completed: vec![Utc::now()],
+            started: Utc::now(),
+        };
+        store
+            .interleaving_puts
+            .lock()
+            .await
+            .insert(key, (2, encode_scanner_cycle_state(&winner, 7).expect("conflict winner should encode")));
+
+        let mut persisted_epoch = 7;
+        assert!(
+            claim_scanner_leadership(
+                &ctx,
+                store.clone(),
+                &mut cycle,
+                &mut revision,
+                &mut persisted_epoch,
+                true,
+                ScannerCycleResetPolicy::ResetCoveragePreservingNext,
+            )
+            .await
+        );
+
+        let persisted = read_config(store, DATA_USAGE_BLOOM_NAME_PATH.as_str())
+            .await
+            .expect("recovered leadership claim should remain durable");
+        let (persisted_cycle, claimed_epoch) =
+            decode_scanner_cycle_state(&persisted).expect("recovered leadership claim should decode");
+        assert_eq!(persisted_cycle.next, 17_118_u64.max(winner_next));
+        assert_eq!(persisted_cycle.current, 0);
+        assert!(persisted_cycle.cycle_completed.is_empty());
+        assert_eq!(claimed_epoch, 8);
+    }
+}
+
+#[test]
+fn recovered_usage_cache_reset_keeps_cycle_and_leader_regression_guards() {
+    let source = DataUsageCacheSource::new(0, 0);
+    let digest = DataUsageScanPlanDigest([9; 32]);
+    let mut newer_cycle = DataUsageCache::default();
+    newer_cycle.info.next_cycle = 17_119;
+    assert_eq!(
+        newer_cycle.prepare_for_scan(DATA_USAGE_ROOT, 17_118, 8, source, digest, true),
+        DataUsageCachePrepareOutcome::RejectedNewerCycle
+    );
+
+    let mut newer_leader = DataUsageCache::default();
+    newer_leader.info.next_cycle = 17_118;
+    newer_leader.info.leader_epoch = 9;
+    assert_eq!(
+        newer_leader.prepare_for_scan(DATA_USAGE_ROOT, 17_118, 8, source, digest, true),
+        DataUsageCachePrepareOutcome::RejectedNewerLeader
+    );
 }
 
 #[tokio::test]
@@ -3461,7 +3669,18 @@ async fn test_leadership_claim_rejects_terminal_epoch() {
     };
     let mut persisted_epoch = u64::MAX - 1;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
+    assert!(
+        !claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
     assert_eq!(persisted_epoch, u64::MAX - 1);
     assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
 }
@@ -3477,7 +3696,18 @@ async fn scanner_defers_leadership_when_usage_snapshots_are_stably_absent() {
     };
     let mut persisted_epoch = 0;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
+    assert!(
+        !claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
     assert!(read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
     assert!(read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str()).await.is_err());
 }
@@ -3493,9 +3723,31 @@ async fn usage_bootstrap_pending_unblocks_first_leadership_claim() {
     let mut revision = DataUsageCacheRevision::Missing;
     let mut cycle = CurrentCycle::default();
     let mut persisted_epoch = 0;
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false,).await);
+    assert!(
+        !claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
     assert!(read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, true, true).await);
+    assert!(
+        claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            true,
+            ScannerCycleResetPolicy::ResetAll,
+        )
+        .await
+    );
 
     let usage = read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
@@ -3583,7 +3835,18 @@ async fn leadership_claim_defers_on_corrupt_usage_baseline_without_bloom_write()
     };
     let mut persisted_epoch = 0;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
+    assert!(
+        !claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
     assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
 }
 
@@ -3603,7 +3866,18 @@ async fn leadership_claim_defers_on_unidentified_usage_baseline_without_bloom_wr
     };
     let mut persisted_epoch = 0;
 
-    assert!(!claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
+    assert!(
+        !claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
     assert!(read_config(store, &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
 }
 
@@ -3625,7 +3899,18 @@ async fn test_leadership_claim_confirms_commit_after_returned_error() {
     let mut persisted_epoch = 0;
     seed_usage_snapshot_for_leadership_claim(&store).await;
 
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
+    assert!(
+        claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
 
     let state = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
         .await
@@ -3681,7 +3966,18 @@ async fn test_leadership_claim_usage_fence_rejects_old_inflight_writer() {
         ..Default::default()
     };
     let mut persisted_epoch = 4;
-    assert!(claim_scanner_leadership(&ctx, store.clone(), &mut cycle, &mut revision, &mut persisted_epoch, false, false).await);
+    assert!(
+        claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
 
     let (fenced_data, fenced_revision) = read_config_with_revision(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
         .await
@@ -3747,7 +4043,7 @@ async fn cycle_budget_lease_takeover_rejects_old_generation() {
             &mut replacement_revision,
             &mut replacement_epoch,
             false,
-            false,
+            ScannerCycleResetPolicy::None,
         )
         .await
     );
