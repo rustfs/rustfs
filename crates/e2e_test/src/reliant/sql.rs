@@ -17,7 +17,8 @@ use crate::common::{RustFSTestEnvironment, init_logging};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{
-    CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, JsonInput, JsonOutput, JsonType, OutputSerialization,
+    CsvInput, CsvOutput, ExpressionType, FileHeaderInfo, InputSerialization, JsonInput, JsonOutput, JsonType,
+    OutputSerialization, RequestProgress,
 };
 use bytes::Bytes;
 use std::error::Error;
@@ -150,6 +151,142 @@ async fn process_select_response(
     })
     .await
     .map_err(|_| -> Box<dyn Error + Send + Sync> { "Select response timed out".into() })?
+}
+
+async fn assert_input_byte_stats(
+    client: &Client,
+    object: &str,
+    body: &[u8],
+    expression: &str,
+    input_serialization: InputSerialization,
+    output_serialization: OutputSerialization,
+    progress_enabled: bool,
+) -> TestResult<()> {
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(object)
+        .body(Bytes::copy_from_slice(body).into())
+        .send()
+        .await?;
+
+    let mut request = client
+        .select_object_content()
+        .bucket(BUCKET)
+        .key(object)
+        .expression(expression)
+        .expression_type(ExpressionType::Sql)
+        .input_serialization(input_serialization)
+        .output_serialization(output_serialization);
+    if progress_enabled {
+        request = request.request_progress(RequestProgress::builder().enabled(true).build());
+    }
+    let response = request.send().await?;
+
+    let mut payload = response.payload;
+    let mut records_len = 0_u64;
+    let mut last_progress: Option<aws_sdk_s3::types::Progress> = None;
+    let mut stats = None;
+    let mut saw_end = false;
+    while let Some(event) = payload.recv().await? {
+        match event {
+            aws_sdk_s3::types::SelectObjectContentEventStream::Records(records) => {
+                if let Some(bytes) = records.payload {
+                    records_len = records_len.saturating_add(u64::try_from(bytes.as_ref().len())?);
+                }
+            }
+            aws_sdk_s3::types::SelectObjectContentEventStream::Progress(event) => {
+                let details = event.details.ok_or("Progress event did not contain details")?;
+                if let Some(previous) = last_progress.as_ref() {
+                    assert!(details.bytes_scanned() >= previous.bytes_scanned());
+                    assert!(details.bytes_processed() >= previous.bytes_processed());
+                    assert!(details.bytes_returned() >= previous.bytes_returned());
+                }
+                last_progress = Some(details);
+            }
+            aws_sdk_s3::types::SelectObjectContentEventStream::Stats(event) => stats = event.details,
+            aws_sdk_s3::types::SelectObjectContentEventStream::End(_) => {
+                saw_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let stats = stats.ok_or("Select response ended without a Stats event")?;
+    let input_len = i64::try_from(body.len())?;
+    assert_eq!(stats.bytes_scanned(), Some(input_len));
+    assert_eq!(stats.bytes_processed(), Some(input_len));
+    assert_eq!(stats.bytes_returned(), Some(i64::try_from(records_len)?));
+    if progress_enabled {
+        let progress = last_progress.ok_or("Select response ended without a Progress event")?;
+        assert_eq!(progress.bytes_scanned(), stats.bytes_scanned());
+        assert_eq!(progress.bytes_processed(), stats.bytes_processed());
+        assert_eq!(progress.bytes_returned(), stats.bytes_returned());
+    } else {
+        assert!(last_progress.is_none(), "disabled request progress emitted a Progress event");
+    }
+    assert!(saw_end, "Select response ended without an End event");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_select_object_content_reports_input_byte_stats() -> TestResult<()> {
+    const CSV_BODY: &[u8] = b"name,age\nAlice,30\nBob,25\n";
+    const JSON_LINES_BODY: &[u8] = b"{\"name\":\"Alice\"}\n{\"name\":\"Bob\"}\n";
+    const JSON_DOCUMENT_BODY: &[u8] = b"[{\"name\":\"Alice\"},{\"name\":\"Bob\"}]";
+
+    let (_env, client) = create_test_environment().await?;
+    setup_test_bucket(&client).await?;
+    assert_input_byte_stats(
+        &client,
+        "input-metrics.csv",
+        CSV_BODY,
+        "SELECT name FROM S3Object",
+        InputSerialization::builder()
+            .csv(CsvInput::builder().file_header_info(FileHeaderInfo::Use).build())
+            .build(),
+        OutputSerialization::builder().csv(CsvOutput::builder().build()).build(),
+        true,
+    )
+    .await?;
+    assert_input_byte_stats(
+        &client,
+        "input-metrics.jsonl",
+        JSON_LINES_BODY,
+        "SELECT name FROM S3Object",
+        InputSerialization::builder()
+            .json(JsonInput::builder().set_type(Some(JsonType::Lines)).build())
+            .build(),
+        OutputSerialization::builder().json(JsonOutput::builder().build()).build(),
+        true,
+    )
+    .await?;
+    assert_input_byte_stats(
+        &client,
+        "input-metrics.json",
+        JSON_DOCUMENT_BODY,
+        "SELECT name FROM S3Object",
+        InputSerialization::builder()
+            .json(JsonInput::builder().set_type(Some(JsonType::Document)).build())
+            .build(),
+        OutputSerialization::builder().json(JsonOutput::builder().build()).build(),
+        true,
+    )
+    .await?;
+    assert_input_byte_stats(
+        &client,
+        "input-metrics-without-progress.csv",
+        CSV_BODY,
+        "SELECT name FROM S3Object",
+        InputSerialization::builder()
+            .csv(CsvInput::builder().file_header_info(FileHeaderInfo::Use).build())
+            .build(),
+        OutputSerialization::builder().csv(CsvOutput::builder().build()).build(),
+        false,
+    )
+    .await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -16,7 +16,7 @@ use std::{collections::VecDeque, fmt::Display};
 
 use datafusion::sql::sqlparser::{
     dialect::Dialect,
-    keywords::Keyword,
+    keywords::{Keyword, RESERVED_FOR_TABLE_ALIAS},
     parser::{Parser, ParserError},
     tokenizer::{Token, Tokenizer},
 };
@@ -138,27 +138,7 @@ fn rewrite_source_object_wildcards(tokens: &mut [Token]) {
 }
 
 fn ends_from_source(keyword: Keyword) -> bool {
-    matches!(
-        keyword,
-        Keyword::WHERE
-            | Keyword::GROUP
-            | Keyword::HAVING
-            | Keyword::ORDER
-            | Keyword::LIMIT
-            | Keyword::OFFSET
-            | Keyword::FETCH
-            | Keyword::UNION
-            | Keyword::EXCEPT
-            | Keyword::INTERSECT
-            | Keyword::QUALIFY
-            | Keyword::WINDOW
-            | Keyword::PREWHERE
-            | Keyword::CLUSTER
-            | Keyword::DISTRIBUTE
-            | Keyword::SORT
-            | Keyword::SETTINGS
-            | Keyword::FORMAT
-    )
+    RESERVED_FOR_TABLE_ALIAS.contains(&keyword) || matches!(keyword, Keyword::PREWHERE | Keyword::SETTINGS | Keyword::FORMAT)
 }
 
 #[cfg(test)]

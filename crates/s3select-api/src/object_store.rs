@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use crate::{
-    PrepareSelectObjectSnapshotError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader, SelectObjectOptions,
-    SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError, SelectStore, SnapshotConsistencyError,
+    PrepareSelectObjectSnapshotError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader, SelectInputMetrics,
+    SelectObjectOptions, SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError, SelectStore,
+    SnapshotConsistencyError,
     query::{
         ast::{JsonPathSegment, JsonSource},
         parser::RustFsDialect,
@@ -42,7 +43,7 @@ use datafusion::{
     },
 };
 use futures::pin_mut;
-use futures::{Stream, StreamExt, future::ready, stream};
+use futures::{Stream, StreamExt, TryStreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
 use parking_lot::Mutex;
@@ -103,6 +104,7 @@ pub struct EcObjectStore {
     is_json_document: bool,
     /// JSON source path produced by the SQL compatibility analyzer.
     json_source: JsonSource,
+    input_metrics: Arc<SelectInputMetrics>,
     memory_pool: Arc<dyn MemoryPool>,
     query_tracker: Option<QueryExecutionTracker>,
     store: Option<Arc<SelectStore>>,
@@ -177,24 +179,39 @@ pub struct InvalidScanRange;
 impl EcObjectStore {
     pub fn new(input: Arc<SelectObjectContentInput>) -> S3Result<Self> {
         let source = legacy_json_source_from_input(&input);
-        Self::build_lazy(input, Arc::new(UnboundedMemoryPool::default()), None, source).map_err(map_build_error_to_s3)
+        Self::build_lazy(
+            input,
+            Arc::new(UnboundedMemoryPool::default()),
+            None,
+            Arc::new(SelectInputMetrics::default()),
+            source,
+        )
+        .map_err(map_build_error_to_s3)
     }
 
     pub fn new_with_snapshot(input: Arc<SelectObjectContentInput>, snapshot: Arc<SelectObjectSnapshot>) -> S3Result<Self> {
         let source = legacy_json_source_from_input(&input);
-        Self::build_with_snapshot(input, Arc::new(UnboundedMemoryPool::default()), None, snapshot, source)
-            .map_err(map_build_error_to_s3)
+        Self::build_with_snapshot(
+            input,
+            Arc::new(UnboundedMemoryPool::default()),
+            None,
+            Arc::new(SelectInputMetrics::default()),
+            snapshot,
+            source,
+        )
+        .map_err(map_build_error_to_s3)
     }
 
     pub(crate) fn new_with_memory_pool_and_source(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
+        input_metrics: Arc<SelectInputMetrics>,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
         source: JsonSource,
     ) -> std::result::Result<Self, EcObjectStoreBuildError> {
         match snapshot {
-            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, None, snapshot, source),
-            None => Self::build_lazy(input, memory_pool, None, source),
+            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, None, input_metrics, snapshot, source),
+            None => Self::build_lazy(input, memory_pool, None, input_metrics, source),
         }
     }
 
@@ -202,12 +219,13 @@ impl EcObjectStore {
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: QueryExecutionTracker,
+        input_metrics: Arc<SelectInputMetrics>,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
         source: JsonSource,
     ) -> std::result::Result<Self, EcObjectStoreBuildError> {
         match snapshot {
-            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, Some(query_tracker), snapshot, source),
-            None => Self::build_lazy(input, memory_pool, Some(query_tracker), source),
+            Some(snapshot) => Self::build_with_snapshot(input, memory_pool, Some(query_tracker), input_metrics, snapshot, source),
+            None => Self::build_lazy(input, memory_pool, Some(query_tracker), input_metrics, source),
         }
     }
 
@@ -215,29 +233,40 @@ impl EcObjectStore {
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Arc<SelectInputMetrics>,
         source: JsonSource,
     ) -> std::result::Result<Self, EcObjectStoreBuildError> {
         let store = resolve_select_object_store_handle().ok_or(EcObjectStoreBuildError::StoreUnavailable)?;
-        Ok(Self::build(input, memory_pool, query_tracker, Some(store), None, source))
+        Ok(Self::build(input, memory_pool, query_tracker, input_metrics, Some(store), None, source))
     }
 
     fn build_with_snapshot(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Arc<SelectInputMetrics>,
         snapshot: Arc<SelectObjectSnapshot>,
         source: JsonSource,
     ) -> std::result::Result<Self, EcObjectStoreBuildError> {
         if !snapshot.is_for(&input.bucket, &input.key) {
             return Err(EcObjectStoreBuildError::Snapshot(SnapshotConsistencyError::ObjectChanged));
         }
-        Ok(Self::build(input, memory_pool, query_tracker, None, Some(snapshot), source))
+        Ok(Self::build(
+            input,
+            memory_pool,
+            query_tracker,
+            input_metrics,
+            None,
+            Some(snapshot),
+            source,
+        ))
     }
 
     fn build(
         input: Arc<SelectObjectContentInput>,
         memory_pool: Arc<dyn MemoryPool>,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Arc<SelectInputMetrics>,
         store: Option<Arc<SelectStore>>,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
         source: JsonSource,
@@ -266,6 +295,7 @@ impl EcObjectStore {
             delimiter,
             is_json_document,
             json_source: source,
+            input_metrics,
             memory_pool,
             query_tracker,
             store,
@@ -782,14 +812,18 @@ impl ObjectStore for EcObjectStore {
             self.object_reader(range).await?
         };
 
+        let meter_input = self.input.request.input_serialization.parquet.is_none();
         let payload = if options.range.is_some() {
             let size = usize::try_from(result_range.end - result_range.start).map_err(|err| o_Error::Generic {
                 store: "EcObjectStore",
                 source: Box::new(err),
             })?;
-            GetResultPayload::Stream(
-                bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), size).boxed(),
-            )
+            let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), size);
+            if meter_input {
+                GetResultPayload::Stream(meter_uncompressed_input_stream(stream, Arc::clone(&self.input_metrics)).boxed())
+            } else {
+                GetResultPayload::Stream(stream.boxed())
+            }
         } else if self.is_json_document {
             // JSON DOCUMENT mode: gate on object size before doing any I/O.
             //
@@ -808,6 +842,7 @@ impl ObjectStore for EcObjectStore {
                 reader.stream,
                 original_size,
                 self.json_source.clone(),
+                Arc::clone(&self.input_metrics),
                 Arc::clone(&self.memory_pool),
                 self.query_tracker.clone(),
             );
@@ -816,12 +851,17 @@ impl ObjectStore for EcObjectStore {
             let delimiter = self.record_delimiter();
             let include_header = self.csv_has_header();
             let header = if include_header && read_start > 0 {
-                Some(self.read_header_record(original_size, &delimiter).await?)
+                let header = self.read_header_record(original_size, &delimiter).await?;
+                self.input_metrics.record_uncompressed(header.len());
+                Some(header)
             } else {
                 None
             };
             let stream = scan_range_stream(
-                ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
+                meter_uncompressed_input_stream(
+                    ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE),
+                    Arc::clone(&self.input_metrics),
+                ),
                 delimiter,
                 scan_range,
                 include_header && header.is_none(),
@@ -834,22 +874,23 @@ impl ObjectStore for EcObjectStore {
             } else {
                 stream
             };
-            GetResultPayload::Stream(convert_csv_delimiter_stream(
-                stream,
-                record_delimiter,
-                self.need_convert.then(|| self.delimiter.clone()),
-            ))
+            let stream =
+                convert_csv_delimiter_stream(stream, record_delimiter, self.need_convert.then(|| self.delimiter.clone()));
+            GetResultPayload::Stream(stream)
         } else {
             let stream_size = usize::try_from(original_size).map_err(|err| o_Error::Generic {
                 store: "EcObjectStore",
                 source: Box::new(err),
             })?;
             let stream = bytes_stream(ReaderStream::with_capacity(reader.stream, SELECT_DEFAULT_READ_BUFFER_SIZE), stream_size);
-            GetResultPayload::Stream(convert_csv_delimiter_stream(
-                stream,
-                record_delimiter,
-                self.need_convert.then(|| self.delimiter.clone()),
-            ))
+            if meter_input {
+                let stream = meter_uncompressed_input_stream(stream, Arc::clone(&self.input_metrics));
+                let stream =
+                    convert_csv_delimiter_stream(stream, record_delimiter, self.need_convert.then(|| self.delimiter.clone()));
+                GetResultPayload::Stream(stream)
+            } else {
+                GetResultPayload::Stream(stream.boxed())
+            }
         };
 
         Ok(GetResult {
@@ -1159,6 +1200,7 @@ fn json_document_ndjson_stream(
     stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
     original_size: u64,
     json_source: JsonSource,
+    input_metrics: Arc<SelectInputMetrics>,
     memory_pool: Arc<dyn MemoryPool>,
     query_tracker: Option<QueryExecutionTracker>,
 ) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
@@ -1166,6 +1208,7 @@ fn json_document_ndjson_stream(
         stream,
         original_size,
         json_source,
+        input_metrics,
         memory_pool,
         query_tracker,
         |all_bytes, json_source| parse_json_document_to_lines(&all_bytes, &json_source),
@@ -1176,6 +1219,7 @@ fn json_document_ndjson_stream_with_parser<P>(
     stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
     original_size: u64,
     json_source: JsonSource,
+    input_metrics: Arc<SelectInputMetrics>,
     memory_pool: Arc<dyn MemoryPool>,
     query_tracker: Option<QueryExecutionTracker>,
     parser: P,
@@ -1204,17 +1248,15 @@ where
             source: Box::new(err),
         })?;
 
-        pin_mut!(stream);
         // ── 1. Read phase (lazy: only runs when the stream is polled) ────
+        pin_mut!(stream);
         let mut all_bytes = Vec::with_capacity(buffer_capacity);
-        stream
-            .take(original_size)
-            .read_to_end(&mut all_bytes)
-            .await
-            .map_err(|e| o_Error::Generic {
-                store: "EcObjectStore",
-                source: Box::new(e),
-            })?;
+        let read_result = stream.take(original_size).read_to_end(&mut all_bytes).await;
+        input_metrics.record_uncompressed(all_bytes.len());
+        read_result.map_err(|e| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(e),
+        })?;
         if all_bytes.len() != buffer_capacity {
             return Err(incomplete_object_stream_error(buffer_capacity - all_bytes.len()));
         }
@@ -1372,7 +1414,10 @@ fn parse_json_document_to_lines(bytes: &[u8], json_source: &JsonSource) -> std::
         serde_json::from_slice(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let json_source_path = json_source.path();
     let values = expand_json_source(root, json_source_path)?;
-    let implicitly_expand_arrays = !matches!(json_source_path.first(), Some(JsonPathSegment::ArrayWildcard));
+    // Preserve the two pre-path-AST forms that flattened arrays implicitly.
+    // Explicit indexes and wildcards already identify the intended records
+    // and must not flatten an array-valued result a second time.
+    let implicitly_expand_arrays = matches!(json_source_path, [] | [JsonPathSegment::Key { .. }]);
     let scalar_column = json_source.scalar_column().unwrap_or_else(|| match json_source_path.last() {
         Some(JsonPathSegment::Key { name, .. }) => name,
         Some(JsonPathSegment::Index(_) | JsonPathSegment::ArrayWildcard | JsonPathSegment::ObjectWildcard) | None => "_1",
@@ -1499,6 +1544,17 @@ fn flatten_json_document_to_ndjson(bytes: &[u8], json_source_path: &[JsonPathSeg
     Ok(Bytes::from(output))
 }
 
+fn meter_uncompressed_input_stream<S, E>(
+    stream: S,
+    input_metrics: Arc<SelectInputMetrics>,
+) -> impl Stream<Item = std::result::Result<Bytes, E>> + Send + 'static
+where
+    S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    stream.inspect_ok(move |bytes| input_metrics.record_uncompressed(bytes.len()))
+}
+
 pub fn bytes_stream<S>(stream: S, content_length: usize) -> impl Stream<Item = Result<Bytes>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
@@ -1559,14 +1615,15 @@ mod test {
         SELECT_DEFAULT_READ_BUFFER_SIZE, SelectObjectOptions, SelectObjectSnapshot, SelectScanRange, SnapshotConsistencyError,
         bytes_stream, convert_csv_delimiter_stream, convert_field_delimiter_stream, convert_record_delimiter_stream,
         find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range, json_document_ndjson_stream,
-        json_document_ndjson_stream_with_parser, legacy_json_source_from_input, map_storage_error, scan_range_from_bounds,
-        scan_range_stream, select_read_headers, snapshot_last_modified, validate_json_document_size,
+        json_document_ndjson_stream_with_parser, legacy_json_source_from_input, map_storage_error,
+        meter_uncompressed_input_stream, scan_range_from_bounds, scan_range_stream, select_read_headers, snapshot_last_modified,
+        validate_json_document_size,
     };
     use crate::query::ast::{JsonPathSegment, JsonSource};
     use crate::query::session::{QueryExecutionGuard, QueryExecutionOwner, QueryExecutionTracker};
     use crate::storage_api::SelectPutObjReader;
     use crate::storage_api::object_store::ObjectIO as _;
-    use crate::{QueryError, SelectError, SelectStorageError};
+    use crate::{QueryError, SelectError, SelectInputMetrics, SelectStorageError};
     use bytes::Bytes;
     use datafusion::{
         common::DataFusionError,
@@ -1582,8 +1639,8 @@ mod test {
     use rustfs_test_utils::PutObjectCommitBarrier;
     use s3s::S3ErrorCode;
     use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONType, OutputSerialization,
-        ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
+        CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput, JSONType,
+        OutputSerialization, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use s3s::header::{
         X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
@@ -1761,6 +1818,21 @@ mod test {
 
         assert_eq!(lazy.json_source, expected);
         assert_eq!(pinned.json_source, expected);
+    }
+
+    fn json_input(bucket: &str, object: &str, json_type: &'static str) -> Arc<SelectObjectContentInput> {
+        let mut input = (*csv_input(bucket, object)).clone();
+        input.request.input_serialization = InputSerialization {
+            json: Some(JSONInput {
+                type_: Some(JSONType::from_static(json_type)),
+            }),
+            ..Default::default()
+        };
+        input.request.output_serialization = OutputSerialization {
+            json: Some(JSONOutput::default()),
+            ..Default::default()
+        };
+        Arc::new(input)
     }
 
     #[test]
@@ -2557,6 +2629,24 @@ mod test {
     }
 
     #[tokio::test]
+    async fn delimiter_conversion_keeps_uncompressed_metrics_equal() {
+        let input = Bytes::from_static(b"a&&1\nb&&2\n");
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let stream = stream::iter([Ok::<_, object_store::Error>(input.clone())]);
+        let stream = meter_uncompressed_input_stream(stream, Arc::clone(&input_metrics));
+        let output = convert_field_delimiter_stream(stream, "&&".to_string())
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("delimiter conversion should succeed")
+            .concat();
+
+        assert_eq!(output, b"a,1\nb,2\n");
+        let input_len = u64::try_from(input.len()).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, input_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, input_len);
+    }
+
+    #[tokio::test]
     async fn test_field_delimiter_stream_converts_delimiter_split_across_chunks() {
         let chunks = stream::iter(vec![
             Ok::<_, object_store::Error>(Bytes::from_static(b"a&")),
@@ -2631,6 +2721,7 @@ mod test {
             delimiter: String::new(),
             is_json_document: false,
             json_source: JsonSource::default(),
+            input_metrics: Arc::new(SelectInputMetrics::default()),
             memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
             query_tracker: None,
             store: None,
@@ -2817,6 +2908,7 @@ mod test {
             delimiter: String::new(),
             is_json_document: false,
             json_source: JsonSource::default(),
+            input_metrics: Arc::new(SelectInputMetrics::default()),
             memory_pool: Arc::new(GreedyMemoryPool::new(32 * 1024 * 1024)),
             query_tracker: None,
             store: None,
@@ -2907,12 +2999,14 @@ mod test {
             },
         });
         let snapshot = prepare_test_snapshot(bucket, object).await;
+        let input_metrics = Arc::new(SelectInputMetrics::default());
         let store = super::EcObjectStore {
             input,
             need_convert: true,
             delimiter: "\r\n".to_string(),
             is_json_document: false,
             json_source: JsonSource::default(),
+            input_metrics: Arc::clone(&input_metrics),
             memory_pool: Arc::new(GreedyMemoryPool::new(1024)),
             query_tracker: None,
             store: None,
@@ -2930,6 +3024,9 @@ mod test {
         let chunks: Vec<Bytes> = stream.try_collect().await.expect("collect converted object stream");
 
         assert_eq!(chunks.concat(), b"a,1\r\n");
+        let input_len = u64::try_from(input_bytes.len()).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, input_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, input_len);
 
         let requested_range = 3..10;
         let ranges = store
@@ -2963,6 +3060,33 @@ mod test {
     }
 
     #[tokio::test]
+    async fn metered_stream_counts_only_polled_chunks() {
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let source_poll_count = Arc::clone(&poll_count);
+        let source = stream::unfold(0, move |index| {
+            let source_poll_count = Arc::clone(&source_poll_count);
+            async move {
+                source_poll_count.fetch_add(1, Ordering::SeqCst);
+                let bytes = match index {
+                    0 => Bytes::from_static(b"abcd"),
+                    1 => Bytes::from_static(b"efgh"),
+                    _ => return None,
+                };
+                Some((Ok::<_, std::io::Error>(bytes), index + 1))
+            }
+        });
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let mut metered = Box::pin(meter_uncompressed_input_stream(source, Arc::clone(&input_metrics)));
+
+        assert_eq!(metered.next().await.expect("first chunk").expect("valid chunk"), b"abcd"[..]);
+        drop(metered);
+
+        assert_eq!(input_metrics.snapshot().bytes_scanned, 4);
+        assert_eq!(input_metrics.snapshot().bytes_processed, 4);
+        assert_eq!(poll_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn test_bytes_stream_rejects_early_eof() {
         let source = stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))]);
         let output = bytes_stream(source, 4);
@@ -2985,6 +3109,223 @@ mod test {
     }
 
     #[tokio::test]
+    async fn full_and_range_object_streams_record_input_metrics() {
+        const BUCKET: &str = "s3select-input-metrics";
+        const OBJECT: &str = "input.csv";
+        const DATA: &[u8] = b"id,name\n1,a\n";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(DATA.to_vec());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put input metrics fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            csv_input(BUCKET, OBJECT),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::clone(&input_metrics),
+            snapshot,
+            JsonSource::default(),
+        )
+        .expect("build metrics-aware object store");
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open full object stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected streaming object payload");
+        };
+        let body = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read full object stream")
+            .concat();
+        assert_eq!(body, DATA);
+        let data_len = u64::try_from(DATA.len()).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, data_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, data_len);
+
+        input_metrics.reset();
+
+        let result = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("open schema-style range stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected range stream payload");
+        };
+        let range = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read schema-style range")
+            .concat();
+        assert_eq!(range, b"id"[..]);
+        assert_eq!(input_metrics.snapshot().bytes_scanned, 2);
+        assert_eq!(input_metrics.snapshot().bytes_processed, 2);
+    }
+
+    #[tokio::test]
+    async fn dropping_real_object_stream_counts_only_consumed_bytes() {
+        const BUCKET: &str = "s3select-partial-input-metrics";
+        const OBJECT: &str = "large.csv";
+
+        let data = vec![b'x'; SELECT_DEFAULT_READ_BUFFER_SIZE * 3];
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(data.clone());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put partial input metrics fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            csv_input(BUCKET, OBJECT),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::clone(&input_metrics),
+            snapshot,
+            JsonSource::default(),
+        )
+        .expect("build metrics-aware object store");
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open partial object stream");
+        let GetResultPayload::Stream(mut stream) = result.payload else {
+            panic!("expected streaming object payload");
+        };
+        let first = stream
+            .next()
+            .await
+            .expect("first object chunk")
+            .expect("first object chunk should be valid");
+        drop(stream);
+
+        assert!(first.len() < data.len(), "fixture must span multiple reader chunks");
+        let consumed = u64::try_from(first.len()).expect("chunk length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, consumed);
+        assert_eq!(input_metrics.snapshot().bytes_processed, consumed);
+    }
+
+    #[tokio::test]
+    async fn json_object_streams_record_input_metrics() {
+        const BUCKET: &str = "s3select-json-input-metrics";
+        const LINES_OBJECT: &str = "input.jsonl";
+        const LINES_DATA: &[u8] = b"{\"id\":1}\n{\"id\":2}\n";
+        const DOCUMENT_OBJECT: &str = "input.json";
+        const DOCUMENT_DATA: &[u8] = b"[{\"id\":1},{\"id\":2}]";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        for (object, data, json_type) in [
+            (LINES_OBJECT, LINES_DATA, JSONType::LINES),
+            (DOCUMENT_OBJECT, DOCUMENT_DATA, JSONType::DOCUMENT),
+        ] {
+            let mut reader = SelectPutObjReader::from_vec(data.to_vec());
+            env.ecstore
+                .put_object(BUCKET, object, &mut reader, &Default::default())
+                .await
+                .expect("put JSON input metrics fixture");
+            let snapshot = prepare_test_snapshot(BUCKET, object).await;
+            let input_metrics = Arc::new(SelectInputMetrics::default());
+            let store = EcObjectStore::build_with_snapshot(
+                json_input(BUCKET, object, json_type),
+                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+                None,
+                Arc::clone(&input_metrics),
+                snapshot,
+                JsonSource::default(),
+            )
+            .expect("build metrics-aware JSON object store");
+
+            let result = store
+                .get_opts(&Path::from(object), GetOptions::default())
+                .await
+                .expect("open JSON object stream");
+            let GetResultPayload::Stream(stream) = result.payload else {
+                panic!("expected streaming JSON payload");
+            };
+            stream.try_collect::<Vec<_>>().await.expect("read JSON object stream");
+
+            let input_len = u64::try_from(data.len()).expect("fixture length should fit in u64");
+            assert_eq!(input_metrics.snapshot().bytes_scanned, input_len, "JSON type {json_type}");
+            assert_eq!(input_metrics.snapshot().bytes_processed, input_len, "JSON type {json_type}");
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_range_metrics_include_header_and_raw_range_once() {
+        const BUCKET: &str = "s3select-scan-range-input-metrics";
+        const OBJECT: &str = "input.csv";
+        const DATA: &[u8] = b"h1,h2\nr1,a\nr2,b\n";
+        const HEADER_LEN: usize = b"h1,h2\n".len();
+        const RECORD_START: usize = b"h1,h2\nr1,a\n".len();
+        const READ_START: usize = RECORD_START - 1;
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(DATA.to_vec());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put ScanRange input metrics fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let mut input = (*csv_input(BUCKET, OBJECT)).clone();
+        input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("CSV input")
+            .file_header_info = Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+        input.request.scan_range = Some(ScanRange {
+            start: Some(i64::try_from(RECORD_START).expect("fixture offset should fit in i64")),
+            end: Some(i64::try_from(RECORD_START).expect("fixture offset should fit in i64")),
+        });
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            Arc::new(input),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::clone(&input_metrics),
+            snapshot,
+            JsonSource::default(),
+        )
+        .expect("build ScanRange metrics-aware object store");
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open ScanRange object stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected streaming ScanRange payload");
+        };
+        let body = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("read ScanRange object stream")
+            .concat();
+
+        assert_eq!(body, b"h1,h2\nr2,b\n");
+        let expected_input = u64::try_from(HEADER_LEN + DATA.len() - READ_START).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, expected_input);
+        assert_eq!(input_metrics.snapshot().bytes_processed, expected_input);
+    }
+
+    #[tokio::test]
     async fn test_json_document_stream_respects_query_memory_pool() {
         let input = b"{}".to_vec();
         let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
@@ -2993,6 +3334,7 @@ mod test {
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
             JsonSource::default(),
+            Arc::new(SelectInputMetrics::default()),
             memory_pool,
             None,
         );
@@ -3025,6 +3367,7 @@ mod test {
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
             source,
+            Arc::new(SelectInputMetrics::default()),
             memory_pool,
             None,
         );
@@ -3047,6 +3390,7 @@ mod test {
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
             JsonSource::new(vec![JsonPathSegment::ArrayWildcard], Some(alias)),
+            Arc::new(SelectInputMetrics::default()),
             memory_pool.clone(),
             None,
         )
@@ -3062,16 +3406,21 @@ mod test {
         let input = b"[1,2]".to_vec();
         let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
         let memory_pool = Arc::new(GreedyMemoryPool::new(required));
+        let input_metrics = Arc::new(SelectInputMetrics::default());
         let output: Vec<Bytes> = json_document_ndjson_stream(
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
             JsonSource::default(),
+            Arc::clone(&input_metrics),
             memory_pool.clone(),
             None,
         )
         .try_collect()
         .await
         .expect("JSON conversion should fit the pool");
+        let input_len = u64::try_from(input.len()).expect("fixture length should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, input_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, input_len);
 
         assert_eq!(output, vec![Bytes::from_static(b"{\"_1\":1}\n"), Bytes::from_static(b"{\"_1\":2}\n")]);
         assert_eq!(memory_pool.reserved(), 0);
@@ -3080,9 +3429,17 @@ mod test {
     #[tokio::test]
     async fn test_json_document_stream_rejects_early_eof() {
         let input = b"{}".to_vec();
+        let input_len = u64::try_from(input.len()).expect("fixture length should fit in u64");
+        let input_metrics = Arc::new(SelectInputMetrics::default());
         let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
-        let mut output =
-            json_document_ndjson_stream(Box::new(std::io::Cursor::new(input)), 4, JsonSource::default(), memory_pool, None);
+        let mut output = json_document_ndjson_stream(
+            Box::new(std::io::Cursor::new(input)),
+            4,
+            JsonSource::default(),
+            Arc::clone(&input_metrics),
+            memory_pool,
+            None,
+        );
 
         let err = output
             .next()
@@ -3095,6 +3452,8 @@ mod test {
         let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
         assert_eq!(source.kind(), std::io::ErrorKind::UnexpectedEof);
         assert!(source.to_string().contains("2 bytes remaining"));
+        assert_eq!(input_metrics.snapshot().bytes_scanned, input_len);
+        assert_eq!(input_metrics.snapshot().bytes_processed, input_len);
         assert!(output.next().await.is_none());
     }
 
@@ -3107,6 +3466,7 @@ mod test {
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
             JsonSource::default(),
+            Arc::new(SelectInputMetrics::default()),
             memory_pool,
             None,
         );
@@ -3131,6 +3491,7 @@ mod test {
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
             JsonSource::default(),
+            Arc::new(SelectInputMetrics::default()),
             memory_pool,
             None,
             |_, _| Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::AmbiguousFieldName)),
@@ -3241,6 +3602,7 @@ mod test {
                 Box::new(std::io::Cursor::new(input.clone())),
                 input.len() as u64,
                 JsonSource::default(),
+                Arc::new(SelectInputMetrics::default()),
                 query_memory_pool,
                 Some(query_tracker),
             );
@@ -3319,6 +3681,7 @@ mod test {
                 Box::new(std::io::Cursor::new(input.clone())),
                 input.len() as u64,
                 JsonSource::default(),
+                Arc::new(SelectInputMetrics::default()),
                 Arc::clone(&memory_pool),
                 Some(query_tracker.clone()),
                 move |_, _| {
@@ -3395,6 +3758,7 @@ mod test {
                 Box::new(std::io::Cursor::new(input.clone())),
                 input.len() as u64,
                 JsonSource::default(),
+                Arc::new(SelectInputMetrics::default()),
                 Arc::clone(&memory_pool),
                 Some(query_tracker),
                 move |_, _| {
@@ -3453,6 +3817,7 @@ mod test {
                 Box::new(std::io::Cursor::new(input.clone())),
                 input.len() as u64,
                 JsonSource::default(),
+                Arc::new(SelectInputMetrics::default()),
                 memory_pool,
                 Some(query_tracker),
                 move |_, _| {
@@ -3610,6 +3975,19 @@ mod test {
             .collect();
 
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn explicit_array_wildcard_does_not_expand_nested_array_records_twice() {
+        let input = br#"{"groups":[[1,2],[3,4]]}"#;
+        let source = JsonSource::new(vec![source_key("groups"), JsonPathSegment::ArrayWildcard], Some("g".to_string()));
+
+        let result = super::parse_json_document_to_lines(input, &source).expect("explicit wildcard path should succeed");
+
+        assert_eq!(
+            result,
+            vec![Bytes::from_static(b"{\"g\":[1,2]}\n"), Bytes::from_static(b"{\"g\":[3,4]}\n")]
+        );
     }
 
     #[test]
@@ -3808,6 +4186,7 @@ mod test {
                 Box::new(std::io::Cursor::new(input.to_vec())),
                 input.len() as u64,
                 JsonSource::from_path(path),
+                Arc::new(SelectInputMetrics::default()),
                 memory_pool,
                 None,
             );

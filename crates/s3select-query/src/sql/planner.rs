@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::ops::ControlFlow;
+use std::{convert::Infallible, ops::ControlFlow};
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use datafusion::sql::{
     planner::{IdentNormalizer, SqlToRel},
     sqlparser::ast::{
-        Expr, GroupByExpr, Ident, JsonPath, JsonPathElem, ObjectNamePart, OrderByKind, Query, Select, SelectFlavor, SetExpr,
-        Statement, TableAlias, TableFactor, Value, Visit, Visitor,
+        AccessExpr, Expr, GroupByExpr, Ident, JsonPath, JsonPathElem, ObjectNamePart, OrderByKind, Query, Select, SelectFlavor,
+        SetExpr, Statement, Subscript, TableAlias, TableFactor, Value, Visit, VisitMut, Visitor, VisitorMut,
     },
 };
 use rustfs_s3select_api::{
@@ -65,8 +65,18 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlanner<'a, S> {
         }
     }
 
-    async fn df_sql_to_plan(&self, mut stmt: Statement, _session: &SessionCtx) -> QueryResult<Plan> {
-        let _source = prepare_s3_select_statement(&mut stmt)?;
+    pub(crate) async fn prepared_statement_to_plan(&self, statement: ExtStatement, session: &SessionCtx) -> QueryResult<Plan> {
+        match statement {
+            ExtStatement::SqlStatement(stmt) => self.df_prepared_sql_to_plan(*stmt, session).await,
+        }
+    }
+
+    async fn df_sql_to_plan(&self, mut stmt: Statement, session: &SessionCtx) -> QueryResult<Plan> {
+        prepare_s3_select_statement(&mut stmt)?;
+        self.df_prepared_sql_to_plan(stmt, session).await
+    }
+
+    async fn df_prepared_sql_to_plan(&self, stmt: Statement, _session: &SessionCtx) -> QueryResult<Plan> {
         let df_plan = self.df_planner.sql_statement_to_plan(stmt).map_err(classify_planner_error)?;
         Ok(Plan::Query(QueryPlan {
             df_plan,
@@ -130,14 +140,68 @@ pub(crate) fn prepare_s3_select_statement(statement: &mut Statement) -> QueryRes
     }
 
     let mut detector = SubqueryDetector { visited_root: false };
-    if query.visit(&mut detector).is_break() {
+    if Visit::visit(&*query, &mut detector).is_break() {
         return Err(unsupported_structure("subqueries are not supported"));
     }
 
-    let SetExpr::Select(select) = query.body.as_mut() else {
-        return Err(unsupported_structure("set operations and nested queries are not supported"));
+    let source = {
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            return Err(unsupported_structure("set operations and nested queries are not supported"));
+        };
+        prepare_select(select)?
     };
-    prepare_select(select)
+    let mut normalizer = PartiQlSubscriptNormalizer;
+    let _ = VisitMut::visit(query, &mut normalizer);
+    Ok(source)
+}
+
+struct PartiQlSubscriptNormalizer;
+
+impl VisitorMut for PartiQlSubscriptNormalizer {
+    type Break = Infallible;
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        let Expr::JsonAccess { value, path } = expr else {
+            return ControlFlow::Continue(());
+        };
+        if !matches!(path.path.first(), Some(JsonPathElem::Bracket { .. }))
+            || path
+                .path
+                .iter()
+                .any(|element| matches!(element, JsonPathElem::ColonBracket { .. }))
+        {
+            return ControlFlow::Continue(());
+        }
+
+        let mut appended_access = Vec::with_capacity(path.path.len());
+        for element in std::mem::take(&mut path.path) {
+            match element {
+                JsonPathElem::Dot { key, quoted } => {
+                    let identifier = if quoted {
+                        Ident::with_quote('"', key)
+                    } else {
+                        Ident::new(key)
+                    };
+                    appended_access.push(AccessExpr::Dot(Expr::Identifier(identifier)));
+                }
+                JsonPathElem::Bracket { key } => {
+                    appended_access.push(AccessExpr::Subscript(Subscript::Index { index: key }));
+                }
+                JsonPathElem::ColonBracket { key } => {
+                    appended_access.push(AccessExpr::Subscript(Subscript::Index { index: key }));
+                }
+            }
+        }
+
+        let value = std::mem::replace(value, Box::new(Expr::Identifier(Ident::new(""))));
+        let (root, mut access_chain) = match *value {
+            Expr::CompoundFieldAccess { root, access_chain } => (root, access_chain),
+            root => (Box::new(root), Vec::new()),
+        };
+        access_chain.extend(appended_access);
+        *expr = Expr::CompoundFieldAccess { root, access_chain };
+        ControlFlow::Continue(())
+    }
 }
 
 fn implicit_source_alias(source_path: &[JsonPathSegment]) -> Ident {
@@ -314,11 +378,12 @@ impl Visitor for SubqueryDetector {
 mod tests {
     use super::prepare_s3_select_statement;
     use crate::sql::parser::ExtParser;
-    use datafusion::sql::sqlparser::ast::Statement;
+    use datafusion::sql::sqlparser::ast::{AccessExpr, Expr, Statement, Visit, Visitor};
     use rustfs_s3select_api::{
         QueryResult, SelectError,
         query::ast::{ExtStatement, JsonPathSegment, JsonSource},
     };
+    use std::ops::ControlFlow;
 
     fn parse_statement(sql: &str) -> Statement {
         let mut statements = ExtParser::parse_sql(sql).expect("SQL should parse");
@@ -362,6 +427,42 @@ mod tests {
             ]
         );
         assert_eq!(statement.to_string(), "SELECT e.name FROM S3Object AS e");
+    }
+
+    #[test]
+    fn partiql_source_support_preserves_projection_and_filter_subscripts() {
+        let mut statement = parse_statement("SELECT s.tags[1] FROM S3Object AS s WHERE s.values[0] = 1");
+
+        prepare_s3_select_statement(&mut statement).expect("array expressions should remain supported");
+        let mut counter = FieldAccessCounter::default();
+        let _ = Visit::visit(&statement, &mut counter);
+
+        assert_eq!(counter.json_accesses, 0);
+        assert_eq!(counter.subscripts, 2);
+    }
+
+    #[derive(Default)]
+    struct FieldAccessCounter {
+        json_accesses: usize,
+        subscripts: usize,
+    }
+
+    impl Visitor for FieldAccessCounter {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            match expr {
+                Expr::JsonAccess { .. } => self.json_accesses += 1,
+                Expr::CompoundFieldAccess { access_chain, .. } => {
+                    self.subscripts += access_chain
+                        .iter()
+                        .filter(|access| matches!(access, AccessExpr::Subscript(_)))
+                        .count();
+                }
+                _ => {}
+            }
+            ControlFlow::Continue(())
+        }
     }
 
     #[test]

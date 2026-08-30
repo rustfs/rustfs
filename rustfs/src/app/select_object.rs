@@ -21,7 +21,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use futures::StreamExt;
 use http::{HeaderMap, StatusCode, header::RANGE};
 use rustfs_s3select_api::{
-    QueryError, SelectError,
+    QueryError, SelectError, SelectInputMetrics,
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
@@ -53,6 +53,7 @@ const UNSUPPORTED_SQL_STRUCTURE_MESSAGE: &str = "We encountered an unsupported S
 struct SelectValidation {
     output_format: SelectOutputFormat,
     progress_enabled: bool,
+    reports_input_metrics: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -64,6 +65,11 @@ enum SelectOutputFormat {
 enum SelectProducerOutcome {
     Terminal(S3Result<SelectObjectContentEvent>),
     ReceiverClosed,
+}
+
+struct SelectEventChannel {
+    tx: mpsc::Sender<S3Result<SelectObjectContentEvent>>,
+    terminal_permit: mpsc::OwnedPermit<S3Result<SelectObjectContentEvent>>,
 }
 
 trait SelectSnapshotFence {
@@ -101,10 +107,12 @@ pub async fn execute_select_object_content(
     let snapshot = Arc::new(snapshot);
     let query =
         Query::new_with_snapshot(Context { input: input.clone() }, input.request.expression.clone(), Arc::clone(&snapshot));
-    let output = timeout_at(query_deadline, db.execute_admitted(&query, admission))
+    let query_handle = timeout_at(query_deadline, db.execute_admitted(&query, admission))
         .await
         .map_err(|_| select_query_timeout_error(query_timeout.as_secs()))?
-        .map_err(map_query_error_to_s3)?
+        .map_err(map_query_error_to_s3)?;
+    let input_metrics = Arc::clone(query_handle.query().input_metrics());
+    let output = query_handle
         .result()
         .into_record_batch_stream()
         .map_err(map_query_error_to_s3)?;
@@ -121,9 +129,9 @@ pub async fn execute_select_object_content(
     spawn_traced(async move {
         send_select_events_until_deadline(
             output,
-            tx,
-            terminal_permit,
+            SelectEventChannel { tx, terminal_permit },
             validation,
+            input_metrics,
             query_deadline,
             query_timeout.as_secs(),
             snapshot,
@@ -136,14 +144,19 @@ pub async fn execute_select_object_content(
 
 async fn send_select_events_until_deadline<L: SelectSnapshotFence>(
     output: SendableRecordBatchStream,
-    tx: mpsc::Sender<S3Result<SelectObjectContentEvent>>,
-    terminal_permit: mpsc::OwnedPermit<S3Result<SelectObjectContentEvent>>,
+    event_channel: SelectEventChannel,
     validation: SelectValidation,
+    input_metrics: Arc<SelectInputMetrics>,
     deadline: Instant,
     timeout_seconds: u64,
     snapshot_lease: L,
 ) {
-    let outcome = match timeout_at(deadline, send_select_events(output, &tx, validation, &snapshot_lease)).await {
+    let outcome = match timeout_at(
+        deadline,
+        send_select_events(output, &event_channel.tx, validation, input_metrics, &snapshot_lease),
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(_) => SelectProducerOutcome::Terminal(Err(map_query_error_to_s3(
             SelectError::QueryTimeout {
@@ -153,7 +166,7 @@ async fn send_select_events_until_deadline<L: SelectSnapshotFence>(
         ))),
     };
     if let SelectProducerOutcome::Terminal(event) = outcome {
-        terminal_permit.send(event);
+        event_channel.terminal_permit.send(event);
     }
     drop(snapshot_lease);
 }
@@ -162,10 +175,11 @@ async fn send_select_events(
     mut output: SendableRecordBatchStream,
     tx: &mpsc::Sender<S3Result<SelectObjectContentEvent>>,
     validation: SelectValidation,
+    input_metrics: Arc<SelectInputMetrics>,
     snapshot_fence: &impl SelectSnapshotFence,
 ) -> SelectProducerOutcome {
     let mut encoder = SelectOutputEncoder::new(validation.output_format);
-    let mut progress = SelectProgress::default();
+    let mut progress = SelectProgress::new(validation.reports_input_metrics.then_some(input_metrics));
 
     if tx
         .send(Ok(SelectObjectContentEvent::Cont(ContinuationEvent::default())))
@@ -192,7 +206,7 @@ async fn send_select_events(
         match encoder.encode_batch(&batch) {
             Ok(payloads) => {
                 for payload in payloads {
-                    progress.add_returned(payload.len());
+                    let payload_len = payload.len();
                     if tx
                         .send(Ok(SelectObjectContentEvent::Records(RecordsEvent { payload: Some(payload) })))
                         .await
@@ -200,6 +214,7 @@ async fn send_select_events(
                     {
                         return SelectProducerOutcome::ReceiverClosed;
                     }
+                    progress.add_returned(payload_len);
                     if validation.progress_enabled
                         && tx
                             .send(Ok(SelectObjectContentEvent::Progress(ProgressEvent {
@@ -265,6 +280,7 @@ fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectCo
     Ok(SelectValidation {
         output_format,
         progress_enabled,
+        reports_input_metrics: input.request.input_serialization.parquet.is_none(),
     })
 }
 
@@ -602,29 +618,39 @@ fn split_records_payload(bytes: Vec<u8>) -> Vec<Bytes> {
         .collect()
 }
 
-#[derive(Default)]
 struct SelectProgress {
+    input_metrics: Option<Arc<SelectInputMetrics>>,
     bytes_returned: u64,
 }
 
 impl SelectProgress {
+    fn new(input_metrics: Option<Arc<SelectInputMetrics>>) -> Self {
+        Self {
+            input_metrics,
+            bytes_returned: 0,
+        }
+    }
+
     fn add_returned(&mut self, bytes: usize) {
-        self.bytes_returned = self.bytes_returned.saturating_add(bytes as u64);
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.bytes_returned = self.bytes_returned.saturating_add(bytes);
     }
 
     fn to_progress(&self) -> Progress {
+        let input = self.input_metrics.as_ref().map(|metrics| metrics.snapshot());
         Progress {
-            bytes_processed: None,
+            bytes_processed: input.map(|metrics| clamp_i64(metrics.bytes_processed)),
             bytes_returned: Some(clamp_i64(self.bytes_returned)),
-            bytes_scanned: None,
+            bytes_scanned: input.map(|metrics| clamp_i64(metrics.bytes_scanned)),
         }
     }
 
     fn to_stats(&self) -> Stats {
+        let input = self.input_metrics.as_ref().map(|metrics| metrics.snapshot());
         Stats {
-            bytes_processed: None,
+            bytes_processed: input.map(|metrics| clamp_i64(metrics.bytes_processed)),
             bytes_returned: Some(clamp_i64(self.bytes_returned)),
-            bytes_scanned: None,
+            bytes_scanned: input.map(|metrics| clamp_i64(metrics.bytes_scanned)),
         }
     }
 }
@@ -852,6 +878,7 @@ mod tests {
         SelectValidation {
             output_format: SelectOutputFormat::Csv(CSVOutput::default()),
             progress_enabled: false,
+            reports_input_metrics: true,
         }
     }
 
@@ -871,9 +898,9 @@ mod tests {
         let (lease, lease_released) = lease_drop_signal();
         let producer = tokio::spawn(send_select_events_until_deadline(
             output,
-            tx,
-            terminal_permit,
+            SelectEventChannel { tx, terminal_permit },
             csv_validation(),
+            Arc::new(SelectInputMetrics::default()),
             Instant::now() + std::time::Duration::from_secs(1),
             300,
             lease,
@@ -1096,9 +1123,9 @@ mod tests {
         let (lease, lease_released) = lease_drop_signal();
         let producer = tokio::spawn(send_select_events_until_deadline(
             output,
-            tx,
-            terminal_permit,
+            SelectEventChannel { tx, terminal_permit },
             csv_validation(),
+            Arc::new(SelectInputMetrics::default()),
             Instant::now() + std::time::Duration::from_secs(1),
             300,
             lease,
@@ -1451,9 +1478,9 @@ mod tests {
         let (lease, lease_released) = lease_drop_signal();
         let producer = send_select_events_until_deadline(
             output,
-            tx,
-            terminal_permit,
+            SelectEventChannel { tx, terminal_permit },
             csv_validation(),
+            Arc::new(SelectInputMetrics::default()),
             Instant::now() + std::time::Duration::from_secs(1),
             300,
             lease,
@@ -1489,7 +1516,8 @@ mod tests {
         ));
         let (tx, mut rx) = mpsc::channel(2);
         let snapshot_fence = LeaseDropSignal(None);
-        let producer = send_select_events(output, &tx, csv_validation(), &snapshot_fence);
+        let producer =
+            send_select_events(output, &tx, csv_validation(), Arc::new(SelectInputMetrics::default()), &snapshot_fence);
         tokio::pin!(producer);
 
         assert!(futures::poll!(producer.as_mut()).is_pending());
@@ -1525,7 +1553,14 @@ mod tests {
         ));
         let (tx, mut rx) = mpsc::channel(4);
 
-        let outcome = send_select_events(output, &tx, csv_validation(), &FailingSnapshotFence).await;
+        let outcome = send_select_events(
+            output,
+            &tx,
+            csv_validation(),
+            Arc::new(SelectInputMetrics::default()),
+            &FailingSnapshotFence,
+        )
+        .await;
 
         let SelectProducerOutcome::Terminal(Err(error)) = outcome else {
             panic!("failed final snapshot fence must produce a terminal error");
@@ -1548,7 +1583,8 @@ mod tests {
             .try_reserve_owned()
             .expect("test channel should reserve terminal capacity");
         let snapshot_fence = FailsAfterFirstSnapshotFence(std::sync::atomic::AtomicUsize::new(0));
-        let producer = send_select_events(output, &tx, csv_validation(), &snapshot_fence);
+        let producer =
+            send_select_events(output, &tx, csv_validation(), Arc::new(SelectInputMetrics::default()), &snapshot_fence);
         tokio::pin!(producer);
 
         assert!(futures::poll!(producer.as_mut()).is_pending());
@@ -1802,7 +1838,7 @@ mod tests {
     #[test]
     fn split_records_payload_uses_exact_returned_bytes() {
         let payloads = split_records_payload(vec![b'x'; RECORDS_CHUNK_TARGET + 7]);
-        let mut progress = SelectProgress::default();
+        let mut progress = SelectProgress::new(Some(Arc::new(SelectInputMetrics::default())));
         for payload in &payloads {
             progress.add_returned(payload.len());
         }
@@ -1922,13 +1958,40 @@ mod tests {
     }
 
     #[test]
-    fn progress_does_not_report_unknown_input_bytes_as_zero() {
-        let mut progress = SelectProgress::default();
+    fn progress_reports_zero_for_an_empty_input() {
+        let mut progress = SelectProgress::new(Some(Arc::new(SelectInputMetrics::default())));
         progress.add_returned(12);
         let stats = progress.to_stats();
         assert_eq!(stats.bytes_returned, Some(12));
+        assert_eq!(stats.bytes_scanned, Some(0));
+        assert_eq!(stats.bytes_processed, Some(0));
+    }
+
+    #[test]
+    fn progress_dto_clamps_counters_to_signed_event_range() {
+        assert_eq!(clamp_i64(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn parquet_progress_keeps_input_metrics_unspecified() {
+        let mut input = base_input();
+        input.request.input_serialization = InputSerialization {
+            csv: None,
+            json: None,
+            parquet: Some(ParquetInput {}),
+            compression_type: None,
+        };
+        let validation = validate_select_request(&HeaderMap::new(), &mut input).expect("Parquet request should validate");
+        let progress = SelectProgress::new(
+            validation
+                .reports_input_metrics
+                .then(|| Arc::new(SelectInputMetrics::default())),
+        );
+
+        let stats = progress.to_stats();
         assert_eq!(stats.bytes_scanned, None);
         assert_eq!(stats.bytes_processed, None);
+        assert_eq!(stats.bytes_returned, Some(0));
     }
 
     #[test]
