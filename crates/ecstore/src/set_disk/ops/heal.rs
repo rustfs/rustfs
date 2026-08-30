@@ -2803,7 +2803,6 @@ mod heal_result_report_tests {
                 .read_version("", &bucket, object, "", &ReadOptions::default())
                 .await
                 .expect("source metadata should be readable");
-            let data_dir = source.data_dir.expect("non-inline source should have a data directory");
             let mut target_slots = [source.erasure.distribution[0] - 1, source.erasure.distribution[1] - 1];
             target_slots.sort_unstable();
 
