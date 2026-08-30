@@ -61,6 +61,9 @@ mod get_codec_streaming_compat_test;
 #[cfg(test)]
 mod version_id_regression_test;
 
+#[cfg(test)]
+mod select_request_root_alias_test;
+
 // Pinned previous-release -> current-build on-disk compatibility.
 #[cfg(test)]
 mod upgrade_compatibility_test;
@@ -163,6 +166,10 @@ mod delete_objects_versioning_test;
 // Regression test for signed DELETE Object?versionId requests without Content-Length.
 #[cfg(test)]
 mod delete_object_no_content_length_test;
+
+// Regression test for signed empty PutObject requests without Content-Length.
+#[cfg(test)]
+mod put_object_no_content_length_test;
 
 // Delete-marker visibility baseline for data-movement migration proof.
 #[cfg(test)]

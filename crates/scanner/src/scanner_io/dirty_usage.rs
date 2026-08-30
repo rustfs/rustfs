@@ -45,7 +45,7 @@ pub(super) fn usize_to_u64_saturated(value: usize) -> u64 {
 
 pub(super) fn advance_generation(generation: &AtomicU64) -> u64 {
     generation
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(1)))
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |current| Some(current.saturating_add(1)))
         .map_or_else(|current| current, |previous| previous.saturating_add(1))
 }
 

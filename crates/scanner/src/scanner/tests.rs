@@ -352,6 +352,7 @@ struct MemoryConfigStore {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     revisions: Mutex<HashMap<String, u64>>,
     insert_after_gets: Mutex<HashMap<String, Vec<u8>>>,
+    delayed_gets: Mutex<HashMap<String, Duration>>,
     non_regular_objects: Mutex<HashSet<String>>,
     fail_put_number: Mutex<HashMap<String, usize>>,
     object_not_found_put_number: Mutex<HashMap<String, usize>>,
@@ -399,6 +400,9 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         _opts: &ObjectOptions,
     ) -> EcstoreResult<GetObjectReader> {
         let key = memory_config_key(bucket, object);
+        if let Some(delay) = self.delayed_gets.lock().await.remove(&key) {
+            tokio::time::sleep(delay).await;
+        }
         let inserted_data = self.insert_after_gets.lock().await.remove(&key);
         let data = {
             let mut objects = self.objects.lock().await;
@@ -1924,6 +1928,176 @@ async fn scanner_startup_uses_primary_and_backup_usage_floor() {
 }
 
 #[tokio::test]
+async fn scanner_usage_floor_keeps_valid_primary_when_backup_has_no_identity() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let mut primary = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    primary.scanner_epoch = Some(8);
+    primary.scanner_cycle = Some(100);
+    let backup = DataUsageInfo {
+        scanner_epoch: Some(9),
+        scanner_cycle: Some(101),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+
+    for (path, usage) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), primary), (backup_path.as_str(), backup)] {
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, path),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
+        );
+    }
+
+    assert_eq!(
+        persisted_usage_floor(store)
+            .await
+            .expect("valid primary should remain authoritative"),
+        PersistedUsageFloor {
+            next_cycle: 101,
+            leader_epoch: 8,
+        }
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovers_from_incomplete_v2_primary_using_fenced_backup() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+
+    // This shape is valid JSON from an interrupted v2 publication, but it is
+    // not a durable baseline because the snapshot is incomplete. It must not
+    // be converted into an empty floor.
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    backup.scanner_epoch = Some(7);
+    backup.scanner_cycle = Some(103);
+
+    for (path, usage) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), primary), (backup_path.as_str(), backup)] {
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, path),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
+        );
+    }
+
+    assert_eq!(
+        persisted_usage_floor(store)
+            .await
+            .expect("valid backup should recover the usage floor"),
+        PersistedUsageFloor {
+            next_cycle: 104,
+            leader_epoch: 7,
+        }
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_does_not_bootstrap_over_incomplete_v2_primary() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&primary).expect("usage snapshot should encode"),
+    );
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("an existing incomplete primary must remain fail-closed");
+    assert!(err.to_string().contains("no authoritative baseline"));
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_rejects_backup_older_than_incomplete_v2_primary() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    backup.scanner_epoch = Some(6);
+    backup.scanner_cycle = Some(10_000);
+
+    for (path, usage) in [(DATA_USAGE_OBJ_NAME_PATH.as_str(), primary), (backup_path.as_str(), backup)] {
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, path),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
+        );
+    }
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("an older backup must not cross the incomplete primary epoch fence");
+    assert!(err.to_string().contains("no authoritative baseline"));
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_rejects_older_legacy_primary_after_incomplete_v2_primary() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    legacy.scanner_epoch = Some(6);
+    legacy.scanner_cycle = Some(103);
+    for (path, usage) in [
+        (DATA_USAGE_OBJ_NAME_PATH.as_str(), primary),
+        (LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(), legacy),
+    ] {
+        store.objects.lock().await.insert(
+            memory_config_key(RUSTFS_META_BUCKET, path),
+            serde_json::to_vec(&usage).expect("usage snapshot should encode"),
+        );
+    }
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("an older legacy baseline must not cross the incomplete v2 epoch fence");
+    assert!(err.to_string().contains("no authoritative baseline"));
+}
+
+#[tokio::test]
+async fn scanner_leadership_fencing_recovers_incomplete_v2_primary_from_backup() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let primary = serde_json::to_vec(&DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    })
+    .expect("incomplete usage snapshot should encode");
+    let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    backup.scanner_epoch = Some(7);
+    backup.scanner_cycle = Some(103);
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, &backup_path),
+        serde_json::to_vec(&backup).expect("backup usage snapshot should encode"),
+    );
+
+    let recovered = usage_snapshot_for_epoch_fence(store, Some(&primary), false)
+        .await
+        .expect("a valid backup should provide the fencing baseline")
+        .expect("the fencing baseline should be present");
+    assert_eq!(recovered.scanner_epoch, Some(7));
+    assert_eq!(recovered.scanner_cycle, Some(103));
+}
+
+#[tokio::test]
 async fn scanner_usage_floor_ignores_older_backup_after_primary_epoch_fence() {
     let store = Arc::new(MemoryConfigStore::default());
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -2481,7 +2655,7 @@ impl crate::ScannerConfigObjectDelete for MemoryConfigStore {
         }
         if self
             .block_publication_after_admissions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| remaining.checked_sub(1))
             == Ok(1)
         {
             self.publication_admission_blocked.store(true, Ordering::Release);
@@ -3183,6 +3357,79 @@ async fn test_observational_usage_defers_when_authoritative_baseline_is_missing(
 }
 
 #[tokio::test]
+async fn test_observational_usage_uses_fenced_backup_when_v2_primary_has_no_identity() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    backup.scanner_epoch = Some(7);
+    backup.scanner_cycle = Some(103);
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&primary).expect("incomplete primary should encode"),
+    );
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, &format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str())),
+        serde_json::to_vec(&backup).expect("backup baseline should encode"),
+    );
+
+    let (sender, receiver) = mpsc::channel(1);
+    let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
+    observation.usage_snapshot_converged = Some(false);
+    sender.send(observation).await.expect("observation should enqueue");
+    drop(sender);
+
+    let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+        CancellationToken::new(),
+        store.clone(),
+        receiver,
+        None,
+        None,
+        || async { false },
+    )
+    .await;
+
+    assert_eq!(outcome, DataUsagePersistOutcome::Saved);
+    let observed = read_config(store, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("observational snapshot should be persisted");
+    let observed = serde_json::from_slice::<DataUsageInfo>(&observed).expect("observational snapshot should decode");
+    assert_eq!(observed.usage_snapshot_authoritative_baseline, Some(backup.snapshot_identity()));
+}
+
+#[tokio::test]
+async fn usage_baseline_does_not_fall_back_to_older_legacy_snapshot() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary = DataUsageInfo {
+        scanner_epoch: Some(7),
+        scanner_cycle: Some(100),
+        usage_snapshot_complete: false,
+        ..Default::default()
+    };
+    let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    legacy.scanner_epoch = Some(6);
+    legacy.scanner_cycle = Some(103);
+    let primary_data = serde_json::to_vec(&primary).expect("incomplete primary should encode");
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        primary_data.clone(),
+    );
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&legacy).expect("legacy baseline should encode"),
+    );
+
+    let baseline = read_data_usage_persist_baseline(store)
+        .await
+        .expect("baseline inspection should complete");
+    assert_eq!(baseline.data.as_deref(), Some(primary_data.as_slice()));
+}
+
+#[tokio::test]
 #[serial]
 async fn test_usage_route_barrier_precedes_durable_reconciliation() {
     let store = Arc::new(MemoryConfigStore::default());
@@ -3249,6 +3496,85 @@ async fn coordinator_does_not_put_after_remote_generation_flip() {
 
     assert_eq!(outcome, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
     assert_eq!(store.put_counts.lock().await.get(&key), None);
+}
+
+#[tokio::test]
+async fn coordinator_classifies_an_expired_publication_lease() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let (sender, receiver) = mpsc::channel(1);
+    sender
+        .send(complete_usage_with_bucket_count(
+            Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            1,
+        ))
+        .await
+        .expect("usage snapshot should enqueue");
+    drop(sender);
+
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("test instant should support a one-second subtraction");
+    let outcome =
+        store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
+            CancellationToken::new(),
+            store.clone(),
+            receiver,
+            None,
+            Some(DataUsagePersistBaseline {
+                data: None,
+                revision: DataUsageCacheRevision::Missing,
+            }),
+            ScannerPublicationFence::new(None, Some(expired), None),
+            || async { false },
+        )
+        .await;
+
+    assert_eq!(
+        outcome,
+        DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
+    );
+    assert!(store.put_counts.lock().await.is_empty(), "expired lease must prevent a PUT");
+}
+
+#[tokio::test]
+async fn backup_sync_checks_the_lease_deadline_after_a_slow_backup_read() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary_path = DATA_USAGE_OBJ_NAME_PATH.as_str();
+    let backup_path = format!("{primary_path}.bkp");
+    let primary_key = memory_config_key(RUSTFS_META_BUCKET, primary_path);
+    let backup_key = memory_config_key(RUSTFS_META_BUCKET, &backup_path);
+    let primary = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    store
+        .objects
+        .lock()
+        .await
+        .insert(primary_key, serde_json::to_vec(&primary).expect("primary usage snapshot should encode"));
+    store
+        .delayed_gets
+        .lock()
+        .await
+        .insert(backup_key.clone(), Duration::from_millis(20));
+
+    // The primary read is allowed to start, but the backup read consumes the
+    // remaining lease window. The second deadline check must prevent a stale
+    // backup PUT after that window has elapsed.
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_millis(5))
+        .expect("test deadline should support a five-millisecond window");
+    let result = sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
+        &CancellationToken::new(),
+        store.clone(),
+        None,
+        Some(deadline),
+        None,
+    )
+    .await;
+
+    assert!(scanner_publication_epoch_changed(
+        &result.expect_err("an expired backup lease must defer publication")
+    ));
+    assert!(!store.objects.lock().await.contains_key(&backup_key));
+    assert_eq!(store.put_counts.lock().await.get(&backup_key), None);
 }
 
 #[tokio::test]
@@ -4302,6 +4628,8 @@ fn scanner_cycle_cache_floor_stays_pending_during_deferred_usage_publication() {
     for reason in [
         ScannerCycleDeferReason::DataMovement,
         ScannerCycleDeferReason::ActivityBaselineUnavailable,
+        ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded,
+        ScannerCycleDeferReason::PublicationLeaseReleaseFailed,
     ] {
         let deferred = DataUsagePersistOutcome::Deferred(reason);
         assert_eq!(
@@ -4363,6 +4691,26 @@ fn finalizing_a_deferred_usage_save_keeps_dirty_work_pending() {
         finalize_scanner_cycle_result(deferred, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
 
     assert_eq!(outcome, ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement));
+    assert!(acknowledgements.is_empty());
+    assert!(crate::scanner_io::dirty_usage_buckets_pending());
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
+}
+
+#[test]
+#[serial]
+fn finalizing_post_scan_observation_advances_partially_without_dirty_ack() {
+    crate::scanner_io::clear_dirty_usage_bucket("photos");
+    crate::scanner_io::record_dirty_usage_bucket("photos");
+    let dirty_snapshot = crate::scanner_io::dirty_usage_buckets_for_tests();
+    let observed = crate::scanner_io::ScannerCycleResult::new(
+        ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        Some(dirty_snapshot),
+    )
+    .with_observational_snapshot_published(true);
+
+    let (outcome, _, acknowledgements) = finalize_scanner_cycle_result(observed, DataUsagePersistOutcome::Saved);
+
+    assert_eq!(outcome, ScannerCycleOutcome::Partial);
     assert!(acknowledgements.is_empty());
     assert!(crate::scanner_io::dirty_usage_buckets_pending());
     crate::scanner_io::clear_dirty_usage_bucket("photos");
@@ -4478,6 +4826,29 @@ async fn data_usage_persist_wait_aborts_after_timeout() {
 
     assert!(matches!(result, DataUsagePersistTaskResult::TimedOut));
     assert!(task.is_finished());
+}
+
+#[tokio::test(start_paused = true)]
+async fn data_usage_persist_timeout_drops_owned_task_without_a_late_commit() {
+    let ctx = CancellationToken::new();
+    let commit_started = Arc::new(AtomicBool::new(false));
+    let commit_started_by_task = commit_started.clone();
+    let task_ready = Arc::new(tokio::sync::Notify::new());
+    let task_ready_by_task = task_ready.clone();
+    let mut task = AbortOnDropHandle::new(tokio::spawn(async move {
+        task_ready_by_task.notify_one();
+        std::future::pending::<()>().await;
+        commit_started_by_task.store(true, Ordering::Release);
+        DataUsagePersistOutcome::Saved
+    }));
+    task_ready.notified().await;
+
+    let result = wait_for_data_usage_persist_task(&ctx, &mut task, Duration::from_secs(1)).await;
+
+    assert!(matches!(result, DataUsagePersistTaskResult::TimedOut));
+    assert!(task.is_finished(), "the timed-out persistence task must be drained before return");
+    tokio::task::yield_now().await;
+    assert!(!commit_started.load(Ordering::Acquire), "an owned task must not commit after its timeout");
 }
 
 #[tokio::test(start_paused = true)]
@@ -4703,6 +5074,140 @@ fn superseded_retry_backoff_grows_from_the_default_cycle() {
         backoff.record_retryable_cycle(true);
         assert_eq!(backoff.retry_interval(Duration::from_secs(60)), Some(Duration::from_secs(expected)));
     }
+}
+
+#[test]
+fn publication_proof_retry_backoff_reaches_its_short_cap() {
+    for (failures, expected) in [(1, 5), (2, 10), (3, 20), (4, 30), (20, 30)] {
+        assert_eq!(scanner_publication_proof_retry_delay(failures), Duration::from_secs(expected));
+    }
+}
+
+#[test]
+fn publication_proof_retry_classifies_availability_without_masking_protocol_errors() {
+    for error in [
+        "peer node3 is temporarily offline",
+        "scanner activity peer node3 timed out after 5s",
+        "transport error: connection refused",
+    ] {
+        assert!(scanner_publication_activity_error_is_retryable(error), "{error}");
+    }
+
+    for error in [
+        "scanner activity peer node3 uses protocol 6, expected 7",
+        "scanner activity peer node3 has a different storage topology",
+        "scanner activity peer node3 omitted its movement generation",
+        "duplicate scanner activity peer: node3",
+        "scanner activity peer[2] is unreachable",
+        "scanner publication lease peer node3 is unavailable",
+    ] {
+        assert!(!scanner_publication_activity_error_is_retryable(error), "{error}");
+    }
+}
+
+#[test]
+fn publication_lease_retry_preserves_only_recoverable_candidates() {
+    for error in [
+        "scanner publication lease acquisition failed: scanner publication lease capacity is exhausted",
+        "scanner publication lease acquisition failed: scanner publication lease response arrived after its safety window",
+        "scanner publication lease acquisition failed: peer node3 is temporarily offline",
+    ] {
+        assert!(scanner_publication_lease_error_is_retryable(error), "{error}");
+    }
+
+    for error in [
+        "scanner publication lease acquisition failed: scanner publication lease generation is stale",
+        "scanner publication lease acquisition failed: peer returned a different scanner publication lease session",
+        "scanner publication lease acquisition failed: scanner publication lease is blocked by data movement",
+        "scanner publication lease acquisition failed: peer returned an invalid scanner publication lease proof",
+    ] {
+        assert!(!scanner_publication_lease_error_is_retryable(error), "{error}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_proof_retains_candidate_until_activity_recovers() {
+    let ctx = CancellationToken::new();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = attempts.clone();
+    let started_at = Instant::now();
+
+    let snapshot = await_scanner_publication_activity(&ctx, 17, "postscan", move || {
+        let attempt = probe_attempts.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if attempt == 0 {
+                Err("peer temporarily offline".to_string())
+            } else {
+                Ok(ScannerActivitySnapshot::new())
+            }
+        }
+    })
+    .await
+    .expect("a retained publication candidate should survive one transient probe failure");
+
+    assert!(snapshot.is_empty());
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(started_at.elapsed(), Duration::from_secs(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_proof_does_not_retry_a_protocol_mismatch() {
+    let ctx = CancellationToken::new();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = attempts.clone();
+
+    let err = await_scanner_publication_activity(&ctx, 17, "postscan", move || {
+        probe_attempts.fetch_add(1, Ordering::SeqCst);
+        async { Err("scanner activity peer node3 uses protocol 6, expected 7".to_string()) }
+    })
+    .await
+    .expect_err("a protocol mismatch must not be hidden behind availability retries");
+
+    assert!(err.contains("uses protocol"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn publication_proof_stops_waiting_when_the_cycle_is_cancelled() {
+    let ctx = CancellationToken::new();
+    ctx.cancel();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = attempts.clone();
+
+    let err = await_scanner_publication_activity(&ctx, 17, "postscan", move || {
+        probe_attempts.fetch_add(1, Ordering::SeqCst);
+        async { Ok(ScannerActivitySnapshot::new()) }
+    })
+    .await
+    .expect_err("a cancelled cycle must release its retained publication candidate");
+
+    assert!(err.contains("cancelled"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_proof_releases_candidate_when_cancelled_during_backoff() {
+    let ctx = CancellationToken::new();
+    let cancel_ctx = ctx.clone();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let probe_attempts = attempts.clone();
+    let started_at = Instant::now();
+
+    let cancel = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cancel_ctx.cancel();
+    });
+    let err = await_scanner_publication_activity(&ctx, 17, "postscan", move || {
+        probe_attempts.fetch_add(1, Ordering::SeqCst);
+        async { Err("peer temporarily offline".to_string()) }
+    })
+    .await
+    .expect_err("cycle cancellation must release a candidate waiting to retry publication proof");
+    cancel.await.expect("cancellation task should complete");
+
+    assert!(err.contains("cancelled"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(started_at.elapsed(), Duration::from_secs(1));
 }
 
 #[tokio::test(start_paused = true)]

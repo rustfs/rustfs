@@ -1537,7 +1537,7 @@ where
         Ok(deleted_at)
     }
 
-    pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<()> {
+    pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<(OffsetDateTime, AccountStatus)> {
         if access_key.is_empty() || secret_key.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1552,7 +1552,16 @@ where
         let mut cred = u.credentials.clone();
         cred.secret_key = secret_key.to_string();
 
+        // Status is captured from the same credential snapshot the new secret
+        // is persisted with, so a caller replicating the rotation broadcasts
+        // exactly what was written rather than re-reading racily.
+        let status = if cred.is_valid() {
+            AccountStatus::Enabled
+        } else {
+            AccountStatus::Disabled
+        };
         let u = UserIdentity::from(cred);
+        let updated_at = u.update_at.unwrap_or_else(OffsetDateTime::now_utc);
         drop(cache);
         drop(users);
 
@@ -1560,7 +1569,8 @@ where
             .save_user_identity(access_key, UserType::Reg, u.clone(), None)
             .await?;
 
-        self.update_user_with_claims(access_key, u)
+        self.update_user_with_claims(access_key, u)?;
+        Ok((updated_at, status))
     }
 
     /// Add SSH public key for a user (for SFTP authentication)

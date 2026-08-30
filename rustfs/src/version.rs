@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use shadow_rs::shadow;
+use std::path::Path;
 use std::process::Command;
 
 shadow!(build);
@@ -59,7 +60,26 @@ fn get_latest_tag() -> Result<String, Box<dyn std::error::Error>> {
 
 /// Check if current HEAD is newer than specified tag
 fn is_head_newer_than_tag(tag: &str) -> bool {
+    is_head_newer_than_tag_in(Path::new("."), tag)
+}
+
+fn is_head_newer_than_tag_in(repo: &Path, tag: &str) -> bool {
+    let head = Command::new("git").current_dir(repo).args(["rev-parse", "HEAD"]).output();
+    let tag_commit = Command::new("git")
+        .current_dir(repo)
+        .args(["rev-list", "-n", "1", tag])
+        .output();
+
+    let (Ok(head), Ok(tag_commit)) = (head, tag_commit) else {
+        return false;
+    };
+
+    if !head.status.success() || !tag_commit.status.success() || head.stdout == tag_commit.stdout {
+        return false;
+    }
+
     let output = Command::new("git")
+        .current_dir(repo)
         .args(["merge-base", "--is-ancestor", tag, "HEAD"])
         .output();
 
@@ -220,6 +240,27 @@ fn compare_pre_release(current: &str, latest: &str) -> bool {
 mod tests {
     use super::*;
     use tracing::debug;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git").current_dir(repo).args(args).status().unwrap();
+        assert!(status.success(), "git command failed: git {}", args.join(" "));
+    }
+
+    #[test]
+    fn test_is_head_newer_than_tag_requires_strict_descendant() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "--quiet"]);
+        run_git(repo.path(), &["config", "user.name", "RustFS Tests"]);
+        run_git(repo.path(), &["config", "user.email", "rustfs@example.com"]);
+        run_git(repo.path(), &["commit", "--allow-empty", "--quiet", "-m", "tagged commit"]);
+        run_git(repo.path(), &["tag", "--annotate", "1.2.3", "--message", "1.2.3"]);
+
+        assert!(!is_head_newer_than_tag_in(repo.path(), "1.2.3"));
+
+        run_git(repo.path(), &["commit", "--allow-empty", "--quiet", "-m", "newer commit"]);
+
+        assert!(is_head_newer_than_tag_in(repo.path(), "1.2.3"));
+    }
 
     #[test]
     fn test_parse_version() {

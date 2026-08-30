@@ -122,6 +122,14 @@ fn control_plane_failure(op: &str, bucket: Option<&str>, error_code: Option<i32>
     if error_code == Some(rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32) {
         return Error::RemoteNotInitialized;
     }
+    if error_code == Some(rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32)
+    {
+        return Error::InvalidArgument(
+            "control-plane".to_string(),
+            op.to_string(),
+            error_info.unwrap_or_else(|| format!("{op}: peer rejected invalid argument without details")),
+        );
+    }
     match error_info {
         Some(msg) => Error::other(msg),
         None => peer_failure_without_details(op, bucket),
@@ -725,7 +733,7 @@ impl PeerRestClient {
     /// never take it offline no matter what its message says. The substring
     /// fallback only covers failures that exist purely as text, such as the
     /// dial errors `get_client` wraps.
-    fn is_network_like_error(err: &Error) -> bool {
+    pub(crate) fn is_network_like_error(err: &Error) -> bool {
         if let Error::Io(io_err) = err
             && let Some(status) = embedded_tonic_status(io_err)
         {
@@ -2335,6 +2343,29 @@ mod tests {
         use rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode;
         assert_eq!(ControlPlaneErrorCode::ControlPlaneErrorUnspecified as i32, 0);
         assert_eq!(ControlPlaneErrorCode::ControlPlaneErrorNotInitialized as i32, 1);
+        assert_eq!(ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32, 2);
+    }
+
+    #[test]
+    fn control_plane_failure_preserves_typed_invalid_argument_reason() {
+        use rustfs_protos::proto_gen::node_service::ControlPlaneErrorCode;
+
+        let reason = "durable unresolved-entry recovery requires pool metadata V2 or V3";
+        let err = control_plane_failure(
+            "start_decommission",
+            None,
+            Some(ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32),
+            Some(reason.to_string()),
+        );
+
+        assert!(
+            matches!(
+                err,
+                Error::InvalidArgument(ref scope, ref operation, ref actual_reason)
+                    if scope == "control-plane" && operation == "start_decommission" && actual_reason == reason
+            ),
+            "forwarded validation failures must remain typed and actionable"
+        );
     }
 
     #[test]

@@ -425,7 +425,7 @@ fn record_active_http_requests(delta: i64) {
     } else {
         let decrement = (-delta) as u64;
         ACTIVE_HTTP_REQUESTS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(decrement)))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(decrement)))
             .unwrap_or_else(|current| current)
             .saturating_sub(decrement)
     };
@@ -2273,6 +2273,7 @@ mod tests {
         let s3_config = rustfs_s3_config();
 
         assert!(s3_config.normalize_forward_slash_path);
+        assert!(s3_config.normalize_content_length);
         assert!(s3_config.enable_sig_v2);
         assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "s3"));
         assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "sts"));

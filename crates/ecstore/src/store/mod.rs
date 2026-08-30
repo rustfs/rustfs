@@ -58,7 +58,7 @@ use crate::{
     core::sets::Sets,
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET},
     layout::endpoints::EndpointServerPools,
-    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, ScannerPublicationCommitScope},
 };
 use futures::future::join_all;
 use http::HeaderMap;
@@ -275,11 +275,13 @@ pub struct ECStore {
 
 impl std::fmt::Debug for ECStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let disk_slot_count: usize = self.disk_map.values().map(Vec::len).sum();
+
         f.debug_struct("ECStore")
             .field("id", &self.id)
-            .field("disk_map", &self.disk_map)
-            .field("pools", &self.pools)
-            .field("pool_meta", &self.pool_meta)
+            .field("disk_map_pool_count", &self.disk_map.len())
+            .field("disk_slot_count", &disk_slot_count)
+            .field("pool_count", &self.pools.len())
             .finish_non_exhaustive()
     }
 }
@@ -518,6 +520,48 @@ impl ECStore {
         }
 
         Some((operation_guard, self.ctx.data_movement_operation_epoch()))
+    }
+
+    /// Acquire a storage-owned scanner publication scope. Unlike the legacy
+    /// admission helper, the movement permit is owned by the returned scope
+    /// and therefore survives cancellation of the scanner coordinator while
+    /// the actual metadata mutation drains.
+    pub async fn scanner_data_usage_publication_commit_scope(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(ScannerPublicationCommitScope::new_storage_owned(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+        ))
+    }
+
+    pub async fn scanner_data_usage_publication_commit_scope_with_release_flag(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(ScannerPublicationCommitScope::new_storage_owned_with_release_flag(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+            lease_release_safe,
+        ))
     }
 
     /// Capture the current publication epoch without holding the movement
@@ -1154,6 +1198,7 @@ mod tests {
     use super::*;
     use crate::core::pools::{PoolDecommissionInfo, PoolStatus};
     use crate::layout::endpoints::{Endpoints, PoolEndpoints, SetupType};
+    use crate::object_api::ObjectOptions;
     use crate::runtime::global::reset_local_disk_test_state;
     use crate::runtime::sources::{clear_local_disk_id_map_for_test, local_disk_path_by_id};
     use crate::store::init_format::{connect_load_init_formats, init_disks};
@@ -1168,6 +1213,81 @@ mod tests {
         assert_eq!(infos.len(), disks.len());
         // All should be None since we passed None disks
         assert!(infos.iter().all(|info| info.is_none()));
+    }
+
+    #[test]
+    fn ecstore_debug_is_bounded_summary() {
+        let endpoint_pools = EndpointServerPools::default();
+        let ctx = Arc::new(InstanceContext::new());
+        let store = ECStore {
+            id: uuid::Uuid::new_v4(),
+            disk_map: [(0, vec![None, None, None, None])].into_iter().collect(),
+            pools: Vec::new(),
+            peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoint_pools, ctx.clone()),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::default(),
+            ctx,
+            bucket_fence_registry: Arc::default(),
+        };
+
+        let rendered = format!("{store:?}");
+
+        assert!(rendered.len() < 256, "ECStore Debug should stay bounded: {rendered}");
+        assert!(rendered.contains("disk_map_pool_count"));
+        assert!(rendered.contains("disk_slot_count"));
+        assert!(!rendered.contains("disk_map:"));
+        assert!(!rendered.contains("pools:"));
+        assert!(!rendered.contains("pool_meta"));
+        assert!(!rendered.contains("format.json"));
+        assert!(!rendered.contains("TimedActionSlot"));
+        assert!(!rendered.contains("DiskHealthTracker"));
+    }
+
+    #[test]
+    fn object_options_debug_does_not_expand_tier_store_handle() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let mut opts = ObjectOptions {
+            version_id: Some("large-version-id".repeat(1024)),
+            expected_current_version_id: Some("large-expected-version-id".repeat(1024)),
+            preserve_etag: Some("large-etag".repeat(1024)),
+            http_preconditions: Some(crate::storage_api_contracts::object::HTTPPreconditions {
+                if_match: Some("large-if-match".repeat(1024)),
+                if_none_match: Some("large-if-none-match".repeat(1024)),
+                ..Default::default()
+            }),
+            tier_delete_journal_api: Some(store),
+            ..Default::default()
+        };
+        opts.user_defined.insert("large-user-metadata".to_owned(), "x".repeat(8192));
+        opts.eval_metadata = Some([("large-eval-metadata".to_owned(), "y".repeat(8192))].into_iter().collect());
+        opts.transition.status = "large-transition-status".repeat(1024);
+        opts.transition.tier = "large-transition-tier".repeat(1024);
+        opts.lifecycle_audit_event.event.rule_id = "large-rule-id".repeat(1024);
+        opts.lifecycle_audit_event.event.storage_class = "large-storage-class".repeat(1024);
+
+        let rendered = format!("{opts:?}");
+
+        assert!(rendered.len() < 4096, "ObjectOptions Debug should stay bounded: {rendered}");
+        assert!(rendered.contains("tier_delete_journal_api: true"));
+        assert!(rendered.contains("user_defined_count: 1"));
+        assert!(rendered.contains("eval_metadata_count: Some(1)"));
+        assert!(!rendered.contains("ECStore {"));
+        assert!(!rendered.contains("disk_map"));
+        assert!(!rendered.contains("large-version-id"));
+        assert!(!rendered.contains("large-expected-version-id"));
+        assert!(!rendered.contains("large-etag"));
+        assert!(!rendered.contains("large-if-match"));
+        assert!(!rendered.contains("large-transition"));
+        assert!(!rendered.contains("large-rule-id"));
+        assert!(!rendered.contains("large-storage-class"));
+        assert!(!rendered.contains("large-user-metadata"));
+        assert!(!rendered.contains("large-eval-metadata"));
+        assert!(!rendered.contains("format.json"));
+        assert!(!rendered.contains("TimedActionSlot"));
+        assert!(!rendered.contains("DiskHealthTracker"));
     }
 
     // Build a minimal ECStore carrying an explicit instance context. Empty
@@ -1331,7 +1451,27 @@ mod tests {
             .await
             .expect("movement writer should proceed after lease expiry")
             .expect("expiry writer task should not panic");
+        assert!(
+            store.validate_scanner_publication_lease(expiring_token, 0).await.is_err(),
+            "an expired lease must not validate after its read guard is released"
+        );
         assert!(!store.release_scanner_publication_lease(expiring_token).await);
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_lease_rejects_a_new_movement_generation() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let (token, generation) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("an idle store should grant a publication lease");
+
+        assert_eq!(store.ctx.advance_data_movement_generation(), Some(1));
+        assert!(
+            store.validate_scanner_publication_lease(token, generation).await.is_err(),
+            "a lease from the prior movement generation must fail closed"
+        );
+        assert!(store.release_scanner_publication_lease(token).await);
     }
 
     #[tokio::test]
@@ -1342,6 +1482,102 @@ mod tests {
             .await
             .expect_err("a stale movement generation must not acquire a lease");
         assert!(error.to_string().contains("generation is stale"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_publication_commit_scope_owns_permit_until_terminal_drain() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let scope = store
+            .scanner_data_usage_publication_commit_scope(
+                0,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                vec![Uuid::new_v4()],
+            )
+            .await
+            .expect("idle storage should grant a publication scope");
+        assert_eq!(scope.state(), crate::object_api::ScannerPublicationCommitState::Admitted);
+        assert_eq!(scope.remote_lease_tokens().len(), 1);
+
+        let gate = store.ctx.data_movement_operation_gate();
+        let writer = tokio::spawn(async move { gate.write_owned().await });
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished(), "the scope must own its movement permit after the caller returns");
+
+        scope.cancel();
+        assert!(scope.mark_aborted_before_commit());
+        assert_eq!(
+            scope.wait_for_completion().await,
+            crate::object_api::ScannerPublicationCommitState::AbortedBeforeCommit
+        );
+        assert!(scope.release_movement_permit().await);
+        tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("movement writer should proceed after the scope drains")
+            .expect("movement writer task should not panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_publication_commit_scope_rejects_late_start_and_keeps_indeterminate_permit() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let scope = store
+            .scanner_data_usage_publication_commit_scope(0, tokio::time::Instant::now() + Duration::from_secs(1), Vec::new())
+            .await
+            .expect("idle storage should grant a publication scope");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            scope.try_begin(),
+            Err(crate::object_api::ScannerPublicationCommitStartError::DeadlineExceeded)
+        );
+        assert!(
+            !scope.release_movement_permit().await,
+            "an admitted scope is not safe to release before owner resolution"
+        );
+        assert!(scope.mark_aborted_before_commit());
+        assert!(scope.release_movement_permit().await);
+
+        let scope = store
+            .scanner_data_usage_publication_commit_scope(0, tokio::time::Instant::now() + Duration::from_secs(30), Vec::new())
+            .await
+            .expect("a second idle publication scope should be granted");
+        scope.try_begin().expect("scope should enter the mutation state");
+        scope.cancel();
+        assert!(scope.mark_indeterminate());
+        assert_eq!(
+            scope.wait_for_completion().await,
+            crate::object_api::ScannerPublicationCommitState::Indeterminate
+        );
+        assert!(!scope.release_movement_permit().await, "indeterminate mutation must retain the permit");
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_scope_guard_classifies_early_returns_conservatively() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let permit = store.ctx.data_movement_operation_gate().read_owned().await;
+        let scope = ScannerPublicationCommitScope::new_storage_owned(
+            0,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Vec::new(),
+            permit,
+        );
+        {
+            let _guard = crate::object_api::ScannerPublicationCommitScopeGuard::new(scope.clone());
+        }
+        assert_eq!(scope.state(), crate::object_api::ScannerPublicationCommitState::AbortedBeforeCommit);
+        assert!(scope.release_movement_permit().await);
+
+        let permit = store.ctx.data_movement_operation_gate().read_owned().await;
+        let scope = ScannerPublicationCommitScope::new_storage_owned(
+            0,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Vec::new(),
+            permit,
+        );
+        scope.try_begin().expect("scope should enter the mutation state");
+        {
+            let _guard = crate::object_api::ScannerPublicationCommitScopeGuard::new(scope.clone());
+        }
+        assert_eq!(scope.state(), crate::object_api::ScannerPublicationCommitState::Indeterminate);
+        assert!(!scope.release_movement_permit().await);
     }
 
     #[tokio::test]

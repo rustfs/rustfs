@@ -773,6 +773,13 @@ const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
 const ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE: bool = true;
 
+// Two-phase metadata/read-plan rollout (backlog#1309). The first phase reads
+// metadata without inline payloads and only fetches inline data from the
+// selected data-shard slots. Keep this opt-in until the Linux multi-node
+// slow-tail and small-inline cost gates are complete.
+const ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE: &str = "RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE";
+const DEFAULT_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE: bool = false;
+
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT: bool = true;
 
@@ -1166,6 +1173,109 @@ mod prepared_get_object_metadata_tests {
             4,
             "reader construction must consume prepared metadata instead of repeating the fanout"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn two_phase_read_plan_uses_metadata_only_for_non_inline_get() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "two-phase-read-plan";
+        let object = object_with_initial_data_shards(bucket, "non-inline-object");
+        let payload = vec![0x5a; 2 * 1024 * 1024];
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(&object);
+                reset_test_get_object_reader_path();
+                let mut reader = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("two-phase GET reader should open");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("two-phase GET body should stream");
+                assert_eq!(restored, payload);
+                assert!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION) < 4,
+                    "non-inline two-phase GET should stop metadata fanout at a quorum"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn two_phase_read_plan_preserves_inline_early_stop_path() {
+        let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "two-phase-read-plan-inline";
+        let object = object_with_initial_data_shards(bucket, "inline-object");
+        let payload = b"two-phase inline payload".repeat(256);
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("inline object should be written");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(&object);
+                let mut reader = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("two-phase inline GET reader should open");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("two-phase inline GET body should stream");
+                assert_eq!(restored, payload);
+                assert_eq!(
+                    test_get_object_reader_path_id(),
+                    3,
+                    "inline GET should retain the direct inline reader path"
+                );
+                assert!(calls.total(disk_call_counters::KIND_READ_VERSION) <= 4);
+            },
+        )
+        .await;
     }
 
     #[test]
@@ -1914,6 +2024,26 @@ fn is_get_metadata_data_read_early_stop_enabled() -> bool {
     }
 }
 
+fn is_get_metadata_two_phase_read_plan_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE,
+            DEFAULT_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE,
+                DEFAULT_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE,
+            )
+        })
+    }
+}
+
 fn is_get_metadata_early_stop_bounded_fanout_enabled() -> bool {
     #[cfg(test)]
     {
@@ -2357,6 +2487,7 @@ enum GetCodecStreamingFallbackReason {
     ReadQuorumNotSafe,
     MultipartPartLimit,
     CopySourceDemandBound,
+    InvalidMetadataShape,
 }
 
 impl GetCodecStreamingFallbackReason {
@@ -2379,6 +2510,7 @@ impl GetCodecStreamingFallbackReason {
             Self::ReadQuorumNotSafe => "read_quorum_not_safe",
             Self::MultipartPartLimit => "multipart_part_limit",
             Self::CopySourceDemandBound => "copy_source_demand_bound",
+            Self::InvalidMetadataShape => "invalid_metadata_shape",
         }
     }
 }
@@ -2438,6 +2570,7 @@ enum GetDirectMemoryFallbackReason {
     Remote,
     ObjectInfoMultipart,
     FileInfoMultipart,
+    MetadataShape,
     InvalidSize,
     SizeMismatch,
     AboveThreshold,
@@ -2463,6 +2596,7 @@ impl GetDirectMemoryFallbackReason {
             Self::Remote => "remote",
             Self::ObjectInfoMultipart => "object_info_multipart",
             Self::FileInfoMultipart => "file_info_multipart",
+            Self::MetadataShape => "metadata_shape",
             Self::InvalidSize => "invalid_size",
             Self::SizeMismatch => "size_mismatch",
             Self::AboveThreshold => "above_threshold",
@@ -2511,8 +2645,41 @@ fn record_get_object_reader_path_observation(
     object_class: GetCodecStreamingObjectClass,
     size_bucket: &'static str,
 ) {
+    #[cfg(test)]
+    LAST_GET_OBJECT_READER_PATH.store(
+        match path {
+            crate::set_disk::read::GET_OBJECT_PATH_MID_SIZE_STREAMING => 1,
+            GET_OBJECT_PATH_DIRECT_MEMORY => 2,
+            GET_OBJECT_PATH_INLINE_DIRECT => 3,
+            GET_OBJECT_PATH_BODY_CACHE => 4,
+            GET_OBJECT_PATH_CODEC_STREAMING => 5,
+            GET_OBJECT_PATH_REMOTE_TRANSITION => 6,
+            GET_OBJECT_PATH_EMPTY => 7,
+            GET_OBJECT_PATH_LEGACY_DUPLEX => 8,
+            _ => 255,
+        },
+        Ordering::Relaxed,
+    );
     rustfs_io_metrics::record_get_object_reader_path(path);
     rustfs_io_metrics::record_get_object_reader_path_by_size(path, object_class.as_str(), size_bucket);
+}
+
+#[cfg(test)]
+static LAST_GET_OBJECT_READER_PATH: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_test_get_object_reader_path() {
+    LAST_GET_OBJECT_READER_PATH.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn test_get_object_reader_selected_mid_size() -> bool {
+    LAST_GET_OBJECT_READER_PATH.load(Ordering::Relaxed) == 1
+}
+
+#[cfg(test)]
+pub(crate) fn test_get_object_reader_path_id() -> u64 {
+    LAST_GET_OBJECT_READER_PATH.load(Ordering::Relaxed)
 }
 
 fn classify_get_codec_streaming_object_class(
@@ -2559,6 +2726,26 @@ fn get_small_object_direct_memory_decision_with_threshold(
     opts: &ObjectOptions,
     enabled: bool,
     threshold: usize,
+) -> GetDirectMemoryDecision {
+    get_small_object_direct_memory_decision_with_threshold_and_plan(
+        range,
+        object_info,
+        fi,
+        opts,
+        enabled,
+        threshold,
+        ReadPathPlan::new(object_info, fi),
+    )
+}
+
+fn get_small_object_direct_memory_decision_with_threshold_and_plan(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+    enabled: bool,
+    threshold: usize,
+    plan: ReadPathPlan,
 ) -> GetDirectMemoryDecision {
     if !enabled {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Disabled);
@@ -2617,14 +2804,24 @@ fn get_small_object_direct_memory_decision_with_threshold(
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::FileInfoMultipart);
     }
 
-    let Ok(object_size) = usize::try_from(fi.size) else {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InvalidSize);
+    if object_info.size != fi.size {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::SizeMismatch);
+    }
+    let Some(shape) = plan.shape() else {
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::MetadataShape);
     };
+    let object_size = shape.object_size;
     if object_size == 0 {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::InvalidSize);
     }
-    if object_info.size != fi.size {
-        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::SizeMismatch);
+    if !plan.is_plain() {
+        if object_info.is_encrypted() || fi.metadata.keys().any(|key| is_object_encryption_marker(key)) {
+            return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Encrypted);
+        }
+        if object_info.is_compressed() || fi.is_compressed() {
+            return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Compressed);
+        }
+        return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::Remote);
     }
     if object_size > threshold {
         return GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::AboveThreshold);
@@ -2633,6 +2830,7 @@ fn get_small_object_direct_memory_decision_with_threshold(
     GetDirectMemoryDecision::Use { object_size }
 }
 
+#[allow(dead_code, reason = "asserted by this file's gate tests")]
 fn get_small_object_direct_memory_decision(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
@@ -2667,6 +2865,7 @@ fn should_prefer_codec_streaming_data_blocks_first_reader_setup(
     max_size > 0 && object_size <= max_size
 }
 
+#[allow(dead_code, reason = "asserted by this file's gate tests")]
 fn get_codec_streaming_reader_gate(
     bucket: &str,
     object: &str,
@@ -2675,6 +2874,29 @@ fn get_codec_streaming_reader_gate(
     object_info: &ObjectInfo,
     fi: &FileInfo,
     lock_optimization_enabled: bool,
+) -> GetCodecStreamingGate {
+    get_codec_streaming_reader_gate_with_plan(
+        bucket,
+        object,
+        part_number,
+        object_class,
+        object_info,
+        fi,
+        lock_optimization_enabled,
+        ReadPathPlan::new(object_info, fi),
+    )
+}
+
+#[allow(clippy::too_many_arguments, reason = "keeps the hot-path gate inputs explicit")]
+fn get_codec_streaming_reader_gate_with_plan(
+    bucket: &str,
+    object: &str,
+    part_number: Option<usize>,
+    object_class: GetCodecStreamingObjectClass,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    lock_optimization_enabled: bool,
+    plan: ReadPathPlan,
 ) -> GetCodecStreamingGate {
     let config = get_codec_streaming_config();
 
@@ -2786,6 +3008,22 @@ fn get_codec_streaming_reader_gate(
             return GetCodecStreamingGate {
                 object_class,
                 decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::MultipartPartLimit),
+                prefer_data_blocks_first_reader_setup: false,
+            };
+        }
+    }
+    if object_class == GetCodecStreamingObjectClass::PlainSinglePart {
+        let Some(_shape) = plan.shape() else {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMetadataShape),
+                prefer_data_blocks_first_reader_setup: false,
+            };
+        };
+        if !plan.is_plain() {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMetadataShape),
                 prefer_data_blocks_first_reader_setup: false,
             };
         }
@@ -3542,7 +3780,7 @@ impl SetDisks {
         let hash_bytes = hash.to_le_bytes();
         let index = usize::from(u16::from_le_bytes([hash_bytes[0], hash_bytes[1]]) % GET_OBJECT_METADATA_CACHE_FENCE_SHARDS);
         let generation = &self.get_object_metadata_cache_generations[index];
-        let previous = match generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1)) {
+        let previous = match generation.try_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1)) {
             Ok(previous) | Err(previous) => previous,
         };
         let previous = GetObjectMetadataCacheGeneration {
@@ -3559,7 +3797,7 @@ impl SetDisks {
 
     fn invalidate_all_get_object_metadata_cache(&self) {
         for generation in self.get_object_metadata_cache_generations.iter() {
-            let _ = generation.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1));
+            let _ = generation.try_update(Ordering::AcqRel, Ordering::Acquire, |current| current.checked_add(1));
         }
         self.get_object_metadata_cache.invalidate_all();
     }
@@ -3830,6 +4068,44 @@ impl SetDisks {
         owner.scanner_data_usage_publication_admission_guard().await
     }
 
+    pub async fn scanner_data_usage_publication_commit_scope(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+    ) -> Option<crate::object_api::ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(crate::object_api::ScannerPublicationCommitScope::new_storage_owned(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+        ))
+    }
+
+    pub async fn scanner_data_usage_publication_commit_scope_with_release_flag(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<crate::object_api::ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(crate::object_api::ScannerPublicationCommitScope::new_storage_owned_with_release_flag(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+            lease_release_safe,
+        ))
+    }
+
     /// Whether both sets' namespace-lock implementations cover the same object key.
     pub(crate) async fn shares_namespace_lock_domain(&self, other: &Self) -> bool {
         match (self.ctx.is_dist_erasure().await, other.ctx.is_dist_erasure().await) {
@@ -4074,6 +4350,80 @@ fn object_fits_single_block(object_size: i64, block_size: usize) -> bool {
     }
 }
 
+/// The common metadata contract consumed by all bounded GET fast paths.
+///
+/// `ObjectInfo` is assembled from `FileInfo`, but callers may also provide a
+/// prepared snapshot or metadata from an older peer.  Never let either copy
+/// independently decide that a request is safe: a disagreement must fall
+/// back to the regular reader.  The returned size is the only size used for
+/// fast-path allocation and reader setup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ReadPathShape {
+    pub(super) object_size: usize,
+}
+
+impl ReadPathShape {
+    pub(super) fn is_plain(self, object_info: &ObjectInfo, fi: &FileInfo) -> bool {
+        !object_info.is_encrypted()
+            && !fi.metadata.keys().any(|key| is_object_encryption_marker(key))
+            && !object_info.is_compressed()
+            && !fi.is_compressed()
+            && !object_info.is_remote()
+            && !fi.is_remote()
+    }
+}
+
+/// Request-local metadata decision reused by all small-object GET gates.
+///
+/// The metadata pair is immutable for the lifetime of `get_object_reader`, so
+/// validating it once avoids repeating part-array and transform scans on every
+/// fast-path predicate while keeping the trust boundary fail-closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadPathPlan {
+    shape: Option<ReadPathShape>,
+    plain: bool,
+}
+
+impl ReadPathPlan {
+    fn new(object_info: &ObjectInfo, fi: &FileInfo) -> Self {
+        let shape = read_path_shape(object_info, fi);
+        let plain = shape.is_some_and(|shape| shape.is_plain(object_info, fi));
+        Self { shape, plain }
+    }
+
+    const fn shape(self) -> Option<ReadPathShape> {
+        self.shape
+    }
+
+    const fn is_plain(self) -> bool {
+        self.plain
+    }
+}
+
+/// Validate the single-part geometry shared by inline, direct-memory, and
+/// bounded mid-size readers.  This is deliberately fail-closed: a stale or
+/// mixed-version `ObjectInfo`/`FileInfo` pair must use the legacy path rather
+/// than risk allocating or decoding with a mismatched size.
+pub(super) fn read_path_shape(object_info: &ObjectInfo, fi: &FileInfo) -> Option<ReadPathShape> {
+    if object_info.parts.len() != 1 || fi.parts.len() != 1 || object_info.size < 0 || fi.size < 0 || object_info.size != fi.size {
+        return None;
+    }
+
+    let object_part = object_info.parts.first()?;
+    let file_part = fi.parts.first()?;
+    let object_size = usize::try_from(fi.size).ok()?;
+    if object_part.number != file_part.number
+        || object_part.size != file_part.size
+        || object_part.actual_size != file_part.actual_size
+        || file_part.size != object_size
+        || file_part.actual_size != fi.size
+    {
+        return None;
+    }
+
+    Some(ReadPathShape { object_size })
+}
+
 fn should_use_inline_small_fast_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> bool {
     is_inline_buffer && object_fits_single_block(object_size, block_size)
 }
@@ -4082,35 +4432,37 @@ fn should_use_single_block_non_inline_fast_path(is_inline_buffer: bool, object_s
     !is_inline_buffer && object_fits_single_block(object_size, block_size)
 }
 
+#[allow(dead_code, reason = "asserted by this file's gate tests")]
 fn should_use_inline_fast_path(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
     fi: &FileInfo,
     opts: &ObjectOptions,
 ) -> bool {
+    should_use_inline_fast_path_with_plan(range, object_info, fi, opts, ReadPathPlan::new(object_info, fi))
+}
+
+fn should_use_inline_fast_path_with_plan(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+    plan: ReadPathPlan,
+) -> bool {
     if !object_info.is_inline_fast_path_eligible() || fi.data.is_none() || range.is_some() || opts.part_number.is_some() {
         return false;
     }
 
+    let Some(shape) = plan.shape() else {
+        return false;
+    };
     // The persisted marker is authoritative for the storage decision, but it
     // is still untrusted metadata at this boundary. Revalidate its geometry so
     // a stale/corrupt marker cannot route an oversized payload into the
-    // in-memory decoder. The persisted marker is the writer's policy decision;
-    // reloading the current storage-class config here would add a hot-path
-    // snapshot load and could make an already durable inline object unreadable
-    // after an operator changes the admission policy. The independent
-    // direct-memory reader remains capped at 128 KiB below.
-    let Some(part) = fi.parts.first() else {
-        return false;
-    };
-    // Plain inline metadata must describe one coherent object. In particular,
-    // do not trust `fi.size` for the allocation below when a corrupt part has
-    // a different `actual_size`; compressed/unknown `actual_size` objects are
-    // excluded earlier by the plain-object checks.
-    if fi.size < 0
-        || fi.size > INLINE_FAST_PATH_MAX_OBJECT_SIZE
-        || object_info.size != fi.size
-        || part.actual_size != fi.size
+    // in-memory decoder. The independent direct-memory reader remains capped
+    // at 128 KiB below.
+    if !plan.is_plain()
+        || shape.object_size > usize::try_from(INLINE_FAST_PATH_MAX_OBJECT_SIZE).expect("inline fast path limit fits usize")
         || fi.erasure.data_blocks == 0
         || fi.erasure.block_size == 0
     {
@@ -6019,6 +6371,7 @@ mod tests {
     use crate::object_api::BLOCK_SIZE_V2;
     use crate::object_api::ObjectInfo;
     use crate::set_disk::core::io_primitives::rename_fanout_barrier;
+    use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::{
         heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
         object::ObjectOperations as _,
@@ -11023,6 +11376,41 @@ mod tests {
     }
 
     #[test]
+    fn read_path_shape_rejects_mismatched_metadata_copies_and_transforms() {
+        let (object_info, fi, _) = direct_memory_test_metadata(1024);
+        let shape = read_path_shape(&object_info, &fi).expect("matching metadata should have a valid shape");
+        assert_eq!(shape.object_size, 1024);
+        assert!(shape.is_plain(&object_info, &fi));
+
+        let mut bad_part_number = object_info.clone();
+        Arc::make_mut(&mut bad_part_number.parts)[0].number = 2;
+        assert!(read_path_shape(&bad_part_number, &fi).is_none());
+
+        let mut bad_part_size = fi.clone();
+        bad_part_size.parts[0].size += 1;
+        assert!(read_path_shape(&object_info, &bad_part_size).is_none());
+
+        let mut bad_actual_size = object_info.clone();
+        Arc::make_mut(&mut bad_actual_size.parts)[0].actual_size += 1;
+        assert!(read_path_shape(&bad_actual_size, &fi).is_none());
+
+        let mut compressed = fi.clone();
+        insert_str(&mut compressed.metadata, SUFFIX_COMPRESSION, "zstd".to_string());
+        let compressed_shape = read_path_shape(&object_info, &compressed).expect("geometry remains valid");
+        assert!(!compressed_shape.is_plain(&object_info, &compressed));
+
+        let mut encrypted = fi;
+        encrypted
+            .metadata
+            .insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+        assert!(
+            !read_path_shape(&object_info, &encrypted)
+                .expect("geometry remains valid")
+                .is_plain(&object_info, &encrypted)
+        );
+    }
+
+    #[test]
     fn inline_fast_path_rejects_part_number_requests() {
         let (mut object_info, mut fi, opts) = direct_memory_test_metadata(1024);
         object_info.inlined = true;
@@ -11169,6 +11557,13 @@ mod tests {
         assert_eq!(
             get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &fi, &opts, true, 128 * 1024),
             GetDirectMemoryDecision::Use { object_size: 1024 }
+        );
+
+        let mut corrupt_part = fi;
+        corrupt_part.parts[0].actual_size += 1;
+        assert_eq!(
+            get_small_object_direct_memory_decision_with_threshold(&None, &object_info, &corrupt_part, &opts, true, 128 * 1024),
+            GetDirectMemoryDecision::Fallback(GetDirectMemoryFallbackReason::MetadataShape)
         );
     }
 
@@ -12414,6 +12809,111 @@ mod tests {
                 .expect("reader drop must release its read lock")
                 .expect("replacement after cancellation should succeed");
         })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn multipart_streaming_get_blocks_overwrite_across_part_boundary() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH, Some("false")),
+            ],
+            async {
+                let set_disks = make_local_bucket_test_set_disks().await;
+                let bucket = "snapshot-multipart-overwrite";
+                let object = "object";
+                let part_size = usize::try_from(GLOBAL_MIN_PART_SIZE.as_u64()).expect("minimum part size should fit usize");
+                let first_part = vec![0x41; part_size];
+                let second_part = vec![0x42; part_size];
+                let replacement = vec![0x43; first_part.len() + second_part.len()];
+                let opts = ObjectOptions::default();
+
+                set_disks
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket should be created");
+                let upload = set_disks
+                    .new_multipart_upload(bucket, object, &opts)
+                    .await
+                    .expect("multipart upload should be created");
+                let mut completed_parts = Vec::with_capacity(2);
+                for (part_num, body) in [(1, &first_part), (2, &second_part)] {
+                    let mut reader = PutObjReader::from_vec(body.clone());
+                    let part = set_disks
+                        .put_object_part(bucket, object, &upload.upload_id, part_num, &mut reader, &opts)
+                        .await
+                        .expect("multipart part should be written");
+                    completed_parts.push(CompletePart {
+                        part_num,
+                        etag: part.etag,
+                        ..Default::default()
+                    });
+                }
+                let completed = Arc::clone(&set_disks)
+                    .complete_multipart_upload(bucket, object, &upload.upload_id, completed_parts, &opts)
+                    .await
+                    .expect("multipart upload should complete");
+                assert!(completed.is_multipart());
+
+                let mut snapshot = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("multipart snapshot reader should open");
+                let overwrite_set = Arc::clone(&set_disks);
+                let overwrite_opts = opts.clone();
+                let overwrite_body = replacement.clone();
+                let commit_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+                let overwrite = tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(overwrite_body);
+                    overwrite_set.put_object(bucket, object, &mut reader, &overwrite_opts).await
+                });
+                commit_barrier.wait_until_paused().await;
+                commit_barrier.release_and_wait_until_namespace_pending().await;
+                assert!(
+                    !commit_barrier.namespace_acquired(),
+                    "overwrite must wait for the multipart response's read lock"
+                );
+
+                let mut restored_first = vec![0; first_part.len()];
+                snapshot
+                    .stream
+                    .read_exact(&mut restored_first)
+                    .await
+                    .expect("the first multipart part should stream");
+                assert_eq!(restored_first, first_part);
+                assert!(
+                    !commit_barrier.namespace_acquired() && !overwrite.is_finished(),
+                    "overwrite must remain blocked at the first/second part boundary"
+                );
+
+                let mut restored_second = Vec::new();
+                snapshot
+                    .stream
+                    .read_to_end(&mut restored_second)
+                    .await
+                    .expect("the second multipart part should stream");
+                assert_eq!(restored_second, second_part);
+                tokio::time::timeout(Duration::from_secs(5), overwrite)
+                    .await
+                    .expect("overwrite should proceed after multipart EOF")
+                    .expect("overwrite task should join")
+                    .expect("overwrite should succeed");
+
+                let mut latest = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("replacement reader should open");
+                let mut latest_body = Vec::new();
+                latest
+                    .stream
+                    .read_to_end(&mut latest_body)
+                    .await
+                    .expect("replacement should stream");
+                assert_eq!(latest_body, replacement);
+            },
+        )
         .await;
     }
 

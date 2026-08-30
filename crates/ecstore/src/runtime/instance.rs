@@ -391,7 +391,7 @@ impl InstanceContext {
         let previous = self.data_movement_operation_epoch.load(Ordering::Acquire);
         let _ = self
             .data_movement_operation_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |epoch| Some(epoch.saturating_add(1)));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| Some(epoch.saturating_add(1)));
         let result = self.data_movement_operation_epoch.load(Ordering::Acquire);
         if result == u64::MAX {
             self.data_movement_operation_epoch_exhausted.store(true, Ordering::Release);
@@ -412,7 +412,7 @@ impl InstanceContext {
         }
         let updated = self
             .data_movement_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| generation.checked_add(1));
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| generation.checked_add(1));
         match updated {
             Ok(previous) => {
                 let Some(generation) = previous.checked_add(1) else {

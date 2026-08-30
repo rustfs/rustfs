@@ -121,14 +121,56 @@ impl Operation for RestLoadTableHandler {
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
         let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
+        let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableMetadataAction).await?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let metadata_backend = table_catalog_backend_from_extensions(&req.extensions)?;
         let store = table_catalog_store_from_backend(metadata_backend.clone())?;
         let snapshot_selection = rest_table_snapshot_selection_from_query(&req.uri)?;
-        let mut response = load_table_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
+        let vended_credentials_requested = requests_vended_credentials(&req.headers);
+        let mut response = if !vended_credentials_requested {
+            load_table_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?
+        } else {
+            let issuer = IamTableCredentialIssuer::from_request(&req)?;
+            let credential_permission = if issuer.enabled() {
+                authorize_table_catalog_resource_for_principal(
+                    &req,
+                    &principal,
+                    &resource,
+                    AdminAction::GetTableCredentialsAction,
+                )
+                .await
+            } else {
+                Ok(())
+            };
+            match credential_permission {
+                Ok(()) => {
+                    load_table_response_with_credentials(
+                        &store,
+                        &metadata_backend,
+                        &warehouse,
+                        &namespace,
+                        &table,
+                        &issuer,
+                        Some(&principal.credentials),
+                    )
+                    .await?
+                }
+                Err(err) if err.code() == &S3ErrorCode::AccessDenied => {
+                    let response = load_table_response(&store, &metadata_backend, &warehouse, &namespace, &table).await?;
+                    apply_credentials_to_load_table_response(
+                        response,
+                        client_provided_credentials_response(CREDENTIAL_VENDING_NOT_AUTHORIZED_REASON),
+                    )
+                }
+                Err(err) => return Err(err),
+            }
+        };
         apply_rest_table_snapshot_selection(&mut response.metadata, snapshot_selection);
-        build_json_response(StatusCode::OK, &response)
+        if vended_credentials_requested {
+            build_sensitive_json_response(StatusCode::OK, &response)
+        } else {
+            build_json_response(StatusCode::OK, &response)
+        }
     }
 }
 

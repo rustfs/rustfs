@@ -475,25 +475,32 @@ current unsupported inventory is:
 ## Credential Boundary
 
 RustFS advertises table credential scope metadata without returning reusable
-storage secrets by default. `loadTable` includes the table warehouse prefix in
-the response config, and the standard credentials endpoint is registered:
+storage secrets by default. The standard credentials endpoint is registered:
 
 ```text
 GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/credentials
 ```
 
 The endpoint returns an empty `storage-credentials` list unless table catalog
-credential vending is explicitly enabled. When enabled, RustFS issues temporary
-table-scoped S3 credentials through the credentials endpoint. Those credentials
-are constrained to the table warehouse prefix and include a session token and
-expiration.
+credential vending is explicitly enabled. LoadTable uses the same issuer when
+the request includes `X-Iceberg-Access-Delegation: vended-credentials`. The
+response advertises the issued session for the table warehouse prefix and for
+the exact current metadata object; the session policy keeps table data access
+inside the warehouse and grants only `GetObject` to that metadata object.
 
-The `rustfs-vended-credentials` profile verifies the client handoff from the
-catalog principal to the table-scoped temporary credentials. It still uses the
-configured principal for setup and REST request signing; the vended credentials
-are first checked against the created table warehouse location, then checked
-with a direct S3 scope probe, and finally applied to PyIceberg S3 data-plane
-access after the table has been created.
+LoadTable remains metadata-only when delegation is absent, vending is disabled,
+or the caller lacks the separate table-credentials permission. Disabled and
+not-authorized fallbacks include an explicit reason. Issuer errors, including
+disallowed chained temporary credentials, are returned as request errors rather
+than silently falling back.
+
+The `rustfs-vended-credentials` profile verifies the client handoff through the
+dedicated credentials endpoint. It still uses the configured principal for
+setup and REST request signing; the vended credentials are checked against the
+created table warehouse location, probed directly against S3 scope boundaries,
+and then applied to PyIceberg data-plane access. Stable PyIceberg releases up to
+0.11 do not consume LoadTable `storage-credentials`; native LoadTable coverage
+requires a client release with that support.
 
 Enablement is server-side and fail-closed:
 

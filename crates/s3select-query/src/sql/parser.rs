@@ -16,6 +16,7 @@ use std::{collections::VecDeque, fmt::Display};
 
 use datafusion::sql::sqlparser::{
     dialect::Dialect,
+    keywords::{Keyword, RESERVED_FOR_TABLE_ALIAS},
     parser::{Parser, ParserError},
     tokenizer::{Token, Tokenizer},
 };
@@ -53,7 +54,8 @@ impl<'a> ExtParser<'a> {
     /// Parse the specified tokens with dialect
     fn new_with_dialect(sql: &str, dialect: &'a dyn Dialect) -> Result<Self> {
         let mut tokenizer = Tokenizer::new(dialect, sql);
-        let tokens = tokenizer.tokenize()?;
+        let mut tokens = tokenizer.tokenize()?;
+        rewrite_source_object_wildcards(&mut tokens);
         Ok(ExtParser {
             parser: Parser::new(dialect).with_tokens(tokens),
         })
@@ -102,6 +104,41 @@ impl<'a> ExtParser<'a> {
     fn expected<T>(&self, expected: &str, found: impl Display) -> Result<T> {
         parser_err!(format!("Expected {}, found: {}", expected, found))
     }
+}
+
+fn rewrite_source_object_wildcards(tokens: &mut [Token]) {
+    let mut paren_depth = 0usize;
+    let mut in_from = false;
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        match &tokens[index] {
+            Token::Word(word) if paren_depth == 0 && word.keyword == Keyword::FROM => {
+                in_from = true;
+            }
+            Token::Word(word) if in_from && paren_depth == 0 && ends_from_source(word.keyword) => {
+                in_from = false;
+            }
+            Token::SemiColon if paren_depth == 0 => in_from = false,
+            Token::LParen => paren_depth = paren_depth.saturating_add(1),
+            Token::RParen => paren_depth = paren_depth.saturating_sub(1),
+            Token::Period if in_from => {
+                if let Some(next) = tokens[index + 1..]
+                    .iter_mut()
+                    .find(|token| !matches!(token, Token::Whitespace(_)))
+                    && matches!(next, Token::Mul)
+                {
+                    *next = Token::make_word("*", None);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+}
+
+fn ends_from_source(keyword: Keyword) -> bool {
+    RESERVED_FOR_TABLE_ALIAS.contains(&keyword) || matches!(keyword, Keyword::PREWHERE | Keyword::SETTINGS | Keyword::FORMAT)
 }
 
 #[cfg(test)]
@@ -170,6 +207,23 @@ mod tests {
                 // Successfully parsed as SQL statement
             }
         }
+    }
+
+    #[test]
+    fn parses_source_object_wildcard_without_rewriting_projection_wildcard() {
+        let mut statements = ExtParser::parse_sql("SELECT e.* FROM S3Object[*].* AS e").expect("query should parse");
+        let ExtStatement::SqlStatement(statement) = statements.pop_front().expect("one statement");
+
+        assert_eq!(statement.to_string(), "SELECT e.* FROM S3Object[*].* AS e");
+    }
+
+    #[test]
+    fn from_tokens_in_literals_and_comments_do_not_change_wildcard_scope() {
+        let sql = "SELECT 'FROM x.*' AS marker /* FROM y.* */ FROM S3Object.*";
+        let mut statements = ExtParser::parse_sql(sql).expect("query should parse");
+        let ExtStatement::SqlStatement(statement) = statements.pop_front().expect("one statement");
+
+        assert_eq!(statement.to_string(), "SELECT 'FROM x.*' AS marker FROM S3Object.*");
     }
 
     #[test]

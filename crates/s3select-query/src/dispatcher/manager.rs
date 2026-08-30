@@ -41,11 +41,11 @@ use rustfs_s3select_api::{
     QueryError, QueryResult, SelectError,
     query::{
         Query,
-        ast::ExtStatement,
-        dispatcher::QueryDispatcher,
+        ast::{ExtStatement, JsonPathSegment, JsonSource},
+        dispatcher::{DispatchedQuery, QueryDispatcher},
         execution::{Output, QueryStateMachine},
         function::FuncMetaManagerRef,
-        logical_planner::{LogicalPlanner, Plan},
+        logical_planner::Plan,
         parser::Parser,
         session::{
             DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES, QueryAdmission, QueryExecutionOwner, QueryExecutionStatus,
@@ -53,7 +53,7 @@ use rustfs_s3select_api::{
         },
     },
 };
-use s3s::dto::{FileHeaderInfo, SelectObjectContentInput};
+use s3s::dto::{FileHeaderInfo, JSONType, SelectObjectContentInput};
 use std::sync::LazyLock;
 use tokio::{
     sync::Semaphore,
@@ -66,6 +66,7 @@ use crate::{
     instance::{DEFAULT_MAX_CONCURRENT_QUERIES, DEFAULT_QUERY_TIMEOUT_SECS},
     metadata::{ContextProviderExtension, MetadataProvider, TableHandleProviderRef, base_table::BaseTableProvider},
     sql::logical::planner::DefaultLogicalPlanner,
+    sql::planner::prepare_s3_select_statement,
 };
 
 static IGNORE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::IGNORE));
@@ -120,7 +121,7 @@ impl Drop for QueryPhaseGuard<'_> {
 #[async_trait]
 impl QueryDispatcher for SimpleQueryDispatcher {
     async fn execute_query(&self, query: &Query) -> QueryResult<Output> {
-        self.execute_query_inner(query, None).await
+        self.execute_query_inner(query, None).await.map(|(_, output)| output)
     }
 
     fn try_reserve_query(&self) -> QueryResult<QueryAdmission> {
@@ -133,6 +134,16 @@ impl QueryDispatcher for SimpleQueryDispatcher {
     }
 
     async fn execute_query_admitted(&self, query: &Query, admission: QueryAdmission) -> QueryResult<Output> {
+        self.execute_query_inner(query, Some(admission))
+            .await
+            .map(|(_, output)| output)
+    }
+
+    async fn dispatch_query(&self, query: &Query) -> QueryResult<DispatchedQuery> {
+        self.execute_query_inner(query, None).await
+    }
+
+    async fn dispatch_query_admitted(&self, query: &Query, admission: QueryAdmission) -> QueryResult<DispatchedQuery> {
         self.execute_query_inner(query, Some(admission)).await
     }
 
@@ -150,32 +161,26 @@ impl QueryDispatcher for SimpleQueryDispatcher {
                 let session = &query_state_machine.session;
                 let query = &query_state_machine.query;
 
-                let scheme_provider = self.build_scheme_provider(session).await?;
-                let logical_planner = DefaultLogicalPlanner::new(&scheme_provider);
-                let statements = self.parser.parse(query.content())?;
-
-                if statements.len() > 1 {
-                    return Err(QueryError::MultiStatement {
-                        num: statements.len(),
-                        sql: query_state_machine.query.content().to_string(),
-                    });
-                }
-
-                let stmt = match statements.front() {
-                    Some(stmt) => stmt.clone(),
+                let stmt = match query_state_machine.prepared_statement() {
+                    Some(statement) => statement.clone(),
                     None => {
-                        return Err(QueryError::Parser {
-                            source: ParserError::ParserError("empty SQL expression".to_string()),
-                        });
+                        let (statement, source) = self.prepare_query_statement(query.content())?;
+                        if source_path_requires_expansion(source.path()) {
+                            return Err(SelectError::DataSourcePathUnsupported.into());
+                        }
+                        statement
                     }
                 };
+                let scheme_provider = self.build_scheme_provider(session).await?;
+                let logical_planner = DefaultLogicalPlanner::new(&scheme_provider);
 
                 let logical_plan = self
-                    .statement_to_logical_plan(stmt, &logical_planner, query_state_machine)
+                    .statement_to_logical_plan(stmt, &logical_planner, Arc::clone(&query_state_machine))
                     .await?;
                 Ok(logical_plan)
             })
             .await?;
+        query_state_machine.query.input_metrics().reset();
         if !query_tracker.mark_planned(&self.query_execution_owner) {
             drop(logical_plan);
             return Err(self.query_tracker_error(&query_tracker));
@@ -212,19 +217,21 @@ impl QueryDispatcher for SimpleQueryDispatcher {
     }
 
     async fn build_query_state_machine(&self, query: Query) -> QueryResult<Arc<QueryStateMachine>> {
-        self.build_query_state_machine_inner(query, None).await
+        self.build_query_state_machine_inner(query.for_execution(), None).await
     }
 }
 
 impl SimpleQueryDispatcher {
-    async fn execute_query_inner(&self, query: &Query, admission: Option<QueryAdmission>) -> QueryResult<Output> {
-        let query_state_machine = self.build_query_state_machine_inner(query.clone(), admission).await?;
+    async fn execute_query_inner(&self, query: &Query, admission: Option<QueryAdmission>) -> QueryResult<DispatchedQuery> {
+        let query_state_machine = self.build_query_state_machine_inner(query.for_execution(), admission).await?;
+        let execution_query = query_state_machine.query.clone();
         let logical_plan = self.build_logical_plan(Arc::clone(&query_state_machine)).await?;
         let Some(logical_plan) = logical_plan else {
-            return Ok(Output::Nil(()));
+            return Ok((execution_query, Output::Nil(())));
         };
 
-        self.execute_logical_plan(logical_plan, query_state_machine).await
+        let output = self.execute_logical_plan(logical_plan, query_state_machine).await?;
+        Ok((execution_query, output))
     }
 
     async fn build_query_state_machine_inner(
@@ -256,35 +263,52 @@ impl SimpleQueryDispatcher {
             self.query_timeout.as_secs(),
         );
         let phase_guard = QueryPhaseGuard::new(&query_tracker, &self.query_execution_owner);
-        let session = if let Some(snapshot) = query.snapshot().cloned() {
-            self.run_with_query_deadline(
+        // Keep parser and analyzer errors in the planning phase. Successful
+        // preparation is cached here because the source path configures the
+        // object store before schema inference starts.
+        let (prepared_statement, source) = match self.prepare_query_statement(query.content()) {
+            Ok((statement, source)) => (Some(statement), source),
+            Err(_) => (None, JsonSource::default()),
+        };
+        let session = self
+            .run_with_query_deadline(
                 &query_tracker,
                 self.session_factory
-                    .create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
-                        query.context(),
-                        snapshot,
+                    .create_session_ctx_for_query_with_source_and_tracker_and_memory_limit(
+                        &query,
+                        source,
                         query_tracker.clone(),
                         self.memory_limit_bytes,
                     ),
             )
-            .await?
-        } else {
-            self.run_with_query_deadline(
-                &query_tracker,
-                self.session_factory.create_session_ctx_with_tracker_and_memory_limit(
-                    query.context(),
-                    query_tracker.clone(),
-                    self.memory_limit_bytes,
-                ),
-            )
-            .await?
-        };
+            .await?;
         if !query_tracker.mark_admitted(&self.query_execution_owner) {
             drop(session);
             return Err(self.query_tracker_error(&query_tracker));
         }
         phase_guard.disarm();
-        Ok(Arc::new(QueryStateMachine::begin_tracked(query, session, query_tracker)?))
+        let state_machine = match prepared_statement {
+            Some(statement) => QueryStateMachine::begin_tracked_prepared(query, session, query_tracker, statement)?,
+            None => QueryStateMachine::begin_tracked(query, session, query_tracker)?,
+        };
+        Ok(Arc::new(state_machine))
+    }
+
+    fn prepare_query_statement(&self, sql: &str) -> QueryResult<(ExtStatement, JsonSource)> {
+        let mut statements = self.parser.parse(sql)?;
+        if statements.len() > 1 {
+            return Err(QueryError::MultiStatement {
+                num: statements.len(),
+                sql: sql.to_string(),
+            });
+        }
+        let mut statement = statements.pop_front().ok_or_else(|| QueryError::Parser {
+            source: ParserError::ParserError("empty SQL expression".to_string()),
+        })?;
+        let ExtStatement::SqlStatement(sql_statement) = &mut statement;
+        let source = prepare_s3_select_statement(sql_statement)?;
+        validate_json_source_path_input(&self.input, source.path())?;
+        Ok((statement, source))
     }
     async fn run_with_query_deadline<T>(
         &self,
@@ -364,7 +388,7 @@ impl SimpleQueryDispatcher {
         // begin analyze
         query_state_machine.begin_analyze();
         let logical_plan = logical_planner
-            .create_logical_plan(stmt, &query_state_machine.session)
+            .prepared_statement_to_plan(stmt, &query_state_machine.session)
             .await?;
         query_state_machine.end_analyze();
 
@@ -500,6 +524,31 @@ impl SimpleQueryDispatcher {
 
         Ok(current_session_table_provider)
     }
+}
+
+fn validate_json_source_path_input(input: &SelectObjectContentInput, source_path: &[JsonPathSegment]) -> QueryResult<()> {
+    if source_path.is_empty() {
+        return Ok(());
+    }
+    let Some(json) = input.request.input_serialization.json.as_ref() else {
+        return Err(SelectError::DataSourcePathUnsupported.into());
+    };
+    if !source_path_requires_expansion(source_path)
+        || json
+            .type_
+            .as_ref()
+            .is_some_and(|json_type| json_type.as_str() == JSONType::DOCUMENT)
+    {
+        return Ok(());
+    }
+    Err(SelectError::DataSourcePathUnsupported.into())
+}
+
+fn source_path_requires_expansion(source_path: &[JsonPathSegment]) -> bool {
+    !source_path
+        .strip_prefix(&[JsonPathSegment::ArrayWildcard])
+        .unwrap_or(source_path)
+        .is_empty()
 }
 
 pub struct TrackedRecordBatchStream {
@@ -759,7 +808,10 @@ impl SimpleQueryDispatcherBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryPhaseGuard, SimpleQueryDispatcher, SimpleQueryDispatcherBuilder, TrackedRecordBatchStream};
+    use super::{
+        QueryPhaseGuard, SimpleQueryDispatcher, SimpleQueryDispatcherBuilder, TrackedRecordBatchStream,
+        validate_json_source_path_input,
+    };
     use crate::{
         execution::{
             factory::{QueryExecutionFactoryRef, SqlQueryExecutionFactory},
@@ -788,6 +840,7 @@ mod tests {
         QueryError, QueryResult, SelectError,
         query::{
             Context as QueryContext, Query,
+            ast::JsonPathSegment,
             dispatcher::QueryDispatcher,
             execution::{
                 Output, QueryExecution, QueryExecutionFactory, QueryExecutionRef, QueryStateMachine, QueryStateMachineRef,
@@ -1030,7 +1083,17 @@ mod tests {
         query_execution_factory: QueryExecutionFactoryRef,
     ) -> (Arc<SimpleQueryDispatcher>, Arc<SelectObjectContentInput>) {
         let input = Arc::new(test_input());
-        let dispatcher = SimpleQueryDispatcherBuilder::default()
+        let dispatcher = test_dispatcher_for_input(Arc::clone(&input), admission, query_timeout, query_execution_factory);
+        (dispatcher, input)
+    }
+
+    fn test_dispatcher_for_input(
+        input: Arc<SelectObjectContentInput>,
+        admission: Arc<Semaphore>,
+        query_timeout: Duration,
+        query_execution_factory: QueryExecutionFactoryRef,
+    ) -> Arc<SimpleQueryDispatcher> {
+        SimpleQueryDispatcherBuilder::default()
             .with_input(Arc::clone(&input))
             .with_default_table_provider(Arc::new(BaseTableProvider::default()))
             .with_session_factory(Arc::new(SessionCtxFactory::new(true)))
@@ -1040,8 +1103,7 @@ mod tests {
             .with_query_admission(admission)
             .with_query_timeout(query_timeout)
             .build()
-            .expect("query dispatcher should build");
-        (dispatcher, input)
+            .expect("query dispatcher should build")
     }
 
     async fn snapshot_test_env() -> &'static TestECStoreEnv {
@@ -1168,6 +1230,68 @@ mod tests {
                 scan_range: None,
             },
         })
+    }
+
+    #[test]
+    fn nested_source_paths_require_json_document_input() {
+        let lines_input = json_snapshot_input();
+        let nested_path = [JsonPathSegment::Key {
+            name: "employees".to_string(),
+            quoted: false,
+        }];
+
+        assert!(matches!(
+            validate_json_source_path_input(&lines_input, &nested_path),
+            Err(ref error) if matches!(error.s3_select_policy_error(), Some(SelectError::DataSourcePathUnsupported))
+        ));
+        assert!(validate_json_source_path_input(&lines_input, &[JsonPathSegment::ArrayWildcard]).is_ok());
+
+        let csv_input = test_input();
+        let parquet_input = parquet_snapshot_input();
+        for input in [&csv_input, parquet_input.as_ref()] {
+            assert!(matches!(
+                validate_json_source_path_input(input, &nested_path),
+                Err(ref error) if matches!(error.s3_select_policy_error(), Some(SelectError::DataSourcePathUnsupported))
+            ));
+        }
+
+        let mut document_input = (*lines_input).clone();
+        document_input.request.input_serialization.json.as_mut().unwrap().type_ = Some(JSONType::from_static(JSONType::DOCUMENT));
+        assert!(validate_json_source_path_input(&document_input, &nested_path).is_ok());
+    }
+
+    #[tokio::test]
+    async fn normal_planning_pipeline_rejects_json_lines_source_expansion() {
+        let mut input = (*json_snapshot_input()).clone();
+        input.request.expression = "SELECT * FROM S3Object.employees".to_string();
+        let input = Arc::new(input);
+        let admission = Arc::new(Semaphore::new(1));
+        let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+        let scheduler = Arc::new(LocalScheduler {});
+        let dispatcher = test_dispatcher_for_input(
+            Arc::clone(&input),
+            Arc::clone(&admission),
+            Duration::from_secs(300),
+            Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler)),
+        );
+        let query = Query::new(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+        );
+        let query_state_machine = dispatcher
+            .build_query_state_machine(query)
+            .await
+            .expect("validation errors should remain in the planning phase");
+
+        let result = dispatcher.build_logical_plan(query_state_machine).await;
+
+        assert!(matches!(
+            result,
+            Err(ref error) if matches!(error.s3_select_policy_error(), Some(SelectError::DataSourcePathUnsupported))
+        ));
+        assert_eq!(admission.available_permits(), 1);
     }
 
     fn parquet_snapshot_input() -> Arc<SelectObjectContentInput> {
@@ -1530,6 +1654,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unprepared_tracked_session_rejects_source_path_expansion() {
+        let mut input = test_input();
+        input.key = "test.json".to_string();
+        input.request.expression = "SELECT * FROM S3Object.employees".to_string();
+        input.request.input_serialization = InputSerialization {
+            json: Some(JSONInput {
+                type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+            }),
+            ..Default::default()
+        };
+        input.request.output_serialization = OutputSerialization {
+            json: Some(JSONOutput::default()),
+            ..Default::default()
+        };
+        let input = Arc::new(input);
+        let admission = Arc::new(Semaphore::new(1));
+        let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+        let scheduler = Arc::new(LocalScheduler {});
+        let dispatcher = test_dispatcher_for_input(
+            Arc::clone(&input),
+            Arc::clone(&admission),
+            Duration::from_secs(300),
+            Arc::new(SqlQueryExecutionFactory::new(optimizer, scheduler)),
+        );
+        let query = Query::new(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+        );
+        let permit = Arc::clone(&admission).acquire_owned().await.expect("admission permit");
+        let tracker = QueryExecutionTracker::new(
+            &dispatcher.query_execution_owner,
+            Arc::new(permit),
+            Instant::now() + Duration::from_secs(300),
+            300,
+        );
+        let session = SessionCtxFactory::new(true)
+            .create_session_ctx_with_tracker_and_memory_limit(
+                query.context(),
+                tracker.clone(),
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+            )
+            .await
+            .expect("test session");
+        assert!(tracker.mark_admitted(&dispatcher.query_execution_owner));
+        let state_machine =
+            Arc::new(QueryStateMachine::begin_tracked(query, session, tracker).expect("tracked state machine should be valid"));
+
+        let result = dispatcher.build_logical_plan(state_machine).await;
+
+        assert!(matches!(
+            result,
+            Err(ref error) if matches!(error.s3_select_policy_error(), Some(SelectError::DataSourcePathUnsupported))
+        ));
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unprepared_tracked_session_preserves_root_scalar_bindings() {
+        for (bucket, expression) in [
+            ("s3select-unprepared-root-scalar-alias", "SELECT V FROM S3Object AS V"),
+            ("s3select-unprepared-root-wildcard", "SELECT _1 FROM S3Object[*]"),
+        ] {
+            let mut input = test_input();
+            input.bucket = bucket.to_string();
+            input.key = "input.json".to_string();
+            input.request.expression = expression.to_string();
+            input.request.input_serialization = InputSerialization {
+                json: Some(JSONInput {
+                    type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+                }),
+                ..Default::default()
+            };
+            input.request.output_serialization = OutputSerialization {
+                json: Some(JSONOutput::default()),
+                ..Default::default()
+            };
+            let input = Arc::new(input);
+            let env = snapshot_test_env().await;
+            env.make_bucket(&input.bucket, false).await;
+            env.put_object_bytes(&input.bucket, &input.key, br#"["one","two"]"#.to_vec())
+                .await;
+            let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+            let dispatcher = production_dispatcher(Arc::clone(&input));
+            let query = Query::new_with_snapshot(
+                QueryContext {
+                    input: Arc::clone(&input),
+                },
+                input.request.expression.clone(),
+                Arc::clone(&snapshot),
+            );
+            let permit = Arc::clone(&dispatcher.query_admission)
+                .acquire_owned()
+                .await
+                .expect("query permit should be available");
+            let tracker = QueryExecutionTracker::new(
+                &dispatcher.query_execution_owner,
+                Arc::new(permit),
+                Instant::now() + Duration::from_secs(300),
+                300,
+            );
+            let session = SessionCtxFactory::new(false)
+                .create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
+                    query.context(),
+                    snapshot,
+                    tracker.clone(),
+                    DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+                )
+                .await
+                .expect("legacy session should preserve the root scalar binding");
+            assert!(tracker.mark_admitted(&dispatcher.query_execution_owner));
+            let state_machine = Arc::new(
+                QueryStateMachine::begin_tracked(query, session, tracker).expect("tracked state machine should be valid"),
+            );
+
+            let logical_plan = dispatcher
+                .build_logical_plan(Arc::clone(&state_machine))
+                .await
+                .expect("unprepared query should plan")
+                .expect("SELECT should produce a logical plan");
+            let values = collect_utf8_output(
+                dispatcher
+                    .execute_logical_plan(logical_plan, state_machine)
+                    .await
+                    .expect("unprepared query should execute"),
+            )
+            .await;
+
+            assert_eq!(values, ["one", "two"]);
+        }
+    }
+
+    #[tokio::test]
     async fn staged_query_rejects_unbound_session() {
         let admission = Arc::new(Semaphore::new(1));
         let (dispatcher, input) = test_dispatcher(Arc::clone(&admission), Duration::from_secs(300));
@@ -1703,6 +1961,55 @@ mod tests {
 
         drop(output);
         assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn reused_query_gets_execution_local_input_metrics() {
+        let admission = Arc::new(Semaphore::new(2));
+        let (dispatcher, input) = test_dispatcher(Arc::clone(&admission), Duration::from_secs(300));
+        let query = Query::new(QueryContext { input }, "SELECT * FROM S3Object".to_string());
+
+        let first = dispatcher
+            .build_query_state_machine(query.clone())
+            .await
+            .expect("first execution state");
+        let second = dispatcher
+            .build_query_state_machine(query)
+            .await
+            .expect("second execution state");
+
+        assert!(!Arc::ptr_eq(first.query.input_metrics(), second.query.input_metrics()));
+        drop((first, second));
+        assert_eq!(admission.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatching_a_reused_query_returns_execution_local_input_metrics() {
+        let env = snapshot_test_env().await;
+        let mut input = test_input();
+        input.bucket = "s3select-reused-query-metrics".to_string();
+        input.key = "input.csv".to_string();
+        let input = Arc::new(input);
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, b"name\nAlice\n".to_vec())
+            .await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+
+        let (first_query, first_output) = dispatcher.dispatch_query(&query).await.expect("first dispatch should start");
+        let (second_query, second_output) = dispatcher.dispatch_query(&query).await.expect("second dispatch should start");
+
+        assert!(!Arc::ptr_eq(first_query.input_metrics(), second_query.input_metrics()));
+        assert!(!Arc::ptr_eq(query.input_metrics(), first_query.input_metrics()));
+        assert!(!Arc::ptr_eq(query.input_metrics(), second_query.input_metrics()));
+        drop((first_output, second_output));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1902,6 +2209,38 @@ mod tests {
         assert!(matches!(
             dispatcher.build_logical_plan(retained_state_machine).await,
             Err(QueryError::Cancel)
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_sql_precedes_malformed_json_snapshot_read() {
+        let mut input = json_snapshot_input();
+        let input_mut = Arc::make_mut(&mut input);
+        input_mut.bucket = "s3select-invalid-sql-precedence".to_string();
+        input_mut.key = "malformed.json".to_string();
+        input_mut.request.expression = "SELECT * FROM".to_string();
+        input_mut.request.input_serialization.json.as_mut().unwrap().type_ = Some(JSONType::from_static(JSONType::DOCUMENT));
+
+        let env = snapshot_test_env().await;
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, b"{bad".to_vec()).await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let query_state_machine = dispatcher
+            .build_query_state_machine(query)
+            .await
+            .expect("invalid SQL should remain a planning-phase error");
+
+        assert!(matches!(
+            dispatcher.build_logical_plan(query_state_machine).await,
+            Err(QueryError::Parser { .. })
         ));
     }
 

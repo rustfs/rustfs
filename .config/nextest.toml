@@ -100,6 +100,16 @@ test-group = 'embedded-test-ports'
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the transition matrix tests. They build a 4-disk hermetic erasure
+# set, populate the get_object_metadata_cache, and assert generation lifecycle
+# semantics. serial_test's #[serial] has no effect across nextest's process
+# boundary, so concurrent execution races the shared metadata-cache generation
+# counter and causes spurious "metadata read should publish the generation"
+# panics. Preventive serialization, no retries.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(set_disk::transition_matrix_tests::)'
+test-group = 'ecstore-serial-flaky'
+
 # The durable ILM decommission regressions build isolated multi-pool stores and
 # deliberately take source or target disks offline while checking fencing.
 [[profile.default.overrides]]
@@ -230,6 +240,12 @@ test-group = 'embedded-test-ports'
 # too. No retries: failures stay visible.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the transition matrix tests under the ci profile too (see the
+# matching default-profile override near the top). No retries.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(set_disk::transition_matrix_tests::)'
 test-group = 'ecstore-serial-flaky'
 
 [[profile.ci.overrides]]

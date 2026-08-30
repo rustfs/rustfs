@@ -162,18 +162,18 @@ impl ScannerIOCycle for ECStore {
                 dirty_usage_status,
                 activity_status,
             );
-            if !publish_usage_snapshot(
-                &updates,
-                status,
-                DataUsageInfo {
-                    last_update: Some(SystemTime::now()),
-                    scanner_cycle: Some(want_cycle),
-                    usage_snapshot_complete: true,
-                    ..Default::default()
-                },
-            )
-            .await?
-            {
+            let empty_usage = DataUsageInfo {
+                last_update: Some(SystemTime::now()),
+                scanner_cycle: Some(want_cycle),
+                usage_snapshot_complete: true,
+                ..Default::default()
+            };
+            let observational_snapshot_published = if should_publish_observational_snapshot(status) {
+                publish_observational_snapshot(&updates, empty_usage).await?
+            } else {
+                publish_usage_snapshot(&updates, status, empty_usage).await?
+            };
+            if !observational_snapshot_published {
                 return Ok(ScannerCycleResult::new(status, None).with_publication_epoch(publication_epoch));
             }
             if status == ScannerCycleStatus::Complete {
@@ -188,6 +188,7 @@ impl ScannerIOCycle for ECStore {
             };
             return Ok(ScannerCycleResult::new(status, dirty_usage_clear)
                 .with_publication_epoch(publication_epoch)
+                .with_observational_snapshot_published(observational_snapshot_published)
                 .with_remote_publication_lease_targets(remote_publication_lease_targets)
                 .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements));
         }
@@ -437,13 +438,19 @@ impl ScannerIOCycle for ECStore {
             dirty_usage_status,
             activity_status,
         );
-        if let Some((data_usage_info, _)) = completed_usage {
-            publish_usage_snapshot(&updates, cycle_status, data_usage_info).await?;
+        let observational_snapshot_published = if let Some((data_usage_info, _)) = completed_usage {
+            if should_publish_observational_snapshot(cycle_status) {
+                publish_observational_snapshot(&updates, data_usage_info).await?
+            } else {
+                publish_usage_snapshot(&updates, cycle_status, data_usage_info).await?
+            }
         } else if !ctx.is_cancelled()
             && let Some((data_usage_info, _)) = observational_usage
         {
-            publish_observational_snapshot(&updates, data_usage_info).await?;
-        }
+            publish_observational_snapshot(&updates, data_usage_info).await?
+        } else {
+            false
+        };
         let dirty_usage_clear = should_clear_dirty_usage_snapshot(
             result.is_ok(),
             structurally_complete_snapshot,
@@ -463,6 +470,7 @@ impl ScannerIOCycle for ECStore {
         };
         Ok(ScannerCycleResult::new(cycle_status, dirty_usage_clear)
             .with_publication_epoch(publication_epoch)
+            .with_observational_snapshot_published(observational_snapshot_published)
             .with_remote_publication_lease_targets(remote_publication_lease_targets)
             .with_remote_dirty_usage_acknowledgements(remote_dirty_usage_acknowledgements)
             .with_failed_dirty_usage(!failed_buckets.is_empty())

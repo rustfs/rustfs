@@ -195,14 +195,14 @@ impl Drop for DiskBucketScanGaugeReset {
 
 pub(super) fn decrement_atomic_usize(counter: &AtomicUsize) -> usize {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(1)))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(1)))
         .map(|previous| previous.saturating_sub(1))
         .unwrap_or_else(|current| current)
 }
 
 pub(super) fn increment_atomic_usize(counter: &AtomicUsize) -> usize {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(1)))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(1)))
         .map(|previous| previous.saturating_add(1))
         .unwrap_or_else(|current| current)
 }
@@ -286,6 +286,16 @@ pub(super) fn scanner_task_join_error(stage: &str, err: tokio::task::JoinError) 
 mod tests {
     use super::*;
     use rustfs_scanner_contracts::metrics::{ScannerWorkSource, global_metrics};
+    use tokio::sync::oneshot;
+
+    fn active_bucket_drive_count(source: ScannerWorkSource, bucket: &str, drive: &str) -> u64 {
+        global_metrics()
+            .scanner_runtime_details_report()
+            .active_bucket_drive_scans
+            .into_iter()
+            .find(|active| active.source == source.as_str() && active.bucket == bucket && active.drive == drive)
+            .map_or(0, |active| active.count)
+    }
 
     #[test]
     fn bucket_drive_failure_guard_retires_active_scan_on_drop() {
@@ -304,5 +314,86 @@ mod tests {
                 .iter()
                 .any(|active| active.source == source.as_str() && active.bucket == bucket && active.drive == drive)
         );
+    }
+
+    #[tokio::test]
+    async fn bucket_drive_failure_guard_retires_active_scan_after_cancellation() {
+        let source = ScannerWorkSource::Usage;
+        let bucket = "__guard_cancel_lifecycle_test__";
+        let drive = "/__guard_cancel_lifecycle_test__";
+        global_metrics().record_scan_bucket_drive_start(source, bucket, drive);
+
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker = tokio::spawn(async move {
+            let mut guard = BucketDriveFailureGuard::new(source, bucket, drive);
+            worker_cancellation.cancelled().await;
+            guard.mark_not_failed();
+        });
+
+        cancellation.cancel();
+        worker.await.expect("cancelled scanner worker should finish");
+
+        assert_eq!(active_bucket_drive_count(source, bucket, drive), 0);
+    }
+
+    #[tokio::test]
+    async fn bucket_drive_failure_guard_retires_active_scan_when_worker_is_aborted() {
+        let source = ScannerWorkSource::Bitrot;
+        let bucket = "__guard_abort_lifecycle_test__";
+        let drive = "/__guard_abort_lifecycle_test__";
+        global_metrics().record_scan_bucket_drive_start(source, bucket, drive);
+
+        let (started_sender, started_receiver) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let _guard = BucketDriveFailureGuard::new(source, bucket, drive);
+            started_sender.send(()).expect("test should observe worker start");
+            std::future::pending::<()>().await;
+        });
+        started_receiver.await.expect("scanner worker should start");
+        assert_eq!(active_bucket_drive_count(source, bucket, drive), 1);
+
+        worker.abort();
+        worker.await.expect_err("aborted scanner worker should report cancellation");
+
+        assert_eq!(active_bucket_drive_count(source, bucket, drive), 0);
+    }
+
+    #[tokio::test]
+    async fn bucket_drive_failure_guards_track_overlapping_scans_independently() {
+        let source = ScannerWorkSource::Usage;
+        let bucket = "__guard_overlap_lifecycle_test__";
+        let drive = "/__guard_overlap_lifecycle_test__";
+        global_metrics().record_scan_bucket_drive_start(source, bucket, drive);
+        global_metrics().record_scan_bucket_drive_start(source, bucket, drive);
+
+        let (first_release_sender, first_release_receiver) = oneshot::channel();
+        let (second_release_sender, second_release_receiver) = oneshot::channel();
+        let (first_started_sender, first_started_receiver) = oneshot::channel();
+        let (second_started_sender, second_started_receiver) = oneshot::channel();
+        let first = tokio::spawn(async move {
+            let _guard = BucketDriveFailureGuard::new(source, bucket, drive);
+            first_started_sender.send(()).expect("test should observe first worker start");
+            first_release_receiver.await.expect("first worker should be released");
+        });
+        let second = tokio::spawn(async move {
+            let _guard = BucketDriveFailureGuard::new(source, bucket, drive);
+            second_started_sender
+                .send(())
+                .expect("test should observe second worker start");
+            second_release_receiver.await.expect("second worker should be released");
+        });
+
+        first_started_receiver.await.expect("first scanner worker should start");
+        second_started_receiver.await.expect("second scanner worker should start");
+        assert_eq!(active_bucket_drive_count(source, bucket, drive), 2);
+
+        first_release_sender.send(()).expect("first worker should be released");
+        first.await.expect("first scanner worker should finish");
+        assert_eq!(active_bucket_drive_count(source, bucket, drive), 1);
+
+        second_release_sender.send(()).expect("second worker should be released");
+        second.await.expect("second scanner worker should finish");
+        assert_eq!(active_bucket_drive_count(source, bucket, drive), 0);
     }
 }

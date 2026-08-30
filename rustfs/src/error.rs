@@ -86,6 +86,14 @@ impl ApiError {
         }
     }
 
+    pub fn service_unavailable() -> Self {
+        ApiError {
+            code: S3ErrorCode::ServiceUnavailable,
+            message: Self::error_code_to_message(&S3ErrorCode::ServiceUnavailable),
+            source: None,
+        }
+    }
+
     pub fn invalid_request(message: impl std::fmt::Display) -> Self {
         ApiError {
             code: S3ErrorCode::InvalidRequest,
@@ -617,6 +625,21 @@ mod tests {
             },
         ));
         let api_error = ApiError::from(storage_error);
+        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+    }
+
+    #[test]
+    fn content_md5_mismatch_io_errors_map_to_bad_digest() {
+        let bad_digest = || rustfs_rio::BadDigest {
+            expected_md5: "expected".to_string(),
+            calculated_md5: "calculated".to_string(),
+        };
+        let api_error = ApiError::from(IoError::new(ErrorKind::InvalidData, bad_digest()));
+        assert_eq!(api_error.code, S3ErrorCode::BadDigest);
+        assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
+
+        let api_error = ApiError::from(StorageError::Io(IoError::new(ErrorKind::InvalidData, bad_digest())));
         assert_eq!(api_error.code, S3ErrorCode::BadDigest);
         assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
     }

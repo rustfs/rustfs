@@ -641,7 +641,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
         // The closure always returns Some, so the update never fails and the Result is discarded.
         let _ = self
             .failed_count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| Some(current.saturating_sub(1)));
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| Some(current.saturating_sub(1)));
     }
 
     /// Maps a per-entry stat outcome inside the ordered failed scan. A NotFound error means the file

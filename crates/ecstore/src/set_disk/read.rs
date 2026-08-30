@@ -89,6 +89,8 @@ use super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT;
 #[cfg(test)]
 use super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE;
 #[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE;
+#[cfg(test)]
 use super::ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE;
 #[cfg(test)]
 use super::ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH;
@@ -125,6 +127,8 @@ use super::is_get_metadata_data_read_early_stop_enabled;
 use super::is_get_metadata_early_stop_bounded_fanout_enabled;
 #[cfg(test)]
 use super::is_get_metadata_early_stop_enabled;
+#[cfg(test)]
+use super::is_get_metadata_two_phase_read_plan_enabled;
 #[cfg(test)]
 use super::is_version_early_stop_enabled;
 #[cfg(test)]
@@ -1370,6 +1374,7 @@ impl SetDisks {
             prefer_data_blocks_first_reader_setup,
             get_codec_streaming_metrics_path(),
             false,
+            false,
         )
         .await
     }
@@ -1408,6 +1413,7 @@ impl SetDisks {
             prefer_data_blocks_first_reader_setup,
             GET_OBJECT_PATH_MID_SIZE_STREAMING,
             true,
+            true,
         )
         .await
     }
@@ -1428,6 +1434,7 @@ impl SetDisks {
         prefer_data_blocks_first_reader_setup: bool,
         metrics_path: &'static str,
         allow_inplace_legacy_fallback: bool,
+        single_inflight: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         let erasure = erasure_cache.get_for_file_info(fi)?;
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
@@ -1451,6 +1458,7 @@ impl SetDisks {
                 metrics_object_class,
                 metrics_size_bucket,
                 prefer_data_blocks_first_reader_setup,
+                single_inflight,
                 // Single-part objects keep the whole-request fallback: a degraded
                 // sole part is detected before any byte streams, so the caller can
                 // still hand the request to the legacy duplex path unchanged.
@@ -1504,6 +1512,7 @@ impl SetDisks {
             metrics_object_class,
             metrics_size_bucket,
             false,
+            false,
             // The first part stays eager and keeps the whole-request fallback:
             // if part 1 is already degraded, the entire GET drops to the legacy
             // duplex path before a single byte is streamed (semantics unchanged).
@@ -1551,6 +1560,7 @@ impl SetDisks {
                     ctx.metrics_object_class,
                     ctx.metrics_size_bucket,
                     false,
+                    false,
                     // backlog#879: later parts have already streamed earlier bytes,
                     // so a whole-request fallback is impossible here. Degrade this
                     // part in place to a legacy per-part decode reader instead of
@@ -1584,6 +1594,7 @@ impl SetDisks {
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
         prefer_data_blocks_first_reader_setup: bool,
+        single_inflight: bool,
         allow_inplace_legacy_fallback: bool,
         metrics_path: &'static str,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
@@ -1704,11 +1715,23 @@ impl SetDisks {
         .with_deferred_parity_handles(deferred_stripe_handles)
         .with_deferred_parity_reopeners(deferred_reopeners);
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
-        let reader =
-            coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?;
-        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
-            coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
-        )))
+        let reader = if single_inflight {
+            coding::decode_reader::ErasureDecodeReader::new_single_inflight_with_metrics_path(
+                source,
+                engine,
+                part_length,
+                metrics_path,
+            )?
+        } else {
+            coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?
+        };
+        if single_inflight {
+            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(reader)))
+        } else {
+            Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
+                coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
+            )))
+        }
     }
 }
 
@@ -4249,6 +4272,19 @@ mod tests {
     }
 
     #[test]
+    fn two_phase_read_plan_gate_defaults_off_and_honors_override() {
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, None::<&str>, || {
+            assert!(!is_get_metadata_two_phase_read_plan_enabled());
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true"), || {
+            assert!(is_get_metadata_two_phase_read_plan_enabled());
+        });
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("false"), || {
+            assert!(!is_get_metadata_two_phase_read_plan_enabled());
+        });
+    }
+
+    #[test]
     fn metadata_early_stop_rejects_healing_and_free_version_requests() {
         temp_env::with_vars(
             [
@@ -4876,6 +4912,7 @@ mod tests {
             "test-size-bucket",
             false,
             false,
+            false,
             get_codec_streaming_metrics_path(),
         )
         .await;
@@ -4895,6 +4932,7 @@ mod tests {
             false,
             "test-object-class",
             "test-size-bucket",
+            false,
             false,
             false,
             get_codec_streaming_metrics_path(),
@@ -5526,9 +5564,10 @@ mod tests {
 
     /// backlog#923: with the data-shards-only lockstep gate on, every retained
     /// parity reader must be an unopened deferred reader carrying a stripe
-    /// handle, so the decode path can realign it to a mid-object stripe. With
-    /// the gate off (default), eagerly opened parity readers are kept exactly
-    /// as before and carry no handles.
+    /// handle and disposable reopener, so the decode path can realign it to a
+    /// mid-object stripe without consuming the later-stripe reserve. With the
+    /// gate off (default), eagerly opened parity readers are kept exactly as
+    /// before and carry neither.
     #[tokio::test]
     #[serial_test::serial]
     async fn bitrot_reader_setup_gates_parity_stripe_handle_conversion() {
@@ -5557,6 +5596,11 @@ mod tests {
                     enabled.is_some(),
                     "parity slot {idx} stripe handle must match the gate (enabled={enabled:?})"
                 );
+                assert_eq!(
+                    setup.deferred_reopeners[idx].is_some(),
+                    enabled.is_some(),
+                    "parity slot {idx} reopener must match the gate (enabled={enabled:?})"
+                );
             }
 
             if enabled.is_some() {
@@ -5579,13 +5623,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn bitrot_reader_setup_data_blocks_first_keeps_deferred_fallback_readers() {
-        let mut setup = setup_inline_bitrot_readers_with_env(
-            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
-            2,
-            2,
-            BitrotReaderSetupMode::ReadQuorum,
-            true,
+        let mut setup = temp_env::async_with_vars(
+            [("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("true"))],
+            setup_inline_bitrot_readers_with_env(
+                vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+                2,
+                2,
+                BitrotReaderSetupMode::ReadQuorum,
+                true,
+            ),
         )
         .await;
 
@@ -5593,6 +5641,8 @@ mod tests {
         assert_eq!(setup.available_shards(), 2);
         assert_eq!(setup.scheduled_shards(), 2);
         assert_eq!(setup.readers.iter().filter(|reader| reader.is_some()).count(), 4);
+        assert!(setup.deferred_reopeners[2].is_some());
+        assert!(setup.deferred_reopeners[3].is_some());
 
         let fallback_index = setup
             .attempted

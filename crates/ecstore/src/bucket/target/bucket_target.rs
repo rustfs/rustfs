@@ -25,6 +25,8 @@ use time::OffsetDateTime;
 use url::Url;
 
 const REDACTED_CREDENTIAL: &str = "<redacted>";
+const GO_YEAR_ONE_START_UNIX_SECONDS: i64 = -62_135_596_800;
+const GO_YEAR_TWO_START_UNIX_SECONDS: i64 = -62_104_060_800;
 
 #[derive(Deserialize, Serialize, Default, Clone)]
 pub struct Credentials {
@@ -41,6 +43,26 @@ pub struct Credentials {
 }
 
 impl Credentials {
+    /// Returns the session token used for request signing.
+    ///
+    /// MinIO-compatible payloads may carry an empty token. Treat whitespace-only
+    /// values as absent without rewriting a real token, whose bytes are opaque.
+    pub fn effective_session_token(&self) -> Option<&str> {
+        self.session_token.as_deref().filter(|token| !token.trim().is_empty())
+    }
+
+    /// Returns the credential expiry after normalizing Go's zero `time.Time`.
+    ///
+    /// Go JSON encoders emit year 1 for an unset `time.Time`; persisted MinIO
+    /// target metadata can therefore contain that sentinel even for static
+    /// credentials.
+    pub fn effective_expiration(&self) -> Option<Timestamp> {
+        self.expiration.filter(|expiration| {
+            let unix_seconds = expiration.as_second();
+            !(GO_YEAR_ONE_START_UNIX_SECONDS..GO_YEAR_TWO_START_UNIX_SECONDS).contains(&unix_seconds)
+        })
+    }
+
     pub fn redacted(&self) -> Self {
         Self {
             access_key: self.access_key.clone(),
@@ -354,6 +376,24 @@ mod tests {
     use serde_json;
     use std::time::Duration;
     use time::OffsetDateTime;
+
+    #[test]
+    fn credential_effective_values_normalize_only_compatibility_sentinels() {
+        let mut credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: Some("  ".to_string()),
+            expiration: Some("0001-01-01T08:00:00+08:00".parse().expect("Go zero time should parse")),
+        };
+
+        assert!(credentials.effective_session_token().is_none());
+        assert!(credentials.effective_expiration().is_none());
+
+        credentials.session_token = Some(" opaque token ".to_string());
+        credentials.expiration = Some("2099-01-01T00:00:00Z".parse().expect("future timestamp should parse"));
+        assert_eq!(credentials.effective_session_token(), Some(" opaque token "));
+        assert_eq!(credentials.effective_expiration(), credentials.expiration);
+    }
 
     #[test]
     fn test_bucket_target_json_deserialize() {

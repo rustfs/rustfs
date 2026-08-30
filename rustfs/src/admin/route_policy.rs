@@ -782,6 +782,7 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", KMS_CONFIGURE, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/start", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/kms/stop", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
+    admin(HttpMethod::Post, "/rustfs/admin/v3/kms/reload", KMS_SERVICE_CONTROL, RouteRiskLevel::High),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/kms/service-status",
@@ -1987,6 +1988,7 @@ mod tests {
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/clear-cache", KMS_CLEAR_CACHE);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/configure", KMS_CONFIGURE);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/start", KMS_SERVICE_CONTROL);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/reload", KMS_SERVICE_CONTROL);
         assert_action(HttpMethod::Delete, "/rustfs/admin/v3/kms/keys/delete", KMS_DELETE_KEY);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/kms/keys/cancel-deletion", KMS_DELETE_KEY);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/kms/keys/{key_id}", KMS_DESCRIBE_KEY);

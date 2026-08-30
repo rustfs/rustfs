@@ -1,0 +1,169 @@
+name: RustFS KMS Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      rustfs_version:
+        description: 'RustFS release tag to test (e.g. 1.0.0-rc.4-preview.1)'
+        required: false
+        default: '1.0.0-rc.4-preview.1'
+      package_url:
+        description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
+        required: false
+        type: string
+  workflow_run:
+    # Strict shared-environment order: run after S3 compatibility test succeeds.
+    workflows: ["RustFS S3 Compatibility Test"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustfs-shared-functional-tests
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+  RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+jobs:
+  kms-test:
+    runs-on: smoke-testing
+    timeout-minutes: 420
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          openssl version
+          docker --version || true
+
+      - name: Cleanup environment (before)
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
+
+      - name: Ensure docker (Vault container)
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+          fi
+          sudo systemctl enable --now docker
+          docker info >/dev/null 2>&1 || sudo docker info >/dev/null 2>&1
+
+      - name: Run KMS suite
+        id: test
+        env:
+          LOG_FILE: /tmp/rustfs-kms.log
+        run: |
+          set -euo pipefail
+          chmod +x auto-testing/rustfs-kms-test.sh
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          ARGS=(--all-topologies --backends "local,vault-kv2" -y --log-file "${LOG_FILE}")
+          if [ -n "${PACKAGE_URL}" ]; then
+            ARGS+=(--package-url "${PACKAGE_URL}")
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            ARGS+=(--version "${RUSTFS_VERSION}")
+          else
+            ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
+          fi
+          ./auto-testing/rustfs-kms-test.sh "${ARGS[@]}"
+
+      - name: Generate report
+        if: always()
+        env:
+          LOG_FILE: /tmp/rustfs-kms.log
+          REPORT_FILE: /tmp/rustfs-kms-report.md
+        run: |
+          set -euo pipefail
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          fi
+          {
+            echo "# RustFS KMS test report"
+            echo ""
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Package: ${PACKAGE_SOURCE}"
+            echo ""
+            echo "## Log tail"
+            echo '```text'
+            tail -n 200 "${LOG_FILE}" || true
+            echo '```'
+          } | tee "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload report and logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-kms-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-kms.log
+            /tmp/rustfs-kms-report.md
+          if-no-files-found: warn
+
+      - name: Cleanup environment (after)
+        if: always()
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS KMS suite failed"
+          echo "See the uploaded report and log artifacts for details."

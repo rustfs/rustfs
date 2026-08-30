@@ -245,6 +245,26 @@ nix build
 nix run
 ```
 
+The flake also exports a NixOS module and the RustFS `rc` client. Add the
+module to your system and provide credentials through runtime files (for
+example, sops-nix or agenix) so secrets are never stored in the Nix store:
+
+```nix
+imports = [ inputs.rustfs.nixosModules.rustfs ];
+
+services.rustfs = {
+  enable = true;
+  accessKeyFile = "/run/secrets/rustfs-access-key";
+  secretKeyFile = "/run/secrets/rustfs-secret-key";
+  volumes = [ "/var/lib/rustfs" ];
+};
+```
+
+Install the S3-compatible client with
+`nix profile install github:rustfs/rustfs#rustfs-client` (the executable is named
+`rc`), or use `inputs.rustfs.packages.${pkgs.system}.rustfs-client` in a system
+configuration.
+
 ### 6\. X-CMD (Option 6)
 
 If you are an [x-cmd](https://www.x-cmd.com/install/rustfs) user:

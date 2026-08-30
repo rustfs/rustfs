@@ -111,8 +111,8 @@ pub(crate) use super::ecfs_extend::{
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
     authorize_sse_kms_object_read, classify_sse_read_response, extract_server_side_encryption_from_headers,
-    rewrap_object_encryption_metadata, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
-    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+    project_sse_read_response_headers, rewrap_object_encryption_metadata, sse_decryption, sse_encryption, sse_prepare_encryption,
+    strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
 };
 
 pub(crate) mod access_consumer {
@@ -363,8 +363,8 @@ pub(crate) mod sse_consumer {
     pub(crate) use super::{
         DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
         authorize_sse_kms_object_read, classify_sse_read_response, extract_server_side_encryption_from_headers,
-        get_buffer_size_opt_in, load_bucket_object_lock_config_state, sse_decryption, sse_encryption, sse_prepare_encryption,
-        validate_bucket_object_lock_enabled_state,
+        get_buffer_size_opt_in, load_bucket_object_lock_config_state, project_sse_read_response_headers, sse_decryption,
+        sse_encryption, sse_prepare_encryption, validate_bucket_object_lock_enabled_state,
     };
 }
 
@@ -1301,14 +1301,6 @@ pub(crate) trait StorageDiskRpcExt {
     async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>>;
     async fn make_volume(&self, volume: &str) -> DiskResult<()>;
     async fn make_volumes(&self, volume: Vec<&str>) -> DiskResult<()>;
-    async fn rename_data(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        file_info: &rustfs_filemeta::FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-    ) -> DiskResult<RenameDataResp>;
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
@@ -1450,17 +1442,6 @@ where
 
     async fn make_volumes(&self, volume: Vec<&str>) -> DiskResult<()> {
         ecstore_disk::DiskAPI::make_volumes(self, volume).await
-    }
-
-    async fn rename_data(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        file_info: &rustfs_filemeta::FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-    ) -> DiskResult<RenameDataResp> {
-        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info.clone(), dst_volume, dst_path).await
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {

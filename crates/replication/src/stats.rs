@@ -265,7 +265,7 @@ fn saturating_atomic_sub(value: &AtomicI64, delta: i64) {
         return;
     }
 
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(delta).max(0)));
+    let _ = value.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_sub(delta).max(0)));
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

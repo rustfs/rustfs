@@ -191,6 +191,12 @@ nix build
 nix run
 ```
 
+该 Flake 同时提供 NixOS 模块和 RustFS `rc` 客户端。将
+`inputs.rustfs.nixosModules.rustfs` 加入 `imports`，并通过运行时密钥文件
+（例如 sops-nix 或 agenix）配置 `accessKeyFile` 与 `secretKeyFile`，避免密钥
+进入 Nix store。客户端包为
+`inputs.rustfs.packages.${pkgs.system}.rustfs-client`，安装后的命令名为 `rc`。
+
 ### 6\. X-CMD (Option 6)
 
 如果你是 [x-cmd](https://www.x-cmd.com/install/rustfs) 用户：

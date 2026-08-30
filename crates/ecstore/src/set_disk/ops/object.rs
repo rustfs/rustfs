@@ -30,32 +30,34 @@ use super::super::{
     GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_INTERNAL_META,
     GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT,
     GET_STAGE_INLINE_PREPARE, GET_STAGE_LOCK_ACQUIRE, GET_STAGE_METADATA, GET_STAGE_OBJECT_INFO, GET_STAGE_PATH_DECISION,
-    GET_STAGE_READER_SETUP, GenericError, GetCodecStreamingDecision, GetDirectMemoryDecision, GetObjectReader, HTTPRangeSpec,
-    HashAlgorithm, HashMap, HashReader, HashSet, HeaderMap, HealChannelPriority, InstanceContext, Instant, LOG_COMPONENT_ECSTORE,
-    LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo, ObjectKey, ObjectLockConfigSnapshot,
-    ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime, Ordering, Pin, PutObjReader,
-    RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReaderImpl, ReplicateDecision, ReplicationObjectBridge, Result,
-    SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE,
-    SUFFIX_RESTORE_OPERATION_ID, SetDisks, SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid,
-    WriteLayout, X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE,
-    adaptive_duplex_buffer_size, build_get_object_info, build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs,
-    can_try_inline_data_shards_direct, check_object_lock_delete, check_object_lock_for_deletion_with_state,
-    check_object_lock_retention_update, classify_get_codec_streaming_object_class, classify_put_write_path,
-    classify_storage_error, collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer, debug,
-    delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker,
-    finish_set_disk_read_lock, get_codec_streaming_reader_gate, get_object_body_cache_hook, get_raw_etag,
-    get_small_object_direct_memory_decision, get_stage_timer_if_enabled, get_str,
-    get_transitioned_object_reader_with_tier_manager, inline_erasure_shard_file_offset, inline_erasure_shard_size, insert_str,
-    is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found, is_explicit_null_version,
-    is_get_codec_streaming_base_enabled, is_lock_optimization_enabled, issue3031_diag_enabled, join_all,
-    known_put_object_storage_size, path_join_buf, put_restore_opts, record_compression_total_memory,
-    record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
-    record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
-    record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
-    require_restore_operation_id, resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result,
-    resolve_write_layout, restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
+    GET_STAGE_READER_SETUP, GenericError, GetCodecStreamingDecision, GetCodecStreamingFallbackReason, GetDirectMemoryDecision,
+    GetObjectReader, HTTPRangeSpec, HashAlgorithm, HashMap, HashReader, HashSet, HeaderMap, HealChannelPriority, InstanceContext,
+    Instant, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo, ObjectKey,
+    ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime, Ordering, Pin,
+    PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReadPathPlan, ReaderImpl, ReplicateDecision,
+    ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
+    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_OPERATION_ID, SetDisks, SmallWritePath, StorageError,
+    TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE,
+    X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE, adaptive_duplex_buffer_size, build_get_object_info,
+    build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
+    check_object_lock_delete, check_object_lock_for_deletion_with_state, check_object_lock_retention_update,
+    classify_get_codec_streaming_object_class, classify_put_write_path, classify_storage_error,
+    collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer, debug, delete_file_info_version_id,
+    disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker, finish_set_disk_read_lock,
+    get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
+    get_small_object_direct_memory_decision_with_threshold_and_plan, get_small_object_direct_memory_threshold,
+    get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_erasure_shard_file_offset,
+    inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found,
+    is_explicit_null_version, is_get_codec_streaming_base_enabled, is_get_small_object_direct_memory_enabled,
+    is_lock_optimization_enabled, issue3031_diag_enabled, join_all, known_put_object_storage_size, path_join_buf,
+    put_restore_opts, record_compression_total_memory, record_get_codec_streaming_gate_decision,
+    record_get_direct_memory_decision, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
+    record_get_object_reader_path_observation, record_get_stage_duration_if_enabled, record_lock_acquire,
+    reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate, require_restore_operation_id,
+    resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result, resolve_write_layout,
+    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
     set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version,
-    should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path,
+    should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path_with_plan,
     take_prepared_get_object_metadata, to_object_err, try_read_inline_data_shards_direct, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
@@ -64,6 +66,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::LifecycleOps;
 use crate::bucket::utils::is_meta_bucketname;
 use crate::bucket::versioning::VersioningApi;
 use crate::disk::DiskAPI;
+use crate::object_api::ScannerPublicationCommitScopeGuard;
 use crate::set_disk::coding;
 use crate::set_disk::core::io_primitives::GetCodecStreamingReaderBuildOutcome;
 use crate::set_disk::mem;
@@ -87,7 +90,10 @@ use tokio::io::AsyncWriteExt;
 const ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE: &str = "RUSTFS_GET_MID_SIZE_STREAMING_ENABLE";
 const DEFAULT_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE: bool = true;
 const GET_MID_SIZE_STREAMING_MIN_SIZE: usize = 128 * 1024 + 1;
-const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 1024 * 1024;
+// Exclude 1 MiB from the bounded mid-size reader until it has a demonstrated
+// high-concurrency performance envelope; existing codec/legacy gates decide
+// which established reader handles the object.
+const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 512 * 1024;
 
 fn is_get_mid_size_streaming_enabled() -> bool {
     #[cfg(test)]
@@ -109,6 +115,7 @@ fn is_get_mid_size_streaming_enabled() -> bool {
 /// codec-streaming gate: only a whole, plain, single-part object is eligible.
 /// Ranges, transforms, remote objects, multipart reads, copy-source reads and
 /// special movement/version requests retain their existing legacy semantics.
+#[allow(dead_code, reason = "asserted by this file's gate tests")]
 fn get_mid_size_streaming_object_size(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
@@ -127,6 +134,7 @@ fn get_mid_size_streaming_object_size(
     )
 }
 
+#[allow(dead_code, reason = "asserted by this file's gate tests")]
 fn get_mid_size_streaming_object_size_with_flags(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
@@ -135,6 +143,26 @@ fn get_mid_size_streaming_object_size_with_flags(
     lock_optimization_enabled: bool,
     mid_size_enabled: bool,
     codec_base_enabled: bool,
+) -> Option<usize> {
+    get_mid_size_streaming_object_size_with_flags_and_plan(
+        range,
+        object_info,
+        opts,
+        lock_optimization_enabled,
+        mid_size_enabled,
+        codec_base_enabled,
+        super::super::ReadPathPlan::new(object_info, fi),
+    )
+}
+
+fn get_mid_size_streaming_object_size_with_flags_and_plan(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    opts: &ObjectOptions,
+    lock_optimization_enabled: bool,
+    mid_size_enabled: bool,
+    codec_base_enabled: bool,
+    plan: super::super::ReadPathPlan,
 ) -> Option<usize> {
     if !mid_size_enabled
         || !codec_base_enabled
@@ -149,26 +177,18 @@ fn get_mid_size_streaming_object_size_with_flags(
         || object_info.delete_marker
         || object_info.metadata_only
         || object_info.version_only
-        || object_info.is_encrypted()
-        || object_info.is_compressed()
-        || object_info.is_remote()
         || crate::set_disk::get_object_read_policy() != super::super::GetObjectReadPolicy::Default
-        || object_info.parts.len() != 1
-        || fi.parts.len() != 1
-        || object_info.size != fi.size
     {
         return None;
     }
 
-    let object_size = usize::try_from(fi.size).ok()?;
-    let object_part = object_info.parts.first()?;
-    let file_part = fi.parts.first()?;
-    if object_part.number != file_part.number || file_part.size != object_size || file_part.actual_size != fi.size {
+    let shape = plan.shape()?;
+    if !plan.is_plain() {
         return None;
     }
     (GET_MID_SIZE_STREAMING_MIN_SIZE..=GET_MID_SIZE_STREAMING_MAX_SIZE)
-        .contains(&object_size)
-        .then_some(object_size)
+        .contains(&shape.object_size)
+        .then_some(shape.object_size)
 }
 
 #[cfg(all(test, feature = "test-util"))]
@@ -252,6 +272,22 @@ use tokio_util::sync::CancellationToken;
 const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES: usize = 64 * 1024;
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES: usize = 256;
+
+fn begin_scanner_publication_delete_mutation(scope: Option<&crate::object_api::ScannerPublicationCommitScope>) -> Result<()> {
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    if scope.state() == crate::object_api::ScannerPublicationCommitState::Admitted {
+        scope
+            .try_begin()
+            .map_err(|_| Error::other("scanner publication delete scope cannot start"))?;
+    }
+    if !scope.can_commit() {
+        let _ = scope.mark_indeterminate();
+        return Err(StorageError::OperationCanceled);
+    }
+    Ok(())
+}
 
 fn take_scanner_publication_lease_tokens(user_defined: &mut HashMap<String, String>) -> Result<Option<HashMap<String, Uuid>>> {
     let Some(encoded) = user_defined.remove(SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY) else {
@@ -1639,7 +1675,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             None
         };
 
-        let metadata_stage_start = Instant::now();
+        let metadata_stage_start = stage_metrics_enabled.then(Instant::now);
         let (snapshot, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
             (prepared.snapshot, prepared.object_info)
         } else {
@@ -1655,7 +1691,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             {
                 Ok(snapshot) => (snapshot, None),
                 Err(err) => {
-                    rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
+                    if let Some(metadata_stage_start) = metadata_stage_start {
+                        rustfs_io_metrics::record_get_object_metadata_phase_duration(
+                            metadata_stage_start.elapsed().as_secs_f64(),
+                        );
+                    }
                     let failure_path = if is_meta_bucketname(bucket) {
                         GET_OBJECT_PATH_INTERNAL_META
                     } else {
@@ -1680,15 +1720,17 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
         let size_bucket = rustfs_io_metrics::get_object_size_bucket(metrics_size);
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_OBJECT_INFO, object_info_stage_start);
-        let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
-        rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_elapsed);
-        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-            GET_OBJECT_PATH_SET_DISK,
-            GET_STAGE_METADATA,
-            object_class.as_str(),
-            size_bucket,
-            metadata_elapsed,
-        );
+        if let Some(metadata_stage_start) = metadata_stage_start {
+            let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
+            rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_elapsed);
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                GET_OBJECT_PATH_SET_DISK,
+                GET_STAGE_METADATA,
+                object_class.as_str(),
+                size_bucket,
+                metadata_elapsed,
+            );
+        }
 
         if object_info.delete_marker {
             if opts.version_id.is_none() {
@@ -1721,6 +1763,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
+        // All remaining local fast paths share this immutable, fail-closed
+        // metadata decision. Build it once after empty/remote exits so those
+        // requests do not pay for part and transform scans they cannot use.
+        let read_path_plan = ReadPathPlan::new(&object_info, fi);
+
         // Inline data fast path: skip duplex pipe for small inline objects.
         // Uses the shared predicate from ObjectInfo; additionally checks that
         // inline data is actually present and neither range nor partNumber is
@@ -1729,7 +1776,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             && fi.data.is_some()
             && range.is_none()
             && opts.part_number.is_none()
-            && should_use_inline_fast_path(&range, &object_info, fi, opts);
+            && should_use_inline_fast_path_with_plan(&range, &object_info, fi, opts, read_path_plan);
         if use_inline_fast_path {
             let mut inline_prepare_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             let data_shards = fi.erasure.data_blocks;
@@ -1892,27 +1939,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
         }
 
-        let path_decision_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let codec_streaming_gate = get_codec_streaming_reader_gate(
-            bucket,
-            object,
-            opts.part_number,
-            object_class,
-            &object_info,
-            fi,
-            lock_optimization_enabled,
-        );
-        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
-
         if object_info.is_remote() {
-            if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_gate.decision {
-                record_get_codec_streaming_gate_decision(
-                    codec_streaming_gate.object_class,
-                    codec_streaming_gate.decision,
-                    size_bucket,
-                );
-                rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
-            }
+            let decision = GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote);
+            record_get_codec_streaming_gate_decision(object_class, decision, size_bucket);
+            rustfs_io_metrics::record_get_object_codec_streaming_fallback(GetCodecStreamingFallbackReason::Remote.as_str());
             record_get_object_reader_path_observation(GET_OBJECT_PATH_REMOTE_TRANSITION, object_class, size_bucket);
             let mut opts = opts.clone();
             if object_info.parts.len() == 1 {
@@ -1932,6 +1962,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(finish_set_disk_read_lock(gr, read_lock_guard.take(), bucket, object));
         }
 
+        // Metadata resolution and the remote-tier branch are complete here.
+        // Keep the rollout/configuration gate deferred until the request
+        // really needs codec streaming so an opted-out codec path cannot add
+        // fixed cost to the inline/direct-memory/mid-size hot paths.
         // App-layer object data cache probe: metadata (etag/size) is resolved
         // but no data shards have been read yet, so a hit skips the erasure
         // read, bitrot verify and decode entirely. The hook validates object
@@ -1978,7 +2012,15 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
         }
 
-        let direct_memory_decision = get_small_object_direct_memory_decision(&range, &object_info, fi, opts);
+        let direct_memory_decision = get_small_object_direct_memory_decision_with_threshold_and_plan(
+            &range,
+            &object_info,
+            fi,
+            opts,
+            is_get_small_object_direct_memory_enabled(),
+            get_small_object_direct_memory_threshold(),
+            read_path_plan,
+        );
         record_get_direct_memory_decision(object_class, direct_memory_decision, size_bucket);
         if let GetDirectMemoryDecision::Use { object_size } = direct_memory_decision {
             if let Some(body) = Self::try_get_object_direct_data_shards_with_fileinfo(
@@ -2064,7 +2106,17 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // rollout remains off by default because its worker overhead is not a
         // win for tiny objects. A failed setup degrades to the existing codec
         // gate/legacy path before any response bytes are returned.
-        if get_mid_size_streaming_object_size(&range, &object_info, fi, opts, lock_optimization_enabled).is_some() {
+        if get_mid_size_streaming_object_size_with_flags_and_plan(
+            &range,
+            &object_info,
+            opts,
+            lock_optimization_enabled,
+            is_get_mid_size_streaming_enabled(),
+            is_get_codec_streaming_base_enabled(),
+            read_path_plan,
+        )
+        .is_some()
+        {
             match Self::get_object_mid_size_reader_with_fileinfo(
                 bucket,
                 object,
@@ -2095,6 +2147,19 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
         }
+
+        let path_decision_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        let codec_streaming_gate = get_codec_streaming_reader_gate_with_plan(
+            bucket,
+            object,
+            opts.part_number,
+            object_class,
+            &object_info,
+            fi,
+            lock_optimization_enabled,
+            read_path_plan,
+        );
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
 
         match codec_streaming_gate.decision {
             GetCodecStreamingDecision::Use => {
@@ -2585,6 +2650,10 @@ impl SetDisks {
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         crate::hp_guard!("SetDisks::put_object");
+        let mut scope_outcome_guard = opts
+            .scanner_publication_commit_scope
+            .clone()
+            .map(ScannerPublicationCommitScopeGuard::new);
         let storage_class_config = self.storage_class_config_snapshot();
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
@@ -3355,8 +3424,16 @@ impl SetDisks {
             let commit_tmp_dir = tmp_dir.clone();
             let commit_object_lock_guard = object_lock_guard.take();
             let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
-            let commit_allows_early_ack = commit_object_lock_guard.is_some();
-            let detach_commit_owner = commit_allows_early_ack || commit_bucket_lifecycle_guard.is_some() || quota_mutation_fence;
+            let commit_scanner_publication_scope = opts.scanner_publication_commit_scope.clone();
+            // A scanner publication scope owns the movement permit until the
+            // complete rename fan-out drains. Keep this path synchronous so
+            // its terminal state is known before the coordinator releases
+            // remote leases.
+            let commit_allows_early_ack = commit_object_lock_guard.is_some() && commit_scanner_publication_scope.is_none();
+            let detach_commit_owner = commit_scanner_publication_scope.is_some()
+                || commit_allows_early_ack
+                || commit_bucket_lifecycle_guard.is_some()
+                || quota_mutation_fence;
             let commit_write_path_label = write_path.metric_label();
             let commit_is_versioned = opts.versioned || opts.version_suspended;
             let commit_versioned = opts.versioned;
@@ -3452,7 +3529,7 @@ impl SetDisks {
                     }
                     Ok(())
                 };
-                let pre_rename_result = if cancellation.is_some() || request_cancellation.is_some() {
+                let mut pre_rename_result = if cancellation.is_some() || request_cancellation.is_some() {
                     tokio::select! {
                         biased;
                         _ = wait_for_put_object_commit_cancellation(cancellation.as_ref(), request_cancellation.as_ref()) => {
@@ -3463,6 +3540,20 @@ impl SetDisks {
                 } else {
                     pre_rename.await
                 };
+                if pre_rename_result.is_ok()
+                    && let Some(scope) = commit_scanner_publication_scope.as_ref()
+                    && let Err(err) = scope.try_begin()
+                {
+                    let _ = scope.mark_aborted_before_commit();
+                    pre_rename_result = Err(Error::other(format!("scanner publication commit scope cannot start: {err:?}")));
+                }
+                if pre_rename_result.is_ok()
+                    && let Some(scope) = commit_scanner_publication_scope.as_ref()
+                    && !scope.can_commit()
+                {
+                    let _ = scope.mark_indeterminate();
+                    pre_rename_result = Err(StorageError::OperationCanceled);
+                }
                 if let Err(err) = pre_rename_result {
                     SetDisks::abort_quota_reservation_after_fence(
                         quota_reservation,
@@ -3498,9 +3589,17 @@ impl SetDisks {
                     crate::set_disk::core::io_primitives::RenameDataFenceOptions::new(
                         write_quorum,
                         commit_scanner_publication_lease_tokens.as_ref(),
-                    ),
+                    )
+                    .with_publication_scope(commit_scanner_publication_scope.clone()),
                 )
                 .await;
+                if let Some(scope) = commit_scanner_publication_scope.as_ref() {
+                    if rename_result.is_ok() {
+                        let _ = scope.mark_committed();
+                    } else {
+                        let _ = scope.mark_indeterminate();
+                    }
+                }
                 #[cfg(any(test, feature = "test-util"))]
                 if rename_result.is_ok() {
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameQuorum).await;
@@ -3815,6 +3914,11 @@ impl SetDisks {
                 let _ = handoff.send(());
             }
             if detach_commit_owner {
+                if let Some(scope_outcome_guard) = scope_outcome_guard.as_mut() {
+                    // The spawned commit closure owns the scope clone and is
+                    // now responsible for its terminal outcome.
+                    scope_outcome_guard.disarm();
+                }
                 let mut cancellation = PutObjectCommitCancellation::new();
                 let child_token = cancellation.child_token();
                 let result = tokio::spawn(async move { Box::pin(commit(Some(child_token))).await })
@@ -3937,7 +4041,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for TransitionUploadReader<R> {
                 let read =
                     u64::try_from(read).map_err(|_| std::io::Error::other("transition upload read count exceeds u64::MAX"))?;
                 self.consumed
-                    .fetch_update(Ordering::Release, Ordering::Relaxed, |consumed| consumed.checked_add(read))
+                    .try_update(Ordering::Release, Ordering::Relaxed, |consumed| consumed.checked_add(read))
                     .map_err(|_| std::io::Error::other("transition upload read count overflow"))?;
                 Poll::Ready(Ok(()))
             }
@@ -7010,8 +7114,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         (del_objects, del_errs, accounting)
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, opts))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
+        let _scope_outcome_guard = opts
+            .scanner_publication_commit_scope
+            .clone()
+            .map(ScannerPublicationCommitScopeGuard::new);
+        let scanner_publication_commit_scope = opts.scanner_publication_commit_scope.clone();
         // Scanner cleanup carries the per-peer lease fence as transient
         // request metadata. Consume it before any delete-prefix fanout so it
         // cannot be persisted or treated as user metadata.
@@ -7106,6 +7215,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 }
                                 delete_request.set_skip_tier_free_version();
                             }
+                            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
                             self.delete_object_version(bucket, object, &delete_request, false).await?;
                             if let Some((_, deleted_object)) = replication_delete {
                                 ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
@@ -7120,6 +7230,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 ..Default::default()
                             };
                             delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
+                            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
                             self.delete_object_version(bucket, object, &delete_request, false).await?;
                         }
                         for version in &versions.free_versions {
@@ -7131,9 +7242,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 ..Default::default()
                             };
                             delete_request.set_tier_free_version();
+                            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
                             self.delete_object_version(bucket, object, &delete_request, false).await?;
                         }
                     }
+                }
+                if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                    let _ = scope.mark_committed();
                 }
                 self.invalidate_get_object_metadata_cache(bucket, object).await;
                 return Ok(ObjectInfo::default());
@@ -7142,10 +7257,19 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
             }
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
-            self.delete_prefix_with_scanner_publication_lease(bucket, object, scanner_publication_lease_tokens.as_ref())
-                .await
-                .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
+            self.delete_prefix_with_scanner_publication_lease(
+                bucket,
+                object,
+                scanner_publication_lease_tokens.as_ref(),
+                scanner_publication_commit_scope.clone(),
+            )
+            .await
+            .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
+            if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                let _ = scope.mark_committed();
+            }
             self.invalidate_all_get_object_metadata_cache();
             return Ok(ObjectInfo::default());
         }
@@ -7218,10 +7342,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 ..Default::default()
             };
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
             self.delete_object_version(bucket, object, &dfi, false)
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
             self.invalidate_get_object_metadata_cache(bucket, object).await;
+            if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                let _ = scope.mark_committed();
+            }
             return Ok(ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended));
         }
 
@@ -7295,6 +7423,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             };
 
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
             self.delete_object_version(bucket, object, &fi, should_force_delete_marker_for_missing_version(&opts))
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -7306,6 +7435,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             oi.user_tags = Arc::clone(&goi.user_tags);
             oi.replication_decision = goi.replication_decision;
             self.invalidate_get_object_metadata_cache(bucket, object).await;
+            if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                let _ = scope.mark_committed();
+            }
             return Ok(oi);
         }
 
@@ -7331,6 +7463,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+        begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -7356,6 +7489,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             obj_info.delete_marker = true;
         }
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+        if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+            let _ = scope.mark_committed();
+        }
         Ok(obj_info)
     }
 
@@ -8369,19 +8505,33 @@ mod mid_size_streaming_gate_tests {
 
     #[test]
     #[serial]
-    fn mid_size_streaming_includes_one_mib_and_rejects_larger_objects() {
-        let (object_info, fi) = plain_metadata(1024 * 1024);
+    fn mid_size_streaming_stops_at_512kib_and_rejects_one_mib() {
+        let (object_info, fi) = plain_metadata(512 * 1024);
         assert_eq!(
             get_mid_size_streaming_object_size_with_flags(&None, &object_info, &fi, &ObjectOptions::default(), true, true, true),
-            Some(1024 * 1024)
+            Some(512 * 1024)
         );
 
-        let (large_info, large_fi) = plain_metadata(1024 * 1024 + 1);
+        let (large_info, large_fi) = plain_metadata(512 * 1024 + 1);
         assert_eq!(
             get_mid_size_streaming_object_size_with_flags(
                 &None,
                 &large_info,
                 &large_fi,
+                &ObjectOptions::default(),
+                true,
+                true,
+                true
+            ),
+            None
+        );
+
+        let (one_mib_info, one_mib_fi) = plain_metadata(1024 * 1024);
+        assert_eq!(
+            get_mid_size_streaming_object_size_with_flags(
+                &None,
+                &one_mib_info,
+                &one_mib_fi,
                 &ObjectOptions::default(),
                 true,
                 true,
@@ -9639,7 +9789,7 @@ mod replication_lww_tests {
 mod inline_put_commit_path_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
-    use crate::config::storageclass::lookup_config_for_pools_without_env;
+    use crate::config::storageclass::{INLINE_BLOCK_ENV, lookup_config_for_pools, lookup_config_for_pools_without_env};
     use crate::disk::ReadOptions;
     use rustfs_config::server_config::KVS;
     use serial_test::serial;
@@ -9704,6 +9854,113 @@ mod inline_put_commit_path_tests {
             .await
             .expect("inline object should stream");
         assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn get_object_reader_wires_mid_size_to_single_inflight() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "mid-size-reader-wiring";
+        let object = "object.bin";
+        let payload: Vec<u8> = (0..256 * 1024).map(|index| (index % 251) as u8).collect();
+        make_bucket(&disk_stores, bucket).await;
+        let storage_class = temp_env::with_var(INLINE_BLOCK_ENV, Some("1KiB"), || lookup_config_for_pools(&KVS::new(), &[4]))
+            .expect("test storage class should resolve");
+        set_disks.set_test_storage_class_config(storage_class);
+
+        let mut writer = PutObjReader::from_vec(payload.clone());
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
+                (rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true")),
+            ],
+            async {
+                set_disks
+                    .put_object(bucket, object, &mut writer, &ObjectOptions::default())
+                    .await
+                    .expect("mid-size wiring fixture should commit");
+
+                crate::set_disk::reset_test_get_object_reader_path();
+                let single_inflight_before = crate::set_disk::coding::decode_reader::test_single_inflight_construction_count();
+                let mut reader = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("mid-size wiring GET should succeed");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("mid-size wiring reader should stream");
+
+                assert_eq!(restored, payload);
+                assert!(
+                    crate::set_disk::test_get_object_reader_selected_mid_size(),
+                    "full get_object_reader path must select mid-size streaming (path id {})",
+                    crate::set_disk::test_get_object_reader_path_id()
+                );
+                assert!(
+                    crate::set_disk::coding::decode_reader::test_single_inflight_construction_count() > single_inflight_before,
+                    "mid-size get_object_reader wiring must construct SingleInFlight"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn get_object_reader_routes_one_mib_away_from_mid_size_reader() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "one-mib-legacy-reader";
+        let object = "object.bin";
+        let payload = vec![0x5a; 1024 * 1024];
+        make_bucket(&disk_stores, bucket).await;
+        let storage_class = temp_env::with_var(INLINE_BLOCK_ENV, Some("1KiB"), || lookup_config_for_pools(&KVS::new(), &[4]))
+            .expect("test storage class should resolve");
+        set_disks.set_test_storage_class_config(storage_class);
+
+        let mut writer = PutObjReader::from_vec(payload.clone());
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("off")),
+                (rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true")),
+            ],
+            async {
+                set_disks
+                    .put_object(bucket, object, &mut writer, &ObjectOptions::default())
+                    .await
+                    .expect("1 MiB fixture should commit");
+
+                crate::set_disk::reset_test_get_object_reader_path();
+                let mut reader = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("1 MiB legacy GET should succeed");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("1 MiB legacy reader should stream");
+
+                assert_eq!(restored, payload);
+                assert_eq!(
+                    crate::set_disk::test_get_object_reader_path_id(),
+                    8,
+                    "1 MiB must bypass mid-size and use legacy duplex when codec rollout is off"
+                );
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
