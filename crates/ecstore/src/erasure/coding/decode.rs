@@ -2867,6 +2867,7 @@ mod tests {
             cursor: Cursor<Vec<u8>>,
             stall: Duration,
             sleep: Option<Pin<Box<Sleep>>>,
+            stall_polls: Arc<AtomicUsize>,
         },
     }
 
@@ -2905,7 +2906,12 @@ mod tests {
                 TestShardReader::TerminalFileNotFound => {
                     Poll::Ready(Err(crate::disk::error::terminal_read_error_to_io(Error::FileNotFound)))
                 }
-                TestShardReader::PrefixThenSlow { cursor, stall, sleep } => {
+                TestShardReader::PrefixThenSlow {
+                    cursor,
+                    stall,
+                    sleep,
+                    stall_polls,
+                } => {
                     let before = buf.filled().len();
                     match Pin::new(cursor).poll_read(cx, buf) {
                         // Cursor still has bytes for the current stripe: serve them.
@@ -2915,6 +2921,7 @@ mod tests {
                         // the task cleanly (no busy `wake_by_ref` spin), letting the
                         // `#[tokio::test(start_paused = true)]` clock auto-advance.
                         Poll::Ready(Ok(())) => {
+                            stall_polls.fetch_add(1, Ordering::SeqCst);
                             let stall = *stall;
                             let sleeper = sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
                             let _ = sleeper.as_mut().poll(cx);
@@ -2932,6 +2939,29 @@ mod tests {
     impl AsyncWrite for FailingEmitWriter {
         fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
             Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "injected emit failure")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct YieldOnceThenFailWriter {
+        yielded: bool,
+    }
+
+    impl AsyncWrite for YieldOnceThenFailWriter {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            if !self.yielded {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "injected emit failure after prefetch poll")))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -3879,6 +3909,7 @@ mod tests {
             (rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some(READ_TIMEOUT_SECS)),
         ];
         temp_env::async_with_vars(vars, async {
+            let stall_polls = Arc::new(AtomicUsize::new(0));
             let readers: Vec<Option<BitrotReader<TestShardReader>>> = shard_bufs
                 .iter()
                 .map(|buf| {
@@ -3888,12 +3919,13 @@ mod tests {
                         cursor: Cursor::new(prefix),
                         stall: STALL,
                         sleep: None,
+                        stall_polls: Arc::clone(&stall_polls),
                     };
                     Some(BitrotReader::new(reader, shard_size, hash_algo.clone(), false))
                 })
                 .collect();
 
-            let mut writer = FailingEmitWriter;
+            let mut writer = YieldOnceThenFailWriter { yielded: false };
             let start = TokioInstant::now();
             let (written, err) = erasure.decode(&mut writer, readers, 0, total_len, total_len).await;
             let elapsed = start.elapsed();
@@ -3901,6 +3933,10 @@ mod tests {
             // Emit failed on stripe 0, so the GET fails with no bytes emitted.
             assert!(err.is_some(), "emit failure must surface as an error");
             assert_eq!(written, 0, "the failing writer accepts no bytes");
+            assert!(
+                stall_polls.load(Ordering::SeqCst) > 0,
+                "the speculative next-stripe read must be in flight before emit fails"
+            );
             // The decisive assertion: the prefetch read was cancelled rather than
             // awaited. Without cancel-safety this would take READ_TIMEOUT_SECS.
             assert!(
