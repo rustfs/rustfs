@@ -1757,15 +1757,22 @@ impl ECStore {
             return Err(SnapshotConsistencyError::LockLost.into());
         }
 
-        let pool = if self.single_pool() {
-            Arc::clone(&self.pools[0])
+        let (mut metadata, pool) = if self.single_pool() {
+            let pool = Arc::clone(&self.pools[0]);
+            let metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
+            (metadata, pool)
         } else {
-            let (_, pool_idx) = self.get_latest_object_info_with_idx(bucket, &object, &opts).await?;
-            self.pools.get(pool_idx).cloned().ok_or_else(|| {
-                StorageError::other(format!("resolved SelectObjectContent pool index {pool_idx} is out of bounds"))
-            })?
+            // Keep the large multi-pool selection future off the caller stack.
+            // Debug builds otherwise exceed the common 2 MiB worker stack.
+            Box::pin(async {
+                let (metadata, pool_idx) = self.prepare_latest_object_metadata_with_idx(bucket, &object, &opts).await?;
+                let pool = self.pools.get(pool_idx).cloned().ok_or_else(|| {
+                    StorageError::other(format!("resolved SelectObjectContent pool index {pool_idx} is out of bounds"))
+                })?;
+                Ok::<_, StorageError>((metadata, pool))
+            })
+            .await?
         };
-        let mut metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
         if read_lock_guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
             return Err(SnapshotConsistencyError::LockLost.into());
         }
@@ -6141,6 +6148,56 @@ mod tests {
             .read_to_end(&mut restored)
             .await
             .expect("prepared body should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn select_snapshot_reuses_metadata_across_three_pools() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let (_third_dirs, third_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set, third_set]).await;
+        let bucket = "select-snapshot-three-pools";
+        let object = "object.bin";
+        let payload = b"select-snapshot-three-pool-payload-".repeat(40_000);
+        let write_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        store.pools[2]
+            .put_object(bucket, object, &mut put_reader, &write_opts)
+            .await
+            .expect("object should be written only to the third pool");
+
+        let calls = disk_call_counters::observe(object);
+        let snapshot = store
+            .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("SelectObjectContent snapshot should resolve the third-pool object");
+        assert_eq!(snapshot.object_info().size, payload.len() as i64);
+        let metadata_calls = calls.total(disk_call_counters::KIND_READ_VERSION);
+        assert_eq!(metadata_calls, 12, "three 4-disk pools must fan out metadata exactly once each");
+
+        let mut reader = snapshot.open_reader(None).await.expect("snapshot body reader should open");
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            metadata_calls,
+            "SelectObjectContent must consume the prepared winner without a second fanout"
+        );
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("snapshot body should stream");
         assert_eq!(restored, payload);
     }
 
