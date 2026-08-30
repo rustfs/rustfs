@@ -1675,7 +1675,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             None
         };
 
-        let metadata_stage_start = Instant::now();
+        let metadata_stage_start = stage_metrics_enabled.then(Instant::now);
         let (snapshot, prepared_object_info) = if let Some(prepared) = take_prepared_get_object_metadata() {
             (prepared.snapshot, prepared.object_info)
         } else {
@@ -1691,7 +1691,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             {
                 Ok(snapshot) => (snapshot, None),
                 Err(err) => {
-                    rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
+                    if let Some(metadata_stage_start) = metadata_stage_start {
+                        rustfs_io_metrics::record_get_object_metadata_phase_duration(
+                            metadata_stage_start.elapsed().as_secs_f64(),
+                        );
+                    }
                     let failure_path = if is_meta_bucketname(bucket) {
                         GET_OBJECT_PATH_INTERNAL_META
                     } else {
@@ -1716,15 +1720,17 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         };
         let size_bucket = rustfs_io_metrics::get_object_size_bucket(metrics_size);
         record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_OBJECT_INFO, object_info_stage_start);
-        let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
-        rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_elapsed);
-        rustfs_io_metrics::record_get_object_stage_duration_by_size(
-            GET_OBJECT_PATH_SET_DISK,
-            GET_STAGE_METADATA,
-            object_class.as_str(),
-            size_bucket,
-            metadata_elapsed,
-        );
+        if let Some(metadata_stage_start) = metadata_stage_start {
+            let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
+            rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_elapsed);
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                GET_OBJECT_PATH_SET_DISK,
+                GET_STAGE_METADATA,
+                object_class.as_str(),
+                size_bucket,
+                metadata_elapsed,
+            );
+        }
 
         if object_info.delete_marker {
             if opts.version_id.is_none() {
