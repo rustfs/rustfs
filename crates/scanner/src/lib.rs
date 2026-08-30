@@ -39,11 +39,11 @@ use storage_api::owner::{
     EcstoreListPathRawOptions, EcstoreNsScannerOpenRequest, EcstoreObjectOpts, EcstoreReplicationConfigurationExt,
     EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
     EcstoreVersioningApi, HTTPPreconditions, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete,
-    ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule,
-    ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
-    ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_invalidate_admin_data_usage_snapshot_cache,
-    ecstore_invalidate_data_usage_snapshot_cache, ecstore_is_erasure, ecstore_is_erasure_sd,
-    ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_object_opts_from_object_info,
+    ScannerPublicationCommitScope, ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission,
+    ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr,
+    ecstore_get_lifecycle_config, ecstore_get_object_lock_config, ecstore_get_replication_config,
+    ecstore_invalidate_admin_data_usage_snapshot_cache, ecstore_invalidate_data_usage_snapshot_cache, ecstore_is_erasure,
+    ecstore_is_erasure_sd, ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_object_opts_from_object_info,
     ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path, ecstore_read_config,
     ecstore_replace_bucket_usage_memory_from_info, ecstore_resolve_object_store_handle, ecstore_save_config,
     scanner_replication_config_for_lifecycle_eval,
@@ -55,6 +55,7 @@ use storage_api::owner::{
     ecstore_new_disk,
 };
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 pub mod data_usage_define;
 pub mod error;
@@ -752,6 +753,32 @@ pub(crate) fn scanner_publication_epoch_changed(error: &EcstoreError) -> bool {
     )
 }
 
+pub(crate) async fn delete_config_with_publication_scope_for_epoch<S>(
+    api: Arc<S>,
+    bucket: &str,
+    object: &str,
+    mut opts: ScannerObjectOptions,
+    expected_epoch: u64,
+    scanner_publication_commit_scope: Option<ScannerPublicationCommitScope>,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let legacy_admission = if scanner_publication_commit_scope.is_none() {
+        Some(
+            scanner_publication_admission_for_epoch(api.clone(), expected_epoch)
+                .await
+                .ok_or_else(|| EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED))?,
+        )
+    } else {
+        None
+    };
+    opts.scanner_publication_commit_scope = scanner_publication_commit_scope;
+    let result = api.delete_config_object(bucket, object, opts).await;
+    drop(legacy_admission);
+    result
+}
+
 pub(crate) async fn delete_config_with_publication_admission_for_epoch<S>(
     api: Arc<S>,
     bucket: &str,
@@ -762,10 +789,7 @@ pub(crate) async fn delete_config_with_publication_admission_for_epoch<S>(
 where
     S: ScannerObjectIO + ScannerConfigObjectDelete,
 {
-    let Some(_admission) = scanner_publication_admission_for_epoch(api.clone(), expected_epoch).await else {
-        return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
-    };
-    api.delete_config_object(bucket, object, opts).await
+    delete_config_with_publication_scope_for_epoch(api, bucket, object, opts, expected_epoch, None).await
 }
 
 /// Capture the storage-owned publication epoch without retaining the read
@@ -796,13 +820,14 @@ where
     Some(admission)
 }
 
-pub(crate) async fn save_config_shared_with_preconditions_and_lease_fence<S>(
+pub(crate) async fn save_config_shared_with_preconditions_and_lease_fence_and_scope<S>(
     api: Arc<S>,
     file: &str,
     data: Bytes,
     sha256hex: Option<String>,
     preconditions: HTTPPreconditions,
     scanner_publication_lease_fence: Option<&str>,
+    scanner_publication_commit_scope: Option<ScannerPublicationCommitScope>,
 ) -> EcstoreResult<ScannerObjectInfo>
 where
     S: ScannerObjectIO,
@@ -822,6 +847,7 @@ where
         &ScannerObjectOptions {
             max_parity: true,
             http_preconditions: Some(preconditions),
+            scanner_publication_commit_scope,
             user_defined,
             ..Default::default()
         },
@@ -886,6 +912,27 @@ pub trait ScannerConfigObjectDelete: Send + Sync + std::fmt::Debug + 'static {
     async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
         None
     }
+
+    /// Acquire a storage-owned scope for a fenced scanner metadata mutation.
+    /// Implementations without a storage movement owner fail closed.
+    async fn scanner_data_usage_publication_commit_scope(
+        &self,
+        _expected_movement_epoch: u64,
+        _safe_deadline: tokio::time::Instant,
+        _remote_lease_tokens: Vec<Uuid>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        None
+    }
+
+    async fn scanner_data_usage_publication_commit_scope_with_release_flag(
+        &self,
+        _expected_movement_epoch: u64,
+        _safe_deadline: tokio::time::Instant,
+        _remote_lease_tokens: Vec<Uuid>,
+        _lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        None
+    }
 }
 
 pub struct ScannerDataUsagePublicationAdmission {
@@ -929,6 +976,32 @@ impl ScannerConfigObjectDelete for ECStore {
         let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
         Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
     }
+
+    async fn scanner_data_usage_publication_commit_scope(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        self.scanner_data_usage_publication_commit_scope(expected_movement_epoch, safe_deadline, remote_lease_tokens)
+            .await
+    }
+
+    async fn scanner_data_usage_publication_commit_scope_with_release_flag(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        self.scanner_data_usage_publication_commit_scope_with_release_flag(
+            expected_movement_epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            lease_release_safe,
+        )
+        .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -945,6 +1018,32 @@ impl ScannerConfigObjectDelete for SetDisks {
     async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
         let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
         Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
+    }
+
+    async fn scanner_data_usage_publication_commit_scope(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        self.scanner_data_usage_publication_commit_scope(expected_movement_epoch, safe_deadline, remote_lease_tokens)
+            .await
+    }
+
+    async fn scanner_data_usage_publication_commit_scope_with_release_flag(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        self.scanner_data_usage_publication_commit_scope_with_release_flag(
+            expected_movement_epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            lease_release_safe,
+        )
+        .await
     }
 }
 

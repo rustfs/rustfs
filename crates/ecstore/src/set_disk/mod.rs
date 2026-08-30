@@ -2525,6 +2525,7 @@ fn record_get_object_reader_path_observation(
             GET_OBJECT_PATH_CODEC_STREAMING => 5,
             GET_OBJECT_PATH_REMOTE_TRANSITION => 6,
             GET_OBJECT_PATH_EMPTY => 7,
+            GET_OBJECT_PATH_LEGACY_DUPLEX => 8,
             _ => 255,
         },
         Ordering::Relaxed,
@@ -3935,6 +3936,44 @@ impl SetDisks {
         drop(operation_guard);
         let owner = runtime_sources::object_store_handle().filter(|owner| Arc::ptr_eq(&owner.ctx, &self.ctx))?;
         owner.scanner_data_usage_publication_admission_guard().await
+    }
+
+    pub async fn scanner_data_usage_publication_commit_scope(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+    ) -> Option<crate::object_api::ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(crate::object_api::ScannerPublicationCommitScope::new_storage_owned(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+        ))
+    }
+
+    pub async fn scanner_data_usage_publication_commit_scope_with_release_flag(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<crate::object_api::ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(crate::object_api::ScannerPublicationCommitScope::new_storage_owned_with_release_flag(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+            lease_release_safe,
+        ))
     }
 
     /// Whether both sets' namespace-lock implementations cover the same object key.

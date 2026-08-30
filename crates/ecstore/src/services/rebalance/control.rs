@@ -1667,6 +1667,8 @@ mod tests {
     async fn assert_real_activation_start_race(paused_kind: PoolActivationStartKind) {
         let (_temp_dirs, rebalance_store, decommission_store) =
             crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        crate::services::rebalance::promote_test_pool_meta_to_v2(&rebalance_store).await;
+        crate::services::rebalance::promote_test_pool_meta_to_v2(&decommission_store).await;
         let disk_stats = vec![
             DiskStat {
                 total_space: 100,

@@ -1301,14 +1301,6 @@ pub(crate) trait StorageDiskRpcExt {
     async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>>;
     async fn make_volume(&self, volume: &str) -> DiskResult<()>;
     async fn make_volumes(&self, volume: Vec<&str>) -> DiskResult<()>;
-    async fn rename_data(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        file_info: &rustfs_filemeta::FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-    ) -> DiskResult<RenameDataResp>;
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
@@ -1450,17 +1442,6 @@ where
 
     async fn make_volumes(&self, volume: Vec<&str>) -> DiskResult<()> {
         ecstore_disk::DiskAPI::make_volumes(self, volume).await
-    }
-
-    async fn rename_data(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        file_info: &rustfs_filemeta::FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-    ) -> DiskResult<RenameDataResp> {
-        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info.clone(), dst_volume, dst_path).await
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {
