@@ -1307,6 +1307,32 @@ pub fn verify_tonic_mutation_body_digest<T>(request: &tonic::Request<T>, canonic
     verify_tonic_mutation_body_digest_with_strictness(request, canonical_body, internode_rpc_body_digest_strict())
 }
 
+/// Verify a non-disk mutation without accepting a newly-generated unsigned v2 body.
+///
+/// The disk mutation lane has a rolling-upgrade exception for `UNSIGNED-PAYLOAD`
+/// while peer replay-cache capability is being discovered. Historical v2 peers
+/// used the fixed `unsigned` nonce before body-digest rollout; preserve that
+/// exact marker for mixed-version compatibility, but reject unsigned v2
+/// requests that omit it or present a different nonce.
+pub fn verify_tonic_mutation_body_digest_reject_unsigned<T>(
+    request: &tonic::Request<T>,
+    canonical_body: &[u8],
+) -> std::io::Result<()> {
+    let version = request
+        .metadata()
+        .get(RPC_AUTH_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let digest = request
+        .metadata()
+        .get(RPC_CONTENT_SHA256_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let nonce = request.metadata().get(RPC_NONCE_HEADER).and_then(|value| value.to_str().ok());
+    if version == Some(RPC_AUTH_VERSION_V2) && digest == Some(UNSIGNED_PAYLOAD) && nonce != Some("unsigned") {
+        return Err(std::io::Error::other("RPC mutation requires a body-bound v2 signature"));
+    }
+    verify_tonic_mutation_body_digest(request, canonical_body)
+}
+
 /// [`verify_tonic_mutation_body_digest`] with the strict gate injected as a parameter, so both
 /// rollout postures are unit-testable without racing on process-global environment variables.
 fn verify_tonic_mutation_body_digest_with_strictness<T>(
