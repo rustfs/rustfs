@@ -23,9 +23,9 @@ use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
 use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_UNSUPPORTED_FIELDS;
-#[cfg(test)]
-use crate::admin::storage_api::bucket::replication::REMOTE_TARGET_WRITABLE_FIELDS;
 use crate::admin::storage_api::bucket::replication::{BucketStats, ReplicationStatusType};
+#[cfg(test)]
+use crate::admin::storage_api::bucket::replication::{REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS};
 use crate::admin::storage_api::bucket::target::{
     BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat, duration_from_secs_or_nanos,
 };
@@ -1480,10 +1480,10 @@ impl Operation for ReplicationMrfHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS, RemoteTargetCredentialsRequest, RemoteTargetRequest,
-        ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp, build_mrf_response, extract_query_params,
-        parse_remote_target_update_ops, render_mrf_backlog, render_replication_diff, unique_replication_peers,
-        validate_remote_target_tls_settings,
+        REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS, REMOTE_TARGET_UNSUPPORTED_FIELDS, REMOTE_TARGET_WRITABLE_FIELDS,
+        RemoteTargetCredentialsRequest, RemoteTargetRequest, ReplicationDiffEntry, SUPPORTED_REMOTE_TARGET_API, TargetUpdateOp,
+        build_mrf_response, extract_query_params, parse_remote_target_update_ops, render_mrf_backlog, render_replication_diff,
+        unique_replication_peers, validate_remote_target_tls_settings,
     };
     use crate::admin::storage_api::bucket::target::{BucketTarget, Credentials as TargetCredentials, LatencyStat};
     use crate::admin::storage_api::replication::{BucketStats, DurableMrfBacklog, MrfOpKind, MrfReplicateEntry};
@@ -2557,6 +2557,21 @@ mod tests {
 
     #[test]
     fn remote_target_capability_fields_do_not_overlap() {
+        assert!(
+            REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS.is_empty(),
+            "v4 must not retain writable temporary-credential fields as historical-only"
+        );
+        for field in REMOTE_TARGET_READ_ONLY_HISTORICAL_FIELDS {
+            assert!(
+                !REMOTE_TARGET_WRITABLE_FIELDS.contains(field),
+                "remote target field {field} cannot be both historical-only and writable"
+            );
+            assert!(
+                !REMOTE_TARGET_UNSUPPORTED_FIELDS.contains(field),
+                "remote target field {field} cannot be both historical-only and unsupported"
+            );
+        }
+
         for field in REMOTE_TARGET_UNSUPPORTED_FIELDS {
             assert!(
                 !REMOTE_TARGET_WRITABLE_FIELDS.contains(field),
