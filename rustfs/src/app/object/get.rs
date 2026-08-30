@@ -164,6 +164,12 @@ impl Drop for GetObjectDiskPermit {
     }
 }
 
+fn release_disk_read_permit_if_buffered(disk_permit: &mut Option<GetObjectDiskPermit>, buffered_body: Option<&Bytes>) {
+    if buffered_body.is_some() {
+        disk_permit.take();
+    }
+}
+
 const COLD_FILL_HARD_MAX_DURATION: Duration = Duration::from_secs(10 * 60);
 
 pub(crate) const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
@@ -2754,7 +2760,7 @@ impl DefaultObjectUsecase {
             }
         }
 
-        let (io_planning, reader) = if let Some(prepared) = prepared.take() {
+        let (mut io_planning, reader) = if let Some(prepared) = prepared.take() {
             let io_planning = metadata_admission
                 .take()
                 .ok_or_else(|| s3_error!(InternalError, "prepared metadata admission is unavailable"))?;
@@ -2797,6 +2803,10 @@ impl DefaultObjectUsecase {
         let read_setup =
             Self::finish_get_object_read(req, manager, bucket, key, rs, part_number, read_start, reader, cache_fill_allowed)
                 .await?;
+        // The buffered body has completed storage reads. Release admission
+        // before output planning so downstream response work cannot occupy a
+        // disk slot; streaming bodies retain the permit below until EOF/drop.
+        release_disk_read_permit_if_buffered(&mut io_planning.disk_permit, read_setup.buffered_body.as_ref());
         if let Some(read_stage_start) = read_stage_start {
             rustfs_io_metrics::record_get_object_stage_duration(
                 "s3_handler",
@@ -7616,6 +7626,38 @@ mod tests {
         assert_eq!(semaphore.available_permits(), 0);
 
         drop(reader);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_body_releases_disk_permit_before_output_planning() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test semaphore should grant owned permit");
+        let mut disk_permit = Some(permit.into());
+        release_disk_read_permit_if_buffered(&mut disk_permit, Some(&Bytes::from_static(b"body")));
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(disk_permit.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_body_retains_disk_permit_for_output_planning() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test semaphore should grant owned permit");
+        let mut disk_permit = Some(permit.into());
+
+        release_disk_read_permit_if_buffered(&mut disk_permit, None);
+        assert_eq!(semaphore.available_permits(), 0);
+        assert!(disk_permit.is_some());
+
+        drop(disk_permit);
         assert_eq!(semaphore.available_permits(), 1);
     }
 
