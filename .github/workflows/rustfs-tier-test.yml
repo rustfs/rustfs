@@ -60,6 +60,8 @@ jobs:
       - name: Cleanup environment (before)
         run: |
           set -euo pipefail
+          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
+          sudo rm -f /tmp/rustfs-mosquitto.conf
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
           SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
           for node in "${NODES[@]}"; do
@@ -77,15 +79,31 @@ jobs:
 
       - name: Ensure MQTT broker + clients
         run: |
+          set -euo pipefail
           if ! command -v mosquitto_sub >/dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install -y mosquitto mosquitto-clients
+            sudo apt-get install -y mosquitto-clients
           fi
-          sudo mkdir -p /etc/mosquitto/conf.d
-          printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/rustfs-test.conf >/dev/null
-          sudo systemctl restart mosquitto
-          sleep 2
-          ss -tln 2>/dev/null | grep -q ':1883' || { echo 'mosquitto not listening on 1883'; exit 1; }
+          command -v docker >/dev/null 2>&1 || { echo 'docker not found on runner'; exit 1; }
+          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
+          cat <<'EOF' | sudo tee /tmp/rustfs-mosquitto.conf >/dev/null
+          listener 1883 0.0.0.0
+          allow_anonymous true
+          EOF
+          sudo docker run -d --name rustfs-test-mqtt -p 1883:1883 \
+            -v /tmp/rustfs-mosquitto.conf:/mosquitto/config/mosquitto.conf:ro \
+            eclipse-mosquitto:2 >/dev/null
+          for _ in {1..10}; do
+            if ss -tln 2>/dev/null | grep -q ':1883'; then
+              break
+            fi
+            sleep 1
+          done
+          ss -tln 2>/dev/null | grep -q ':1883' || {
+            echo 'mosquitto container is not listening on 1883'
+            sudo docker logs rustfs-test-mqtt || true
+            exit 1
+          }
 
       - name: Run tier suite
         id: test
@@ -150,6 +168,8 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
+          sudo rm -f /tmp/rustfs-mosquitto.conf
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
           SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
           for node in "${NODES[@]}"; do

@@ -1962,6 +1962,12 @@ where
         .map_err(|_| Error::other(format!("scanner activity peer {host} timed out after {timeout_duration:?}")))?
 }
 
+/// Classify transport-only activity failures without treating an answered
+/// peer's application error as an outage.
+pub fn scanner_peer_transport_error_message_is_retryable(error: &str) -> bool {
+    crate::cluster::rpc::client::message_has_network_needle(error)
+}
+
 fn scanner_activity_should_retry(first_error: Option<&Error>, timed_out: bool) -> bool {
     timed_out || first_error.is_some_and(PeerRestClient::is_network_like_error)
 }

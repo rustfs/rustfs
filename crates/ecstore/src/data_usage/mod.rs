@@ -422,9 +422,7 @@ async fn save_data_usage_in_backend(
     if publication_epoch != expected_publication_epoch {
         return Err(Error::other("data usage publication epoch changed before save"));
     }
-    crate::config::com::save_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH, data)
-        .await
-        .map_err(Error::other)?;
+    crate::config::com::save_config(store.clone(), &DATA_USAGE_OBJ_NAME_PATH, data).await?;
     drop(publication_guard);
 
     cleanup_observed_data_usage_after_authoritative_save_with_publication(store.as_ref(), &data_usage_info, Some(store.as_ref()))
@@ -641,7 +639,7 @@ where
     {
         Ok(reader) => reader,
         Err(Error::FileNotFound | Error::ObjectNotFound(_, _) | Error::ConfigNotFound) => return Ok(None),
-        Err(err) => return Err(err),
+        Err(err) => return Err(map_data_usage_metadata_read_error(err, object)),
     };
     let revision = reader
         .object_info
@@ -654,6 +652,18 @@ where
     populate_backward_compatible_usage_maps(&mut data_usage_info);
     validate_complete_usage_snapshot(&mut data_usage_info);
     Ok(Some((data_usage_info, revision)))
+}
+
+/// A missing usage object is harmless during bucket creation, but a missing
+/// system metadata volume is a storage outage. Keep the latter retryable and
+/// distinguishable from the user bucket not existing.
+fn map_data_usage_metadata_read_error(err: Error, object: &str) -> Error {
+    match err {
+        Error::BucketNotFound(_) | Error::VolumeNotFound => {
+            Error::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), object.to_string())
+        }
+        other => other,
+    }
 }
 
 fn data_usage_contains_bucket(data_usage_info: &DataUsageInfo, bucket: &str) -> bool {
@@ -912,7 +922,7 @@ where
             )
             .await;
         drop(publication_guard);
-        match save_result {
+        match save_result.map_err(|err| crate::config::com::map_system_metadata_write_error(err, object)) {
             Ok(_) => return Ok(()),
             Err(err) => {
                 if let Some((observed, observed_revision)) = load_data_usage_for_bucket_removal(store, object).await? {
@@ -2759,6 +2769,7 @@ mod tests {
     struct UsageCacheReadStore {
         transient_failures: Mutex<usize>,
         reads: Mutex<Vec<String>>,
+        terminal_error: Mutex<Option<Error>>,
     }
 
     impl UsageCacheReadStore {
@@ -2766,6 +2777,15 @@ mod tests {
             Self {
                 transient_failures: Mutex::new(n),
                 reads: Mutex::new(Vec::new()),
+                terminal_error: Mutex::new(None),
+            }
+        }
+
+        fn with_terminal_error(error: Error) -> Self {
+            Self {
+                transient_failures: Mutex::new(0),
+                reads: Mutex::new(Vec::new()),
+                terminal_error: Mutex::new(Some(error)),
             }
         }
 
@@ -2793,6 +2813,9 @@ mod tests {
             _opts: &Self::ObjectOptions,
         ) -> Result<Self::GetObjectReader, Self::Error> {
             self.reads.lock().await.push(object.to_string());
+            if let Some(error) = self.terminal_error.lock().await.clone() {
+                return Err(error);
+            }
             let mut remaining = self.transient_failures.lock().await;
             if *remaining > 0 {
                 *remaining -= 1;
@@ -2857,6 +2880,22 @@ mod tests {
         assert!(!is_data_usage_cache_absent(&Error::DiskNotFound));
     }
 
+    #[test]
+    fn data_usage_removal_maps_missing_system_volume_to_read_quorum() {
+        for error in [Error::VolumeNotFound, Error::BucketNotFound(RUSTFS_META_BUCKET.to_string())] {
+            assert_eq!(
+                map_data_usage_metadata_read_error(error, "bucket-metadata/.usage.json"),
+                Error::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), "bucket-metadata/.usage.json".to_string())
+            );
+        }
+
+        let missing_object = Error::ObjectNotFound(RUSTFS_META_BUCKET.to_string(), "bucket-metadata/.usage.json".to_string());
+        assert_eq!(
+            map_data_usage_metadata_read_error(missing_object.clone(), "bucket-metadata/.usage.json"),
+            missing_object
+        );
+    }
+
     #[tokio::test]
     async fn load_data_usage_cache_treats_absence_as_an_empty_cache_without_retrying() {
         let name = "usage-cache";
@@ -2870,6 +2909,22 @@ mod tests {
             vec![prefixed_usage_key(name), name.to_string()],
             "the prefixed key is tried first, then the legacy one, and neither absence is retried"
         );
+    }
+
+    #[tokio::test]
+    async fn data_usage_removal_surfaces_missing_system_volume_as_read_quorum() {
+        for cause in [Error::BucketNotFound(RUSTFS_META_BUCKET.to_string()), Error::VolumeNotFound] {
+            let store = UsageCacheReadStore::with_terminal_error(cause);
+
+            let error = load_data_usage_for_bucket_removal(&store, "bucket-metadata/.usage.json")
+                .await
+                .expect_err("missing system metadata volume must not be treated as an absent usage object");
+
+            assert_eq!(
+                error,
+                Error::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), "bucket-metadata/.usage.json".to_string())
+            );
+        }
     }
 
     #[tokio::test]
