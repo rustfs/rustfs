@@ -3943,6 +3943,7 @@ dependencies = [
  "hyper-util",
  "local-ip-address",
  "md-5 0.11.0",
+ "minlz",
  "opentelemetry-proto",
  "prost 0.14.4",
  "rand 0.10.2",
@@ -10448,6 +10449,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "md-5 0.11.0",
+ "minlz",
  "pin-project-lite",
  "rand 0.10.2",
  "reqwest",
@@ -10882,6 +10884,7 @@ version = "1.0.0-rc.4"
 dependencies = [
  "async-compression",
  "hotpath",
+ "rustfs-rio",
  "thiserror 2.0.20",
  "tokio",
 ]

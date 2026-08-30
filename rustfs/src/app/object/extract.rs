@@ -1008,12 +1008,6 @@ impl DefaultObjectUsecase {
         let body =
             tokio::io::BufReader::with_capacity(buffer_size, StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))));
 
-        let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
-            return Err(s3_error!(InvalidArgument, "key extension not found"));
-        };
-
-        let ext = ext.to_owned();
-
         let md5hex = if let Some(base64_md5) = content_md5 {
             let md5 = base64_simd::STANDARD
                 .decode_to_vec(base64_md5.as_bytes())
@@ -1036,16 +1030,15 @@ impl DefaultObjectUsecase {
         let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?;
         let archive_upload_state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
         let extract_limits = put_object_extract_limits();
-        let decoder = CompressionFormat::from_extension(&ext)
-            .get_decoder(ExtractArchiveEtagReader::new(
-                archive_reader,
-                expected_archive_length,
-                archive_upload_state.clone(),
-            ))
-            .map_err(|e| {
-                error!(error = ?e, "Archive decoder creation failed");
-                s3_error!(InvalidArgument, "get_decoder err")
-            })?;
+        let tracked_archive =
+            ExtractArchiveEtagReader::new(archive_reader, expected_archive_length, archive_upload_state.clone());
+        let (archive_format, sniffed_archive) = CompressionFormat::sniff(tracked_archive)
+            .await
+            .map_err(|_| s3_error!(InvalidArgument, "Failed to detect archive compression"))?;
+        let decoder = archive_format.get_decoder(sniffed_archive).map_err(|e| {
+            error!(error = ?e, "Archive decoder creation failed");
+            s3_error!(InvalidArgument, "get_decoder err")
+        })?;
         let decoder = ExtractDecodedLimitReader::new(decoder, extract_limits.max_decoded_size);
 
         let mut ar = build_put_object_extract_archive(decoder, extract_limits);
@@ -1487,6 +1480,82 @@ mod tests {
     use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
+
+    #[tokio::test]
+    async fn archive_etag_reader_finalizes_at_expected_length() {
+        let payload = b"compressed-archive-bytes".to_vec();
+        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let mut reader = ExtractArchiveEtagReader::new(
+            std::io::Cursor::new(payload.clone()),
+            u64::try_from(payload.len()).expect("fixture length must fit u64"),
+            state.clone(),
+        );
+        let mut output = Vec::new();
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("complete archive must be readable");
+
+        let expected_etag = hex_simd::encode_to_string(Md5::digest(&payload), hex_simd::AsciiCase::Lower);
+        let state = state.lock().expect("archive state lock must remain healthy");
+        assert_eq!(output, payload);
+        assert_eq!(state.etag.as_deref(), Some(expected_etag.as_str()));
+        assert!(state.length_complete);
+    }
+
+    #[tokio::test]
+    async fn archive_etag_reader_completes_without_polling_raw_eof() {
+        let payload = b"decoder-consumed-exact-body".to_vec();
+        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let mut reader = ExtractArchiveEtagReader::new(
+            std::io::Cursor::new(payload.clone()),
+            u64::try_from(payload.len()).expect("fixture length must fit u64"),
+            state.clone(),
+        );
+        let mut output = vec![0u8; payload.len()];
+        reader
+            .read_exact(&mut output)
+            .await
+            .expect("decoder should consume exactly the declared body without polling EOF");
+
+        let expected_etag = hex_simd::encode_to_string(Md5::digest(&payload), hex_simd::AsciiCase::Lower);
+        let state = state.lock().expect("archive state lock must remain healthy");
+        assert_eq!(output, payload);
+        assert_eq!(state.etag.as_deref(), Some(expected_etag.as_str()));
+        assert!(state.length_complete);
+    }
+
+    #[tokio::test]
+    async fn archive_etag_reader_rejects_body_shorter_than_content_length() {
+        let payload = b"short".to_vec();
+        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let mut reader = ExtractArchiveEtagReader::new(std::io::Cursor::new(payload), 6, state.clone());
+        let mut output = Vec::new();
+        let err = reader
+            .read_to_end(&mut output)
+            .await
+            .expect_err("short archive body must not finalize successfully");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let state = state.lock().expect("archive state lock must remain healthy");
+        assert!(!state.length_complete);
+    }
+
+    #[tokio::test]
+    async fn archive_etag_reader_rejects_body_longer_than_content_length() {
+        let payload = b"too-long".to_vec();
+        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let mut reader = ExtractArchiveEtagReader::new(std::io::Cursor::new(payload), 3, state.clone());
+        let mut output = Vec::new();
+        let err = reader
+            .read_to_end(&mut output)
+            .await
+            .expect_err("overlong archive body must not finalize successfully");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let state = state.lock().expect("archive state lock must remain healthy");
+        assert!(!state.length_complete);
+    }
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
         let body_len = 1 + key.len() + 1 + value.len() + 1;

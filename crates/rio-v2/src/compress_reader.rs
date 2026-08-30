@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use minlz::{Encoder as MinlzEncoder, crc::crc, decode};
+use minlz::{Encoder as MinlzEncoder, crc::crc};
 use pin_project_lite::pin_project;
 use rand::RngExt;
-use rustfs_rio::{EtagResolvable, HashReaderDetector, HashReaderMut, Index, TryGetIndex};
+use rustfs_rio::{EtagResolvable, HashReaderDetector, HashReaderMut, Index, S2Decoder, TryGetIndex};
 use rustfs_utils::CompressionAlgorithm;
 use std::cmp::min;
 use std::fmt;
@@ -25,12 +25,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
 const MAGIC_CHUNK: &[u8] = b"\xff\x06\x00\x00S2sTwO";
-const MAGIC_CHUNK_SNAPPY: &[u8] = b"\xff\x06\x00\x00sNaPpY";
 const CHUNK_TYPE_COMPRESSED_DATA: u8 = 0x00;
 const CHUNK_TYPE_UNCOMPRESSED_DATA: u8 = 0x01;
-const CHUNK_TYPE_INDEX: u8 = 0x99;
 const CHUNK_TYPE_PADDING: u8 = 0xfe;
-const CHUNK_TYPE_STREAM_IDENTIFIER: u8 = 0xff;
 const DEFAULT_BLOCK_SIZE: usize = 1 << 20;
 const MAX_CHUNK_SIZE: usize = (1 << 24) - 1;
 const CHECKSUM_SIZE: usize = 4;
@@ -243,18 +240,7 @@ pin_project! {
     #[derive(Debug)]
     pub struct DecompressReader<R> {
         #[pin]
-        inner: R,
-        buffer: Vec<u8>,
-        buffer_pos: usize,
-        finished: bool,
-        header_buf: [u8; CHUNK_HEADER_LEN],
-        header_read: usize,
-        chunk_type: u8,
-        chunk_buf: Vec<u8>,
-        chunk_len: usize,
-        chunk_read: usize,
-        reading_chunk: bool,
-        stream_initialized: bool,
+        inner: S2Decoder<R>,
     }
 }
 
@@ -263,20 +249,7 @@ where
     R: AsyncRead + Unpin + Send + Sync,
 {
     pub fn new(inner: R, _compression_algorithm: CompressionAlgorithm) -> Self {
-        Self {
-            inner,
-            buffer: Vec::new(),
-            buffer_pos: 0,
-            finished: false,
-            header_buf: [0u8; CHUNK_HEADER_LEN],
-            header_read: 0,
-            chunk_type: 0,
-            chunk_buf: Vec::new(),
-            chunk_len: 0,
-            chunk_read: 0,
-            reading_chunk: false,
-            stream_initialized: false,
-        }
+        Self { inner: S2Decoder::new(inner) }
     }
 }
 
@@ -285,125 +258,7 @@ where
     R: AsyncRead + Unpin + Send + Sync,
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-
-        if *this.buffer_pos < this.buffer.len() {
-            let to_copy = min(buf.remaining(), this.buffer.len() - *this.buffer_pos);
-            buf.put_slice(&this.buffer[*this.buffer_pos..*this.buffer_pos + to_copy]);
-            *this.buffer_pos += to_copy;
-            if *this.buffer_pos == this.buffer.len() {
-                this.buffer.clear();
-                *this.buffer_pos = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
-
-        loop {
-            if *this.finished {
-                return Poll::Ready(Ok(()));
-            }
-
-            if !*this.reading_chunk {
-                while *this.header_read < CHUNK_HEADER_LEN {
-                    let mut read_buf = ReadBuf::new(&mut this.header_buf[*this.header_read..]);
-                    match this.inner.as_mut().poll_read(cx, &mut read_buf) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Ok(())) => {
-                            let n = read_buf.filled().len();
-                            if n == 0 {
-                                if *this.header_read == 0 {
-                                    *this.finished = true;
-                                    return Poll::Ready(Ok(()));
-                                }
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "unexpected EOF while reading S2 chunk header",
-                                )));
-                            }
-                            *this.header_read += n;
-                        }
-                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    }
-                }
-
-                *this.chunk_type = this.header_buf[0];
-                *this.chunk_len =
-                    (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
-                *this.header_read = 0;
-
-                if this.chunk_buf.len() < *this.chunk_len {
-                    this.chunk_buf.resize(*this.chunk_len, 0);
-                }
-                *this.chunk_read = 0;
-                *this.reading_chunk = true;
-            }
-
-            while *this.chunk_read < *this.chunk_len {
-                let mut read_buf = ReadBuf::new(&mut this.chunk_buf[*this.chunk_read..*this.chunk_len]);
-                match this.inner.as_mut().poll_read(cx, &mut read_buf) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {
-                        let n = read_buf.filled().len();
-                        if n == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "unexpected EOF while reading S2 chunk body",
-                            )));
-                        }
-                        *this.chunk_read += n;
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                }
-            }
-
-            let chunk = &this.chunk_buf[..*this.chunk_len];
-            *this.reading_chunk = false;
-            match *this.chunk_type {
-                CHUNK_TYPE_STREAM_IDENTIFIER => {
-                    if chunk != &MAGIC_CHUNK[CHUNK_HEADER_LEN..] && chunk != &MAGIC_CHUNK_SNAPPY[CHUNK_HEADER_LEN..] {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "invalid S2 stream identifier")));
-                    }
-                    *this.stream_initialized = true;
-                    continue;
-                }
-                CHUNK_TYPE_COMPRESSED_DATA => {
-                    *this.stream_initialized = true;
-                    let decompressed = decode_chunk(chunk, true)?;
-                    *this.buffer = decompressed;
-                }
-                CHUNK_TYPE_UNCOMPRESSED_DATA => {
-                    *this.stream_initialized = true;
-                    let decompressed = decode_chunk(chunk, false)?;
-                    *this.buffer = decompressed;
-                }
-                CHUNK_TYPE_INDEX | CHUNK_TYPE_PADDING | 0x80..=0xfd => {
-                    *this.stream_initialized = true;
-                    continue;
-                }
-                _ => {
-                    if !*this.stream_initialized && *this.chunk_type != CHUNK_TYPE_COMPRESSED_DATA {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unknown S2 chunk type: 0x{:02x}", *this.chunk_type),
-                        )));
-                    }
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unknown S2 chunk type: 0x{:02x}", *this.chunk_type),
-                    )));
-                }
-            }
-
-            *this.buffer_pos = 0;
-            let to_copy = min(buf.remaining(), this.buffer.len());
-            buf.put_slice(&this.buffer[..to_copy]);
-            *this.buffer_pos += to_copy;
-            if *this.buffer_pos == this.buffer.len() {
-                this.buffer.clear();
-                *this.buffer_pos = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
+        self.project().inner.poll_read(cx, buf)
     }
 }
 
@@ -412,7 +267,7 @@ where
     R: EtagResolvable,
 {
     fn try_resolve_etag(&mut self) -> Option<String> {
-        self.inner.try_resolve_etag()
+        self.inner.get_mut().try_resolve_etag()
     }
 }
 
@@ -421,11 +276,11 @@ where
     R: HashReaderDetector,
 {
     fn is_hash_reader(&self) -> bool {
-        self.inner.is_hash_reader()
+        self.inner.get_ref().is_hash_reader()
     }
 
     fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
-        self.inner.as_hash_reader_mut()
+        self.inner.get_mut().as_hash_reader_mut()
     }
 }
 
@@ -481,34 +336,6 @@ fn build_padding_chunk(current_size: usize, padding_multiple: usize) -> io::Resu
     }
 
     Ok(Some(out))
-}
-
-fn decode_chunk(chunk: &[u8], compressed: bool) -> io::Result<Vec<u8>> {
-    if chunk.len() < CHECKSUM_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "S2 chunk smaller than checksum header"));
-    }
-
-    let expected_crc = u32::from_le_bytes(chunk[..CHECKSUM_SIZE].try_into().expect("checksum header"));
-    let payload = &chunk[CHECKSUM_SIZE..];
-    let decompressed = if compressed {
-        decode(payload).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("S2 decode error: {err}")))?
-    } else {
-        payload.to_vec()
-    };
-
-    let actual_crc = crc(&decompressed);
-    if actual_crc != expected_crc {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "S2 CRC mismatch: expected={expected_crc:08x} actual={actual_crc:08x} compressed={compressed} payload_len={} decompressed_len={}",
-                payload.len(),
-                decompressed.len()
-            ),
-        ));
-    }
-
-    Ok(decompressed)
 }
 
 #[cfg(test)]
@@ -583,7 +410,7 @@ mod tests {
         let plaintext = b"compressible-rio-v2-block-".repeat(4096);
         let mut encoder = S2BlockEncoder::new();
         let compressed = encode_block(&plaintext, &mut encoder);
-        let decoded = decode(&compressed).expect("decode payload");
+        let decoded = minlz::decode(&compressed).expect("decode payload");
 
         assert_eq!(decoded, plaintext);
     }
