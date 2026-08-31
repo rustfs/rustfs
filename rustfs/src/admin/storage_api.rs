@@ -85,7 +85,7 @@ mod ecstore_rpc {
 }
 
 mod ecstore_storage {
-    pub(crate) use crate::storage::storage_api::ecstore_storage::ECStore;
+    pub(crate) use crate::storage::storage_api::ecstore_storage::{ECStore, ScannerDataMovementPauseStatus};
 }
 
 mod ecstore_tier {
@@ -108,6 +108,7 @@ pub(crate) type RebalanceCleanupWarnings = ecstore_rebalance::RebalanceCleanupWa
 pub(crate) type RebalanceMeta = ecstore_rebalance::RebalanceMeta;
 pub(crate) type RebalanceStats = ecstore_rebalance::RebalanceStats;
 pub(crate) type RebalanceStopPropagationRecord = ecstore_rebalance::RebalanceStopPropagationRecord;
+pub(crate) type ScannerDataMovementPauseStatus = ecstore_storage::ScannerDataMovementPauseStatus;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type Error = StorageError;
 pub(crate) type Result<T> = core::result::Result<T, Error>;
