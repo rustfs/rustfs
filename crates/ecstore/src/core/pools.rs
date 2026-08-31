@@ -9192,17 +9192,6 @@ impl ECStore {
         idx: usize,
         generation: OffsetDateTime,
     ) -> Result<Option<DecommissionCapacityOwner>> {
-        let active_worker = self
-            .decommission_cancelers
-            .read()
-            .await
-            .get(idx)
-            .and_then(Option::as_ref)
-            .is_some_and(DecommissionCanceler::is_active);
-        if !active_worker {
-            return Ok(None);
-        }
-
         let pool_meta = self.pool_meta.read().await;
         ensure_decommission_generation(&pool_meta, idx, generation)?;
         let Some(reservation) = pool_meta
@@ -9212,12 +9201,7 @@ impl ECStore {
             .and_then(|info| info.capacity_reservation.as_ref())
             .filter(|reservation| reservation.lease_active_at(OffsetDateTime::now_utc()))
         else {
-            #[cfg(test)]
             return Ok(None);
-            #[cfg(not(test))]
-            return Err(decommission_capacity_blocked_error(format!(
-                "source pool {idx} has no active reservation"
-            )));
         };
         Ok(Some(DecommissionCapacityOwner {
             source_pool_index: idx,
