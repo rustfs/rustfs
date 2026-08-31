@@ -70,11 +70,24 @@ jobs:
           warp --version || true
           df -h /data | tail -1
 
-      - name: Reset test environment (before)
+      - name: Cleanup environment (before)
         if: ${{ inputs.cleanup_before != 'false' }}
         run: |
-          chmod +x auto-testing/rustfs_heal_test.sh
-          ./auto-testing/rustfs_heal_test.sh --reset -y
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
 
       - name: Install RustFS package & start cluster
         run: |
@@ -115,10 +128,24 @@ jobs:
             /tmp/rustfs-warp.*.log
           if-no-files-found: warn
 
-      - name: Reset test environment (after)
+      - name: Cleanup environment (after)
         if: ${{ always() && inputs.cleanup_after != 'false' }}
         run: |
-          ./auto-testing/rustfs_heal_test.sh --reset -y
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
 
       - name: Notify on failure
         if: failure()

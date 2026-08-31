@@ -1757,15 +1757,22 @@ impl ECStore {
             return Err(SnapshotConsistencyError::LockLost.into());
         }
 
-        let pool = if self.single_pool() {
-            Arc::clone(&self.pools[0])
+        let (mut metadata, pool) = if self.single_pool() {
+            let pool = Arc::clone(&self.pools[0]);
+            let metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
+            (metadata, pool)
         } else {
-            let (_, pool_idx) = self.get_latest_object_info_with_idx(bucket, &object, &opts).await?;
-            self.pools.get(pool_idx).cloned().ok_or_else(|| {
-                StorageError::other(format!("resolved SelectObjectContent pool index {pool_idx} is out of bounds"))
-            })?
+            // Keep the large multi-pool selection future off the caller stack.
+            // Debug builds otherwise exceed the common 2 MiB worker stack.
+            Box::pin(async {
+                let (metadata, pool_idx) = self.prepare_latest_object_metadata_with_idx(bucket, &object, &opts).await?;
+                let pool = self.pools.get(pool_idx).cloned().ok_or_else(|| {
+                    StorageError::other(format!("resolved SelectObjectContent pool index {pool_idx} is out of bounds"))
+                })?;
+                Ok::<_, StorageError>((metadata, pool))
+            })
+            .await?
         };
-        let mut metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
         if read_lock_guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
             return Err(SnapshotConsistencyError::LockLost.into());
         }
@@ -3927,7 +3934,7 @@ mod tests {
     };
     use crate::core::pools::{PoolDecommissionInfo, PoolStatus};
     use crate::core::sets::make_local_two_set_sets_with_ctx;
-    use crate::ecstore_validation_blackbox::{make_local_set_disks, make_local_set_disks_with_ctx};
+    use crate::ecstore_validation_blackbox::{RefreshLossLockClient, make_local_set_disks, make_local_set_disks_with_ctx};
     use crate::layout::{
         endpoints::{Endpoints, PoolEndpoints, SetupType},
         format::FormatV3,
@@ -3942,7 +3949,7 @@ mod tests {
     use bytes::Bytes;
     use std::io::Cursor;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
 
     struct WaitForLockLossReader {
@@ -3984,68 +3991,17 @@ mod tests {
         calls: AtomicUsize,
     }
 
-    #[derive(Debug)]
-    struct RefreshFailureLockClient {
-        inner: LocalClient,
-        fail_refresh: AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl rustfs_lock::LockClient for RefreshFailureLockClient {
-        async fn acquire_lock(&self, request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<rustfs_lock::LockResponse> {
-            rustfs_lock::LockClient::acquire_lock(&self.inner, request).await
-        }
-
-        async fn release(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
-            rustfs_lock::LockClient::release(&self.inner, lock_id).await
-        }
-
-        async fn refresh(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
-            if self.fail_refresh.load(Ordering::Acquire) {
-                return Ok(false);
-            }
-            rustfs_lock::LockClient::refresh(&self.inner, lock_id).await
-        }
-
-        async fn force_release(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
-            rustfs_lock::LockClient::force_release(&self.inner, lock_id).await
-        }
-
-        async fn check_status(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<rustfs_lock::LockInfo>> {
-            rustfs_lock::LockClient::check_status(&self.inner, lock_id).await
-        }
-
-        async fn get_stats(&self) -> rustfs_lock::Result<rustfs_lock::LockStats> {
-            rustfs_lock::LockClient::get_stats(&self.inner).await
-        }
-
-        async fn close(&self) -> rustfs_lock::Result<()> {
-            rustfs_lock::LockClient::close(&self.inner).await
-        }
-
-        async fn is_online(&self) -> bool {
-            rustfs_lock::LockClient::is_online(&self.inner).await
-        }
-
-        async fn is_local(&self) -> bool {
-            rustfs_lock::LockClient::is_local(&self.inner).await
-        }
-    }
-
     async fn refresh_failure_test_guard(
         owner: &'static str,
     ) -> (
         ObjectLockDiagGuard,
         Arc<rustfs_lock::distributed_lock::LockLostSignal>,
-        Arc<RefreshFailureLockClient>,
+        Arc<RefreshLossLockClient>,
     ) {
         let manager = Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
             rustfs_lock::FastObjectLockManager::new(),
         )));
-        let client = Arc::new(RefreshFailureLockClient {
-            inner: LocalClient::with_manager(manager),
-            fail_refresh: AtomicBool::new(false),
-        });
+        let client = Arc::new(RefreshLossLockClient::with_manager(manager));
         let namespace_lock = rustfs_lock::NamespaceLock::with_clients_and_quorum(
             owner.to_string(),
             vec![Arc::clone(&client) as Arc<dyn rustfs_lock::LockClient>],
@@ -4080,7 +4036,7 @@ mod tests {
     ) -> (
         Arc<SelectObjectSnapshotLease>,
         Arc<rustfs_lock::distributed_lock::LockLostSignal>,
-        Arc<RefreshFailureLockClient>,
+        Arc<RefreshLossLockClient>,
     ) {
         let (guard, signal, client) = refresh_failure_test_guard(owner).await;
         (Arc::new(SelectObjectSnapshotLease::new(vec![guard])), signal, client)
@@ -4213,7 +4169,11 @@ mod tests {
         let release_signal = Arc::clone(&signal);
         let release_task = tokio::spawn(async move {
             poll_started_rx.await.expect("reader poll should start");
-            release_client.fail_refresh.store(true, Ordering::Release);
+            release_client.reject_refreshes();
+            release_client
+                .wait_for_rejected_refresh(Duration::from_secs(5))
+                .await
+                .expect("refresh rejection should be observed");
             tokio::time::timeout(Duration::from_secs(5), release_signal.notified())
                 .await
                 .expect("heartbeat should observe the rejected refresh");
@@ -4251,7 +4211,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn select_snapshot_reader_checks_guards_at_eof_before_monitor_runs() {
         let (guard, signal, client) = refresh_failure_test_guard("select-snapshot-eof-fence").await;
-        client.fail_refresh.store(true, Ordering::Release);
+        client.reject_refreshes();
+        client
+            .wait_for_rejected_refresh(Duration::from_secs(5))
+            .await
+            .expect("refresh rejection should be observed");
         tokio::time::timeout(Duration::from_secs(5), signal.notified())
             .await
             .expect("heartbeat should observe the rejected refresh");
@@ -4316,7 +4280,11 @@ mod tests {
         second_started_rx
             .await
             .expect("second inner reader should reach Poll::Pending");
-        second_client.fail_refresh.store(true, Ordering::Release);
+        second_client.reject_refreshes();
+        second_client
+            .wait_for_rejected_refresh(Duration::from_secs(5))
+            .await
+            .expect("refresh rejection should be observed");
         let (first_result, second_result) = tokio::join!(
             tokio::time::timeout(Duration::from_secs(5), first_read_task),
             tokio::time::timeout(Duration::from_secs(5), second_read_task),
@@ -4329,7 +4297,7 @@ mod tests {
             assert_eq!(error.kind(), std::io::ErrorKind::Other);
         }
 
-        assert!(!first_client.fail_refresh.load(Ordering::Acquire));
+        assert!(!first_client.refreshes_rejected());
         assert!(!first_signal.is_lost());
         assert!(second_signal.is_lost());
     }
@@ -6141,6 +6109,56 @@ mod tests {
             .read_to_end(&mut restored)
             .await
             .expect("prepared body should stream");
+        assert_eq!(restored, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn select_snapshot_reuses_metadata_across_three_pools() {
+        let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
+        let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
+        let (_third_dirs, third_set) = make_local_set_disks(4, 2).await;
+        let store = new_prepared_reader_test_store(&[first_set, second_set, third_set]).await;
+        let bucket = "select-snapshot-three-pools";
+        let object = "object.bin";
+        let payload = b"select-snapshot-three-pool-payload-".repeat(40_000);
+        let write_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        for pool in &store.pools {
+            pool.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket should be created in each pool");
+        }
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        store.pools[2]
+            .put_object(bucket, object, &mut put_reader, &write_opts)
+            .await
+            .expect("object should be written only to the third pool");
+
+        let calls = disk_call_counters::observe(object);
+        let snapshot = store
+            .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("SelectObjectContent snapshot should resolve the third-pool object");
+        assert_eq!(snapshot.object_info().size, payload.len() as i64);
+        let metadata_calls = calls.total(disk_call_counters::KIND_READ_VERSION);
+        assert_eq!(metadata_calls, 12, "three 4-disk pools must fan out metadata exactly once each");
+
+        let mut reader = snapshot.open_reader(None).await.expect("snapshot body reader should open");
+        assert_eq!(
+            calls.total(disk_call_counters::KIND_READ_VERSION),
+            metadata_calls,
+            "SelectObjectContent must consume the prepared winner without a second fanout"
+        );
+        let mut restored = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut restored)
+            .await
+            .expect("snapshot body should stream");
         assert_eq!(restored, payload);
     }
 
