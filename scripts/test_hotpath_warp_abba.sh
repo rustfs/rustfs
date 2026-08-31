@@ -69,6 +69,32 @@ if rg -q -- 'rustfs-bench' "$TRACE_FILE"; then
   echo "unexpected rustfs-bench command" >&2
   exit 1
 fi
+
+FOCUSED_OUT_DIR="${TMP_DIR}/focused"
+"$RUNNER" \
+  --baseline-bin /usr/bin/true \
+  --candidate-bin /usr/bin/true \
+  --baseline-revision baseline-test \
+  --candidate-revision candidate-test \
+  --warp-bin /usr/bin/true \
+  --rounds 3 \
+  --workload 'put-128kib|put|128KiB' \
+  --workload 'put-512kib|put|512KiB' \
+  --drive-sync 'sync-on|true' \
+  --out-dir "$FOCUSED_OUT_DIR" \
+  --dry-run >/dev/null 2>&1
+awk -F',' 'NR == 1 {next} {seen[$3]++; if ($1 != "sync-on" || $3 !~ /^put-(128|512)kib$/) exit 1} END {exit (seen["put-128kib"] == 4 && seen["put-512kib"] == 4) ? 0 : 1}' "$FOCUSED_OUT_DIR/abba_schedule.csv"
+rg -Fxq 'workloads=put-128kib|put|128KiB;put-512kib|put|512KiB' "$FOCUSED_OUT_DIR/manifest.env"
+rg -Fxq 'drive_sync_matrix=sync-on|true' "$FOCUSED_OUT_DIR/manifest.env"
+
+if "$RUNNER" --baseline-bin /usr/bin/true --candidate-bin /usr/bin/true --baseline-revision baseline-test --candidate-revision candidate-test --warp-bin /usr/bin/true --rounds 3 --workload 'bad|delete|1KiB' --out-dir "${TMP_DIR}/bad-workload" --dry-run >/dev/null 2>&1; then
+  echo "expected invalid --workload mode to fail" >&2
+  exit 1
+fi
+if "$RUNNER" --baseline-bin /usr/bin/true --candidate-bin /usr/bin/true --baseline-revision baseline-test --candidate-revision candidate-test --warp-bin /usr/bin/true --rounds 3 --drive-sync 'sync-on|maybe' --out-dir "${TMP_DIR}/bad-drive-sync" --dry-run >/dev/null 2>&1; then
+  echo "expected invalid --drive-sync value to fail" >&2
+  exit 1
+fi
 rg -qF -- '--labeled-compare-csv sync-on/put-4kib/B1-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-off/put-4kib/B1-vs-A1' "$TRACE_FILE"
 rg -qF -- '--labeled-compare-csv sync-on/put-4kib/A2-vs-A1' "$TRACE_FILE"

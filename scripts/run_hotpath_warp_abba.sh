@@ -43,6 +43,14 @@ EXEMPTION_REASON="deliberate correctness tradeoff"
 OUT_DIR="${PROJECT_ROOT}/target/hotpath-abba/$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo run)"
 DRY_RUN=false
 ALLOW_UNMANAGED_EXTERNAL=false
+AFTER_PROBE=false
+NODE_SSH_TARGETS=()
+NODE_SSH_IDENTITY_FILE=""
+NODE_SSH_TIMEOUT_SECS=30
+REQUIRE_NODE_TELEMETRY=false
+SERVICE_PROMETHEUS_QUERY_URL=""
+SERVICE_PROMETHEUS_QUERY=""
+SERVICE_METRICS_SERVICE_NAME=""
 
 WORKLOADS=(
   "put-4kib|put|4KiB"
@@ -52,7 +60,9 @@ WORKLOADS=(
   "get-10mib|get|10MiB"
   "mixed-256k|mixed|256KiB"
 )
+WORKLOAD_OVERRIDES=()
 DRIVE_SYNC_MATRIX=("sync-on|true" "sync-off|false")
+DRIVE_SYNC_OVERRIDES=()
 
 usage() {
   cat <<'USAGE'
@@ -94,6 +104,22 @@ Production / cluster mode:
                               mode, then write a non-empty evidence file.
   --allow-unmanaged-external Preserve legacy external mode without a deploy
                               hook. Its output is not formal ABBA evidence.
+  --after-probe              Enable per-round PUT HEAD/GET/hash verification.
+  --node-ssh-target <node=host>
+                              Capture node CPU/RSS/IOPS/await/PSI/scheduler telemetry.
+  --node-ssh-identity-file <path>
+                              SSH identity file for node telemetry.
+  --node-ssh-timeout-secs <n>
+                              Bound each remote telemetry command (default 30).
+  --require-node-telemetry    Fail a round if node telemetry is incomplete.
+  --service-prometheus-query-url <url>
+                              Prometheus query endpoint for PUT stage snapshots.
+  --service-prometheus-query <query>
+                              PromQL selector; include internode RPC metrics when needed.
+  --service-metrics-service-name <name>
+                              Optional service.name filter for stage snapshots.
+  --workload <name|mode|size> Restrict the matrix; repeat for multiple workloads.
+  --drive-sync <label|true|false> Restrict durability cells; repeat if needed.
   --health-path <path>      Readiness path (default /health).
 
 Benchmark:
@@ -150,6 +176,23 @@ validate_positive_int() {
   [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]] || die "$name must be a positive integer"
 }
 
+validate_workload_spec() {
+  local spec="$1" name mode size extra
+  IFS='|' read -r name mode size extra <<<"$spec"
+  [[ -n "$name" && -n "$mode" && -n "$size" && -z "${extra:-}" ]] || die "--workload must be name|mode|size"
+  case "$mode" in
+    put|get|mixed) ;;
+    *) die "--workload mode must be put, get, or mixed" ;;
+  esac
+}
+
+validate_drive_sync_spec() {
+  local spec="$1" label value extra
+  IFS='|' read -r label value extra <<<"$spec"
+  [[ -n "$label" && -n "$value" && -z "${extra:-}" ]] || die "--drive-sync must be label|true|false"
+  [[ "$value" == "true" || "$value" == "false" ]] || die "--drive-sync value must be true or false"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --baseline-bin) BASELINE_BIN="$2"; shift 2 ;;
@@ -178,10 +221,33 @@ while [[ $# -gt 0 ]]; do
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --allow-unmanaged-external) ALLOW_UNMANAGED_EXTERNAL=true; shift ;;
+    --after-probe) AFTER_PROBE=true; shift ;;
+    --node-ssh-target) NODE_SSH_TARGETS+=("$2"); shift 2 ;;
+    --node-ssh-identity-file) NODE_SSH_IDENTITY_FILE="$2"; shift 2 ;;
+    --node-ssh-timeout-secs) NODE_SSH_TIMEOUT_SECS="$2"; shift 2 ;;
+    --require-node-telemetry) REQUIRE_NODE_TELEMETRY=true; shift ;;
+    --service-prometheus-query-url) SERVICE_PROMETHEUS_QUERY_URL="$2"; shift 2 ;;
+    --service-prometheus-query) SERVICE_PROMETHEUS_QUERY="$2"; shift 2 ;;
+    --service-metrics-service-name) SERVICE_METRICS_SERVICE_NAME="$2"; shift 2 ;;
+    --workload) WORKLOAD_OVERRIDES+=("$2"); shift 2 ;;
+    --drive-sync) DRIVE_SYNC_OVERRIDES+=("$2"); shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
+
+if ((${#WORKLOAD_OVERRIDES[@]} > 0)); then
+  for workload in "${WORKLOAD_OVERRIDES[@]}"; do
+    validate_workload_spec "$workload"
+  done
+  WORKLOADS=("${WORKLOAD_OVERRIDES[@]}")
+fi
+if ((${#DRIVE_SYNC_OVERRIDES[@]} > 0)); then
+  for drive_sync in "${DRIVE_SYNC_OVERRIDES[@]}"; do
+    validate_drive_sync_spec "$drive_sync"
+  done
+  DRIVE_SYNC_MATRIX=("${DRIVE_SYNC_OVERRIDES[@]}")
+fi
 
 validate_positive_int "$DISKS" "--disks"
 validate_positive_int "$CONCURRENCY" "--concurrency"
@@ -354,6 +420,7 @@ EOF
 
 measure() {
   local leg="$1" workload="$2" mode="$3" size="$4" sync_label="$5" bucket="$6" baseline_csv="${7:-}"
+  local node_target
   local cell="$OUT_DIR/$workload/$sync_label/$leg"
   local args=(
     --tool warp --warp-bin "$WARP_BIN" --warp-mode "$mode"
@@ -362,6 +429,24 @@ measure() {
     --duration "$DURATION" --rounds "$ROUNDS" --cooldown-secs "$COOLDOWN_SECS"
     --out-dir "$cell"
   )
+  if [[ "$AFTER_PROBE" == "true" && "$mode" == "put" ]]; then
+    args+=(--after-probe)
+  fi
+  if ((${#NODE_SSH_TARGETS[@]} > 0)); then
+    for node_target in "${NODE_SSH_TARGETS[@]}"; do
+      args+=(--node-ssh-target "$node_target")
+    done
+  fi
+  [[ -n "$NODE_SSH_IDENTITY_FILE" ]] && args+=(--node-ssh-identity-file "$NODE_SSH_IDENTITY_FILE")
+  if [[ "$REQUIRE_NODE_TELEMETRY" == "true" ]]; then
+    args+=(--require-node-telemetry)
+  fi
+  args+=(--node-ssh-timeout-secs "$NODE_SSH_TIMEOUT_SECS")
+  if [[ -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    args+=(--service-prometheus-query-url "$SERVICE_PROMETHEUS_QUERY_URL" --service-metrics-dir "$cell/service_metrics")
+    [[ -n "$SERVICE_PROMETHEUS_QUERY" ]] && args+=(--service-prometheus-query "$SERVICE_PROMETHEUS_QUERY")
+    [[ -n "$SERVICE_METRICS_SERVICE_NAME" ]] && args+=(--service-metrics-service-name "$SERVICE_METRICS_SERVICE_NAME")
+  fi
   if [[ "$mode" != "put" ]]; then
     # Warp defaults to 2,500 setup objects per round. At 10 MiB that writes
     # 25 GiB before every 12-second measurement, so the matrix cannot finish
@@ -462,6 +547,14 @@ external_isolation=$(isolation_mode)
 evidence_mode=$(evidence_mode)
 formal_evidence=$(formal_evidence)
 performance_conclusion=$(performance_conclusion)
+after_probe=$AFTER_PROBE
+node_ssh_target_count=${#NODE_SSH_TARGETS[@]}
+node_ssh_identity_file=${NODE_SSH_IDENTITY_FILE:-N/A}
+node_ssh_timeout_secs=$NODE_SSH_TIMEOUT_SECS
+require_node_telemetry=$REQUIRE_NODE_TELEMETRY
+service_prometheus_query_url=${SERVICE_PROMETHEUS_QUERY_URL:-N/A}
+service_prometheus_query=${SERVICE_PROMETHEUS_QUERY:-default}
+service_metrics_service_name=${SERVICE_METRICS_SERVICE_NAME:-N/A}
 dataset_namespace=$DATASET_NAMESPACE
 local_run_data_root=$RUN_DATA_ROOT
 bucket_isolation=per-leg
