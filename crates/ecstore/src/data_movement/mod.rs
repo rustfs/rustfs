@@ -1614,9 +1614,13 @@ async fn migrate_object_inner(
     let capacity_expected_data_bytes = usize::try_from(object_info.size).ok();
 
     if should_use_multipart_data_movement(&object_info, has_part_checksums) {
-        let multipart_mutation_fence = match capacity_owner {
-            Some(owner) => Some(store.acquire_decommission_multipart_mutation_fence(owner).await?),
-            None => None,
+        // The decommission object fence already covers the source/target
+        // namespace for this migration. Acquiring the synthetic multipart
+        // fence while holding that read lock deadlocks local lock domains;
+        // retain the extra fence only for callers without the outer fence.
+        let multipart_mutation_fence = match (capacity_owner, mutation_fence.is_some()) {
+            (Some(owner), false) => Some(store.acquire_decommission_multipart_mutation_fence(owner).await?),
+            _ => None,
         };
         let mut new_multipart_opts = data_movement_new_multipart_opts(&object_info, pool_idx);
         if let Some(capacity_owner) = capacity_owner {

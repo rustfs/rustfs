@@ -2035,6 +2035,18 @@ mod tests {
         .await
         .expect("store should build around the fresh context");
 
+        // Capacity admission in these local fixtures must not depend on the
+        // host volume's statvfs values. Keep enough identical snapshots for
+        // startup, recovery, and the mutation probes exercised by each test.
+        let layout = DecommissionErasureLayout { data: 2, parity: 2 };
+        let snapshot: Vec<DecommissionPoolCapacityInfo> = store
+            .pools
+            .iter()
+            .enumerate()
+            .map(|(pool_index, _)| DecommissionPoolCapacityInfo::for_test(pool_index, layout, 1 << 40, 1 << 40, 1 << 30))
+            .collect();
+        set_decommission_capacity_info_overrides_for_test(store.id, (0..128).map(|_| snapshot.clone()).collect());
+
         (instance_ctx, store, shutdown)
     }
 
@@ -2169,7 +2181,7 @@ mod tests {
         let layout = DecommissionErasureLayout { data: 2, parity: 2 };
         let source_physical_bytes = 1024 * 1024 * 1024;
         let target_physical_bytes = source_physical_bytes * 8;
-        let capacity = store
+        let capacity: Vec<DecommissionPoolCapacityInfo> = store
             .pools
             .iter()
             .enumerate()
@@ -2181,7 +2193,7 @@ mod tests {
                 }
             })
             .collect();
-        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacity]);
+        set_decommission_capacity_info_overrides_for_test(store.id, (0..128).map(|_| capacity.clone()).collect());
     }
 
     async fn mark_test_pool_decommissioning(store: &Arc<crate::store::ECStore>, pool_idx: usize) {
@@ -2622,7 +2634,6 @@ mod tests {
         drop(lifecycle_guard);
 
         mark_test_pool_decommissioning(&store, 0).await;
-
         let err = store
             .ensure_decommission_multipart_uploads_drained_for_test(0)
             .await

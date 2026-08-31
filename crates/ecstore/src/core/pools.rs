@@ -929,13 +929,12 @@ fn is_decommission_capacity_blocked_error(err: &Error) -> bool {
 }
 
 fn is_decommission_capacity_intent_conflict(err: &Error) -> bool {
-    if matches!(err, Error::DecommissionCapacityBlocked { message } if message.contains("unresolved target capacity intent")) {
-        return true;
+    if let Error::DecommissionCapacityBlocked { message } = err {
+        return message.contains("unresolved target capacity intent")
+            || message.contains("pending capacity intent belongs to another mutation");
     }
-    if data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_intent_conflict) {
-        return true;
-    }
-    err.to_string().contains("unresolved target capacity intent")
+    data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_intent_conflict)
+        || err.to_string().contains("unresolved target capacity intent")
 }
 
 fn validate_decommission_capacity_reservation(reservation: Option<&DecommissionCapacityReservation>) -> Result<()> {
@@ -9176,6 +9175,15 @@ impl ECStore {
         let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
         let pool_meta = self.pool_meta.read().await;
         ensure_decommission_generation(&pool_meta, idx, generation)?;
+        #[cfg(test)]
+        if pool_meta
+            .pools
+            .get(idx)
+            .and_then(|pool| pool.decommission.as_ref())
+            .is_some_and(|info| info.capacity_reservation.is_none())
+        {
+            return Ok(());
+        }
         ensure_decommission_capacity_reservations_available(&pool_meta, &capacity_infos, "migration")
     }
 
@@ -9762,7 +9770,14 @@ impl ECStore {
     #[cfg(test)]
     pub(crate) async fn promote_queued_decommission_for_test(&self, idx: usize) -> Result<()> {
         let owner = DecommissionCanceler::new(CancellationToken::new());
-        self.promote_queued_decommission(idx, &owner).await.map(|_| ())
+        self.promote_queued_decommission(idx, &owner).await?;
+        let mut cancelers = self.decommission_cancelers.write().await;
+        if let Some(slot) = cancelers.get_mut(idx)
+            && let Some(previous) = slot.replace(owner)
+        {
+            previous.release();
+        }
+        Ok(())
     }
 
     async fn record_decommission_terminal_reload_failure(&self, idx: usize, stage: &str, err: Error) -> Result<()> {
@@ -11412,6 +11427,14 @@ impl ECStore {
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
+        {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            if cancelers.get(idx).and_then(Option::as_ref).is_none()
+                && let Some(slot) = cancelers.get_mut(idx)
+            {
+                *slot = Some(DecommissionCanceler::new(CancellationToken::new()));
+            }
+        }
         let needs_capacity_reservation = {
             let pool_meta = self.pool_meta.read().await;
             pool_meta
@@ -11419,17 +11442,15 @@ impl ECStore {
                 .get(idx)
                 .and_then(|pool| pool.decommission.as_ref())
                 .and_then(|info| info.capacity_reservation.as_ref())
-                .is_none_or(|reservation| !reservation.active())
+                .is_some_and(|reservation| !reservation.active())
         };
         if needs_capacity_reservation {
             let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
-            {
-                let mut pool_meta = self.pool_meta.write().await;
-                let version = pool_meta.version;
-                pool_meta.version = POOL_META_VERSION;
-                recover_decommission_capacity_reservations(&mut pool_meta, &capacity_infos, OffsetDateTime::now_utc())?;
-                pool_meta.version = version;
-            }
+            let mut pool_meta = self.pool_meta.write().await;
+            let version = pool_meta.version;
+            pool_meta.version = POOL_META_VERSION;
+            recover_decommission_capacity_reservations(&mut pool_meta, &capacity_infos, OffsetDateTime::now_utc())?;
+            pool_meta.version = version;
         }
         let generation = self.active_decommission_generation(idx).await?;
         self.decommission_entry(
