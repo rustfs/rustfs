@@ -59,20 +59,20 @@ pub const ENV_CAPACITY_MAX_TIMEOUT: &str = "RUSTFS_CAPACITY_MAX_TIMEOUT";
 // ============================================================================
 
 /// Scheduled update interval in seconds
-/// Default: 120 seconds (2 minutes)
-pub const DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS: u64 = 120;
+/// Default: 600 seconds (10 minutes)
+pub const DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS: u64 = 600;
 
 /// Write trigger delay in seconds
-/// Default: 5 seconds
-pub const DEFAULT_WRITE_TRIGGER_DELAY_SECS: u64 = 5;
+/// Default: 30 seconds
+pub const DEFAULT_WRITE_TRIGGER_DELAY_SECS: u64 = 30;
 
 /// Write frequency threshold (writes per minute)
-/// Default: 5 writes/minute
-pub const DEFAULT_WRITE_FREQUENCY_THRESHOLD: usize = 5;
+/// Default: 20 writes/minute
+pub const DEFAULT_WRITE_FREQUENCY_THRESHOLD: usize = 20;
 
 /// Fast update threshold in seconds
-/// Default: 30 seconds
-pub const DEFAULT_FAST_UPDATE_THRESHOLD_SECS: u64 = 30;
+/// Default: 120 seconds
+pub const DEFAULT_FAST_UPDATE_THRESHOLD_SECS: u64 = 120;
 
 /// Maximum files threshold for sampling
 /// Default: 200,000 files
@@ -128,5 +128,17 @@ mod tests {
         assert_eq!(ENV_CAPACITY_ENABLE_DYNAMIC_TIMEOUT, "RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT");
         assert_eq!(ENV_CAPACITY_MIN_TIMEOUT, "RUSTFS_CAPACITY_MIN_TIMEOUT");
         assert_eq!(ENV_CAPACITY_MAX_TIMEOUT, "RUSTFS_CAPACITY_MAX_TIMEOUT");
+    }
+
+    #[test]
+    fn test_capacity_default_values() {
+        assert_eq!(DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS, 600);
+        assert_eq!(DEFAULT_WRITE_TRIGGER_DELAY_SECS, 30);
+        assert_eq!(DEFAULT_WRITE_FREQUENCY_THRESHOLD, 20);
+        assert_eq!(DEFAULT_FAST_UPDATE_THRESHOLD_SECS, 120);
+        assert_eq!(DEFAULT_MAX_FILES_THRESHOLD, 200_000);
+        assert_eq!(DEFAULT_STAT_TIMEOUT_SECS, 3);
+        assert_eq!(DEFAULT_SAMPLE_RATE, 200);
+        assert_eq!(DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, 600);
     }
 }

@@ -1705,22 +1705,22 @@ mod tests {
             (
                 ENV_CAPACITY_SCHEDULED_INTERVAL,
                 || get_scheduled_update_interval().as_secs(),
-                120,
+                600,
                 "600",
                 600,
             ),
-            (ENV_CAPACITY_WRITE_TRIGGER_DELAY, || get_write_trigger_delay().as_secs(), 5, "20", 20),
+            (ENV_CAPACITY_WRITE_TRIGGER_DELAY, || get_write_trigger_delay().as_secs(), 30, "20", 20),
             (
                 ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
                 || get_write_frequency_threshold() as u64,
-                5,
+                20,
                 "20",
                 20,
             ),
             (
                 ENV_CAPACITY_FAST_UPDATE_THRESHOLD,
                 || get_fast_update_threshold().as_secs(),
-                30,
+                120,
                 "120",
                 120,
             ),
@@ -2773,10 +2773,10 @@ mod tests {
         let config = HybridStrategyConfig::from_env();
 
         // Check default values
-        assert_eq!(config.scheduled_update_interval, Duration::from_secs(120));
-        assert_eq!(config.write_trigger_delay, Duration::from_secs(5));
-        assert_eq!(config.write_frequency_threshold, 5);
-        assert_eq!(config.fast_update_threshold, Duration::from_secs(30));
+        assert_eq!(config.scheduled_update_interval, Duration::from_secs(600));
+        assert_eq!(config.write_trigger_delay, Duration::from_secs(30));
+        assert_eq!(config.write_frequency_threshold, 20);
+        assert_eq!(config.fast_update_threshold, Duration::from_secs(120));
         assert!(config.enable_smart_update);
         assert!(config.enable_write_trigger);
     }

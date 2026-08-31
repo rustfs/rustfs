@@ -282,10 +282,10 @@ get_capacity_manager()
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` | `120s` | 定时刷新间隔 |
-| `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` | `5s` | 写后防抖延迟 |
-| `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` | `5` | 最近 60 秒写频率阈值 |
-| `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` | `30s` | 缓存超过该年龄后才考虑快速刷新 |
+| `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` | `600s` | 定时刷新间隔 |
+| `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` | `30s` | 写后防抖延迟 |
+| `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` | `20` | 最近 60 秒写频率阈值 |
+| `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` | `120s` | 缓存超过该年龄后才考虑快速刷新 |
 | `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` | `200000` | 精确统计文件数阈值 |
 | `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3s` | 基础扫描超时 |
 | `RUSTFS_CAPACITY_SAMPLE_RATE` | `200` | overflow 文件采样间隔 |
