@@ -6977,7 +6977,7 @@ pub struct DecommissionCapacityTarget {
     pub inflight_physical_bytes: usize,
     #[serde(default)]
     pub pending_physical_bytes: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub pending_mutation_id: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub temporary_mutations: Vec<DecommissionCapacityTemporaryMutation>,
@@ -8100,6 +8100,18 @@ impl ECStore {
         Ok((pool_meta_guard, has_active_source))
     }
 
+    pub(crate) async fn acquire_decommission_capacity_release_fence_with_active_source(
+        &self,
+    ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let (pool_meta_guard, snapshot) = self
+            .acquire_pool_meta_read_guard(&mut save_guard, "capacity release fence failed")
+            .await?;
+        let has_active_source = pool_meta_has_active_decommission(&snapshot);
+        drop(save_guard);
+        Ok((pool_meta_guard, has_active_source))
+    }
+
     pub(crate) async fn run_decommission_capacity_admitted_mutation<T, F, Fut>(
         &self,
         target_pool_index: usize,
@@ -9148,17 +9160,6 @@ impl ECStore {
         idx: usize,
         generation: OffsetDateTime,
     ) -> Result<Option<DecommissionCapacityOwner>> {
-        let active_worker = self
-            .decommission_cancelers
-            .read()
-            .await
-            .get(idx)
-            .and_then(Option::as_ref)
-            .is_some_and(DecommissionCanceler::is_active);
-        if !active_worker {
-            return Ok(None);
-        }
-
         let pool_meta = self.pool_meta.read().await;
         ensure_decommission_generation(&pool_meta, idx, generation)?;
         let reservation = pool_meta
@@ -16459,10 +16460,11 @@ mod pools_tests {
         wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use super::{
-        DecommissionCapacityOwner, DecommissionCapacityReservation, decommission_capacity_mutation_id,
-        ensure_decommission_target_owner_admission, ensure_external_decommission_target_admission,
-        is_decommission_capacity_blocked_error, record_decommission_target_consumption, reserve_decommission_target_pending,
-        resolve_decommission_target_pending, set_decommission_capacity_info_overrides_for_test,
+        DecommissionCapacityOwner, DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation,
+        decommission_capacity_mutation_id, ensure_decommission_target_owner_admission,
+        ensure_external_decommission_target_admission, is_decommission_capacity_blocked_error,
+        record_decommission_target_consumption, reserve_decommission_target_pending, resolve_decommission_target_pending,
+        set_decommission_capacity_info_overrides_for_test,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -16483,10 +16485,12 @@ mod pools_tests {
     use crate::storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec};
     use crate::store::ECStore;
     use byteorder::{ByteOrder, LittleEndian};
+    use rmp_serde::Serializer;
     use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
     use rustfs_filemeta::{MetaCacheEntries, MetadataResolutionParams};
     use rustfs_lock::{GlobalLockManager, LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use rustfs_rio::Index;
+    use serde::Serialize;
     use std::future::Future;
     use std::io::Cursor;
     use std::sync::{
@@ -20708,6 +20712,36 @@ mod pools_tests {
                     .operation_id
             );
         }
+    }
+
+    #[test]
+    fn decommission_capacity_target_round_trip_preserves_temporary_mutation_without_pending_intent() {
+        let mutation_id = uuid::Uuid::new_v4();
+        let target = DecommissionCapacityTarget {
+            pool_index: 1,
+            layout: DecommissionErasureLayout { data: 2, parity: 2 },
+            physical_total_at_reservation: 200,
+            physical_free_at_reservation: 200,
+            reserved_physical_bytes: 200,
+            consumed_physical_bytes: 0,
+            observed_physical_bytes: 1,
+            inflight_physical_bytes: 1,
+            pending_physical_bytes: 0,
+            pending_mutation_id: None,
+            temporary_mutations: vec![DecommissionCapacityTemporaryMutation {
+                mutation_id,
+                physical_bytes: 1,
+            }],
+        };
+        let mut encoded = Vec::new();
+        target
+            .serialize(&mut Serializer::new(&mut encoded))
+            .expect("capacity target should serialize");
+
+        let restored: DecommissionCapacityTarget =
+            rmp_serde::from_slice(&encoded).expect("capacity target with a released pending intent should deserialize");
+
+        assert_eq!(restored, target);
     }
 
     #[test]
