@@ -214,20 +214,11 @@ struct FleetCapabilityProofToken {
     peer_epochs: Arc<BTreeMap<String, Uuid>>,
 }
 
+#[derive(Default)]
 struct FleetCapabilityProofState {
     proof: Option<FleetCapabilityProof>,
     draining_generation: Option<Arc<FleetCapabilityProofGeneration>>,
     topology_conflict: bool,
-}
-
-impl Default for FleetCapabilityProofState {
-    fn default() -> Self {
-        Self {
-            proof: None,
-            draining_generation: None,
-            topology_conflict: false,
-        }
-    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -389,6 +380,18 @@ pub(crate) fn tier_delete_journal_fleet_proof_matches(proof: &TierDeleteJournalF
 
 pub(crate) fn tier_delete_journal_topology_generation(proof: &TierDeleteJournalFleetProofToken) -> String {
     stable_tier_delete_journal_topology_generation(&proof.token.topology_fingerprint)
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn tier_delete_journal_fleet_proof_has_inflight_for_test() -> bool {
+    let state = tier_delete_journal_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.proof.as_ref().is_some_and(|proof| !proof.generation.is_drained())
+        || state
+            .draining_generation
+            .as_ref()
+            .is_some_and(|generation| !generation.is_drained())
 }
 
 fn stable_tier_delete_journal_topology_generation(topology_fingerprint: &str) -> String {

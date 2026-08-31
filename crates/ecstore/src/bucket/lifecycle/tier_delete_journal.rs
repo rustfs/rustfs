@@ -13,19 +13,23 @@
 // limitations under the License.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, HashSet},
     future::Future,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+
+#[cfg(all(test, feature = "test-util"))]
+use std::sync::atomic::AtomicUsize;
 
 use crate::bucket::lifecycle::config_boundary;
 use crate::bucket::lifecycle::durable_namespace::{
@@ -57,10 +61,21 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 const EVENT_LIFECYCLE_TIER_DELETE_JOURNAL: &str = "lifecycle_tier_delete_journal";
 
-pub const DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT: usize = 1_000;
+// Keep one background pass small enough that a slow remote tier cannot hold
+// the shared recovery worker for minutes. Subsequent passes resume from the
+// returned marker, so this bounds latency without reducing eventual coverage.
+pub const DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT: usize = 8;
 const TIER_DELETE_JOURNAL_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 const TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
 const TIER_DELETE_REMOTE_DEADLINE: Duration = Duration::from_secs(30);
+const TIER_DELETE_JOURNAL_ENTRY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(90);
+const TIER_DELETE_JOURNAL_RECOVERY_CONCURRENCY: usize = 4;
+const TIER_DELETE_DISPATCH_MANIFEST_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+const TIER_DELETE_DISPATCH_MANIFEST_RECOVERY_CONCURRENCY: usize = 4;
+const TIER_DELETE_DISPATCH_MEMBER_READ_CONCURRENCY: usize = 32;
+const TIER_DELETE_DISPATCH_MEMBER_DELETE_CONCURRENCY: usize = 32;
+const TIER_DELETE_DISPATCH_PREPARE_CONCURRENCY: usize = 16;
+const TIER_DELETE_DISPATCH_CAS_CONCURRENCY: usize = 32;
 const TIER_DELETE_JOURNAL_VERSION: u8 = 2;
 const TIER_DELETE_JOURNAL_EXACT_VERSION: u8 = 3;
 const TIER_DELETE_JOURNAL_STATE_VERSION: u8 = 4;
@@ -80,6 +95,10 @@ pub(crate) const TIER_DELETE_DISPATCH_MANIFEST_PREFIX: &str = "ilm/tier-delete-d
 const TIER_DELETE_DISPATCH_MANIFEST_VERSION: u8 = 1;
 pub(crate) const MAX_TIER_DELETE_DISPATCH_MANIFEST_SIZE: usize = 32 * 1024 * 1024;
 const MAX_TIER_DELETE_DISPATCH_JOURNALS: usize = 200_000;
+
+fn valid_tier_delete_topology_generation(generation: &str) -> bool {
+    generation.len() == 64 && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum TierDeleteDispatchManifestState {
@@ -113,8 +132,7 @@ impl TierDeleteDispatchManifest {
             || self.bucket_incarnation.is_nil()
             || self.journal_names.len() > MAX_TIER_DELETE_DISPATCH_JOURNALS
             || self.journal_count != self.journal_names.len() as u64
-            || self.topology_generation.len() != 64
-            || !self.topology_generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !valid_tier_delete_topology_generation(&self.topology_generation)
         {
             return Err(Error::other("tier delete dispatch manifest is invalid"));
         }
@@ -223,6 +241,32 @@ pub(crate) fn validate_tier_delete_dispatch_manifest_record(
     ))
 }
 
+/// Return the fleet generation durably bound to a v6 manifest or journal.
+/// Legacy v1-v5 records deliberately return `None` and retain their existing
+/// cleanup compatibility behavior.
+pub(crate) fn durable_ilm_v6_topology_generation(object_name: &str, data: &[u8]) -> Result<Option<String>> {
+    if object_name.starts_with(TIER_DELETE_DISPATCH_MANIFEST_PREFIX) {
+        return decode_tier_delete_dispatch_manifest(data, object_name).map(|manifest| Some(manifest.topology_generation));
+    }
+    if object_name.starts_with(TIER_DELETE_JOURNAL_V6_PREFIX) {
+        let entry = decode_tier_delete_journal_entry(data)?;
+        if entry.persisted_version != TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION
+            || tier_delete_journal_object_name(&entry) != object_name
+        {
+            return Err(Error::other("tier delete journal v6 topology binding does not match its path"));
+        }
+        let generation = entry
+            .dispatch
+            .ok_or_else(|| Error::other("tier delete journal v6 topology binding is missing"))?
+            .topology_generation;
+        if !valid_tier_delete_topology_generation(&generation) {
+            return Err(Error::other("tier delete journal v6 topology generation is invalid"));
+        }
+        return Ok(Some(generation));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 pub(crate) fn test_tier_delete_dispatch_manifest_record(
     operation_id: uuid::Uuid,
@@ -325,6 +369,7 @@ impl TierDeleteDispatchAuthorization {
             operation_id: self.0.operation_id,
             manifest_object: self.0.manifest_object.clone(),
             journal_set_sha256: self.0.journal_set_sha256.clone(),
+            topology_generation: self.0.topology_generation.clone(),
         });
         let name = tier_delete_journal_object_name(&bound);
         if !self.0.journal_names.contains(&name) {
@@ -415,6 +460,13 @@ impl PersistedTierDeleteJournalEntry {
         validate_version_state(je.version_state, &je.version_id, je.version_id_exact)?;
         let legacy_unknown = je.version_state == rustfs_filemeta::TransitionVersionState::Unknown;
         let version = if je.dispatch.is_some() {
+            if !je
+                .dispatch
+                .as_ref()
+                .is_some_and(|dispatch| valid_tier_delete_topology_generation(&dispatch.topology_generation))
+            {
+                return Err(Error::other("tier delete v6 transaction has an invalid topology generation"));
+            }
             if je.backend_identity.is_none() {
                 return Err(Error::other("tier delete transaction is missing its backend identity"));
             }
@@ -554,10 +606,13 @@ impl PersistedTierDeleteJournalEntry {
                 })?;
                 validate_version_state(version_state, &self.version_id, exact)?;
                 let dispatch = if version == TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION {
-                    Some(
-                        self.dispatch
-                            .ok_or_else(|| Error::other("tier delete journal v6 entry is missing its dispatch binding"))?,
-                    )
+                    let dispatch = self
+                        .dispatch
+                        .ok_or_else(|| Error::other("tier delete journal v6 entry is missing its dispatch binding"))?;
+                    if !valid_tier_delete_topology_generation(&dispatch.topology_generation) {
+                        return Err(Error::other("tier delete journal v6 entry has an invalid topology generation"));
+                    }
+                    Some(dispatch)
                 } else {
                     if self.dispatch.is_some() {
                         return Err(Error::other("tier delete journal v5 entry has an unsupported dispatch binding"));
@@ -740,6 +795,485 @@ fn ensure_durable_write_fence(fences_current: &impl Fn() -> bool, edge: &str) ->
     }
 }
 
+#[derive(Debug)]
+struct DecommissionCheckpointTargetsIncompleteError {
+    source: Error,
+}
+
+impl std::fmt::Display for DecommissionCheckpointTargetsIncompleteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "decommission durable ILM checkpoint was not confirmed on every receipt-bearing target: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for DecommissionCheckpointTargetsIncompleteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn decommission_checkpoint_targets_incomplete(error: Error) -> Error {
+    Error::other(DecommissionCheckpointTargetsIncompleteError { source: error })
+}
+
+fn is_decommission_checkpoint_targets_incomplete(error: &Error) -> bool {
+    matches!(error, Error::Io(io_error) if io_error
+        .get_ref()
+        .is_some_and(|source| source.is::<DecommissionCheckpointTargetsIncompleteError>()))
+}
+
+#[cfg(all(test, feature = "test-util"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TierDeleteDispatchRollbackTestStage {
+    Delete,
+    Confirmation,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TierDeleteDispatchMemberReadTestStage {
+    Validation,
+    Authorized,
+    Completed,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct TierDeleteDispatchMemberReadTestState {
+    stage: TierDeleteDispatchMemberReadTestStage,
+    pause_arrived: tokio::sync::Notify,
+    pause_release: CancellationToken,
+    entry_count: AtomicUsize,
+    authorized_progress_count: AtomicUsize,
+    in_flight: AtomicUsize,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct TierDeleteDispatchMemberReadTestHook {
+    state: Arc<TierDeleteDispatchMemberReadTestState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct TierDeleteDispatchMemberReadTestPermit {
+    state: Arc<TierDeleteDispatchMemberReadTestState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static TIER_DELETE_DISPATCH_MEMBER_READ_TEST_HOOK: OnceLock<Mutex<Option<Arc<TierDeleteDispatchMemberReadTestState>>>> =
+    OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+impl TierDeleteDispatchMemberReadTestHook {
+    pub(crate) fn install_pause(stage: TierDeleteDispatchMemberReadTestStage) -> Self {
+        let state = Arc::new(TierDeleteDispatchMemberReadTestState {
+            stage,
+            pause_arrived: tokio::sync::Notify::new(),
+            pause_release: CancellationToken::new(),
+            entry_count: AtomicUsize::new(0),
+            authorized_progress_count: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+        });
+        let mut slot = TIER_DELETE_DISPATCH_MEMBER_READ_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("tier delete dispatch member read test hook should not poison");
+        assert!(slot.is_none(), "tier delete dispatch member read test hook must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_read_pause_count(&self, expected: usize) {
+        while self.state.entry_count.load(Ordering::Acquire) < expected {
+            self.state.pause_arrived.notified().await;
+        }
+    }
+
+    pub(crate) fn release_all_reads(&self) {
+        self.state.pause_release.cancel();
+    }
+
+    pub(crate) fn entry_count(&self) -> usize {
+        self.state.entry_count.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn authorized_progress_count(&self) -> usize {
+        self.state.authorized_progress_count.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn in_flight(&self) -> usize {
+        self.state.in_flight.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TierDeleteDispatchMemberReadTestHook {
+    fn drop(&mut self) {
+        self.state.pause_release.cancel();
+        let mut slot = TIER_DELETE_DISPATCH_MEMBER_READ_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("tier delete dispatch member read test hook should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TierDeleteDispatchMemberReadTestPermit {
+    fn drop(&mut self) {
+        let previous = self.state.in_flight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "tier delete dispatch member read test hook underflow");
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+async fn tier_delete_dispatch_member_read_test_hook(
+    stage: TierDeleteDispatchMemberReadTestStage,
+) -> Option<TierDeleteDispatchMemberReadTestPermit> {
+    let state = TIER_DELETE_DISPATCH_MEMBER_READ_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("tier delete dispatch member read test hook should not poison")
+        .clone();
+    let state = state.filter(|state| state.stage == stage)?;
+    state.entry_count.fetch_add(1, Ordering::AcqRel);
+    state.in_flight.fetch_add(1, Ordering::AcqRel);
+    state.pause_arrived.notify_waiters();
+    state.pause_release.cancelled().await;
+    Some(TierDeleteDispatchMemberReadTestPermit { state })
+}
+
+#[cfg(all(test, feature = "test-util"))]
+fn tier_delete_dispatch_authorized_progress_test_observed() {
+    let state = TIER_DELETE_DISPATCH_MEMBER_READ_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("tier delete dispatch member read test hook should not poison")
+        .clone();
+    if let Some(state) = state.filter(|state| state.stage == TierDeleteDispatchMemberReadTestStage::Authorized) {
+        state.authorized_progress_count.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct TierDeleteDispatchRollbackTestState {
+    pause_delete_name: Option<String>,
+    pause_all_deletes: bool,
+    pause_all_except_delete_name: Option<String>,
+    watch_delete_name: Option<String>,
+    fail_delete_name: Option<String>,
+    fail_confirmation_name: Option<String>,
+    pause_arrived: tokio::sync::Notify,
+    pause_release: tokio::sync::Notify,
+    pause_all_release: CancellationToken,
+    watch_arrived: tokio::sync::Notify,
+    pause_seen: AtomicBool,
+    pause_count: AtomicUsize,
+    delete_entry_count: AtomicUsize,
+    watch_seen: AtomicBool,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct TierDeleteDispatchRollbackTestHook {
+    state: Arc<TierDeleteDispatchRollbackTestState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct TierDeleteDispatchRollbackTestPermit {
+    state: Arc<TierDeleteDispatchRollbackTestState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static TIER_DELETE_DISPATCH_ROLLBACK_TEST_HOOK: OnceLock<Mutex<Option<Arc<TierDeleteDispatchRollbackTestState>>>> =
+    OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+impl TierDeleteDispatchRollbackTestHook {
+    fn install(state: TierDeleteDispatchRollbackTestState) -> Self {
+        let state = Arc::new(state);
+        let mut slot = TIER_DELETE_DISPATCH_ROLLBACK_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("tier delete dispatch rollback test hook should not poison");
+        assert!(slot.is_none(), "tier delete dispatch rollback test hook must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) fn install_slow_delete(pause_delete_name: &str, watch_delete_name: &str) -> Self {
+        Self::install(TierDeleteDispatchRollbackTestState {
+            pause_delete_name: Some(pause_delete_name.to_string()),
+            pause_all_deletes: false,
+            pause_all_except_delete_name: None,
+            watch_delete_name: Some(watch_delete_name.to_string()),
+            fail_delete_name: None,
+            fail_confirmation_name: None,
+            pause_arrived: tokio::sync::Notify::new(),
+            pause_release: tokio::sync::Notify::new(),
+            pause_all_release: CancellationToken::new(),
+            watch_arrived: tokio::sync::Notify::new(),
+            pause_seen: AtomicBool::new(false),
+            pause_count: AtomicUsize::new(0),
+            delete_entry_count: AtomicUsize::new(0),
+            watch_seen: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn install_delete_failure(fail_delete_name: &str) -> Self {
+        Self::install(TierDeleteDispatchRollbackTestState {
+            pause_delete_name: None,
+            pause_all_deletes: false,
+            pause_all_except_delete_name: None,
+            watch_delete_name: None,
+            fail_delete_name: Some(fail_delete_name.to_string()),
+            fail_confirmation_name: None,
+            pause_arrived: tokio::sync::Notify::new(),
+            pause_release: tokio::sync::Notify::new(),
+            pause_all_release: CancellationToken::new(),
+            watch_arrived: tokio::sync::Notify::new(),
+            pause_seen: AtomicBool::new(false),
+            pause_count: AtomicUsize::new(0),
+            delete_entry_count: AtomicUsize::new(0),
+            watch_seen: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn install_confirmation_failure(fail_confirmation_name: &str) -> Self {
+        Self::install(TierDeleteDispatchRollbackTestState {
+            pause_delete_name: None,
+            pause_all_deletes: false,
+            pause_all_except_delete_name: None,
+            watch_delete_name: None,
+            fail_delete_name: None,
+            fail_confirmation_name: Some(fail_confirmation_name.to_string()),
+            pause_arrived: tokio::sync::Notify::new(),
+            pause_release: tokio::sync::Notify::new(),
+            pause_all_release: CancellationToken::new(),
+            watch_arrived: tokio::sync::Notify::new(),
+            pause_seen: AtomicBool::new(false),
+            pause_count: AtomicUsize::new(0),
+            delete_entry_count: AtomicUsize::new(0),
+            watch_seen: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn install_pause_all_deletes() -> Self {
+        Self::install(TierDeleteDispatchRollbackTestState {
+            pause_delete_name: None,
+            pause_all_deletes: true,
+            pause_all_except_delete_name: None,
+            watch_delete_name: None,
+            fail_delete_name: None,
+            fail_confirmation_name: None,
+            pause_arrived: tokio::sync::Notify::new(),
+            pause_release: tokio::sync::Notify::new(),
+            pause_all_release: CancellationToken::new(),
+            watch_arrived: tokio::sync::Notify::new(),
+            pause_seen: AtomicBool::new(false),
+            pause_count: AtomicUsize::new(0),
+            delete_entry_count: AtomicUsize::new(0),
+            watch_seen: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn install_pause_all_except_delete(delete_name: &str) -> Self {
+        Self::install(TierDeleteDispatchRollbackTestState {
+            pause_delete_name: None,
+            pause_all_deletes: false,
+            pause_all_except_delete_name: Some(delete_name.to_string()),
+            watch_delete_name: None,
+            fail_delete_name: None,
+            fail_confirmation_name: None,
+            pause_arrived: tokio::sync::Notify::new(),
+            pause_release: tokio::sync::Notify::new(),
+            pause_all_release: CancellationToken::new(),
+            watch_arrived: tokio::sync::Notify::new(),
+            pause_seen: AtomicBool::new(false),
+            pause_count: AtomicUsize::new(0),
+            delete_entry_count: AtomicUsize::new(0),
+            watch_seen: AtomicBool::new(false),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) async fn wait_until_delete_paused(&self) {
+        while !self.state.pause_seen.load(Ordering::Acquire) {
+            self.state.pause_arrived.notified().await;
+        }
+    }
+
+    pub(crate) async fn wait_until_delete_observed(&self) {
+        while !self.state.watch_seen.load(Ordering::Acquire) {
+            self.state.watch_arrived.notified().await;
+        }
+    }
+
+    pub(crate) async fn wait_until_delete_pause_count(&self, expected: usize) {
+        while self.state.pause_count.load(Ordering::Acquire) < expected {
+            self.state.pause_arrived.notified().await;
+        }
+    }
+
+    pub(crate) fn release_delete(&self) {
+        self.state.pause_release.notify_one();
+    }
+
+    pub(crate) fn release_all_deletes(&self) {
+        self.state.pause_all_release.cancel();
+    }
+
+    pub(crate) fn delete_entry_count(&self) -> usize {
+        self.state.delete_entry_count.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.state.max_in_flight.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TierDeleteDispatchRollbackTestHook {
+    fn drop(&mut self) {
+        self.state.pause_release.notify_one();
+        self.state.pause_all_release.cancel();
+        let mut slot = TIER_DELETE_DISPATCH_ROLLBACK_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("tier delete dispatch rollback test hook should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for TierDeleteDispatchRollbackTestPermit {
+    fn drop(&mut self) {
+        let previous = self.state.in_flight.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "tier delete dispatch rollback test hook underflow");
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+async fn tier_delete_dispatch_rollback_test_hook(
+    stage: TierDeleteDispatchRollbackTestStage,
+    name: &str,
+) -> Result<Option<TierDeleteDispatchRollbackTestPermit>> {
+    let state = TIER_DELETE_DISPATCH_ROLLBACK_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("tier delete dispatch rollback test hook should not poison")
+        .clone();
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let current = state.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+    state.max_in_flight.fetch_max(current, Ordering::AcqRel);
+    let permit = TierDeleteDispatchRollbackTestPermit { state: state.clone() };
+
+    if stage == TierDeleteDispatchRollbackTestStage::Delete {
+        state.delete_entry_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    if stage == TierDeleteDispatchRollbackTestStage::Delete && state.watch_delete_name.as_deref() == Some(name) {
+        state.watch_seen.store(true, Ordering::Release);
+        state.watch_arrived.notify_one();
+    }
+    let pause_all = state.pause_all_deletes
+        || state
+            .pause_all_except_delete_name
+            .as_deref()
+            .is_some_and(|except| except != name);
+    if stage == TierDeleteDispatchRollbackTestStage::Delete && pause_all {
+        state.pause_count.fetch_add(1, Ordering::AcqRel);
+        state.pause_arrived.notify_waiters();
+        state.pause_all_release.cancelled().await;
+    } else if stage == TierDeleteDispatchRollbackTestStage::Delete && state.pause_delete_name.as_deref() == Some(name) {
+        state.pause_seen.store(true, Ordering::Release);
+        state.pause_count.store(1, Ordering::Release);
+        state.pause_arrived.notify_one();
+        state.pause_release.notified().await;
+    }
+    let fail = match stage {
+        TierDeleteDispatchRollbackTestStage::Delete => state.fail_delete_name.as_deref() == Some(name),
+        TierDeleteDispatchRollbackTestStage::Confirmation => state.fail_confirmation_name.as_deref() == Some(name),
+    };
+    if fail {
+        return Err(Error::other(match stage {
+            TierDeleteDispatchRollbackTestStage::Delete => "injected tier delete dispatch rollback delete failure",
+            TierDeleteDispatchRollbackTestStage::Confirmation => "injected tier delete dispatch rollback confirmation failure",
+        }));
+    }
+    Ok(Some(permit))
+}
+
+#[cfg(all(test, feature = "test-util"))]
+struct DecommissionCheckpointTargetFailureState {
+    target_pool_index: usize,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) struct DecommissionCheckpointTargetFailureHook {
+    state: Arc<DecommissionCheckpointTargetFailureState>,
+}
+
+#[cfg(all(test, feature = "test-util"))]
+static DECOMMISSION_CHECKPOINT_TARGET_FAILURE_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<DecommissionCheckpointTargetFailureState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(all(test, feature = "test-util"))]
+impl DecommissionCheckpointTargetFailureHook {
+    pub(crate) fn install(target_pool_index: usize) -> Self {
+        let state = Arc::new(DecommissionCheckpointTargetFailureState { target_pool_index });
+        let mut slot = DECOMMISSION_CHECKPOINT_TARGET_FAILURE_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission checkpoint target failure hook should not poison");
+        assert!(slot.is_none(), "decommission checkpoint target failure hook must be unique");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+impl Drop for DecommissionCheckpointTargetFailureHook {
+    fn drop(&mut self) {
+        let mut slot = DECOMMISSION_CHECKPOINT_TARGET_FAILURE_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("decommission checkpoint target failure hook should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+fn fail_decommission_checkpoint_target_for_test(target_pool_index: usize) -> bool {
+    DECOMMISSION_CHECKPOINT_TARGET_FAILURE_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission checkpoint target failure hook should not poison")
+        .as_ref()
+        .is_some_and(|state| state.target_pool_index == target_pool_index)
+}
+
 async fn save_config_if_none_fenced(
     api: Arc<ECStore>,
     name: &str,
@@ -783,6 +1317,181 @@ async fn save_config_if_none_fenced(
     }
 }
 
+async fn save_decommission_manifest_checkpoint_if_match(
+    api: Arc<ECStore>,
+    name: &str,
+    next_data: &[u8],
+    etag: &str,
+    fences_current: &impl Fn() -> bool,
+) -> Result<bool> {
+    let Some(targets) = api.decommission_durable_ilm_checkpoint_targets(name, next_data, etag).await? else {
+        return Ok(false);
+    };
+    let encoded_name = rustfs_utils::path::encode_dir_object(name);
+    let mut first_write_error = None;
+    for target in &targets {
+        ensure_durable_write_fence(fences_current, "before decommission checkpoint namespace lock")?;
+        let guards = api
+            .acquire_data_movement_publication_write_locks(
+                RUSTFS_META_BUCKET,
+                &encoded_name,
+                target.source_pool_index,
+                target.target_pool_index,
+                true,
+            )
+            .await?;
+        ensure_durable_write_fence(fences_current, "before decommission checkpoint capacity admission")?;
+        if guards.iter().any(crate::store::ObjectLockDiagGuard::is_lock_lost) {
+            return Err(Error::other("decommission checkpoint publication lock was lost"));
+        }
+
+        let pool = api.pools[target.target_pool_index].clone();
+        let (observed_data, observed_metadata) = config_boundary::read_config_with_metadata(
+            pool.clone(),
+            name,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await?;
+        if observed_data.len() > MAX_TIER_DELETE_DISPATCH_MANIFEST_SIZE {
+            return Err(Error::other("decommission checkpoint target exceeds the manifest size limit"));
+        }
+        let observed_etag = observed_metadata
+            .etag
+            .filter(|etag| !etag.trim().is_empty())
+            .ok_or_else(|| Error::other("decommission checkpoint target is missing an ETag"))?;
+        if observed_data.as_slice() == next_data {
+            if api
+                .has_decommission_capacity_temporary_mutation_state(target.target_pool_index, target.capacity_owner)
+                .await
+            {
+                api.reconcile_decommission_capacity_after_equivalent_temporary_target(
+                    target.capacity_owner,
+                    target.target_pool_index,
+                    next_data.len(),
+                )
+                .await?;
+            }
+            if guards.iter().any(crate::store::ObjectLockDiagGuard::is_lock_lost) {
+                return Err(Error::other("decommission checkpoint publication lock was lost during capacity replay"));
+            }
+            continue;
+        }
+        if target.already_committed || target.target_etag.as_deref() != Some(observed_etag.as_str()) {
+            first_write_error = Some(Error::PreconditionFailed);
+            break;
+        }
+
+        let mut opts = ObjectOptions {
+            max_parity: true,
+            no_lock: true,
+            http_preconditions: Some(HTTPPreconditions {
+                if_match: Some(observed_etag),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for guard in &guards {
+            guard.add_namespace_lock_fence(&mut opts);
+        }
+        target.capacity_owner.apply_to(&mut opts);
+        #[cfg(all(test, feature = "test-util"))]
+        if fail_decommission_checkpoint_target_for_test(target.target_pool_index) {
+            first_write_error = Some(Error::other(format!(
+                "injected decommission checkpoint target {} failure",
+                target.target_pool_index
+            )));
+            break;
+        }
+        let write_data = next_data.to_vec();
+        let write = api
+            .run_decommission_capacity_temporary_mutation_with_capacity_lease(
+                target.target_pool_index,
+                Some(target.capacity_owner),
+                Some(next_data.len()),
+                |capacity_lease| async move {
+                    let mut opts = opts;
+                    if let Some(signal) = capacity_lease.as_ref() {
+                        opts.add_namespace_lock_lost_signal(signal.clone());
+                        if signal.is_lost() {
+                            return Err(Error::other("decommission checkpoint capacity lease was lost before save"));
+                        }
+                    }
+                    let result = config_boundary::save_config_with_opts(pool, name, write_data, &opts).await;
+                    if capacity_lease.as_ref().is_some_and(|signal| signal.is_lost()) {
+                        return Err(Error::other("decommission checkpoint capacity lease was lost during save"));
+                    }
+                    result
+                },
+            )
+            .await;
+        let publication_lost = guards.iter().any(crate::store::ObjectLockDiagGuard::is_lock_lost);
+        if let Err(err) = ensure_durable_write_fence(fences_current, "during decommission checkpoint save") {
+            first_write_error = Some(err);
+            break;
+        }
+        if publication_lost {
+            first_write_error = Some(Error::other("decommission checkpoint publication lock was lost during save"));
+            break;
+        }
+        if let Err(err) = write {
+            first_write_error = Some(err);
+            break;
+        }
+        drop(guards);
+    }
+
+    if let Some(write_error) = first_write_error {
+        // A target PUT may have committed even when its caller observed an
+        // error. Confirm every receipt-bearing target independently; never let
+        // one globally visible copy advance receipts for a partial update.
+        for target in &targets {
+            ensure_durable_write_fence(fences_current, "before decommission checkpoint confirmation")?;
+            let guards = api
+                .acquire_data_movement_publication_write_locks(
+                    RUSTFS_META_BUCKET,
+                    &encoded_name,
+                    target.source_pool_index,
+                    target.target_pool_index,
+                    true,
+                )
+                .await?;
+            let observed = config_boundary::read_config_with_metadata(
+                api.pools[target.target_pool_index].clone(),
+                name,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+            let Ok((observed_data, _)) = observed else {
+                return Err(write_error);
+            };
+            if observed_data.as_slice() != next_data {
+                return Err(write_error);
+            }
+            if api
+                .has_decommission_capacity_temporary_mutation_state(target.target_pool_index, target.capacity_owner)
+                .await
+            {
+                api.reconcile_decommission_capacity_after_equivalent_temporary_target(
+                    target.capacity_owner,
+                    target.target_pool_index,
+                    next_data.len(),
+                )
+                .await?;
+            }
+            if guards.iter().any(crate::store::ObjectLockDiagGuard::is_lock_lost) {
+                return Err(Error::other("decommission checkpoint publication lock was lost during confirmation"));
+            }
+        }
+    }
+    Ok(true)
+}
+
 async fn save_config_if_match_fenced(
     api: Arc<ECStore>,
     name: &str,
@@ -791,6 +1500,14 @@ async fn save_config_if_match_fenced(
     fences_current: &impl Fn() -> bool,
 ) -> Result<()> {
     ensure_durable_write_fence(fences_current, "before If-Match save")?;
+    match save_decommission_manifest_checkpoint_if_match(api.clone(), name, &data, etag, fences_current).await {
+        Ok(true) => {
+            ensure_durable_write_fence(fences_current, "during decommission If-Match save")?;
+            return record_durable_config_progress_fenced(api, name, &data, fences_current).await;
+        }
+        Ok(false) => {}
+        Err(err) => return Err(decommission_checkpoint_targets_incomplete(err)),
+    }
     let write = config_boundary::save_config_with_opts(
         api.clone(),
         name,
@@ -1004,7 +1721,13 @@ pub(crate) async fn install_test_tier_delete_dispatch_fixture(
         topology_generation,
         state: manifest_state,
     };
-    let mut bound = bind_dispatch_entries(raw_entries, manifest.operation_id, &manifest_name, &manifest.journal_set_sha256)?;
+    let mut bound = bind_dispatch_entries(
+        raw_entries,
+        manifest.operation_id,
+        &manifest_name,
+        &manifest.journal_set_sha256,
+        &manifest.topology_generation,
+    )?;
     save_config_if_none(api.clone(), &manifest_name, encode_tier_delete_dispatch_manifest(&manifest)?).await?;
     for entry in &mut bound {
         let name = tier_delete_journal_object_name(entry);
@@ -1030,11 +1753,25 @@ pub(crate) async fn test_tier_delete_dispatch_manifest_state(
         .map(|(manifest, _)| manifest.state))
 }
 
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn test_tier_delete_dispatch_manifest_checkpoint(
+    api: Arc<ECStore>,
+    manifest_name: &str,
+    next_state: TierDeleteDispatchManifestState,
+) -> Result<(Vec<u8>, String)> {
+    let (mut manifest, etag) = read_tier_delete_dispatch_manifest(api, manifest_name)
+        .await?
+        .ok_or(Error::ConfigNotFound)?;
+    manifest.state = next_state;
+    Ok((encode_tier_delete_dispatch_manifest(&manifest)?, etag))
+}
+
 fn bind_dispatch_entries(
     entries: Vec<Jentry>,
     operation_id: uuid::Uuid,
     manifest_object: &str,
     journal_set_sha256: &str,
+    topology_generation: &str,
 ) -> Result<Vec<Jentry>> {
     let mut entries = entries;
     entries.sort_by_key(|entry| tier_delete_journal_v6_object_name(entry, operation_id));
@@ -1053,6 +1790,7 @@ fn bind_dispatch_entries(
             operation_id,
             manifest_object: manifest_object.to_string(),
             journal_set_sha256: journal_set_sha256.to_string(),
+            topology_generation: topology_generation.to_string(),
         });
         debug_assert_eq!(tier_delete_journal_object_name(&entry), name);
         if last_name.as_ref() == Some(&name) {
@@ -1100,6 +1838,7 @@ fn validate_bound_journal(manifest: &TierDeleteDispatchManifest, name: &str, ent
                     &manifest.prefix,
                 ),
                 journal_set_sha256: manifest.journal_set_sha256.clone(),
+                topology_generation: manifest.topology_generation.clone(),
             })
     {
         return Err(Error::other("tier delete journal does not match its dispatch manifest"));
@@ -1113,19 +1852,38 @@ async fn load_complete_dispatch_journal_set(
     allowed_states: &[TierDeleteJournalState],
     fences_current: &impl Fn() -> bool,
 ) -> Result<Vec<Jentry>> {
-    let mut entries = Vec::with_capacity(manifest.journal_names.len());
-    for name in &manifest.journal_names {
-        let (entry, _) = read_tier_delete_journal_with_etag(api.clone(), name)
-            .await?
-            .ok_or_else(|| Error::other("tier delete dispatch manifest references a missing journal"))?;
-        validate_bound_journal(manifest, name, &entry)?;
-        if !allowed_states.contains(&entry.state) {
-            return Err(Error::other("tier delete dispatch journal has an invalid state"));
+    let mut reads = futures::stream::iter((0..manifest.journal_names.len()).map(|index| {
+        let api = api.clone();
+        let name = manifest.journal_names[index].clone();
+        async move {
+            let (entry, _) = read_tier_delete_journal_with_etag(api.clone(), &name)
+                .await?
+                .ok_or_else(|| Error::other("tier delete dispatch manifest references a missing journal"))?;
+            validate_bound_journal(manifest, &name, &entry)?;
+            if !allowed_states.contains(&entry.state) {
+                return Err(Error::other("tier delete dispatch journal has an invalid state"));
+            }
+            record_tier_delete_journal_progress_fenced(api, &name, &entry, fences_current).await?;
+            Ok::<_, Error>((index, entry))
         }
-        record_tier_delete_journal_progress_fenced(api.clone(), name, &entry, fences_current).await?;
-        entries.push(entry);
+    }))
+    .buffer_unordered(TIER_DELETE_DISPATCH_MEMBER_READ_CONCURRENCY);
+    let mut entries = vec![None; manifest.journal_names.len()];
+    let mut first_error = None;
+    while let Some(result) = reads.next().await {
+        match result {
+            Ok((index, entry)) => entries[index] = Some(entry),
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
     }
-    Ok(entries)
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    entries
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| Error::other("tier delete dispatch journal validation produced an incomplete set"))
 }
 
 async fn persist_prepared_dispatch_journal(
@@ -1194,17 +1952,79 @@ async fn dispatch_prepared_journal(
     Err(Error::other("tier delete journal changed repeatedly during dispatch"))
 }
 
-async fn validate_staged_dispatch_journal_set(api: Arc<ECStore>, manifest: &TierDeleteDispatchManifest) -> Result<()> {
-    for name in &manifest.journal_names {
-        let Some((entry, _)) = read_tier_delete_journal_with_etag(api.clone(), name).await? else {
-            continue;
-        };
-        validate_bound_journal(manifest, name, &entry)?;
-        if !matches!(entry.state, TierDeleteJournalState::Prepared | TierDeleteJournalState::Dispatched) {
-            return Err(Error::other("an uncommitted tier delete dispatch contains a committed journal"));
+fn ensure_tier_delete_dispatch_member_scan_fence(fences_current: &impl Fn() -> bool) -> Result<()> {
+    if fences_current() {
+        Ok(())
+    } else {
+        Err(Error::other("tier delete dispatch member scan fence changed"))
+    }
+}
+
+async fn validate_staged_dispatch_journal_set(
+    api: Arc<ECStore>,
+    manifest: &TierDeleteDispatchManifest,
+    fences_current: &impl Fn() -> bool,
+) -> Result<()> {
+    ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let make_read = |name: String| {
+        let api = api.clone();
+        let stopped = stopped.clone();
+        async move {
+            if stopped.load(Ordering::Acquire) {
+                return Ok::<_, Error>(());
+            }
+            let result = async {
+                ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+                #[cfg(all(test, feature = "test-util"))]
+                let _test_permit =
+                    tier_delete_dispatch_member_read_test_hook(TierDeleteDispatchMemberReadTestStage::Validation).await;
+                ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+                let observed = read_tier_delete_journal_with_etag(api, &name).await?;
+                ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+                let Some((entry, _)) = observed else {
+                    return Ok(());
+                };
+                validate_bound_journal(manifest, &name, &entry)?;
+                if !matches!(entry.state, TierDeleteJournalState::Prepared | TierDeleteJournalState::Dispatched) {
+                    return Err(Error::other("an uncommitted tier delete dispatch contains a committed journal"));
+                }
+                Ok(())
+            }
+            .await;
+            if result.is_err() {
+                stopped.store(true, Ordering::Release);
+            }
+            result
+        }
+    };
+    let mut next = 0;
+    let mut reads = futures::stream::FuturesUnordered::new();
+    while next < manifest.journal_names.len() && reads.len() < TIER_DELETE_DISPATCH_MEMBER_READ_CONCURRENCY {
+        reads.push(make_read(manifest.journal_names[next].clone()));
+        next += 1;
+    }
+    let mut first_error = None;
+    while let Some(result) = reads.next().await {
+        if let Err(err) = result
+            && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
+        if first_error.is_none() && !stopped.load(Ordering::Acquire) {
+            if let Err(err) = ensure_tier_delete_dispatch_member_scan_fence(fences_current) {
+                stopped.store(true, Ordering::Release);
+                first_error = Some(err);
+            } else if next < manifest.journal_names.len() {
+                reads.push(make_read(manifest.journal_names[next].clone()));
+                next += 1;
+            }
         }
     }
-    Ok(())
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 async fn delete_staged_dispatch_journal_set<F>(
@@ -1213,44 +2033,114 @@ async fn delete_staged_dispatch_journal_set<F>(
     fences_current: &F,
 ) -> Result<()>
 where
-    F: Fn() -> bool,
+    F: Fn() -> bool + Sync,
 {
     // Validate the complete immutable set before deleting its first member so
     // a corrupt binding or impossible Committed state quarantines the whole
     // operation rather than producing a partial rollback.
-    validate_staged_dispatch_journal_set(api.clone(), manifest).await?;
-    for name in &manifest.journal_names {
-        if !fences_current() {
-            return Err(Error::other("tier delete dispatch rollback fence changed"));
-        }
-        let Some((entry, etag)) = read_tier_delete_journal_with_etag(api.clone(), name).await? else {
-            continue;
-        };
-        validate_bound_journal(manifest, name, &entry)?;
-        if !matches!(entry.state, TierDeleteJournalState::Prepared | TierDeleteJournalState::Dispatched) {
-            return Err(Error::other("an uncommitted tier delete dispatch contains a committed journal"));
-        }
-        if !fences_current() {
-            return Err(Error::other("tier delete dispatch rollback fence changed"));
-        }
-        let data = encode_tier_delete_journal_entry(&entry)?;
-        match delete_durable_config_if_match(api.clone(), name, &data, &etag, fences_current).await {
-            Ok(()) | Err(Error::ConfigNotFound) => {}
-            Err(Error::PreconditionFailed) => {
-                return Err(Error::other("tier delete dispatch journal changed during rollback"));
+    validate_staged_dispatch_journal_set(api.clone(), manifest, fences_current).await?;
+
+    // The validation barrier above must drain before this stream is created.
+    // Once deletion starts, stop admitting useful work after the first error
+    // but drain the at-most-bounded in-flight set so no detached mutation
+    // escapes the manifest operation/fleet fences.
+    let delete_stopped = Arc::new(AtomicBool::new(false));
+    let mut deletes = futures::stream::iter(manifest.journal_names.iter().cloned().map(|name| {
+        let api = api.clone();
+        let delete_stopped = delete_stopped.clone();
+        async move {
+            if delete_stopped.load(Ordering::Acquire) {
+                return Ok(());
             }
-            Err(err) => return Err(err),
+            let result = async {
+                #[cfg(all(test, feature = "test-util"))]
+                let _test_permit =
+                    tier_delete_dispatch_rollback_test_hook(TierDeleteDispatchRollbackTestStage::Delete, &name).await?;
+                if !fences_current() {
+                    return Err(Error::other("tier delete dispatch rollback fence changed"));
+                }
+                let Some((entry, etag)) = read_tier_delete_journal_with_etag(api.clone(), &name).await? else {
+                    return Ok(());
+                };
+                validate_bound_journal(manifest, &name, &entry)?;
+                if !matches!(entry.state, TierDeleteJournalState::Prepared | TierDeleteJournalState::Dispatched) {
+                    return Err(Error::other("an uncommitted tier delete dispatch contains a committed journal"));
+                }
+                if !fences_current() {
+                    return Err(Error::other("tier delete dispatch rollback fence changed"));
+                }
+                let data = encode_tier_delete_journal_entry(&entry)?;
+                match delete_durable_config_if_match(api, &name, &data, &etag, fences_current).await {
+                    Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
+                    Err(Error::PreconditionFailed) => Err(Error::other("tier delete dispatch journal changed during rollback")),
+                    Err(err) => Err(err),
+                }
+            }
+            .await;
+            if result.is_err() {
+                delete_stopped.store(true, Ordering::Release);
+            }
+            result
+        }
+    }))
+    .buffer_unordered(TIER_DELETE_DISPATCH_MEMBER_DELETE_CONCURRENCY);
+    let mut first_error = None;
+    while let Some(result) = deletes.next().await {
+        if let Err(err) = result
+            && first_error.is_none()
+        {
+            first_error = Some(err);
         }
     }
-    for name in &manifest.journal_names {
-        if !fences_current() {
-            return Err(Error::other("tier delete dispatch rollback fence changed"));
+    drop(deletes);
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+
+    let confirmation_stopped = Arc::new(AtomicBool::new(false));
+    let mut confirmations = futures::stream::iter(manifest.journal_names.iter().cloned().map(|name| {
+        let api = api.clone();
+        let confirmation_stopped = confirmation_stopped.clone();
+        async move {
+            if confirmation_stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let result = async {
+                #[cfg(all(test, feature = "test-util"))]
+                let _test_permit =
+                    tier_delete_dispatch_rollback_test_hook(TierDeleteDispatchRollbackTestStage::Confirmation, &name).await?;
+                if !fences_current() {
+                    return Err(Error::other("tier delete dispatch rollback fence changed"));
+                }
+                if let Some((entry, _)) = read_tier_delete_journal_with_etag(api.clone(), &name).await? {
+                    let data = encode_tier_delete_journal_entry(&entry)?;
+                    if !api.durable_ilm_terminal_receipt_covers_active_source(&name, &data).await? {
+                        return Err(Error::other("tier delete dispatch rollback retained a journal"));
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if result.is_err() {
+                confirmation_stopped.store(true, Ordering::Release);
+            }
+            result
         }
-        if read_tier_delete_journal_with_etag(api.clone(), name).await?.is_some() {
-            return Err(Error::other("tier delete dispatch rollback retained a journal"));
+    }))
+    .buffer_unordered(TIER_DELETE_DISPATCH_MEMBER_READ_CONCURRENCY);
+    let mut first_error = None;
+    while let Some(result) = confirmations.next().await {
+        if let Err(err) = result
+            && first_error.is_none()
+        {
+            first_error = Some(err);
         }
     }
-    Ok(())
+    drop(confirmations);
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 async fn seal_and_rollback_preparing_dispatch(
@@ -1470,17 +2360,94 @@ pub(crate) async fn prepare_tier_delete_dispatch(
         }
     };
 
-    let bound = bind_dispatch_entries(entries, manifest.operation_id, &manifest_name, &manifest.journal_set_sha256)?;
+    let bound = bind_dispatch_entries(
+        entries,
+        manifest.operation_id,
+        &manifest_name,
+        &manifest.journal_set_sha256,
+        &manifest.topology_generation,
+    )?;
     let attempt = async {
         let fences_current =
             || dispatch_write_fences_current(bucket_fence, &operation_guard, &fleet_proof, &manifest.topology_generation);
-        for entry in &bound {
-            ensure_dispatch_lock_current(bucket_fence, &operation_guard)?;
-            persist_prepared_dispatch_journal(api.clone(), &manifest, entry, &fences_current).await?;
+        let manifest_ref = &manifest;
+        let operation_guard_ref = &operation_guard;
+        let prepare_stopped = Arc::new(AtomicBool::new(false));
+        let mut prepare_writes = futures::stream::iter((0..bound.len()).map(|index| {
+            let api = api.clone();
+            let prepare_stopped = prepare_stopped.clone();
+            let fences_current = &fences_current;
+            let manifest = manifest_ref;
+            let operation_guard = operation_guard_ref;
+            let entry = bound[index].clone();
+            async move {
+                if prepare_stopped.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let result = match ensure_dispatch_lock_current(bucket_fence, operation_guard) {
+                    Ok(()) => persist_prepared_dispatch_journal(api, manifest, &entry, fences_current).await,
+                    Err(err) => Err(err),
+                };
+                if result.is_err() {
+                    prepare_stopped.store(true, Ordering::Release);
+                }
+                result
+            }
+        }))
+        .buffer_unordered(TIER_DELETE_DISPATCH_PREPARE_CONCURRENCY);
+        let mut prepare_error = None;
+        while let Some(result) = prepare_writes.next().await {
+            if let Err(err) = result
+                && prepare_error.is_none()
+            {
+                prepare_error = Some(err);
+            }
         }
-        for entry in &bound {
-            ensure_dispatch_lock_current(bucket_fence, &operation_guard)?;
-            dispatch_prepared_journal(api.clone(), &manifest, entry, &fences_current).await?;
+        drop(prepare_writes);
+        if let Some(err) = prepare_error {
+            return Err(err);
+        }
+
+        // Preserve the phase barrier: every Prepared write is durable before
+        // any journal is advanced to Dispatched. On the first failure, stop
+        // admitting new writes but drain the already-started bounded set
+        // before the caller seals and rolls the operation back.
+        let dispatch_stopped = Arc::new(AtomicBool::new(false));
+        let mut dispatch_writes = futures::stream::iter((0..bound.len()).map(|index| {
+            let api = api.clone();
+            let dispatch_stopped = dispatch_stopped.clone();
+            let fences_current = &fences_current;
+            let manifest = manifest_ref;
+            let operation_guard = operation_guard_ref;
+            let entry = bound[index].clone();
+            async move {
+                if dispatch_stopped.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let result = match ensure_dispatch_lock_current(bucket_fence, operation_guard) {
+                    Ok(()) => dispatch_prepared_journal(api, manifest, &entry, fences_current)
+                        .await
+                        .map(|_| ()),
+                    Err(err) => Err(err),
+                };
+                if result.is_err() {
+                    dispatch_stopped.store(true, Ordering::Release);
+                }
+                result
+            }
+        }))
+        .buffer_unordered(TIER_DELETE_DISPATCH_CAS_CONCURRENCY);
+        let mut dispatch_error = None;
+        while let Some(result) = dispatch_writes.next().await {
+            if let Err(err) = result
+                && dispatch_error.is_none()
+            {
+                dispatch_error = Some(err);
+            }
+        }
+        drop(dispatch_writes);
+        if let Some(err) = dispatch_error {
+            return Err(err);
         }
         ensure_dispatch_lock_current(bucket_fence, &operation_guard)?;
         if !tier_delete_journal_fleet_proof_matches(&fleet_proof)
@@ -1495,6 +2462,7 @@ pub(crate) async fn prepare_tier_delete_dispatch(
             Err(Error::PreconditionFailed) => {
                 return Err(Error::other("tier delete dispatch manifest changed before authorization"));
             }
+            Err(cas_err) if is_decommission_checkpoint_targets_incomplete(&cas_err) => return Err(cas_err),
             Err(cas_err) => {
                 // The write may have reached quorum even if the client saw a
                 // timeout. Only a strong read confirming Authorized permits
@@ -2505,8 +3473,10 @@ fn manifest_recovery_fences_current(
     operation_guard: &rustfs_lock::NamespaceLockGuard,
     fleet_proof: &TierDeleteJournalFleetProofToken,
     manifest: &TierDeleteDispatchManifest,
+    cancel_token: Option<&CancellationToken>,
 ) -> bool {
-    !bucket_guard.is_lock_lost()
+    cancel_token.is_none_or(|token| !token.is_cancelled())
+        && !bucket_guard.is_lock_lost()
         && !operation_guard.is_lock_lost()
         && tier_delete_journal_fleet_proof_matches(fleet_proof)
         && tier_delete_journal_topology_generation(fleet_proof) == manifest.topology_generation
@@ -2535,7 +3505,10 @@ async fn cas_tier_delete_dispatch_manifest_state(
         fences_current,
     )
     .await;
-    let observed = read_tier_delete_dispatch_manifest(api, manifest_name).await?;
+    if write.as_ref().is_err_and(is_decommission_checkpoint_targets_incomplete) {
+        return Err(write.expect_err("the decommission checkpoint result should remain an error"));
+    }
+    let observed = read_tier_delete_dispatch_manifest(api.clone(), manifest_name).await?;
     if !fences_current() {
         return Err(Error::other(
             "tier delete dispatch manifest recovery fence changed during state transition",
@@ -2564,16 +3537,26 @@ async fn delete_tier_delete_dispatch_manifest_if_match_confirmed(
     }
     let data = encode_tier_delete_dispatch_manifest(manifest)?;
     let delete = delete_durable_config_if_match(api.clone(), manifest_name, &data, etag, fences_current).await;
-    let observed = read_tier_delete_dispatch_manifest(api, manifest_name).await?;
+    let observed = read_tier_delete_dispatch_manifest(api.clone(), manifest_name).await?;
     if !fences_current() {
         return Err(Error::other("tier delete dispatch manifest recovery fence changed during deletion"));
     }
     match observed {
         None => Ok(()),
-        Some((observed, _)) => Err(Error::other_with_context(
-            "tier delete dispatch manifest changed during deletion",
-            format!("observed {:?}, delete result {:?}", observed.state, delete.as_ref().err()),
-        )),
+        Some((observed, _)) => {
+            let observed_data = encode_tier_delete_dispatch_manifest(&observed)?;
+            if api
+                .durable_ilm_terminal_receipt_covers_active_source(manifest_name, &observed_data)
+                .await?
+            {
+                Ok(())
+            } else {
+                Err(Error::other_with_context(
+                    "tier delete dispatch manifest changed during deletion",
+                    format!("observed {:?}, delete result {:?}", observed.state, delete.as_ref().err()),
+                ))
+            }
+        }
     }
 }
 
@@ -2582,23 +3565,75 @@ async fn authorized_dispatch_all_committed(
     manifest: &TierDeleteDispatchManifest,
     fences_current: &impl Fn() -> bool,
 ) -> Result<bool> {
-    for name in &manifest.journal_names {
-        let (entry, _) = read_tier_delete_journal_with_etag(api.clone(), name)
-            .await?
-            .ok_or_else(|| Error::other("authorized tier delete dispatch manifest references a missing journal"))?;
-        validate_bound_journal(manifest, name, &entry)?;
-        record_tier_delete_journal_progress_fenced(api.clone(), name, &entry, fences_current).await?;
-        match entry.state {
-            TierDeleteJournalState::Committed => {}
-            TierDeleteJournalState::Dispatched => return Ok(false),
-            TierDeleteJournalState::Prepared => {
-                return Err(Error::other(
+    ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let make_read = |name: String| {
+        let api = api.clone();
+        let stopped = stopped.clone();
+        async move {
+            if stopped.load(Ordering::Acquire) {
+                return Ok::<_, Error>(TierDeleteJournalState::Committed);
+            }
+            let result = async {
+                ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+                #[cfg(all(test, feature = "test-util"))]
+                let _test_permit =
+                    tier_delete_dispatch_member_read_test_hook(TierDeleteDispatchMemberReadTestStage::Authorized).await;
+                ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+                let observed = read_tier_delete_journal_with_etag(api.clone(), &name).await?;
+                ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+                let (entry, _) = observed
+                    .ok_or_else(|| Error::other("authorized tier delete dispatch manifest references a missing journal"))?;
+                validate_bound_journal(manifest, &name, &entry)?;
+                #[cfg(all(test, feature = "test-util"))]
+                tier_delete_dispatch_authorized_progress_test_observed();
+                record_tier_delete_journal_progress_fenced(api, &name, &entry, fences_current).await?;
+                Ok(entry.state)
+            }
+            .await;
+            if result.is_err() {
+                stopped.store(true, Ordering::Release);
+            }
+            result
+        }
+    };
+    let mut next = 0;
+    let mut reads = futures::stream::FuturesUnordered::new();
+    while next < manifest.journal_names.len() && reads.len() < TIER_DELETE_DISPATCH_MEMBER_READ_CONCURRENCY {
+        reads.push(make_read(manifest.journal_names[next].clone()));
+        next += 1;
+    }
+    let mut all_committed = true;
+    let mut first_error = None;
+    while let Some(result) = reads.next().await {
+        match result {
+            Ok(TierDeleteJournalState::Committed) => {}
+            Ok(TierDeleteJournalState::Dispatched) => all_committed = false,
+            Ok(TierDeleteJournalState::Prepared) if first_error.is_none() => {
+                first_error = Some(Error::other(
                     "authorized tier delete dispatch contains a journal that was never dispatched",
                 ));
             }
+            Ok(TierDeleteJournalState::Prepared) => {}
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+        if first_error.is_some() {
+            stopped.store(true, Ordering::Release);
+        } else if !stopped.load(Ordering::Acquire) {
+            if let Err(err) = ensure_tier_delete_dispatch_member_scan_fence(fences_current) {
+                stopped.store(true, Ordering::Release);
+                first_error = Some(err);
+            } else if next < manifest.journal_names.len() {
+                reads.push(make_read(manifest.journal_names[next].clone()));
+                next += 1;
+            }
         }
     }
-    Ok(true)
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(all_committed),
+    }
 }
 
 async fn completed_dispatch_has_present_journal(
@@ -2606,16 +3641,59 @@ async fn completed_dispatch_has_present_journal(
     manifest: &TierDeleteDispatchManifest,
     fences_current: &impl Fn() -> bool,
 ) -> Result<bool> {
-    for name in &manifest.journal_names {
-        let Some((entry, _)) = read_tier_delete_journal_with_etag(api.clone(), name).await? else {
-            continue;
-        };
-        validate_bound_journal(manifest, name, &entry)?;
-        record_tier_delete_journal_progress_fenced(api.clone(), name, &entry, fences_current).await?;
-        if entry.state != TierDeleteJournalState::Committed {
-            return Err(Error::other("completed tier delete dispatch contains an uncommitted journal"));
+    for chunk in manifest.journal_names.chunks(TIER_DELETE_DISPATCH_MEMBER_READ_CONCURRENCY) {
+        ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut reads = futures::stream::iter(chunk.iter().cloned().map(|name| {
+            let api = api.clone();
+            let stopped = stopped.clone();
+            async move {
+                if stopped.load(Ordering::Acquire) {
+                    return Ok::<_, Error>(None);
+                }
+                let result = async {
+                    ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+                    #[cfg(all(test, feature = "test-util"))]
+                    let _test_permit =
+                        tier_delete_dispatch_member_read_test_hook(TierDeleteDispatchMemberReadTestStage::Completed).await;
+                    ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+                    let observed = read_tier_delete_journal_with_etag(api, &name).await?;
+                    ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+                    let Some((entry, _)) = observed else {
+                        return Ok(None);
+                    };
+                    validate_bound_journal(manifest, &name, &entry)?;
+                    if entry.state != TierDeleteJournalState::Committed {
+                        return Err(Error::other("completed tier delete dispatch contains an uncommitted journal"));
+                    }
+                    Ok(Some((name, entry)))
+                }
+                .await;
+                if result.is_err() {
+                    stopped.store(true, Ordering::Release);
+                }
+                result
+            }
+        }))
+        .buffer_unordered(TIER_DELETE_DISPATCH_MEMBER_READ_CONCURRENCY);
+        let mut present = None;
+        let mut first_error = None;
+        while let Some(result) = reads.next().await {
+            match result {
+                Ok(Some(found)) if present.is_none() => present = Some(found),
+                Ok(_) => {}
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
         }
-        return Ok(true);
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        ensure_tier_delete_dispatch_member_scan_fence(fences_current)?;
+        if let Some((name, entry)) = present {
+            record_tier_delete_journal_progress_fenced(api.clone(), &name, &entry, fences_current).await?;
+            return Ok(true);
+        }
     }
     Ok(false)
 }
@@ -2624,11 +3702,18 @@ async fn process_tier_delete_dispatch_manifest(
     api: Arc<ECStore>,
     manifest_name: &str,
     observed_before_lock: &TierDeleteDispatchManifest,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<TierDeleteDispatchManifestRecoveryOutcome> {
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+    }
     // A stale/missing capability may inspect records but must never mutate or
     // delete v6 evidence. The same proof is revalidated at every write edge.
     let fleet_proof = acquire_matching_manifest_fleet_proof(observed_before_lock).map_err(Error::other)?;
     let bucket_guard = api.acquire_bucket_lifecycle_write_lock(&observed_before_lock.bucket).await?;
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+    }
     let operation_lock = api
         .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(manifest_name))
         .await?;
@@ -2639,18 +3724,31 @@ async fn process_tier_delete_dispatch_manifest(
         .await?
         .ok_or_else(|| Error::ConfigNotFound)?;
     if current.bucket != observed_before_lock.bucket
-        || !manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current)
+        || !manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token)
     {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+        }
         return Err(Error::other("tier delete dispatch manifest recovery fence changed"));
     }
     {
-        let fences_current = || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current);
+        let fences_current =
+            || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
+        // A prior target PUT may have committed before its temporary capacity
+        // progress save. When recovery observes that checkpoint as current,
+        // no state CAS is left to trigger the normal already-committed path;
+        // reconcile the exact deterministic intent before any later journal
+        // mutation can be admitted.
+        let current_data = encode_tier_delete_dispatch_manifest(&current)?;
+        let _ = save_decommission_manifest_checkpoint_if_match(api.clone(), manifest_name, &current_data, &etag, &fences_current)
+            .await?;
         record_tier_delete_dispatch_manifest_progress_fenced(api.clone(), manifest_name, &current, &fences_current).await?;
     }
 
     if current.state == TierDeleteDispatchManifestState::Preparing {
         let next = {
-            let fences_current = || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current);
+            let fences_current =
+                || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
             cas_tier_delete_dispatch_manifest_state(
                 api.clone(),
                 manifest_name,
@@ -2669,12 +3767,14 @@ async fn process_tier_delete_dispatch_manifest(
         TierDeleteDispatchManifestState::Aborting | TierDeleteDispatchManifestState::Aborted
     ) {
         {
-            let fences_current = || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current);
+            let fences_current =
+                || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
             delete_staged_dispatch_journal_set(api.clone(), &current, &fences_current).await?;
         }
         if current.state == TierDeleteDispatchManifestState::Aborting {
             let next = {
-                let fences_current = || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current);
+                let fences_current =
+                    || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
                 cas_tier_delete_dispatch_manifest_state(
                     api.clone(),
                     manifest_name,
@@ -2687,22 +3787,31 @@ async fn process_tier_delete_dispatch_manifest(
             };
             (current, etag) = next;
         }
-        if !manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current) {
+        if !manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token) {
+            if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+                return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+            }
             return Err(Error::other("tier delete dispatch manifest recovery fence changed"));
         }
-        validate_staged_dispatch_journal_set(api.clone(), &current).await?;
-        let fences_current = || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current);
+        validate_staged_dispatch_journal_set(api.clone(), &current, &|| {
+            manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token)
+        })
+        .await?;
+        let fences_current =
+            || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
         delete_tier_delete_dispatch_manifest_if_match_confirmed(api, manifest_name, &current, &etag, &fences_current).await?;
         return Ok(TierDeleteDispatchManifestRecoveryOutcome::Deleted);
     }
 
     if current.state == TierDeleteDispatchManifestState::DispatchAuthorized {
-        let fences_current = || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current);
+        let fences_current =
+            || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
         if !authorized_dispatch_all_committed(api.clone(), &current, &fences_current).await? {
             return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
         }
         let next = {
-            let fences_current = || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current);
+            let fences_current =
+                || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
             cas_tier_delete_dispatch_manifest_state(
                 api.clone(),
                 manifest_name,
@@ -2722,11 +3831,15 @@ async fn process_tier_delete_dispatch_manifest(
     if current.state != TierDeleteDispatchManifestState::Completed {
         return Err(Error::other("tier delete dispatch manifest has an unsupported recovery state"));
     }
-    let fences_current = || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current);
+    let fences_current =
+        || manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token);
     if completed_dispatch_has_present_journal(api.clone(), &current, &fences_current).await? {
         return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
     }
-    if !manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current) {
+    if !manifest_recovery_fences_current(&bucket_guard, &operation_guard, &fleet_proof, &current, cancel_token) {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained);
+        }
         return Err(Error::other("tier delete dispatch manifest recovery fence changed"));
     }
     delete_tier_delete_dispatch_manifest_if_match_confirmed(api, manifest_name, &current, &etag, &fences_current).await?;
@@ -2738,9 +3851,263 @@ pub(crate) async fn recover_test_tier_delete_dispatch_manifest(api: Arc<ECStore>
     let (manifest, _) = read_tier_delete_dispatch_manifest(api.clone(), manifest_name)
         .await?
         .ok_or(Error::ConfigNotFound)?;
-    process_tier_delete_dispatch_manifest(api, manifest_name, &manifest)
+    process_tier_delete_dispatch_manifest(api, manifest_name, &manifest, None)
         .await
         .map(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TierDeleteDispatchManifestScanOutcome {
+    Advanced,
+    Deleted,
+    Retained,
+    Converged,
+    Failed,
+}
+
+type TierDeleteDispatchManifestRecoveryKey = (uuid::Uuid, String);
+
+#[derive(Default)]
+struct TierDeleteDispatchManifestRecoveryRegistry {
+    keys: HashSet<TierDeleteDispatchManifestRecoveryKey>,
+    active_by_store: HashMap<uuid::Uuid, usize>,
+}
+
+static TIER_DELETE_DISPATCH_MANIFEST_RECOVERIES: OnceLock<Mutex<TierDeleteDispatchManifestRecoveryRegistry>> = OnceLock::new();
+
+struct TierDeleteDispatchManifestRecoveryGuard {
+    key: TierDeleteDispatchManifestRecoveryKey,
+}
+
+impl TierDeleteDispatchManifestRecoveryGuard {
+    fn try_acquire(store_id: uuid::Uuid, object_name: &str) -> Option<Self> {
+        let key = (store_id, object_name.to_string());
+        let mut recoveries = TIER_DELETE_DISPATCH_MANIFEST_RECOVERIES
+            .get_or_init(|| Mutex::new(TierDeleteDispatchManifestRecoveryRegistry::default()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recoveries.keys.contains(&key)
+            || recoveries.active_by_store.get(&store_id).copied().unwrap_or_default()
+                >= TIER_DELETE_DISPATCH_MANIFEST_RECOVERY_CONCURRENCY
+        {
+            return None;
+        }
+        recoveries.keys.insert(key.clone());
+        *recoveries.active_by_store.entry(store_id).or_default() += 1;
+        Some(Self { key })
+    }
+}
+
+impl Drop for TierDeleteDispatchManifestRecoveryGuard {
+    fn drop(&mut self) {
+        let mut recoveries = TIER_DELETE_DISPATCH_MANIFEST_RECOVERIES
+            .get_or_init(|| Mutex::new(TierDeleteDispatchManifestRecoveryRegistry::default()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !recoveries.keys.remove(&self.key) {
+            return;
+        }
+        let store_id = self.key.0;
+        let remove_store = if let Some(active) = recoveries.active_by_store.get_mut(&store_id) {
+            *active = active.saturating_sub(1);
+            *active == 0
+        } else {
+            false
+        };
+        if remove_store {
+            recoveries.active_by_store.remove(&store_id);
+        }
+    }
+}
+
+async fn recover_tier_delete_dispatch_manifest_object(
+    api: Arc<ECStore>,
+    object_name: String,
+    cancel_token: Option<CancellationToken>,
+) -> TierDeleteDispatchManifestScanOutcome {
+    if cancel_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        return TierDeleteDispatchManifestScanOutcome::Retained;
+    }
+    let data = match config_boundary::read_config(api.clone(), &object_name).await {
+        Ok(data) => data,
+        Err(Error::ConfigNotFound) | Err(Error::FileNotFound) => {
+            return TierDeleteDispatchManifestScanOutcome::Converged;
+        }
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                manifest_object = %object_name,
+                error = ?err,
+                "Failed to read tier delete dispatch manifest"
+            );
+            return TierDeleteDispatchManifestScanOutcome::Failed;
+        }
+    };
+    let manifest = match decode_tier_delete_dispatch_manifest(&data, &object_name) {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                manifest_object = %object_name,
+                error = ?err,
+                "Invalid tier delete dispatch manifest is quarantined"
+            );
+            return TierDeleteDispatchManifestScanOutcome::Failed;
+        }
+    };
+    match api
+        .durable_ilm_terminal_receipt_covers_active_source(&object_name, &data)
+        .await
+    {
+        Ok(true) => {
+            // The remaining copy is the decommission source checkpoint. Its
+            // target-side terminal receipt makes the logical operation
+            // complete; only decommission verification may remove it.
+            return TierDeleteDispatchManifestScanOutcome::Retained;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            debug!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                manifest_object = %object_name,
+                operation_id = %manifest.operation_id,
+                error = ?err,
+                "Tier delete dispatch terminal source proof will retry later"
+            );
+            return TierDeleteDispatchManifestScanOutcome::Failed;
+        }
+    }
+    let result = process_tier_delete_dispatch_manifest(api, &object_name, &manifest, cancel_token.as_ref()).await;
+    if cancel_token.as_ref().is_some_and(CancellationToken::is_cancelled) {
+        // Cancellation is cooperative: every admitted mutation above has
+        // already returned while the operation/fleet guards and registry
+        // permit were still held. Durable partial progress is intentionally
+        // retained for a fresh store instance to replay.
+        return TierDeleteDispatchManifestScanOutcome::Retained;
+    }
+    match result {
+        Ok(TierDeleteDispatchManifestRecoveryOutcome::Advanced) => TierDeleteDispatchManifestScanOutcome::Advanced,
+        Ok(TierDeleteDispatchManifestRecoveryOutcome::Deleted) => TierDeleteDispatchManifestScanOutcome::Deleted,
+        Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained) => TierDeleteDispatchManifestScanOutcome::Retained,
+        Err(Error::ConfigNotFound) => TierDeleteDispatchManifestScanOutcome::Converged,
+        Err(err) => {
+            debug!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                manifest_object = %object_name,
+                operation_id = %manifest.operation_id,
+                state = ?manifest.state,
+                error = ?err,
+                "Tier delete dispatch manifest recovery will retry later"
+            );
+            TierDeleteDispatchManifestScanOutcome::Failed
+        }
+    }
+}
+
+async fn schedule_tier_delete_dispatch_manifest_recovery(
+    api: Arc<ECStore>,
+    object_name: String,
+    recovery_timeout: Duration,
+) -> TierDeleteDispatchManifestScanOutcome {
+    let Some(guard) = TierDeleteDispatchManifestRecoveryGuard::try_acquire(api.id, &object_name) else {
+        // A prior page timed out while this manifest was still running, or the
+        // per-store worker budget is full. Do not queue an operation-lock or
+        // worker-permit waiter: the durable record will be observed by a later
+        // page after an active worker converges or releases its permit.
+        return TierDeleteDispatchManifestScanOutcome::Retained;
+    };
+    let log_name = object_name.clone();
+    let cancel_token = api.ctx.background_cancel_token();
+    let mut recovery = tokio::spawn(async move {
+        let _guard = guard;
+        // Never drop an in-flight recovery on shutdown: lower config writes
+        // may hand their physical commit to a detached task. The token is a
+        // cooperative admission fence, so already-started mutations drain
+        // under the same bucket/operation/fleet guards and registry permit.
+        recover_tier_delete_dispatch_manifest_object(api, object_name, cancel_token).await
+    });
+    match tokio::time::timeout(recovery_timeout, &mut recovery).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(err)) => {
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                manifest_object = %log_name,
+                error = ?err,
+                "Tier delete dispatch manifest recovery task failed and will retry later"
+            );
+            TierDeleteDispatchManifestScanOutcome::Failed
+        }
+        Err(_) => {
+            // Dropping a Tokio JoinHandle detaches rather than cancels the
+            // task. The per-store/object guard keeps later pages from queuing
+            // duplicates while this bounded worker continues toward the tail
+            // of a large manifest under the same operation/fleet fences.
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                manifest_object = %log_name,
+                timeout_seconds = recovery_timeout.as_secs_f64(),
+                "Tier delete dispatch manifest recovery exceeded its page budget and continues in the background"
+            );
+            TierDeleteDispatchManifestScanOutcome::Failed
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn recover_test_tier_delete_dispatch_manifest_with_page_budget(
+    api: Arc<ECStore>,
+    manifest_name: &str,
+    recovery_timeout: Duration,
+) -> bool {
+    matches!(
+        schedule_tier_delete_dispatch_manifest_recovery(api, manifest_name.to_string(), recovery_timeout).await,
+        TierDeleteDispatchManifestScanOutcome::Failed
+    )
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn tier_delete_dispatch_manifest_recovery_inflight_for_test(api: &ECStore, manifest_name: &str) -> bool {
+    TIER_DELETE_DISPATCH_MANIFEST_RECOVERIES
+        .get_or_init(|| Mutex::new(TierDeleteDispatchManifestRecoveryRegistry::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys
+        .contains(&(api.id, manifest_name.to_string()))
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) fn tier_delete_dispatch_manifest_recovery_count_for_test(api: &ECStore) -> usize {
+    TIER_DELETE_DISPATCH_MANIFEST_RECOVERIES
+        .get_or_init(|| Mutex::new(TierDeleteDispatchManifestRecoveryRegistry::default()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active_by_store
+        .get(&api.id)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn tier_delete_dispatch_manifest_operation_lock_held_for_test(api: Arc<ECStore>, manifest_name: &str) -> bool {
+    let Ok(lock) = api
+        .new_ns_lock(RUSTFS_META_BUCKET, &tier_delete_dispatch_operation_lock_name(manifest_name))
+        .await
+    else {
+        return false;
+    };
+    lock.get_write_lock(Duration::from_millis(20)).await.is_err()
 }
 
 pub async fn recover_tier_delete_dispatch_manifests(
@@ -2773,60 +4140,134 @@ pub async fn recover_tier_delete_dispatch_manifests(
         next_marker: list.next_continuation_token,
         truncated: list.is_truncated,
     };
-    for object in list.objects {
+    let mut recoveries = futures::stream::iter(list.objects.into_iter().map(|object| {
+        let api = api.clone();
+        async move {
+            schedule_tier_delete_dispatch_manifest_recovery(api, object.name, TIER_DELETE_DISPATCH_MANIFEST_RECOVERY_TIMEOUT)
+                .await
+        }
+    }))
+    .buffer_unordered(TIER_DELETE_DISPATCH_MANIFEST_RECOVERY_CONCURRENCY);
+    while let Some(outcome) = recoveries.next().await {
         stats.scanned += 1;
-        let data = match config_boundary::read_config(api.clone(), &object.name).await {
-            Ok(data) => data,
-            Err(Error::ConfigNotFound) | Err(Error::FileNotFound) => continue,
-            Err(err) => {
-                stats.failed += 1;
-                warn!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    manifest_object = %object.name,
-                    error = ?err,
-                    "Failed to read tier delete dispatch manifest"
-                );
-                continue;
-            }
-        };
-        let manifest = match decode_tier_delete_dispatch_manifest(&data, &object.name) {
-            Ok(manifest) => manifest,
-            Err(err) => {
-                stats.failed += 1;
-                warn!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    manifest_object = %object.name,
-                    error = ?err,
-                    "Invalid tier delete dispatch manifest is quarantined"
-                );
-                continue;
-            }
-        };
-        match process_tier_delete_dispatch_manifest(api.clone(), &object.name, &manifest).await {
-            Ok(TierDeleteDispatchManifestRecoveryOutcome::Advanced) => stats.advanced += 1,
-            Ok(TierDeleteDispatchManifestRecoveryOutcome::Deleted) => stats.deleted += 1,
-            Ok(TierDeleteDispatchManifestRecoveryOutcome::Retained) => stats.retained += 1,
-            Err(Error::ConfigNotFound) => {}
-            Err(err) => {
-                stats.failed += 1;
-                debug!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    manifest_object = %object.name,
-                    operation_id = %manifest.operation_id,
-                    state = ?manifest.state,
-                    error = ?err,
-                    "Tier delete dispatch manifest recovery will retry later"
-                );
-            }
+        match outcome {
+            TierDeleteDispatchManifestScanOutcome::Advanced => stats.advanced += 1,
+            TierDeleteDispatchManifestScanOutcome::Deleted => stats.deleted += 1,
+            TierDeleteDispatchManifestScanOutcome::Retained => stats.retained += 1,
+            TierDeleteDispatchManifestScanOutcome::Failed => stats.failed += 1,
+            TierDeleteDispatchManifestScanOutcome::Converged => {}
         }
     }
     Ok(stats)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TierDeleteJournalEntryRecoveryOutcome {
+    Deleted,
+    Converged,
+    Retained,
+    Failed,
+}
+
+async fn recover_tier_delete_journal_entry(api: Arc<ECStore>, object_name: String) -> TierDeleteJournalEntryRecoveryOutcome {
+    let data = match config_boundary::read_config(api.clone(), &object_name).await {
+        Ok(data) => data,
+        Err(Error::ConfigNotFound) => return TierDeleteJournalEntryRecoveryOutcome::Converged,
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                journal_object = %object_name,
+                error = ?err,
+                "Failed to read tier delete journal entry"
+            );
+            return TierDeleteJournalEntryRecoveryOutcome::Failed;
+        }
+    };
+
+    let je = match decode_tier_delete_journal_entry(&data) {
+        Ok(je) => je,
+        Err(err) => {
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                journal_object = %object_name,
+                error = ?err,
+                "Failed to decode tier delete journal entry"
+            );
+            return TierDeleteJournalEntryRecoveryOutcome::Failed;
+        }
+    };
+
+    if tier_delete_journal_object_name(&je) != object_name {
+        warn!(
+            event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            journal_object = %object_name,
+            "Tier delete journal content does not match its object name and will be retained"
+        );
+        return TierDeleteJournalEntryRecoveryOutcome::Failed;
+    }
+
+    match api
+        .durable_ilm_terminal_receipt_covers_active_source(&object_name, &data)
+        .await
+    {
+        Ok(true) => return TierDeleteJournalEntryRecoveryOutcome::Retained,
+        Ok(false) => {}
+        Err(err) => {
+            debug!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                journal_object = %object_name,
+                error = ?err,
+                "Tier delete journal terminal source proof will retry later"
+            );
+            return TierDeleteJournalEntryRecoveryOutcome::Failed;
+        }
+    }
+
+    if je.backend_identity.is_none() {
+        warn!(
+            event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            journal_object = %object_name,
+            remote_object = %je.obj_name,
+            remote_version_id = %je.version_id,
+            tier = %je.tier_name,
+            "Legacy tier delete journal entry has no durable backend identity and will be retained"
+        );
+        return TierDeleteJournalEntryRecoveryOutcome::Failed;
+    }
+
+    match process_tier_delete_journal_entry(api, &je).await {
+        Ok(()) => TierDeleteJournalEntryRecoveryOutcome::Deleted,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Another recovery worker may have completed the same journal
+            // after this page was listed but before we acquired its recovery
+            // lock. The durable obligation has converged.
+            TierDeleteJournalEntryRecoveryOutcome::Converged
+        }
+        Err(err) => {
+            debug!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                journal_object = %object_name,
+                remote_object = %je.obj_name,
+                remote_version_id = %je.version_id,
+                tier = %je.tier_name,
+                error = ?err,
+                "Tier delete journal recovery will retry later"
+            );
+            TierDeleteJournalEntryRecoveryOutcome::Failed
+        }
+    }
 }
 
 pub async fn recover_tier_delete_journal_entries(
@@ -2843,7 +4284,7 @@ pub async fn recover_tier_delete_journal_entries(
         .list_objects_v2(
             RUSTFS_META_BUCKET,
             TIER_DELETE_JOURNAL_PREFIX,
-            marker.clone(),
+            marker,
             None,
             i32::try_from(limit).unwrap_or(i32::MAX),
             false,
@@ -2859,90 +4300,39 @@ pub async fn recover_tier_delete_journal_entries(
         next_marker: list.next_continuation_token,
         truncated: list.is_truncated,
     };
+    let mut recoveries = futures::stream::iter(list.objects.into_iter().map(|object| {
+        let api = api.clone();
+        async move {
+            let object_name = object.name;
+            match tokio::time::timeout(
+                TIER_DELETE_JOURNAL_ENTRY_RECOVERY_TIMEOUT,
+                recover_tier_delete_journal_entry(api, object_name.clone()),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    warn!(
+                        event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                        journal_object = %object_name,
+                        timeout_seconds = TIER_DELETE_JOURNAL_ENTRY_RECOVERY_TIMEOUT.as_secs(),
+                        "Tier delete journal entry recovery timed out and will retry after marker rotation"
+                    );
+                    TierDeleteJournalEntryRecoveryOutcome::Failed
+                }
+            }
+        }
+    }))
+    .buffer_unordered(TIER_DELETE_JOURNAL_RECOVERY_CONCURRENCY);
 
-    for object in list.objects {
+    while let Some(outcome) = recoveries.next().await {
         stats.scanned += 1;
-        let data = match config_boundary::read_config(api.clone(), &object.name).await {
-            Ok(data) => data,
-            Err(Error::ConfigNotFound) => continue,
-            Err(err) => {
-                stats.failed += 1;
-                warn!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    journal_object = %object.name,
-                    error = ?err,
-                    "Failed to read tier delete journal entry"
-                );
-                continue;
-            }
-        };
-
-        let je = match decode_tier_delete_journal_entry(&data) {
-            Ok(je) => je,
-            Err(err) => {
-                stats.failed += 1;
-                warn!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    journal_object = %object.name,
-                    error = ?err,
-                    "Failed to decode tier delete journal entry"
-                );
-                continue;
-            }
-        };
-
-        if tier_delete_journal_object_name(&je) != object.name {
-            stats.failed += 1;
-            warn!(
-                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                journal_object = %object.name,
-                "Tier delete journal content does not match its object name and will be retained"
-            );
-            continue;
-        }
-
-        if je.backend_identity.is_none() {
-            stats.failed += 1;
-            warn!(
-                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                journal_object = %object.name,
-                remote_object = %je.obj_name,
-                remote_version_id = %je.version_id,
-                tier = %je.tier_name,
-                "Legacy tier delete journal entry has no durable backend identity and will be retained"
-            );
-            continue;
-        }
-
-        match process_tier_delete_journal_entry(api.clone(), &je).await {
-            Ok(()) => stats.deleted += 1,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                // Another recovery worker may have completed the same journal
-                // after this page was listed but before we acquired its
-                // recovery lock. The durable obligation has converged.
-            }
-            Err(err) => {
-                stats.failed += 1;
-                debug!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    journal_object = %object.name,
-                    remote_object = %je.obj_name,
-                    remote_version_id = %je.version_id,
-                    tier = %je.tier_name,
-                    error = ?err,
-                    "Tier delete journal recovery will retry later"
-                );
-            }
+        match outcome {
+            TierDeleteJournalEntryRecoveryOutcome::Deleted => stats.deleted += 1,
+            TierDeleteJournalEntryRecoveryOutcome::Failed => stats.failed += 1,
+            TierDeleteJournalEntryRecoveryOutcome::Converged | TierDeleteJournalEntryRecoveryOutcome::Retained => {}
         }
     }
 
@@ -3121,6 +4511,7 @@ mod tests {
                 operation_id,
                 manifest_object: "ilm/tier-delete-dispatch-manifests/manifest.json".to_string(),
                 journal_set_sha256: "7".repeat(64),
+                topology_generation: "8".repeat(64),
             }),
         }
     }

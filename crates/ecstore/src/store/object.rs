@@ -2959,7 +2959,7 @@ impl ECStore {
         Ok(guards)
     }
 
-    async fn acquire_data_movement_publication_write_locks(
+    pub(crate) async fn acquire_data_movement_publication_write_locks(
         &self,
         bucket: &str,
         object: &str,

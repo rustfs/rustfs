@@ -310,6 +310,7 @@ pub(crate) struct TierDeleteDispatchBinding {
     pub(crate) operation_id: Uuid,
     pub(crate) manifest_object: String,
     pub(crate) journal_set_sha256: String,
+    pub(crate) topology_generation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
