@@ -37,6 +37,14 @@ pub(crate) struct SiteReplicationRetryEvent {
     /// [`settle_site_replication_retry_events`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) edit_generation: Option<u64>,
+    /// Whether every failure folded into this collapsed IAM entry had its
+    /// deletion body (if it was a deletion) recorded in
+    /// [`SiteReplicationState::iam_deletion_replays`]. Only then may a
+    /// successful deletion replay plus a stable snapshot resend settle the
+    /// entry; a legacy entry (or one degraded by record overflow) keeps the
+    /// escalation semantics because an unrecorded deletion may hide in it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) deletions_recorded: bool,
 }
 
 pub(crate) fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path: &str) -> bool {
@@ -87,6 +95,10 @@ pub(crate) fn normalize_collapsed_retry_queue_paths(queue: &mut Vec<SiteReplicat
             (Some(_), None) => true,
             _ => false,
         };
+        // Merged rows may span binaries: a row written without deletion
+        // recording taints the merged entry, so only both-recorded merges
+        // stay settleable.
+        let deletions_recorded = existing.deletions_recorded && event.deletions_recorded;
         if event_is_newer {
             let retry_count = existing.retry_count.max(event.retry_count);
             *existing = event;
@@ -94,6 +106,7 @@ pub(crate) fn normalize_collapsed_retry_queue_paths(queue: &mut Vec<SiteReplicat
         } else {
             existing.retry_count = existing.retry_count.max(event.retry_count);
         }
+        existing.deletions_recorded = deletions_recorded;
         existing.failed = existing.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
     }
     *queue = normalized;
@@ -210,6 +223,7 @@ pub(crate) fn upsert_site_replication_retry_event(
         last_error: detail,
         updated_at: Some(now),
         edit_generation: generation,
+        deletions_recorded: false,
     });
     if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
         let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
@@ -268,6 +282,342 @@ pub(crate) async fn enqueue_site_replication_retry_event_for_generation(
             path,
             error = ?err,
             "failed to persist site replication retry event"
+        );
+    }
+}
+
+pub(crate) const SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/iam-item";
+
+/// Per-peer cap on recorded deletion bodies. Beyond it the peer's collapsed
+/// IAM entry degrades to the escalation semantics (an unrecorded deletion may
+/// exist), so the list stays bounded without silently dropping liability.
+pub(crate) const SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER: usize = 256;
+
+/// One IAM deletion event whose delivery to `peer` failed, kept verbatim so
+/// the retry drain can replay it before the snapshot resend. `entity`
+/// collapses repeated deletions of the same entity into the newest body.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct SiteReplicationIamDeletionReplay {
+    pub(crate) id: String,
+    pub(crate) peer_deployment_id: String,
+    pub(crate) peer_endpoint: String,
+    pub(crate) entity: String,
+    pub(crate) item: Value,
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    pub(crate) recorded_at: Option<OffsetDateTime>,
+}
+
+pub(crate) fn iam_deletion_replay_matches(record: &SiteReplicationIamDeletionReplay, peer: &PeerInfo) -> bool {
+    record.peer_deployment_id == peer.deployment_id || record.peer_endpoint == peer.endpoint
+}
+
+/// The entity a deletion-shaped IAM item removes, or `None` for items that
+/// create or update state (those are faithfully replayed by the snapshot
+/// resend and need no record). Group member removal keys on the removed
+/// member set: two removals from the same group are distinct events, not a
+/// newer revision of one another.
+pub(crate) fn iam_item_deletion_entity(item: &SRIAMItem) -> Option<String> {
+    match item.r#type.as_str() {
+        "policy" if item.policy.is_none() => Some(format!("policy:{}", item.name)),
+        "iam-user" => item
+            .iam_user
+            .as_ref()
+            .filter(|user| user.is_delete_req)
+            .map(|user| format!("iam-user:{}", user.access_key)),
+        "group-info" => item
+            .group_info
+            .as_ref()
+            .filter(|group| group.update_req.is_remove)
+            .map(|group| {
+                let mut members = group.update_req.members.clone();
+                members.sort_unstable();
+                format!("group-remove:{}:{}", group.update_req.group, members.join(","))
+            }),
+        "policy-mapping" => item
+            .policy_mapping
+            .as_ref()
+            .filter(|mapping| mapping.policy.is_empty())
+            .map(|mapping| format!("policy-mapping:{}:{}:{}", mapping.user_or_group, mapping.user_type, mapping.is_group)),
+        "service-account" => item
+            .svc_acc_change
+            .as_ref()
+            .and_then(|change| change.delete.as_ref())
+            .map(|delete| format!("svc-acc:{}", delete.access_key)),
+        _ => None,
+    }
+}
+
+/// Failure bookkeeping for one IAM item delivery: upsert the collapsed retry
+/// event and, when the item is a deletion, record its body for replay. Both
+/// live in the same state so the caller commits them in one transaction — a
+/// retry entry can never exist whose deletion body was lost to a separate
+/// failed write.
+pub(crate) fn record_failed_iam_delivery(state: &mut SiteReplicationState, peer: &PeerInfo, item: &SRIAMItem, error: &str) {
+    let existed = state
+        .retry_queue
+        .iter()
+        .any(|event| retry_event_matches(event, peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH));
+    upsert_site_replication_retry_event(&mut state.retry_queue, peer, SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH, error, None);
+    if !existed
+        && let Some(event) = state
+            .retry_queue
+            .iter_mut()
+            .find(|event| retry_event_matches(event, peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH))
+    {
+        // Fresh entry: every failure it will ever collapse goes through this
+        // recording path, so a deletion replay plus a stable snapshot resend
+        // can later settle it instead of escalating.
+        event.deletions_recorded = true;
+    }
+
+    let Some(entity) = iam_item_deletion_entity(item) else {
+        return;
+    };
+    let item_value = match serde_json::to_value(item) {
+        Ok(value) => value,
+        Err(_) => {
+            degrade_iam_retry_event_to_escalation(state, peer);
+            return;
+        }
+    };
+    let now = OffsetDateTime::now_utc();
+    if let Some(existing) = state
+        .iam_deletion_replays
+        .iter_mut()
+        .find(|record| iam_deletion_replay_matches(record, peer) && record.entity == entity)
+    {
+        existing.item = item_value;
+        existing.recorded_at = Some(now);
+        return;
+    }
+
+    let per_peer = state
+        .iam_deletion_replays
+        .iter()
+        .filter(|record| iam_deletion_replay_matches(record, peer))
+        .count();
+    if per_peer >= SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER {
+        // The record set is no longer complete for this peer; the entry must
+        // escalate rather than settle. Drop the oldest record to stay
+        // bounded — remaining records are still replayed best-effort.
+        degrade_iam_retry_event_to_escalation(state, peer);
+        if let Some(oldest) = state
+            .iam_deletion_replays
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| iam_deletion_replay_matches(record, peer))
+            .min_by_key(|(_, record)| record.recorded_at)
+            .map(|(index, _)| index)
+        {
+            state.iam_deletion_replays.remove(oldest);
+        }
+    }
+    state.iam_deletion_replays.push(SiteReplicationIamDeletionReplay {
+        id: Uuid::new_v4().to_string(),
+        peer_deployment_id: peer.deployment_id.clone(),
+        peer_endpoint: peer.endpoint.clone(),
+        entity,
+        item: item_value,
+        recorded_at: Some(now),
+    });
+}
+
+pub(crate) fn degrade_iam_retry_event_to_escalation(state: &mut SiteReplicationState, peer: &PeerInfo) {
+    if let Some(event) = state
+        .retry_queue
+        .iter_mut()
+        .find(|event| retry_event_matches(event, peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH))
+    {
+        event.deletions_recorded = false;
+    }
+}
+
+pub(crate) fn iam_deletion_replays_for_peer(
+    state: &SiteReplicationState,
+    peer: &PeerInfo,
+) -> Vec<SiteReplicationIamDeletionReplay> {
+    let mut records: Vec<SiteReplicationIamDeletionReplay> = state
+        .iam_deletion_replays
+        .iter()
+        .filter(|record| iam_deletion_replay_matches(record, peer))
+        .cloned()
+        .collect();
+    // Oldest first, so a later deletion of a recreated entity lands after
+    // the earlier one.
+    records.sort_by_key(|record| record.recorded_at);
+    records
+}
+
+pub(crate) fn clear_iam_deletion_replays_for_peer(state: &mut SiteReplicationState, peer: &PeerInfo) {
+    state
+        .iam_deletion_replays
+        .retain(|record| !iam_deletion_replay_matches(record, peer));
+}
+
+pub(crate) async fn record_failed_site_replication_iam_delivery(peer: &PeerInfo, item: &SRIAMItem, error: &S3Error) {
+    let peer_owned = peer.clone();
+    let item_owned = item.clone();
+    let error_text = error.to_string();
+    let deletion_entity = iam_item_deletion_entity(item);
+    let result = update_site_replication_state(move |state| {
+        // A departed peer can never drain its entries again (remove_sites
+        // already pruned them) — mirror enqueue_site_replication_retry_event.
+        if state.peers.contains_key(&peer_owned.deployment_id) {
+            record_failed_iam_delivery(state, &peer_owned, &item_owned, &error_text);
+        }
+        Ok(())
+    })
+    .await;
+
+    match result {
+        Ok(()) => {
+            if let Some(entity) = deletion_entity {
+                warn!(
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    peer = %peer.endpoint,
+                    deployment_id = %peer.deployment_id,
+                    entity = %entity,
+                    result = "iam_deletion_recorded_for_replay",
+                    "IAM deletion delivery to peer failed; recorded for retry-drain replay"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                peer = %peer.endpoint,
+                deployment_id = %peer.deployment_id,
+                error = ?err,
+                "failed to persist site replication IAM delivery failure"
+            );
+        }
+    }
+}
+
+/// Post-replay settlement for a collapsed IAM entry: remove the replayed
+/// deletion records and, when the entry's whole liability is provably
+/// replayed (`deletions_recorded` and no residual records), remove the entry.
+/// Anything else falls back to the escalation marker, and a failure stamped
+/// after `snapshot_updated_at` keeps the entry drain-eligible untouched.
+/// Returns whether the entry was fully settled.
+pub(crate) fn settle_replayed_iam_retry_events(
+    state: &mut SiteReplicationState,
+    peer: &PeerInfo,
+    path: &str,
+    snapshot_updated_at: Option<OffsetDateTime>,
+    replayed_record_ids: &[String],
+) -> bool {
+    state
+        .iam_deletion_replays
+        .retain(|record| !(iam_deletion_replay_matches(record, peer) && replayed_record_ids.contains(&record.id)));
+
+    if collapsed_retry_queue_path(path) != Some(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH) {
+        return false;
+    }
+    let Some(index) = state
+        .retry_queue
+        .iter()
+        .position(|event| retry_event_matches(event, peer, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH))
+    else {
+        return false;
+    };
+    let event = &state.retry_queue[index];
+    let newer_failure_recorded = match (event.updated_at, snapshot_updated_at) {
+        (Some(current), Some(seen)) => current > seen,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if newer_failure_recorded && event.last_error != SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER {
+        // The newer failure's own deletion (if any) has its own record; the
+        // next drain pass replays it.
+        return false;
+    }
+    let residual_records = state
+        .iam_deletion_replays
+        .iter()
+        .any(|record| iam_deletion_replay_matches(record, peer));
+    if event.deletions_recorded && !residual_records {
+        state.retry_queue.remove(index);
+        return true;
+    }
+    escalate_site_replication_retry_events_up_to(&mut state.retry_queue, peer, path, snapshot_updated_at);
+    false
+}
+
+pub(crate) async fn settle_replayed_site_replication_iam_retry_event(
+    peer: &PeerInfo,
+    path: &str,
+    snapshot_updated_at: Option<OffsetDateTime>,
+    replayed_record_ids: Vec<String>,
+) {
+    let peer_owned = peer.clone();
+    let path_owned = path.to_string();
+    let result = update_site_replication_state(move |state| {
+        Ok(settle_replayed_iam_retry_events(
+            state,
+            &peer_owned,
+            &path_owned,
+            snapshot_updated_at,
+            &replayed_record_ids,
+        ))
+    })
+    .await;
+
+    match result {
+        Ok(true) => {
+            info!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                peer = %peer.endpoint,
+                deployment_id = %peer.deployment_id,
+                result = "iam_retry_event_settled",
+                "recorded IAM deletions replayed and snapshot stable; collapsed retry entry settled"
+            );
+        }
+        Ok(false) => {}
+        Err(err) => {
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                peer = %peer.endpoint,
+                deployment_id = %peer.deployment_id,
+                path,
+                error = ?err,
+                "failed to settle replayed site replication IAM retry event"
+            );
+        }
+    }
+}
+
+/// Drop a deletion record whose body no longer deserializes (it can never be
+/// replayed) and degrade the peer's entry to escalation so the liability
+/// stays operator-visible instead of silently settling.
+pub(crate) async fn drop_corrupt_iam_deletion_replay(peer: &PeerInfo, record_id: &str) {
+    let peer_owned = peer.clone();
+    let record_id_owned = record_id.to_string();
+    let result = update_site_replication_state(move |state| {
+        state.iam_deletion_replays.retain(|record| record.id != record_id_owned);
+        degrade_iam_retry_event_to_escalation(state, &peer_owned);
+        Ok(())
+    })
+    .await;
+
+    if let Err(err) = result {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            peer = %peer.endpoint,
+            deployment_id = %peer.deployment_id,
+            record_id,
+            error = ?err,
+            "failed to drop corrupt site replication IAM deletion record"
         );
     }
 }
@@ -631,13 +981,15 @@ pub(crate) fn actionable_site_replication_retry_events(
 /// Background consumer for the retry queue, run from the reconcile tick.
 ///
 /// Scope: this settles "delivered once and failed" entries whose replay is
-/// faithful (bucket ops, peer edits). Collapsed iam-item / bucket-meta
-/// entries are snapshot-resent and then *escalated*, not cleared — a failed
-/// deletion leaves no task in the snapshot, so remote absence stays unproven
-/// until a later delivery or a manual repair. A hook that never fired (crash
-/// between the local commit and the send) leaves no entry at all, so the
-/// drain is not a full cross-site diff-heal; manual repair remains the
-/// authoritative catch-all.
+/// faithful (bucket ops, peer edits). Collapsed iam-item entries replay the
+/// recorded deletion bodies and then the snapshot, which together cover every
+/// failure the hook recorded, so a fully-recorded entry settles; an entry
+/// with an unrecorded deletion (legacy rows, record overflow) is *escalated*
+/// instead — remote absence stays unproven until a later delivery or a
+/// manual repair. Collapsed bucket-meta entries keep the escalate-only
+/// semantics. A hook that never fired (crash between the local commit and
+/// the send) leaves no entry at all, so the drain is not a full cross-site
+/// diff-heal; manual repair remains the authoritative catch-all.
 pub(crate) async fn drain_site_replication_retry_queue() {
     if let Err(err) = drain_site_replication_retry_queue_inner().await {
         warn!(
@@ -778,6 +1130,28 @@ pub(crate) async fn drain_one_site_replication_retry_event(
             let Some(plan) = plan else {
                 return Ok(false);
             };
+            // Replay recorded IAM deletion bodies BEFORE the snapshot: an
+            // entity deleted and later recreated locally is restored by the
+            // snapshot that follows, so the replay can never end below the
+            // current local state (backlog#2071).
+            let is_iam = matches!(action, RetryDrainAction::IamSnapshot);
+            let mut replayed_record_ids = Vec::new();
+            if is_iam {
+                for record in iam_deletion_replays_for_peer(&runtime.state, peer) {
+                    let Ok(item) = serde_json::from_value::<SRIAMItem>(record.item.clone()) else {
+                        drop_corrupt_iam_deletion_replay(peer, &record.id).await;
+                        continue;
+                    };
+                    if let Err(err) = SiteReplicationRepairTask::Iam(&item)
+                        .send(transport, access_key, secret_key)
+                        .await
+                    {
+                        enqueue_site_replication_retry_event(peer, &event.path, &err).await;
+                        return Err(err);
+                    }
+                    replayed_record_ids.push(record.id.clone());
+                }
+            }
             let mut current_snapshot = RetrySnapshot::from_plan(&action, plan).expect("snapshot action has a snapshot");
             let mut replay = current_snapshot.clone();
             for _ in 0..SITE_REPLICATION_RETRY_SNAPSHOT_STABILITY_ATTEMPTS {
@@ -790,7 +1164,17 @@ pub(crate) async fn drain_one_site_replication_retry_event(
                 let fresh_plan = site_replication_bootstrap_plan(&fresh_info)?;
                 let fresh_snapshot = RetrySnapshot::from_plan(&action, &fresh_plan).expect("snapshot action has a snapshot");
                 if fresh_snapshot.fingerprint()? == current_fingerprint {
-                    escalate_site_replication_retry_event_up_to(peer, &event.path, event.updated_at).await;
+                    if is_iam {
+                        settle_replayed_site_replication_iam_retry_event(
+                            peer,
+                            &event.path,
+                            event.updated_at,
+                            replayed_record_ids,
+                        )
+                        .await;
+                    } else {
+                        escalate_site_replication_retry_event_up_to(peer, &event.path, event.updated_at).await;
+                    }
                     return Ok(true);
                 }
                 replay = RetrySnapshot::replay_after_change(&current_snapshot, &fresh_snapshot, OffsetDateTime::now_utc());
