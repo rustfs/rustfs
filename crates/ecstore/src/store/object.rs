@@ -884,8 +884,7 @@ impl AsyncRead for SelectObjectSnapshotReader {
         }
         let filled_before = buf.filled().len();
         let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        let reached_eof = matches!(&poll, Poll::Ready(Ok(()))) && buf.filled().len() == filled_before;
-        if self.lease.is_lost() || (reached_eof && self.lease.check().is_err()) {
+        if self.lease.check().is_err() {
             buf.set_filled(filled_before);
             return Poll::Ready(Err(std::io::Error::other(SnapshotConsistencyError::LockLost)));
         }
@@ -4209,7 +4208,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn select_snapshot_reader_checks_guards_at_eof_before_monitor_runs() {
+    async fn select_snapshot_reader_checks_guards_before_monitor_runs() {
         let (guard, signal, client) = refresh_failure_test_guard("select-snapshot-eof-fence").await;
         client.reject_refreshes();
         client
@@ -4234,7 +4233,7 @@ mod tests {
             .await
             .expect_err("EOF fence must reject a lease lost before its monitor is scheduled");
 
-        assert_eq!(output, b"old-generation");
+        assert!(output.is_empty(), "bytes from a known-lost snapshot must not escape");
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
     }
 
