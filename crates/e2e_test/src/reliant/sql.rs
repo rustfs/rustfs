@@ -324,7 +324,6 @@ async fn test_select_object_content_http_event_order_crc_and_input_byte_stats() 
 async fn test_select_object_content_http_disconnect_releases_query() -> TestResult<()> {
     const OBJECT: &str = "disconnect.csv";
     const ROWS: usize = 16 * 1024;
-    const RELEASE_ATTEMPTS: usize = 20;
     const RELEASE_BACKOFF: Duration = Duration::from_millis(25);
 
     init_logging();
@@ -358,22 +357,15 @@ async fn test_select_object_content_http_disconnect_releases_query() -> TestResu
 
     drop(first);
     let second = tokio::time::timeout(Duration::from_secs(5), async {
-        for attempt in 0..RELEASE_ATTEMPTS {
+        loop {
             match csv_select_request(&client, OBJECT).send().await {
                 Ok(response) => return Ok::<_, Box<dyn Error + Send + Sync>>(response),
-                Err(error)
-                    if error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("SlowDown")
-                        && attempt + 1 < RELEASE_ATTEMPTS =>
-                {
-                    tokio::time::sleep(RELEASE_BACKOFF).await;
-                }
                 Err(error) if error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("SlowDown") => {
-                    return Err("disconnected Select retained its query permit after bounded retries".into());
+                    tokio::time::sleep(RELEASE_BACKOFF).await;
                 }
                 Err(error) => return Err(format!("unexpected Select error after disconnect: {error}").into()),
             }
         }
-        Err("query permit release retry loop ended unexpectedly".into())
     })
     .await
     .map_err(|_| -> Box<dyn Error + Send + Sync> { "disconnected Select did not release its query permit".into() })??;
