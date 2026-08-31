@@ -269,6 +269,7 @@ jobs:
                 { key: 'tier', label: 'Tier' },
                 { key: 'heal', label: 'Heal' },
                 { key: 'pool', label: 'Pool Expansion' },
+                { key: 'security', label: 'Security' },
               ];
               const tabs = document.getElementById('tabs');
               const list = document.getElementById('list');
