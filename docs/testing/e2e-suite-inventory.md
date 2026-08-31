@@ -30,7 +30,7 @@
 | chaos | 2 |  |
 | checksum_upload_test | 7 |  |
 | cluster_concurrency_test | 3 | 🌙 |
-| cluster_multidrive_pool_test | 3 | 🌙 |
+| cluster_multidrive_pool_test | 4 | 🌙 |
 | common | 17 |  |
 | compression_test | 6 | ✅ |
 | connection_cap_test | 2 |  |
@@ -103,4 +103,4 @@
 | tls_hot_reload_test | 1 | ✅ |
 | version_id_regression_test | 10 | ✅ |
 
-**Total listed: 620 tests across 86 modules · PR smoke: 165 tests / 36 modules · merge/main full: 495 tests / 77 modules · nightly replication: 56 tests · nightly cluster faults: 30 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-31.
+**Total listed: 621 tests across 86 modules · PR smoke: 165 tests / 36 modules · merge/main full: 495 tests / 77 modules · nightly replication: 56 tests · nightly cluster faults: 31 tests / 7 modules · nightly protocols: 16 tests** · updated 2026-08-31.
