@@ -492,23 +492,12 @@ path = "junit.xml"
 # parallel-safe — the same property e2e-smoke relies on. The exceptions are the
 # 4-disk reliability / degraded-read fault-injection tests and the fixed-port
 # Vault tests, both serialized below.
-# KNOWN-FAILURE EXCLUSIONS (characterization run 29381309848, 2026-07-15:
-# 341 ran / 32 failed on the suites' first automated run ever). Deterministic
-# product failures cannot be quarantined away with retries, so each family is
-# excluded here with its tracking issue, under the same discipline as the
-# ci-profile quarantine (docs/testing/README.md): every entry MUST cite one
-# OPEN issue, and the fixing PR MUST delete the exclusion. The passing
-# negative-path siblings of each family stay in as regression guards.
-#   * rustfs#4843 — over-limit archive entry paths hard-reject the whole
-#     archive even under ignore-errors semantics.
 [profile.e2e-full]
 default-filter = """
     package(e2e_test)
     & !test(/^protocols::/)
     & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
     & !test(/^replication_extension_test::/)
-    & !test(/^multipart_auth_test::test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_enabled$/)
-    & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(ignores_invalid_entries_when_requested|supports_standard_headers_with_combined_extract_options)$/)
 """
 fail-fast = false
 
