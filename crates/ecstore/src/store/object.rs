@@ -2693,20 +2693,26 @@ impl ECStore {
             return Err(decommission_free_version_overwrite_error(bucket, &object, fi.version_id));
         }
 
+        let expected_data_bytes = usize::try_from(fi.size).ok();
         let result = self
-            .run_decommission_capacity_admitted_mutation(idx, DecommissionCapacityOwner::from_options(&opts), None, || async {
-                if is_free_version {
-                    self.pools[idx]
-                        .get_disks_by_key(&object)
-                        .decommission_tier_free_version(bucket, &object, &fi, &opts)
-                        .await
-                } else {
-                    self.pools[idx]
-                        .get_disks_by_key(&object)
-                        .decommission_tiered_object(bucket, &object, &fi, &opts)
-                        .await
-                }
-            })
+            .run_decommission_capacity_admitted_mutation(
+                idx,
+                DecommissionCapacityOwner::from_options(&opts),
+                expected_data_bytes,
+                || async {
+                    if is_free_version {
+                        self.pools[idx]
+                            .get_disks_by_key(&object)
+                            .decommission_tier_free_version(bucket, &object, &fi, &opts)
+                            .await
+                    } else {
+                        self.pools[idx]
+                            .get_disks_by_key(&object)
+                            .decommission_tiered_object(bucket, &object, &fi, &opts)
+                            .await
+                    }
+                },
+            )
             .await;
         if matches!(result, Err(Error::PreconditionFailed)) {
             if self
@@ -5883,6 +5889,7 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
+            decommission_capacity_entry_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -5946,6 +5953,7 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
+            decommission_capacity_entry_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }
