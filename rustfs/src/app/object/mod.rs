@@ -161,7 +161,7 @@ use rustfs_utils::http::{
 };
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
-use rustfs_zip::{ArchiveLimits, CompressionFormat};
+use rustfs_zip::{ArchiveLimits, CompressionFormat, ZipError};
 use s3s::StdError;
 use s3s::dto::{
     CacheControl, Checksum, ChecksumAlgorithm, ChecksumType, ContentDisposition, ContentEncoding, ContentLanguage, ContentType,
@@ -177,6 +177,14 @@ use s3s::dto::{
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+
+fn object_s3_error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'static, str>>) -> S3Error {
+    S3Error::with_message(code, message)
+}
+
+fn object_s3_error_default(code: S3ErrorCode) -> S3Error {
+    S3Error::new(code)
+}
 
 mod copy;
 mod delete;

@@ -41,9 +41,9 @@ pub use config::{
 };
 pub use delete::{
     DeletedObjectReplicationInfo, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
-    delete_replication_creates_marker, is_retryable_delete_replication_head_error, is_version_delete_replication,
-    replicate_delete_outcome, resync_existing_delete_replication_info, should_retry_delete_marker_purge,
-    target_delete_version_id,
+    delete_replication_creates_marker, is_object_lock_denied_delete, is_retryable_delete_replication_head_error,
+    is_version_delete_replication, replicate_delete_outcome, resync_existing_delete_replication_info,
+    should_retry_delete_marker_purge, target_delete_version_id,
 };
 pub use filemeta::{
     NULL_VERSION_ID, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, REPLICATE_INCOMING,
@@ -65,7 +65,8 @@ pub use multipart::{
 pub use object::{
     ReplicationSourceObject, ReplicationTargetObject, SsecPassthroughCapability, SsecPassthroughGate, content_matches_by_etag,
     is_replication_target_offline_error, replication_action_for_target, replication_etags_match,
-    ssec_passthrough_evidence_present, ssec_passthrough_gate, target_is_newer_than_source_null_version, version_identity_drifted,
+    single_part_replica_etag_mismatch, ssec_passthrough_evidence_present, ssec_passthrough_gate,
+    target_is_newer_than_source_null_version, version_identity_drifted,
 };
 pub use operation::{
     MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteSource, ReplicationDeleteStateSource,

@@ -18,6 +18,7 @@ use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     app_context_from_req, current_object_store_handle_for_context, current_scanner_metrics_report,
 };
+use crate::admin::storage_api::ScannerDataMovementPauseStatus;
 use crate::module_switches::{ENV_SCANNER_ENABLED, scanner_enabled_from_env};
 use crate::server::ADMIN_PREFIX;
 use chrono::Utc;
@@ -27,6 +28,8 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
+#[cfg(test)]
+use rustfs_scanner_contracts::metrics::ScannerLifecycleTransitionSnapshot;
 use rustfs_scanner_contracts::metrics::{
     ScannerLifecycleExpirySnapshot, ScannerMaintenanceControlSnapshot, ScannerMetricsReport,
 };
@@ -46,6 +49,9 @@ struct ScannerStatusResponse {
     cycle_schedule: rustfs_scanner::ScannerCycleScheduleStatus,
     runtime_config: rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
     cycle_recovery: rustfs_scanner::ScannerCycleRecoveryStatus,
+    data_movement_pause: ScannerDataMovementPauseStatus,
+    pause_backlog: rustfs_scanner::ScannerPauseBacklogStatus,
+    catch_up_estimate: ScannerCatchUpEstimate,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +69,17 @@ struct ScannerFreshnessStatus {
 }
 
 #[derive(Debug, Serialize)]
+struct ScannerCatchUpEstimate {
+    estimated: bool,
+    movement_work_items: u64,
+    dirty_usage_buckets: u64,
+    discovered_expiry_items: u64,
+    discovered_transition_items: u64,
+    undiscovered_ilm_items_known: bool,
+    usage_baseline_unix_secs: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct IlmExpiryStatusResponse {
     enabled: bool,
     disabled_reason: Option<String>,
@@ -71,6 +88,46 @@ struct IlmExpiryStatusResponse {
     maintenance_control: ScannerMaintenanceControlSnapshot,
     current_cycle_lifecycle_expiry_actions: u64,
     last_cycle_lifecycle_expiry_actions: u64,
+    data_movement_pause: ScannerDataMovementPauseStatus,
+    pause_backlog: rustfs_scanner::ScannerPauseBacklogStatus,
+    catch_up_estimate: ScannerCatchUpEstimate,
+}
+
+fn scanner_catch_up_estimate(
+    pause: &ScannerDataMovementPauseStatus,
+    backlog: &rustfs_scanner::ScannerPauseBacklogStatus,
+    metrics: &ScannerMetricsReport,
+) -> ScannerCatchUpEstimate {
+    ScannerCatchUpEstimate {
+        estimated: pause.paused || backlog.phase != rustfs_scanner::ScannerPauseBacklogPhase::Idle,
+        movement_work_items: pause.movement_backlog_work_items.max(backlog.movement_work_items),
+        dirty_usage_buckets: metrics.usage_freshness.dirty_pending_buckets.max(backlog.dirty_usage_buckets),
+        discovered_expiry_items: metrics
+            .lifecycle_expiry
+            .current_queued
+            .saturating_add(metrics.lifecycle_expiry.current_active)
+            .max(backlog.discovered_expiry_items),
+        discovered_transition_items: metrics
+            .lifecycle_transition
+            .current_queued
+            .saturating_add(metrics.lifecycle_transition.current_active)
+            .saturating_add(metrics.lifecycle_transition.compensation_pending)
+            .saturating_add(metrics.lifecycle_transition.compensation_running)
+            .max(backlog.discovered_transition_items),
+        undiscovered_ilm_items_known: !pause.paused && !backlog.pending_full_scan,
+        usage_baseline_unix_secs: metrics.usage_freshness.last_durable_success_unix_secs,
+    }
+}
+
+fn unavailable_pause_backlog(error: &str) -> rustfs_scanner::ScannerPauseBacklogStatus {
+    rustfs_scanner::ScannerPauseBacklogStatus {
+        persistence_state: "unavailable".to_string(),
+        alerting: true,
+        alert_reasons: vec![rustfs_scanner::ScannerPauseBacklogAlertReason::PersistenceUnavailable],
+        thresholds: rustfs_scanner::ScannerPauseBacklogThresholds::default(),
+        error: Some(error.to_string()),
+        ..Default::default()
+    }
 }
 
 fn scanner_disabled_reason(enabled: bool) -> Option<String> {
@@ -122,8 +179,11 @@ fn scanner_status_response(
     metrics: ScannerMetricsReport,
     runtime_config: rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
     cycle_schedule: rustfs_scanner::ScannerCycleScheduleStatus,
+    data_movement_pause: ScannerDataMovementPauseStatus,
+    pause_backlog: rustfs_scanner::ScannerPauseBacklogStatus,
 ) -> ScannerStatusResponse {
     let freshness = scanner_freshness_status(&metrics, &runtime_config, cycle_schedule.effective_interval_seconds());
+    let catch_up_estimate = scanner_catch_up_estimate(&data_movement_pause, &pause_backlog, &metrics);
     ScannerStatusResponse {
         enabled,
         disabled_reason: scanner_disabled_reason(enabled),
@@ -132,6 +192,9 @@ fn scanner_status_response(
         cycle_schedule,
         runtime_config,
         cycle_recovery: rustfs_scanner::scanner::scanner_cycle_recovery_status(),
+        data_movement_pause,
+        pause_backlog,
+        catch_up_estimate,
     }
 }
 
@@ -140,8 +203,11 @@ fn ilm_expiry_status_response(
     metrics: ScannerMetricsReport,
     runtime_config: rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
     cycle_schedule: rustfs_scanner::ScannerCycleScheduleStatus,
+    data_movement_pause: ScannerDataMovementPauseStatus,
+    pause_backlog: rustfs_scanner::ScannerPauseBacklogStatus,
 ) -> IlmExpiryStatusResponse {
     let freshness = scanner_freshness_status(&metrics, &runtime_config, cycle_schedule.effective_interval_seconds());
+    let catch_up_estimate = scanner_catch_up_estimate(&data_movement_pause, &pause_backlog, &metrics);
     IlmExpiryStatusResponse {
         enabled,
         disabled_reason: scanner_disabled_reason(enabled),
@@ -150,6 +216,9 @@ fn ilm_expiry_status_response(
         maintenance_control: metrics.maintenance_control,
         current_cycle_lifecycle_expiry_actions: metrics.current_cycle_lifecycle_expiry_actions,
         last_cycle_lifecycle_expiry_actions: metrics.last_cycle_lifecycle_expiry_actions,
+        data_movement_pause,
+        pause_backlog,
+        catch_up_estimate,
     }
 }
 
@@ -208,7 +277,20 @@ impl Operation for ScannerStatusHandler {
         let metrics = current_scanner_metrics_report().await;
         let runtime_config = rustfs_scanner::scanner_runtime_config_status();
         let cycle_schedule = rustfs_scanner::scanner_cycle_schedule_status();
-        let response = scanner_status_response(enabled, metrics, runtime_config, cycle_schedule);
+        let store =
+            app_context_from_req(&req).and_then(|context| current_object_store_handle_for_context(Some(context.as_ref())));
+        let (data_movement_pause, pause_backlog) = match store {
+            Some(store) => (
+                store.scanner_data_movement_pause_status().await,
+                rustfs_scanner::scanner_pause_backlog_status(store).await,
+            ),
+            None => (
+                ScannerDataMovementPauseStatus::default(),
+                unavailable_pause_backlog("storage layer not initialized"),
+            ),
+        };
+        let response =
+            scanner_status_response(enabled, metrics, runtime_config, cycle_schedule, data_movement_pause, pause_backlog);
         let body = serde_json::to_vec(&response).map_err(|err| {
             S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode scanner status: {err}"))
         })?;
@@ -258,7 +340,20 @@ impl Operation for IlmExpiryStatusHandler {
         let metrics = current_scanner_metrics_report().await;
         let runtime_config = rustfs_scanner::scanner_runtime_config_status();
         let cycle_schedule = rustfs_scanner::scanner_cycle_schedule_status();
-        let response = ilm_expiry_status_response(enabled, metrics, runtime_config, cycle_schedule);
+        let store =
+            app_context_from_req(&req).and_then(|context| current_object_store_handle_for_context(Some(context.as_ref())));
+        let (data_movement_pause, pause_backlog) = match store {
+            Some(store) => (
+                store.scanner_data_movement_pause_status().await,
+                rustfs_scanner::scanner_pause_backlog_status(store).await,
+            ),
+            None => (
+                ScannerDataMovementPauseStatus::default(),
+                unavailable_pause_backlog("storage layer not initialized"),
+            ),
+        };
+        let response =
+            ilm_expiry_status_response(enabled, metrics, runtime_config, cycle_schedule, data_movement_pause, pause_backlog);
         let body = serde_json::to_vec(&response).map_err(|err| {
             S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode ILM expiry status: {err}"))
         })?;
@@ -388,6 +483,8 @@ mod tests {
             ScannerMetricsReport::default(),
             rustfs_scanner::scanner_runtime_config_status(),
             rustfs_scanner::ScannerCycleScheduleStatus::default(),
+            ScannerDataMovementPauseStatus::default(),
+            rustfs_scanner::ScannerPauseBacklogStatus::default(),
         );
 
         let encoded = serde_json::to_value(response).expect("scanner status should serialize");
@@ -401,6 +498,23 @@ mod tests {
             encoded["cycle_recovery"]["quarantine_path"],
             rustfs_scanner::DATA_USAGE_BLOOM_RECOVERY_PATH.as_str()
         );
+        assert_eq!(encoded["data_movement_pause"]["policy"], "global_pause");
+        assert_eq!(encoded["data_movement_pause"]["paused"], false);
+        assert_eq!(encoded["catch_up_estimate"]["estimated"], false);
+        assert_eq!(encoded["catch_up_estimate"]["undiscovered_ilm_items_known"], true);
+    }
+
+    #[test]
+    fn scanner_status_keeps_an_unavailable_storage_layer_observable() {
+        let backlog = unavailable_pause_backlog("storage layer not initialized");
+
+        assert_eq!(backlog.persistence_state, "unavailable");
+        assert!(backlog.alerting);
+        assert_eq!(
+            backlog.alert_reasons,
+            vec![rustfs_scanner::ScannerPauseBacklogAlertReason::PersistenceUnavailable]
+        );
+        assert_eq!(backlog.error.as_deref(), Some("storage layer not initialized"));
     }
 
     #[test]
@@ -418,6 +532,13 @@ mod tests {
                 scanner_not_enqueued: 13,
                 delete_failed: 19,
             },
+            lifecycle_transition: ScannerLifecycleTransitionSnapshot {
+                current_queued: 2,
+                current_active: 3,
+                compensation_pending: 5,
+                compensation_running: 7,
+                ..Default::default()
+            },
             maintenance_control: ScannerMaintenanceControlSnapshot {
                 primary_control: "expiry_backlog".to_string(),
                 ..Default::default()
@@ -431,6 +552,18 @@ mod tests {
             metrics,
             rustfs_scanner::scanner_runtime_config_status(),
             rustfs_scanner::ScannerCycleScheduleStatus::default(),
+            ScannerDataMovementPauseStatus {
+                paused: true,
+                movement_backlog_work_items: 31,
+                movement_backlog_estimated: true,
+                ..Default::default()
+            },
+            rustfs_scanner::ScannerPauseBacklogStatus {
+                phase: rustfs_scanner::ScannerPauseBacklogPhase::Paused,
+                movement_work_items: 31,
+                pending_full_scan: true,
+                ..Default::default()
+            },
         );
 
         let encoded = serde_json::to_value(response).expect("ILM expiry status should serialize");
@@ -441,5 +574,11 @@ mod tests {
         assert_eq!(encoded["maintenance_control"]["primary_control"].as_str(), Some("expiry_backlog"));
         assert_eq!(encoded["current_cycle_lifecycle_expiry_actions"].as_u64(), Some(23));
         assert_eq!(encoded["last_cycle_lifecycle_expiry_actions"].as_u64(), Some(29));
+        assert_eq!(encoded["data_movement_pause"]["paused"], true);
+        assert_eq!(encoded["pause_backlog"]["phase"], "paused");
+        assert_eq!(encoded["catch_up_estimate"]["movement_work_items"].as_u64(), Some(31));
+        assert_eq!(encoded["catch_up_estimate"]["discovered_expiry_items"].as_u64(), Some(9));
+        assert_eq!(encoded["catch_up_estimate"]["discovered_transition_items"].as_u64(), Some(17));
+        assert_eq!(encoded["catch_up_estimate"]["undiscovered_ilm_items_known"], false);
     }
 }

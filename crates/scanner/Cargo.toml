@@ -106,7 +106,7 @@ hex-simd.workspace = true
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time"] }
 serial_test = { workspace = true }
-temp-env = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
 tempfile = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
 tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }

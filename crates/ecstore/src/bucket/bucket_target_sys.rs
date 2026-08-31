@@ -22,7 +22,9 @@ use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::runtime::sources as runtime_sources;
 use aws_credential_types::Credentials as SdkCredentials;
+use aws_credential_types::provider::{ProvideCredentials, error::CredentialsError, future};
 use aws_sdk_s3::config::Region as SdkRegion;
+use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
@@ -38,6 +40,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::Tagging as SdkTagging;
 use aws_sdk_s3::types::{
     ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
+    ServerSideEncryption,
 };
 use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
 use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
@@ -77,7 +80,7 @@ use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -89,6 +92,71 @@ use uuid::Uuid;
 
 const MAX_CONCURRENT_TARGET_HEALTH_CHECKS: usize = 16;
 const REDACTED_CREDENTIAL: &str = "<redacted>";
+const EXPIRED_REMOTE_TARGET_CREDENTIALS: &str = "remote target credentials have expired";
+
+#[derive(Clone)]
+struct RemoteTargetCredentialsProvider {
+    credentials: SdkCredentials,
+}
+
+impl RemoteTargetCredentialsProvider {
+    fn resolve_at(&self, now: SystemTime) -> aws_credential_types::provider::Result {
+        if self.credentials.expiry().is_some_and(|expiration| expiration <= now) {
+            return Err(CredentialsError::provider_error(std::io::Error::other(EXPIRED_REMOTE_TARGET_CREDENTIALS)));
+        }
+        Ok(self.credentials.clone())
+    }
+}
+
+impl fmt::Debug for RemoteTargetCredentialsProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteTargetCredentialsProvider")
+            .field("temporary", &self.credentials.session_token().is_some())
+            .field("expiration", &self.credentials.expiry())
+            .finish()
+    }
+}
+
+impl ProvideCredentials for RemoteTargetCredentialsProvider {
+    fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        future::ProvideCredentials::ready(self.resolve_at(SystemTime::now()))
+    }
+
+    fn fallback_on_interrupt(&self) -> Option<SdkCredentials> {
+        self.resolve_at(SystemTime::now()).ok()
+    }
+}
+
+fn remote_target_sdk_credentials(
+    credentials: &Credentials,
+    account_id: &str,
+    now: SystemTime,
+) -> Result<SdkCredentials, &'static str> {
+    let session_token = credentials.effective_session_token();
+    let expiration = credentials.effective_expiration().map(SystemTime::from);
+    if expiration.is_some() && session_token.is_none() {
+        return Err("remote target credential expiration requires a session token");
+    }
+    if expiration.is_some_and(|expiration| expiration <= now) {
+        return Err(EXPIRED_REMOTE_TARGET_CREDENTIALS);
+    }
+
+    let mut builder = SdkCredentials::builder()
+        .access_key_id(credentials.access_key.clone())
+        .secret_access_key(credentials.secret_key.clone())
+        .account_id(account_id.to_string())
+        .provider_name("bucket_target_sys");
+    if let Some(session_token) = session_token {
+        builder = builder.session_token(session_token.to_string());
+    }
+    if let Some(expiration) = expiration {
+        builder = builder.expiry(expiration);
+    }
+    Ok(builder.build())
+}
 
 pub type HeadObjectSdkError = Box<SdkError<HeadObjectError>>;
 pub type GetObjectSdkError = Box<SdkError<GetObjectError>>;
@@ -845,13 +913,26 @@ impl BucketTargetSys {
         Ok(BucketTargets { targets: new_targets })
     }
 
+    async fn mark_refresh_attempt(&self, arn: &str) {
+        // Rate-limit a failed config fetch as well as a failed client build.
+        // A successful rebuild replaces this timestamp during publication.
+        self.arn_remotes_map
+            .write()
+            .await
+            .entry(arn.to_string())
+            .or_default()
+            .last_refresh = OffsetDateTime::now_utc();
+    }
+
     pub async fn mark_refresh_in_progress(&self, bucket: &str, arn: &str) {
         let mut arn_errs = self.arn_errs_map.write().await;
-        arn_errs.entry(arn.to_string()).or_insert_with(|| ArnErrs {
-            bucket: bucket.to_string(),
-            update_in_progress: true,
+        let err = arn_errs.entry(arn.to_string()).or_insert_with(|| ArnErrs {
             count: 1,
+            bucket: bucket.to_string(),
+            ..Default::default()
         });
+        err.update_in_progress = true;
+        err.bucket = bucket.to_string();
     }
 
     pub async fn mark_refresh_done(&self, bucket: &str, arn: &str) {
@@ -863,15 +944,21 @@ impl BucketTargetSys {
     }
 
     pub async fn is_reloading_target(&self, _bucket: &str, arn: &str) -> bool {
-        let arn_errs = self.arn_errs_map.read().await;
-        arn_errs.get(arn).map(|err| err.update_in_progress).unwrap_or(false)
+        self.arn_errs_map
+            .read()
+            .await
+            .get(arn)
+            .is_some_and(|err| err.update_in_progress)
     }
 
-    pub async fn inc_arn_errs(&self, _bucket: &str, arn: &str) {
+    pub async fn inc_arn_errs(&self, bucket: &str, arn: &str) {
         let mut arn_errs = self.arn_errs_map.write().await;
-        if let Some(err) = arn_errs.get_mut(arn) {
-            err.count += 1;
-        }
+        let err = arn_errs.entry(arn.to_string()).or_insert_with(|| ArnErrs {
+            bucket: bucket.to_string(),
+            ..Default::default()
+        });
+        err.count += 1;
+        err.bucket = bucket.to_string();
     }
 
     pub async fn get_remote_target_client(&self, bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
@@ -884,13 +971,13 @@ impl BucketTargetSys {
                 .unwrap_or((None, None))
         };
 
-        if let Some(cli) = cli {
+        let credentials_expired = cli
+            .as_ref()
+            .is_some_and(|client| client.credentials_expired_at(jiff::Timestamp::now()));
+        if let Some(cli) = cli
+            && !credentials_expired
+        {
             return Some(cli);
-        }
-
-        // TODO(backlog): spawn an async task to proactively reload the replication target
-        if self.is_reloading_target(bucket, arn).await {
-            return None;
         }
 
         if let Some(last_refresh) = last_refresh {
@@ -900,16 +987,24 @@ impl BucketTargetSys {
             }
         }
 
+        // The existing per-bucket publication lock is also the reload claim:
+        // try-locking keeps the request path non-blocking, is cancellation-safe,
+        // and prevents a stale reload from publishing after a credential update.
+        let update_mutex = self.target_update_mutex(bucket).await;
+        let Ok(update_guard) = update_mutex.try_lock() else {
+            return None;
+        };
+        self.mark_refresh_attempt(arn).await;
+
         match get_bucket_targets_config(bucket).await {
             Ok(bucket_targets) => {
-                self.mark_refresh_in_progress(bucket, arn).await;
-                self.update_all_targets(bucket, Some(&bucket_targets)).await;
-                self.mark_refresh_done(bucket, arn).await;
+                self.update_all_targets_locked(bucket, Some(&bucket_targets)).await;
             }
             Err(e) => {
                 error!("get bucket targets config error:{}", e);
             }
         };
+        drop(update_guard);
 
         let cli = self
             .arn_remotes_map
@@ -917,8 +1012,10 @@ impl BucketTargetSys {
             .await
             .get(arn)
             .and_then(|target| target.client.clone());
-        if cli.is_some() {
-            return cli;
+        if let Some(cli) = cli
+            && !cli.credentials_expired_at(jiff::Timestamp::now())
+        {
+            return Some(cli);
         }
 
         self.inc_arn_errs(bucket, arn).await;
@@ -948,12 +1045,13 @@ impl BucketTargetSys {
             });
         };
 
-        let creds = SdkCredentials::builder()
-            .access_key_id(credentials.access_key.clone())
-            .secret_access_key(credentials.secret_key.clone())
-            .account_id(target.reset_id.clone())
-            .provider_name("bucket_target_sys")
-            .build();
+        let creds = remote_target_sdk_credentials(credentials, &target.reset_id, SystemTime::now()).map_err(|error| {
+            BucketTargetError::RemoteTargetConnectionErr {
+                bucket: target.target_bucket.clone(),
+                access_key: credentials.access_key.clone(),
+                error: error.to_string(),
+            }
+        })?;
 
         let endpoint = if target.secure {
             format!("https://{}", target.endpoint)
@@ -973,9 +1071,10 @@ impl BucketTargetSys {
 
         let mut config_builder = S3Config::builder()
             .endpoint_url(endpoint.clone())
-            .credentials_provider(SharedCredentialsProvider::new(creds))
+            .credentials_provider(SharedCredentialsProvider::new(RemoteTargetCredentialsProvider { credentials: creds }))
             .region(SdkRegion::new(target.region.clone()))
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .request_checksum_calculation(replication_request_checksum_calculation());
 
         if should_force_path_style(target) {
             config_builder = config_builder.force_path_style(true);
@@ -1047,6 +1146,13 @@ impl BucketTargetSys {
         let update_mutex = self.target_update_mutex(bucket).await;
         let _update_guard = update_mutex.lock().await;
 
+        self.update_all_targets_locked(bucket, targets).await;
+    }
+
+    /// Builds and publishes one bucket snapshot while its update mutex is held.
+    /// Keeping persisted-config reads under the same mutex prevents a stale
+    /// reload from overwriting a concurrent credential rotation.
+    async fn update_all_targets_locked(&self, bucket: &str, targets: Option<&BucketTargets>) {
         let mut clients = Vec::new();
         if let Some(new_targets) = targets {
             for target in &new_targets.targets {
@@ -1078,6 +1184,17 @@ impl BucketTargetSys {
             && !new_targets.is_empty()
         {
             for (target, client) in clients {
+                // Keep a timestamped placeholder for configured targets whose
+                // client cannot be built. Replication records these attempts as
+                // failed, while the placeholder prevents every object from
+                // triggering another metadata reload/client build for five minutes.
+                arn_remotes_map.insert(
+                    target.arn.clone(),
+                    ArnTarget {
+                        client: None,
+                        last_refresh: OffsetDateTime::now_utc(),
+                    },
+                );
                 match client {
                     Ok(client) => {
                         arn_remotes_map.insert(
@@ -1090,11 +1207,6 @@ impl BucketTargetSys {
                         health_map.insert(client.arn.clone(), target_health(&client));
                         self.update_bandwidth_limit(bucket, &target.arn, target.bandwidth_limit);
                     }
-                    // The target stays in `targets_map`, so it keeps showing up in
-                    // `bucket remote ls` while no client exists to replicate through it —
-                    // replication then drops every object for this ARN. Without this the
-                    // rejection (loopback endpoint, bad CA, unparseable URL) left no trace
-                    // anywhere.
                     Err(err) => warn!(
                         bucket = %bucket,
                         arn = %target.arn,
@@ -1256,6 +1368,25 @@ fn loopback_replication_targets_allowed() -> bool {
     std::env::var(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV)
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false)
+}
+
+const REPLICATION_STREAMING_CHECKSUMS_ENV: &str = "RUSTFS_REPLICATION_STREAMING_CHECKSUMS";
+
+/// Streaming trailer checksums make the SDK frame request bodies as
+/// `aws-chunked`; a target that does not decode that framing stores the frames
+/// verbatim, silently corrupting every replica while the transfer itself
+/// succeeds (#6853). Plain signed payloads are the compatible default; the env
+/// knob restores trailer checksums for fleets whose targets are all known to
+/// decode them.
+fn replication_request_checksum_calculation() -> RequestChecksumCalculation {
+    if std::env::var(REPLICATION_STREAMING_CHECKSUMS_ENV)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+    {
+        RequestChecksumCalculation::WhenSupported
+    } else {
+        RequestChecksumCalculation::WhenRequired
+    }
 }
 
 fn validate_replication_target_endpoint(url: &Url) -> Result<(), OutboundUrlError> {
@@ -1637,6 +1768,17 @@ impl Default for AdvancedPutOptions {
     }
 }
 
+/// The subset of the target's PutObject response replication audits.
+#[derive(Debug, Clone)]
+pub struct RemotePutObjectResponse {
+    /// Version id the target assigned (`x-amz-version-id`).
+    pub version_id: Option<String>,
+    /// ETag of what the target stored; `None` when the target withheld it or
+    /// when its encryption mode (SSE-KMS / SSE-C) makes it incomparable to
+    /// the source ETag. `None` is therefore "not decidable", never evidence.
+    pub etag: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct PutObjectOptions {
     pub user_metadata: HashMap<String, String>,
@@ -1962,6 +2104,13 @@ pub struct TargetClient {
 }
 
 impl TargetClient {
+    fn credentials_expired_at(&self, now: jiff::Timestamp) -> bool {
+        self.credentials
+            .as_ref()
+            .and_then(Credentials::effective_expiration)
+            .is_some_and(|expiration| expiration <= now)
+    }
+
     pub fn to_url(&self) -> Url {
         Url::parse(&self.endpoint).unwrap()
     }
@@ -2175,7 +2324,9 @@ impl TargetClient {
 
     /// On success returns the version id the target assigned (from
     /// `x-amz-version-id`), letting callers audit the version-identity
-    /// contract — a target that adopts the source version echoes it back.
+    /// contract — a target that adopts the source version echoes it back —
+    /// together with the ETag of what the target actually stored, so callers
+    /// can detect a target that persisted transformed bytes (#6853).
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -2183,7 +2334,7 @@ impl TargetClient {
         size: i64,
         body: ByteStream,
         opts: &PutObjectOptions,
-    ) -> Result<Option<String>, S3ClientError> {
+    ) -> Result<RemotePutObjectResponse, S3ClientError> {
         let mut headers = opts.header();
 
         let builder = self.client.put_object();
@@ -2218,7 +2369,25 @@ impl TargetClient {
             .send()
             .await
         {
-            Ok(output) => Ok(output.version_id().map(ToOwned::to_owned)),
+            Ok(output) => {
+                // Under SSE-KMS/DSSE or SSE-C the target's ETag is not the MD5
+                // of the stored plaintext, so it cannot be compared against the
+                // source ETag; withhold it rather than let a caller conclude
+                // corruption from an opaque value.
+                let etag_comparable = output.sse_customer_algorithm().is_none()
+                    && !matches!(
+                        output.server_side_encryption(),
+                        Some(ServerSideEncryption::AwsKms) | Some(ServerSideEncryption::AwsKmsDsse)
+                    );
+                Ok(RemotePutObjectResponse {
+                    version_id: output.version_id().map(ToOwned::to_owned),
+                    etag: if etag_comparable {
+                        output.e_tag().map(ToOwned::to_owned)
+                    } else {
+                        None
+                    },
+                })
+            }
             Err(e) => match e {
                 SdkError::ServiceError(service_err) => {
                     let err = service_err.into_err();
@@ -2557,6 +2726,165 @@ mod tests {
         }
     }
 
+    type RecordedHeaders = Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+
+    /// Records full request headers and answers with canned response headers,
+    /// for asserting wire framing and response parsing.
+    #[derive(Clone, Debug)]
+    struct RecordingHeaderConnector {
+        request_headers: RecordedHeaders,
+        response_headers: Vec<(String, String)>,
+    }
+
+    impl SmithyHttpConnector for RecordingHeaderConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            self.request_headers
+                .lock()
+                .expect("recorded header lock should not be poisoned")
+                .push(
+                    request
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                );
+            let mut response = HttpResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(200_u16).expect("200 should be a valid response status"),
+                SdkBody::empty(),
+            );
+            for (name, value) in &self.response_headers {
+                response.headers_mut().insert(name.clone(), value.clone());
+            }
+            HttpConnectorFuture::ready(Ok(response))
+        }
+    }
+
+    fn header_recording_target_client(response_headers: Vec<(String, String)>) -> (TargetClient, RecordedHeaders) {
+        let request_headers: RecordedHeaders = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(RecordingHeaderConnector {
+            request_headers: Arc::clone(&request_headers),
+            response_headers,
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let client = s3_client_for_test(443, Some(http_client));
+        (
+            TargetClient {
+                endpoint: "https://localhost:443".to_string(),
+                credentials: None,
+                bucket: "target-bucket".to_string(),
+                storage_class: String::new(),
+                disable_proxy: false,
+                arn: "arn:rustfs:replication:us-east-1:target:bucket".to_string(),
+                reset_id: String::new(),
+                secure: true,
+                health_check_duration: Duration::from_secs(5),
+                replicate_sync: false,
+                client: Arc::new(client),
+            },
+            request_headers,
+        )
+    }
+
+    fn streaming_test_body(payload: &'static [u8]) -> ByteStream {
+        let stream = tokio_util::io::ReaderStream::new(std::io::Cursor::new(payload));
+        let body = http_body_util::StreamBody::new(futures::StreamExt::map(stream, |r| r.map(http_body::Frame::data)));
+        ByteStream::new(SdkBody::from_body_1_x(body))
+    }
+
+    #[test]
+    fn replication_checksums_default_to_plain_payloads() {
+        assert!(matches!(
+            replication_request_checksum_calculation(),
+            RequestChecksumCalculation::WhenRequired
+        ));
+    }
+
+    #[tokio::test]
+    async fn replication_put_object_sends_plain_signed_payloads_by_default() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &PutObjectOptions::default())
+            .await
+            .expect("recorded put_object should succeed");
+
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let headers = &recorded[0];
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        // The #6853 regression shape: trailer checksums force aws-chunked
+        // framing, which a non-decoding target stores verbatim as the object.
+        assert_eq!(header("x-amz-trailer"), None, "streaming uploads must not carry a trailer checksum");
+        assert!(
+            header("content-encoding").is_none_or(|v| !v.contains("aws-chunked")),
+            "streaming uploads must not be aws-chunked framed"
+        );
+        assert_eq!(header("x-amz-decoded-content-length"), None);
+        assert_eq!(header("content-length"), Some("4"));
+    }
+
+    #[tokio::test]
+    async fn put_object_returns_the_etag_the_target_stored() {
+        let (client, _) =
+            header_recording_target_client(vec![("etag".to_string(), "\"9a0364b9e99bb480dd25e1f0284c8555\"".to_string())]);
+        let response = client
+            .put_object(
+                "target-bucket",
+                "object",
+                4,
+                ByteStream::from_static(b"data"),
+                &PutObjectOptions::default(),
+            )
+            .await
+            .expect("recorded put_object should succeed");
+        assert_eq!(response.etag.as_deref(), Some("\"9a0364b9e99bb480dd25e1f0284c8555\""));
+    }
+
+    #[tokio::test]
+    async fn put_object_withholds_the_etag_under_target_side_kms() {
+        let (client, _) = header_recording_target_client(vec![
+            ("etag".to_string(), "\"9a0364b9e99bb480dd25e1f0284c8555\"".to_string()),
+            ("x-amz-server-side-encryption".to_string(), "aws:kms".to_string()),
+        ]);
+        let response = client
+            .put_object(
+                "target-bucket",
+                "object",
+                4,
+                ByteStream::from_static(b"data"),
+                &PutObjectOptions::default(),
+            )
+            .await
+            .expect("recorded put_object should succeed");
+        assert!(
+            response.etag.is_none(),
+            "a KMS-encrypted replica's etag is not the content MD5 and must be withheld"
+        );
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordingAuthConnector {
+        signed_requests: Arc<std::sync::Mutex<Vec<(bool, bool)>>>,
+    }
+
+    impl SmithyHttpConnector for RecordingAuthConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let has_expected_token = request.headers().get("x-amz-security-token") == Some("temporary-session-token");
+            let has_authorization = request.headers().contains_key("authorization");
+            self.signed_requests
+                .lock()
+                .expect("recorded auth request lock should not be poisoned")
+                .push((has_expected_token, has_authorization));
+            HttpConnectorFuture::ready(Ok(HttpResponse::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(200_u16).expect("200 should be a valid response status"),
+                SdkBody::empty(),
+            )))
+        }
+    }
+
     fn recording_target_client() -> (TargetClient, Arc<std::sync::Mutex<Vec<String>>>) {
         let request_uris = Arc::new(std::sync::Mutex::new(Vec::new()));
         let connector = SharedHttpConnector::new(RecordingHttpConnector {
@@ -2580,6 +2908,150 @@ mod tests {
             },
             request_uris,
         )
+    }
+
+    #[test]
+    fn remote_target_sdk_credentials_preserve_temporary_credential_fields() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let expiration = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: Some("temporary-session-token".to_string()),
+            expiration: Some(jiff::Timestamp::try_from(expiration).expect("test expiration should convert")),
+        };
+
+        let sdk_credentials =
+            remote_target_sdk_credentials(&credentials, "account", now).expect("unexpired temporary credentials should build");
+
+        assert_eq!(sdk_credentials.session_token(), Some("temporary-session-token"));
+        assert_eq!(sdk_credentials.expiry(), Some(expiration));
+        assert_eq!(sdk_credentials.account_id().map(|id| id.as_str()), Some("account"));
+    }
+
+    #[test]
+    fn remote_target_sdk_credentials_normalize_go_zero_expiration() {
+        let credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            expiration: Some("0001-01-01T00:00:00Z".parse().expect("Go zero time should parse")),
+        };
+
+        let sdk_credentials = remote_target_sdk_credentials(&credentials, "", SystemTime::now())
+            .expect("Go zero expiration should remain compatible with static credentials");
+
+        assert!(sdk_credentials.session_token().is_none());
+        assert!(sdk_credentials.expiry().is_none());
+    }
+
+    #[test]
+    fn remote_target_sdk_credentials_reject_invalid_expiration_boundaries() {
+        let expiration = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let mut credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            expiration: Some(jiff::Timestamp::try_from(expiration).expect("test expiration should convert")),
+        };
+
+        assert_eq!(
+            remote_target_sdk_credentials(&credentials, "", SystemTime::UNIX_EPOCH + Duration::from_secs(1_000))
+                .expect_err("expiration without a session token must fail"),
+            "remote target credential expiration requires a session token"
+        );
+
+        credentials.session_token = Some("temporary-session-token".to_string());
+        assert_eq!(
+            remote_target_sdk_credentials(&credentials, "", expiration)
+                .expect_err("credentials expire at the exact expiration boundary"),
+            EXPIRED_REMOTE_TARGET_CREDENTIALS
+        );
+    }
+
+    #[test]
+    fn remote_target_credentials_provider_fails_closed_after_expiration() {
+        let expiration = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let provider = RemoteTargetCredentialsProvider {
+            credentials: SdkCredentials::new(
+                "access",
+                "secret",
+                Some("temporary-session-token".to_string()),
+                Some(expiration),
+                "test",
+            ),
+        };
+
+        assert!(provider.resolve_at(expiration - Duration::from_nanos(1)).is_ok());
+        let err = provider
+            .resolve_at(expiration)
+            .expect_err("expired credentials must not be returned");
+        assert_eq!(err.source().map(ToString::to_string).as_deref(), Some(EXPIRED_REMOTE_TARGET_CREDENTIALS));
+        assert!(!format!("{provider:?}").contains("temporary-session-token"));
+        assert!(!format!("{provider:?}").contains("secret"));
+    }
+
+    #[test]
+    fn target_client_detects_expiration_for_cache_refresh() {
+        let expiration: jiff::Timestamp = "2099-01-01T00:00:00Z".parse().expect("expiration should parse");
+        let (mut client, _) = recording_target_client();
+        client.credentials = Some(Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: Some("temporary-session-token".to_string()),
+            expiration: Some(expiration),
+        });
+
+        assert!(!client.credentials_expired_at("2098-12-31T23:59:59Z".parse().expect("pre-expiration timestamp should parse")));
+        assert!(client.credentials_expired_at(expiration));
+
+        client.credentials.as_mut().expect("credentials should exist").expiration =
+            Some("0001-01-01T00:00:00Z".parse().expect("Go zero time should parse"));
+        assert!(!client.credentials_expired_at(jiff::Timestamp::now()));
+    }
+
+    #[tokio::test]
+    async fn temporary_credentials_add_security_token_to_sigv4_requests() {
+        let signed_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connector = SharedHttpConnector::new(RecordingAuthConnector {
+            signed_requests: Arc::clone(&signed_requests),
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let credentials = Credentials {
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: Some("temporary-session-token".to_string()),
+            expiration: Some("2099-01-01T00:00:00Z".parse().expect("future expiration should parse")),
+        };
+        let sdk_credentials = remote_target_sdk_credentials(&credentials, "", SystemTime::now())
+            .expect("unexpired temporary credentials should build");
+        let client = S3Client::from_conf(
+            S3Config::builder()
+                .endpoint_url("https://target.example")
+                .credentials_provider(SharedCredentialsProvider::new(RemoteTargetCredentialsProvider {
+                    credentials: sdk_credentials,
+                }))
+                .region(SdkRegion::new("us-east-1"))
+                .http_client(http_client)
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .build(),
+        );
+
+        client
+            .head_bucket()
+            .bucket("target-bucket")
+            .send()
+            .await
+            .expect("recording connector should accept the signed request");
+
+        assert_eq!(
+            signed_requests
+                .lock()
+                .expect("recorded auth request lock should not be poisoned")
+                .as_slice(),
+            &[(true, true)],
+            "SigV4 request must include both authorization and the session-token header"
+        );
     }
 
     fn spawn_https_server(cert: &rcgen::CertifiedKey<rcgen::KeyPair>, requests: usize) -> (u16, std::thread::JoinHandle<()>) {
@@ -2689,7 +3161,10 @@ mod tests {
             .credentials_provider(SharedCredentialsProvider::new(credentials))
             .region(SdkRegion::new("us-east-1"))
             .force_path_style(true)
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest());
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            // Mirror the production remote-target builder so recorded requests
+            // exercise the same checksum/framing behavior (#6853).
+            .request_checksum_calculation(replication_request_checksum_calculation());
         if let Some(http_client) = http_client {
             config = config.http_client(http_client);
         }
@@ -3514,6 +3989,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_refresh_attempt_updates_retry_timestamp_and_error_count() {
+        let sys = BucketTargetSys::default();
+
+        sys.mark_refresh_attempt("arn:reload").await;
+        let last_refresh = sys.arn_remotes_map.read().await["arn:reload"].last_refresh;
+        assert!(OffsetDateTime::now_utc() - last_refresh < Duration::from_secs(5));
+
+        sys.inc_arn_errs("bucket", "arn:reload").await;
+        sys.inc_arn_errs("bucket", "arn:reload").await;
+        let errors = sys.arn_errs_map.read().await;
+        assert_eq!(errors["arn:reload"].count, 2);
+        assert_eq!(errors["arn:reload"].bucket, "bucket");
+        drop(errors);
+
+        sys.mark_refresh_in_progress("bucket", "arn:reload").await;
+        assert!(sys.is_reloading_target("bucket", "arn:reload").await);
+        sys.mark_refresh_done("bucket", "arn:reload").await;
+        assert!(!sys.is_reloading_target("bucket", "arn:reload").await);
+        sys.mark_refresh_in_progress("bucket", "arn:reload").await;
+        assert!(sys.is_reloading_target("bucket", "arn:reload").await);
+    }
+
+    #[tokio::test]
     async fn update_all_targets_publishes_disable_proxy_on_target_client() {
         // The read-proxy selector (replication_proxy::get_proxy_targets) skips
         // targets whose TargetClient carries disable_proxy — the persisted
@@ -3549,6 +4047,88 @@ mod tests {
             .await
             .expect("client should be published");
         assert!(opted_out.disable_proxy, "disable_proxy must reach the published TargetClient");
+    }
+
+    #[tokio::test]
+    async fn update_all_targets_keeps_failed_client_placeholder() {
+        let sys = BucketTargetSys::default();
+        let target = BucketTarget {
+            arn: "arn:expired".to_string(),
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: Some("temporary-session-token".to_string()),
+                expiration: Some("2000-01-01T00:00:00Z".parse().expect("expired timestamp should parse")),
+            }),
+            ..Default::default()
+        };
+        let targets = BucketTargets { targets: vec![target] };
+
+        sys.update_all_targets("bucket", Some(&targets)).await;
+
+        let remotes = sys.arn_remotes_map.read().await;
+        let placeholder = remotes
+            .get("arn:expired")
+            .expect("configured target should retain a cache entry");
+        assert!(placeholder.client.is_none());
+        assert!(OffsetDateTime::now_utc() - placeholder.last_refresh < Duration::from_secs(5));
+        drop(remotes);
+        assert!(sys.get_remote_target_client("bucket", "arn:expired").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_rotation_atomically_replaces_published_client() {
+        let sys = BucketTargetSys::default();
+        let target = |session_token: &str| BucketTarget {
+            arn: "arn:rotating".to_string(),
+            endpoint: "192.168.1.10:9000".to_string(),
+            target_bucket: "target-bucket".to_string(),
+            region: "us-east-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: Some(session_token.to_string()),
+                expiration: None,
+            }),
+            ..Default::default()
+        };
+
+        sys.update_all_targets(
+            "bucket",
+            Some(&BucketTargets {
+                targets: vec![target("old-session-token")],
+            }),
+        )
+        .await;
+        let old_client = sys
+            .get_remote_target_client("bucket", "arn:rotating")
+            .await
+            .expect("initial client should be published");
+
+        sys.update_all_targets(
+            "bucket",
+            Some(&BucketTargets {
+                targets: vec![target("new-session-token")],
+            }),
+        )
+        .await;
+        let new_client = sys
+            .get_remote_target_client("bucket", "arn:rotating")
+            .await
+            .expect("rotated client should be published");
+
+        assert!(!Arc::ptr_eq(&old_client, &new_client));
+        assert_eq!(
+            old_client.credentials.as_ref().and_then(Credentials::effective_session_token),
+            Some("old-session-token")
+        );
+        assert_eq!(
+            new_client.credentials.as_ref().and_then(Credentials::effective_session_token),
+            Some("new-session-token")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

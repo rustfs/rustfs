@@ -31,6 +31,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
 use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, runtime_sources};
 use crate::storage::storage_api::{
     sign_tonic_rpc_response_proof, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+    verify_tonic_mutation_body_digest_reject_unsigned,
 };
 use bytes::Bytes;
 use futures::Stream;
@@ -121,6 +122,30 @@ fn verify_node_mutation_body<T: CanonicalMutationBody>(request: &Request<T>, ope
         .map_err(|_| Status::invalid_argument(format!("{operation} request length cannot be represented")))?;
     verify_tonic_mutation_body_digest(request, &canonical_body)
         .map_err(|err| Status::permission_denied(format!("{operation} authentication failed: {err}")))
+}
+
+fn verify_node_signal_body<T: CanonicalMutationBody>(request: &Request<T>, operation: &'static str) -> Result<(), Status> {
+    let canonical_body = request
+        .get_ref()
+        .canonical_body()
+        .map_err(|_| Status::invalid_argument(format!("{operation} request length cannot be represented")))?;
+    verify_tonic_mutation_body_digest_reject_unsigned(request, &canonical_body)
+        .map_err(|err| Status::permission_denied(format!("{operation} authentication failed: {err}")))
+}
+
+fn start_decommission_failure_response(err: Error) -> StartDecommissionResponse {
+    match err {
+        Error::InvalidArgument(_, _, reason) => StartDecommissionResponse {
+            success: false,
+            error_info: Some(reason),
+            error_code: Some(ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32),
+        },
+        err => StartDecommissionResponse {
+            success: false,
+            error_info: Some(err.to_string()),
+            error_code: None,
+        },
+    }
 }
 
 fn supports_dynamic_config_rpc(sub_system: &str) -> bool {
@@ -1824,7 +1849,7 @@ impl Node for NodeService {
     }
 
     async fn signal_service(&self, request: Request<SignalServiceRequest>) -> Result<Response<SignalServiceResponse>, Status> {
-        verify_node_mutation_body(&request, "signal service")?;
+        verify_node_signal_body(&request, "signal service")?;
         let request = request.into_inner();
         let vars = match request.vars {
             Some(vars) => vars.value,
@@ -2334,11 +2359,7 @@ impl Node for NodeService {
                 success: true,
                 error_info: None,
             })),
-            Err(err) => Ok(Response::new(StartDecommissionResponse {
-                error_code: None,
-                success: false,
-                error_info: Some(err.to_string()),
-            })),
+            Err(err) => Ok(Response::new(start_decommission_failure_response(err))),
         }
     }
 
@@ -2456,7 +2477,7 @@ mod tests {
         initialize_heal_topology_fingerprint, initialize_heal_topology_fingerprint_with_probe, legacy_scanner_activity_response,
         make_heal_control_server, make_heal_control_server_with_cache, make_server, make_server_for_context,
         make_tier_mutation_control_server_for_context, previous_scanner_activity_response, remove_heal_control_replay,
-        scanner_activity_response_v7, stop_rebalance_response,
+        scanner_activity_response_v7, start_decommission_failure_response, stop_rebalance_response,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
@@ -2479,14 +2500,14 @@ mod tests {
     use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, BatchGenerallyLockRequest, CancelDecommissionRequest, CheckPartsRequest,
-        ClearDecommissionRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest, DeletePolicyRequest,
-        DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest, DeleteVersionsRequest,
-        DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest, GetAllBucketStatsRequest,
-        GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest, GetMetacacheListingRequest,
-        GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
-        GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest, HealControlRequest,
-        ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
-        LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+        ClearDecommissionRequest, ControlPlaneErrorCode, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
+        DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest,
+        DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest,
+        GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
+        GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
+        GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
+        HealBucketRequest, HealControlRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest,
+        LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
         MakeVolumesRequest, Mss, PingRequest, PreparePartTransactionRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest,
         ReadVersionRequest, ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
@@ -2574,6 +2595,20 @@ mod tests {
                 "NodeService RPC {method} has unsupported auth-policy {policy:?}",
             );
         }
+    }
+
+    #[test]
+    fn start_decommission_failure_response_preserves_invalid_argument_reason() {
+        let reason = "durable unresolved-entry recovery requires pool metadata V2 or V3";
+        let response = start_decommission_failure_response(Error::InvalidArgument(
+            "decommission".to_string(),
+            "pool-metadata-version".to_string(),
+            reason.to_string(),
+        ));
+
+        assert!(!response.success);
+        assert_eq!(response.error_info.as_deref(), Some(reason));
+        assert_eq!(response.error_code, Some(ControlPlaneErrorCode::ControlPlaneErrorInvalidArgument as i32));
     }
 
     struct HealControlMockStorage;
@@ -4719,6 +4754,34 @@ mod tests {
         assert!(refresh_response.error_info.is_some());
     }
 
+    #[tokio::test]
+    async fn lock_rolling_unsigned_v2_remains_compatible_for_unknown_peer() {
+        let service = create_test_node_service();
+        let unsigned_request = || {
+            let mut request = Request::new(GenerallyLockRequest {
+                args: "invalid json".to_string(),
+            });
+            request
+                .metadata_mut()
+                .insert("x-rustfs-rpc-auth-version", "2".parse().expect("valid metadata value"));
+            request
+                .metadata_mut()
+                .insert("x-rustfs-content-sha256", "UNSIGNED-PAYLOAD".parse().expect("valid metadata value"));
+            request
+        };
+
+        let lock = service
+            .lock(unsigned_request())
+            .await
+            .expect("unsigned lock must pass the rolling body gate");
+        assert!(!lock.into_inner().success, "invalid test lock args should fail in the lock handler");
+        let unlock = service
+            .un_lock(unsigned_request())
+            .await
+            .expect("unsigned unlock must pass the rolling body gate");
+        assert!(!unlock.into_inner().success, "invalid test unlock args should fail in the unlock handler");
+    }
+
     /// Premise guard for the no-object-layer RPC tests (backlog#1830): they
     /// assert the error surface returned while the global object layer is
     /// absent. Under nextest — the authoritative runner — every test owns its
@@ -5534,6 +5597,54 @@ mod tests {
             .into_inner();
         assert!(!response.success);
         assert_eq!(response.error_info.as_deref(), Some("unsupported service signal: 99"));
+    }
+
+    #[tokio::test]
+    async fn signal_service_rejects_explicitly_unsigned_v2_body() {
+        let service = create_test_node_service();
+        let request = SignalServiceRequest {
+            vars: Some(Mss {
+                value: HashMap::from([(PEER_RESTSIGNAL.to_string(), "99".to_string())]),
+            }),
+        };
+        let mut request = Request::new(request);
+        request
+            .metadata_mut()
+            .insert("x-rustfs-rpc-auth-version", "2".parse().expect("valid metadata value"));
+        request
+            .metadata_mut()
+            .insert("x-rustfs-content-sha256", "UNSIGNED-PAYLOAD".parse().expect("valid metadata value"));
+
+        let error = service
+            .signal_service(request)
+            .await
+            .expect_err("an explicitly unsigned v2 signal must fail before handler logic");
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn signal_service_accepts_historical_unsigned_v2_marker_during_rollout() {
+        let service = create_test_node_service();
+        let mut request = Request::new(SignalServiceRequest {
+            vars: Some(Mss {
+                value: HashMap::from([(PEER_RESTSIGNAL.to_string(), "99".to_string())]),
+            }),
+        });
+        request
+            .metadata_mut()
+            .insert("x-rustfs-rpc-auth-version", "2".parse().expect("valid metadata value"));
+        request
+            .metadata_mut()
+            .insert("x-rustfs-content-sha256", "UNSIGNED-PAYLOAD".parse().expect("valid metadata value"));
+        request
+            .metadata_mut()
+            .insert("x-rustfs-rpc-nonce", "unsigned".parse().expect("valid metadata value"));
+
+        let response = service
+            .signal_service(request)
+            .await
+            .expect("historical unsigned v2 marker must remain compatible during rollout");
+        assert!(!response.into_inner().success, "invalid signal fixture should reach handler validation");
     }
 
     #[tokio::test]

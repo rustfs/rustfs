@@ -29,6 +29,7 @@ use tracing::debug;
 use crate::{QueryError, QueryResult};
 
 use super::Query;
+use super::ast::ExtStatement;
 use super::logical_planner::Plan;
 use super::session::{QueryExecutionTracker, SessionCtx};
 
@@ -172,6 +173,7 @@ pub struct QueryStateMachine {
     pub session: SessionCtx,
     pub query: Query,
 
+    prepared_statement: Option<ExtStatement>,
     query_tracker: Option<QueryExecutionTracker>,
     state: RwLock<QueryState>,
     start: Instant,
@@ -196,6 +198,7 @@ impl QueryStateMachine {
         Self {
             session,
             query,
+            prepared_statement: None,
             query_tracker: None,
             state: RwLock::new(QueryState::ACCEPTING),
             start: Instant::now(),
@@ -209,6 +212,21 @@ impl QueryStateMachine {
         let mut state_machine = Self::begin(query, session);
         state_machine.query_tracker = Some(query_tracker);
         Ok(state_machine)
+    }
+
+    pub fn begin_tracked_prepared(
+        query: Query,
+        session: SessionCtx,
+        query_tracker: QueryExecutionTracker,
+        prepared_statement: ExtStatement,
+    ) -> QueryResult<Self> {
+        let mut state_machine = Self::begin_tracked(query, session, query_tracker)?;
+        state_machine.prepared_statement = Some(prepared_statement);
+        Ok(state_machine)
+    }
+
+    pub fn prepared_statement(&self) -> Option<&ExtStatement> {
+        self.prepared_statement.as_ref()
     }
 
     pub fn query_tracker(&self) -> Option<&QueryExecutionTracker> {

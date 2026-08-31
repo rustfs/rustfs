@@ -25,6 +25,10 @@ on:
         description: 'warp write duration (e.g. 5m, 10m)'
         required: false
         default: '10m'
+      warp_concurrent:
+        description: 'Pool fill: concurrent warp operations'
+        required: false
+        default: '32'
       run_decommission:
         description: 'Run the pool decommission step (3-pool topology only)'
         type: boolean
@@ -46,7 +50,7 @@ on:
         type: boolean
         default: true
   workflow_run:
-    # Strict shared-environment order: run after tier test succeeds.
+    # Strict shared-environment order: run after tier test completes.
     workflows: ["RustFS Tier Test"]
     types: [completed]
 
@@ -70,16 +74,17 @@ env:
   RUSTFS_API_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
   RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
   RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
   # Package used by the nightly run (workflow_dispatch inputs are empty for
   # workflow_run events), i.e. the latest nightly deb published by nightly-gnu.yml.
   RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
 
 jobs:
-  pool-expansion-test:
-    name: Pool expansion / decommission test
+  heal-test:
+    name: Heal test
     runs-on: smoke-testing
-    timeout-minutes: 360
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    timeout-minutes: 480
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run' }}
     steps:
       - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -95,109 +100,26 @@ jobs:
           uname -a
           jq --version
           openssl version
-          warp --version || true
           df -h /data | tail -1
 
-      - name: Reset test environment (before)
+      - name: Cleanup environment (before)
         if: ${{ inputs.cleanup_before != 'false' }}
         run: |
-          chmod +x auto-testing/rustfs_pool_expand.sh
-          ./auto-testing/rustfs_pool_expand.sh --reset -y
-
-      - name: Install RustFS package & start first pool
-        run: |
-          ARGS=(--steps "1,2,3" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          elif [ -n "${{ inputs.rustfs_version }}" ]; then
-            ARGS+=(--version "${{ inputs.rustfs_version }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
-
-      - name: Preflight checks
-        run: |
-          ARGS=(--preflight --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          elif [ -n "${{ inputs.rustfs_version }}" ]; then
-            ARGS+=(--version "${{ inputs.rustfs_version }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
-
-      - name: Run pool expansion & decommission test
-        id: pool_test
-        run: |
-          set -o pipefail
-          STEPS="4,5,6"
-          if [ "${{ inputs.pools || '3' }}" = "3" ]; then
-            STEPS="$STEPS,7,8"
-            if [ "${{ inputs.run_decommission != 'false' }}" = "true" ]; then
-              STEPS="$STEPS,9"
-            fi
-          fi
-          ARGS=(--steps "$STEPS" --with-warp -y \
-            --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
-            --storage-threshold "${{ inputs.storage_threshold || '50' }}" \
-            --warp-duration "${{ inputs.warp_duration || '10m' }}" \
-            --log-file /tmp/rustfs-pool-test.log)
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          elif [ -n "${{ inputs.rustfs_version }}" ]; then
-            ARGS+=(--version "${{ inputs.rustfs_version }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
-
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: rustfs-pool-test-${{ github.run_id }}
-          path: |
-            /tmp/rustfs-pool-test*.log
-            /tmp/rustfs-warp.*.log
-          if-no-files-found: warn
-
-      - name: Reset test environment (after)
-        if: ${{ always() && inputs.cleanup_after != 'false' }}
-        run: |
-          ./auto-testing/rustfs_pool_expand.sh --reset -y
-
-      - name: Notify on failure
-        if: failure()
-        run: |
-          echo "RustFS pool expansion test failed"
-          echo "Package source: ${{ inputs.package_url || inputs.rustfs_version || 'nightly (R2 latest)' }}"
-          echo "See the uploaded log artifact for details."
-
-  # Heal regression runs after the pool test regardless of its outcome: a pool
-  # failure must be reported (it makes the run red) but must not block heal.
-  heal-test:
-    name: Heal test (after pool test)
-    runs-on: smoke-testing
-    timeout-minutes: 480
-    needs: pool-expansion-test
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') }}
-    steps:
-      - name: Checkout auto-testing scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: rustfs/auto-testing
-          ref: main
-          path: auto-testing
-          persist-credentials: false
-          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
-
-      - name: Reset test environment (before)
-        if: ${{ inputs.cleanup_before != 'false' }}
-        run: |
-          chmod +x auto-testing/rustfs_heal_test.sh
-          ./auto-testing/rustfs_heal_test.sh --reset -y
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
 
       - name: Install RustFS package & start cluster
         run: |
@@ -220,6 +142,7 @@ jobs:
           ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
 
       - name: Run heal test (write -> outage -> heal -> verify)
+        id: test
         run: |
           ARGS=(--steps "3,4,5,6,7" -y \
             --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
@@ -233,6 +156,211 @@ jobs:
           fi
           ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
 
+      - name: Generate report
+        if: always()
+        env:
+          LOG_FILE: /tmp/rustfs-heal-test.log
+          REPORT_FILE: /tmp/rustfs-heal-report.md
+        run: |
+          set -euo pipefail
+          PACKAGE_URL='${{ inputs.package_url }}'
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          fi
+          {
+            echo "# RustFS heal test report"
+            echo ""
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo ""
+            echo "## Log tail"
+            echo '```text'
+            tail -n 200 "${LOG_FILE}" || true
+            echo '```'
+          } | tee "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload functional report to dashboard
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          REPORT_FILE: /tmp/rustfs-heal-report.md
+          SUITE: heal
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
+            exit 0
+          fi
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
+          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          fi
+
+          cat > /tmp/rustfs-functional-index.html <<'EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>RustFS Functional Test Reports</title>
+            <style>
+              :root { --bg:#f4f6fb; --card:#fff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb; --accent:#0f766e; }
+              * { box-sizing: border-box; }
+              body { margin: 0; font-family: ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+              .wrap { max-width: 980px; margin: 32px auto; padding: 0 16px; }
+              .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+              h1 { margin: 0 0 8px; font-size: 26px; }
+              p { margin: 0 0 14px; color: var(--muted); }
+              .tabs { display: flex; gap: 10px; margin: 14px 0 18px; flex-wrap: wrap; }
+              button { border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 10px; padding: 8px 14px; cursor: pointer; }
+              button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+              .report-btn { border: 0; background: transparent; padding: 0; color: var(--accent); }
+              ul { list-style: none; margin: 0; padding: 0; }
+              li { padding: 10px 0; border-bottom: 1px solid var(--line); }
+              a { color: var(--accent); text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              .meta { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+              .kv { margin: 6px 0; color: var(--text); }
+              .muted { color: var(--muted); }
+            </style>
+          </head>
+          <body>
+            <div class="wrap">
+              <div class="card">
+                <h1>RustFS Functional Test Reports</h1>
+                <p>Select a suite and date to view the build version used in that run.</p>
+                <div class="tabs" id="tabs"></div>
+                <ul id="list"></ul>
+                <div class="meta">
+                  <div class="kv"><strong>Date:</strong> <span id="report-date" class="muted">N/A</span></div>
+                  <div class="kv"><strong>RustFS Version:</strong> <span id="report-version" class="muted">N/A</span></div>
+                  <div class="kv"><a id="report-link" href="#" target="_blank" rel="noreferrer">Open report</a></div>
+                </div>
+              </div>
+            </div>
+            <script>
+              const suites = [
+                { key: 's3', label: 'S3 Compatibility' },
+                { key: 'kms', label: 'KMS' },
+                { key: 'tier', label: 'Tier' },
+                { key: 'heal', label: 'Heal' },
+                { key: 'pool', label: 'Pool Expansion' },
+                { key: 'security', label: 'Security' },
+                { key: 'upgrade', label: 'Upgrade' },
+              ];
+              const tabs = document.getElementById('tabs');
+              const list = document.getElementById('list');
+              const reportDate = document.getElementById('report-date');
+              const reportVersion = document.getElementById('report-version');
+              const reportLink = document.getElementById('report-link');
+
+              function parseVersion(markdown) {
+                const m = markdown.match(/^- RustFS Version:\s*(.+)$/m);
+                return m ? m[1].trim() : 'N/A';
+              }
+
+              async function showReport(report) {
+                reportDate.textContent = report.name.replace('.md', '');
+                reportVersion.textContent = 'Loading...';
+                reportLink.href = report.html_url;
+                try {
+                  const res = await fetch(report.download_url, { cache: 'no-store' });
+                  if (!res.ok) {
+                    reportVersion.textContent = 'N/A';
+                    return;
+                  }
+                  const text = await res.text();
+                  reportVersion.textContent = parseVersion(text);
+                } catch (_e) {
+                  reportVersion.textContent = 'N/A';
+                }
+              }
+
+              async function loadSuite(suite) {
+                list.innerHTML = '<li>Loading...</li>';
+                const api = `https://api.github.com/repos/rustfs/dashboard/contents/functional-reports/${suite}`;
+                try {
+                  const res = await fetch(api);
+                  if (!res.ok) {
+                    list.innerHTML = '<li>No reports yet.</li>';
+                    return;
+                  }
+                  const data = await res.json();
+                  const files = data.filter(f => f.type === 'file' && f.name.endsWith('.md')).sort((a,b) => b.name.localeCompare(a.name));
+                  if (!files.length) {
+                    list.innerHTML = '<li>No reports yet.</li>';
+                    reportDate.textContent = 'N/A';
+                    reportVersion.textContent = 'N/A';
+                    reportLink.href = '#';
+                    return;
+                  }
+                  list.innerHTML = '';
+                  files.forEach((f) => {
+                    const li = document.createElement('li');
+                    const btn = document.createElement('button');
+                    btn.className = 'report-btn';
+                    btn.textContent = f.name.replace('.md', '');
+                    btn.addEventListener('click', () => showReport(f));
+                    li.appendChild(btn);
+                    list.appendChild(li);
+                  });
+                  showReport(files[0]);
+                } catch (_e) {
+                  list.innerHTML = '<li>Failed to load reports.</li>';
+                  reportDate.textContent = 'N/A';
+                  reportVersion.textContent = 'N/A';
+                  reportLink.href = '#';
+                }
+              }
+
+              function setActive(key) {
+                for (const btn of tabs.querySelectorAll('button')) {
+                  btn.classList.toggle('active', btn.dataset.key === key);
+                }
+                loadSuite(key);
+              }
+
+              for (const suite of suites) {
+                const btn = document.createElement('button');
+                btn.textContent = suite.label;
+                btn.dataset.key = suite.key;
+                btn.addEventListener('click', () => setActive(suite.key));
+                tabs.appendChild(btn);
+              }
+              setActive('s3');
+            </script>
+          </body>
+          </html>
+          EOF
+
+          INDEX_PATH="functional/index.html"
+          INDEX_CONTENT="$(python3 -c 'import base64;print(base64.b64encode(open("/tmp/rustfs-functional-index.html","rb").read()).decode())')"
+          INDEX_SHA="$(gh api "repos/rustfs/dashboard/contents/${INDEX_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${INDEX_SHA}" ]; then
+            jq -n --arg msg "functional ui update" --arg content "${INDEX_CONTENT}" --arg sha "${INDEX_SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "functional ui init" --arg content "${INDEX_CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
+          fi
+
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
@@ -243,13 +371,635 @@ jobs:
             /tmp/rustfs-warp.*.log
           if-no-files-found: warn
 
-      - name: Reset test environment (after)
+      - name: Cleanup environment (after)
         if: ${{ always() && inputs.cleanup_after != 'false' }}
         run: |
-          ./auto-testing/rustfs_heal_test.sh --reset -y
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
 
       - name: Notify on failure
         if: failure()
         run: |
           echo "RustFS heal test failed"
+          echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+          echo "See the uploaded log artifact for details."
+
+  # Pool expansion runs after heal regardless of heal outcome.
+  pool-expansion-test:
+    name: Pool expansion / decommission test
+    runs-on: smoke-testing
+    timeout-minutes: 360
+    needs: heal-test
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') }}
+    env:
+      RUSTFS_POOL_ADMIN_ENDPOINT: ${{ secrets.RUSTFS_POOL_ADMIN_ENDPOINT || vars.RUSTFS_POOL_ADMIN_ENDPOINT || 'http://rustfs-node1:9000' }}
+      RUSTFS_POOL_PROXY_ENDPOINT: http://127.0.0.1:19000
+      RUSTFS_POOL_WARP_ENDPOINT: http://127.0.0.1:19000
+      RUSTFS_SHARED_PROXY_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
+      RUSTFS_POOL_NODE_ENDPOINTS: ${{ secrets.RUSTFS_POOL_NODE_ENDPOINTS || vars.RUSTFS_POOL_NODE_ENDPOINTS || 'http://rustfs-node1:9000 http://rustfs-node2:9000 http://rustfs-node3:9000' }}
+    steps:
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Initialize pool test artifacts
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="${RUNNER_TEMP}/rustfs-pool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${ARTIFACT_DIR}"
+          echo "POOL_ARTIFACT_DIR=${ARTIFACT_DIR}" >> "${GITHUB_ENV}"
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          openssl version
+          warp --version || true
+          df -h /data | tail -1
+
+      - name: Cleanup environment (before)
+        if: ${{ inputs.cleanup_before != 'false' }}
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
+
+      - name: Install RustFS package & start cluster
+        run: |
+          ARGS=(--steps "1,2,3" -y \
+            --admin-endpoint "${RUSTFS_POOL_ADMIN_ENDPOINT}" \
+            --warp-endpoint "${RUSTFS_POOL_WARP_ENDPOINT}" \
+            --node-endpoints "${RUSTFS_POOL_NODE_ENDPOINTS}" \
+            --log-file "${POOL_ARTIFACT_DIR}/pool-test.log")
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          elif [ -n "${{ inputs.rustfs_version }}" ]; then
+            ARGS+=(--version "${{ inputs.rustfs_version }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
+
+      - name: Preflight checks
+        run: |
+          ARGS=(--preflight \
+            --admin-endpoint "${RUSTFS_POOL_ADMIN_ENDPOINT}" \
+            --warp-endpoint "${RUSTFS_POOL_WARP_ENDPOINT}" \
+            --node-endpoints "${RUSTFS_POOL_NODE_ENDPOINTS}" \
+            --log-file "${POOL_ARTIFACT_DIR}/pool-test.log")
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          elif [ -n "${{ inputs.rustfs_version }}" ]; then
+            ARGS+=(--version "${{ inputs.rustfs_version }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
+
+      - name: Reset dedicated pool proxy
+        run: |
+          set -euo pipefail
+          RUSTFS_POOL_NGINX_CONFIG_PATH=/etc/nginx/conf.d/rustfs-pool-test.conf \
+          RUSTFS_POOL_NGINX_LISTEN="${RUSTFS_POOL_PROXY_ENDPOINT#http://}" \
+          RUSTFS_POOL_NGINX_ACCESS_LOG=/var/log/nginx/rustfs-pool-test-access.log \
+          RUSTFS_POOL_NGINX_ERROR_LOG=/var/log/nginx/rustfs-pool-test-error.log \
+            ./auto-testing/rustfs_pool_nginx_stage.sh cleanup
+
+      - name: Capture pool test baseline
+        run: |
+          set -uo pipefail
+          BASELINE_FILE="${POOL_ARTIFACT_DIR}/pool-baseline.log"
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          read -r -a DIRECT_ENDPOINTS <<< "${RUSTFS_POOL_NODE_ENDPOINTS}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          failed=0
+          : > "${BASELINE_FILE}"
+
+          if [ "${#DIRECT_ENDPOINTS[@]}" -lt "${#NODES[@]}" ]; then
+            echo "not enough direct endpoints for the configured nodes" | tee -a "${BASELINE_FILE}" >&2
+            exit 1
+          fi
+
+          for index in "${!NODES[@]}"; do
+            node="${NODES[$index]}"
+            endpoint="${DIRECT_ENDPOINTS[$index]}"
+            body_file="${POOL_ARTIFACT_DIR}/ready-baseline-$((index + 1)).body"
+            {
+              echo "--- node=${node} endpoint=${endpoint} ---"
+              if ! ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+                "${SSH_USER}@${node}" '
+                  set -euo pipefail
+                  SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+                  echo "--- rustfs version ---"
+                  rustfs --version
+                  echo "--- systemd state ---"
+                  ${SUDO} systemctl show rustfs --no-pager \
+                    --property=ActiveState,SubState,Result,ExecMainPID,ExecMainStartTimestamp,NRestarts
+                '; then
+                echo "baseline collection failed for ${node}"
+                failed=1
+              fi
+              curl -sS --connect-timeout 5 --max-time 15 -o "${body_file}" \
+                -w "baseline_ready=${endpoint} http=%{http_code} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+                "${endpoint%/}/health/ready" || true
+              echo "--- readiness body ---"
+              cat "${body_file}" 2>/dev/null || true
+              echo
+            } >> "${BASELINE_FILE}" 2>&1
+          done
+
+          [ "${failed}" -eq 0 ] || exit 1
+
+      - name: Run pool expansion & decommission test
+        id: pool_test
+        run: |
+          set -o pipefail
+          STEPS="4,5,6"
+          if [ "${{ inputs.pools || '3' }}" = "3" ]; then
+            STEPS="$STEPS,7,8"
+            if [ "${{ inputs.run_decommission != 'false' }}" = "true" ]; then
+              STEPS="$STEPS,9"
+            fi
+          fi
+          ARGS=(--steps "$STEPS" --with-warp -y \
+            --admin-endpoint "${RUSTFS_POOL_ADMIN_ENDPOINT}" \
+            --warp-endpoint "${RUSTFS_POOL_WARP_ENDPOINT}" \
+            --node-endpoints "${RUSTFS_POOL_NODE_ENDPOINTS}" \
+            --storage-threshold "${{ inputs.storage_threshold || '50' }}" \
+            --warp-duration "${{ inputs.warp_duration || '10m' }}" \
+            --warp-concurrent "${{ inputs.warp_concurrent || '32' }}" \
+            --log-file "${POOL_ARTIFACT_DIR}/pool-test.log")
+          if [ -n "${RUSTFS_POOL_PROXY_ENDPOINT}" ]; then
+            ARGS+=(--proxy-endpoint "${RUSTFS_POOL_PROXY_ENDPOINT}")
+          fi
+          if [ -n "${{ inputs.package_url }}" ]; then
+            ARGS+=(--package-url "${{ inputs.package_url }}")
+          elif [ -n "${{ inputs.rustfs_version }}" ]; then
+            ARGS+=(--version "${{ inputs.rustfs_version }}")
+          else
+            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
+          fi
+          RUSTFS_WARP_LOG_FILE="${POOL_ARTIFACT_DIR}/warp.log" \
+          RUSTFS_PROXY_STAGE_HOOK=./auto-testing/rustfs_pool_nginx_stage.sh \
+          RUSTFS_POOL_NGINX_CONFIG_PATH=/etc/nginx/conf.d/rustfs-pool-test.conf \
+          RUSTFS_POOL_NGINX_LISTEN="${RUSTFS_POOL_PROXY_ENDPOINT#http://}" \
+          RUSTFS_POOL_NGINX_ACCESS_LOG=/var/log/nginx/rustfs-pool-test-access.log \
+          RUSTFS_POOL_NGINX_ERROR_LOG=/var/log/nginx/rustfs-pool-test-error.log \
+            ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
+
+      - name: Collect pool test diagnostics
+        if: always()
+        run: |
+          set -uo pipefail
+          ARTIFACT_DIR="${POOL_ARTIFACT_DIR:-${RUNNER_TEMP}/rustfs-pool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+          mkdir -p "${ARTIFACT_DIR}"
+          echo "POOL_ARTIFACT_DIR=${ARTIFACT_DIR}" >> "${GITHUB_ENV}"
+
+          redact() {
+            sed -E \
+              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)=).*/\1[REDACTED]/Ig' \
+              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
+              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/(proxy_set_header[[:space:]]+Authorization[[:space:]]+).*/\1[REDACTED];/Ig' \
+              -e 's/^.*(password|secret|token).*/[REDACTED SENSITIVE LINE]/Ig'
+          }
+
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=()
+          else
+            SUDO=(sudo -n)
+          fi
+
+          {
+            echo "captured_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            if command -v nginx >/dev/null 2>&1; then
+              "${SUDO[@]}" nginx -T 2>&1 || echo "nginx -T failed"
+            else
+              echo "nginx is not installed on the runner"
+            fi
+          } | redact > "${ARTIFACT_DIR}/nginx-config-redacted.txt"
+
+          for log_path in \
+            /var/log/nginx/access.log \
+            /var/log/nginx/error.log \
+            /var/log/nginx/rustfs-pool-test-access.log \
+            /var/log/nginx/rustfs-pool-test-error.log; do
+            log_name="$(basename "${log_path}")"
+            if "${SUDO[@]}" test -r "${log_path}" 2>/dev/null; then
+              "${SUDO[@]}" cat "${log_path}" 2>&1 | redact \
+                > "${ARTIFACT_DIR}/nginx-${log_name%.log}-redacted.log"
+            else
+              echo "unavailable: ${log_path}" > "${ARTIFACT_DIR}/nginx-${log_name%.log}-redacted.log"
+            fi
+          done
+          "${SUDO[@]}" journalctl -u nginx --no-pager -n 5000 2>&1 | redact \
+            > "${ARTIFACT_DIR}/nginx-journal-redacted.log" || true
+
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            safe_node="${node//[^A-Za-z0-9_.-]/_}"
+            {
+              if ! ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+                "${SSH_USER}@${node}" '
+                  SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+                  echo "--- rustfs version ---"
+                  rustfs --version 2>&1 || true
+                  echo "--- systemd state ---"
+                  ${SUDO} systemctl show rustfs --no-pager \
+                    --property=ActiveState,SubState,Result,ExecMainPID,ExecMainStartTimestamp,NRestarts 2>&1 || true
+                  echo "--- rustfs journal ---"
+                  ${SUDO} journalctl -u rustfs --no-pager -n 10000 2>&1 || true
+                  echo "--- rustfs file logs ---"
+                  if ${SUDO} test -d /var/log/rustfs; then
+                    ${SUDO} find /var/log/rustfs -maxdepth 2 -type f -print 2>/dev/null | while IFS= read -r file; do
+                      echo "--- ${file} (last 5000 lines) ---"
+                      ${SUDO} tail -n 5000 "${file}" 2>&1 || true
+                    done
+                  else
+                    echo "/var/log/rustfs is unavailable"
+                  fi
+                '; then
+                echo "SSH diagnostics failed for ${node}"
+              fi
+            } 2>&1 | redact > "${ARTIFACT_DIR}/${safe_node}-rustfs-redacted.log"
+          done
+
+          : > "${ARTIFACT_DIR}/endpoint-ready-probes.log"
+          read -r -a DIRECT_ENDPOINTS <<< "${RUSTFS_POOL_NODE_ENDPOINTS}"
+          probe_index=0
+          for endpoint in "${DIRECT_ENDPOINTS[@]}"; do
+            probe_index=$((probe_index + 1))
+            curl -sS --connect-timeout 5 --max-time 15 -o "${ARTIFACT_DIR}/ready-direct-${probe_index}.body" \
+              -w "direct[${probe_index}]=${endpoint} http=%{http_code} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+              "${endpoint%/}/health/ready" >> "${ARTIFACT_DIR}/endpoint-ready-probes.log" 2>&1 || true
+          done
+          if [ -n "${RUSTFS_POOL_PROXY_ENDPOINT}" ]; then
+            curl -sS --connect-timeout 5 --max-time 15 -o "${ARTIFACT_DIR}/ready-proxy.body" \
+              -w "proxy=${RUSTFS_POOL_PROXY_ENDPOINT} http=%{http_code} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+              "${RUSTFS_POOL_PROXY_ENDPOINT%/}/health/ready" >> "${ARTIFACT_DIR}/endpoint-ready-probes.log" 2>&1 || true
+          fi
+          if [ -n "${RUSTFS_SHARED_PROXY_ENDPOINT}" ]; then
+            curl -sS --connect-timeout 5 --max-time 15 -o "${ARTIFACT_DIR}/ready-shared-proxy.body" \
+              -w "shared_proxy=${RUSTFS_SHARED_PROXY_ENDPOINT} http=%{http_code} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+              "${RUSTFS_SHARED_PROXY_ENDPOINT%/}/health/ready" >> "${ARTIFACT_DIR}/endpoint-ready-probes.log" 2>&1 || true
+          fi
+
+      - name: Generate report
+        if: always()
+        run: |
+          set -euo pipefail
+          LOG_FILE="${POOL_ARTIFACT_DIR}/pool-test.log"
+          REPORT_FILE="${POOL_ARTIFACT_DIR}/pool-report.md"
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          fi
+          {
+            echo "# RustFS pool expansion test report"
+            echo ""
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- Warp concurrent: ${{ inputs.warp_concurrent || '32' }}"
+            echo "- Test Step Outcome: ${{ steps.pool_test.outcome }}"
+            echo ""
+            echo "## Log tail"
+            echo '```text'
+            tail -n 200 "${LOG_FILE}" || true
+            echo '```'
+          } | tee "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Validate pool diagnostic completeness
+        if: always()
+        run: |
+          set -euo pipefail
+          failed=0
+          require_nonempty() {
+            if [ ! -s "$1" ]; then
+              echo "required diagnostic is missing or empty: $1" >&2
+              failed=1
+            fi
+          }
+          require_available() {
+            if [ ! -e "$1" ]; then
+              echo "required diagnostic is missing: $1" >&2
+              failed=1
+            elif grep -Fq 'unavailable:' "$1" 2>/dev/null; then
+              echo "required diagnostic could not be collected: $1" >&2
+              failed=1
+            fi
+          }
+
+          require_nonempty "${POOL_ARTIFACT_DIR}/pool-test.log"
+          require_nonempty "${POOL_ARTIFACT_DIR}/warp.log"
+          require_nonempty "${POOL_ARTIFACT_DIR}/pool-report.md"
+          require_nonempty "${POOL_ARTIFACT_DIR}/pool-baseline.log"
+          require_nonempty "${POOL_ARTIFACT_DIR}/nginx-config-redacted.txt"
+          require_nonempty "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-access-redacted.log"
+          require_available "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-access-redacted.log"
+          require_available "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-error-redacted.log"
+          require_nonempty "${POOL_ARTIFACT_DIR}/endpoint-ready-probes.log"
+
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          if grep -Fq 'baseline collection failed' "${POOL_ARTIFACT_DIR}/pool-baseline.log" 2>/dev/null; then
+            echo "one or more node baselines could not be collected" >&2
+            failed=1
+          fi
+          for node in "${NODES[@]}"; do
+            safe_node="${node//[^A-Za-z0-9_.-]/_}"
+            node_log="${POOL_ARTIFACT_DIR}/${safe_node}-rustfs-redacted.log"
+            require_nonempty "${node_log}"
+            if grep -Fq "SSH diagnostics failed for ${node}" "${node_log}" 2>/dev/null; then
+              echo "node diagnostics failed: ${node_log}" >&2
+              failed=1
+            fi
+            if ! grep -Eq '^rustfs @' "${node_log}" 2>/dev/null \
+              || ! grep -Eq '^NRestarts=[0-9]+$' "${node_log}" 2>/dev/null; then
+              echo "node version or restart evidence is incomplete: ${node_log}" >&2
+              failed=1
+            elif grep -Eq '^NRestarts=[1-9][0-9]*$' "${node_log}"; then
+              echo "RustFS restarted unexpectedly during the run: ${node_log}" >&2
+              failed=1
+            fi
+          done
+
+          if ! grep -Fq "upstream_status=\"\$upstream_status\"" \
+            "${POOL_ARTIFACT_DIR}/nginx-config-redacted.txt"; then
+            echo "Nginx config does not expose upstream status fields" >&2
+            failed=1
+          fi
+          if ! grep -Eq '^proxy=.* http=200([[:space:]]|$)' "${POOL_ARTIFACT_DIR}/endpoint-ready-probes.log"; then
+            echo "dedicated proxy readiness probe did not return HTTP 200" >&2
+            failed=1
+          fi
+          if grep -Eq 'status=50(2|4)|upstream_status="[^"]*50(2|4)' \
+            "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-access-redacted.log"; then
+            echo "dedicated proxy access log contains a 502/504 response" >&2
+            failed=1
+          fi
+          if grep -Eiq 'upstream prematurely closed connection|upstream timed out|(connect\(\)|recv\(\)|send\(\)) failed.*upstream|connection reset by peer.*upstream' \
+            "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-error-redacted.log"; then
+            echo "dedicated proxy error log contains an upstream timeout or connection failure" >&2
+            failed=1
+          fi
+          [ "${failed}" -eq 0 ] || exit 1
+
+      - name: Upload functional report to dashboard
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          SUITE: pool
+        run: |
+          set -euo pipefail
+          REPORT_FILE="${POOL_ARTIFACT_DIR}/pool-report.md"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
+            exit 0
+          fi
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
+          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          fi
+
+          cat > /tmp/rustfs-functional-index.html <<'EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>RustFS Functional Test Reports</title>
+            <style>
+              :root { --bg:#f4f6fb; --card:#fff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb; --accent:#0f766e; }
+              * { box-sizing: border-box; }
+              body { margin: 0; font-family: ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+              .wrap { max-width: 980px; margin: 32px auto; padding: 0 16px; }
+              .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+              h1 { margin: 0 0 8px; font-size: 26px; }
+              p { margin: 0 0 14px; color: var(--muted); }
+              .tabs { display: flex; gap: 10px; margin: 14px 0 18px; flex-wrap: wrap; }
+              button { border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 10px; padding: 8px 14px; cursor: pointer; }
+              button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+              .report-btn { border: 0; background: transparent; padding: 0; color: var(--accent); }
+              ul { list-style: none; margin: 0; padding: 0; }
+              li { padding: 10px 0; border-bottom: 1px solid var(--line); }
+              a { color: var(--accent); text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              .meta { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+              .kv { margin: 6px 0; color: var(--text); }
+              .muted { color: var(--muted); }
+            </style>
+          </head>
+          <body>
+            <div class="wrap">
+              <div class="card">
+                <h1>RustFS Functional Test Reports</h1>
+                <p>Select a suite and date to view the build version used in that run.</p>
+                <div class="tabs" id="tabs"></div>
+                <ul id="list"></ul>
+                <div class="meta">
+                  <div class="kv"><strong>Date:</strong> <span id="report-date" class="muted">N/A</span></div>
+                  <div class="kv"><strong>RustFS Version:</strong> <span id="report-version" class="muted">N/A</span></div>
+                  <div class="kv"><a id="report-link" href="#" target="_blank" rel="noreferrer">Open report</a></div>
+                </div>
+              </div>
+            </div>
+            <script>
+              const suites = [
+                { key: 's3', label: 'S3 Compatibility' },
+                { key: 'kms', label: 'KMS' },
+                { key: 'tier', label: 'Tier' },
+                { key: 'heal', label: 'Heal' },
+                { key: 'pool', label: 'Pool Expansion' },
+                { key: 'security', label: 'Security' },
+                { key: 'upgrade', label: 'Upgrade' },
+              ];
+              const tabs = document.getElementById('tabs');
+              const list = document.getElementById('list');
+              const reportDate = document.getElementById('report-date');
+              const reportVersion = document.getElementById('report-version');
+              const reportLink = document.getElementById('report-link');
+
+              function parseVersion(markdown) {
+                const m = markdown.match(/^- RustFS Version:\s*(.+)$/m);
+                return m ? m[1].trim() : 'N/A';
+              }
+
+              async function showReport(report) {
+                reportDate.textContent = report.name.replace('.md', '');
+                reportVersion.textContent = 'Loading...';
+                reportLink.href = report.html_url;
+                try {
+                  const res = await fetch(report.download_url, { cache: 'no-store' });
+                  if (!res.ok) {
+                    reportVersion.textContent = 'N/A';
+                    return;
+                  }
+                  const text = await res.text();
+                  reportVersion.textContent = parseVersion(text);
+                } catch (_e) {
+                  reportVersion.textContent = 'N/A';
+                }
+              }
+
+              async function loadSuite(suite) {
+                list.innerHTML = '<li>Loading...</li>';
+                const api = `https://api.github.com/repos/rustfs/dashboard/contents/functional-reports/${suite}`;
+                try {
+                  const res = await fetch(api);
+                  if (!res.ok) {
+                    list.innerHTML = '<li>No reports yet.</li>';
+                    return;
+                  }
+                  const data = await res.json();
+                  const files = data.filter(f => f.type === 'file' && f.name.endsWith('.md')).sort((a,b) => b.name.localeCompare(a.name));
+                  if (!files.length) {
+                    list.innerHTML = '<li>No reports yet.</li>';
+                    reportDate.textContent = 'N/A';
+                    reportVersion.textContent = 'N/A';
+                    reportLink.href = '#';
+                    return;
+                  }
+                  list.innerHTML = '';
+                  files.forEach((f) => {
+                    const li = document.createElement('li');
+                    const btn = document.createElement('button');
+                    btn.className = 'report-btn';
+                    btn.textContent = f.name.replace('.md', '');
+                    btn.addEventListener('click', () => showReport(f));
+                    li.appendChild(btn);
+                    list.appendChild(li);
+                  });
+                  showReport(files[0]);
+                } catch (_e) {
+                  list.innerHTML = '<li>Failed to load reports.</li>';
+                  reportDate.textContent = 'N/A';
+                  reportVersion.textContent = 'N/A';
+                  reportLink.href = '#';
+                }
+              }
+
+              function setActive(key) {
+                for (const btn of tabs.querySelectorAll('button')) {
+                  btn.classList.toggle('active', btn.dataset.key === key);
+                }
+                loadSuite(key);
+              }
+
+              for (const suite of suites) {
+                const btn = document.createElement('button');
+                btn.textContent = suite.label;
+                btn.dataset.key = suite.key;
+                btn.addEventListener('click', () => setActive(suite.key));
+                tabs.appendChild(btn);
+              }
+              setActive('s3');
+            </script>
+          </body>
+          </html>
+          EOF
+
+          INDEX_PATH="functional/index.html"
+          INDEX_CONTENT="$(python3 -c 'import base64;print(base64.b64encode(open("/tmp/rustfs-functional-index.html","rb").read()).decode())')"
+          INDEX_SHA="$(gh api "repos/rustfs/dashboard/contents/${INDEX_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${INDEX_SHA}" ]; then
+            jq -n --arg msg "functional ui update" --arg content "${INDEX_CONTENT}" --arg sha "${INDEX_SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "functional ui init" --arg content "${INDEX_CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
+          fi
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-pool-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rustfs-pool-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+
+      - name: Restore dedicated pool proxy
+        if: always()
+        run: |
+          set -euo pipefail
+          RUSTFS_POOL_NGINX_CONFIG_PATH=/etc/nginx/conf.d/rustfs-pool-test.conf \
+          RUSTFS_POOL_NGINX_LISTEN="${RUSTFS_POOL_PROXY_ENDPOINT#http://}" \
+          RUSTFS_POOL_NGINX_ACCESS_LOG=/var/log/nginx/rustfs-pool-test-access.log \
+          RUSTFS_POOL_NGINX_ERROR_LOG=/var/log/nginx/rustfs-pool-test-error.log \
+            ./auto-testing/rustfs_pool_nginx_stage.sh cleanup
+
+      - name: Cleanup environment (after)
+        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS pool expansion test failed"
+          echo "Package source: ${{ inputs.package_url || inputs.rustfs_version || 'nightly (R2 latest)' }}"
           echo "See the uploaded log artifact for details."

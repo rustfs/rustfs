@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::SelectObjectSnapshot;
-use crate::query::Context;
-use crate::{QueryError, QueryResult, object_store::EcObjectStore};
+use crate::query::{Context, Query, ast::JsonSource};
+use crate::{
+    QueryError, QueryResult, SelectInputMetrics, SelectObjectSnapshot,
+    object_store::{EcObjectStore, is_json_document_input, legacy_json_source_from_input},
+};
 use datafusion::{
     arrow::{
         array::{Int32Array, StringArray},
@@ -28,6 +30,7 @@ use datafusion::{
     prelude::SessionContext,
 };
 use parking_lot::Mutex;
+use s3s::dto::CompressionType;
 use std::sync::{
     Arc, Weak,
     atomic::{AtomicU8, Ordering},
@@ -314,8 +317,15 @@ impl SessionCtxFactory {
     }
 
     pub async fn create_session_ctx(&self, context: &Context) -> QueryResult<SessionCtx> {
-        self.create_session_ctx_inner(context, None, None, DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES)
-            .await
+        self.create_session_ctx_inner(
+            context,
+            None,
+            legacy_json_source_from_input(&context.input),
+            None,
+            None,
+            DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+        )
+        .await
     }
 
     pub async fn create_session_ctx_with_tracker_and_memory_limit(
@@ -324,8 +334,15 @@ impl SessionCtxFactory {
         query_tracker: QueryExecutionTracker,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionCtx> {
-        self.create_session_ctx_inner(context, None, Some(query_tracker), memory_limit_bytes)
-            .await
+        self.create_session_ctx_inner(
+            context,
+            None,
+            legacy_json_source_from_input(&context.input),
+            Some(query_tracker),
+            None,
+            memory_limit_bytes,
+        )
+        .await
     }
 
     pub async fn create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
@@ -335,19 +352,63 @@ impl SessionCtxFactory {
         query_tracker: QueryExecutionTracker,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionCtx> {
-        self.create_session_ctx_inner(context, Some(snapshot), Some(query_tracker), memory_limit_bytes)
-            .await
+        self.create_session_ctx_inner(
+            context,
+            Some(snapshot),
+            legacy_json_source_from_input(&context.input),
+            Some(query_tracker),
+            None,
+            memory_limit_bytes,
+        )
+        .await
+    }
+
+    pub async fn create_session_ctx_for_query_with_source_and_tracker_and_memory_limit(
+        &self,
+        query: &Query,
+        source: JsonSource,
+        query_tracker: QueryExecutionTracker,
+        memory_limit_bytes: usize,
+    ) -> QueryResult<SessionCtx> {
+        self.create_session_ctx_inner(
+            query.context(),
+            query.snapshot().cloned(),
+            source,
+            Some(query_tracker),
+            Some(Arc::clone(query.input_metrics())),
+            memory_limit_bytes,
+        )
+        .await
+    }
+
+    pub async fn create_session_ctx_for_query_with_tracker_and_memory_limit(
+        &self,
+        query: &Query,
+        query_tracker: QueryExecutionTracker,
+        memory_limit_bytes: usize,
+    ) -> QueryResult<SessionCtx> {
+        self.create_session_ctx_inner(
+            query.context(),
+            query.snapshot().cloned(),
+            legacy_json_source_from_input(&query.context().input),
+            Some(query_tracker),
+            Some(Arc::clone(query.input_metrics())),
+            memory_limit_bytes,
+        )
+        .await
     }
 
     async fn create_session_ctx_inner(
         &self,
         context: &Context,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
+        source: JsonSource,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Option<Arc<SelectInputMetrics>>,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionCtx> {
         let df_session_ctx = self
-            .build_df_session_context(context, snapshot, query_tracker.clone(), memory_limit_bytes)
+            .build_df_session_context(context, snapshot, source, query_tracker.clone(), input_metrics, memory_limit_bytes)
             .await?;
 
         Ok(SessionCtx {
@@ -361,7 +422,9 @@ impl SessionCtxFactory {
         &self,
         context: &Context,
         snapshot: Option<Arc<SelectObjectSnapshot>>,
+        source: JsonSource,
         query_tracker: Option<QueryExecutionTracker>,
+        input_metrics: Option<Arc<SelectInputMetrics>>,
         memory_limit_bytes: usize,
     ) -> QueryResult<SessionContext> {
         let path = format!("s3://{}", context.input.bucket);
@@ -383,7 +446,22 @@ impl SessionCtxFactory {
             .is_some_and(|delimiter| delimiter.len() == 2 && delimiter.as_bytes() != b"\r\n");
         let scan_range_requires_single_file_scan =
             context.input.request.scan_range.is_some() && context.input.request.input_serialization.parquet.is_none();
-        let config = if custom_two_byte_record_delimiter || scan_range_requires_single_file_scan {
+        let json_document_requires_single_file_scan = is_json_document_input(&context.input);
+        let compressed_input_requires_single_file_scan = context
+            .input
+            .request
+            .input_serialization
+            .compression_type
+            .as_ref()
+            .is_some_and(|compression| compression.as_str() != CompressionType::NONE);
+        let metered_input_requires_single_file_scan =
+            input_metrics.is_some() && context.input.request.input_serialization.parquet.is_none();
+        let config = if custom_two_byte_record_delimiter
+            || scan_range_requires_single_file_scan
+            || json_document_requires_single_file_scan
+            || compressed_input_requires_single_file_scan
+            || metered_input_requires_single_file_scan
+        {
             config.with_repartition_file_scans(false)
         } else {
             config
@@ -438,11 +516,23 @@ impl SessionCtxFactory {
 
             df_session_state.with_object_store(&store_url, store).build()
         } else {
+            let input_metrics = input_metrics.unwrap_or_else(|| Arc::new(SelectInputMetrics::default()));
             let store: EcObjectStore = match query_tracker {
-                Some(query_tracker) => {
-                    EcObjectStore::new_with_query_tracker(context.input.clone(), memory_pool, query_tracker, snapshot)
-                }
-                None => EcObjectStore::new_with_memory_pool(context.input.clone(), memory_pool, snapshot),
+                Some(query_tracker) => EcObjectStore::new_with_query_tracker_and_source(
+                    context.input.clone(),
+                    memory_pool,
+                    query_tracker,
+                    input_metrics,
+                    snapshot,
+                    source,
+                ),
+                None => EcObjectStore::new_with_memory_pool_and_source(
+                    context.input.clone(),
+                    memory_pool,
+                    input_metrics,
+                    snapshot,
+                    source,
+                ),
             }
             .map_err(|err| QueryError::Datafusion {
                 source: Box::new(DataFusionError::External(Box::new(err))),
@@ -515,15 +605,15 @@ mod tests {
     use crate::storage_api::object_store::ObjectIO as _;
     use datafusion::{
         datasource::{
-            file_format::csv::CsvFormat,
+            file_format::{csv::CsvFormat, json::JsonFormat},
             listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
         },
         execution::memory_pool::MemoryLimit,
     };
     use http::HeaderMap;
     use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, InputSerialization, JSONInput, OutputSerialization, ParquetInput, ScanRange,
-        SelectObjectContentInput, SelectObjectContentRequest,
+        CSVInput, CSVOutput, ExpressionType, InputSerialization, JSONInput, JSONType, OutputSerialization, ParquetInput,
+        ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use std::io::Write as _;
 
@@ -564,6 +654,103 @@ mod tests {
         )
     }
 
+    async fn test_query_tracker() -> QueryExecutionTracker {
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("query permit should be available");
+        QueryExecutionTracker::new(
+            &QueryExecutionOwner::new(),
+            Arc::new(permit),
+            Instant::now() + std::time::Duration::from_secs(300),
+            300,
+        )
+    }
+
+    async fn assert_legacy_json_column(bucket: &str, expression: &str, document: &[u8], column_name: &str, expected: &[&str]) {
+        const OBJECT: &str = "input.json";
+
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        let mut context = test_context();
+        {
+            let input = Arc::make_mut(&mut context.input);
+            input.bucket = bucket.to_string();
+            input.key = OBJECT.to_string();
+            input.request.expression = expression.to_string();
+            input.request.input_serialization.csv = None;
+            input.request.input_serialization.json = Some(JSONInput {
+                type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+            });
+        }
+        env.make_bucket(bucket, false).await;
+        env.put_object_bytes(bucket, OBJECT, document.to_vec()).await;
+        let factory = SessionCtxFactory::new(false);
+        let lazy_session = factory
+            .create_session_ctx(&context)
+            .await
+            .expect("legacy lazy session should preserve the JSON source");
+        let tracked_lazy_session = factory
+            .create_session_ctx_with_tracker_and_memory_limit(
+                &context,
+                test_query_tracker().await,
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+            )
+            .await
+            .expect("legacy tracked lazy session should preserve the JSON source");
+        let snapshot = prepare_test_snapshot(&context).await;
+        let snapshot_session = factory
+            .create_session_ctx_with_snapshot_and_tracker_and_memory_limit(
+                &context,
+                snapshot,
+                test_query_tracker().await,
+                DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+            )
+            .await
+            .expect("legacy snapshot session should preserve the JSON source");
+
+        for (kind, session) in [
+            ("lazy", lazy_session),
+            ("tracked lazy", tracked_lazy_session),
+            ("tracked snapshot", snapshot_session),
+        ] {
+            let table_path = ListingTableUrl::parse(format!("s3://{bucket}/{OBJECT}")).expect("parse JSON table URL");
+            let listing_options = ListingOptions::new(Arc::new(JsonFormat::default())).with_file_extension(".json");
+            let schema = listing_options
+                .infer_schema(session.inner(), &table_path)
+                .await
+                .expect("infer expanded JSON schema");
+            let table = ListingTable::try_new(
+                ListingTableConfig::new(table_path)
+                    .with_listing_options(listing_options)
+                    .with_schema(schema),
+            )
+            .expect("build expanded JSON table");
+            let query_context = SessionContext::new_with_state(session.inner().clone());
+            query_context
+                .register_table("legacy_input", Arc::new(table))
+                .expect("register expanded JSON table");
+            let batches = query_context
+                .sql(&format!("SELECT {column_name} FROM legacy_input"))
+                .await
+                .expect("plan expanded JSON query")
+                .collect()
+                .await
+                .expect("execute expanded JSON query");
+            let mut values = Vec::new();
+            for batch in batches {
+                let column = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("expanded column should be Utf8");
+                for row in 0..batch.num_rows() {
+                    values.push(column.value(row).to_string());
+                }
+            }
+            assert_eq!(values, expected, "{kind} legacy constructor");
+        }
+    }
+
     #[test]
     fn session_factory_fields_remain_source_compatible() {
         let factory = SessionCtxFactory {
@@ -585,6 +772,32 @@ mod tests {
 
         assert_eq!(session.inner().config().target_partitions(), 3);
         assert!(session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn metered_csv_and_json_inputs_disable_file_repartitioning() {
+        let factory = SessionCtxFactory::new(true).with_target_partitions(3);
+        let csv_context = test_context();
+        let mut json_context = test_context();
+        let json_request = &mut Arc::make_mut(&mut json_context.input).request;
+        json_request.input_serialization.csv = None;
+        json_request.input_serialization.json = Some(JSONInput::default());
+
+        for context in [&csv_context, &json_context] {
+            let session = factory
+                .create_session_ctx_inner(
+                    context,
+                    None,
+                    JsonSource::default(),
+                    None,
+                    Some(Arc::new(SelectInputMetrics::default())),
+                    DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES,
+                )
+                .await
+                .expect("metered session should be created");
+
+            assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+        }
     }
 
     #[tokio::test]
@@ -623,6 +836,55 @@ mod tests {
             .create_session_ctx(&context)
             .await
             .expect("JSON LINES ScanRange session should be created");
+
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn json_lines_without_scan_range_keeps_file_repartitioning() {
+        let mut context = test_context();
+        let request = &mut Arc::make_mut(&mut context.input).request;
+        request.input_serialization.csv = None;
+        request.input_serialization.json = Some(JSONInput::default());
+
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(2)
+            .create_session_ctx(&context)
+            .await
+            .expect("JSON LINES session should be created");
+
+        assert!(session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn compressed_input_disables_file_repartitioning_without_metrics() {
+        let mut context = test_context();
+        Arc::make_mut(&mut context.input).request.input_serialization.compression_type =
+            Some(CompressionType::from_static(CompressionType::GZIP));
+
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(2)
+            .create_session_ctx(&context)
+            .await
+            .expect("compressed session should be created");
+
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn json_document_disables_file_repartitioning() {
+        let mut context = test_context();
+        let request = &mut Arc::make_mut(&mut context.input).request;
+        request.input_serialization.csv = None;
+        request.input_serialization.json = Some(JSONInput {
+            type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+        });
+
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(2)
+            .create_session_ctx(&context)
+            .await
+            .expect("JSON DOCUMENT session should be created");
 
         assert!(!session.inner().config().options().optimizer.repartition_file_scans);
     }
@@ -702,7 +964,7 @@ mod tests {
     async fn session_factory_applies_memory_limit() {
         let factory = SessionCtxFactory::new(true);
         let session = factory
-            .create_session_ctx_inner(&test_context(), None, None, 1024)
+            .create_session_ctx_inner(&test_context(), None, JsonSource::default(), None, None, 1024)
             .await
             .expect("session should be created with a bounded memory pool");
 
@@ -748,6 +1010,45 @@ mod tests {
             .expect("legacy tracked session should install a lazy object store");
 
         assert!(session.is_bound_to(&tracker));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn legacy_session_factory_preserves_single_key_json_source() {
+        assert_legacy_json_column(
+            "s3select-legacy-session-json-source",
+            "SELECT e.name FROM S3Object.employees AS e",
+            br#"{"employees":[{"name":"Alice"}]}"#,
+            "name",
+            &["Alice"],
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn legacy_session_factory_preserves_implicit_root_alias() {
+        assert_legacy_json_column(
+            "s3select-legacy-session-root-alias",
+            "SELECT S3Object FROM S3Object",
+            br#"["one","two"]"#,
+            "s3object",
+            &["one", "two"],
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn legacy_session_factory_preserves_quoted_root_alias() {
+        assert_legacy_json_column(
+            "s3select-legacy-session-quoted-root-alias",
+            "SELECT \"V\" FROM S3Object AS \"V\"",
+            br#"["one","two"]"#,
+            "\"V\"",
+            &["one", "two"],
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

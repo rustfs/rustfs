@@ -68,6 +68,35 @@ const LOG_COMPONENT_ADMIN: &str = "admin";
 const LOG_SUBSYSTEM_BUCKET_META: &str = "bucket_meta";
 const EVENT_ADMIN_BUCKET_META_STATE: &str = "admin_bucket_meta_state";
 
+fn export_internal_error(message: impl Into<String>) -> s3s::S3Error {
+    let message = message.into();
+    s3_error!(InternalError, "{message}")
+}
+
+fn checked_raw_xml<T, E, F>(validated: &T, raw: Vec<u8>, parse: F) -> S3Result<Vec<u8>>
+where
+    T: PartialEq,
+    E: std::fmt::Display,
+    F: FnOnce(&[u8]) -> Result<T, E>,
+{
+    let selected = parse(&raw)
+        .map_err(|e| export_internal_error(format!("persisted bucket metadata changed to invalid XML during export: {e}")))?;
+    if selected != *validated {
+        return Err(export_internal_error("bucket metadata changed during export"));
+    }
+    Ok(raw)
+}
+
+fn checked_versioning_xml(validated: &VersioningConfiguration, raw: Vec<u8>) -> S3Result<Vec<u8>> {
+    if raw.is_empty() {
+        if *validated != VersioningConfiguration::default() {
+            return Err(export_internal_error("bucket metadata changed during export"));
+        }
+        return serialize(validated).map_err(|e| export_internal_error(format!("serialize config failed: {e}")));
+    }
+    checked_raw_xml(validated, raw, deserialize::<VersioningConfiguration>)
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct ExportBucketMetadataQuery {
     pub bucket: String,
@@ -190,8 +219,13 @@ impl Operation for ExportBucketMetadata {
                                 Ok(None) => continue,
                             };
 
+                        let raw_config = metadata_sys::get(&bucket.name)
+                            .await
+                            .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                            .notification_config_xml
+                            .clone();
                         let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                            checked_raw_xml(&config, raw_config, deserialize::<s3s::dto::NotificationConfiguration>)?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
@@ -210,8 +244,12 @@ impl Operation for ExportBucketMetadata {
                                 return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
                             }
                         };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "failed to serialize config: {e}"))?;
+                        let raw_config = metadata_sys::get(&bucket.name)
+                            .await
+                            .map_err(|e| export_internal_error(format!("failed to load bucket metadata: {e}")))?
+                            .lifecycle_config_xml
+                            .clone();
+                        let config_xml = checked_raw_xml(&config, raw_config, deserialize::<BucketLifecycleConfiguration>)?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
@@ -230,8 +268,12 @@ impl Operation for ExportBucketMetadata {
                                 return Err(s3_error!(InternalError, "failed to load bucket metadata: {e}"));
                             }
                         };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "failed to serialize config: {e}"))?;
+                        let raw_config = metadata_sys::get(&bucket.name)
+                            .await
+                            .map_err(|e| export_internal_error(format!("failed to load bucket metadata: {e}")))?
+                            .tagging_config_xml
+                            .clone();
+                        let config_xml = checked_raw_xml(&config, raw_config, deserialize::<Tagging>)?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
@@ -270,8 +312,12 @@ impl Operation for ExportBucketMetadata {
                                 return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
                             }
                         };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                        let raw_config = metadata_sys::get(&bucket.name)
+                            .await
+                            .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                            .object_lock_config_xml
+                            .clone();
+                        let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ObjectLockConfiguration>)?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
@@ -290,8 +336,12 @@ impl Operation for ExportBucketMetadata {
                                 return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
                             }
                         };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                        let raw_config = metadata_sys::get(&bucket.name)
+                            .await
+                            .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                            .encryption_config_xml
+                            .clone();
+                        let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ServerSideEncryptionConfiguration>)?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
@@ -310,8 +360,12 @@ impl Operation for ExportBucketMetadata {
                                 return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
                             }
                         };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                        let raw_config = metadata_sys::get(&bucket.name)
+                            .await
+                            .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                            .versioning_config_xml
+                            .clone();
+                        let config_xml = checked_versioning_xml(&config, raw_config)?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
@@ -330,8 +384,12 @@ impl Operation for ExportBucketMetadata {
                                 return Err(s3_error!(InternalError, "get bucket metadata failed: {e}"));
                             }
                         };
-                        let config_xml =
-                            serialize(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                        let raw_config = metadata_sys::get(&bucket.name)
+                            .await
+                            .map_err(|e| export_internal_error(format!("get bucket metadata failed: {e}")))?
+                            .replication_config_xml
+                            .clone();
+                        let config_xml = checked_raw_xml(&config, raw_config, deserialize::<ReplicationConfiguration>)?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())
@@ -1014,6 +1072,66 @@ mod imported_config_apply_tests {
     }
 
     #[test]
+    fn g_d3_005_new_writer_backup_payloads_pass_old_import_validators() {
+        // Captured from the gateway persistence writers at a16e94426b36c6a454dc200a5639c711b590e1eb.
+        // Keep these bytes independent of RustFS's old serializer so rollback drift stays visible.
+        let new_writer_payloads: [(&str, &[u8]); 7] = [
+            (
+                BUCKET_NOTIFICATION_CONFIG,
+                b"<NotificationConfiguration></NotificationConfiguration>",
+            ),
+            (
+                BUCKET_LIFECYCLE_CONFIG,
+                b"<LifecycleConfiguration><Rule><Expiration><Days>30</Days></Expiration><Filter><Prefix>logs/</Prefix></Filter><ID>expire</ID><Status>Enabled</Status></Rule></LifecycleConfiguration>",
+            ),
+            (
+                BUCKET_SSECONFIG,
+                b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>",
+            ),
+            (
+                BUCKET_TAGGING_CONFIG,
+                b"<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
+            ),
+            (
+                OBJECT_LOCK_CONFIG,
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+            ),
+            (
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            ),
+            (
+                BUCKET_REPLICATION_CONFIG,
+                b"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication</Role><Rule><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination><Filter><Prefix></Prefix></Filter><Priority>1</Priority><Status>Enabled</Status></Rule></ReplicationConfiguration>",
+            ),
+        ];
+
+        let imported_xml_cases = import_cases()
+            .into_iter()
+            .filter(|case| case.conf_name != BUCKET_TARGETS_FILE)
+            .collect::<Vec<_>>();
+        assert_eq!(new_writer_payloads.len(), imported_xml_cases.len());
+        assert!(
+            imported_xml_cases
+                .iter()
+                .all(|case| new_writer_payloads.iter().any(|(name, _)| *name == case.conf_name))
+        );
+
+        let mut metadatas = imported_bucket();
+        for (conf_name, payload) in new_writer_payloads {
+            assert!(
+                apply_imported_bucket_config(&mut metadatas, BUCKET, conf_name, payload.to_vec(), imported_at())
+                    .unwrap_or_else(|error| panic!("new-writer {conf_name} must pass the old import validator: {error}"))
+            );
+            let case = imported_xml_cases
+                .iter()
+                .find(|case| case.conf_name == conf_name)
+                .unwrap_or_else(|| panic!("{conf_name} must have an import mapping"));
+            assert_eq!((case.payload)(&metadatas[BUCKET]), payload);
+        }
+    }
+
+    #[test]
     fn a_rejected_payload_leaves_the_field_untouched() {
         for case in import_cases() {
             let mut metadatas = imported_bucket();
@@ -1212,6 +1330,235 @@ mod import_persist_tests {
             serde_json::to_vec(&BucketQuota::new(Some(1024))).expect("durable quota should encode"),
         )];
         assert!(imported_quota_requires_fleet_proof(&durable).expect("durable quota should pass preflight"));
+    }
+}
+
+#[cfg(test)]
+mod backup_zip_compatibility_tests {
+    use super::*;
+    use crate::admin::runtime_sources::{AppContext, publish_test_app_context};
+    use http::{Extensions, Uri};
+    use http_body_util::BodyExt as _;
+    use rustfs_iam::store::{Store as _, object::IAM_CONFIG_PREFIX};
+    use std::sync::Arc;
+
+    const ROOT_ACCESS_KEY: &str = "BUCKETMETABACKUPROOT";
+    const ROOT_SECRET_KEY: &str = "bucketMetaBackupRootSecret123";
+    const BUCKET: &str = "backup-compatibility";
+    const NOTIFICATION_XML: &[u8] = b"<NotificationConfiguration>\n</NotificationConfiguration>";
+    const LIFECYCLE_XML: &[u8] = b"<LifecycleConfiguration>\n<Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule>\n</LifecycleConfiguration>";
+    const SSE_XML: &[u8] = b"<ServerSideEncryptionConfiguration>\n<Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule>\n</ServerSideEncryptionConfiguration>";
+    const TAGGING_XML: &[u8] = b"<Tagging>\n<TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet>\n</Tagging>";
+    const OBJECT_LOCK_XML: &[u8] =
+        b"<ObjectLockConfiguration>\n<ObjectLockEnabled>Enabled</ObjectLockEnabled>\n</ObjectLockConfiguration>";
+    const VERSIONING_XML: &[u8] = b"<VersioningConfiguration>\n<Status>Enabled</Status>\n</VersioningConfiguration>";
+    const OLD_REPLICATION_XML: &[u8] = b"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication</Role><FutureTopLevel>preserve-me</FutureTopLevel><Rule><Status>Enabled</Status><Priority>1</Priority><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Filter><Prefix></Prefix></Filter><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination></Rule></ReplicationConfiguration>";
+    const DIFFERENT_REPLICATION_XML: &[u8] = b"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication</Role><Rule><Status>Enabled</Status><Priority>2</Priority><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Filter><Prefix>changed/</Prefix></Filter><Destination><Bucket>arn:aws:s3:::replacement</Bucket></Destination></Rule></ReplicationConfiguration>";
+
+    fn persisted_xml_fixtures() -> [(&'static str, &'static [u8]); 7] {
+        [
+            (BUCKET_NOTIFICATION_CONFIG, NOTIFICATION_XML),
+            (BUCKET_LIFECYCLE_CONFIG, LIFECYCLE_XML),
+            (BUCKET_SSECONFIG, SSE_XML),
+            (BUCKET_TAGGING_CONFIG, TAGGING_XML),
+            (OBJECT_LOCK_CONFIG, OBJECT_LOCK_XML),
+            (BUCKET_VERSIONING_CONFIG, VERSIONING_XML),
+            (BUCKET_REPLICATION_CONFIG, OLD_REPLICATION_XML),
+        ]
+    }
+
+    fn persisted_xml<'a>(metadata: &'a BucketMetadata, config_file: &str) -> &'a [u8] {
+        match config_file {
+            BUCKET_NOTIFICATION_CONFIG => &metadata.notification_config_xml,
+            BUCKET_LIFECYCLE_CONFIG => &metadata.lifecycle_config_xml,
+            BUCKET_SSECONFIG => &metadata.encryption_config_xml,
+            BUCKET_TAGGING_CONFIG => &metadata.tagging_config_xml,
+            OBJECT_LOCK_CONFIG => &metadata.object_lock_config_xml,
+            BUCKET_VERSIONING_CONFIG => &metadata.versioning_config_xml,
+            BUCKET_REPLICATION_CONFIG => &metadata.replication_config_xml,
+            _ => panic!("unexpected persisted XML config {config_file}"),
+        }
+    }
+
+    fn zip_with_entries(bucket: &str, entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for (config_file, payload) in entries {
+            writer
+                .start_file(format!("{bucket}/{config_file}"), SimpleFileOptions::default())
+                .expect("start compatibility archive entry");
+            writer.write_all(payload).expect("write compatibility archive entry");
+        }
+        writer.finish().expect("finish compatibility archive").into_inner()
+    }
+
+    fn admin_request(method: Method, uri: Uri, body: Vec<u8>) -> S3Request<Body> {
+        S3Request {
+            input: Body::from(body),
+            method,
+            uri,
+            headers: HeaderMap::new(),
+            extensions: Extensions::new(),
+            credentials: Some(s3s::auth::Credentials {
+                access_key: ROOT_ACCESS_KEY.to_string(),
+                secret_key: s3s::auth::SecretKey::from(ROOT_SECRET_KEY.to_string()),
+            }),
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
+    async fn import_archive(archive: Vec<u8>) {
+        let response = ImportBucketMetadata {}
+            .call(
+                admin_request(Method::PUT, Uri::from_static("/rustfs/admin/v3/import-bucket-metadata"), archive),
+                Params::new(),
+            )
+            .await
+            .expect("root admin must import the compatibility archive");
+        assert_eq!(response.output.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn g_zip_001_002_003_use_real_admin_archive_and_persistence_paths() {
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some(ROOT_ACCESS_KEY.to_string()),
+            Some(ROOT_SECRET_KEY.to_string()),
+        );
+        let temp = tempfile::tempdir().expect("create bucket metadata backup test root");
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .base_dir(temp.path())
+            .disk_count(1)
+            .build()
+            .await;
+        env.make_bucket(BUCKET, false).await;
+        rustfs_iam::store::object::ObjectStore::new(Arc::clone(&env.ecstore))
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(Arc::clone(&env.ecstore))
+            .await
+            .expect("build test IAM");
+        publish_test_app_context(Arc::new(AppContext::with_default_interfaces(
+            Arc::clone(&env.ecstore),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        )));
+
+        let corrupt_error = ImportBucketMetadata {}
+            .call(
+                admin_request(
+                    Method::PUT,
+                    Uri::from_static("/rustfs/admin/v3/import-bucket-metadata"),
+                    b"not a zip archive".to_vec(),
+                ),
+                Params::new(),
+            )
+            .await
+            .expect_err("a corrupt compatibility archive must be rejected");
+        assert!(
+            corrupt_error
+                .message()
+                .is_some_and(|message| message.contains("failed to read import archive")),
+            "corrupt archive returned the wrong error: {corrupt_error:?}"
+        );
+
+        let fixtures = persisted_xml_fixtures();
+        import_archive(zip_with_entries(BUCKET, &fixtures)).await;
+        let imported = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("old archive must persist bucket metadata");
+        for (config_file, payload) in fixtures {
+            assert_eq!(persisted_xml(&imported, config_file), payload, "g-zip-001 changed {config_file} bytes");
+        }
+        import_archive(zip_with_entries(BUCKET, &[(BUCKET_REPLICATION_CONFIG, b"not xml")])).await;
+        let after_rejected_payload = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("rejected payload must leave persisted metadata readable");
+        assert_eq!(
+            after_rejected_payload.replication_config_xml, OLD_REPLICATION_XML,
+            "a rejected archive payload must not replace persisted bytes"
+        );
+
+        let (validated_replication, _) = metadata_sys::get_replication_config(BUCKET)
+            .await
+            .expect("load the revision validated before export");
+        checked_raw_xml(
+            &validated_replication,
+            DIFFERENT_REPLICATION_XML.to_vec(),
+            deserialize::<ReplicationConfiguration>,
+        )
+        .expect_err("a different valid revision must not be exported after validating the old revision");
+        checked_raw_xml(&validated_replication, b"not xml".to_vec(), deserialize::<ReplicationConfiguration>)
+            .expect_err("an invalid raw revision must not be exported after validating the old revision");
+        let matching_raw = checked_raw_xml(
+            &validated_replication,
+            OLD_REPLICATION_XML.to_vec(),
+            deserialize::<ReplicationConfiguration>,
+        )
+        .expect("the exact validated raw revision must remain exportable");
+        assert_eq!(matching_raw, OLD_REPLICATION_XML);
+        let default_versioning = VersioningConfiguration::default();
+        assert!(
+            !checked_versioning_xml(&default_versioning, Vec::new())
+                .expect("empty persisted versioning keeps the existing default fallback")
+                .is_empty()
+        );
+        let enabled_versioning: VersioningConfiguration = deserialize(VERSIONING_XML).expect("parse enabled versioning fixture");
+        checked_versioning_xml(&enabled_versioning, Vec::new())
+            .expect_err("an empty raw revision must not export a previously validated enabled revision");
+
+        let export_response = ExportBucketMetadata {}
+            .call(
+                admin_request(
+                    Method::GET,
+                    format!("/rustfs/admin/v3/export-bucket-metadata?bucket={BUCKET}")
+                        .parse()
+                        .expect("export URI"),
+                    Vec::new(),
+                ),
+                Params::new(),
+            )
+            .await
+            .expect("root admin must export persisted bucket metadata");
+        assert_eq!(export_response.output.0, StatusCode::OK);
+        let exported_archive = export_response
+            .output
+            .1
+            .collect()
+            .await
+            .expect("read exported archive body")
+            .to_bytes()
+            .to_vec();
+        let mut archive = ZipArchive::new(Cursor::new(&exported_archive)).expect("open exported archive");
+        for (config_file, payload) in persisted_xml_fixtures() {
+            let mut exported_payload = Vec::new();
+            archive
+                .by_name(&format!("{BUCKET}/{config_file}"))
+                .unwrap_or_else(|_| panic!("exported archive must contain {config_file}"))
+                .read_to_end(&mut exported_payload)
+                .unwrap_or_else(|_| panic!("read exported {config_file}"));
+            assert_eq!(exported_payload, payload, "g-zip-003 export must preserve {config_file} byte-for-byte");
+        }
+        drop(archive);
+
+        metadata_sys::update(BUCKET, BUCKET_REPLICATION_CONFIG, DIFFERENT_REPLICATION_XML.to_vec())
+            .await
+            .expect("replace persisted config before rollback import");
+        import_archive(exported_archive).await;
+        let restored = metadata_sys::get_config_from_disk(BUCKET)
+            .await
+            .expect("new archive must persist through old import");
+        for (config_file, payload) in persisted_xml_fixtures() {
+            assert_eq!(
+                persisted_xml(&restored, config_file),
+                payload,
+                "g-zip-002 rollback import did not restore {config_file}"
+            );
+        }
+        let _: ReplicationConfiguration =
+            deserialize(&restored.replication_config_xml).expect("old parser must read the newly exported archive payload");
     }
 }
 

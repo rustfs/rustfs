@@ -18,18 +18,117 @@ use crate::core::pools::merge_pool_status_refresh;
 use crate::layout::pool_space::{ServerPoolsAvailableSpace, build_server_pools_available_space};
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::{admin::StorageAdminApi, namespace::NamespaceLocking as _, object::ObjectOperations as _};
+use futures::stream::{FuturesUnordered, StreamExt};
 pub(in crate::store) mod support;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_POOLS: &str = "pools";
 const EVENT_POOL_META_RELOAD: &str = "pool_meta_reload";
+
+#[cfg(test)]
+struct PreparedPoolReadFallbackBarrierState {
+    object: String,
+    pause_before_refetch: bool,
+    fanout_arrived: tokio::sync::Notify,
+    fanout_release: tokio::sync::Notify,
+    refetch_arrived: tokio::sync::Notify,
+    refetch_release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(in crate::store) struct PreparedPoolReadFallbackBarrier {
+    state: Arc<PreparedPoolReadFallbackBarrierState>,
+}
+
+#[cfg(test)]
+static PREPARED_POOL_READ_FALLBACK_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<PreparedPoolReadFallbackBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl PreparedPoolReadFallbackBarrier {
+    pub(in crate::store) fn install(object: &str, pause_before_refetch: bool) -> Self {
+        let state = Arc::new(PreparedPoolReadFallbackBarrierState {
+            object: object.to_string(),
+            pause_before_refetch,
+            fanout_arrived: tokio::sync::Notify::new(),
+            fanout_release: tokio::sync::Notify::new(),
+            refetch_arrived: tokio::sync::Notify::new(),
+            refetch_release: tokio::sync::Notify::new(),
+        });
+        *PREPARED_POOL_READ_FALLBACK_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("prepared pool read fallback barrier must not be poisoned") = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(in crate::store) async fn wait_after_fanout(&self) {
+        self.state.fanout_arrived.notified().await;
+    }
+
+    pub(in crate::store) fn release_after_fanout(&self) {
+        self.state.fanout_release.notify_one();
+    }
+
+    pub(in crate::store) async fn wait_before_refetch(&self) {
+        self.state.refetch_arrived.notified().await;
+    }
+
+    pub(in crate::store) fn release_before_refetch(&self) {
+        self.state.refetch_release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for PreparedPoolReadFallbackBarrier {
+    fn drop(&mut self) {
+        self.state.fanout_release.notify_waiters();
+        self.state.refetch_release.notify_waiters();
+        if let Some(barrier) = PREPARED_POOL_READ_FALLBACK_BARRIER.get() {
+            *barrier
+                .lock()
+                .expect("prepared pool read fallback barrier must not be poisoned") = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_prepared_pool_read_after_fanout(object: &str) {
+    let state = PREPARED_POOL_READ_FALLBACK_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("prepared pool read fallback barrier must not be poisoned")
+        .as_ref()
+        .filter(|state| state.object == object)
+        .cloned();
+    if let Some(state) = state {
+        state.fanout_arrived.notify_one();
+        state.fanout_release.notified().await;
+    }
+}
+
+#[cfg(test)]
+async fn pause_prepared_pool_read_before_refetch(object: &str) {
+    let state = PREPARED_POOL_READ_FALLBACK_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("prepared pool read fallback barrier must not be poisoned")
+        .as_ref()
+        .filter(|state| state.object == object && state.pause_before_refetch)
+        .cloned();
+    if let Some(state) = state {
+        state.refetch_arrived.notify_one();
+        state.refetch_release.notified().await;
+    }
+}
 #[cfg(test)]
 use support::resolve_latest_object_info_candidates;
 use support::{
     LatestObjectInfoCandidate, PoolErr, PoolObjInfo, RebalanceDeletePoolResult, pool_lookup_not_found_error,
     rebalance_disk_set_lookup_error, resolve_latest_object_info_candidates_with_pool_state,
     resolve_rebalance_delete_from_all_pools_result, resolve_rebalance_delete_from_all_pools_results,
-    resolve_store_rebalance_pool_meta_reload_result,
+    resolve_store_rebalance_pool_meta_reload_result, validate_prepared_pool_refetch_identity,
 };
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -675,6 +774,134 @@ impl ECStore {
         resolve_latest_object_info_candidates_with_pool_state(candidates, &suspended_pools, bucket, object, opts)
     }
 
+    pub(super) async fn prepare_latest_object_metadata_with_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(crate::set_disk::PreparedGetObjectMetadata, usize)> {
+        let suspended_pools = if opts.skip_decommissioned {
+            let pool_meta = self.pool_meta.read().await;
+            Some(
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let mut futures = FuturesUnordered::new();
+        for (idx, pool) in self.pools.iter().enumerate() {
+            if suspended_pools.as_ref().is_some_and(|pools| pools[idx]) {
+                continue;
+            }
+
+            if opts.skip_rebalancing && self.is_pool_rebalancing(idx).await {
+                continue;
+            }
+
+            futures.push(async move {
+                let result = pool
+                    .prepare_get_object_reader_metadata(bucket, object, opts)
+                    .await
+                    .map_err(|err| to_object_err(err, vec![bucket, object]));
+                (idx, result)
+            });
+        }
+
+        let mut candidates = (0..self.pools.len()).map(|_| None).collect::<Vec<_>>();
+        // Retain one provisional winner. Other pools only need their lightweight
+        // identity for final conflict checks; if pool state changes while the
+        // fanout runs, the final winner is refetched and revalidated below.
+        let mut latest_prepared = None;
+        let mut latest_mod_time = None;
+        let mut provisional_dynamic_pool_state = None;
+        while let Some((idx, result)) = futures.next().await {
+            match result {
+                Ok(metadata) => {
+                    let mod_time = metadata.object_info().mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
+                    let info = metadata.object_info().clone();
+                    let retain = match (latest_mod_time, latest_prepared.as_ref()) {
+                        (None, _) => true,
+                        (Some(current), _) if mod_time > current => true,
+                        (Some(current), _) if mod_time < current => false,
+                        (Some(_), Some((current_idx, _))) => {
+                            if suspended_pools.is_none() && provisional_dynamic_pool_state.is_none() {
+                                let pool_meta = self.pool_meta.read().await;
+                                provisional_dynamic_pool_state = Some(
+                                    (0..self.pools.len())
+                                        .map(|pool_idx| pool_meta.is_suspended(pool_idx))
+                                        .collect::<Vec<_>>(),
+                                );
+                            }
+                            let provisional_pool_state = suspended_pools
+                                .as_ref()
+                                .or(provisional_dynamic_pool_state.as_ref())
+                                .ok_or_else(|| Error::other("GET pool state snapshot is unavailable"))?;
+                            let new_key = (provisional_pool_state.get(idx).copied().unwrap_or(false), std::cmp::Reverse(idx));
+                            let current_key = (
+                                provisional_pool_state.get(*current_idx).copied().unwrap_or(false),
+                                std::cmp::Reverse(*current_idx),
+                            );
+                            new_key < current_key
+                        }
+                        (Some(_), None) => true,
+                    };
+                    if retain {
+                        if latest_mod_time.is_none_or(|current| mod_time > current) {
+                            latest_mod_time = Some(mod_time);
+                        }
+                        latest_prepared = Some((idx, metadata));
+                    }
+                    candidates[idx] = Some(LatestObjectInfoCandidate {
+                        info: Some(info),
+                        idx,
+                        err: None,
+                    });
+                }
+                Err(err) => {
+                    candidates[idx] = Some(LatestObjectInfoCandidate {
+                        info: None,
+                        idx,
+                        err: Some(err),
+                    });
+                }
+            }
+        }
+
+        #[cfg(test)]
+        pause_prepared_pool_read_after_fanout(object).await;
+
+        let suspended_pools = match suspended_pools {
+            Some(pools) => pools,
+            None => {
+                let pool_meta = self.pool_meta.read().await;
+                (0..self.pools.len())
+                    .map(|idx| pool_meta.is_suspended(idx))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let candidates = candidates.into_iter().flatten().collect();
+        let (winner_info, winner_idx) =
+            resolve_latest_object_info_candidates_with_pool_state(candidates, &suspended_pools, bucket, object, opts)?;
+        if let Some((prepared_idx, metadata)) = latest_prepared
+            && prepared_idx == winner_idx
+        {
+            return Ok((metadata, winner_idx));
+        }
+
+        let pool = self.pools.get(winner_idx).ok_or(Error::ErasureReadQuorum)?;
+        #[cfg(test)]
+        pause_prepared_pool_read_before_refetch(object).await;
+        let metadata = pool
+            .prepare_get_object_reader_metadata(bucket, object, opts)
+            .await
+            .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+        validate_prepared_pool_refetch_identity(&winner_info, metadata.object_info())?;
+        Ok((metadata, winner_idx))
+    }
+
     pub(super) async fn delete_object_from_all_pools(
         &self,
         bucket: &str,
@@ -698,9 +925,19 @@ impl ECStore {
             }
 
             if let Some(idx) = pe.index {
+                let pool = self.pools[idx].clone();
                 results.push(RebalanceDeletePoolResult {
                     pool_idx: idx,
-                    result: self.pools[idx].delete_object(bucket, object, opts.clone()).await,
+                    result: self
+                        .run_external_decommission_capacity_object_delete(
+                            idx,
+                            bucket,
+                            object,
+                            object,
+                            opts.clone(),
+                            |opts| async move { pool.delete_object(bucket, object, opts).await },
+                        )
+                        .await,
                 });
             }
         }

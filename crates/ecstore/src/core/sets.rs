@@ -1352,10 +1352,19 @@ pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
     ctx: Arc<InstanceContext>,
     pool_idx: usize,
 ) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
+    make_local_two_set_sets_for_pool_with_drive_count_and_ctx(ctx, pool_idx, 2).await
+}
+
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) async fn make_local_two_set_sets_for_pool_with_drive_count_and_ctx(
+    ctx: Arc<InstanceContext>,
+    pool_idx: usize,
+    set_drive_count: usize,
+) -> (Vec<tempfile::TempDir>, Arc<Sets>) {
     use crate::layout::endpoint::Endpoint;
     use rustfs_lock::client::local::LocalClient;
 
-    let format = FormatV3::new(2, 2);
+    let format = FormatV3::new(2, set_drive_count);
     let mut temp_dirs = Vec::new();
     let mut all_endpoints = Vec::new();
     let mut disk_sets = Vec::new();
@@ -1363,7 +1372,7 @@ pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
     for set_index in 0..2 {
         let mut endpoints = Vec::new();
         let mut disks = Vec::new();
-        for disk_index in 0..2 {
+        for disk_index in 0..set_drive_count {
             let temp_dir = tempfile::tempdir().expect("tempdir should be created");
             let mut endpoint = Endpoint::try_from(temp_dir.path().to_str().expect("tempdir path should be utf8"))
                 .expect("endpoint should parse");
@@ -1389,7 +1398,7 @@ pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
             endpoints.push(endpoint);
             disks.push(Some(disk));
         }
-        let lockers = (0..2)
+        let lockers = (0..set_drive_count)
             .map(|_| {
                 Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
                     rustfs_lock::FastObjectLockManager::new(),
@@ -1400,7 +1409,7 @@ pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
             SetDisks::new_with_instance_ctx(
                 "test-owner".to_string(),
                 Arc::new(RwLock::new(disks)),
-                2,
+                set_drive_count,
                 1,
                 set_index,
                 pool_idx,
@@ -1420,7 +1429,7 @@ pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
         endpoints: PoolEndpoints {
             legacy: false,
             set_count: 2,
-            drives_per_set: 2,
+            drives_per_set: set_drive_count,
             endpoints: Endpoints::from(all_endpoints),
             cmd_line: String::new(),
             platform: String::new(),
@@ -1428,7 +1437,7 @@ pub(crate) async fn make_local_two_set_sets_for_pool_with_ctx(
         format,
         parity_count: 1,
         set_count: 2,
-        set_drive_count: 2,
+        set_drive_count,
         default_parity_count: 1,
         distribution_algo: DistributionAlgoVersion::V1,
         exit_signal: None,

@@ -48,6 +48,7 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 
 ### S3 object actions, copy, multipart, and upload policy validation
 
+- `GHSA-g8w9-qw9q-fghr`: a valid presigned `PutObject` accepted extra `x-amz-tagging`, website redirect, and storage-class headers omitted from `SignedHeaders`. Lesson: a presigned URL is a bounded capability; reject `x-amz-*` headers that are not cryptographically bound by the signature so unsigned metadata cannot change authorization, lifecycle, redirect, cost, or durability semantics.
 - `GHSA-3ppv-fx5m-m749`: explicit `versionId` reads and copy sources authorized `s3:GetObject` instead of `s3:GetObjectVersion`. Lesson: version-specific object access must select version-specific actions for direct reads, `CopyObject`, and `UploadPartCopy`, with tests proving the backend is not reached on denial.
 - `GHSA-x298-9x87-fvjq`: anonymous `ListObjectVersions` fell back to `ListBucket` and returned before public-access-block gates. Lesson: compatibility fallbacks must converge on the same post-authorization checks as direct grants, especially `RestrictPublicBuckets` and anonymous data-plane denies.
 - `GHSA-mx42-j6wv-px98`: `UploadPartCopy` missed source authorization and allowed cross-bucket object exfiltration. Lesson: multipart copy must enforce the same source and destination contract as `CopyObject`.
@@ -119,7 +120,7 @@ Use these targeted searches when a diff touches security-sensitive code:
 ```bash
 rg -n "validate_admin_request|check_permissions|AdminAction::|deny_only|is_allowed" rustfs crates
 rg -n "authorize_operation|FtpsDriver|SftpDriver|RETR|MKD|SIZE|MDTM|CreateBucket|GetObject|HeadObject" crates/protocols rustfs
-rg -n "UploadPartCopy|upload_part_copy|CompleteMultipart|PostObject|content-length-range|starts-with" rustfs crates
+rg -n "UploadPartCopy|upload_part_copy|CompleteMultipart|PostObject|presign|SignedHeaders|content-length-range|starts-with" rustfs crates
 rg -n "ListBucketVersions|GetObjectVersion|versionId|VersionId|ExistingObjectTag|ForAllValues|ForAnyValue|POLICY_PLUGIN|opa" rustfs crates
 rg -n "normalize_extract_entry_key|Snowball|auto-extract|PathBuf::join|canonicalize|\\.\\.|x-forwarded-for|x-real-ip|SourceIp" rustfs crates
 rg -n "DEFAULT_SECRET|DEFAULT_ACCESS|TEST_PRIVATE_KEY|rustfs rpc|RUSTFS_RPC_SECRET" rustfs crates
@@ -136,6 +137,7 @@ rg -n "deny_unknown_fields|serde.default|as u32|as usize|as i32" rustfs crates
 - Protocol frontend authz fixes: include denied `RETR`, `SIZE`/`MDTM`, `MKD`, bucket probe, and sibling allowed-operation cases, and assert denied paths do not reach the storage backend.
 - IAM fixes: include import/update/list service-account cases with attacker-controlled parent, claims, access key, secret key, and policy.
 - Copy/upload fixes: include cross-bucket, cross-user, source-denied, destination-denied, copy-source-condition, and multipart completion cases.
+- Presigned upload fixes: include a valid presign with extra unsigned tagging, redirect, and storage-class headers; require rejection before storage access, and verify explicitly signed equivalents still work.
 - Version-action fixes: include historical UUID, explicit current version, `null`, range, partNumber, presigned, STS/session, service-account, anonymous bucket-policy, copy source, and multipart-copy source cases.
 - Policy-condition fixes: include reserved-key header collisions, missing keys, partially overlapping multi-value sets, plugin mode, and built-in policy mode.
 - Path fixes: include encoded traversal, absolute path, nested traversal, archive entries with `..`, valid object keys that resemble traversal text but should be rejected, and canonical bucket/prefix boundary checks.

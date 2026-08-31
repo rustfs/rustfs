@@ -1306,8 +1306,8 @@ mod tests {
         assert_eq!(response.summary.manual_transition_jobs.state, CapabilityState::Supported);
         assert_eq!(response.replication.contract_version, 1);
         assert_eq!(response.replication.bucket_replication.contract_version, 1);
-        // v3: temporary-credential fields are explicitly historical-only.
-        assert_eq!(response.replication.remote_targets.contract_version, 3);
+        // v4: temporary-credential fields moved from historical-only to writable.
+        assert_eq!(response.replication.remote_targets.contract_version, 4);
         assert_eq!(response.replication.bucket_replication.status.state, CapabilityState::Supported);
         assert_eq!(response.replication.remote_targets.status.state, CapabilityState::Supported);
         assert_eq!(
@@ -1363,8 +1363,8 @@ mod tests {
                     .remote_targets
                     .fields
                     .iter()
-                    .any(|field| field.name == name && field.state == super::ReplicationFieldState::ReadOnlyHistorical),
-                "remote target field {name} must be advertised as historical-only"
+                    .any(|field| field.name == name && field.state == super::ReplicationFieldState::Supported),
+                "remote target field {name} must be advertised as writable"
             );
         }
         assert_eq!(response.manual_transition_jobs.contract_version, 1);
@@ -1428,7 +1428,7 @@ mod tests {
         assert_eq!(value["summary"]["manual_transition_jobs"]["state"], "supported");
         assert_eq!(value["replication"]["contract_version"], 1);
         assert_eq!(value["replication"]["bucket_replication"]["contract_version"], 1);
-        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 3);
+        assert_eq!(value["replication"]["remote_targets"]["contract_version"], 4);
         assert_eq!(value["replication"]["bucket_replication"]["status"]["state"], "supported");
         assert_eq!(value["replication"]["remote_targets"]["status"]["state"], "supported");
         assert_eq!(
@@ -1469,8 +1469,8 @@ mod tests {
                     .as_array()
                     .expect("remote target fields should be an array")
                     .iter()
-                    .any(|field| field["name"] == name && field["state"] == "read_only_historical"),
-                "serialized remote target field {name} must be historical-only"
+                    .any(|field| field["name"] == name && field["state"] == "supported"),
+                "serialized remote target field {name} must be writable"
             );
         }
         assert_eq!(value["manual_transition_jobs"]["contract_version"], 1);

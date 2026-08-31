@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM;
 use rustfs_rio::{InternodeHttpError, InternodeHttpErrorKind};
 use std::error::Error as StdError;
 use std::hash::{Hash, Hasher};
@@ -229,6 +230,19 @@ fn classify_internode_missing_error(error: &InternodeHttpError) -> Option<DiskEr
     None
 }
 
+fn internode_write_error_is_retryable(error: &InternodeHttpError) -> bool {
+    error.kind().is_retryable()
+        || (matches!(error.kind(), InternodeHttpErrorKind::HttpStatus(status) if status.as_u16() == 409)
+            && error.context().operation() == Some(INTERNODE_OPERATION_PUT_FILE_STREAM))
+}
+
+fn io_error_contains_retryable_internode_write(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+        .is_some_and(internode_write_error_is_retryable)
+}
+
 /// Wrap a terminal shard-read failure without changing its typed
 /// classification.  Timeout-like disk errors retain `TimedOut`; other errors
 /// retain their inner I/O kind or use `Other` when no more specific kind exists.
@@ -336,10 +350,7 @@ impl DiskError {
 
     pub fn is_retryable_internode_write_failure(&self) -> bool {
         match self {
-            DiskError::Io(io_error) => io_error
-                .get_ref()
-                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
-                .is_some_and(|err| err.kind().is_retryable()),
+            DiskError::Io(io_error) => io_error_contains_retryable_internode_write(io_error),
             _ => false,
         }
     }
@@ -1238,6 +1249,68 @@ mod tests {
         assert!(too_many_requests.is_internode_http_status(429));
         assert!(!too_many_requests.is_internode_http_status(500));
         assert!(!DiskError::FileNotFound.is_internode_http_status(429));
+    }
+
+    #[test]
+    fn test_put_file_server_epoch_conflict_is_retryable_write_failure() {
+        let conflict = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::CONFLICT),
+        ));
+        let bad_request = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::BAD_REQUEST),
+        ));
+
+        assert!(conflict.is_retryable_internode_write_failure());
+        assert!(!bad_request.is_retryable_internode_write_failure());
+    }
+
+    #[tokio::test]
+    async fn read_stream_conflict_is_not_a_retryable_put_file_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind isolated HTTP fixture");
+            let address = listener.local_addr().expect("fixture address");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept read request");
+                let mut request = [0_u8; 4096];
+                let mut read = 0;
+                loop {
+                    let count = stream.read(&mut request[read..]).await.expect("read HTTP request");
+                    assert!(count > 0, "request ended before its complete headers");
+                    read += count;
+                    if request[..read].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                    assert!(read < request.len(), "fixture request headers exceed their budget");
+                }
+                stream
+                    .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("send typed conflict response");
+            });
+            let error = match rustfs_rio::HttpReader::new(
+                format!("http://{address}/rustfs/rpc/read_file_stream"),
+                http::Method::GET,
+                http::HeaderMap::new(),
+                None,
+            )
+            .await
+            {
+                Ok(_) => panic!("HTTP 409 must fail the read"),
+                Err(error) => DiskError::from(error),
+            };
+            server.await.expect("fixture task should complete");
+            assert!(error.is_internode_http_status(409));
+            assert!(
+                !error.is_retryable_internode_write_failure(),
+                "read-operation 409 must not trigger put-file retry"
+            );
+        })
+        .await
+        .expect("isolated read-conflict test must finish within its budget");
     }
 
     #[test]

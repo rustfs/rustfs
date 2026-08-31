@@ -57,7 +57,7 @@ The `/v3/scanner/status` response reports each effective runtime value with a
 | `scanner.cycle_max_directories` | `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` | directories | `0` | Caps directories entered by one cycle. `0` disables this budget. |
 | `heal.bitrot_cycle` | `RUSTFS_SCANNER_BITROT_CYCLE_SECS` | seconds | `2592000` | Controls periodic deep bitrot scans. `false`, `off`, `no`, or `disabled` disables periodic deep scans; `0`, `true`, `on`, or `yes` runs deep mode every scanner cycle. |
 | `scanner.idle_mode` | `RUSTFS_SCANNER_IDLE_MODE` | boolean | `true` | Enables scanner sleeps and cooperative throttling. |
-| `scanner.cache_save_timeout` | `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` | seconds | `30` | Timeout for saving scanner cache; runtime enforces a minimum of `1`. |
+| `scanner.cache_save_timeout` | `RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS` | seconds | `14` | Timeout for saving scanner cache; runtime enforces a minimum of `1` and keeps the default persistence budget within the distributed publication lease. |
 | `scanner.max_concurrent_set_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` | count | `4` | Caps concurrent set-level scanner tasks. `0` keeps topology-derived concurrency. |
 | `scanner.max_concurrent_disk_scans` | `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` | count | `4` | Caps concurrent disk bucket walks per set. `0` keeps disk-count-derived concurrency. |
 | `scanner.yield_every_n_objects` | `RUSTFS_SCANNER_YIELD_EVERY_N_OBJECTS` | objects | `128` | Controls how often object loops yield to the async runtime. `0` disables this extra yield. |
@@ -139,6 +139,12 @@ objects:
   backoff state.
 - `metrics`: scanner work, pressure, checkpoint, lifecycle, replication, heal,
   bitrot, and alert counters.
+- `data_movement_pause`: the global-pause policy, current movement reason,
+  operation epoch, start time, duration, and estimated movement work items.
+- `pause_backlog`: the replicated durable pause ledger, post-pause catch-up
+  phase, rate window, retry state, thresholds, and active alert reasons.
+- `catch_up_estimate`: movement work plus current dirty-usage and already
+  discovered lifecycle queues.
 
 Example fields to inspect:
 
@@ -163,7 +169,96 @@ metrics.cycle_timeout_total
 metrics.cycle_last_progress_age
 metrics.leader_lease_without_progress
 metrics.cycle_recovery_required_total
+data_movement_pause.paused
+data_movement_pause.reasons
+data_movement_pause.duration_seconds
+data_movement_pause.operation_epoch
+data_movement_pause.movement_generation
+data_movement_pause.movement_backlog_work_items
+pause_backlog.persistence_state
+pause_backlog.phase
+pause_backlog.pause_duration_seconds
+pause_backlog.pending_full_scan
+pause_backlog.pending_work_items
+pause_backlog.next_attempt_at_unix_secs
+pause_backlog.alert_reasons
+catch_up_estimate.dirty_usage_buckets
+catch_up_estimate.discovered_expiry_items
+catch_up_estimate.discovered_transition_items
 ```
+
+## Data Movement Pauses
+
+RustFS currently uses a `global_pause` policy while pool decommission or
+rebalance can hide scanner metadata. Usage publication, lifecycle discovery,
+tier cleanup discovery, scanner-originated heal and bitrot checks, and
+replication discovery are deferred together. A failed or canceled
+decommission remains a publication barrier until an operator retries or clears
+it.
+
+`data_movement_pause.reasons` combines the in-process decommission worker state
+with the durable pool and rebalance operation metadata. Exhausted operation
+epochs or movement generations also fail closed and appear as explicit pause
+reasons. Its start time, duration, and movement backlog come from the durable
+metadata; a worker-only or exhausted-counter snapshot can therefore report
+`paused=true` with zero start time and backlog.
+`movement_backlog_work_items` counts remaining movement bucket work units, not
+expired objects. `catch_up_estimate` combines that estimate with dirty-usage
+buckets and lifecycle items that were already discovered before or during the
+pause. The API sets `undiscovered_ilm_items_known=false` because a global pause
+cannot count newly expired objects without scanning the namespace. Use
+`usage_baseline_unix_secs` to judge the age of that estimate.
+
+The same pause and estimate objects are included in
+`GET /v3/ilm/expiry/status`. The gauges
+`rustfs_scanner_data_movement_paused`,
+`rustfs_scanner_data_movement_pause_duration_seconds`, and
+`rustfs_scanner_data_movement_backlog_work_items` expose the local snapshot
+without bucket-name labels.
+
+The scanner persists `.scanner-pause-backlog.json` independently on erasure
+sets in every surviving pool. A generation becomes authoritative only after
+the identical commit record reaches every set named by its membership marker.
+When a failed, canceled, or cleared decommission source rejoins, the last
+committed surviving-set ledger seeds it before a new full-membership commit is
+allowed; a smaller stale source membership cannot override the largest valid
+surviving-set proof, and a membership claim is valid only when every declared
+member stores the same proof. This repair appears as
+`membership_repair_pending`. A partial commit is
+rolled back to the previous stable generation after a crash or leader switch.
+The ledger never rewrites pool or rebalance movement state. A new scanner
+leader recovers the committed writer epoch and generation, counts an
+interrupted attempt as a failure, and requires one successful full namespace
+scan after movement clears. Known dirty-usage, expiry, and transition queues
+must also reach zero before the ledger returns to `idle`. If the ledger cannot
+be read or updated, scanner cycles remain gated and persistence is retried
+every five minutes; the management status reports `persistence_unavailable`
+until recovery.
+
+Catch-up attempts remain subject to the normal cycle duration, object,
+directory, sleeper, and foreground-read budgets. The additional durable rate
+window admits at most four attempts per hour and no more than one attempt per
+five minutes. Five consecutive failed or interrupted attempts move the ledger
+to `retry_exhausted`; accelerated retries stop and a sparse hourly probe is
+used instead. A successful probe can return to bounded catch-up.
+
+`pause_backlog.thresholds` reports the exact pause-duration, deferred-cycle,
+backlog-size, rate, and failure limits used by the running binary.
+`pause_backlog.alert_reasons` identifies exceeded thresholds, exhausted
+counters or retries, replica degradation, and persistence failures. The
+threshold alerts fire after a 24-hour pause, three movement deferrals in one
+unconverged pause episode, or 10,000 known pending work items. The
+corresponding unlabeled gauges are:
+
+- `rustfs_scanner_pause_backlog_phase` (`0` idle, `1` paused, `2` catching up,
+  `3` retry exhausted);
+- `rustfs_scanner_pause_backlog_pause_duration_seconds`;
+- `rustfs_scanner_pause_backlog_pending_work_items`;
+- `rustfs_scanner_pause_backlog_consecutive_failures`;
+- `rustfs_scanner_pause_backlog_rate_limited`;
+- `rustfs_scanner_pause_backlog_retry_exhausted`;
+- `rustfs_scanner_pause_backlog_alerting`;
+- `rustfs_scanner_pause_backlog_replica_degraded`.
 
 ## Reading Pacing Pressure
 

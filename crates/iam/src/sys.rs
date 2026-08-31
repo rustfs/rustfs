@@ -960,7 +960,11 @@ impl<T: Store> IamSys<T> {
         Ok(updated_at)
     }
 
-    pub async fn set_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<()> {
+    pub async fn set_user_secret_key(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus)> {
         if !is_access_key_valid(access_key) {
             return Err(IamError::InvalidAccessKeyLength);
         }
@@ -969,7 +973,9 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidSecretKeyLength);
         }
 
-        self.store.update_user_secret_key(access_key, secret_key).await
+        let (updated_at, status) = self.store.update_user_secret_key(access_key, secret_key).await?;
+        self.notify_for_user(access_key, false).await;
+        Ok((updated_at, status))
     }
 
     /// Add SSH public key for a user (for SFTP authentication)

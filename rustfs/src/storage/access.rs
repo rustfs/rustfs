@@ -1598,7 +1598,11 @@ async fn table_data_plane_resource_for_request<T>(
                 error = %err,
                 "failed to resolve table data-plane resource"
             );
-            s3_error!(AccessDenied, "Access Denied")
+            if matches!(err, crate::table_catalog::TableCatalogStoreError::Unavailable(_)) {
+                S3Error::from(ApiError::service_unavailable())
+            } else {
+                s3_error!(AccessDenied, "Access Denied")
+            }
         })?;
     let bucket_fence_key = (bucket.to_string(), crate::table_catalog::default_table_bucket_publication_lock_path());
     let mut state = retained.state.lock();

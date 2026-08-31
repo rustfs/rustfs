@@ -37,6 +37,8 @@ use super::super::ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS;
 #[cfg(test)]
 use super::super::ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX;
 #[cfg(test)]
+use super::super::ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE;
+#[cfg(test)]
 use super::super::get_metadata_slowtail_fault_delay;
 use super::super::{
     Bytes, CHECK_PART_DISK_NOT_FOUND, DeleteOptions, DiskError, DiskStore, EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
@@ -46,13 +48,15 @@ use super::super::{
     ObjectPartInfo, OffsetDateTime, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RawFileInfo, ReadMultipleReq,
     ReadMultipleResp, ReadOptions, Result, SLASH_SEPARATOR, STORAGE_FORMAT_FILE, SetDisks, SnapshotLeaseToken, StorageError,
     UpdateMetadataOpts, Uuid, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
-    capacity_scope_from_disks, coding, collect_inline_data_shard_fileinfos_by_index_or_reason, current_dirty_generation, debug,
-    disk, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info, inline_erasure_shard_file_offset,
-    inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found, is_get_metadata_data_read_early_stop_enabled,
-    is_get_metadata_early_stop_bounded_fanout_enabled, is_get_metadata_early_stop_enabled, is_object_dangling,
+    capacity_scope_from_disks, codec_streaming_rollout_applies, coding, collect_inline_data_shard_fileinfos_by_index_or_reason,
+    current_dirty_generation, debug, disk, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info,
+    inline_erasure_shard_file_offset, inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found,
+    is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
+    is_get_metadata_early_stop_enabled, is_get_metadata_non_inline_data_read_early_stop_enabled, is_object_dangling,
     is_version_early_stop_enabled, issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure,
-    merge_file_meta_versions, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs, reduce_write_quorum_errs,
-    send_heal_request_with_admission, should_prevent_write, to_object_err, try_read_inline_data_shards_direct, warn,
+    merge_file_meta_versions, object_fits_single_block, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs,
+    reduce_write_quorum_errs, send_heal_request_with_admission, should_prevent_write, to_object_err,
+    try_read_inline_data_shards_direct, warn,
 };
 #[cfg(test)]
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
@@ -449,13 +453,29 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::task::JoinSet;
 
+struct AbortOnDropJoinHandle<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Future for AbortOnDropJoinHandle<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
 pub(in crate::set_disk) const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
 const ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE: &str = "RUSTFS_GET_METADATA_READ_VERSION_COALESCE";
 const ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS: &str = "RUSTFS_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS";
 const DEFAULT_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS: u64 = 200;
 const METRIC_GET_METADATA_READ_VERSION_COALESCER_TOTAL: &str = "rustfs_get_metadata_read_version_coalescer_total";
-pub(in crate::set_disk) const ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE: &str = "RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE";
+pub(crate) const ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE: &str = "RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE";
 /// Default reader-setup strategy for the GET read path (rustfs/backlog#1215,
 /// #1159, #923).
 ///
@@ -687,6 +707,10 @@ pub(in crate::set_disk) struct MetadataQuorumAccumulator {
     pub(in crate::set_disk) hard_errors: usize,
     pub(in crate::set_disk) candidate: Option<FileInfo>,
     pub(in crate::set_disk) candidate_votes: usize,
+    // Bitset of shard indexes whose metadata matches the candidate. Erasure
+    // layouts are capped at 16 shards, so this stays allocation-free on the
+    // GET metadata hot path.
+    candidate_shard_mask: u16,
     pub(in crate::set_disk) conflicting_metadata: bool,
     pub(in crate::set_disk) delete_marker_seen: bool,
     pub(in crate::set_disk) delete_marker_candidates: Vec<(FileInfo, usize)>,
@@ -708,6 +732,7 @@ impl MetadataQuorumAccumulator {
             hard_errors: 0,
             candidate: None,
             candidate_votes: 0,
+            candidate_shard_mask: 0,
             conflicting_metadata: false,
             delete_marker_seen: false,
             delete_marker_candidates: Vec::new(),
@@ -723,6 +748,14 @@ impl MetadataQuorumAccumulator {
     }
 
     pub(in crate::set_disk) fn observe_file_info(&mut self, file_info: &FileInfo) {
+        self.observe_file_info_with_index(None, file_info);
+    }
+
+    pub(in crate::set_disk) fn observe_file_info_at(&mut self, disk_index: usize, file_info: &FileInfo) {
+        self.observe_file_info_with_index(Some(disk_index), file_info);
+    }
+
+    fn observe_file_info_with_index(&mut self, disk_index: Option<usize>, file_info: &FileInfo) {
         if !file_info_is_valid_for_metadata(file_info) {
             self.hard_errors = self.hard_errors.saturating_add(1);
             return;
@@ -762,6 +795,11 @@ impl MetadataQuorumAccumulator {
         match &self.candidate {
             Some(candidate) if metadata_early_stop_candidate_matches(candidate, file_info) => {
                 self.candidate_votes = self.candidate_votes.saturating_add(1);
+                if let Some(disk_index) = disk_index
+                    && let Some(bit) = Self::candidate_shard_bit(candidate, file_info, disk_index)
+                {
+                    self.candidate_shard_mask |= bit;
+                }
             }
             Some(_) => {
                 self.conflicting_metadata = true;
@@ -769,8 +807,36 @@ impl MetadataQuorumAccumulator {
             None => {
                 self.candidate = Some(file_info.clone());
                 self.candidate_votes = 1;
+                if let Some(disk_index) = disk_index
+                    && let Some(bit) = Self::candidate_shard_bit(file_info, file_info, disk_index)
+                {
+                    self.candidate_shard_mask |= bit;
+                }
             }
         }
+    }
+
+    fn candidate_shard_bit(candidate: &FileInfo, file_info: &FileInfo, disk_index: usize) -> Option<u16> {
+        let &erasure_index = candidate.erasure.distribution.get(disk_index)?;
+        if erasure_index == 0 || erasure_index > u16::BITS as usize || file_info.erasure.index != erasure_index {
+            return None;
+        }
+        Some(1u16 << (erasure_index - 1))
+    }
+
+    pub(in crate::set_disk) fn candidate_has_read_reserve(&self) -> bool {
+        self.candidate_read_reserve_target()
+            .is_some_and(|required| self.candidate_shard_mask.count_ones() as usize >= required)
+    }
+
+    pub(in crate::set_disk) fn candidate_read_reserve_target(&self) -> Option<usize> {
+        let candidate = self.candidate.as_ref()?;
+        Some(
+            candidate
+                .erasure
+                .data_blocks
+                .saturating_add(usize::from(candidate.erasure.parity_blocks > 0)),
+        )
     }
 
     pub(in crate::set_disk) fn observe_error(&mut self, err: &DiskError) {
@@ -1082,6 +1148,33 @@ fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Op
     }
     None
 }
+
+pub(in crate::set_disk) fn non_inline_data_read_candidate_is_safe(candidate: &FileInfo) -> bool {
+    if candidate.inline_data()
+        || candidate.is_compressed()
+        || candidate.is_remote()
+        || candidate
+            .metadata
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key))
+        || candidate.parts.len() != 1
+    {
+        return false;
+    }
+    candidate.has_valid_erasure_geometry()
+}
+
+pub(in crate::set_disk) fn late_materialization_candidate_is_safe(candidate: &FileInfo) -> bool {
+    non_inline_data_read_candidate_is_safe(candidate)
+        && candidate.size > 512 * 1024
+        && object_fits_single_block(candidate.size, candidate.erasure.block_size)
+}
+
+pub(in crate::set_disk) fn non_inline_data_read_early_stop_allowed(read_data: bool, bucket: &str, object: &str) -> bool {
+    read_data && is_get_metadata_non_inline_data_read_early_stop_enabled() && !codec_streaming_rollout_applies(bucket, object)
+}
+
+const NON_INLINE_SINGLE_PENDING_HEDGE_DELAY: Duration = Duration::from_millis(100);
 
 fn data_read_inline_missing_shards_are_pending(
     candidate: &FileInfo,
@@ -1929,14 +2022,10 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         return;
     }
 
-    // Only CopySource uses disposable, stripe-aligned reopeners. Ordinary GET
-    // readers use the existing deferred handle and should not retain one
-    // heap-allocated closure (plus cloned path/disk state) for every parity
-    // slot.
-    let copy_source_demand_bound = matches!(
-        crate::set_disk::get_object_read_policy(),
-        crate::set_disk::GetObjectReadPolicy::CopySource
-    );
+    // Every demand-bound lockstep reader needs a disposable, stripe-aligned
+    // reopener. Otherwise a recovered slow data read can cancel and consume
+    // the only parity reserve needed by a later degraded stripe.
+    let demand_bound_lockstep = crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled();
 
     for idx in 0..disks.len() {
         if setup.attempted[idx] {
@@ -1951,7 +2040,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        let reopener = copy_source_demand_bound.then(|| {
+        let reopener = demand_bound_lockstep.then(|| {
             deferred_reader_reopener(
                 inline_data.clone(),
                 disk.clone(),
@@ -1992,7 +2081,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     // ready/error bookkeeping that quorum decisions rely on is left untouched.
     // Gate off (default): keep the eagerly opened parity readers exactly as
     // before — the lockstep path reads them on every stripe.
-    if !crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled() {
+    if !demand_bound_lockstep {
         return;
     }
     for idx in data_shards..disks.len() {
@@ -2004,7 +2093,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let disk = disks[idx].clone();
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
-        let reopener = copy_source_demand_bound.then(|| {
+        let reopener = demand_bound_lockstep.then(|| {
             deferred_reader_reopener(
                 inline_data.clone(),
                 disk.clone(),
@@ -2869,6 +2958,7 @@ impl SetDisks {
                 read_data,
                 healing,
                 incl_free_versions,
+                non_inline_data_read_early_stop_allowed(read_data, bucket, object),
                 default_parity_count,
                 allow_coalescing,
             )
@@ -2934,7 +3024,7 @@ impl SetDisks {
             let object = object.clone();
             let version_id = version_id.clone();
             let slowtail_fault = slowtail_fault.clone();
-            tokio::spawn(async move {
+            AbortOnDropJoinHandle(tokio::spawn(async move {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
                     Self::record_read_version_call(&object, disk_index);
@@ -2949,7 +3039,7 @@ impl SetDisks {
                 };
                 let elapsed = response_start.map(|start| start.elapsed());
                 (result, elapsed)
-            })
+            }))
         });
 
         // Wait for all futures to complete
@@ -3008,6 +3098,7 @@ impl SetDisks {
         read_data: bool,
         healing: bool,
         incl_free_versions: bool,
+        allow_non_inline_data_read_early_stop: bool,
         default_parity_count: usize,
         allow_coalescing: bool,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
@@ -3038,6 +3129,8 @@ impl SetDisks {
         let mut scheduled_count = 0usize;
         let mut force_full_wait = false;
         let mut final_miss_reason_override = None;
+        let mut non_inline_candidate_eligible = None;
+        let mut single_pending_hedge_deadline = None;
         let slowtail_fault = get_metadata_slowtail_fault_request(bucket.as_ref(), object.as_ref(), read_data);
         let spawn_read_version =
             |join_set: &mut JoinSet<(usize, disk::error::Result<FileInfo>, Duration)>, index: usize, disk: Option<DiskStore>| {
@@ -3085,17 +3178,55 @@ impl SetDisks {
             }
         }
 
-        while let Some(result) = join_set.join_next().await {
+        loop {
             let mut defer_pending_inline_data_shard = false;
+            let result = if let Some(deadline) = single_pending_hedge_deadline.take() {
+                tokio::select! {
+                    result = join_set.join_next() => result,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if bounded_fanout
+                            && !force_full_wait
+                            && join_set.len() == 1
+                            && non_inline_candidate_eligible == Some(true)
+                            && !accumulator.candidate_has_read_reserve()
+                            && next_fanout_index < disks.len()
+                        {
+                            while next_fanout_index < disks.len() {
+                                let disk_index = fanout_order[next_fanout_index];
+                                next_fanout_index = next_fanout_index.saturating_add(1);
+                                if let Some(disk) = disks.get(disk_index).cloned() {
+                                    spawn_read_version(&mut join_set, disk_index, disk);
+                                    scheduled_count = scheduled_count.saturating_add(1);
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                join_set.join_next().await
+            };
+            let Some(result) = result else { break };
             match result {
                 Ok((index, res, elapsed)) => match res {
                     Ok(file_info) => {
                         observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
-                        accumulator.observe_file_info(&file_info);
+                        if allow_non_inline_data_read_early_stop {
+                            accumulator.observe_file_info_at(index, &file_info);
+                        } else {
+                            accumulator.observe_file_info(&file_info);
+                        }
+                        if allow_non_inline_data_read_early_stop && non_inline_candidate_eligible.is_none() {
+                            non_inline_candidate_eligible =
+                                accumulator.candidate.as_ref().map(non_inline_data_read_candidate_is_safe);
+                        }
                         if bounded_fanout
                             && read_data
                             && !force_full_wait
                             && let Some(reason) = data_read_early_stop_inline_candidate_miss_reason(&file_info)
+                            && !(non_inline_candidate_eligible == Some(true)
+                                && reason == GET_METADATA_EARLY_STOP_REASON_DATA_READ_INLINE_NOT_INLINE)
                         {
                             force_full_wait = true;
                             final_miss_reason_override.get_or_insert(reason);
@@ -3126,6 +3257,9 @@ impl SetDisks {
             {
                 let should_return_early = if read_data {
                     match accumulator.candidate.as_ref() {
+                        Some(_candidate) if non_inline_candidate_eligible == Some(true) => {
+                            accumulator.candidate_has_read_reserve()
+                        }
                         Some(candidate) => match data_read_early_stop_inline_body_miss_reason(
                             bucket.as_ref(),
                             object.as_ref(),
@@ -3196,12 +3330,37 @@ impl SetDisks {
             }
 
             let pending_responses = join_set.len();
-            let should_hedge_single_pending_data_read = read_data
+            // Inline verification can still depend on a missing data shard;
+            // issue one immediate spare when only that shard remains. The
+            // non-inline path keeps its delayed hedge below to avoid healthy
+            // reads paying speculative I/O before the candidate is classified.
+            let should_hedge_single_pending_inline_read = read_data
                 && !force_full_wait
                 && !defer_pending_inline_data_shard
                 && pending_responses == 1
+                && non_inline_candidate_eligible != Some(true)
                 && accumulator.can_still_reach_early_stop_with_pending(pending_responses);
-            if bounded_fanout && force_full_wait {
+            // A non-inline plan must retain one extra matching shard as a
+            // reconstruction reserve. Schedule that reserve only after the
+            // candidate is known to be eligible, so inline GETs do not pay an
+            // extra fanout and the healthy path remains allocation-free.
+            let needs_non_inline_read_reserve = non_inline_candidate_eligible == Some(true)
+                && !accumulator.candidate_has_read_reserve()
+                && accumulator
+                    .candidate_read_reserve_target()
+                    .is_some_and(|reserve_target| scheduled_count < reserve_target || pending_responses == 0);
+            if bounded_fanout
+                && !force_full_wait
+                && (needs_non_inline_read_reserve || should_hedge_single_pending_inline_read)
+                && next_fanout_index < disks.len()
+            {
+                let disk_index = fanout_order[next_fanout_index];
+                if let Some(disk) = disks.get(disk_index).cloned() {
+                    spawn_read_version(&mut join_set, disk_index, disk);
+                    scheduled_count = scheduled_count.saturating_add(1);
+                }
+                next_fanout_index = next_fanout_index.saturating_add(1);
+            } else if bounded_fanout && force_full_wait {
                 while next_fanout_index < disks.len() {
                     let disk_index = fanout_order[next_fanout_index];
                     if let Some(disk) = disks.get(disk_index).cloned() {
@@ -3213,8 +3372,7 @@ impl SetDisks {
             } else if bounded_fanout
                 && !defer_pending_inline_data_shard
                 && next_fanout_index < disks.len()
-                && (!accumulator.can_still_reach_early_stop_with_pending(pending_responses)
-                    || should_hedge_single_pending_data_read)
+                && !accumulator.can_still_reach_early_stop_with_pending(pending_responses)
             {
                 let disk_index = fanout_order[next_fanout_index];
                 if let Some(disk) = disks.get(disk_index).cloned() {
@@ -3222,6 +3380,17 @@ impl SetDisks {
                     scheduled_count = scheduled_count.saturating_add(1);
                 }
                 next_fanout_index = next_fanout_index.saturating_add(1);
+            }
+            if bounded_fanout
+                && !force_full_wait
+                && !defer_pending_inline_data_shard
+                && join_set.len() == 1
+                && non_inline_candidate_eligible == Some(true)
+                && !accumulator.candidate_has_read_reserve()
+                && accumulator.can_still_reach_early_stop_with_pending(join_set.len())
+                && next_fanout_index < disks.len()
+            {
+                single_pending_hedge_deadline = Some(tokio::time::Instant::now() + NON_INLINE_SINGLE_PENDING_HEDGE_DELAY);
             }
         }
 
@@ -3657,6 +3826,7 @@ pub(in crate::set_disk) struct RenameTailOutcome {
 pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     write_quorum: usize,
     scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
+    scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3667,7 +3837,16 @@ impl<'a> RenameDataFenceOptions<'a> {
         Self {
             write_quorum,
             scanner_publication_lease_tokens,
+            scanner_publication_commit_scope: None,
         }
+    }
+
+    pub(in crate::set_disk) fn with_publication_scope(
+        mut self,
+        scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    ) -> Self {
+        self.scanner_publication_commit_scope = scanner_publication_commit_scope;
+        self
     }
 }
 
@@ -3776,6 +3955,37 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     if needs_heal {
         submit(request).await;
     }
+}
+
+async fn run_scanner_publication_delete_owner<F, Fut>(
+    scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    operation: F,
+) -> disk::error::Result<()>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = disk::error::Result<()>> + Send + 'static,
+{
+    if scope.is_none() {
+        return operation().await;
+    }
+    if let Some(scope) = scope.as_ref() {
+        scope.attach_mutation_owner();
+    }
+    tokio::spawn(async move {
+        let result = operation().await;
+        if let Some(scope) = scope.as_ref() {
+            if result.is_ok() {
+                let _ = scope.mark_committed();
+            } else {
+                // A failed quorum does not prove that no replica committed;
+                // keep the permit indeterminate for supervisor reconciliation.
+                let _ = scope.mark_indeterminate();
+            }
+        }
+        result
+    })
+    .await
+    .map_err(|_| DiskError::other("scanner publication delete owner failed"))?
 }
 
 impl SetDisks {
@@ -3995,6 +4205,7 @@ impl SetDisks {
         let RenameDataFenceOptions {
             write_quorum,
             scanner_publication_lease_tokens,
+            scanner_publication_commit_scope: _scanner_publication_commit_scope,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4352,6 +4563,7 @@ impl SetDisks {
         let RenameDataFenceOptions {
             write_quorum,
             scanner_publication_lease_tokens,
+            scanner_publication_commit_scope,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4383,11 +4595,15 @@ impl SetDisks {
         let fanout_src_object = src_object.clone();
         let fanout_dst_bucket = dst_bucket.clone();
         let fanout_dst_object = dst_object.clone();
+        let fanout_publication_scope = scanner_publication_commit_scope.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
         // completed disk mutations. Per-disk futures stay ordered in `join_all`,
         // preserving slot-indexed quorum and convergence accounting without a
         // scheduler task for every disk.
         let fanout = tokio::spawn(async move {
+            // Keep the storage-owned movement permit attached to the actual
+            // fan-out owner, even if the caller future is cancelled.
+            let _fanout_publication_scope = fanout_publication_scope;
             let successful_rename_completion_rank =
                 rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
             let futures = fanout_disks
@@ -4401,6 +4617,7 @@ impl SetDisks {
                     let dst_object = fanout_dst_object.clone();
                     let dst_bucket = fanout_dst_bucket.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
+                    let publication_scope = scanner_publication_commit_scope.clone();
 
                     std::panic::AssertUnwindSafe(async move {
                         // Test-only introspection guard: counts this operation as
@@ -4431,6 +4648,13 @@ impl SetDisks {
 
                         if let Some(err) = Self::rename_injected_error(&dst_object, i) {
                             return Err(err);
+                        }
+
+                        if let Some(scope) = publication_scope.as_ref()
+                            && !scope.can_commit()
+                        {
+                            let _ = scope.mark_indeterminate();
+                            return Err(DiskError::other("scanner publication commit scope deadline or cancellation reached"));
                         }
 
                         let disk_wait_started = rustfs_io_metrics::put_stage_timer();
@@ -5841,7 +6065,8 @@ impl SetDisks {
 
     #[cfg(test)]
     pub(in crate::set_disk) async fn delete_prefix(&self, bucket: &str, prefix: &str) -> disk::error::Result<()> {
-        self.delete_prefix_with_scanner_publication_lease(bucket, prefix, None).await
+        self.delete_prefix_with_scanner_publication_lease(bucket, prefix, None, None)
+            .await
     }
 
     /// Delete a prefix with an optional per-remote-disk scanner publication
@@ -5852,6 +6077,7 @@ impl SetDisks {
         bucket: &str,
         prefix: &str,
         scanner_publication_lease_tokens: Option<&HashMap<String, Uuid>>,
+        scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     ) -> disk::error::Result<()> {
         let disks = self.get_disks_internal().await;
         let write_quorum = disks.len() / 2 + 1;
@@ -5860,11 +6086,21 @@ impl SetDisks {
         let mut futures = Vec::with_capacity(disks.len());
 
         for (disk_op, scanner_publication_lease_token) in disks.iter().zip(fanout_fence_tokens) {
+            let disk_op = disk_op.clone();
             let bucket = bucket.to_string();
             let prefix = prefix.to_string();
+            let scanner_publication_commit_scope = scanner_publication_commit_scope.clone();
             futures.push(async move {
                 if let Some(disk) = disk_op {
-                    disk.delete_with_scanner_publication_lease(
+                    if let Some(scope) = scanner_publication_commit_scope.as_ref()
+                        && !scope.can_commit()
+                    {
+                        return Err(DiskError::other("scanner publication delete scope cannot commit"));
+                    }
+                    let external_guard = scanner_publication_commit_scope
+                        .as_ref()
+                        .map(|scope| Arc::new(scope.clone()) as Arc<dyn Send + Sync>);
+                    disk.delete_with_scanner_publication_lease_and_guard(
                         &bucket,
                         &prefix,
                         DeleteOptions {
@@ -5873,6 +6109,7 @@ impl SetDisks {
                             ..Default::default()
                         },
                         scanner_publication_lease_token,
+                        external_guard,
                     )
                     .await
                 } else {
@@ -5881,7 +6118,10 @@ impl SetDisks {
             });
         }
 
-        Self::reduce_delete_prefix_results(join_all(futures).await, write_quorum)
+        run_scanner_publication_delete_owner(scanner_publication_commit_scope, move || async move {
+            Self::reduce_delete_prefix_results(join_all(futures).await, write_quorum)
+        })
+        .await
     }
 
     /// Scan a single disk's copy of `prefix` and decide whether it is an orphan
@@ -6609,7 +6849,7 @@ pub(in crate::set_disk) mod rename_fanout_barrier_phase {
 /// Cross-process/black-box fault injection (toxiproxy, blackhole peers, 2-pool)
 /// is a later cluster-harness block, not this one.
 #[cfg(test)]
-pub(in crate::set_disk) mod rename_fanout_barrier {
+pub(crate) mod rename_fanout_barrier {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, OnceLock};
@@ -6808,6 +7048,84 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    #[serial_test::serial(codec_streaming_env)]
+    fn non_inline_early_stop_is_mutually_exclusive_with_codec_rollout() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_ROLLOUT", Some("on")),
+                ("RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED", Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED", Some("true")),
+            ],
+            || assert!(!non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
+        );
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_ROLLOUT", Some("off")),
+            ],
+            || assert!(non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_delete_owner_survives_waiter_cancellation() {
+        let movement_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let movement_permit = movement_gate.clone().read_owned().await;
+        let scope = crate::object_api::ScannerPublicationCommitScope::new_storage_owned(
+            7,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            Vec::new(),
+            movement_permit,
+        );
+        scope.try_begin().expect("delete scope should enter flight");
+        let scope_guard = crate::object_api::ScannerPublicationCommitScopeGuard::new(scope.clone());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(run_scanner_publication_delete_owner(Some(scope.clone()), move || async move {
+            started_tx.send(()).expect("delete owner should start");
+            release_rx.await.expect("delete owner should be released");
+            finished_tx.send(()).expect("delete owner should finish");
+            Ok(())
+        }));
+        started_rx.await.expect("delete owner should run");
+        drop(scope_guard);
+        waiter.abort();
+        assert_eq!(
+            scope.state(),
+            crate::object_api::ScannerPublicationCommitState::InFlight,
+            "caller cancellation must not classify an owned delete as indeterminate"
+        );
+
+        let mut movement_writer = Box::pin(movement_gate.write_owned());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut movement_writer)
+                .await
+                .is_err(),
+            "movement transition must remain fenced while delete owner drains"
+        );
+        release_tx.send(()).expect("delete owner should remain alive");
+        finished_rx.await.expect("delete owner should drain");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if scope.state() == crate::object_api::ScannerPublicationCommitState::Committed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete owner should report a terminal result");
+        assert!(
+            scope.release_movement_permit().await,
+            "terminal delete should release its movement permit"
+        );
+        movement_writer.await;
+    }
 
     #[test]
     fn write_precondition_lookup_errors_fail_closed_unless_absence_is_known() {
@@ -7172,6 +7490,90 @@ mod tests {
                 assert_eq!(parts_metadata.iter().filter(|fi| fi.name == object).count(), DISKS);
                 assert!(errs.iter().all(Option::is_none));
                 assert_eq!(diagnostics.total_responses(), DISKS);
+            },
+        )
+        .await;
+
+        drop(dirs);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_slowtail_fault_gate_stops_before_unneeded_tail() {
+        const DISKS: usize = 4;
+        let bucket = "metadata-slowtail-gated-bucket";
+        let object = "objects/metadata-slowtail-gated-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_mapped_metadata_fanout_fileinfo(&disks, bucket, object).await;
+        let order = bounded_metadata_fanout_order(bucket, object, DISKS, 2);
+        let slow_disk = *order.get(3).expect("four-disk fanout should have a deferred tail disk");
+        let slow_disk_env = slow_disk.to_string();
+
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("150")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some(slow_disk_env.as_str())),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some(bucket)),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(object);
+                let read_with_data =
+                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", true, false, false, true, 2);
+                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_millis(500), read_with_data)
+                    .await
+                    .expect("gated metadata read should stop before the deferred slow tail")
+                    .expect("gated metadata fanout should resolve");
+                assert!(parts_metadata.iter().filter(|fi| fi.name == object).count() >= 3);
+                assert!(errs.iter().all(Option::is_none));
+                assert!(diagnostics.total_responses() < DISKS);
+                assert_eq!(calls.total(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT), 0);
+            },
+        )
+        .await;
+
+        drop(dirs);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_slowtail_fault_gate_hedges_an_initial_slow_data_shard() {
+        const DISKS: usize = 4;
+        let bucket = "metadata-slowtail-gated-initial-bucket";
+        let object = "objects/metadata-slowtail-gated-initial-object";
+        let (dirs, disks) = call_counter_local_disks(bucket, DISKS).await;
+        install_mapped_metadata_fanout_fileinfo(&disks, bucket, object).await;
+        let order = bounded_metadata_fanout_order(bucket, object, DISKS, 2);
+        let slow_disk = *order.get(1).expect("four-disk fanout should have an initial data disk");
+        let spare_disk = *order.get(3).expect("four-disk fanout should have a spare disk");
+        let slow_disk_env = slow_disk.to_string();
+
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS, Some("500")),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS, Some(slow_disk_env.as_str())),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET, Some(bucket)),
+                (ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX, Some("objects/")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(object);
+                let read_with_data =
+                    SetDisks::read_all_fileinfo_observed(&disks, bucket, bucket, object, "", true, false, false, true, 2);
+                let (parts_metadata, errs, diagnostics) = tokio::time::timeout(Duration::from_millis(300), read_with_data)
+                    .await
+                    .expect("gated metadata read should hedge the initial slow shard")
+                    .expect("gated metadata fanout should resolve");
+                assert!(parts_metadata.iter().filter(|fi| fi.name == object).count() >= 3);
+                assert!(errs.iter().all(Option::is_none));
+                assert!(diagnostics.total_responses() < DISKS);
+                assert_eq!(calls.for_disk(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT, slow_disk), 1);
+                assert_eq!(calls.for_disk(disk_call_counters::KIND_READ_VERSION, spare_disk), 1);
             },
         )
         .await;
@@ -7589,6 +7991,32 @@ mod tests {
             )
             .await
             .expect("metadata should be installed on every disk");
+        }
+    }
+
+    async fn install_mapped_metadata_fanout_fileinfo(disks: &[Option<DiskStore>], bucket: &str, object: &str) {
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let mod_time = OffsetDateTime::now_utc();
+        let distribution = FileInfo::new(&metadata_distribution_key(bucket, object), 2, 2)
+            .erasure
+            .distribution;
+        for (index, disk) in disks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, disk)| disk.as_ref().map(|disk| (index, disk)))
+        {
+            disk.write_all(bucket, &format!("{object}/{data_dir}/part.1"), Bytes::from_static(b"x"))
+                .await
+                .expect("part data should be installed on every disk");
+            let mut file_info = valid_metadata_fanout_fileinfo(bucket, object, version_id, data_dir, mod_time);
+            file_info.erasure.distribution = distribution.clone();
+            file_info.erasure.index = *distribution
+                .get(index)
+                .expect("mapped metadata distribution should cover every disk");
+            disk.write_metadata(bucket, bucket, object, file_info)
+                .await
+                .expect("mapped metadata should be installed on every disk");
         }
     }
 
@@ -10212,6 +10640,41 @@ mod tests {
         let mut impossible_parity = candidate;
         impossible_parity.erasure.parity_blocks = 4;
         assert_eq!(accumulator.candidate_latest_quorum(&impossible_parity), None);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_tracks_mapped_shards_and_requires_a_reserve() {
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let base = valid_metadata_fanout_fileinfo("bucket", "object", version_id, data_dir, OffsetDateTime::now_utc());
+        let distribution = base.erasure.distribution.clone();
+        let mut accumulator = MetadataQuorumAccumulator::new(4, 2, true);
+
+        for (disk_index, &erasure_index) in distribution.iter().take(2).enumerate() {
+            let mut file_info = base.clone();
+            file_info.erasure.index = erasure_index;
+            accumulator.observe_file_info_at(disk_index, &file_info);
+        }
+        assert!(
+            !accumulator.candidate_has_read_reserve(),
+            "data quorum without parity reserve must not early-stop"
+        );
+
+        let mut mismatched = base.clone();
+        mismatched.erasure.index = distribution[3];
+        accumulator.observe_file_info_at(2, &mismatched);
+        assert!(
+            !accumulator.candidate_has_read_reserve(),
+            "mapped index mismatch must not count as a reserve"
+        );
+
+        let mut reserve = base;
+        reserve.erasure.index = distribution[2];
+        accumulator.observe_file_info_at(2, &reserve);
+        assert!(
+            accumulator.candidate_has_read_reserve(),
+            "one matching reserve shard should complete the read reserve"
+        );
     }
 
     #[test]

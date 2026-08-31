@@ -157,7 +157,15 @@ impl SetDisks {
             .clone()
             .unwrap_or_else(|| get_raw_etag(obj_info.user_defined.as_ref()));
         let version_id = expected.version_id.map(|v| v.to_string());
-        let lock_guard = if !opts.no_lock {
+        let (decommission_object_lock_guard, decommission_target_lock_covered, mut decommission_capacity_guard) =
+            if let Some(store) = opts.decommission_capacity_admission.as_ref() {
+                store
+                    .acquire_external_decommission_commit_guards(self.pool_index, bucket, object, opts.no_lock)
+                    .await?
+            } else {
+                (None, false, None)
+            };
+        let lock_guard = if !opts.no_lock && !decommission_target_lock_covered {
             Some(
                 self.acquire_write_lock_diag("restore_finalize_metadata", bucket, object)
                     .await?,
@@ -165,6 +173,15 @@ impl SetDisks {
         } else {
             None
         };
+        if decommission_capacity_guard.is_none()
+            && let Some(store) = opts.decommission_capacity_admission.as_ref()
+        {
+            decommission_capacity_guard = Some(
+                store
+                    .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                    .await?,
+            );
+        }
         let read_opts = ObjectOptions {
             version_id,
             versioned: opts.versioned,
@@ -198,7 +215,12 @@ impl SetDisks {
         );
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         ensure_restore_metadata_lock_held(bucket, object, opts, "restore_finalize_metadata")?;
-        if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+        if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || decommission_object_lock_guard
+                .as_ref()
+                .is_some_and(|guard| guard.is_lock_lost())
+            || decommission_capacity_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
             return Err(Error::other("restore finalization lock lost before metadata update"));
         }
         self.update_object_meta_with_opts(
@@ -233,7 +255,15 @@ impl SetDisks {
             .clone()
             .unwrap_or_else(|| get_raw_etag(obj_info.user_defined.as_ref()));
         let version_id = expected.version_id.map(|v| v.to_string());
-        let lock_guard = if !opts.no_lock {
+        let (decommission_object_lock_guard, decommission_target_lock_covered, mut decommission_capacity_guard) =
+            if let Some(store) = opts.decommission_capacity_admission.as_ref() {
+                store
+                    .acquire_external_decommission_commit_guards(self.pool_index, bucket, object, opts.no_lock)
+                    .await?
+            } else {
+                (None, false, None)
+            };
+        let lock_guard = if !opts.no_lock && !decommission_target_lock_covered {
             Some(
                 self.acquire_write_lock_diag("restore_cleanup_metadata", bucket, object)
                     .await?,
@@ -241,6 +271,15 @@ impl SetDisks {
         } else {
             None
         };
+        if decommission_capacity_guard.is_none()
+            && let Some(store) = opts.decommission_capacity_admission.as_ref()
+        {
+            decommission_capacity_guard = Some(
+                store
+                    .acquire_external_decommission_capacity_fence(&[self.pool_index], "mutation")
+                    .await?,
+            );
+        }
         let read_opts = ObjectOptions {
             version_id,
             versioned: opts.versioned,
@@ -269,7 +308,12 @@ impl SetDisks {
             &mut fi.metadata,
             rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
         );
-        if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+        if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || decommission_object_lock_guard
+                .as_ref()
+                .is_some_and(|guard| guard.is_lock_lost())
+            || decommission_capacity_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
             return Err(Error::other("restore cleanup lock lost before metadata update".to_string()));
         }
         self.invalidate_get_object_metadata_cache(bucket, object).await;

@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use minlz::{Encoder as MinlzEncoder, crc::crc, decode};
+use minlz::{Encoder as MinlzEncoder, crc::crc};
 use pin_project_lite::pin_project;
 use rand::RngExt;
-use rustfs_rio::{EtagResolvable, HashReaderDetector, HashReaderMut, Index, TryGetIndex};
+use rustfs_rio::{
+    EtagResolvable, HashReaderDetector, HashReaderMut, Index, MAX_S2_DECOMPRESSED_BLOCK_SIZE, S2Decoder, TryGetIndex,
+};
 use rustfs_utils::CompressionAlgorithm;
 use std::cmp::min;
 use std::fmt;
@@ -25,18 +27,16 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
 const MAGIC_CHUNK: &[u8] = b"\xff\x06\x00\x00S2sTwO";
-const MAGIC_CHUNK_SNAPPY: &[u8] = b"\xff\x06\x00\x00sNaPpY";
 const CHUNK_TYPE_COMPRESSED_DATA: u8 = 0x00;
 const CHUNK_TYPE_UNCOMPRESSED_DATA: u8 = 0x01;
-const CHUNK_TYPE_INDEX: u8 = 0x99;
 const CHUNK_TYPE_PADDING: u8 = 0xfe;
-const CHUNK_TYPE_STREAM_IDENTIFIER: u8 = 0xff;
 const DEFAULT_BLOCK_SIZE: usize = 1 << 20;
 const MAX_CHUNK_SIZE: usize = (1 << 24) - 1;
 const CHECKSUM_SIZE: usize = 4;
 const CHUNK_HEADER_LEN: usize = 4;
 const ENCRYPTED_PADDING_MULTIPLE: usize = 256;
 const MIN_INDEX_SIZE: usize = 8 << 20;
+const MAX_READY_READS_PER_POLL: usize = 64;
 
 pin_project! {
     #[derive(Debug)]
@@ -88,7 +88,17 @@ where
         Self::with_block_size(inner, DEFAULT_BLOCK_SIZE, CompressionAlgorithm::default())
     }
 
+    /// Create an encoder with a caller-selected S2 block size.
+    ///
+    /// Zero selects the default. Larger values are capped at the maximum block
+    /// accepted by the paired decoder, preserving this infallible API without
+    /// allowing it to emit a stream that RustFS cannot read back.
     pub fn with_block_size(inner: R, block_size: usize, _compression_algorithm: CompressionAlgorithm) -> Self {
+        let block_size = if block_size == 0 {
+            DEFAULT_BLOCK_SIZE
+        } else {
+            block_size.min(MAX_S2_DECOMPRESSED_BLOCK_SIZE)
+        };
         Self {
             inner,
             buffer: Vec::new(),
@@ -125,6 +135,7 @@ where
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let mut this = self.project();
+        let mut ready_reads = 0usize;
 
         if *this.pos < this.buffer.len() {
             let to_copy = min(buf.remaining(), this.buffer.len() - *this.pos);
@@ -142,6 +153,11 @@ where
         }
 
         while this.temp_buffer.len() < *this.block_size {
+            if ready_reads >= MAX_READY_READS_PER_POLL {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+
             let remaining = *this.block_size - this.temp_buffer.len();
             let mut read_buf = ReadBuf::new(&mut this.read_buffer[..remaining]);
             match this.inner.as_mut().poll_read(cx, &mut read_buf) {
@@ -149,6 +165,7 @@ where
                     return Poll::Pending;
                 }
                 Poll::Ready(Ok(())) => {
+                    ready_reads += 1;
                     let n = read_buf.filled().len();
                     if n == 0 {
                         break;
@@ -243,18 +260,7 @@ pin_project! {
     #[derive(Debug)]
     pub struct DecompressReader<R> {
         #[pin]
-        inner: R,
-        buffer: Vec<u8>,
-        buffer_pos: usize,
-        finished: bool,
-        header_buf: [u8; CHUNK_HEADER_LEN],
-        header_read: usize,
-        chunk_type: u8,
-        chunk_buf: Vec<u8>,
-        chunk_len: usize,
-        chunk_read: usize,
-        reading_chunk: bool,
-        stream_initialized: bool,
+        inner: S2Decoder<R>,
     }
 }
 
@@ -264,18 +270,7 @@ where
 {
     pub fn new(inner: R, _compression_algorithm: CompressionAlgorithm) -> Self {
         Self {
-            inner,
-            buffer: Vec::new(),
-            buffer_pos: 0,
-            finished: false,
-            header_buf: [0u8; CHUNK_HEADER_LEN],
-            header_read: 0,
-            chunk_type: 0,
-            chunk_buf: Vec::new(),
-            chunk_len: 0,
-            chunk_read: 0,
-            reading_chunk: false,
-            stream_initialized: false,
+            inner: S2Decoder::new_at_legacy_chunk_boundary(inner),
         }
     }
 }
@@ -285,125 +280,7 @@ where
     R: AsyncRead + Unpin + Send + Sync,
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let mut this = self.project();
-
-        if *this.buffer_pos < this.buffer.len() {
-            let to_copy = min(buf.remaining(), this.buffer.len() - *this.buffer_pos);
-            buf.put_slice(&this.buffer[*this.buffer_pos..*this.buffer_pos + to_copy]);
-            *this.buffer_pos += to_copy;
-            if *this.buffer_pos == this.buffer.len() {
-                this.buffer.clear();
-                *this.buffer_pos = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
-
-        loop {
-            if *this.finished {
-                return Poll::Ready(Ok(()));
-            }
-
-            if !*this.reading_chunk {
-                while *this.header_read < CHUNK_HEADER_LEN {
-                    let mut read_buf = ReadBuf::new(&mut this.header_buf[*this.header_read..]);
-                    match this.inner.as_mut().poll_read(cx, &mut read_buf) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(Ok(())) => {
-                            let n = read_buf.filled().len();
-                            if n == 0 {
-                                if *this.header_read == 0 {
-                                    *this.finished = true;
-                                    return Poll::Ready(Ok(()));
-                                }
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "unexpected EOF while reading S2 chunk header",
-                                )));
-                            }
-                            *this.header_read += n;
-                        }
-                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                    }
-                }
-
-                *this.chunk_type = this.header_buf[0];
-                *this.chunk_len =
-                    (this.header_buf[1] as usize) | ((this.header_buf[2] as usize) << 8) | ((this.header_buf[3] as usize) << 16);
-                *this.header_read = 0;
-
-                if this.chunk_buf.len() < *this.chunk_len {
-                    this.chunk_buf.resize(*this.chunk_len, 0);
-                }
-                *this.chunk_read = 0;
-                *this.reading_chunk = true;
-            }
-
-            while *this.chunk_read < *this.chunk_len {
-                let mut read_buf = ReadBuf::new(&mut this.chunk_buf[*this.chunk_read..*this.chunk_len]);
-                match this.inner.as_mut().poll_read(cx, &mut read_buf) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(())) => {
-                        let n = read_buf.filled().len();
-                        if n == 0 {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "unexpected EOF while reading S2 chunk body",
-                            )));
-                        }
-                        *this.chunk_read += n;
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                }
-            }
-
-            let chunk = &this.chunk_buf[..*this.chunk_len];
-            *this.reading_chunk = false;
-            match *this.chunk_type {
-                CHUNK_TYPE_STREAM_IDENTIFIER => {
-                    if chunk != &MAGIC_CHUNK[CHUNK_HEADER_LEN..] && chunk != &MAGIC_CHUNK_SNAPPY[CHUNK_HEADER_LEN..] {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "invalid S2 stream identifier")));
-                    }
-                    *this.stream_initialized = true;
-                    continue;
-                }
-                CHUNK_TYPE_COMPRESSED_DATA => {
-                    *this.stream_initialized = true;
-                    let decompressed = decode_chunk(chunk, true)?;
-                    *this.buffer = decompressed;
-                }
-                CHUNK_TYPE_UNCOMPRESSED_DATA => {
-                    *this.stream_initialized = true;
-                    let decompressed = decode_chunk(chunk, false)?;
-                    *this.buffer = decompressed;
-                }
-                CHUNK_TYPE_INDEX | CHUNK_TYPE_PADDING | 0x80..=0xfd => {
-                    *this.stream_initialized = true;
-                    continue;
-                }
-                _ => {
-                    if !*this.stream_initialized && *this.chunk_type != CHUNK_TYPE_COMPRESSED_DATA {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unknown S2 chunk type: 0x{:02x}", *this.chunk_type),
-                        )));
-                    }
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unknown S2 chunk type: 0x{:02x}", *this.chunk_type),
-                    )));
-                }
-            }
-
-            *this.buffer_pos = 0;
-            let to_copy = min(buf.remaining(), this.buffer.len());
-            buf.put_slice(&this.buffer[..to_copy]);
-            *this.buffer_pos += to_copy;
-            if *this.buffer_pos == this.buffer.len() {
-                this.buffer.clear();
-                *this.buffer_pos = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
+        self.project().inner.poll_read(cx, buf)
     }
 }
 
@@ -412,7 +289,7 @@ where
     R: EtagResolvable,
 {
     fn try_resolve_etag(&mut self) -> Option<String> {
-        self.inner.try_resolve_etag()
+        self.inner.get_mut().try_resolve_etag()
     }
 }
 
@@ -421,11 +298,11 @@ where
     R: HashReaderDetector,
 {
     fn is_hash_reader(&self) -> bool {
-        self.inner.is_hash_reader()
+        self.inner.get_ref().is_hash_reader()
     }
 
     fn as_hash_reader_mut(&mut self) -> Option<&mut dyn HashReaderMut> {
-        self.inner.as_hash_reader_mut()
+        self.inner.get_mut().as_hash_reader_mut()
     }
 }
 
@@ -483,41 +360,56 @@ fn build_padding_chunk(current_size: usize, padding_multiple: usize) -> io::Resu
     Ok(Some(out))
 }
 
-fn decode_chunk(chunk: &[u8], compressed: bool) -> io::Result<Vec<u8>> {
-    if chunk.len() < CHECKSUM_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "S2 chunk smaller than checksum header"));
-    }
-
-    let expected_crc = u32::from_le_bytes(chunk[..CHECKSUM_SIZE].try_into().expect("checksum header"));
-    let payload = &chunk[CHECKSUM_SIZE..];
-    let decompressed = if compressed {
-        decode(payload).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("S2 decode error: {err}")))?
-    } else {
-        payload.to_vec()
-    };
-
-    let actual_crc = crc(&decompressed);
-    if actual_crc != expected_crc {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "S2 CRC mismatch: expected={expected_crc:08x} actual={actual_crc:08x} compressed={compressed} payload_len={} decompressed_len={}",
-                payload.len(),
-                decompressed.len()
-            ),
-        ));
-    }
-
-    Ok(decompressed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
     use std::pin::Pin;
-    use std::task::{Context, Poll};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::{Context, Poll, Wake, Waker};
     use tokio::io::AsyncReadExt;
+
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct AlwaysReadyOneByte {
+        bytes: Vec<u8>,
+        position: usize,
+        read_calls: Arc<AtomicUsize>,
+    }
+
+    impl AlwaysReadyOneByte {
+        fn new(bytes: Vec<u8>, read_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                bytes,
+                position: 0,
+                read_calls,
+            }
+        }
+    }
+
+    impl AsyncRead for AlwaysReadyOneByte {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            self.read_calls.fetch_add(1, Ordering::Relaxed);
+            if self.position == self.bytes.len() || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let byte = self.bytes[self.position];
+            self.position += 1;
+            buf.put_slice(&[byte]);
+            Poll::Ready(Ok(()))
+        }
+    }
 
     struct PendingAfterBytes<R> {
         inner: R,
@@ -583,7 +475,7 @@ mod tests {
         let plaintext = b"compressible-rio-v2-block-".repeat(4096);
         let mut encoder = S2BlockEncoder::new();
         let compressed = encode_block(&plaintext, &mut encoder);
-        let decoded = decode(&compressed).expect("decode payload");
+        let decoded = minlz::decode(&compressed).expect("decode payload");
 
         assert_eq!(decoded, plaintext);
     }
@@ -600,6 +492,97 @@ mod tests {
         let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
         let mut actual = Vec::new();
         decompressor.read_to_end(&mut actual).await.expect("read decompressed data");
+
+        assert_eq!(actual, plaintext);
+    }
+
+    #[test]
+    fn s2_compress_reader_yields_after_ready_read_budget() {
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let source = AlwaysReadyOneByte::new(vec![b'x'; MAX_READY_READS_PER_POLL + 1], read_calls.clone());
+        let mut reader = CompressReader::new(source, CompressionAlgorithm::default());
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake_counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut output = [0u8; 1];
+        let mut read_buf = ReadBuf::new(&mut output);
+
+        assert!(Pin::new(&mut reader).poll_read(&mut cx, &mut read_buf).is_pending());
+        assert!(read_buf.filled().is_empty());
+        assert_eq!(read_calls.load(Ordering::Relaxed), MAX_READY_READS_PER_POLL);
+        assert_eq!(reader.temp_buffer.len(), MAX_READY_READS_PER_POLL);
+        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn s2_compress_reader_normalizes_non_decodable_block_sizes() {
+        let zero = CompressReader::with_block_size(Cursor::new(Vec::<u8>::new()), 0, CompressionAlgorithm::default());
+        assert_eq!(zero.block_size, DEFAULT_BLOCK_SIZE);
+
+        let oversized = CompressReader::with_block_size(
+            Cursor::new(Vec::<u8>::new()),
+            MAX_S2_DECOMPRESSED_BLOCK_SIZE + 1,
+            CompressionAlgorithm::default(),
+        );
+        assert_eq!(oversized.block_size, MAX_S2_DECOMPRESSED_BLOCK_SIZE);
+    }
+
+    #[tokio::test]
+    async fn s2_compress_reader_max_block_roundtrips_with_paired_decoder() {
+        let plaintext = pseudo_random_bytes(MAX_S2_DECOMPRESSED_BLOCK_SIZE);
+        let mut reader = CompressReader::with_block_size(
+            Cursor::new(plaintext.clone()),
+            MAX_S2_DECOMPRESSED_BLOCK_SIZE,
+            CompressionAlgorithm::default(),
+        );
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("read maximum S2 block");
+
+        let mut decompressor = DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor
+            .read_to_end(&mut actual)
+            .await
+            .expect("paired decoder should accept maximum S2 block");
+        assert_eq!(actual, plaintext);
+    }
+
+    #[tokio::test]
+    async fn s2_decompress_reader_accepts_legacy_block_above_16_mib() {
+        const PRE_CAP_LEGACY_BLOCK_SIZE: usize = (16 << 20) + 1;
+        let plaintext = vec![b'x'; PRE_CAP_LEGACY_BLOCK_SIZE];
+        let mut encoder = S2BlockEncoder::new();
+        let mut fixture = MAGIC_CHUNK.to_vec();
+        fixture.extend_from_slice(
+            &build_s2_chunk(&plaintext, &mut encoder).expect("the pre-cap writer format should encode a block above 16 MiB"),
+        );
+        assert_eq!(fixture[MAGIC_CHUNK.len()], CHUNK_TYPE_COMPRESSED_DATA);
+
+        let mut decompressor = DecompressReader::new(Cursor::new(fixture), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor
+            .read_to_end(&mut actual)
+            .await
+            .expect("legacy rio-v2 blocks above the current writer limit should remain readable");
+
+        assert_eq!(actual, plaintext);
+    }
+
+    #[tokio::test]
+    async fn s2_decompress_reader_accepts_an_indexed_headerless_tail() {
+        let plaintext = b"indexed-rio-v2-s2-tail-".repeat(32_768);
+        let mut reader = CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default());
+        let mut compressed = Vec::new();
+        reader.read_to_end(&mut compressed).await.expect("read compressed data");
+        assert!(compressed.starts_with(MAGIC_CHUNK));
+
+        let mut decompressor =
+            DecompressReader::new(Cursor::new(compressed[MAGIC_CHUNK.len()..].to_vec()), CompressionAlgorithm::default());
+        let mut actual = Vec::new();
+        decompressor
+            .read_to_end(&mut actual)
+            .await
+            .expect("indexed tail should decode without the stream header");
 
         assert_eq!(actual, plaintext);
     }

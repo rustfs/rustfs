@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::core::pools::{DecommissionCapacityOwner, ensure_decommission_capacity_mutation_id};
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
@@ -196,6 +197,21 @@ async fn list_pool_multipart_uploads_for_incarnation(
 }
 
 impl ECStore {
+    pub(crate) async fn acquire_decommission_multipart_mutation_fence(
+        &self,
+        owner: DecommissionCapacityOwner,
+    ) -> Result<ObjectLockDiagGuard> {
+        let mutation_id = owner
+            .mutation_id
+            .ok_or_else(|| Error::other("decommission multipart mutation identity is missing"))?;
+        let object = format!(
+            "decommission-multipart/{}/{}/{}/{}",
+            owner.source_pool_index, owner.operation_id, owner.generation, mutation_id
+        );
+        self.acquire_object_write_lock("decommission_multipart_mutation", crate::disk::RUSTFS_META_MULTIPART_BUCKET, &object)
+            .await
+    }
+
     async fn existing_multipart_pool_order(&self) -> Vec<usize> {
         // A draining source must not hide a valid UploadID in an active target,
         // while physical order within each phase preserves fail-closed errors.
@@ -213,6 +229,24 @@ impl ECStore {
         }
         active.extend(draining);
         active
+    }
+
+    async fn multipart_upload_pool_idx(
+        &self,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        opts: &ObjectOptions,
+    ) -> Result<usize> {
+        for pool_idx in self.existing_multipart_pool_order().await {
+            match self.pools[pool_idx].get_multipart_info(bucket, object, upload_id, opts).await {
+                Ok(_) => return Ok(pool_idx),
+                Err(err) if is_err_invalid_upload_id(&err) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -433,8 +467,10 @@ impl ECStore {
         if self.single_pool() {
             self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence)
                 .await;
-            return self.pools[0]
-                .new_multipart_upload(bucket, object, &opts)
+            return self
+                .run_decommission_capacity_admitted_mutation(0, None, None, || async {
+                    self.pools[0].new_multipart_upload(bucket, object, &opts).await
+                })
                 .await
                 .map(|res| (res, 0, opts.expected_bucket_incarnation_id));
         }
@@ -450,7 +486,14 @@ impl ECStore {
             }
             self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
                 .await;
-            let res = self.pools[idx].new_multipart_upload(bucket, object, &opts).await?;
+            let res = self
+                .run_decommission_capacity_temporary_mutation(
+                    idx,
+                    DecommissionCapacityOwner::from_options(&opts),
+                    None,
+                    || async { self.pools[idx].new_multipart_upload(bucket, object, &opts).await },
+                )
+                .await?;
             return Ok((res, idx, opts.expected_bucket_incarnation_id));
         }
 
@@ -475,8 +518,19 @@ impl ECStore {
             if !res.uploads.is_empty() {
                 self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
                     .await;
-                let res = self.pools[idx].new_multipart_upload(bucket, object, &opts).await?;
-                return Ok((res, idx, opts.expected_bucket_incarnation_id));
+                let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
+                let lock_object = encode_dir_object(object);
+                let res = self
+                    .run_external_decommission_capacity_object_mutation(
+                        idx,
+                        bucket,
+                        &lock_object,
+                        object,
+                        opts,
+                        |opts| async move { self.pools[idx].new_multipart_upload(bucket, object, &opts).await },
+                    )
+                    .await?;
+                return Ok((res, idx, expected_bucket_incarnation_id));
             }
         }
         let idx = self.get_pool_idx(bucket, object, -1).await?;
@@ -490,8 +544,23 @@ impl ECStore {
 
         self.apply_decommission_target_mutation_fence(idx, object, &mut opts, mutation_fence)
             .await;
-        let res = self.pools[idx].new_multipart_upload(bucket, object, &opts).await?;
-        Ok((res, idx, opts.expected_bucket_incarnation_id))
+        let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
+        let res = if opts.data_movement {
+            self.run_decommission_capacity_temporary_mutation(
+                idx,
+                DecommissionCapacityOwner::from_options(&opts),
+                None,
+                || async { self.pools[idx].new_multipart_upload(bucket, object, &opts).await },
+            )
+            .await?
+        } else {
+            let lock_object = encode_dir_object(object);
+            self.run_external_decommission_capacity_object_mutation(idx, bucket, &lock_object, object, opts, |opts| async move {
+                self.pools[idx].new_multipart_upload(bucket, object, &opts).await
+            })
+            .await?
+        };
+        Ok((res, idx, expected_bucket_incarnation_id))
     }
 
     #[instrument(skip(self))]
@@ -529,7 +598,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<PartInfo> {
         check_put_object_part_args(bucket, object, upload_id)?;
-        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         let opts = &opts;
 
         if self.single_pool() {
@@ -538,26 +608,10 @@ impl ECStore {
                 .await;
         }
 
-        for pool_idx in self.existing_multipart_pool_order().await {
-            let pool = &self.pools[pool_idx];
-            let err = match pool.put_object_part(bucket, object, upload_id, part_id, data, opts).await {
-                Ok(res) => return Ok(res),
-                Err(err) => {
-                    if is_err_invalid_upload_id(&err) {
-                        None
-                    } else {
-                        Some(err)
-                    }
-                }
-            };
-
-            if let Some(err) = err {
-                error!("put_object_part err: {:?}", err);
-                return Err(err);
-            }
-        }
-
-        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+        let pool_idx = self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await?;
+        self.pools[pool_idx]
+            .put_object_part(bucket, object, upload_id, part_id, data, opts)
+            .await
     }
 
     pub(crate) async fn put_object_part_for_data_movement(
@@ -576,12 +630,24 @@ impl ECStore {
         if !opts.data_movement {
             return Err(Error::other("targeted multipart upload requires data_movement options"));
         }
-        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
-        let pool = self
-            .pools
-            .get(target_pool_idx)
-            .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
-        pool.put_object_part(bucket, object, upload_id, part_id, data, &opts).await
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
+        let pool = self.pools.get(target_pool_idx).ok_or_else(|| {
+            Error::InvalidArgument("data-movement".to_string(), "target-pool".to_string(), target_pool_idx.to_string())
+        })?;
+        let expected_data_bytes = usize::try_from(data.size()).ok();
+        self.run_decommission_capacity_temporary_mutation_with_capacity_lease(
+            target_pool_idx,
+            DecommissionCapacityOwner::from_options(&opts),
+            expected_data_bytes,
+            |capacity_lease| async move {
+                if let Some(capacity_lease) = capacity_lease {
+                    opts.add_namespace_lock_lost_signal(capacity_lease);
+                }
+                pool.put_object_part(bucket, object, upload_id, part_id, data, &opts).await
+            },
+        )
+        .await
     }
 
     #[instrument(skip(self))]
@@ -662,16 +728,95 @@ impl ECStore {
         upload_id: &str,
         opts: &ObjectOptions,
     ) -> Result<()> {
-        check_abort_multipart_args(bucket, object, upload_id)?;
-        if !opts.data_movement {
-            return Err(Error::other("targeted multipart abort requires data_movement options"));
-        }
-        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        self.abort_multipart_uploads_for_data_movement(target_pool_idx, bucket, object, &[upload_id.to_owned()], None, opts)
+            .await
+    }
+
+    pub(crate) async fn reconcile_multipart_uploads_for_data_movement(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_identity: &str,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
         let pool = self
             .pools
             .get(target_pool_idx)
             .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
-        pool.abort_multipart_upload(bucket, object, upload_id, &opts).await
+        let owner = DecommissionCapacityOwner::from_options(opts);
+        let has_capacity_state = match owner {
+            Some(owner) => {
+                self.has_decommission_capacity_temporary_mutation_state(target_pool_idx, owner)
+                    .await
+            }
+            None => false,
+        };
+        if !has_capacity_state {
+            return Ok(());
+        }
+        let set = pool.get_disks_by_key(object);
+        let upload_ids = set
+            .data_movement_multipart_upload_ids(bucket, object, opts.expected_bucket_incarnation_id, upload_identity)
+            .await?;
+        self.abort_multipart_uploads_for_data_movement(target_pool_idx, bucket, object, &upload_ids, Some(upload_identity), opts)
+            .await
+    }
+
+    async fn abort_multipart_uploads_for_data_movement(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_ids: &[String],
+        expected_upload_identity: Option<&str>,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        check_new_multipart_args(bucket, object)?;
+        for upload_id in upload_ids {
+            check_abort_multipart_args(bucket, object, upload_id)?;
+        }
+        if !opts.data_movement {
+            return Err(Error::other("targeted multipart abort requires data_movement options"));
+        }
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
+        let pool = self
+            .pools
+            .get(target_pool_idx)
+            .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
+        let set = pool.get_disks_by_key(object);
+        let mut guards = Vec::with_capacity(upload_ids.len());
+        for upload_id in upload_ids {
+            if let Some(guard) = set
+                .lock_data_movement_multipart_abort(bucket, object, upload_id, expected_upload_identity, &opts)
+                .await?
+            {
+                guard.add_namespace_lock_fence(&mut opts);
+                guards.push(guard);
+            }
+        }
+        opts.no_lock = true;
+        let capacity_owner = DecommissionCapacityOwner::from_options(&opts);
+        // Keep every upload namespace guard alive through the final capacity progress save.
+        let result = self
+            .run_decommission_capacity_temporary_release_with_capacity_lease(target_pool_idx, capacity_owner, |capacity_lease| {
+                let mut delete_opts = opts.clone();
+                let guards = &guards;
+                let set = &set;
+                async move {
+                    if let Some(capacity_lease) = capacity_lease {
+                        delete_opts.add_namespace_lock_lost_signal(capacity_lease);
+                    }
+                    for guard in guards {
+                        guard.delete(set, bucket, object, &delete_opts).await?;
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+        drop(guards);
+        result
     }
 
     #[instrument(skip(self))]
@@ -684,7 +829,8 @@ impl ECStore {
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
         check_complete_multipart_args(bucket, object, upload_id)?;
-        let (opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         let opts = &opts;
 
         if self.single_pool() {
@@ -694,27 +840,10 @@ impl ECStore {
                 .await;
         }
 
-        for pool_idx in self.existing_multipart_pool_order().await {
-            let pool = &self.pools[pool_idx];
-
-            let pool = pool.clone();
-            let err = match pool
-                .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)
-                .await
-            {
-                Ok(res) => return Ok(res),
-                Err(err) => {
-                    //
-                    if is_err_invalid_upload_id(&err) { None } else { Some(err) }
-                }
-            };
-
-            if let Some(er) = err {
-                return Err(er);
-            }
-        }
-
-        Err(StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned()))
+        let pool_idx = self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await?;
+        let pool = self.pools[pool_idx].clone();
+        pool.complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+            .await
     }
 
     pub(crate) async fn complete_multipart_upload_for_data_movement(
@@ -732,6 +861,7 @@ impl ECStore {
             return Err(Error::other("targeted multipart completion requires data_movement options"));
         }
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
+        ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
         if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
@@ -764,12 +894,24 @@ impl ECStore {
             .get(target_pool_idx)
             .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?
             .clone();
-        let result = enqueue_transition_after_write(
-            pool.complete_multipart_upload(bucket, object, upload_id, uploaded_parts, &opts)
-                .await,
-            LcEventSrc::S3CompleteMultipartUpload,
-        )
-        .await;
+        // Data movement already owns the pool-meta write lease. Forward its
+        // loss signal into SetDisks so commit fencing observes the same lease
+        // without trying to reacquire the namespace.
+        let result = self
+            .run_decommission_capacity_admitted_mutation_with_capacity_lease(
+                target_pool_idx,
+                DecommissionCapacityOwner::from_options(&opts),
+                opts.capacity_expected_data_bytes(),
+                |capacity_lease| async move {
+                    if let Some(capacity_lease) = capacity_lease {
+                        opts.add_namespace_lock_lost_signal(capacity_lease);
+                    }
+                    pool.complete_multipart_upload(bucket, object, upload_id, uploaded_parts, &opts)
+                        .await
+                },
+            )
+            .await;
+        let result = enqueue_transition_after_write(result, LcEventSrc::S3CompleteMultipartUpload).await;
         if result.is_ok() {
             list_objects::observe_list_objects_mutation(self.as_ref(), bucket).await;
         }
@@ -961,6 +1103,7 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
+            decommission_capacity_entry_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }

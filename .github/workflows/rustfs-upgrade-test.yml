@@ -1,0 +1,477 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: RustFS Upgrade Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_version:
+        description: 'OLD RustFS release tag (e.g. 1.0.0-rc.4-preview.1)'
+        required: false
+        default: '1.0.0-rc.4-preview.1'
+      from_url:
+        description: 'OLD .deb URL. Overrides from_version.'
+        required: false
+        type: string
+      to_version:
+        description: 'NEW RustFS release tag (leave empty for latest nightly)'
+        required: false
+      to_url:
+        description: 'NEW .deb URL. Overrides to_version / nightly default.'
+        required: false
+        type: string
+      topology:
+        description: 'Topology to run (all = SNSD, SNMD, MNMD)'
+        type: choice
+        options:
+          - all
+          - single-single
+          - single-multi
+          - multi-multi
+        default: all
+      backends:
+        description: 'KMS backends to run (local,vault-kv2)'
+        required: false
+        default: 'local,vault-kv2'
+      cleanup_before:
+        description: 'Reset the nodes before the test (DESTROYS existing data/config)'
+        type: boolean
+        default: true
+      cleanup_after:
+        description: 'Reset the nodes after the test (DESTROYS test data/config)'
+        type: boolean
+        default: true
+  workflow_run:
+    # Runs first in the functional chain: upgrade compatibility gates the
+    # nightly suites that follow (S3 -> KMS -> Tier -> Pool/Heal -> Security).
+    workflows: ["Nightly GNU Build"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustfs-shared-functional-tests
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+  RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+jobs:
+  upgrade-test:
+    runs-on: smoke-testing
+    continue-on-error: true
+    timeout-minutes: 420
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Show environment
+        run: |
+          uname -a
+          jq --version
+          openssl version
+          aws --version || true
+          docker --version || true
+          df -h /data | tail -1
+
+      - name: Cleanup environment (before)
+        if: ${{ inputs.cleanup_before != 'false' || github.event_name != 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
+
+      - name: Ensure docker (Vault container)
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+          fi
+          sudo systemctl enable --now docker
+          docker info >/dev/null 2>&1 || sudo docker info >/dev/null 2>&1
+
+      - name: Run upgrade compatibility suite
+        id: test
+        continue-on-error: true
+        env:
+          LOG_FILE: /tmp/rustfs-upgrade.log
+        run: |
+          set -euo pipefail
+          chmod +x auto-testing/rustfs-upgrade-test.sh
+          FROM_URL='${{ inputs.from_url }}'
+          FROM_VERSION='${{ inputs.from_version }}'
+          TO_URL='${{ inputs.to_url }}'
+          TO_VERSION='${{ inputs.to_version }}'
+          TOPOLOGY='${{ inputs.topology }}'
+          BACKENDS='${{ inputs.backends }}'
+          ARGS=(-y --log-file "${LOG_FILE}")
+          if [ "${TOPOLOGY}" = "all" ] || [ -z "${TOPOLOGY}" ] || [ "${TOPOLOGY}" = "null" ]; then
+            ARGS+=(--all-topologies)
+          else
+            ARGS+=(--topology "${TOPOLOGY}")
+          fi
+          if [ -n "${BACKENDS}" ] && [ "${BACKENDS}" != "null" ]; then
+            ARGS+=(--backends "${BACKENDS}")
+          fi
+          if [ -n "${FROM_URL}" ]; then
+            ARGS+=(--from-url "${FROM_URL}")
+          elif [ -n "${FROM_VERSION}" ] && [ "${FROM_VERSION}" != "null" ]; then
+            ARGS+=(--from-version "${FROM_VERSION}")
+          fi
+          if [ -n "${TO_URL}" ]; then
+            ARGS+=(--to-url "${TO_URL}")
+          elif [ -n "${TO_VERSION}" ] && [ "${TO_VERSION}" != "null" ]; then
+            ARGS+=(--to-version "${TO_VERSION}")
+          else
+            ARGS+=(--to-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
+          fi
+          ./auto-testing/rustfs-upgrade-test.sh "${ARGS[@]}"
+
+      - name: Generate report
+        if: always()
+        env:
+          LOG_FILE: /tmp/rustfs-upgrade.log
+          REPORT_FILE: /tmp/rustfs-upgrade-report.md
+        run: |
+          set -euo pipefail
+          FROM_URL='${{ inputs.from_url }}'
+          FROM_VERSION='${{ inputs.from_version }}'
+          TO_URL='${{ inputs.to_url }}'
+          TO_VERSION='${{ inputs.to_version }}'
+          if [ -n "${FROM_URL}" ]; then
+            FROM_SOURCE="${FROM_URL}"
+          elif [ -n "${FROM_VERSION}" ]; then
+            FROM_SOURCE="version ${FROM_VERSION}"
+          else
+            FROM_SOURCE="release (default)"
+          fi
+          if [ -n "${TO_URL}" ]; then
+            TO_SOURCE="${TO_URL}"
+          elif [ -n "${TO_VERSION}" ]; then
+            TO_SOURCE="version ${TO_VERSION}"
+          else
+            TO_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          fi
+          CASE_TABLE="/tmp/rustfs-upgrade-cases.md"
+          python3 - "${LOG_FILE}" "${CASE_TABLE}" <<'PY'
+          import re
+          import sys
+
+          log_file, out_file = sys.argv[1], sys.argv[2]
+          ansi = re.compile(r'\x1b\[[0-9;]*m')
+          start_re = re.compile(r'^---\s+([A-Z]+-[0-9]+)\s+(.+?)\s+---$')
+          done_re = re.compile(r'^\[(PASS|FAIL|UNSUPPORTED)\]\s+([A-Z]+-[0-9]+)\b')
+
+          rows = []
+          index = {}
+          try:
+            with open(log_file, 'r', encoding='utf-8', errors='replace') as fh:
+              for raw in fh:
+                line = ansi.sub('', raw).strip()
+                m = start_re.match(line)
+                if m:
+                  case_id, name = m.group(1), m.group(2)
+                  if case_id not in index:
+                    index[case_id] = len(rows)
+                    rows.append([case_id, name, 'RUNNING'])
+                  continue
+                m = done_re.match(line)
+                if m:
+                  status, case_id = m.group(1), m.group(2)
+                  if case_id in index:
+                    rows[index[case_id]][2] = status
+                  else:
+                    rows.append([case_id, case_id, status])
+                    index[case_id] = len(rows) - 1
+          except FileNotFoundError:
+            rows = []
+
+          counts = {'PASS': 0, 'FAIL': 0, 'UNSUPPORTED': 0, 'RUNNING': 0}
+          for _, _, status in rows:
+            counts[status] = counts.get(status, 0) + 1
+
+          with open(out_file, 'w', encoding='utf-8') as out:
+            out.write('## Case Summary\n\n')
+            out.write(f"- Total: {len(rows)}\\n")
+            out.write(f"- PASS: {counts.get('PASS', 0)}\\n")
+            out.write(f"- FAIL: {counts.get('FAIL', 0)}\\n")
+            out.write(f"- UNSUPPORTED: {counts.get('UNSUPPORTED', 0)}\\n")
+            out.write('\\n')
+            out.write('| Case | Name | Status |\\n')
+            out.write('| --- | --- | --- |\\n')
+            for case_id, name, status in rows:
+              out.write(f'| {case_id} | {name} | {status} |\\n')
+          PY
+          {
+            echo "# RustFS upgrade compatibility report"
+            echo ""
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- From: ${FROM_SOURCE}"
+            echo "- To: ${TO_SOURCE}"
+            echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo ""
+            cat "${CASE_TABLE}" || true
+            echo ""
+            echo "## Log tail"
+            echo '```text'
+            tail -n 200 "${LOG_FILE}" || true
+            echo '```'
+          } | tee "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload functional report to dashboard
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          REPORT_FILE: /tmp/rustfs-upgrade-report.md
+          SUITE: upgrade
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
+            exit 0
+          fi
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
+          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          fi
+
+          cat > /tmp/rustfs-functional-index.html <<'EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>RustFS Functional Test Reports</title>
+            <style>
+              :root { --bg:#f4f6fb; --card:#fff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb; --accent:#0f766e; }
+              * { box-sizing: border-box; }
+              body { margin: 0; font-family: ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+              .wrap { max-width: 980px; margin: 32px auto; padding: 0 16px; }
+              .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+              h1 { margin: 0 0 8px; font-size: 26px; }
+              p { margin: 0 0 14px; color: var(--muted); }
+              .tabs { display: flex; gap: 10px; margin: 14px 0 18px; flex-wrap: wrap; }
+              button { border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 10px; padding: 8px 14px; cursor: pointer; }
+              button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+              .report-btn { border: 0; background: transparent; padding: 0; color: var(--accent); }
+              ul { list-style: none; margin: 0; padding: 0; }
+              li { padding: 10px 0; border-bottom: 1px solid var(--line); }
+              a { color: var(--accent); text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              .meta { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+              .kv { margin: 6px 0; color: var(--text); }
+              .muted { color: var(--muted); }
+            </style>
+          </head>
+          <body>
+            <div class="wrap">
+              <div class="card">
+                <h1>RustFS Functional Test Reports</h1>
+                <p>Select a suite and date to view the build version used in that run.</p>
+                <div class="tabs" id="tabs"></div>
+                <ul id="list"></ul>
+                <div class="meta">
+                  <div class="kv"><strong>Date:</strong> <span id="report-date" class="muted">N/A</span></div>
+                  <div class="kv"><strong>RustFS Version:</strong> <span id="report-version" class="muted">N/A</span></div>
+                  <div class="kv"><a id="report-link" href="#" target="_blank" rel="noreferrer">Open report</a></div>
+                </div>
+              </div>
+            </div>
+            <script>
+              const suites = [
+                { key: 'upgrade', label: 'Upgrade' },
+                { key: 's3', label: 'S3 Compatibility' },
+                { key: 'kms', label: 'KMS' },
+                { key: 'tier', label: 'Tier' },
+                { key: 'heal', label: 'Heal' },
+                { key: 'pool', label: 'Pool Expansion' },
+                { key: 'security', label: 'Security' },
+              ];
+              const tabs = document.getElementById('tabs');
+              const list = document.getElementById('list');
+              const reportDate = document.getElementById('report-date');
+              const reportVersion = document.getElementById('report-version');
+              const reportLink = document.getElementById('report-link');
+
+              function parseVersion(markdown) {
+                const m = markdown.match(/^- RustFS Version:\s*(.+)$/m);
+                return m ? m[1].trim() : 'N/A';
+              }
+
+              async function showReport(report) {
+                reportDate.textContent = report.name.replace('.md', '');
+                reportVersion.textContent = 'Loading...';
+                reportLink.href = report.html_url;
+                try {
+                  const res = await fetch(report.download_url, { cache: 'no-store' });
+                  if (!res.ok) {
+                    reportVersion.textContent = 'N/A';
+                    return;
+                  }
+                  const text = await res.text();
+                  reportVersion.textContent = parseVersion(text);
+                } catch (_e) {
+                  reportVersion.textContent = 'N/A';
+                }
+              }
+
+              async function loadSuite(suite) {
+                list.innerHTML = '<li>Loading...</li>';
+                const api = `https://api.github.com/repos/rustfs/dashboard/contents/functional-reports/${suite}`;
+                try {
+                  const res = await fetch(api);
+                  if (!res.ok) {
+                    list.innerHTML = '<li>No reports yet.</li>';
+                    return;
+                  }
+                  const data = await res.json();
+                  const files = data.filter(f => f.type === 'file' && f.name.endsWith('.md')).sort((a,b) => b.name.localeCompare(a.name));
+                  if (!files.length) {
+                    list.innerHTML = '<li>No reports yet.</li>';
+                    reportDate.textContent = 'N/A';
+                    reportVersion.textContent = 'N/A';
+                    reportLink.href = '#';
+                    return;
+                  }
+                  list.innerHTML = '';
+                  files.forEach((f) => {
+                    const li = document.createElement('li');
+                    const btn = document.createElement('button');
+                    btn.className = 'report-btn';
+                    btn.textContent = f.name.replace('.md', '');
+                    btn.addEventListener('click', () => showReport(f));
+                    li.appendChild(btn);
+                    list.appendChild(li);
+                  });
+                  showReport(files[0]);
+                } catch (_e) {
+                  list.innerHTML = '<li>Failed to load reports.</li>';
+                  reportDate.textContent = 'N/A';
+                  reportVersion.textContent = 'N/A';
+                  reportLink.href = '#';
+                }
+              }
+
+              function setActive(key) {
+                for (const btn of tabs.querySelectorAll('button')) {
+                  btn.classList.toggle('active', btn.dataset.key === key);
+                }
+                loadSuite(key);
+              }
+
+              for (const suite of suites) {
+                const btn = document.createElement('button');
+                btn.textContent = suite.label;
+                btn.dataset.key = suite.key;
+                btn.addEventListener('click', () => setActive(suite.key));
+                tabs.appendChild(btn);
+              }
+              setActive('upgrade');
+            </script>
+          </body>
+          </html>
+          EOF
+
+          INDEX_PATH="functional/index.html"
+          INDEX_CONTENT="$(python3 -c 'import base64;print(base64.b64encode(open("/tmp/rustfs-functional-index.html","rb").read()).decode())')"
+          INDEX_SHA="$(gh api "repos/rustfs/dashboard/contents/${INDEX_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${INDEX_SHA}" ]; then
+            jq -n --arg msg "functional ui update" --arg content "${INDEX_CONTENT}" --arg sha "${INDEX_SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "functional ui init" --arg content "${INDEX_CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
+          fi
+
+      - name: Upload report and logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-upgrade-test-${{ github.run_id }}
+          path: |
+            /tmp/rustfs-upgrade-report.md
+            /tmp/rustfs-upgrade.*/*
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: Cleanup environment (after)
+        if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+            '
+          done
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS upgrade compatibility test failed"
+          echo "From: ${{ inputs.from_url || inputs.from_version || 'release (default)' }}"
+          echo "To: ${{ inputs.to_url || inputs.to_version || 'nightly (R2 latest)' }}"
+          echo "See the uploaded report and logs for details."

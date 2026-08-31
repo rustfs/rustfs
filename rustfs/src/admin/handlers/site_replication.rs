@@ -32,7 +32,9 @@ use crate::admin::storage_api::bucket::replication::{
 };
 use crate::admin::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
-use crate::admin::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
+use crate::admin::storage_api::bucket::{
+    AdminObjectLockConfigExt as _, AdminReplicationConfigExt as _, AdminVersioningConfigExt as _,
+};
 use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
@@ -61,18 +63,18 @@ use rustfs_madmin::{
     BucketBandwidth, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric, LDAPConfigSettings, LDAPSettings,
     OpenIDProviderSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SR_IAM_ITEM_STS_ACC_LEGACY,
-    SRBucketMeta, SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem, SRIAMUser, SRILMExpiryStatsSummary, SRInfo,
-    SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation, SRPolicyMapping, SRPolicyStatsSummary,
-    SRRemoveReq, SRResyncOpStatus, SRSTSCredential, SRSessionPolicy, SRSiteSummary, SRStateEditReq, SRStateInfo, SRStatusInfo,
-    SRSvcAccChange, SRSvcAccCreate, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
+    SRBucketInfo, SRBucketMeta, SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem, SRIAMUser,
+    SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation, SRPolicyMapping,
+    SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRSTSCredential, SRSessionPolicy, SRSiteSummary, SRStateEditReq,
+    SRStateInfo, SRStatusInfo, SRSvcAccChange, SRSvcAccCreate, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
 };
 use rustfs_policy::policy::{
     Policy,
     action::{Action, AdminAction},
 };
 use s3s::dto::{
-    DeleteMarkerReplicationStatus, DeleteReplicationStatus, ExistingObjectReplicationStatus, ReplicaModificationsStatus,
-    ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
+    DeleteMarkerReplicationStatus, DeleteReplicationStatus, ExistingObjectReplicationStatus, ObjectLockConfiguration,
+    ReplicaModificationsStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, VersioningConfiguration,
 };
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Deserialize;
@@ -287,10 +289,19 @@ struct SiteReplicationAddPreflightInfo {
     endpoint: String,
     deployment_id: String,
     enabled: bool,
-    bucket_count: usize,
-    bucket_names: HashSet<String>,
+    buckets: BTreeMap<String, AddPreflightBucketCompat>,
     peer_deployment_ids: BTreeSet<String>,
     idp_settings: serde_json::Value,
+}
+
+/// The per-bucket facts the add preflight compares across sites when more
+/// than one requested site holds data (rustfs/backlog#2070). Only properties
+/// that cannot converge after the add belong here — everything else is
+/// reconciled by the bucket-metadata sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AddPreflightBucketCompat {
+    versioning_enabled: bool,
+    object_lock_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -935,19 +946,65 @@ fn idp_settings_value(settings: &IDPSettings) -> S3Result<serde_json::Value> {
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize IDP settings failed: {e}")))
 }
 
+/// The merge-critical facts of one bucket a site reported in its add
+/// preflight metainfo. The configs arrive as the `build_sr_info` wire form
+/// (base64-encoded XML); an undecodable config fails the preflight instead of
+/// defaulting, so corruption cannot admit an unsafe merge.
+fn add_preflight_bucket_compat(endpoint: &str, bucket: &str, info: &SRBucketInfo) -> S3Result<AddPreflightBucketCompat> {
+    let versioning_enabled = info
+        .versioning
+        .as_deref()
+        .map(|raw| {
+            deserialize::<VersioningConfiguration>(&decode_bucket_meta_wire_value(raw))
+                .map(|config| config.enabled())
+                .map_err(|e| {
+                    s3_error!(
+                        InvalidRequest,
+                        "site `{endpoint}` reported an unreadable versioning config for bucket `{bucket}`: {e}"
+                    )
+                })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let object_lock_enabled = info
+        .object_lock_config
+        .as_deref()
+        .map(|raw| {
+            deserialize::<ObjectLockConfiguration>(&decode_bucket_meta_wire_value(raw))
+                .map(|config| config.enabled())
+                .map_err(|e| {
+                    s3_error!(
+                        InvalidRequest,
+                        "site `{endpoint}` reported an unreadable object-lock config for bucket `{bucket}`: {e}"
+                    )
+                })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    Ok(AddPreflightBucketCompat {
+        versioning_enabled,
+        object_lock_enabled,
+    })
+}
+
 fn add_preflight_info_from_sr_info(
     site: &PeerSite,
     info: SRInfo,
     idp_settings: IDPSettings,
 ) -> S3Result<SiteReplicationAddPreflightInfo> {
-    let bucket_names = info.buckets.keys().cloned().collect();
+    let buckets = info
+        .buckets
+        .iter()
+        .map(|(bucket, bucket_info)| {
+            add_preflight_bucket_compat(&site.endpoint, bucket, bucket_info).map(|compat| (bucket.clone(), compat))
+        })
+        .collect::<S3Result<BTreeMap<_, _>>>()?;
     Ok(SiteReplicationAddPreflightInfo {
         name: if info.name.is_empty() { site.name.clone() } else { info.name },
         endpoint: site.endpoint.clone(),
         deployment_id: info.deployment_id,
         enabled: info.enabled,
-        bucket_count: info.buckets.len(),
-        bucket_names,
+        buckets,
         peer_deployment_ids: info.state.peers.keys().cloned().collect(),
         idp_settings: idp_settings_value(&idp_settings)?,
     })
@@ -1045,7 +1102,7 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
         if info.deployment_id == local_peer.deployment_id {
             local_seen = true;
         }
-        if info.bucket_count > 0 {
+        if !info.buckets.is_empty() {
             non_empty_sites.push(info.name.clone());
         }
     }
@@ -1070,11 +1127,15 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
     }
 
     if non_empty_sites.len() > 1 {
-        return Err(s3_error!(
-            InvalidRequest,
-            "site replication can be initialized with data on only one site; non-empty sites: {}",
-            non_empty_sites.join(", ")
-        ));
+        validate_nonempty_add_bucket_compatibility(infos)?;
+        info!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "nonempty_sites_admitted",
+            non_empty_sites = %non_empty_sites.join(", "),
+            "admin site replication state"
+        );
     }
 
     let requested: BTreeSet<String> = infos.iter().map(|info| info.deployment_id.clone()).collect();
@@ -1084,6 +1145,76 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
                 InvalidRequest,
                 "site `{}` is already configured with a different site replication peer set",
                 info.endpoint
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Operator recovery guidance for a rejected add between sites that both hold
+/// data — the only supported path is to empty one side and let a resync copy
+/// the objects back (rustfs/backlog#2070).
+const NONEMPTY_ADD_RECOVERY_HINT: &str = "to pair these sites, delete the conflicting bucket (or its data) on all but one \
+     site, re-run `replicate add`, then run `replicate resync` from the surviving site to restore the objects";
+
+/// Admission check for an add in which more than one requested site holds
+/// data — the DR re-pair case: two sites that were unpaired (or never
+/// finished a removal) both keep their buckets, and the historical
+/// unconditional "only one site may hold data" rejection made `replicate
+/// remove` a one-way door (rustfs/backlog#2070).
+///
+/// The add is admitted when every bucket name held by MORE than one requested
+/// site is provably safe to merge through the existing backfill/resync
+/// convergence:
+///
+/// - versioning must be Enabled on every holder: replication into a versioned
+///   bucket lands as another version, so a same-key object from the peer
+///   never destroys the local copy — while on an unversioned holder it would
+///   silently replace the only copy;
+/// - object-lock enablement must match across holders: lock cannot be toggled
+///   after bucket creation, so a mismatch never converges, and replicating
+///   locked objects into a lock-less bucket would strip their WORM guarantee.
+///
+/// A bucket held by a single site carries no merge risk — the post-add
+/// backfill creates it on the peers exactly as the historical
+/// one-non-empty-site path always has.
+fn validate_nonempty_add_bucket_compatibility(infos: &[SiteReplicationAddPreflightInfo]) -> S3Result<()> {
+    let mut holders: BTreeMap<&str, Vec<(&SiteReplicationAddPreflightInfo, AddPreflightBucketCompat)>> = BTreeMap::new();
+    for info in infos {
+        for (bucket, compat) in &info.buckets {
+            holders.entry(bucket.as_str()).or_default().push((info, *compat));
+        }
+    }
+
+    for (bucket, holders) in holders {
+        let [(first, first_compat), rest @ ..] = holders.as_slice() else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        if let Some((conflicting, _)) = rest
+            .iter()
+            .find(|(_, compat)| compat.object_lock_enabled != first_compat.object_lock_enabled)
+        {
+            let (enabled_on, disabled_on) = if first_compat.object_lock_enabled {
+                (&first.name, &conflicting.name)
+            } else {
+                (&conflicting.name, &first.name)
+            };
+            return Err(s3_error!(
+                InvalidRequest,
+                "bucket `{bucket}` has object lock enabled on site `{enabled_on}` but not on site `{disabled_on}`, and \
+                 object lock cannot be changed after bucket creation; {NONEMPTY_ADD_RECOVERY_HINT}"
+            ));
+        }
+        if let Some((unversioned, _)) = holders.iter().find(|(_, compat)| !compat.versioning_enabled) {
+            return Err(s3_error!(
+                InvalidRequest,
+                "bucket `{bucket}` exists on more than one site but does not have versioning enabled on site `{}`, so \
+                 merging could silently overwrite objects; enable versioning on every site holding it, or {NONEMPTY_ADD_RECOVERY_HINT}",
+                unversioned.name
             ));
         }
     }
@@ -2739,6 +2870,7 @@ fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: Pendi
         last_error: "endpoint target refresh pending".to_string(),
         updated_at: Some(OffsetDateTime::now_utc()),
         edit_generation: None,
+        deletions_recorded: false,
     });
     state.pending_endpoint_refresh = Some(pending);
     Ok(())
@@ -3152,6 +3284,7 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         state.peers.clear();
         state.resync_status.clear();
         state.retry_queue.clear();
+        state.iam_deletion_replays.clear();
         state.pending_endpoint_refresh = None;
         state.updated_at = Some(OffsetDateTime::now_utc());
         return state;
@@ -3162,6 +3295,7 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         state.peers.clear();
         state.resync_status.clear();
         state.retry_queue.clear();
+        state.iam_deletion_replays.clear();
         state.pending_endpoint_refresh = None;
         state.updated_at = Some(OffsetDateTime::now_utc());
         return state;
@@ -3181,6 +3315,11 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         !removed_peers
             .iter()
             .any(|(deployment_id, endpoint)| &event.peer_deployment_id == deployment_id || &event.peer_endpoint == endpoint)
+    });
+    state.iam_deletion_replays.retain(|record| {
+        !removed_peers
+            .iter()
+            .any(|(deployment_id, endpoint)| &record.peer_deployment_id == deployment_id || &record.peer_endpoint == endpoint)
     });
     state
         .resync_status
@@ -5407,7 +5546,14 @@ async fn apply_iam_policy_item(iam_sys: &IamSys<ObjectStore>, name: &str, policy
             serde_json::from_value(policy).map_err(|e| s3_error!(InvalidRequest, "invalid policy body: {}", e))?;
         iam_sys.set_policy(name, policy).await.map_err(ApiError::from)?;
     } else {
-        iam_sys.delete_policy(name, true).await.map_err(ApiError::from)?;
+        // Idempotent delete: the retry drain replays recorded deletions, and
+        // an entity already absent here IS the converged outcome — erroring
+        // would wedge the replay forever (backlog#2071).
+        match iam_sys.delete_policy(name, true).await {
+            Ok(()) => {}
+            Err(err) if rustfs_iam::error::is_err_no_such_policy(&err) => {}
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
     }
     Ok(())
 }
@@ -5430,10 +5576,26 @@ async fn apply_iam_group_info_item(iam_sys: &IamSys<ObjectStore>, group_info: Op
     };
     let update = group_info.update_req;
     if !group_info_requires_upsert(&update) {
-        iam_sys
-            .remove_users_from_group(&update.group, update.members)
-            .await
-            .map_err(ApiError::from)?;
+        // Idempotent removal: a replayed deletion may find the group or a
+        // member already gone (deleted here earlier, or the user tombstone
+        // was replayed first) — that IS the converged outcome, and erroring
+        // would wedge the retry drain forever (backlog#2071). Members absent
+        // here are dropped individually so one missing user cannot veto the
+        // removal of the members that do exist.
+        let mut members = Vec::with_capacity(update.members.len());
+        for member in update.members.iter() {
+            if iam_sys.get_user(member).await.is_some() {
+                members.push(member.clone());
+            }
+        }
+        if members.is_empty() && !update.members.is_empty() {
+            return Ok(());
+        }
+        match iam_sys.remove_users_from_group(&update.group, members).await {
+            Ok(_) => {}
+            Err(err) if rustfs_iam::error::is_err_no_such_group(&err) => {}
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
         return Ok(());
     }
 
@@ -5670,6 +5832,53 @@ fn sts_replication_compatibility_policy<'a>(claims: &HashMap<String, Value>, par
     (!claims.contains_key(OIDC_VIRTUAL_PARENT_CLAIM) && !parent_policy_mapping.is_empty()).then_some(parent_policy_mapping)
 }
 
+/// Adopt only the fields a committed add computed onto the freshly loaded
+/// transaction state. Everything else is owned by writers that commit without
+/// touching `updated_at` (retry events, peer-edit generations, resync
+/// progress, the acks/clears of an already pending rotation), so the add's
+/// `updated_at` CAS cannot vouch for them — they keep the freshly loaded
+/// value, except `pending_remove`:
+///
+/// A committed add supersedes a half-finished removal THIS site started,
+/// exactly as an accepted join does on the receiving side (`apply_peer_join`,
+/// rustfs/rustfs#5963): the adopted topology IS the new membership, while the
+/// pending record only exists to keep notifying peers about the old one. Left
+/// in place, the reconcile tick would replay the stale `SRRemoveReq` against
+/// a freshly re-paired peer — `SRPeerRemoveHandler` applies it
+/// unconditionally — and dismantle the pairing this add just created
+/// (rustfs/backlog#2070). A removal that started AFTER the add's preflight
+/// snapshot moved `updated_at`, so the CAS refuses the commit before this
+/// runs.
+///
+/// The exhaustive destructure makes adding a state field a compile error here
+/// until it is classified.
+fn adopt_add_commit_state(state: &mut SiteReplicationState, next_state: SiteReplicationState) {
+    let SiteReplicationState {
+        name,
+        service_account_access_key,
+        service_account_secret_key: _,
+        service_account_parent,
+        peers,
+        updated_at,
+        resync_status: _,
+        pending_rotation: _,
+        pending_remove: _,
+        pending_endpoint_refresh: _,
+        retry_queue: _,
+        iam_deletion_replays: _,
+        sync_state_initialized,
+        edit_generation: _,
+        applied_edit_generations: _,
+    } = next_state;
+    state.name = name;
+    state.service_account_access_key = service_account_access_key;
+    state.service_account_parent = service_account_parent;
+    state.peers = peers;
+    state.updated_at = updated_at;
+    state.sync_state_initialized = sync_state_initialized;
+    state.pending_remove = None;
+}
+
 pub struct SiteReplicationAddHandler {}
 
 /// MinIO's `SRPeerJoin` replies with an empty body on success; synthesize the
@@ -5725,7 +5934,7 @@ impl Operation for SiteReplicationAddHandler {
         let bootstrap_buckets = preflight_infos
             .iter()
             .filter(|info| !same_identity_endpoint(&info.endpoint, &local_peer.endpoint))
-            .flat_map(|info| info.bucket_names.iter().cloned())
+            .flat_map(|info| info.buckets.keys().cloned())
             .collect();
         let add_in_progress_guard = SiteReplicationAddInProgressGuard::start(lifecycle_guard, bootstrap_buckets)?;
         let mut state = merge_add_sites(
@@ -5822,35 +6031,7 @@ impl Operation for SiteReplicationAddHandler {
                     "site replication state changed during peer join; the peers may already be joined — re-run replicate add"
                 ));
             }
-            // Adopt only the fields this add computed. Everything else is
-            // owned by writers that commit without touching `updated_at`
-            // (retry events, peer-edit generations, resync progress, the
-            // acks/clears of an already pending rotation or removal), so the
-            // CAS above cannot vouch for them — they keep the freshly loaded
-            // value. The exhaustive destructure makes adding a state field a
-            // compile error here until it is classified.
-            let SiteReplicationState {
-                name,
-                service_account_access_key,
-                service_account_secret_key: _,
-                service_account_parent,
-                peers,
-                updated_at,
-                resync_status: _,
-                pending_rotation: _,
-                pending_remove: _,
-                pending_endpoint_refresh: _,
-                retry_queue: _,
-                sync_state_initialized,
-                edit_generation: _,
-                applied_edit_generations: _,
-            } = next_state;
-            state.name = name;
-            state.service_account_access_key = service_account_access_key;
-            state.service_account_parent = service_account_parent;
-            state.peers = peers;
-            state.updated_at = updated_at;
-            state.sync_state_initialized = sync_state_initialized;
+            adopt_add_commit_state(state, next_state);
             let edit_generation = next_peer_edit_generation(state);
             Ok((state.clone(), edit_generation))
         })
@@ -9389,15 +9570,26 @@ mod tests {
     }
 
     fn preflight_site(name: &str, endpoint: &str, deployment_id: &str, bucket_count: usize) -> SiteReplicationAddPreflightInfo {
+        // Site-prefixed names keep the generated buckets disjoint across
+        // sites; tests exercising shared-bucket merges insert their own.
+        let buckets = (0..bucket_count)
+            .map(|i| (format!("{name}-bucket-{i}"), versioned_bucket()))
+            .collect();
         SiteReplicationAddPreflightInfo {
             name: name.to_string(),
             endpoint: endpoint.to_string(),
             deployment_id: deployment_id.to_string(),
             enabled: false,
-            bucket_count,
-            bucket_names: HashSet::new(),
+            buckets,
             peer_deployment_ids: BTreeSet::new(),
             idp_settings: serde_json::json!({"provider": "same"}),
+        }
+    }
+
+    fn versioned_bucket() -> AddPreflightBucketCompat {
+        AddPreflightBucketCompat {
+            versioning_enabled: true,
+            object_lock_enabled: false,
         }
     }
 
@@ -9459,20 +9651,120 @@ mod tests {
         assert!(err.to_string().contains("IDP settings mismatch"));
     }
 
+    // rustfs/backlog#2070: two sites that both hold data (the DR re-pair
+    // case) must be admitted when their bucket sets are merge-safe, instead
+    // of the historical unconditional "only one site may hold data" rejection
+    // that made `replicate remove` a one-way door.
     #[test]
-    fn test_validate_add_preflight_topology_rejects_multiple_non_empty_sites() {
+    fn test_validate_add_preflight_topology_accepts_compatible_non_empty_sites() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 1);
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 1);
+        // The same bucket on both sites, versioning enabled on both: the
+        // exact shape a formerly paired cluster is left in after a remove.
+        local.buckets.insert("shared".to_string(), versioned_bucket());
+        remote.buckets.insert("shared".to_string(), versioned_bucket());
+        let infos = vec![local, remote];
+
+        validate_add_preflight_topology(&infos, &local_peer).expect("compatible non-empty sites should be admitted");
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_accepts_disjoint_non_empty_sites() {
         let local_peer = PeerInfo {
             deployment_id: "local-dep".to_string(),
             ..peer("local", "https://local.example.com")
         };
         let infos = vec![
-            preflight_site("local", "https://local.example.com", "local-dep", 1),
-            preflight_site("remote", "https://remote.example.com", "remote-dep", 1),
+            preflight_site("local", "https://local.example.com", "local-dep", 2),
+            preflight_site("remote", "https://remote.example.com", "remote-dep", 2),
         ];
 
-        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("multiple non-empty sites should fail");
+        validate_add_preflight_topology(&infos, &local_peer).expect("disjoint non-empty sites should be admitted");
+    }
 
-        assert!(err.to_string().contains("only one site"));
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_shared_bucket_object_lock_mismatch() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        local.buckets.insert(
+            "shared".to_string(),
+            AddPreflightBucketCompat {
+                versioning_enabled: true,
+                object_lock_enabled: true,
+            },
+        );
+        remote.buckets.insert("shared".to_string(), versioned_bucket());
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("object-lock mismatch should fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("bucket `shared` has object lock enabled on site `local`"),
+            "got: {message}"
+        );
+        // The rejection must carry the operator recovery steps, not a bare no.
+        assert!(message.contains("re-run `replicate add`"), "got: {message}");
+        assert!(message.contains("`replicate resync`"), "got: {message}");
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_shared_unversioned_bucket() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        local.buckets.insert("shared".to_string(), versioned_bucket());
+        remote.buckets.insert(
+            "shared".to_string(),
+            AddPreflightBucketCompat {
+                versioning_enabled: false,
+                object_lock_enabled: false,
+            },
+        );
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("shared unversioned bucket should fail");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("bucket `shared`") && message.contains("versioning enabled on site `remote`"),
+            "got: {message}"
+        );
+        assert!(message.contains("re-run `replicate add`"), "got: {message}");
+    }
+
+    // A bucket held by a single site never blocks the add, whatever its
+    // configs: the backfill creates it on the peers exactly like the
+    // historical one-non-empty-site path.
+    #[test]
+    fn test_validate_add_preflight_topology_ignores_unshared_bucket_configs() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 1);
+        let remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 1);
+        local.buckets.insert(
+            "local-only".to_string(),
+            AddPreflightBucketCompat {
+                versioning_enabled: false,
+                object_lock_enabled: true,
+            },
+        );
+        let infos = vec![local, remote];
+
+        validate_add_preflight_topology(&infos, &local_peer).expect("unshared buckets should not block the add");
     }
 
     #[test]
@@ -9490,6 +9782,91 @@ mod tests {
         let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("peer set mismatch should fail");
 
         assert!(err.to_string().contains("different site replication peer set"));
+    }
+
+    // add_preflight_bucket_compat reads the build_sr_info wire form:
+    // base64-encoded XML for both the versioning and the object-lock config.
+    #[test]
+    fn test_add_preflight_bucket_compat_parses_wire_configs() {
+        let info = SRBucketInfo {
+            versioning: Some(
+                BASE64_STANDARD.encode_to_string(b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"),
+            ),
+            object_lock_config: Some(BASE64_STANDARD.encode_to_string(
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+            )),
+            ..Default::default()
+        };
+
+        let compat = add_preflight_bucket_compat("https://a.example.com", "b", &info).expect("wire configs should parse");
+
+        assert!(compat.versioning_enabled);
+        assert!(compat.object_lock_enabled);
+    }
+
+    #[test]
+    fn test_add_preflight_bucket_compat_absent_and_suspended_configs_are_disabled() {
+        let absent = add_preflight_bucket_compat("https://a.example.com", "b", &SRBucketInfo::default())
+            .expect("absent configs should parse");
+        assert!(!absent.versioning_enabled);
+        assert!(!absent.object_lock_enabled);
+
+        let suspended = SRBucketInfo {
+            versioning: Some(
+                BASE64_STANDARD
+                    .encode_to_string(b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>"),
+            ),
+            ..Default::default()
+        };
+        let compat =
+            add_preflight_bucket_compat("https://a.example.com", "b", &suspended).expect("suspended config should parse");
+        assert!(!compat.versioning_enabled, "suspended versioning is not merge-safe");
+    }
+
+    // rustfs/backlog#2070: a committed add must supersede this site's own
+    // half-finished removal (mirroring the join side, rustfs/rustfs#5963) —
+    // otherwise the reconcile tick replays the stale removal against the
+    // freshly re-paired peer and dismantles the new pairing.
+    #[test]
+    fn test_adopt_add_commit_state_clears_pending_remove() {
+        let mut state = SiteReplicationState {
+            pending_remove: Some(PendingRemove {
+                id: "remove-1".to_string(),
+                ..Default::default()
+            }),
+            edit_generation: 7,
+            ..Default::default()
+        };
+        let next_state = SiteReplicationState {
+            name: "local".to_string(),
+            peers: BTreeMap::from([
+                ("local-dep".to_string(), peer("local", "https://local.example.com")),
+                ("remote-dep".to_string(), peer("remote", "https://remote.example.com")),
+            ]),
+            updated_at: Some(OffsetDateTime::now_utc()),
+            sync_state_initialized: true,
+            ..Default::default()
+        };
+
+        adopt_add_commit_state(&mut state, next_state);
+
+        assert!(state.pending_remove.is_none(), "the committed add supersedes the removal");
+        assert_eq!(state.peers.len(), 2, "the add's topology is adopted");
+        assert_eq!(state.edit_generation, 7, "commit-owned fields keep the loaded value");
+    }
+
+    // Fail closed: a config this site cannot read must fail the preflight
+    // instead of defaulting into an unsafe admission.
+    #[test]
+    fn test_add_preflight_bucket_compat_rejects_undecodable_config() {
+        let info = SRBucketInfo {
+            versioning: Some(BASE64_STANDARD.encode_to_string(b"<VersioningConfiguration")),
+            ..Default::default()
+        };
+
+        let err = add_preflight_bucket_compat("https://a.example.com", "b", &info).expect_err("broken XML should fail");
+
+        assert!(err.to_string().contains("unreadable versioning config"));
     }
 
     /// P1-15 review follow-up: the receiving side of the ordering fence. Two
@@ -9889,6 +10266,13 @@ mod tests {
                 path: "/rustfs/admin/v3/site-replication/peer/iam-item".to_string(),
                 ..Default::default()
             }],
+            iam_deletion_replays: vec![SiteReplicationIamDeletionReplay {
+                id: "record-1".to_string(),
+                peer_deployment_id: "remote-dep".to_string(),
+                peer_endpoint: "https://remote.example.com".to_string(),
+                entity: "iam-user:alice".to_string(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
 
@@ -9901,6 +10285,10 @@ mod tests {
         );
 
         assert!(state.retry_queue.is_empty());
+        assert!(
+            state.iam_deletion_replays.is_empty(),
+            "a departed peer's recorded deletions can never be replayed"
+        );
     }
 
     #[test]
@@ -12073,6 +12461,7 @@ mod tests {
                 last_error: "site replication is not enabled".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                deletions_recorded: false,
             }],
             ..Default::default()
         };
@@ -12270,6 +12659,7 @@ mod tests {
                 last_error: "peer offline".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                deletions_recorded: false,
             }],
             ..Default::default()
         };

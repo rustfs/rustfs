@@ -46,6 +46,11 @@ e2e-reliability = { max-threads = 1 }
 e2e-inline-boundaries = { max-threads = 1 }
 e2e-cluster-nightly = { max-threads = 1 }
 
+# Deep async storage futures are composed into tests across several crates.
+# Keep the test stack bounded but above libtest's 2 MiB default.
+[scripts.setup.ecstore-base-stack]
+command = ['sh', '-c', 'echo RUST_MIN_STACK=4194304 >> "$NEXTEST_ENV"']
+
 # These exact regression scenarios build deep async storage futures that exceed
 # libtest's 2 MiB spawned-thread stack on Linux. Give only their test processes
 # the same 32 MiB stack already used by the crate's dedicated large-stack tests.
@@ -62,6 +67,10 @@ command = ['sh', '-c', 'echo RUST_MIN_STACK=33554432 >> "$NEXTEST_ENV"']
 [[profile.default.scripts]]
 filter = 'package(rustfs-ecstore) & test(/^(bucket::lifecycle::bucket_lifecycle_ops::tests::manual_transition_worker_result_recovery_marks_unknown_for_corrupt_marker|services::rebalance::entry::tests::real_rebalance_run_fence_loss_blocks_multipart_publication|store::init::tests::(decommission_entry_(allows_free_version_consumed_before_source_lock|rejects_subquorum_free_version_conflict_and_retains_source|skips_cleanup_only_marker_when_free_version_is_present)|prepared_tier_delete_recovery_(checks_later_pool_then_commits_after_source_removal|finds_directory_source_on_encoded_set|retains_journal_on_source_metadata_error)|tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently|transition_response_loss_persists_unknown_outcome_for_provider_recovery|transition_transaction_recovery_(drops_record_after_confirmed_local_commit|keeps_cleanup_pending_local_commit)))$/)'
 setup = 'ecstore-large-stack'
+
+[[profile.default.scripts]]
+filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
+setup = 'ecstore-base-stack'
 
 [[profile.default.scripts]]
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
@@ -100,10 +109,27 @@ test-group = 'embedded-test-ports'
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the transition matrix tests. They build a 4-disk hermetic erasure
+# set, populate the get_object_metadata_cache, and assert generation lifecycle
+# semantics. serial_test's #[serial] has no effect across nextest's process
+# boundary, so concurrent execution races the shared metadata-cache generation
+# counter and causes spurious "metadata read should publish the generation"
+# panics. Preventive serialization, no retries.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(set_disk::transition_matrix_tests::)'
+test-group = 'ecstore-serial-flaky'
+
 # The durable ILM decommission regressions build isolated multi-pool stores and
 # deliberately take source or target disks offline while checking fencing.
 [[profile.default.overrides]]
 filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup) | test(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page) | test(decommission_durable_ilm_recovery_keeps_multiple_active_sources))'
+test-group = 'ecstore-serial-flaky'
+
+# Decommission entry and marker/barrier tests share process-wide fault hooks and
+# deterministic commit barriers. Keep the whole init decommission family in one
+# nextest group; serial_test alone cannot isolate separate test processes.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_|suspended_.*decommission)$/)'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the bucket-incarnation / lifecycle-fence tests. They drive
@@ -159,6 +185,10 @@ path = "junit.xml"
 [[profile.ci.scripts]]
 filter = 'package(rustfs-ecstore) & test(/^(bucket::lifecycle::bucket_lifecycle_ops::tests::manual_transition_worker_result_recovery_marks_unknown_for_corrupt_marker|services::rebalance::entry::tests::real_rebalance_run_fence_loss_blocks_multipart_publication|store::init::tests::(decommission_entry_(allows_free_version_consumed_before_source_lock|rejects_subquorum_free_version_conflict_and_retains_source|skips_cleanup_only_marker_when_free_version_is_present)|prepared_tier_delete_recovery_(checks_later_pool_then_commits_after_source_removal|finds_directory_source_on_encoded_set|retains_journal_on_source_metadata_error)|tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently|transition_response_loss_persists_unknown_outcome_for_provider_recovery|transition_transaction_recovery_(drops_record_after_confirmed_local_commit|keeps_cleanup_pending_local_commit)))$/)'
 setup = 'ecstore-large-stack'
+
+[[profile.ci.scripts]]
+filter = 'package(rustfs-ecstore) | package(rustfs-s3select-api) | package(rustfs-scanner) | (package(rustfs) & test(/^(app::multipart_usecase::tests::concurrent_completions_share_durable_bucket_quota_reservations|app::object::delete::tests::compressed_delete_requests_update_observed_usage_without_releasing_quota_floor|storage::access::tests::(delete_object_access_captures_authorized_bucket_incarnation|copy_operations_reject_recreated_source_bucket_after_authorization|request_slot_keeps_bucket_policy_bound_to_its_store))$/))'
+setup = 'ecstore-base-stack'
 
 [[profile.ci.scripts]]
 filter = 'binary(lifecycle_integration_test) | (package(rustfs) & test(/^app::lifecycle_transition_api_test::/))'
@@ -232,8 +262,18 @@ test-group = 'embedded-test-ports'
 filter = 'package(rustfs-ecstore) & test(manual_transition_page_checkpoint_persists_durable_job_progress)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the transition matrix tests under the ci profile too (see the
+# matching default-profile override near the top). No retries.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(set_disk::transition_matrix_tests::)'
+test-group = 'ecstore-serial-flaky'
+
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup) | test(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page) | test(decommission_durable_ilm_recovery_keeps_multiple_active_sources))'
+test-group = 'ecstore-serial-flaky'
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_|suspended_.*decommission)$/)'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the bucket-incarnation / lifecycle-fence tests under the ci profile
@@ -452,23 +492,12 @@ path = "junit.xml"
 # parallel-safe — the same property e2e-smoke relies on. The exceptions are the
 # 4-disk reliability / degraded-read fault-injection tests and the fixed-port
 # Vault tests, both serialized below.
-# KNOWN-FAILURE EXCLUSIONS (characterization run 29381309848, 2026-07-15:
-# 341 ran / 32 failed on the suites' first automated run ever). Deterministic
-# product failures cannot be quarantined away with retries, so each family is
-# excluded here with its tracking issue, under the same discipline as the
-# ci-profile quarantine (docs/testing/README.md): every entry MUST cite one
-# OPEN issue, and the fixing PR MUST delete the exclusion. The passing
-# negative-path siblings of each family stay in as regression guards.
-#   * rustfs#4843 — over-limit archive entry paths hard-reject the whole
-#     archive even under ignore-errors semantics.
 [profile.e2e-full]
 default-filter = """
     package(e2e_test)
     & !test(/^protocols::/)
     & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
     & !test(/^replication_extension_test::/)
-    & !test(/^multipart_auth_test::test_signed_put_object_extract_skips_invalid_entry_when_ignore_errors_enabled$/)
-    & !test(/^snowball_auto_extract_test::tests::snowball_auto_extract_(ignores_invalid_entries_when_requested|supports_standard_headers_with_combined_extract_options)$/)
 """
 fail-fast = false
 

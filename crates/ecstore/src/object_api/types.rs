@@ -19,6 +19,9 @@ use crate::storage_api_contracts::{
         HTTPPreconditions, ObjectLockRetentionOptions, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
     },
 };
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct NamespaceLockFence {
@@ -347,6 +350,347 @@ impl QuotaAdmission {
     }
 }
 
+const SCANNER_PUBLICATION_SCOPE_ADMITTED: u8 = 0;
+const SCANNER_PUBLICATION_SCOPE_IN_FLIGHT: u8 = 1;
+const SCANNER_PUBLICATION_SCOPE_COMMITTED: u8 = 2;
+const SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT: u8 = 3;
+const SCANNER_PUBLICATION_SCOPE_INDETERMINATE: u8 = 4;
+
+/// The terminal result of a storage-owned scanner publication mutation.
+///
+/// This state is deliberately not serialized. It is the ownership hand-off
+/// between the scanner coordinator and the storage mutation task, so a
+/// detached rename/cleanup task can retain the movement permit until it has
+/// reported a definitive result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerPublicationCommitState {
+    Admitted,
+    InFlight,
+    Committed,
+    AbortedBeforeCommit,
+    Indeterminate,
+}
+
+impl ScannerPublicationCommitState {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Admitted => SCANNER_PUBLICATION_SCOPE_ADMITTED,
+            Self::InFlight => SCANNER_PUBLICATION_SCOPE_IN_FLIGHT,
+            Self::Committed => SCANNER_PUBLICATION_SCOPE_COMMITTED,
+            Self::AbortedBeforeCommit => SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
+            Self::Indeterminate => SCANNER_PUBLICATION_SCOPE_INDETERMINATE,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            SCANNER_PUBLICATION_SCOPE_IN_FLIGHT => Self::InFlight,
+            SCANNER_PUBLICATION_SCOPE_COMMITTED => Self::Committed,
+            SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT => Self::AbortedBeforeCommit,
+            SCANNER_PUBLICATION_SCOPE_INDETERMINATE => Self::Indeterminate,
+            _ => Self::Admitted,
+        }
+    }
+
+    /// A caller may release its remote lease only after one of these states.
+    /// `Indeterminate` is intentionally excluded: the mutation may have
+    /// committed after cancellation or a transport failure.
+    pub fn permits_lease_release(self) -> bool {
+        matches!(self, Self::Committed | Self::AbortedBeforeCommit)
+    }
+}
+
+/// Why a storage-owned publication scope could not start its mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScannerPublicationCommitStartError {
+    Cancelled,
+    DeadlineExceeded,
+    AlreadyStarted,
+    Terminal,
+}
+
+struct ScannerPublicationCommitScopeInner {
+    expected_movement_epoch: u64,
+    safe_deadline: tokio::time::Instant,
+    remote_lease_tokens: Arc<[Uuid]>,
+    cancellation: CancellationToken,
+    state: AtomicU8,
+    completed: Notify,
+    /// Set once a storage mutation task has taken ownership of the scope.
+    /// The caller-side RAII guard must not classify cancellation as
+    /// indeterminate while that owner can still report a definitive result.
+    owner_attached: AtomicBool,
+    /// The permit is storage-owned rather than borrowed from the scanner
+    /// future. A detached mutation task keeps the scope alive and therefore
+    /// keeps this guard alive until it reports a terminal state.
+    movement_permit: Mutex<Option<OwnedRwLockReadGuard<()>>>,
+    lease_release_safe: Arc<AtomicBool>,
+}
+
+/// Storage-owned ownership scope for one fenced scanner metadata mutation.
+///
+/// The scope is an in-memory capability. It is intentionally carried through
+/// [`ObjectOptions`] as a hidden field and never participates in serde, object
+/// metadata, RPC wire structures, or on-disk formats.
+#[derive(Clone)]
+pub struct ScannerPublicationCommitScope {
+    inner: Arc<ScannerPublicationCommitScopeInner>,
+}
+
+/// RAII fallback for storage paths that return before their commit closure
+/// takes ownership. An in-flight scope is never guessed to be aborted: it is
+/// marked indeterminate so remote lease release remains blocked.
+pub(crate) struct ScannerPublicationCommitScopeGuard {
+    scope: Option<ScannerPublicationCommitScope>,
+}
+
+impl ScannerPublicationCommitScopeGuard {
+    pub(crate) fn new(scope: ScannerPublicationCommitScope) -> Self {
+        Self { scope: Some(scope) }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.scope = None;
+    }
+}
+
+impl Drop for ScannerPublicationCommitScopeGuard {
+    fn drop(&mut self) {
+        let Some(scope) = self.scope.as_ref() else {
+            return;
+        };
+        if scope.owner_attached() {
+            return;
+        }
+        match scope.state() {
+            ScannerPublicationCommitState::Admitted => {
+                let _ = scope.mark_aborted_before_commit();
+            }
+            ScannerPublicationCommitState::InFlight => {
+                let _ = scope.mark_indeterminate();
+            }
+            ScannerPublicationCommitState::Committed
+            | ScannerPublicationCommitState::AbortedBeforeCommit
+            | ScannerPublicationCommitState::Indeterminate => {}
+        }
+    }
+}
+
+impl Debug for ScannerPublicationCommitScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScannerPublicationCommitScope")
+            .field("expected_movement_epoch", &self.expected_movement_epoch())
+            .field("safe_deadline", &self.safe_deadline())
+            .field("remote_lease_token_count", &self.remote_lease_tokens().len())
+            .field("state", &self.state())
+            .finish()
+    }
+}
+
+impl ScannerPublicationCommitScope {
+    /// Construct a scope after the storage layer has acquired its movement
+    /// read permit. Callers must keep the scope attached to the actual
+    /// mutation owner until [`Self::wait_for_completion`] has resolved.
+    pub(crate) fn new_storage_owned(
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        movement_permit: OwnedRwLockReadGuard<()>,
+    ) -> Self {
+        Self::new_storage_owned_with_release_flag(
+            expected_movement_epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    pub(crate) fn new_storage_owned_with_release_flag(
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        movement_permit: OwnedRwLockReadGuard<()>,
+        lease_release_safe: Arc<AtomicBool>,
+    ) -> Self {
+        lease_release_safe.store(false, Ordering::Release);
+        Self {
+            inner: Arc::new(ScannerPublicationCommitScopeInner {
+                expected_movement_epoch,
+                safe_deadline,
+                remote_lease_tokens: remote_lease_tokens.into(),
+                cancellation: CancellationToken::new(),
+                state: AtomicU8::new(SCANNER_PUBLICATION_SCOPE_ADMITTED),
+                completed: Notify::new(),
+                owner_attached: AtomicBool::new(false),
+                movement_permit: Mutex::new(Some(movement_permit)),
+                lease_release_safe,
+            }),
+        }
+    }
+
+    pub fn expected_movement_epoch(&self) -> u64 {
+        self.inner.expected_movement_epoch
+    }
+
+    pub fn safe_deadline(&self) -> tokio::time::Instant {
+        self.inner.safe_deadline
+    }
+
+    pub fn is_expired(&self) -> bool {
+        tokio::time::Instant::now() >= self.safe_deadline()
+    }
+
+    pub fn remote_lease_tokens(&self) -> &[Uuid] {
+        &self.inner.remote_lease_tokens
+    }
+
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.inner.cancellation.clone()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancellation.is_cancelled()
+    }
+
+    /// Whether a mutation that has already begun may still enter its durable
+    /// commit boundary. The storage owner must check this immediately before
+    /// starting each irreversible fan-out/rename operation.
+    pub fn can_commit(&self) -> bool {
+        self.state() == ScannerPublicationCommitState::InFlight && !self.is_cancelled() && !self.is_expired()
+    }
+
+    /// Transfer terminal-state responsibility from the caller to a detached
+    /// storage mutation owner. Once set, dropping a scanner waiter leaves the
+    /// scope in-flight until that owner reports committed or indeterminate.
+    pub fn attach_mutation_owner(&self) {
+        self.inner.owner_attached.store(true, Ordering::Release);
+    }
+
+    fn owner_attached(&self) -> bool {
+        self.inner.owner_attached.load(Ordering::Acquire)
+    }
+
+    pub fn state(&self) -> ScannerPublicationCommitState {
+        ScannerPublicationCommitState::from_u8(self.inner.state.load(Ordering::Acquire))
+    }
+
+    /// Request cancellation without claiming that a mutation has stopped.
+    /// The owner must still report `AbortedBeforeCommit` or `Indeterminate`.
+    pub fn cancel(&self) {
+        self.inner.cancellation.cancel();
+    }
+
+    pub fn try_begin(&self) -> std::result::Result<(), ScannerPublicationCommitStartError> {
+        if self.inner.cancellation.is_cancelled() {
+            return Err(ScannerPublicationCommitStartError::Cancelled);
+        }
+        if self.is_expired() {
+            return Err(ScannerPublicationCommitStartError::DeadlineExceeded);
+        }
+        self.inner
+            .state
+            .compare_exchange(
+                SCANNER_PUBLICATION_SCOPE_ADMITTED,
+                SCANNER_PUBLICATION_SCOPE_IN_FLIGHT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|state| {
+                if ScannerPublicationCommitState::from_u8(state).permits_lease_release() {
+                    ScannerPublicationCommitStartError::Terminal
+                } else {
+                    ScannerPublicationCommitStartError::AlreadyStarted
+                }
+            })
+    }
+
+    pub fn mark_committed(&self) -> bool {
+        self.mark_terminal(ScannerPublicationCommitState::Committed)
+    }
+
+    pub fn mark_aborted_before_commit(&self) -> bool {
+        if self
+            .inner
+            .state
+            .compare_exchange(
+                SCANNER_PUBLICATION_SCOPE_ADMITTED,
+                SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.inner.lease_release_safe.store(true, Ordering::Release);
+            self.inner.completed.notify_waiters();
+            return true;
+        }
+        false
+    }
+
+    pub fn mark_indeterminate(&self) -> bool {
+        self.mark_terminal(ScannerPublicationCommitState::Indeterminate)
+    }
+
+    fn mark_terminal(&self, terminal: ScannerPublicationCommitState) -> bool {
+        self.inner
+            .state
+            .compare_exchange(SCANNER_PUBLICATION_SCOPE_IN_FLIGHT, terminal.as_u8(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then(|| {
+                if terminal.permits_lease_release() {
+                    self.inner.lease_release_safe.store(true, Ordering::Release);
+                }
+                self.inner.completed.notify_waiters()
+            })
+            .is_some()
+    }
+
+    /// Wait until the mutation owner has reported a definitive terminal
+    /// state. The permit remains owned by this scope until all scope clones are
+    /// dropped or [`Self::release_movement_permit`] is called safely.
+    pub async fn wait_for_completion(&self) -> ScannerPublicationCommitState {
+        loop {
+            let notified = self.inner.completed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let state = self.state();
+            if state != ScannerPublicationCommitState::Admitted && state != ScannerPublicationCommitState::InFlight {
+                return state;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the storage-owned movement permit only after a known-safe
+    /// terminal result. Returns `false` for in-flight or indeterminate work.
+    pub async fn release_movement_permit(&self) -> bool {
+        if !self.state().permits_lease_release() {
+            return false;
+        }
+        self.inner.movement_permit.lock().await.take().is_some()
+    }
+}
+
+impl Drop for ScannerPublicationCommitScopeInner {
+    fn drop(&mut self) {
+        if !ScannerPublicationCommitState::from_u8(self.state.load(Ordering::Acquire)).permits_lease_release() {
+            self.lease_release_safe.store(false, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+#[doc(hidden)]
+pub struct DecommissionCapacityOptions {
+    pub(crate) expected_data_bytes: Option<usize>,
+    pub(crate) operation_id: Option<Uuid>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) owner_nonce: Option<Uuid>,
+    pub(crate) mutation_id: Option<Uuid>,
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -384,8 +728,19 @@ pub struct ObjectOptions {
     #[doc(hidden)]
     pub put_object_cancellation: Option<tokio_util::sync::CancellationToken>,
 
+    /// Storage-owned scanner publication capability. This field is an
+    /// in-memory hand-off only; it is never copied into object metadata.
+    #[doc(hidden)]
+    pub scanner_publication_commit_scope: Option<ScannerPublicationCommitScope>,
+
     pub data_movement: bool,
     pub raw_data_movement_read: bool,
+    /// Durable reservation identity carried only by decommission writes. Other
+    /// data-movement users, including rebalance, leave it unset. Keep this
+    /// context boxed because `ObjectOptions` is passed by value through deep
+    /// storage futures.
+    #[doc(hidden)]
+    pub decommission_capacity: Option<Box<DecommissionCapacityOptions>>,
     /// Materialize the data-movement per-part checksum sidecar for APIs that
     /// return part checksums. Ordinary object reads leave it encoded.
     pub include_part_checksums: bool,
@@ -449,6 +804,36 @@ pub struct ObjectOptions {
     /// Storage-owned journal writer used by the atomic delete path. This is
     /// populated only by the `ECStore` wrapper that holds the namespace locks.
     pub tier_delete_journal_api: Option<Arc<crate::store::ECStore>>,
+    /// Internal staged-mutation admission supplied by `ECStore`; each local
+    /// publish is fenced namespace-first and then by decommission capacity.
+    #[doc(hidden)]
+    pub decommission_capacity_admission: Option<Arc<crate::store::ECStore>>,
+}
+
+impl ObjectOptions {
+    pub(crate) fn with_capacity_expected_data_bytes(expected_data_bytes: Option<usize>) -> Self {
+        Self {
+            decommission_capacity: expected_data_bytes.map(|expected_data_bytes| {
+                Box::new(DecommissionCapacityOptions {
+                    expected_data_bytes: Some(expected_data_bytes),
+                    ..Default::default()
+                })
+            }),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn capacity_expected_data_bytes(&self) -> Option<usize> {
+        self.decommission_capacity
+            .as_deref()
+            .and_then(|capacity| capacity.expected_data_bytes)
+    }
+
+    pub(crate) fn has_decommission_capacity_reservation(&self) -> bool {
+        self.decommission_capacity
+            .as_deref()
+            .is_some_and(|capacity| capacity.operation_id.is_some())
+    }
 }
 
 impl std::fmt::Debug for ObjectOptions {
@@ -473,6 +858,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("skip_rebalancing", &self.skip_rebalancing)
             .field("skip_free_version", &self.skip_free_version)
             .field("put_object_cancellation", &self.put_object_cancellation.is_some())
+            .field("scanner_publication_commit_scope", &self.scanner_publication_commit_scope)
             .field("data_movement", &self.data_movement)
             .field("raw_data_movement_read", &self.raw_data_movement_read)
             .field("include_part_checksums", &self.include_part_checksums)

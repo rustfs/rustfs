@@ -250,6 +250,40 @@ pub(crate) trait DiskStoreRenameDataExt {
         dst_volume: &str,
         dst_path: &str,
     ) -> Result<RenameDataResp>;
+
+    async fn rename_data_borrowed_with_guard(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<RenameDataResp> {
+        let _ = external_guard;
+        self.rename_data_borrowed(src_volume, src_path, fi, dst_volume, dst_path)
+            .await
+    }
+}
+
+/// Run a mutation in an owned task when a caller supplied publication guard.
+/// RPC cancellation drops only the waiter; the mutation owner keeps the guard
+/// until its operation has returned, including any detached blocking syscall.
+async fn run_owned_mutation<T, F, Fut>(external_guard: Option<Arc<dyn Send + Sync>>, operation: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    if external_guard.is_none() {
+        return operation().await;
+    }
+    tokio::spawn(async move {
+        let _external_guard = external_guard;
+        operation().await
+    })
+    .await
+    .map_err(|_| Error::other("owned mutation task failed"))?
 }
 
 impl DiskStoreRenameDataExt for LocalDiskWrapper {
@@ -271,6 +305,49 @@ impl DiskStoreRenameDataExt for LocalDiskWrapper {
             },
             get_max_timeout_duration(),
         )
+        .await
+    }
+
+    async fn rename_data_borrowed_with_guard(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<RenameDataResp> {
+        let operation = self.clone();
+        let src_volume = src_volume.to_owned();
+        let src_path = src_path.to_owned();
+        let fi = fi.clone();
+        let dst_volume = dst_volume.to_owned();
+        let dst_path = dst_path.to_owned();
+        let timeout_duration = if external_guard.is_some() {
+            // A fenced mutation owns the publication guard until the storage
+            // operation returns. Timing out this waiter would cancel the
+            // LocalDisk future while a spawn_blocking namespace syscall could
+            // still be committing, reopening the movement window. The caller
+            // may drop its waiter; the owned task drains the mutation.
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
+        run_owned_mutation(external_guard, move || async move {
+            operation
+                .track_disk_health_mutation(
+                    "rename_data",
+                    DiskMetricMutation::Write,
+                    || async {
+                        operation
+                            .disk
+                            .rename_data_borrowed(&src_volume, &src_path, &fi, &dst_volume, &dst_path)
+                            .await
+                    },
+                    timeout_duration,
+                )
+                .await
+        })
         .await
     }
 }
@@ -1111,6 +1188,37 @@ impl LocalDiskWrapper {
             Arc::new(DiskHealthTracker::new()),
             Arc::new(DiskHealthMetricEpoch::default()),
         )
+    }
+
+    /// Run a delete under an owned coordinator task when a publication guard
+    /// is present. This keeps the guard alive if the RPC waiter is cancelled
+    /// while the local namespace mutation is still in progress.
+    pub(crate) async fn delete_with_publication_guard(
+        &self,
+        volume: &str,
+        path: &str,
+        options: DeleteOptions,
+        external_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<()> {
+        let operation = self.clone();
+        let volume = volume.to_owned();
+        let path = path.to_owned();
+        let timeout_duration = if external_guard.is_some() {
+            Duration::ZERO
+        } else {
+            get_max_timeout_duration()
+        };
+        run_owned_mutation(external_guard, move || async move {
+            operation
+                .track_disk_health_mutation(
+                    "delete",
+                    DiskMetricMutation::Delete,
+                    || async { operation.disk.delete(&volume, &path, options).await },
+                    timeout_duration,
+                )
+                .await
+        })
+        .await
     }
 
     pub(crate) fn new_with_reconnect_state(
@@ -2262,6 +2370,44 @@ mod tests {
         task::{Context, Poll},
     };
     use tokio::io::AsyncWrite;
+
+    struct DropProbe(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_mutation_keeps_publication_guard_after_waiter_cancellation() {
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let guard: Arc<dyn Send + Sync> = Arc::new(DropProbe(Arc::clone(&drops)));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(run_owned_mutation(Some(guard), move || async move {
+            started_tx.send(()).expect("mutation should signal start");
+            release_rx.await.expect("mutation should be released");
+            finished_tx.send(()).expect("mutation should signal completion");
+            Ok::<_, Error>(())
+        }));
+
+        started_rx.await.expect("mutation owner should start");
+        waiter.abort();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        release_tx.send(()).expect("mutation owner should still be alive");
+        finished_rx.await.expect("mutation owner should finish");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while drops.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication guard should be released after mutation completion");
+    }
 
     struct PendingWriter;
 

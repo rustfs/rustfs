@@ -15,7 +15,7 @@
 use s3s::dto::SelectObjectContentInput;
 use std::sync::Arc;
 
-use crate::SelectObjectSnapshot;
+use crate::{SelectInputMetrics, SelectObjectSnapshot};
 
 pub mod analyzer;
 pub mod ast;
@@ -40,6 +40,7 @@ pub struct Query {
     context: Context,
     content: String,
     snapshot: Option<Arc<SelectObjectSnapshot>>,
+    input_metrics: Arc<SelectInputMetrics>,
 }
 
 impl Query {
@@ -49,6 +50,7 @@ impl Query {
             context,
             content,
             snapshot: None,
+            input_metrics: Arc::new(SelectInputMetrics::default()),
         }
     }
 
@@ -58,6 +60,7 @@ impl Query {
             context,
             content,
             snapshot: Some(snapshot),
+            input_metrics: Arc::new(SelectInputMetrics::default()),
         }
     }
 
@@ -72,4 +75,46 @@ impl Query {
     pub fn snapshot(&self) -> Option<&Arc<SelectObjectSnapshot>> {
         self.snapshot.as_ref()
     }
+
+    pub fn input_metrics(&self) -> &Arc<SelectInputMetrics> {
+        &self.input_metrics
+    }
+
+    pub fn for_execution(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            content: self.content.clone(),
+            snapshot: self.snapshot.clone(),
+            input_metrics: Arc::new(SelectInputMetrics::default()),
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_query() -> Query {
+    use s3s::dto::{CSVInput, CSVOutput, ExpressionType, InputSerialization, OutputSerialization, SelectObjectContentRequest};
+
+    let input = SelectObjectContentInput {
+        bucket: "bucket".to_string(),
+        expected_bucket_owner: None,
+        key: "input.csv".to_string(),
+        sse_customer_algorithm: None,
+        sse_customer_key: None,
+        sse_customer_key_md5: None,
+        request: SelectObjectContentRequest {
+            expression: "SELECT * FROM S3Object".to_string(),
+            expression_type: ExpressionType::from_static(ExpressionType::SQL),
+            input_serialization: InputSerialization {
+                csv: Some(CSVInput::default()),
+                ..Default::default()
+            },
+            output_serialization: OutputSerialization {
+                csv: Some(CSVOutput::default()),
+                ..Default::default()
+            },
+            request_progress: None,
+            scan_range: None,
+        },
+    };
+    Query::new(Context { input: Arc::new(input) }, "SELECT * FROM S3Object".to_string())
 }

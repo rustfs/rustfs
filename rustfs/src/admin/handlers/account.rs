@@ -33,6 +33,7 @@ use super::account_audit::{
 };
 use super::admin_json_response;
 use super::iam_error::iam_error_to_s3_error;
+use super::site_replication::site_replication_iam_change_hook;
 use super::supervise_admin_mutation;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
@@ -48,6 +49,7 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_iam::mfa::service as mfa_service;
 use rustfs_madmin::account::{AccountMfaSummary, ChangePasswordRequest, IdentityType, SelfAccountInfo, SetUserSecretKeyRequest};
+use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, SITE_REPL_API_VERSION, SRIAMItem, SRIAMUser};
 use rustfs_policy::auth::is_secret_key_valid;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::MaskedAccessKey;
@@ -239,7 +241,7 @@ impl Operation for ChangeOwnPasswordHandler {
             let iam_store =
                 current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
-            iam_store
+            let (updated_at, status) = iam_store
                 .set_user_secret_key(&access_key, &new_secret_key)
                 .await
                 .map_err(iam_error_to_s3_error)?;
@@ -282,6 +284,11 @@ impl Operation for ChangeOwnPasswordHandler {
                 result = "changed",
                 "admin account state"
             );
+
+            // After the local revocation: peer delivery has no ordering
+            // dependency on it, and a slow peer must not delay killing the
+            // old sessions here.
+            broadcast_secret_key_rotation("change_own_password", &access_key, &new_secret_key, status, updated_at).await;
 
             Ok(revoked)
         })
@@ -390,7 +397,19 @@ impl Operation for SetUserSecretKeyHandler {
             let iam_store =
                 current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
-            iam_store
+            // Derived credentials live outside the `iam-user` replication
+            // item: rotating one here would succeed locally and silently skip
+            // the peer broadcast, leaving the sites permanently diverged.
+            if let Some(existing) = iam_store.get_user(&target).await
+                && (existing.credentials.is_temp() || existing.credentials.is_service_account())
+            {
+                return Err(s3::error(
+                    S3ErrorCode::InvalidRequest,
+                    "the target access key is a derived credential; rotate service accounts through update-service-account",
+                ));
+            }
+
+            let (updated_at, status) = iam_store
                 .set_user_secret_key(&target, &request.secret_key)
                 .await
                 .map_err(iam_error_to_s3_error)?;
@@ -430,6 +449,11 @@ impl Operation for SetUserSecretKeyHandler {
                 "admin account state"
             );
 
+            // After the local revocation: peer delivery has no ordering
+            // dependency on it, and a slow peer must not delay killing the
+            // old sessions here.
+            broadcast_secret_key_rotation("set_user_secret_key", &target, &request.secret_key, status, updated_at).await;
+
             Ok(revoked)
         })
         .await?;
@@ -450,6 +474,58 @@ impl Operation for SetUserSecretKeyHandler {
 #[derive(Debug, serde::Serialize)]
 struct ChangePasswordResult {
     sessions_revoked: u32,
+}
+
+/// The `iam-user` item a secret rotation fans out to peer sites.
+///
+/// The non-empty secret routes the peer through its create-user path (not the
+/// status-only path), so the persisted status must ride along or a disabled
+/// account would be re-enabled on the peer.
+fn secret_key_rotation_item(access_key: &str, secret_key: &str, status: AccountStatus, updated_at: OffsetDateTime) -> SRIAMItem {
+    SRIAMItem {
+        r#type: "iam-user".to_string(),
+        iam_user: Some(SRIAMUser {
+            access_key: access_key.to_string(),
+            is_delete_req: false,
+            user_req: Some(AddOrUpdateUserReq {
+                secret_key: secret_key.to_string(),
+                policy: None,
+                status,
+            }),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        }),
+        updated_at: Some(updated_at),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Fan a rotated secret out to peer sites.
+///
+/// The rotation is already durable locally; a broadcast failure only logs,
+/// matching the other IAM site-replication hooks. `status` and `updated_at`
+/// come from the persisting write itself, so the item carries exactly the
+/// state that was stored.
+async fn broadcast_secret_key_rotation(
+    action: &'static str,
+    access_key: &str,
+    secret_key: &str,
+    status: AccountStatus,
+    updated_at: OffsetDateTime,
+) {
+    if let Err(err) = site_replication_iam_change_hook(secret_key_rotation_item(access_key, secret_key, status, updated_at)).await
+    {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_ACCOUNT,
+            event = EVENT_ADMIN_ACCOUNT_STATE,
+            action,
+            access_key = %MaskedAccessKey(access_key),
+            result = "site_replication_hook_failed",
+            error = ?err,
+            "admin account state"
+        );
+    }
 }
 
 /// Reject a new secret that would be useless or a no-op.
@@ -497,6 +573,49 @@ mod tests {
     #[test]
     fn a_valid_rotation_passes_validation() {
         validate_new_secret_key(&change_request("old-secret-key", "new-secret-key")).expect("must accept");
+    }
+
+    #[test]
+    fn rotation_item_takes_the_peer_create_path_and_preserves_status() {
+        let ts = OffsetDateTime::now_utc();
+        let item = secret_key_rotation_item("rotated-user", "new-secret-key", AccountStatus::Disabled, ts);
+
+        assert_eq!(item.r#type, "iam-user");
+        assert_eq!(item.updated_at, Some(ts));
+        assert!(item.api_version.is_some());
+
+        let user = item.iam_user.expect("iam-user payload");
+        assert_eq!(user.access_key, "rotated-user");
+        assert!(!user.is_delete_req);
+
+        let req = user.user_req.expect("user_req payload");
+        // A non-empty secret is what routes the peer through create-user
+        // instead of the status-only path.
+        assert_eq!(req.secret_key, "new-secret-key");
+        // Policy must stay unset so the peer's policy mapping is untouched.
+        assert!(req.policy.is_none());
+        // A disabled account must stay disabled on the peer.
+        assert_eq!(req.status, AccountStatus::Disabled);
+    }
+
+    #[test]
+    fn both_rotation_handlers_broadcast_after_revoking_sessions() {
+        let src = include_str!("account.rs");
+        for marker in [
+            "impl Operation for ChangeOwnPasswordHandler",
+            "impl Operation for SetUserSecretKeyHandler",
+        ] {
+            let start = src.find(marker).expect("handler should exist");
+            let block = &src[start..];
+            let block = &block[..block.find("\n}\n").expect("handler block end")];
+            let revoke = block
+                .find("revoke_sts_sessions_for_parent")
+                .expect("handler must revoke sessions");
+            let broadcast = block
+                .find("broadcast_secret_key_rotation(")
+                .expect("handler must broadcast the rotation to peer sites");
+            assert!(revoke < broadcast, "{marker}: peer broadcast must not delay the local session revocation");
+        }
     }
 
     #[test]

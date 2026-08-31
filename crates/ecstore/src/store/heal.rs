@@ -470,6 +470,27 @@ impl ECStore {
         let object = encode_dir_object(object);
 
         let pools = self.get_pools_for_heal_object(opts)?;
+        if let Some(set_idx) = opts.set {
+            for pool in &pools {
+                if set_idx >= pool.disk_set.len() {
+                    let err = StorageError::InvalidArgument(
+                        "heal".to_string(),
+                        "set".to_string(),
+                        format!(
+                            "invalid heal set index {set_idx} for pool {} with {} sets",
+                            pool.pool_idx,
+                            pool.disk_set.len()
+                        ),
+                    );
+                    if opts.pool.is_some() {
+                        return Err(err);
+                    }
+                    return Ok((HealResultItem::default(), Some(err)));
+                }
+            }
+        }
+        #[cfg(test)]
+        let store_id = self.id;
 
         let mut futures = Vec::with_capacity(pools.len());
         for pool in pools.iter() {
@@ -499,7 +520,17 @@ impl ECStore {
                 }
                 continue;
             }
-            futures.push(pool.heal_object(bucket, &object, version_id, opts));
+            let pool_idx = pool.pool_idx;
+            let pool = Arc::clone(pool);
+            let pool_object = object.clone();
+            let opts = *opts;
+            futures.push(
+                self.run_external_decommission_capacity_heal(pool_idx, bucket, &object, opts, move |opts| async move {
+                    #[cfg(test)]
+                    crate::core::pools::notify_decommission_external_heal_operation_started(store_id);
+                    pool.heal_object(bucket, &pool_object, version_id, &opts).await
+                }),
+            );
         }
         let results = join_all(futures).await;
 
@@ -594,14 +625,18 @@ mod tests {
     use crate::cluster::rpc::PeerS3Client;
     use crate::config::com::{delete_config, read_config_no_lock_preserve_empty_with_metadata, save_config};
     use crate::core::pools::{
-        POOL_META_IDENTITY_NAME, PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus, initialized_pool_meta_identity_for_test,
+        DecommissionCapacityLockOrderBarrier, DecommissionErasureLayout, DecommissionPoolCapacityInfo, POOL_META_IDENTITY_NAME,
+        PoolDecommissionInfo, PoolMetaReplicaState, PoolStatus, initialized_pool_meta_identity_for_test,
+        set_decommission_capacity_info_overrides_for_test,
     };
     use crate::core::sets::HealFormatAfterSaveBarrier;
     use crate::disk::error::Result as DiskResult;
     use crate::disk::{DeleteOptions, DiskOption, FORMAT_CONFIG_FILE, format::FormatV3, new_disk};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::runtime::instance::InstanceContext;
-    use crate::services::rebalance::{RebalanceInfo, RebalanceStats};
+    use crate::services::rebalance::{
+        RebalanceInfo, RebalanceStats, test_three_pool_stores_with_isolated_node_contexts, test_two_pool_stores,
+    };
     use crate::storage_api_contracts::bucket::{
         BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
     };
@@ -743,6 +778,7 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
+            decommission_capacity_entry_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -1205,6 +1241,292 @@ mod tests {
                 if field == "pool" && reason.contains("invalid heal pool index 2 for 2 pools")),
             "unexpected invalid pool error: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn targeted_heal_is_blocked_by_exact_fit_decommission_reservation() {
+        let (_temp_dirs, store, _other_store) = test_two_pool_stores(None).await;
+        let bucket = format!("heal-capacity-{}", Uuid::new_v4().simple());
+        let object = "targeted-heal.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("heal capacity bucket should be created");
+
+        let target_set = store.pools[1].get_disks(0);
+        let mut reader = PutObjReader::from_vec(b"targeted heal body".to_vec());
+        target_set
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("targeted heal fixture should be written");
+        let missing_disk = target_set.disks.read().await[0]
+            .clone()
+            .expect("targeted heal fixture disk should be online");
+        missing_disk
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("targeted heal fixture shard should be removed");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_err(),
+            "targeted heal fixture must start with one missing metadata copy"
+        );
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("the exact-fit decommission reservation should activate");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the active decommission reservation should be durable");
+            assert_eq!(reservation.targets.len(), 1);
+            assert_eq!(reservation.targets[0].pool_index, 1);
+            assert_eq!(reservation.targets[0].reserved_physical_bytes, 60);
+        }
+
+        let (_, err) = store
+            .handle_heal_object(
+                &bucket,
+                object,
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    set: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("targeted heal should return a mapped capacity result");
+        assert!(matches!(err, Some(Error::SlowDown)), "targeted heal must be capacity-blocked: {err:?}");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_err(),
+            "capacity-blocked targeted heal must not rewrite the missing shard"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn targeted_heal_keeps_target_lock_for_different_lock_domain() {
+        let (_temp_dirs, store, other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = format!("heal-lock-domain-{}", Uuid::new_v4().simple());
+        let object = "different-domain-heal.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("heal lock-domain bucket should be created");
+
+        let target_set = other_store.pools[1].get_disks(0);
+        let mut reader = PutObjReader::from_vec(b"different lock domain body".to_vec());
+        target_set
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("heal lock-domain fixture should be written");
+        let missing_disk = target_set.disks.read().await[0]
+            .clone()
+            .expect("heal lock-domain fixture disk should be online");
+        missing_disk
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("heal lock-domain fixture shard should be removed");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_err(),
+            "heal lock-domain fixture must start with one missing metadata copy"
+        );
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 0, 100, 100),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 60, 60, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("heal lock-domain reservation should activate");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("heal lock-domain reservation should be durable");
+            assert_eq!(reservation.targets.len(), 1);
+            assert_eq!(reservation.targets[0].pool_index, 2);
+        }
+        let pool_meta = store.pool_meta.read().await.clone();
+        *other_store.pool_meta.write().await = pool_meta;
+
+        let fixed_set = other_store.pools[0].disk_set[0].clone();
+        assert!(
+            !fixed_set.shares_namespace_lock_domain(&target_set).await,
+            "heal fixture must use different fixed and target lock domains"
+        );
+        let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, other_store.id);
+        let heal_store = Arc::clone(&other_store);
+        let heal_bucket = bucket.clone();
+        let heal_object = object.to_string();
+        let mut heal = tokio::spawn(async move {
+            heal_store
+                .handle_heal_object(
+                    &heal_bucket,
+                    &heal_object,
+                    "",
+                    &HealOpts {
+                        pool: Some(1),
+                        set: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        barrier.wait_until_external_capacity_released().await;
+        barrier.wait_until_external_heal_target_lock_attempted().await;
+
+        let (_, err) = tokio::time::timeout(std::time::Duration::from_secs(30), &mut heal)
+            .await
+            .expect("targeted heal should finish after target lock release")
+            .expect("targeted heal task should not panic")
+            .expect("targeted heal should complete");
+        assert!(err.is_none(), "targeted heal should repair after target lock release: {err:?}");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_ok(),
+            "targeted heal should rewrite the missing shard after the target lock is released"
+        );
+        drop(barrier);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn targeted_heal_reuses_shared_target_lock_without_reentrant_lock() {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = format!("heal-shared-lock-domain-{}", Uuid::new_v4().simple());
+        let object = "shared-domain-heal.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("shared heal lock-domain bucket should be created");
+
+        let target_set = store.pools[0].get_disks(0);
+        let mut reader = PutObjReader::from_vec(b"shared lock domain body".to_vec());
+        target_set
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("shared heal lock-domain fixture should be written");
+        let missing_disk = target_set.disks.read().await[0]
+            .clone()
+            .expect("shared heal lock-domain fixture disk should be online");
+        missing_disk
+            .delete(
+                &bucket,
+                object,
+                DeleteOptions {
+                    recursive: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("shared heal lock-domain fixture shard should be removed");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_err(),
+            "shared heal lock-domain fixture must start with one missing metadata copy"
+        );
+
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, 100, 100),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0),
+                DecommissionPoolCapacityInfo::for_test(2, layout, 0, 30, 30),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[2], Vec::new())
+            .await
+            .expect("shared heal lock-domain reservation should activate");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[2]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("shared heal lock-domain reservation should be durable");
+            assert_eq!(reservation.targets.len(), 1);
+            assert_eq!(reservation.targets[0].pool_index, 1);
+            assert_eq!(reservation.targets[0].reserved_physical_bytes, 60);
+        }
+
+        let fixed_set = store.pools[0].disk_set[0].clone();
+        assert!(
+            fixed_set.shares_namespace_lock_domain(&target_set).await,
+            "shared heal fixture must use one fixed and target lock domain"
+        );
+
+        let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+        let heal_store = Arc::clone(&store);
+        let heal_bucket = bucket.clone();
+        let heal_object = object.to_string();
+        let mut heal = tokio::spawn(async move {
+            heal_store
+                .handle_heal_object(
+                    &heal_bucket,
+                    &heal_object,
+                    "",
+                    &HealOpts {
+                        pool: Some(0),
+                        set: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        barrier.wait_until_external_capacity_released().await;
+        barrier.wait_until_external_heal_operation_started().await;
+        let (_, err) = tokio::time::timeout(std::time::Duration::from_secs(5), &mut heal)
+            .await
+            .expect("shared-domain heal must not reenter the fixed namespace lock")
+            .expect("shared-domain heal task should not panic")
+            .expect("shared-domain heal should complete");
+        assert!(err.is_none(), "shared-domain heal should repair after admission: {err:?}");
+        assert!(
+            missing_disk.read_xl(&bucket, object, false).await.is_ok(),
+            "shared-domain heal should rewrite the missing shard"
+        );
+        drop(barrier);
     }
 
     #[tokio::test]
@@ -1697,8 +2019,10 @@ mod tests {
             .expect("quorum boundary heal should return a mapped result");
         *store.pools[0].disk_set[0].disks.write().await = original_quorum_disks;
         assert!(
-            matches!(quorum_err, Some(Error::ErasureReadQuorum)),
-            "quorum-boundary heal must preserve quorum error, got {quorum_err:?}"
+            quorum_err.as_ref().is_some_and(|err| err
+                .to_string()
+                .contains("pool metadata writes remain blocked after a recovery-required replica state")),
+            "heal must fail closed when capacity admission cannot verify pool metadata, got {quorum_err:?}"
         );
         shutdown.cancel();
     }
@@ -1808,6 +2132,7 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
+            decommission_capacity_entry_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         };

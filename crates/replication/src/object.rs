@@ -71,6 +71,32 @@ pub fn replication_etags_match(source: Option<&str>, target: Option<&str>) -> bo
     source_etag.is_some() && source_etag == target_etag
 }
 
+fn is_plain_single_part_md5(etag: &str) -> bool {
+    etag.len() == 32 && etag.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether the ETag the target returned for a single-part replica proves the
+/// stored bytes differ from what the source sent — e.g. a target that does not
+/// decode `aws-chunked` framing stores the frames verbatim and returns their
+/// ETag. Only a plain single-part MD5 ETag on both sides is decidable; a
+/// multipart or opaque (encrypted) ETag, or a withheld replica ETag, returns
+/// `false` because no corruption can be concluded from it.
+pub fn single_part_replica_etag_mismatch(source_etag: Option<&str>, replica_etag: Option<&str>) -> bool {
+    let Some(source) = source_etag.map(trim_etag) else {
+        return false;
+    };
+    if !is_plain_single_part_md5(&source) {
+        return false;
+    }
+    let Some(replica) = replica_etag.map(trim_etag) else {
+        return false;
+    };
+    if !is_plain_single_part_md5(&replica) {
+        return false;
+    }
+    !source.eq_ignore_ascii_case(&replica)
+}
+
 pub fn target_is_newer_than_source_null_version(
     source: &ReplicationSourceObject<'_>,
     target: &ReplicationTargetObject<'_>,
@@ -276,11 +302,41 @@ pub fn ssec_passthrough_evidence_present(sse_customer_algorithm: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
+    const SOURCE_MD5: &str = "9a0364b9e99bb480dd25e1f0284c8555";
+    const FRAMED_MD5: &str = "0f343b0931126a20f133d67c2b018a3b";
+
+    #[test]
+    fn single_part_replica_mismatch_is_only_decided_on_plain_md5_pairs() {
+        // The #6853 shape: the target stored aws-chunked frames verbatim and
+        // returned the framed bytes' ETag.
+        assert!(single_part_replica_etag_mismatch(Some(SOURCE_MD5), Some(FRAMED_MD5)));
+        assert!(single_part_replica_etag_mismatch(
+            Some(&format!("\"{SOURCE_MD5}\"")),
+            Some(&format!("\"{FRAMED_MD5}\""))
+        ));
+
+        // A faithful replica, quoted or not, passes; hex case must not matter
+        // (a target may return the same MD5 uppercased).
+        assert!(!single_part_replica_etag_mismatch(Some(SOURCE_MD5), Some(SOURCE_MD5)));
+        assert!(!single_part_replica_etag_mismatch(Some(&format!("\"{SOURCE_MD5}\"")), Some(SOURCE_MD5)));
+        assert!(!single_part_replica_etag_mismatch(
+            Some(SOURCE_MD5),
+            Some(&SOURCE_MD5.to_ascii_uppercase())
+        ));
+
+        // Not decidable: multipart source, opaque replica ETag, or either side
+        // missing must never be reported as corruption.
+        assert!(!single_part_replica_etag_mismatch(Some(&format!("{SOURCE_MD5}-3")), Some(FRAMED_MD5)));
+        assert!(!single_part_replica_etag_mismatch(Some(SOURCE_MD5), Some(&format!("{FRAMED_MD5}-3"))));
+        assert!(!single_part_replica_etag_mismatch(Some(SOURCE_MD5), None));
+        assert!(!single_part_replica_etag_mismatch(None, Some(FRAMED_MD5)));
+    }
+
     use super::{
         ReplicationSourceObject, ReplicationTargetObject, SsecPassthroughCapability, SsecPassthroughGate,
         content_matches_by_etag, is_replication_target_offline_error, replication_action_for_target, replication_etags_match,
-        ssec_passthrough_evidence_present, ssec_passthrough_gate, target_is_newer_than_source_null_version,
-        version_identity_drifted,
+        single_part_replica_etag_mismatch, ssec_passthrough_evidence_present, ssec_passthrough_gate,
+        target_is_newer_than_source_null_version, version_identity_drifted,
     };
     use crate::filemeta::{ReplicationAction, ReplicationType};
     use crate::http::AMZ_OBJECT_LOCK_MODE;

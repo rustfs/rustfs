@@ -933,8 +933,29 @@ impl Erasure {
     }
 
     pub(crate) fn decode_data_with_reconstruction_verification(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        self.decode_data_with_reconstruction_verification_policy(shards, false)
+    }
+
+    pub(crate) fn decode_data_with_reconstruction_verification_for_lockstep(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+    ) -> io::Result<()> {
+        self.decode_data_with_reconstruction_verification_policy(shards, true)
+    }
+
+    fn decode_data_with_reconstruction_verification_policy(
+        &self,
+        shards: &mut [Option<Vec<u8>>],
+        require_surplus_source: bool,
+    ) -> io::Result<()> {
         let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
         let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
+        if require_surplus_source && missing_data_source && available_shards == self.data_shards {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "insufficient source shards to verify reconstructed data",
+            ));
+        }
         let source_parity = if missing_data_source && available_shards > self.data_shards {
             shards
                 .iter()
@@ -1866,6 +1887,31 @@ mod tests {
             .expect_err("verified decode must reject inconsistent parity");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn decode_data_with_verification_scopes_exact_quorum_to_lockstep() {
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(3, 2, 128, uses_legacy);
+            let data = b"verified reads must not accept reconstruction without a surplus source";
+            let encoded = erasure.encode_data(data).expect("encode should succeed");
+            let mut exact_quorum = optional_shards(&encoded);
+            exact_quorum[0] = None;
+            exact_quorum[erasure.total_shard_count() - 1] = None;
+
+            let mut default_shards = exact_quorum.clone();
+            erasure
+                .decode_data_with_reconstruction_verification(&mut default_shards)
+                .expect("default decode must preserve exact-quorum reconstruction");
+            assert_eq!(default_shards[0].as_deref(), Some(encoded[0].as_ref()));
+
+            let err = erasure
+                .decode_data_with_reconstruction_verification_for_lockstep(&mut exact_quorum)
+                .expect_err("data-shards-only lockstep must reject an exact decode quorum");
+
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("insufficient source shards"));
+        }
     }
 
     #[test]

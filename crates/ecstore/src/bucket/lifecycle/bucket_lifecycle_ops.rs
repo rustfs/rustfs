@@ -12195,7 +12195,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn tier_free_version_recovery_continues_after_deleted_marker_bucket() {
-        let (_paths, ecstore) = setup_test_env().await;
+        let (disk_paths, ecstore) = setup_test_env().await;
         let suffix = Uuid::new_v4().simple();
         let earlier_bucket = format!("zzzz-recovery-{suffix}-a");
         let deleted_marker = format!("zzzz-recovery-{suffix}-m");
@@ -12203,11 +12203,7 @@ mod tests {
         let later_object = "a-before-stale-marker";
         create_test_bucket(&ecstore, &earlier_bucket).await;
         create_test_bucket(&ecstore, &later_bucket).await;
-        let mut reader = PutObjReader::from_vec(b"cursor reset probe".to_vec());
-        ecstore
-            .put_object(&later_bucket, later_object, &mut reader, &ObjectOptions::default())
-            .await
-            .expect("successor bucket object should be created");
+        seed_recoverable_free_version(&disk_paths, &later_bucket, later_object, None, None).await;
 
         let page = list_tier_free_versions(
             Arc::clone(&ecstore),
@@ -12220,14 +12216,10 @@ mod tests {
         .expect("recovery should resume at the first bucket after a deleted marker bucket");
 
         assert_eq!(page.buckets_scanned, 1, "the later bucket must not be skipped");
-        assert_eq!(
-            page.scanned_entries, 1,
-            "the deleted bucket's object marker must not skip objects in the successor bucket"
-        );
-        ecstore
-            .delete_object(&later_bucket, later_object, ObjectOptions::default())
-            .await
-            .expect("successor bucket object should be removed");
+        assert_eq!(page.items.len(), 1, "the successor bucket's recoverable object must be returned");
+        assert_eq!(page.items[0].bucket, later_bucket);
+        assert_eq!(page.items[0].name, later_object);
+        remove_seeded_free_version(&disk_paths, &later_bucket, later_object).await;
         for bucket in [&earlier_bucket, &later_bucket] {
             ecstore
                 .delete_bucket(bucket, &DeleteBucketOptions::default())

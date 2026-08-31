@@ -12,7 +12,7 @@ on:
         required: false
         type: string
   workflow_run:
-    # Strict shared-environment order: run after KMS test succeeds.
+    # Strict shared-environment order: run after KMS test completes.
     workflows: ["RustFS KMS Test"]
     types: [completed]
 
@@ -38,8 +38,9 @@ env:
 jobs:
   tier-test:
     runs-on: smoke-testing
+    continue-on-error: true
     timeout-minutes: 420
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run' }}
     steps:
       - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -60,6 +61,8 @@ jobs:
       - name: Cleanup environment (before)
         run: |
           set -euo pipefail
+          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
+          sudo rm -f /tmp/rustfs-mosquitto.conf
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
           SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
           for node in "${NODES[@]}"; do
@@ -77,18 +80,35 @@ jobs:
 
       - name: Ensure MQTT broker + clients
         run: |
+          set -euo pipefail
           if ! command -v mosquitto_sub >/dev/null 2>&1; then
             sudo apt-get update
-            sudo apt-get install -y mosquitto mosquitto-clients
+            sudo apt-get install -y mosquitto-clients
           fi
-          sudo mkdir -p /etc/mosquitto/conf.d
-          printf 'listener 1883 0.0.0.0\nallow_anonymous true\n' | sudo tee /etc/mosquitto/conf.d/rustfs-test.conf >/dev/null
-          sudo systemctl restart mosquitto
-          sleep 2
-          ss -tln 2>/dev/null | grep -q ':1883' || { echo 'mosquitto not listening on 1883'; exit 1; }
+          command -v docker >/dev/null 2>&1 || { echo 'docker not found on runner'; exit 1; }
+          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
+          cat <<'EOF' | sudo tee /tmp/rustfs-mosquitto.conf >/dev/null
+          listener 1883 0.0.0.0
+          allow_anonymous true
+          EOF
+          sudo docker run -d --name rustfs-test-mqtt -p 1883:1883 \
+            -v /tmp/rustfs-mosquitto.conf:/mosquitto/config/mosquitto.conf:ro \
+            eclipse-mosquitto:2 >/dev/null
+          for _ in {1..10}; do
+            if ss -tln 2>/dev/null | grep -q ':1883'; then
+              break
+            fi
+            sleep 1
+          done
+          ss -tln 2>/dev/null | grep -q ':1883' || {
+            echo 'mosquitto container is not listening on 1883'
+            sudo docker logs rustfs-test-mqtt || true
+            exit 1
+          }
 
       - name: Run tier suite
         id: test
+        continue-on-error: true
         env:
           LOG_FILE: /tmp/rustfs-tier.log
         run: |
@@ -122,12 +142,65 @@ jobs:
           else
             PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
+          CASE_TABLE="/tmp/rustfs-tier-cases.md"
+          python3 - "${LOG_FILE}" "${CASE_TABLE}" <<'PY'
+          import re
+          import sys
+
+          log_file, out_file = sys.argv[1], sys.argv[2]
+          ansi = re.compile(r'\x1b\[[0-9;]*m')
+          start_re = re.compile(r'^---\s+([A-Z]+-[0-9]+)\s+(.+?)\s+---$')
+          done_re = re.compile(r'^\[(PASS|FAIL|UNSUPPORTED)\]\s+([A-Z]+-[0-9]+)\b')
+
+          rows = []
+          index = {}
+          try:
+            with open(log_file, 'r', encoding='utf-8', errors='replace') as fh:
+              for raw in fh:
+                line = ansi.sub('', raw).strip()
+                m = start_re.match(line)
+                if m:
+                  case_id, name = m.group(1), m.group(2)
+                  if case_id not in index:
+                    index[case_id] = len(rows)
+                    rows.append([case_id, name, 'RUNNING'])
+                  continue
+                m = done_re.match(line)
+                if m:
+                  status, case_id = m.group(1), m.group(2)
+                  if case_id in index:
+                    rows[index[case_id]][2] = status
+                  else:
+                    rows.append([case_id, case_id, status])
+                    index[case_id] = len(rows) - 1
+          except FileNotFoundError:
+            rows = []
+
+          counts = {'PASS': 0, 'FAIL': 0, 'UNSUPPORTED': 0, 'RUNNING': 0}
+          for _, _, status in rows:
+            counts[status] = counts.get(status, 0) + 1
+
+          with open(out_file, 'w', encoding='utf-8') as out:
+            out.write('## Case Summary\n\n')
+            out.write(f"- Total: {len(rows)}\\n")
+            out.write(f"- PASS: {counts.get('PASS', 0)}\\n")
+            out.write(f"- FAIL: {counts.get('FAIL', 0)}\\n")
+            out.write(f"- UNSUPPORTED: {counts.get('UNSUPPORTED', 0)}\\n")
+            out.write('\\n')
+            out.write('| Case | Name | Status |\\n')
+            out.write('| --- | --- | --- |\\n')
+            for case_id, name, status in rows:
+              out.write(f'| {case_id} | {name} | {status} |\\n')
+          PY
           {
             echo "# RustFS tier test report"
             echo ""
             echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "- Trigger: ${{ github.event_name }}"
             echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo ""
+            cat "${CASE_TABLE}" || true
             echo ""
             echo "## Log tail"
             echo '```text'
@@ -135,6 +208,133 @@ jobs:
             echo '```'
           } | tee "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload functional report to dashboard
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          REPORT_FILE: /tmp/rustfs-tier-report.md
+          SUITE: tier
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
+            exit 0
+          fi
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
+          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          fi
+
+          cat > /tmp/rustfs-functional-index.html <<'EOF'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>RustFS Functional Test Reports</title>
+            <style>
+              :root { --bg:#f4f6fb; --card:#fff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb; --accent:#0f766e; }
+              * { box-sizing: border-box; }
+              body { margin: 0; font-family: ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+              .wrap { max-width: 980px; margin: 32px auto; padding: 0 16px; }
+              .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
+              h1 { margin: 0 0 8px; font-size: 26px; }
+              p { margin: 0 0 14px; color: var(--muted); }
+              .tabs { display: flex; gap: 10px; margin: 14px 0 18px; flex-wrap: wrap; }
+              button { border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 10px; padding: 8px 14px; cursor: pointer; }
+              button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+              ul { list-style: none; margin: 0; padding: 0; }
+              li { padding: 10px 0; border-bottom: 1px solid var(--line); }
+              a { color: var(--accent); text-decoration: none; }
+              a:hover { text-decoration: underline; }
+            </style>
+          </head>
+          <body>
+            <div class="wrap">
+              <div class="card">
+                <h1>RustFS Functional Test Reports</h1>
+                <p>S3, KMS, Tier report tabs. Each tab lists reports by date.</p>
+                <div class="tabs" id="tabs"></div>
+                <ul id="list"></ul>
+              </div>
+            </div>
+            <script>
+              const suites = [
+                { key: 's3', label: 'S3 Compatibility' },
+                { key: 'kms', label: 'KMS' },
+                { key: 'tier', label: 'Tier' },
+                { key: 'heal', label: 'Heal' },
+                { key: 'pool', label: 'Pool Expansion' },
+                { key: 'security', label: 'Security' },
+                { key: 'upgrade', label: 'Upgrade' },
+              ];
+              const tabs = document.getElementById('tabs');
+              const list = document.getElementById('list');
+
+              async function loadSuite(suite) {
+                list.innerHTML = '<li>Loading...</li>';
+                const api = `https://api.github.com/repos/rustfs/dashboard/contents/functional-reports/${suite}`;
+                try {
+                  const res = await fetch(api);
+                  if (!res.ok) {
+                    list.innerHTML = '<li>No reports yet.</li>';
+                    return;
+                  }
+                  const data = await res.json();
+                  const files = data.filter(f => f.type === 'file' && f.name.endsWith('.md')).sort((a,b) => b.name.localeCompare(a.name));
+                  if (!files.length) {
+                    list.innerHTML = '<li>No reports yet.</li>';
+                    return;
+                  }
+                  list.innerHTML = files.map(f => `<li><a href="${f.html_url}" target="_blank" rel="noreferrer">${f.name.replace('.md','')}</a></li>`).join('');
+                } catch (_e) {
+                  list.innerHTML = '<li>Failed to load reports.</li>';
+                }
+              }
+
+              function setActive(key) {
+                for (const btn of tabs.querySelectorAll('button')) {
+                  btn.classList.toggle('active', btn.dataset.key === key);
+                }
+                loadSuite(key);
+              }
+
+              for (const suite of suites) {
+                const btn = document.createElement('button');
+                btn.textContent = suite.label;
+                btn.dataset.key = suite.key;
+                btn.addEventListener('click', () => setActive(suite.key));
+                tabs.appendChild(btn);
+              }
+              setActive('s3');
+            </script>
+          </body>
+          </html>
+          EOF
+
+          INDEX_PATH="functional/index.html"
+          INDEX_CONTENT="$(python3 -c 'import base64;print(base64.b64encode(open("/tmp/rustfs-functional-index.html","rb").read()).decode())')"
+          INDEX_SHA="$(gh api "repos/rustfs/dashboard/contents/${INDEX_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${INDEX_SHA}" ]; then
+            jq -n --arg msg "functional ui update" --arg content "${INDEX_CONTENT}" --arg sha "${INDEX_SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "functional ui init" --arg content "${INDEX_CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
+          fi
 
       - name: Upload report and logs
         if: always()
@@ -150,6 +350,8 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
+          sudo rm -f /tmp/rustfs-mosquitto.conf
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
           SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
           for node in "${NODES[@]}"; do

@@ -2241,6 +2241,7 @@ fn test_cache_save_timeout_uses_default_when_env_missing() {
             DataUsageCache::cache_save_timeout(),
             Duration::from_secs(rustfs_config::DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS)
         );
+        assert_eq!(DataUsageCache::persistence_timeout(), Duration::from_millis(52_350));
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }

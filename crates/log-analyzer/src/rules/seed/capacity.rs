@@ -75,13 +75,13 @@ pub(super) fn rules() -> Vec<Rule> {
         },
         Rule {
             evidence_fields: strings(["required", "target_free"]),
-            anchors: strings(["insufficient target pool capacity"]),
+            anchors: strings(["insufficient reserved physical target capacity"]),
             ..base(
                 "decom-capacity-insufficient",
                 P1Unavailable,
                 "capacity",
                 "pool 下线目标容量不足",
-                contains("insufficient target pool capacity"),
+                contains("insufficient reserved physical target capacity"),
                 "pool 下线迁移目标容量不足,decommission 无法开始。",
                 "先扩容目标 pool。",
             )

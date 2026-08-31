@@ -73,6 +73,7 @@ pub fn check_valid_bucket_name_strict(bucket_name: &str) -> Result<()> {
     check_bucket_name_common(bucket_name, true)
 }
 
+// RUSTFS_COMPAT_TODO(s3gate-metadata-xml): the s3s codec reads persisted XML during migration. Remove after every supported writer uses the gateway codec and every retained metadata object and backup archive is verified or rewritten.
 pub fn deserialize<T>(input: &[u8]) -> xml::DeResult<T>
 where
     T: for<'xml> xml::Deserialize<'xml>,

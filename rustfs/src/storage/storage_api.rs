@@ -125,9 +125,12 @@ pub(crate) mod access_consumer {
 }
 
 pub(crate) mod concurrency_consumer {
+    #[cfg(test)]
+    pub(crate) use super::super::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
     pub(crate) use super::super::concurrency::{
         ConcurrencyManager, DiskReadAdmission, ForegroundWriteAdmission, GetObjectGuard, IoQueueStatus, IoStrategy,
-        PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
+        PutObjectGuard, SNOWBALL_STAGING_BYTES_LIMIT, get_concurrency_aware_buffer_size, get_concurrency_manager,
+        get_put_concurrency_aware_buffer_size,
     };
 }
 
@@ -350,7 +353,7 @@ pub(crate) mod s3_api_consumer {
     }
 
     pub(crate) mod tagging {
-        pub(crate) use super::super::super::s3_api::tagging::resolve_copy_object_tags;
+        pub(crate) use super::super::super::s3_api::tagging::{parse_copy_object_tags, resolve_copy_object_tags};
     }
 }
 
@@ -539,7 +542,8 @@ pub(crate) mod ecstore_rpc {
         sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, sign_tonic_rpc_response_proof,
         tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
         verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature_with_bootstrap,
+        verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -593,8 +597,9 @@ pub(crate) mod ecstore_storage {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
-        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, all_local_disk, all_local_disk_path, find_local_disk_by_ref,
-        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
+        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk, all_local_disk_path,
+        find_local_disk_by_ref, init_local_disks_with_instance_ctx, init_lock_clients,
+        prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 
@@ -1301,14 +1306,6 @@ pub(crate) trait StorageDiskRpcExt {
     async fn list_volumes(&self) -> DiskResult<Vec<VolumeInfo>>;
     async fn make_volume(&self, volume: &str) -> DiskResult<()>;
     async fn make_volumes(&self, volume: Vec<&str>) -> DiskResult<()>;
-    async fn rename_data(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        file_info: &rustfs_filemeta::FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-    ) -> DiskResult<RenameDataResp>;
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
     async fn read_file(&self, volume: &str, path: &str) -> DiskResult<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> DiskResult<FileReader>;
@@ -1450,17 +1447,6 @@ where
 
     async fn make_volumes(&self, volume: Vec<&str>) -> DiskResult<()> {
         ecstore_disk::DiskAPI::make_volumes(self, volume).await
-    }
-
-    async fn rename_data(
-        &self,
-        src_volume: &str,
-        src_path: &str,
-        file_info: &rustfs_filemeta::FileInfo,
-        dst_volume: &str,
-        dst_path: &str,
-    ) -> DiskResult<RenameDataResp> {
-        ecstore_disk::DiskAPI::rename_data(self, src_volume, src_path, file_info.clone(), dst_volume, dst_path).await
     }
 
     async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {
@@ -1920,6 +1906,13 @@ pub(crate) fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>,
 
 pub(crate) fn verify_tonic_mutation_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
     ecstore_rpc::verify_tonic_mutation_body_digest(request, canonical_body)
+}
+
+pub(crate) fn verify_tonic_mutation_body_digest_reject_unsigned<T>(
+    request: &tonic::Request<T>,
+    canonical_body: &[u8],
+) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_mutation_body_digest_reject_unsigned(request, canonical_body)
 }
 
 #[cfg(test)]

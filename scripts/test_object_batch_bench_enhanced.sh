@@ -23,7 +23,9 @@ trap cleanup EXIT
   --duration 1s \
   --out-dir "$OUT_DIR" \
   --warp-bin true \
+  --warp-mode put \
   --dry-run \
+  --after-probe \
   --service-metrics-dir "${OUT_DIR}/metrics" \
   --server-image-ref rustfs/rustfs:bench \
   --server-image-digest sha256:0123456789abcdef \
@@ -32,6 +34,10 @@ trap cleanup EXIT
   --label topology=4x2 \
   --label workload=get \
   --node-metrics-url node1=http://127.0.0.1:9001/metrics \
+  --node-ssh-target node1=localhost \
+  --node-ssh-identity-file /tmp/nonexistent-key \
+  --node-ssh-timeout-secs 7 \
+  --require-node-telemetry \
   --node-docker-container node1=rustfs-bench-1 >/dev/null
 
 rg -qx 'server_image_ref=rustfs/rustfs:bench' "${OUT_DIR}/run_manifest.env"
@@ -43,6 +49,29 @@ rg -qx 'run_label_workload=get' "${OUT_DIR}/run_manifest.env"
 rg -q '^node1,rustfs-bench-1,not_run_dry_run,N/A,N/A,N/A,N/A$' "${OUT_DIR}/node_inventory.csv"
 rg -q '^1MiB,warp,1,1,before,node1,not_run_dry_run,' "${OUT_DIR}/node_metrics_captures.csv"
 rg -q '^1MiB,warp,1,1,after,node1,rustfs-bench-1,not_run_dry_run,' "${OUT_DIR}/node_resource_captures.csv"
+rg -qx 'after_probe=true' "${OUT_DIR}/run_manifest.env"
+rg -qx 'node_ssh_identity_file=/tmp/nonexistent-key' "${OUT_DIR}/run_manifest.env"
+rg -qx 'node_ssh_timeout_secs=7' "${OUT_DIR}/run_manifest.env"
+rg -qx 'require_node_telemetry=true' "${OUT_DIR}/run_manifest.env"
+rg -q '^1MiB,warp,1,1,before,node1,localhost,not_run_dry_run,' "${OUT_DIR}/node_telemetry_captures.csv"
+rg -q '^1MiB,warp,1,1,not_run_dry_run,rustfs-bench,N/A,1048576,N/A,N/A,N/A,N/A,N/A,dry_run$' "${OUT_DIR}/after_probe.csv"
+
+"$RUNNER" \
+  --tool warp \
+  --endpoint http://127.0.0.1:9000 \
+  --access-key test-access \
+  --secret-key test-secret \
+  --sizes 1MB \
+  --rounds 1 \
+  --retry-per-round 1 \
+  --cooldown-secs 0 \
+  --duration 1s \
+  --out-dir "${TMP_DIR}/decimal-size" \
+  --warp-bin true \
+  --warp-mode put \
+  --dry-run \
+  --after-probe >/dev/null
+rg -q '^1MB,warp,1,1,not_run_dry_run,rustfs-bench,N/A,1000000,N/A,N/A,N/A,N/A,N/A,dry_run$' "${TMP_DIR}/decimal-size/after_probe.csv"
 
 if "$RUNNER" \
   --tool warp \

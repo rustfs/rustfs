@@ -412,8 +412,14 @@ pub(crate) fn require_bucket_metadata_sys_in(
 }
 
 pub(crate) async fn object_store_in(ctx: &crate::runtime::instance::InstanceContext) -> Result<Arc<ECStore>> {
-    let sys = bucket_metadata_sys_of(ctx)?;
-    Ok(sys.read().await.api.clone())
+    object_store_if_initialized_in(ctx)
+        .await
+        .ok_or_else(|| Error::other("bucket metadata sys not initialized for this instance"))
+}
+
+pub(crate) async fn object_store_if_initialized_in(ctx: &crate::runtime::instance::InstanceContext) -> Option<Arc<ECStore>> {
+    let sys = ctx.bucket_metadata_sys().or_else(get_global_bucket_metadata_sys)?;
+    Some(sys.read().await.api.clone())
 }
 
 pub(crate) async fn get_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<Arc<BucketMetadata>> {
@@ -2512,10 +2518,168 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::isolated_store_over_temp_disks;
     use super::*;
+    use crate::bucket::metadata::{
+        BUCKET_ACCELERATE_CONFIG, BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_NOTIFICATION_CONFIG,
+        BUCKET_POLICY_CONFIG, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG,
+        BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, OBJECT_LOCK_CONFIG,
+    };
     use crate::bucket::target::{BucketTarget, BucketTargetType, Credentials};
+    use crate::config::com::read_config;
     use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+    use byteorder::{ByteOrder as _, LittleEndian};
     use serial_test::serial;
     use tokio::time::timeout;
+
+    const NEW_WRITER_REPLICATION_XML: &[u8] = br#"<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Role>arn:aws:iam::111122223333:role/replication-role</Role><Rule><ID>rollback</ID><Priority>1</Priority><Filter><Prefix>documents/</Prefix></Filter><Status>Enabled</Status><Destination><Bucket>arn:aws:s3:::replica-bucket</Bucket></Destination><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication></Rule></ReplicationConfiguration>"#;
+
+    const NEW_WRITER_CONFIGS: [(&str, &[u8]); 14] = [
+        (BUCKET_POLICY_CONFIG, br#"{"Version":"2012-10-17","Statement":[]}"#),
+        (BUCKET_NOTIFICATION_CONFIG, br#"<NotificationConfiguration/>"#),
+        (
+            BUCKET_LIFECYCLE_CONFIG,
+            br#"<LifecycleConfiguration><Rule><ID>expire</ID><Status>Enabled</Status><Filter><Prefix>logs/</Prefix></Filter><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"#,
+        ),
+        (
+            OBJECT_LOCK_CONFIG,
+            br#"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>7</Days></DefaultRetention></Rule></ObjectLockConfiguration>"#,
+        ),
+        (
+            BUCKET_VERSIONING_CONFIG,
+            br#"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"#,
+        ),
+        (
+            BUCKET_SSECONFIG,
+            br#"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>"#,
+        ),
+        (
+            BUCKET_TAGGING_CONFIG,
+            r#"<Tagging><TagSet><Tag><Key>environment</Key><Value>测试-🦀</Value></Tag></TagSet></Tagging>"#.as_bytes(),
+        ),
+        (BUCKET_REPLICATION_CONFIG, NEW_WRITER_REPLICATION_XML),
+        (
+            BUCKET_CORS_CONFIG,
+            br#"<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>https://example.test</AllowedOrigin></CORSRule></CORSConfiguration>"#,
+        ),
+        (BUCKET_LOGGING_CONFIG, br#"<BucketLoggingStatus/>"#),
+        (
+            BUCKET_WEBSITE_CONFIG,
+            br#"<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>"#,
+        ),
+        (
+            BUCKET_ACCELERATE_CONFIG,
+            br#"<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>"#,
+        ),
+        (
+            BUCKET_REQUEST_PAYMENT_CONFIG,
+            br#"<RequestPaymentConfiguration><Payer>Requester</Payer></RequestPaymentConfiguration>"#,
+        ),
+        (
+            BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG,
+            br#"<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>"#,
+        ),
+    ];
+
+    #[tokio::test]
+    async fn g_d3_003_new_writer_replication_loads_without_fail_closed_state() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "rollback-new-replication";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("rollback fixture bucket should be created");
+        }
+
+        let writer = BucketMetadataSys::new(store.clone());
+        let mut metadata = BucketMetadata::new(bucket);
+        metadata
+            .update_config(BUCKET_REPLICATION_CONFIG, NEW_WRITER_REPLICATION_XML.to_vec())
+            .expect("new-writer replication XML should be accepted before persistence");
+        writer
+            .persist_new_and_set(metadata)
+            .await
+            .expect("new-writer replication metadata should persist");
+
+        let old_reader = BucketMetadataSys::new(store);
+        let (loaded, _) = old_reader
+            .get_replication_config(bucket)
+            .await
+            .expect("old metadata_sys must not classify new-writer replication XML as invalid");
+        assert_eq!(loaded.role, "arn:aws:iam::111122223333:role/replication-role");
+        assert_eq!(loaded.rules.len(), 1);
+        assert_eq!(loaded.rules[0].id.as_deref(), Some("rollback"));
+    }
+
+    #[tokio::test]
+    async fn g_d3_004_new_writer_metadata_blob_keeps_legacy_header_and_configs() {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "rollback-new-metadata";
+        for dir in &dirs {
+            std::fs::create_dir_all(dir.path().join(bucket)).expect("rollback fixture bucket should be created");
+        }
+
+        let writer = BucketMetadataSys::new(store.clone());
+        let mut metadata = BucketMetadata::new(bucket);
+        for (config_file, bytes) in NEW_WRITER_CONFIGS {
+            metadata
+                .update_config(config_file, bytes.to_vec())
+                .unwrap_or_else(|err| panic!("new-writer {config_file} fixture must be valid: {err}"));
+        }
+        writer
+            .persist_new_and_set(metadata)
+            .await
+            .expect("new-writer metadata should persist");
+
+        let path = BucketMetadata::new(bucket).save_file_path();
+        let blob = read_config(store.clone(), &path)
+            .await
+            .expect("persisted .metadata.bin should be readable");
+        assert_eq!(
+            LittleEndian::read_u16(&blob[0..2]),
+            1,
+            "bucket metadata format must stay rollback-readable"
+        );
+        assert_eq!(
+            LittleEndian::read_u16(&blob[2..4]),
+            1,
+            "bucket metadata version must stay rollback-readable"
+        );
+
+        let loaded = load_bucket_metadata(store, bucket)
+            .await
+            .expect("old read_bucket_metadata path must load the new-writer blob");
+        let loaded_configs: [(&str, &[u8]); 14] = [
+            (BUCKET_POLICY_CONFIG, &loaded.policy_config_json),
+            (BUCKET_NOTIFICATION_CONFIG, &loaded.notification_config_xml),
+            (BUCKET_LIFECYCLE_CONFIG, &loaded.lifecycle_config_xml),
+            (OBJECT_LOCK_CONFIG, &loaded.object_lock_config_xml),
+            (BUCKET_VERSIONING_CONFIG, &loaded.versioning_config_xml),
+            (BUCKET_SSECONFIG, &loaded.encryption_config_xml),
+            (BUCKET_TAGGING_CONFIG, &loaded.tagging_config_xml),
+            (BUCKET_REPLICATION_CONFIG, &loaded.replication_config_xml),
+            (BUCKET_CORS_CONFIG, &loaded.cors_config_xml),
+            (BUCKET_LOGGING_CONFIG, &loaded.logging_config_xml),
+            (BUCKET_WEBSITE_CONFIG, &loaded.website_config_xml),
+            (BUCKET_ACCELERATE_CONFIG, &loaded.accelerate_config_xml),
+            (BUCKET_REQUEST_PAYMENT_CONFIG, &loaded.request_payment_config_xml),
+            (BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, &loaded.public_access_block_config_xml),
+        ];
+        for ((expected_name, expected), (loaded_name, actual)) in NEW_WRITER_CONFIGS.into_iter().zip(loaded_configs) {
+            assert_eq!(loaded_name, expected_name);
+            assert_eq!(actual, expected, "old read_bucket_metadata changed {expected_name} bytes");
+        }
+        assert!(loaded.policy_config.is_some());
+        assert!(loaded.notification_config.is_some());
+        assert!(loaded.lifecycle_config.is_some());
+        assert!(loaded.object_lock_config.is_some());
+        assert!(loaded.versioning_config.is_some());
+        assert!(loaded.sse_config.is_some());
+        assert!(loaded.tagging_config.is_some());
+        assert!(loaded.replication_config.is_some());
+        assert!(loaded.cors_config.is_some());
+        assert!(loaded.logging_config.is_some());
+        assert!(loaded.website_config.is_some());
+        assert!(loaded.accelerate_config.is_some());
+        assert!(loaded.request_payment_config.is_some());
+        assert!(loaded.public_access_block_config.is_some());
+    }
 
     #[tokio::test]
     async fn malformed_delete_configs_are_not_treated_as_absent() {

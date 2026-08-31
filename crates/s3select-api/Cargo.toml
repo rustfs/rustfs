@@ -60,21 +60,26 @@ hotpath-cpu = [
 [dependencies]
 hotpath.workspace = true
 metrics = { workspace = true }
+async-compression = { workspace = true, features = ["tokio", "gzip", "bzip2"] }
 async-trait.workspace = true
+arc-swap.workspace = true
 bytes = { workspace = true, features = ["serde"] }
 chrono = { workspace = true, features = ["serde"] }
+crc-fast.workspace = true
 rustfs-common.workspace = true
 datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 rustfs-ecstore.workspace = true
 rustfs-storage-api.workspace = true
 futures = { workspace = true }
 futures-core = { workspace = true }
+flate2.workspace = true
 http.workspace = true
 s3s = { workspace = true, features = ["minio"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 parking_lot.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread"] }
+tokio-stream.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
 tracing.workspace = true
 uuid.workspace = true

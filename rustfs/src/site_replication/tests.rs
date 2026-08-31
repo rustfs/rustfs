@@ -419,7 +419,279 @@ fn drain_event(peer: &str, path: &str, retry_count: u32, updated_at: Option<Offs
         last_error: "remote-operation-failed".to_string(),
         updated_at,
         edit_generation: None,
+        deletions_recorded: false,
     }
+}
+
+fn user_delete_item(access_key: &str) -> SRIAMItem {
+    SRIAMItem {
+        r#type: "iam-user".to_string(),
+        iam_user: Some(rustfs_madmin::SRIAMUser {
+            access_key: access_key.to_string(),
+            is_delete_req: true,
+            user_req: None,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        }),
+        updated_at: Some(OffsetDateTime::now_utc()),
+        ..Default::default()
+    }
+}
+
+fn policy_delete_item(name: &str) -> SRIAMItem {
+    SRIAMItem {
+        r#type: "policy".to_string(),
+        name: name.to_string(),
+        policy: None,
+        updated_at: Some(OffsetDateTime::now_utc()),
+        ..Default::default()
+    }
+}
+
+fn deletion_replay_state(peer: &PeerInfo) -> SiteReplicationState {
+    let mut state = SiteReplicationState::default();
+    state.peers.insert(peer.deployment_id.clone(), peer.clone());
+    state
+}
+
+/// Deletion-shaped IAM items get an entity key (and hence a replay record);
+/// creations and updates are covered by the snapshot resend and get none.
+#[test]
+fn test_iam_item_deletion_entity_shapes() {
+    assert_eq!(iam_item_deletion_entity(&user_delete_item("alice")).as_deref(), Some("iam-user:alice"));
+    assert_eq!(
+        iam_item_deletion_entity(&policy_delete_item("readonly")).as_deref(),
+        Some("policy:readonly")
+    );
+
+    let group_remove = SRIAMItem {
+        r#type: "group-info".to_string(),
+        group_info: Some(SRGroupInfo {
+            update_req: GroupAddRemove {
+                group: "devs".to_string(),
+                members: vec!["bob".to_string(), "alice".to_string()],
+                status: GroupStatus::Enabled,
+                is_remove: true,
+            },
+            api_version: None,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        iam_item_deletion_entity(&group_remove).as_deref(),
+        Some("group-remove:devs:alice,bob"),
+        "member set must be part of the key so distinct removals do not collapse"
+    );
+
+    let mapping_clear = SRIAMItem {
+        r#type: "policy-mapping".to_string(),
+        policy_mapping: Some(SRPolicyMapping {
+            user_or_group: "alice".to_string(),
+            user_type: 0,
+            is_group: false,
+            policy: String::new(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(iam_item_deletion_entity(&mapping_clear).as_deref(), Some("policy-mapping:alice:0:false"));
+
+    let svc_acc_delete = SRIAMItem {
+        r#type: "service-account".to_string(),
+        svc_acc_change: Some(rustfs_madmin::SRSvcAccChange {
+            delete: Some(rustfs_madmin::SRSvcAccDelete {
+                access_key: "svc-1".to_string(),
+                api_version: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(iam_item_deletion_entity(&svc_acc_delete).as_deref(), Some("svc-acc:svc-1"));
+
+    // Creations/updates carry no deletion entity.
+    let mut user_create = user_delete_item("alice");
+    user_create.iam_user.as_mut().expect("iam user").is_delete_req = false;
+    assert!(iam_item_deletion_entity(&user_create).is_none());
+    let mut policy_set = policy_delete_item("readonly");
+    policy_set.policy = Some(serde_json::json!({"Version": "2012-10-17"}));
+    assert!(iam_item_deletion_entity(&policy_set).is_none());
+}
+
+/// A failed deletion delivery persists a replay record next to the collapsed
+/// retry entry; a fresh entry is stamped `deletions_recorded` so a later
+/// replay can settle it, and a repeated deletion of the same entity keeps the
+/// newest body instead of growing the list.
+#[test]
+fn test_record_failed_iam_delivery_records_deletions_and_flags_entry() {
+    let target = PeerInfo {
+        deployment_id: "remote-dep".to_string(),
+        ..peer("remote", "https://remote.example.com")
+    };
+    let mut state = deletion_replay_state(&target);
+
+    // Non-deletion failure: entry flagged, no record.
+    let mut user_update = user_delete_item("alice");
+    user_update.iam_user.as_mut().expect("iam user").is_delete_req = false;
+    record_failed_iam_delivery(&mut state, &target, &user_update, "peer offline");
+    assert_eq!(state.retry_queue.len(), 1);
+    assert_eq!(state.retry_queue[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+    assert!(state.retry_queue[0].deletions_recorded);
+    assert!(state.iam_deletion_replays.is_empty());
+
+    // Deletion failure: recorded for replay, entry stays flagged.
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    assert_eq!(state.iam_deletion_replays.len(), 1);
+    assert_eq!(state.iam_deletion_replays[0].entity, "iam-user:alice");
+    assert!(state.retry_queue[0].deletions_recorded);
+    assert_eq!(state.retry_queue.len(), 1, "IAM failures stay collapsed per peer");
+
+    // Same entity again: newest body replaces the record.
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    assert_eq!(state.iam_deletion_replays.len(), 1);
+
+    // Different entity: second record.
+    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("readonly"), "peer offline");
+    assert_eq!(state.iam_deletion_replays.len(), 2);
+
+    // A legacy entry (created without recording) is never stamped.
+    let legacy = PeerInfo {
+        deployment_id: "legacy-dep".to_string(),
+        ..peer("legacy", "https://legacy.example.com")
+    };
+    state.peers.insert(legacy.deployment_id.clone(), legacy.clone());
+    upsert_site_replication_retry_event(
+        &mut state.retry_queue,
+        &legacy,
+        SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH,
+        "peer offline",
+        None,
+    );
+    record_failed_iam_delivery(&mut state, &legacy, &user_delete_item("bob"), "peer offline");
+    let legacy_event = state
+        .retry_queue
+        .iter()
+        .find(|event| event.peer_deployment_id == legacy.deployment_id)
+        .expect("legacy entry");
+    assert!(
+        !legacy_event.deletions_recorded,
+        "an entry that predates recording may hide an unrecorded deletion"
+    );
+}
+
+/// Overflowing the per-peer record cap degrades the entry back to the
+/// escalation semantics: the record set is no longer complete, so a replay
+/// can no longer prove the peer converged.
+#[test]
+fn test_record_failed_iam_delivery_overflow_degrades_to_escalation() {
+    let target = PeerInfo {
+        deployment_id: "remote-dep".to_string(),
+        ..peer("remote", "https://remote.example.com")
+    };
+    let mut state = deletion_replay_state(&target);
+    for index in 0..SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER {
+        record_failed_iam_delivery(&mut state, &target, &policy_delete_item(&format!("p{index}")), "peer offline");
+    }
+    assert!(state.retry_queue[0].deletions_recorded);
+    assert_eq!(state.iam_deletion_replays.len(), SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER);
+
+    record_failed_iam_delivery(&mut state, &target, &policy_delete_item("one-too-many"), "peer offline");
+    assert_eq!(
+        state.iam_deletion_replays.len(),
+        SITE_REPLICATION_IAM_DELETION_REPLAY_LIMIT_PER_PEER,
+        "the list stays bounded"
+    );
+    assert!(
+        !state.retry_queue[0].deletions_recorded,
+        "an overflowed record set can no longer settle the entry"
+    );
+}
+
+/// After a successful deletion replay plus a stable snapshot resend, a
+/// fully-recorded entry settles (entry and replayed records removed); an
+/// unrecorded entry escalates as before, and a failure stamped after the
+/// snapshot keeps the entry drain-eligible.
+#[test]
+fn test_settle_replayed_iam_retry_events_settles_or_escalates() {
+    let target = PeerInfo {
+        deployment_id: "remote-dep".to_string(),
+        ..peer("remote", "https://remote.example.com")
+    };
+    let snapshot_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+
+    // Fully recorded: settles.
+    let mut state = deletion_replay_state(&target);
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    state.retry_queue[0].updated_at = Some(snapshot_at);
+    let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
+    assert!(settle_replayed_iam_retry_events(
+        &mut state,
+        &target,
+        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+        Some(snapshot_at),
+        &replayed,
+    ));
+    assert!(state.retry_queue.is_empty());
+    assert!(state.iam_deletion_replays.is_empty());
+
+    // Not fully recorded: replayed records are still removed, but the entry
+    // escalates instead of settling.
+    let mut state = deletion_replay_state(&target);
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    state.retry_queue[0].updated_at = Some(snapshot_at);
+    state.retry_queue[0].deletions_recorded = false;
+    let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
+    assert!(!settle_replayed_iam_retry_events(
+        &mut state,
+        &target,
+        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+        Some(snapshot_at),
+        &replayed,
+    ));
+    assert!(state.iam_deletion_replays.is_empty());
+    assert_eq!(state.retry_queue.len(), 1);
+    assert_eq!(state.retry_queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
+
+    // Newer failure since the snapshot: entry untouched and drain-eligible,
+    // residual (unreplayed) record kept for the next pass.
+    let mut state = deletion_replay_state(&target);
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("alice"), "peer offline");
+    let replayed: Vec<String> = state.iam_deletion_replays.iter().map(|record| record.id.clone()).collect();
+    record_failed_iam_delivery(&mut state, &target, &user_delete_item("bob"), "peer offline");
+    state.retry_queue[0].updated_at = Some(snapshot_at + time::Duration::seconds(5));
+    assert!(!settle_replayed_iam_retry_events(
+        &mut state,
+        &target,
+        SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+        Some(snapshot_at),
+        &replayed,
+    ));
+    assert_eq!(state.retry_queue.len(), 1);
+    assert_ne!(state.retry_queue[0].last_error, SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER);
+    assert!(
+        classify_site_replication_retry_event(&state.retry_queue[0]).is_some(),
+        "the newer failure must stay drain-eligible"
+    );
+    assert_eq!(state.iam_deletion_replays.len(), 1);
+    assert_eq!(state.iam_deletion_replays[0].entity, "iam-user:bob");
+}
+
+/// Merging legacy wire-path rows into the collapsed entry must not launder an
+/// unrecorded deletion into a settleable entry.
+#[test]
+fn test_normalize_collapsed_paths_taints_merged_deletion_recording() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let mut recorded = drain_event("remote-dep", SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH, 1, Some(now));
+    recorded.deletions_recorded = true;
+    let legacy = drain_event(
+        "remote-dep",
+        "/rustfs/admin/v3/site-replication/peer/iam-item",
+        2,
+        Some(now + time::Duration::seconds(5)),
+    );
+    let mut queue = vec![recorded, legacy];
+    assert!(normalize_collapsed_retry_queue_paths(&mut queue));
+    assert_eq!(queue.len(), 1);
+    assert!(!queue[0].deletions_recorded, "a merged legacy row may hide an unrecorded deletion");
 }
 
 /// P1-3 red-light: the drain must only ever act on deliveries it can
@@ -588,6 +860,59 @@ fn test_actionable_site_replication_retry_events_filters() {
     let actionable = actionable_site_replication_retry_events(&state, now);
     assert_eq!(actionable.len(), 1, "only the due, replayable, known-peer event is actionable");
     assert_eq!(actionable[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
+}
+
+/// The deferred subset is the probe's territory: replayable events held back
+/// only by backoff, at least one base interval after their last failure. A
+/// recovered peer's bucket-op stuck behind a 2400s+ backoff (the round-four
+/// R1.6 shape: three outage-window failures, then a 900s test window) must
+/// appear here so the probe can promote it at the first tick.
+#[test]
+fn test_deferred_site_replication_retry_events_partition() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let mut state = SiteReplicationState::default();
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+    let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+    state.retry_queue = vec![
+        // retry_count 3 => 2400s backoff; failed 700s ago: deferred.
+        drain_event("remote", bucket_make, 3, Some(now - time::Duration::seconds(700))),
+        // Failed less than one base interval ago: neither due nor probed.
+        drain_event(
+            "remote",
+            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+            3,
+            Some(now - time::Duration::seconds(300)),
+        ),
+        // Past its own backoff: actionable, not deferred.
+        drain_event(
+            "remote",
+            "/rustfs/admin/v3/site-replication/peer/bucket-meta",
+            1,
+            Some(now - time::Duration::seconds(700)),
+        ),
+        // Unknown peer: never probed.
+        drain_event("gone", bucket_make, 3, Some(now - time::Duration::seconds(700))),
+    ];
+    // Escalated marker: not replayable, never probed.
+    let mut escalated = drain_event(
+        "remote",
+        SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH,
+        3,
+        Some(now - time::Duration::seconds(700)),
+    );
+    escalated.last_error = SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER.to_string();
+    state.retry_queue.push(escalated);
+
+    let deferred = deferred_site_replication_retry_events(&state, now);
+    assert_eq!(deferred.len(), 1, "only the backed-off, replayable, known-peer event defers");
+    assert_eq!(deferred[0].path, bucket_make);
+
+    let actionable = actionable_site_replication_retry_events(&state, now);
+    assert_eq!(actionable.len(), 1);
+    assert_eq!(actionable[0].path, "/rustfs/admin/v3/site-replication/peer/bucket-meta");
 }
 
 /// The drain settles a peer-edit success under a freshly allocated
