@@ -48,14 +48,15 @@ use super::super::{
     ObjectPartInfo, OffsetDateTime, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RawFileInfo, ReadMultipleReq,
     ReadMultipleResp, ReadOptions, Result, SLASH_SEPARATOR, STORAGE_FORMAT_FILE, SetDisks, SnapshotLeaseToken, StorageError,
     UpdateMetadataOpts, Uuid, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
-    capacity_scope_from_disks, coding, collect_inline_data_shard_fileinfos_by_index_or_reason, current_dirty_generation, debug,
-    disk, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info, inline_erasure_shard_file_offset,
-    inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found, is_get_metadata_data_read_early_stop_enabled,
-    is_get_metadata_early_stop_bounded_fanout_enabled, is_get_metadata_early_stop_enabled,
-    is_get_metadata_non_inline_data_read_early_stop_enabled, is_object_dangling, is_version_early_stop_enabled,
-    issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure, merge_file_meta_versions, path_join_buf,
-    record_global_dirty_scope, reduce_read_quorum_errs, reduce_write_quorum_errs, send_heal_request_with_admission,
-    should_prevent_write, to_object_err, try_read_inline_data_shards_direct, warn,
+    capacity_scope_from_disks, codec_streaming_rollout_applies, coding, collect_inline_data_shard_fileinfos_by_index_or_reason,
+    current_dirty_generation, debug, disk, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info,
+    inline_erasure_shard_file_offset, inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found,
+    is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
+    is_get_metadata_early_stop_enabled, is_get_metadata_non_inline_data_read_early_stop_enabled, is_object_dangling,
+    is_version_early_stop_enabled, issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure,
+    merge_file_meta_versions, object_fits_single_block, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs,
+    reduce_write_quorum_errs, send_heal_request_with_admission, should_prevent_write, to_object_err,
+    try_read_inline_data_shards_direct, warn,
 };
 #[cfg(test)]
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
@@ -1132,7 +1133,7 @@ fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Op
     None
 }
 
-fn non_inline_data_read_candidate_is_safe(candidate: &FileInfo) -> bool {
+pub(in crate::set_disk) fn non_inline_data_read_candidate_is_safe(candidate: &FileInfo) -> bool {
     if candidate.inline_data()
         || candidate.is_compressed()
         || candidate.is_remote()
@@ -1145,6 +1146,16 @@ fn non_inline_data_read_candidate_is_safe(candidate: &FileInfo) -> bool {
         return false;
     }
     candidate.has_valid_erasure_geometry()
+}
+
+pub(in crate::set_disk) fn late_materialization_candidate_is_safe(candidate: &FileInfo) -> bool {
+    non_inline_data_read_candidate_is_safe(candidate)
+        && candidate.size > 512 * 1024
+        && object_fits_single_block(candidate.size, candidate.erasure.block_size)
+}
+
+pub(in crate::set_disk) fn non_inline_data_read_early_stop_allowed(read_data: bool, bucket: &str, object: &str) -> bool {
+    read_data && is_get_metadata_non_inline_data_read_early_stop_enabled() && !codec_streaming_rollout_applies(bucket, object)
 }
 
 const NON_INLINE_SINGLE_PENDING_HEDGE_DELAY: Duration = Duration::from_millis(100);
@@ -2931,7 +2942,7 @@ impl SetDisks {
                 read_data,
                 healing,
                 incl_free_versions,
-                read_data && is_get_metadata_non_inline_data_read_early_stop_enabled(),
+                non_inline_data_read_early_stop_allowed(read_data, bucket, object),
                 default_parity_count,
                 allow_coalescing,
             )
@@ -7021,6 +7032,27 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    #[serial_test::serial(codec_streaming_env)]
+    fn non_inline_early_stop_is_mutually_exclusive_with_codec_rollout() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_ROLLOUT", Some("on")),
+                ("RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED", Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED", Some("true")),
+            ],
+            || assert!(!non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
+        );
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_ROLLOUT", Some("off")),
+            ],
+            || assert!(non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
+        );
+    }
 
     #[tokio::test]
     async fn scanner_delete_owner_survives_waiter_cancellation() {
