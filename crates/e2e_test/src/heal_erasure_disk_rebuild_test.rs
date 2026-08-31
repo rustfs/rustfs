@@ -691,6 +691,27 @@ mod tests {
             .find(|index| !outage_peer_erasure_indices.contains(index))
             .ok_or("online outage-object shards leave no erasure index for the replacement target")?;
 
+        // The PUT path may have admitted a direct Internal object repair while
+        // node 1 was offline. Cancel the isolated bucket path before the target
+        // returns; otherwise it could rebuild the outage object and invalidate
+        // the explicit-root ownership assertion below.
+        let cancel_outage_heal_path = format!("/rustfs/admin/v3/heal/{bucket}?forceStop=true");
+        let (cancel_status, cancel_body) = admin_request(
+            &cluster.nodes[0].url,
+            Method::POST,
+            &cancel_outage_heal_path,
+            Some(
+                r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#
+                    .to_string(),
+            ),
+            &cluster.access_key,
+            &cluster.secret_key,
+        )
+        .await?;
+        if !cancel_status.is_success() {
+            return Err(format!("cancel outage heal failed: {cancel_status} {cancel_body}").into());
+        }
+
         cluster.start_node(1).await?;
 
         let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
