@@ -2142,8 +2142,16 @@ mod tests {
                     },
                 )
                 .await?;
-            crate::data_movement::migrate_decommission_object(migration_store, 0, migration_bucket, source_reader, None, op_label)
-                .await
+            crate::data_movement::migrate_decommission_object(
+                migration_store,
+                0,
+                migration_bucket,
+                source_reader,
+                None,
+                op_label,
+                None,
+            )
+            .await
         });
         barrier.wait_until_paused().await;
         barrier.release();

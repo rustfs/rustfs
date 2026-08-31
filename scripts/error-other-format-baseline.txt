@@ -26,7 +26,7 @@
 10|crates/ecstore/src/cluster/rpc/remote_disk.rs
 6|crates/ecstore/src/config/com.rs
 14|crates/ecstore/src/config/storageclass.rs
-185|crates/ecstore/src/core/pools.rs
+183|crates/ecstore/src/core/pools.rs
 8|crates/ecstore/src/data_movement/mod.rs
 2|crates/ecstore/src/data_usage/local_snapshot.rs
 12|crates/ecstore/src/data_usage/mod.rs

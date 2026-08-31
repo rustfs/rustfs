@@ -395,7 +395,7 @@ impl DefaultObjectUsecase {
         // with that key (for example, copying `bucket/bucket` onto itself).
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
-        if cp_src_dst_same && key == bucket && expected_current_version_id.is_none() {
+        if cp_src_dst_same && key == bucket {
             dst_opts.object_lock_config_snapshot =
                 Some(store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?);
         }
@@ -405,7 +405,11 @@ impl DefaultObjectUsecase {
                 .map_err(ApiError::from)?,
         );
 
-        let _self_copy_lock_guard = if cp_src_dst_same && expected_current_version_id.is_none() {
+        // Hold the self-copy namespace write lock before opening the source reader, including
+        // expected-current historical copies. With lock optimization disabled, the source
+        // stream retains its read guard until EOF; taking the write lock later in ECStore
+        // would self-deadlock before the copy can consume that stream.
+        let _self_copy_lock_guard = if cp_src_dst_same {
             let guard = acquire_self_copy_namespace_lock(store.as_ref(), &bucket, &key).await?;
             src_opts.no_lock = true;
             src_get_opts.no_lock = true;
@@ -1159,6 +1163,129 @@ mod tests {
         let err = Box::pin(usecase.execute_copy_object(req)).await.unwrap_err();
         // Must not be rejected by the self-copy guard; it fails later at store init instead.
         assert_ne!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_copy_object_expected_current_historical_self_copy_releases_reader_before_write() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        if current_app_context().is_none() {
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        }
+        let ambient = current_app_context().expect("expected-current copy test requires an AppContext");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("copy-current-lock-{}", Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned copy test bucket should be created");
+
+        const STREAMING_TEST_BODY_SIZE: usize = 256 * 1024;
+        let historical_body = vec![b'h'; STREAMING_TEST_BODY_SIZE];
+        let current_body = vec![b'c'; STREAMING_TEST_BODY_SIZE];
+        let mut old_reader = PutObjReader::from_vec(historical_body.clone());
+        let old = store
+            .put_object(
+                &bucket,
+                object,
+                &mut old_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("historical source version should be written");
+        assert!(!old.is_inline_fast_path_eligible(), "historical source must use the streaming path");
+        let mut current_reader = PutObjReader::from_vec(current_body);
+        let current = store
+            .put_object(
+                &bucket,
+                object,
+                &mut current_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("current destination version should be written");
+        let source_version_id = old.version_id.expect("historical source should have a version id");
+        let current_version_id = current.version_id.expect("current destination should have a version id");
+
+        let input = CopyObjectInput::builder()
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: object.to_string().into(),
+                version_id: Some(source_version_id.to_string().into()),
+            })
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("expected-current historical copy input should build");
+        let mut req = build_request(input, Method::PUT);
+        req.headers.insert(
+            RUSTFS_EXPECTED_CURRENT_VERSION_ID,
+            HeaderValue::from_str(&current_version_id.to_string()).expect("current version header should be valid"),
+        );
+        let response = temp_env::async_with_vars(
+            [(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))],
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                DefaultObjectUsecase::with_context(Some(context)).execute_copy_object(req),
+            ),
+        )
+        .await
+        .expect("nonbuffered source reader must not deadlock behind the self-copy write lock")
+        .expect("expected-current historical self-copy should succeed");
+        assert!(response.output.copy_object_result.is_some());
+        let source_version_id_text = source_version_id.to_string();
+        assert_eq!(response.output.copy_source_version_id.as_deref(), Some(source_version_id_text.as_str()));
+        let destination_version_id = response
+            .output
+            .version_id
+            .clone()
+            .expect("versioned self-copy should return its destination version");
+        assert_ne!(destination_version_id, source_version_id_text);
+        assert_ne!(destination_version_id, current_version_id.to_string());
+        use tokio::io::AsyncReadExt;
+        let verify_opts = ObjectOptions {
+            version_id: Some(destination_version_id.clone()),
+            versioned: true,
+            ..Default::default()
+        };
+        let mut verified = store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &verify_opts)
+            .await
+            .expect("copied destination version should be readable");
+        let mut copied_body = Vec::new();
+        verified
+            .stream
+            .read_to_end(&mut copied_body)
+            .await
+            .expect("copied destination body should be readable");
+        assert_eq!(copied_body, historical_body);
+        assert_eq!(verified.object_info.version_id.map(|id| id.to_string()), Some(destination_version_id));
+
+        store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("expected-current copy test bucket should be removed");
     }
 
     #[tokio::test]
