@@ -453,6 +453,22 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::task::JoinSet;
 
+struct AbortOnDropJoinHandle<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Future for AbortOnDropJoinHandle<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
 pub(in crate::set_disk) const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
 const ENV_RUSTFS_GET_METADATA_READ_VERSION_COALESCE: &str = "RUSTFS_GET_METADATA_READ_VERSION_COALESCE";
@@ -3008,7 +3024,7 @@ impl SetDisks {
             let object = object.clone();
             let version_id = version_id.clone();
             let slowtail_fault = slowtail_fault.clone();
-            tokio::spawn(async move {
+            AbortOnDropJoinHandle(tokio::spawn(async move {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
                     Self::record_read_version_call(&object, disk_index);
@@ -3023,7 +3039,7 @@ impl SetDisks {
                 };
                 let elapsed = response_start.map(|start| start.elapsed());
                 (result, elapsed)
-            })
+            }))
         });
 
         // Wait for all futures to complete

@@ -1442,6 +1442,14 @@ mod data_read_metadata_early_stop_request_shape_tests {
         restore_opts.transition.restore_request.days = Some(1);
         assert!(!data_read_metadata_early_stop_request_shape_allowed(&None, &restore_opts));
     }
+
+    #[test]
+    fn late_materialized_retry_clears_partial_buffer_after_error() {
+        let mut output = b"partial-prefix".to_vec();
+        let result = Err(Error::FileCorrupt);
+        assert!(prepare_late_materialized_retry(&result, &mut output, 1024));
+        assert!(output.is_empty());
+    }
 }
 
 /// Length of the full plaintext body when — and only when — this read's output
