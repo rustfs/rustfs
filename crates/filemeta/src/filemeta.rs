@@ -2107,17 +2107,6 @@ mod test {
     }
 
     #[test]
-    fn test_truncated_inline_payload_is_file_corrupt() {
-        let mut data = create_xlmeta_with_inline_data().expect("inline fixture should encode");
-        FileMeta::load(&data).expect("complete inline fixture should decode");
-        data.pop().expect("inline fixture must contain payload bytes");
-        assert_eq!(
-            FileMeta::load(&data).expect_err("truncated inline payload must be rejected"),
-            Error::FileCorrupt,
-        );
-    }
-
-    #[test]
     fn test_into_fileinfo_reads_legacy_nil_uuid_inline_key() {
         let mut fm = FileMeta::new();
         let mut fi = FileInfo::new("test", 2, 1);

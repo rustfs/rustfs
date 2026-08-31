@@ -571,44 +571,6 @@ fn usage_cache_needs_prompt_scan(authoritative: &DataUsageInfo, observed: Option
         || observed.is_some_and(|observed| observed_data_usage_is_newer(observed, authoritative))
 }
 
-/// Legacy usage is a read-only migration source. Its backup may replace a
-/// corrupt primary, but v2 reads must retain the primary's own CAS revision.
-async fn read_usage_primary_or_legacy_backup(
-    storeapi: Arc<impl ScannerObjectIO>,
-    path: &str,
-) -> Result<(Option<Vec<u8>>, DataUsageCacheRevision), EcstoreError> {
-    let primary = read_config_with_revision(storeapi.clone(), path).await;
-    if path != LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() {
-        return primary;
-    }
-    let corrupt = match &primary {
-        Err(EcstoreError::FileCorrupt) => true,
-        Ok((Some(data), _)) => serde_json::from_slice::<DataUsageInfo>(data).is_err_and(|err| err.is_syntax() || err.is_eof()),
-        _ => false,
-    };
-    if !corrupt {
-        return primary;
-    }
-    let backup_path = format!("{path}.bkp");
-    let backup = read_config_with_revision(storeapi, &backup_path).await?;
-    if backup.0.as_deref().is_some_and(|data| {
-        serde_json::from_slice::<DataUsageInfo>(data).is_ok_and(|usage| data_usage_info_has_persisted_baseline_identity(&usage))
-    }) {
-        warn!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            state = "legacy_usage_backup_recovered",
-            path,
-            backup_path,
-            "Recovered legacy usage from its backup"
-        );
-        return Ok(backup);
-    }
-    primary
-}
-
 async fn read_data_usage_config_for_startup(storeapi: &Arc<impl ScannerObjectIO>) -> Result<Option<Vec<u8>>, EcstoreError> {
     async fn read_pair(storeapi: &Arc<impl ScannerObjectIO>, primary_path: &str) -> Result<Option<Vec<u8>>, EcstoreError> {
         match read_config(storeapi.clone(), primary_path).await {

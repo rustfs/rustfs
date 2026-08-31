@@ -572,7 +572,6 @@ impl Drop for ScannerDefaultCycleGuard {
 #[derive(Debug, Default)]
 struct MemoryConfigStore {
     objects: Mutex<HashMap<String, Vec<u8>>>,
-    get_errors: Mutex<HashMap<String, EcstoreError>>,
     revisions: Mutex<HashMap<String, u64>>,
     insert_after_gets: Mutex<HashMap<String, Vec<u8>>>,
     read_errors: Mutex<HashMap<String, EcstoreError>>,
@@ -2174,259 +2173,6 @@ async fn scanner_startup_uses_primary_and_backup_usage_floor() {
     apply_persisted_usage_floor(&mut cycle, &mut epoch, floor);
     assert_eq!(cycle.next, 104);
     assert_eq!(epoch, 11);
-}
-
-#[tokio::test]
-#[serial]
-async fn scanner_legacy_usage_backup_recovers_truncated_inline_metadata() {
-    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
-    let (temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
-    let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
-    usage.usage_snapshot_complete = false;
-    usage.scanner_cycle = Some(41);
-    let mut data = serde_json::to_vec(&usage).expect("legacy usage should encode");
-    data.resize(data.len() + 16 * 1024, b' ');
-    let legacy_path = LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str();
-    let backup_path = format!("{legacy_path}.bkp");
-    for path in [legacy_path, backup_path.as_str()] {
-        save_config(store.clone(), path, data.clone())
-            .await
-            .expect("legacy usage fixture should persist");
-    }
-    let mut truncated_files = Vec::new();
-    for disk_index in 0..4 {
-        let path = temp_dir
-            .path()
-            .join(format!("pool0/disk{disk_index}"))
-            .join(RUSTFS_META_BUCKET)
-            .join(legacy_path)
-            .join("xl.meta");
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .await
-            .expect("legacy inline metadata should exist");
-        assert!(file.metadata().await.expect("metadata should be readable").len() > 4096);
-        file.set_len(4096).await.expect("fixture should truncate at a page boundary");
-        truncated_files.push((
-            path.clone(),
-            tokio::fs::read(&path)
-                .await
-                .expect("truncated evidence should remain readable"),
-        ));
-    }
-    let store = restart_scanner_cycle_store_from(&store).await;
-    let error = read_config_with_revision(store.clone(), legacy_path)
-        .await
-        .expect_err("truncated primary must fail in the real object reader");
-    assert_eq!(error, EcstoreError::FileCorrupt);
-    assert_eq!(
-        read_config_with_revision(store.clone(), &backup_path)
-            .await
-            .expect("backup should remain readable")
-            .0,
-        Some(data.clone()),
-    );
-    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
-        .await
-        .expect("intact legacy backup must recover startup despite truncated primary");
-    assert_eq!(
-        floor,
-        PersistedUsageFloor {
-            next_cycle: 42,
-            leader_epoch: 0
-        }
-    );
-    assert_eq!(state, PersistedUsageFloorStartup::Authoritative);
-
-    let baseline = read_data_usage_persist_baseline(store.clone())
-        .await
-        .expect("publication must also read the intact backup");
-    assert_eq!(baseline.data.as_deref(), Some(data.as_slice()));
-    assert_eq!(baseline.revision, DataUsageCacheRevision::Missing);
-    let ctx = CancellationToken::new();
-    fence_scanner_usage_epoch_with_expected_epoch(&ctx, store.clone(), 7, None, false)
-        .await
-        .expect("legacy backup must be fenced into v2");
-    let store = restart_scanner_cycle_store_from(&store).await;
-    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
-        .await
-        .expect("a restart after fencing must preserve the recovered floor");
-    assert_eq!(
-        floor,
-        PersistedUsageFloor {
-            next_cycle: 42,
-            leader_epoch: 7
-        }
-    );
-    assert_eq!(state, PersistedUsageFloorStartup::Authoritative);
-    let restarted = restart_scanner_cycle_store_from(&store).await;
-    assert_eq!(
-        persisted_usage_floor(restarted)
-            .await
-            .expect("fenced floor must survive another restart"),
-        PersistedUsageFloor {
-            next_cycle: 42,
-            leader_epoch: 7
-        }
-    );
-    for (path, bytes) in truncated_files {
-        assert_eq!(tokio::fs::read(path).await.expect("legacy evidence must not be removed"), bytes);
-    }
-    assert_eq!(
-        read_config(store, &backup_path)
-            .await
-            .expect("legacy backup must remain intact"),
-        data
-    );
-    global_metrics().set_cycle(None).await;
-    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
-}
-
-async fn legacy_usage_backup_store() -> (Arc<MemoryConfigStore>, Vec<u8>) {
-    let store = Arc::new(MemoryConfigStore::default());
-    let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 1);
-    usage.usage_snapshot_complete = false;
-    usage.scanner_cycle = Some(41);
-    let data = serde_json::to_vec(&usage).expect("legacy snapshot should encode");
-    store.objects.lock().await.insert(
-        memory_config_key(RUSTFS_META_BUCKET, &format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str())),
-        data.clone(),
-    );
-    (store, data)
-}
-
-#[tokio::test]
-async fn scanner_legacy_usage_backup_recovers_json_syntax_but_not_invalid_identity() {
-    for primary in [b"{".as_slice(), b"not-json", br#"{}"#, br#"{"scanner_epoch":"invalid"}"#] {
-        let (store, backup) = legacy_usage_backup_store().await;
-        store.objects.lock().await.insert(
-            memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
-            primary.to_vec(),
-        );
-        let (data, _) = read_usage_primary_or_legacy_backup(store.clone(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str())
-            .await
-            .expect("a readable primary or validated backup should be returned");
-        if primary == b"{" || primary == b"not-json" {
-            assert_eq!(data.as_deref(), Some(backup.as_slice()));
-            assert_eq!(
-                persisted_usage_floor(store)
-                    .await
-                    .expect("backup should recover the floor")
-                    .next_cycle,
-                42
-            );
-        } else {
-            assert_eq!(data.as_deref(), Some(primary), "invalid identity must not be hidden by the backup");
-            assert!(usage_snapshot_for_epoch_fence(store, None, false).await.is_err());
-        }
-    }
-}
-
-#[tokio::test]
-async fn scanner_legacy_usage_backup_does_not_hide_operational_read_errors() {
-    for error in [
-        EcstoreError::FileAccessDenied,
-        EcstoreError::ErasureReadQuorum,
-        EcstoreError::RemoteClientUnavailable("offline".to_string()),
-        EcstoreError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "read timeout")),
-        EcstoreError::other("InlineData value out of range"),
-    ] {
-        let (store, _) = legacy_usage_backup_store().await;
-        store.get_errors.lock().await.insert(
-            memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
-            error.clone(),
-        );
-        assert_eq!(
-            read_usage_primary_or_legacy_backup(store.clone(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str())
-                .await
-                .expect_err("operational failure must not trigger recovery"),
-            error,
-        );
-        assert!(persisted_usage_floor_for_startup(store.clone(), true).await.is_err());
-        assert!(usage_snapshot_for_epoch_fence(store.clone(), None, false).await.is_err());
-        assert_eq!(
-            read_data_usage_persist_baseline(store)
-                .await
-                .expect_err("publication must defer"),
-            error
-        );
-    }
-}
-
-#[tokio::test]
-async fn scanner_legacy_usage_backup_requires_a_valid_companion() {
-    for backup in [None, Some(b"".as_slice()), Some(b"not-json"), Some(br#"{}"#)] {
-        let (store, _) = legacy_usage_backup_store().await;
-        let backup_key = memory_config_key(RUSTFS_META_BUCKET, &format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()));
-        match backup {
-            Some(data) => {
-                store.objects.lock().await.insert(backup_key, data.to_vec());
-            }
-            None => {
-                store.objects.lock().await.remove(&backup_key);
-            }
-        }
-        store.get_errors.lock().await.insert(
-            memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
-            EcstoreError::FileCorrupt,
-        );
-        assert!(persisted_usage_floor_for_startup(store.clone(), true).await.is_err());
-        assert!(usage_snapshot_for_epoch_fence(store.clone(), None, false).await.is_err());
-        assert_eq!(
-            read_data_usage_persist_baseline(store.clone())
-                .await
-                .expect_err("no usable baseline"),
-            EcstoreError::FileCorrupt
-        );
-        assert!(store.put_counts.lock().await.is_empty(), "failed recovery must not reset persisted state");
-    }
-}
-
-#[tokio::test]
-async fn scanner_legacy_usage_backup_does_not_override_v2_corruption_or_epoch() {
-    for v2_error in [true, false] {
-        let (store, _) = legacy_usage_backup_store().await;
-        store.get_errors.lock().await.insert(
-            memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
-            EcstoreError::FileCorrupt,
-        );
-        let v2_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
-        let v2_data = serde_json::to_vec(&DataUsageInfo {
-            scanner_epoch: Some(7),
-            ..Default::default()
-        })
-        .expect("incomplete v2 should encode");
-        if v2_error {
-            store.get_errors.lock().await.insert(v2_key, EcstoreError::FileCorrupt);
-        } else {
-            store.objects.lock().await.insert(v2_key, v2_data.clone());
-        }
-        assert!(persisted_usage_floor_for_startup(store.clone(), true).await.is_err());
-        if v2_error {
-            assert_eq!(
-                read_data_usage_persist_baseline(store)
-                    .await
-                    .expect_err("v2 must remain fail closed"),
-                EcstoreError::FileCorrupt
-            );
-        } else {
-            assert!(
-                usage_snapshot_for_epoch_fence(store.clone(), Some(&v2_data), false)
-                    .await
-                    .expect("stale backup is not selected")
-                    .is_none()
-            );
-            assert_eq!(
-                read_data_usage_persist_baseline(store)
-                    .await
-                    .expect("v2 fence must be retained")
-                    .data
-                    .as_deref(),
-                Some(v2_data.as_slice())
-            );
-        }
-    }
 }
 
 #[tokio::test]
@@ -4402,6 +4148,125 @@ async fn scanner_usage_floor_leadership_claim_recovers_legacy_backup_after_prima
     let usage = serde_json::from_slice::<DataUsageInfo>(&usage).expect("fenced v2 usage primary should decode");
     assert_eq!(usage.scanner_epoch, Some(20));
     assert_eq!(usage.scanner_cycle, Some(41));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn scanner_legacy_usage_backup_survives_fencing_and_restart_after_real_metadata_truncation() {
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    let (temp_dir, store) = setup_scanner_cycle_store_with_usage_baseline(false).await;
+    let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    usage.usage_snapshot_complete = false;
+    usage.scanner_cycle = Some(41);
+    let mut data = serde_json::to_vec(&usage).expect("legacy usage should encode");
+    data.resize(data.len() + 16 * 1024, b' ');
+    let legacy_path = LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str();
+    let backup_path = format!("{legacy_path}.bkp");
+    for path in [legacy_path, backup_path.as_str()] {
+        save_config(store.clone(), path, data.clone())
+            .await
+            .expect("legacy usage fixture should persist");
+    }
+    let mut truncated_files = Vec::new();
+    for disk_index in 0..4 {
+        let path = temp_dir
+            .path()
+            .join(format!("pool0/disk{disk_index}"))
+            .join(RUSTFS_META_BUCKET)
+            .join(legacy_path)
+            .join("xl.meta");
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .expect("legacy inline metadata should exist");
+        assert!(file.metadata().await.expect("metadata should be readable").len() > 4096);
+        file.set_len(4096).await.expect("fixture should truncate at a page boundary");
+        truncated_files.push((
+            path.clone(),
+            tokio::fs::read(&path)
+                .await
+                .expect("truncated evidence should remain readable"),
+        ));
+    }
+
+    let store = restart_scanner_cycle_store_from(&store).await;
+    let error = read_config_with_revision(store.clone(), legacy_path)
+        .await
+        .expect_err("truncated primary must fail in the real object reader");
+    assert!(
+        error.to_string().contains("InlineData value out of range"),
+        "unexpected truncated-primary error: {error}"
+    );
+    assert_eq!(
+        read_config_with_revision(store.clone(), &backup_path)
+            .await
+            .expect("backup should remain readable")
+            .0,
+        Some(data.clone()),
+    );
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("intact legacy backup must recover startup despite truncated primary");
+    assert_eq!(
+        floor,
+        PersistedUsageFloor {
+            next_cycle: 42,
+            leader_epoch: 0
+        }
+    );
+    assert_eq!(state, PersistedUsageFloorStartup::Authoritative);
+
+    let baseline = read_data_usage_persist_baseline(store.clone())
+        .await
+        .expect("publication must also read the intact backup");
+    assert_eq!(baseline.data.as_deref(), Some(data.as_slice()));
+    assert_eq!(baseline.revision, DataUsageCacheRevision::Missing);
+    fence_scanner_usage_epoch_with_expected_epoch(&CancellationToken::new(), store.clone(), 7, None, false)
+        .await
+        .expect("legacy backup must be fenced into v2");
+    let fenced = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("fencing must publish a v2 usage primary");
+    let fenced = serde_json::from_slice::<DataUsageInfo>(&fenced).expect("fenced v2 usage primary should decode");
+    assert!(
+        fenced.usage_snapshot_complete,
+        "the fenced pre-marker baseline must become a complete v2 identity"
+    );
+
+    let store = restart_scanner_cycle_store_from(&store).await;
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("a restart after fencing must preserve the recovered floor");
+    assert_eq!(
+        floor,
+        PersistedUsageFloor {
+            next_cycle: 42,
+            leader_epoch: 7
+        }
+    );
+    assert_eq!(state, PersistedUsageFloorStartup::Authoritative);
+    let restarted = restart_scanner_cycle_store_from(&store).await;
+    assert_eq!(
+        persisted_usage_floor(restarted)
+            .await
+            .expect("fenced floor must survive another restart"),
+        PersistedUsageFloor {
+            next_cycle: 42,
+            leader_epoch: 7
+        }
+    );
+    for (path, bytes) in truncated_files {
+        assert_eq!(tokio::fs::read(path).await.expect("legacy evidence must not be removed"), bytes);
+    }
+    assert_eq!(
+        read_config(store, &backup_path)
+            .await
+            .expect("legacy backup must remain intact"),
+        data
+    );
+    global_metrics().set_cycle(None).await;
+    crate::scanner_io::clear_dirty_usage_buckets_for_tests();
 }
 
 #[tokio::test]

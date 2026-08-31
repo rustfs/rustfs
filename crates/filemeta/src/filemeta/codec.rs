@@ -189,7 +189,7 @@ impl FileMeta {
             self.data.update(buf);
             self.data.validate().map_err(|e| {
                 error!("data validation failed: {}", e);
-                Error::FileCorrupt
+                e
             })?;
         }
 
