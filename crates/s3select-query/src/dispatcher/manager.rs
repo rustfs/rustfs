@@ -53,7 +53,7 @@ use rustfs_s3select_api::{
         },
     },
 };
-use s3s::dto::{FileHeaderInfo, JSONType, SelectObjectContentInput};
+use s3s::dto::{CompressionType, FileHeaderInfo, JSONType, SelectObjectContentInput};
 use std::sync::LazyLock;
 use tokio::{
     sync::Semaphore,
@@ -72,6 +72,7 @@ use crate::{
 static IGNORE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::IGNORE));
 static NONE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::NONE));
 static USE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::USE));
+const EXACT_OBJECT_FILE_EXTENSION: &str = "";
 
 #[derive(Clone)]
 pub struct SimpleQueryDispatcher {
@@ -416,6 +417,13 @@ impl SimpleQueryDispatcher {
 
         let path = format!("s3://{}/{}", self.input.bucket, self.input.key);
         let table_path = ListingTableUrl::parse(path)?;
+        let compressed_input = self
+            .input
+            .request
+            .input_serialization
+            .compression_type
+            .as_ref()
+            .is_some_and(|compression| compression.as_str() != CompressionType::NONE);
         let (listing_options, need_rename_volume_name, need_ignore_volume_name) =
             if let Some(csv) = self.input.request.input_serialization.csv.as_ref() {
                 let mut need_rename_volume_name = false;
@@ -465,22 +473,30 @@ impl SimpleQueryDispatcher {
                     file_format = file_format.with_quote(quote.as_bytes().first().copied().unwrap_or_default());
                 }
                 (
-                    ListingOptions::new(Arc::new(file_format)).with_file_extension(".csv"),
+                    ListingOptions::new(Arc::new(file_format)).with_file_extension(if compressed_input {
+                        EXACT_OBJECT_FILE_EXTENSION
+                    } else {
+                        ".csv"
+                    }),
                     need_rename_volume_name,
                     need_ignore_volume_name,
                 )
             } else if self.input.request.input_serialization.json.is_some() {
                 let file_format = JsonFormat::default();
-                // Use the actual file extension from the object key so that files stored
-                // with a `.jsonl` suffix (newline-delimited JSON) are also matched by
-                // DataFusion's listing/schema-inference logic. Falling back to ".json"
-                // preserves behaviour for keys that have no extension.
-                let file_ext = std::path::Path::new(&self.input.key)
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| format!(".{e}"))
-                    .unwrap_or_else(|| ".json".to_string());
-                (ListingOptions::new(Arc::new(file_format)).with_file_extension(file_ext), false, false)
+                let file_extension = if compressed_input {
+                    EXACT_OBJECT_FILE_EXTENSION.to_string()
+                } else {
+                    std::path::Path::new(&self.input.key)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .map(|extension| format!(".{extension}"))
+                        .unwrap_or_else(|| ".json".to_string())
+                };
+                (
+                    ListingOptions::new(Arc::new(file_format)).with_file_extension(file_extension),
+                    false,
+                    false,
+                )
             } else {
                 return Err(SelectError::InvalidDataSource.into());
             };

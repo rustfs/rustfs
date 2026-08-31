@@ -461,8 +461,8 @@ pub mod rpc {
         tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
         verify_ns_scanner_capability, verify_ns_scanner_capability_with_tier_registry_generation, verify_put_file_auth_trailer,
         verify_put_file_capability, verify_rpc_signature, verify_tonic_boot_epoch_response, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_response_proof, verify_tonic_rpc_signature,
-        verify_tonic_rpc_signature_with_bootstrap,
+        verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned, verify_tonic_rpc_response_proof,
+        verify_tonic_rpc_signature, verify_tonic_rpc_signature_with_bootstrap,
     };
 }
 
@@ -489,9 +489,9 @@ pub mod storage {
     pub use crate::core::pools::HealLifecycleExpiryContext;
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
-        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, all_local_disk, all_local_disk_path, find_local_disk_by_ref, init_local_disks,
-        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
-        prewarm_local_disk_id_map_with_instance_ctx,
+        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk, all_local_disk_path,
+        find_local_disk_by_ref, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients,
+        prewarm_local_disk_id_map, prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 

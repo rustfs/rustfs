@@ -27,8 +27,10 @@
 //! Readiness is established by the harness's `start()` handshake (TCP reachability
 //! plus an S3 `ListBuckets` poll) — there are no fixed sleeps.
 //!
-//! Out of scope for this block (tracked separately): network fault injection
-//! (toxiproxy / socket proxy) and 5GiB large-object budgets.
+//! The volume-proxy smoke below also proves that the socket-level fault proxy
+//! can be installed before startup without changing the client-facing node URL.
+//! A full lock-plane partition matrix and 5GiB large-object budget remain
+//! tracked separately.
 
 use crate::common::{ClusterTopology, RustFSTestClusterEnvironment};
 
@@ -76,6 +78,28 @@ async fn cluster_multidrive_single_pool_smoke() -> TestResult {
     Ok(())
 }
 
+/// 4 nodes x 4 drives, single pool: exercise the maximum local erasure layout
+/// supported by the cluster harness. This remains in the nightly lane because
+/// it starts four real server processes and sixteen data directories.
+#[tokio::test]
+async fn cluster_four_node_four_drive_single_pool_smoke() -> TestResult {
+    crate::common::init_logging();
+
+    let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(4, 4)).await?;
+
+    let volumes = cluster.rustfs_volumes_arg();
+    assert_eq!(volumes.split(' ').count(), 16, "expected 16 explicit endpoints, got: {volumes}");
+    assert!(!volumes.contains('{'), "single-pool layout must not use ellipses: {volumes}");
+    assert!(cluster.nodes.iter().all(|node| node.data_dirs.len() == 4));
+
+    cluster.start().await?;
+    cluster.create_test_bucket(BUCKET).await?;
+
+    let payload = vec![0x3Cu8; 1024 * 1024];
+    put_get_roundtrip(&cluster, "multidrive-4/object", &payload).await?;
+    Ok(())
+}
+
 /// Two single-node pools, 2 drives each: the multi-pool layout boots and
 /// round-trips. Every pool is a distinct erasure pool (`pool_idx` 0 and 1).
 #[tokio::test]
@@ -102,4 +126,28 @@ async fn cluster_two_pool_smoke() -> TestResult {
     let payload = vec![0x5Au8; 256 * 1024];
     put_get_roundtrip(&cluster, "twopool/object", &payload).await?;
     Ok(())
+}
+
+/// A real cluster smoke for the volume FaultProxy wiring. The proxy target is
+/// not listening yet when it is created; cluster startup must still converge
+/// once the target node starts, and peer disk/RPC traffic must traverse it.
+#[tokio::test]
+async fn cluster_volume_fault_proxy_pass_smoke() -> TestResult {
+    crate::common::init_logging();
+
+    let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(2, 2)).await?;
+    let proxy = cluster.start_volume_proxy_for_node(0).await?;
+    let proxied = proxy.local_addr().to_string();
+    assert!(cluster.rustfs_volumes_arg().contains(&proxied));
+
+    let result: TestResult = async {
+        cluster.start().await?;
+        cluster.create_test_bucket(BUCKET).await?;
+        let payload = vec![0x6Du8; 256 * 1024];
+        put_get_roundtrip(&cluster, "volume-proxy/object", &payload).await
+    }
+    .await;
+
+    proxy.shutdown().await;
+    result
 }

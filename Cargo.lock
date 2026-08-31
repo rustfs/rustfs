@@ -3926,6 +3926,7 @@ dependencies = [
  "aws-sdk-s3",
  "aws-sdk-sts",
  "aws-smithy-http-client",
+ "aws-smithy-types",
  "base64-simd",
  "bytes",
  "chrono",
@@ -10557,10 +10558,14 @@ dependencies = [
 name = "rustfs-s3select-api"
 version = "1.0.0-rc.4"
 dependencies = [
+ "arc-swap",
+ "async-compression",
  "async-trait",
  "bytes",
  "chrono",
+ "crc-fast",
  "datafusion",
+ "flate2",
  "futures",
  "futures-core",
  "hotpath",
@@ -10576,6 +10581,7 @@ dependencies = [
  "serial_test",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "tracing",
  "transform-stream",

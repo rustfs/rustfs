@@ -3177,6 +3177,19 @@ pub(crate) async fn queue_replication_heal_internal(
             }
         }
         ReplicationHealQueueAction::QueueDelete(dv) => {
+            // A purge the peer denied under object lock cannot succeed until
+            // the lock lapses (#6850); requeuing it every heal cycle only
+            // burns bandwidth and failure counters. The backoff expires on
+            // its own, so the purge is probed again — and converges — once
+            // the retention window has a chance of being over.
+            if super::replication_object_decision_boundary::is_version_delete_replication(&dv.delete_object)
+                && super::replication_resyncer::object_lock_denied_purge_backoff_active(&dv)
+            {
+                return ReplicationHealQueueResult {
+                    object_info: roi,
+                    admission: ReplicationQueueAdmission::Skipped,
+                };
+            }
             let admission = if let Some(pool) = runtime_sources::replication_pool() {
                 pool.queue_replica_delete_task(dv).await
             } else {

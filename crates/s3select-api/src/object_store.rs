@@ -13,9 +13,14 @@
 // limitations under the License.
 
 use crate::{
-    PrepareSelectObjectSnapshotError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader, SelectInputMetrics,
-    SelectObjectOptions, SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError, SelectStore,
-    SnapshotConsistencyError,
+    PrepareSelectObjectSnapshotError, QueryError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader,
+    SelectInputMetrics, SelectObjectOptions, SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError,
+    SelectStore, SnapshotConsistencyError,
+    input_stream::{
+        CompressionFormat, MAX_SELECT_RECORD_BYTES, SELECT_DECODE_CHUNK_BYTES, SelectInputReader, compressed_input_reader,
+        compressed_input_stream, input_io_error, processed_bytes_limit,
+    },
+    metrics::SelectInputMetricsRecorder,
     query::{
         ast::{JsonPathSegment, JsonSource},
         parser::RustFsDialect,
@@ -52,12 +57,15 @@ use s3s::header::{
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5,
 };
-use s3s::{S3Error, S3ErrorCode, S3Result, dto::SelectObjectContentInput};
+use s3s::{
+    S3Error, S3ErrorCode, S3Result,
+    dto::{CompressionType, InputSerialization, ScanRange, SelectObjectContentInput},
+};
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, atomic::AtomicBool};
 use tokio::{io::AsyncReadExt, sync::OnceCell};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
@@ -66,6 +74,15 @@ use crate::storage_api::object_store::HTTPRangeSpec;
 
 fn select_default_read_buffer_size_u64() -> u64 {
     u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)
+}
+
+fn compression_format(input: &InputSerialization) -> Result<Option<CompressionFormat>, SelectError> {
+    match input.compression_type.as_ref().map(|value| value.as_str()) {
+        None | Some(CompressionType::NONE) => Ok(None),
+        Some(CompressionType::GZIP) => Ok(Some(CompressionFormat::Gzip)),
+        Some(CompressionType::BZIP2) => Ok(Some(CompressionFormat::Bzip2)),
+        Some(_) => Err(SelectError::InvalidCompressionFormat),
+    }
 }
 
 /// Maximum allowed object size for JSON DOCUMENT mode.
@@ -89,10 +106,17 @@ fn select_default_read_buffer_size_u64() -> u64 {
 pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 const JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER: usize = 64;
 const JSON_SCALAR_COLUMN_MEMORY_RESERVATION_MULTIPLIER: usize = 14;
+const JSON_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
+const JSON_CANCELLATION_CHECK_KEYS: usize = 1024;
 pub const INVALID_SCAN_RANGE_MESSAGE: &str =
     "The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.";
 const NORMALIZED_RECORD_DELIMITER: &[u8] = b"\r\n";
 const NORMALIZED_FIELD_DELIMITER: &[u8] = &[DEFAULT_DELIMITER];
+
+/// Returns true for the MinIO-compatible full-scan range marker.
+pub fn is_noop_scan_range(scan_range: &ScanRange) -> bool {
+    scan_range.start == Some(0) && scan_range.end.is_none()
+}
 
 pub struct EcObjectStore {
     input: Arc<SelectObjectContentInput>,
@@ -312,6 +336,9 @@ impl EcObjectStore {
         let Some(scan_range) = self.input.request.scan_range.as_ref() else {
             return Ok(None);
         };
+        if is_noop_scan_range(scan_range) {
+            return Ok(None);
+        }
         scan_range_from_bounds(scan_range.start, scan_range.end, object_size)
     }
 
@@ -766,6 +793,22 @@ impl ObjectStore for EcObjectStore {
         // this instance's immutable snapshot; later operations reuse it.
         let snapshot = self.snapshot(options.version.as_deref()).await?;
         let original_size = snapshot.logical_size();
+        let compression = compression_format(&self.input.request.input_serialization).map_err(|source| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(source),
+        })?;
+        let has_effective_request_range = self
+            .input
+            .request
+            .scan_range
+            .as_ref()
+            .is_some_and(|scan_range| !is_noop_scan_range(scan_range));
+        if compression.is_some() && (options.range.is_some() || has_effective_request_range) {
+            return Err(o_Error::Generic {
+                store: "EcObjectStore",
+                source: Box::new(SelectError::UnsupportedScanRangeInput),
+            });
+        }
         let object_info = snapshot.object_info();
         let meta = ObjectMeta {
             location: location.clone(),
@@ -791,7 +834,7 @@ impl ObjectStore for EcObjectStore {
         }
 
         let record_delimiter = self.record_delimiter_for_conversion();
-        let needs_scan_context = options.range.is_none() && self.input.request.scan_range.is_some();
+        let needs_scan_context = options.range.is_none() && has_effective_request_range;
         let scan_context = if needs_scan_context {
             if let Some(scan_range) = self.scan_range(original_size)? {
                 let delimiter = self.record_delimiter();
@@ -813,7 +856,51 @@ impl ObjectStore for EcObjectStore {
         };
 
         let meter_input = self.input.request.input_serialization.parquet.is_none();
-        let payload = if options.range.is_some() {
+        let payload = if let Some(compression) = compression {
+            let max_processed_bytes = processed_bytes_limit();
+            let query_guard = match self.query_tracker.as_ref() {
+                Some(query_tracker) => Some(query_tracker.query_guard().ok_or_else(|| o_Error::Generic {
+                    store: "EcObjectStore",
+                    source: Box::new(QueryError::Cancel),
+                })?),
+                None => None,
+            };
+            if self.is_json_document {
+                let reader = compressed_input_reader(
+                    reader.stream,
+                    original_size,
+                    compression,
+                    Arc::clone(&self.input_metrics),
+                    max_processed_bytes,
+                    query_guard,
+                );
+                let stream = compressed_json_document_ndjson_stream(
+                    reader,
+                    self.json_source.clone(),
+                    Arc::clone(&self.memory_pool),
+                    self.query_tracker.clone(),
+                );
+                GetResultPayload::Stream(stream)
+            } else {
+                let input_record_delimiter = if self.input.request.input_serialization.csv.is_some() {
+                    self.record_delimiter()
+                } else {
+                    b"\n".to_vec()
+                };
+                let stream = compressed_input_stream(
+                    reader.stream,
+                    original_size,
+                    compression,
+                    Arc::clone(&self.input_metrics),
+                    input_record_delimiter,
+                    max_processed_bytes,
+                    query_guard,
+                )?;
+                let stream =
+                    convert_csv_delimiter_stream(stream, record_delimiter, self.need_convert.then(|| self.delimiter.clone()));
+                GetResultPayload::Stream(stream)
+            }
+        } else if options.range.is_some() {
             let size = usize::try_from(result_range.end - result_range.start).map_err(|err| o_Error::Generic {
                 store: "EcObjectStore",
                 source: Box::new(err),
@@ -851,8 +938,9 @@ impl ObjectStore for EcObjectStore {
             let delimiter = self.record_delimiter();
             let include_header = self.csv_has_header();
             let header = if include_header && read_start > 0 {
+                let input_metrics = self.input_metrics.recorder();
                 let header = self.read_header_record(original_size, &delimiter).await?;
-                self.input_metrics.record_uncompressed(header.len());
+                input_metrics.record_uncompressed(header.len());
                 Some(header)
             } else {
                 None
@@ -1197,7 +1285,7 @@ impl<S> ScanRangeState<S> {
 ///    scalar/object root) is yielded as a separate [`Bytes`] chunk, so
 ///    DataFusion can pipeline row processing as lines arrive.
 fn json_document_ndjson_stream(
-    stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
+    stream: SelectInputReader,
     original_size: u64,
     json_source: JsonSource,
     input_metrics: Arc<SelectInputMetrics>,
@@ -1206,60 +1294,107 @@ fn json_document_ndjson_stream(
 ) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
     json_document_ndjson_stream_with_parser(
         stream,
-        original_size,
+        JsonDocumentReadMode::Exact {
+            original_size,
+            input_metrics: input_metrics.recorder(),
+        },
         json_source,
-        input_metrics,
         memory_pool,
         query_tracker,
-        |all_bytes, json_source| parse_json_document_to_lines(&all_bytes, &json_source),
+        |all_bytes, json_source, cancellation| {
+            parse_json_document_to_lines_cancellable(&all_bytes, &json_source, cancellation.as_ref())
+        },
     )
 }
 
-fn json_document_ndjson_stream_with_parser<P>(
-    stream: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
-    original_size: u64,
+fn compressed_json_document_ndjson_stream(
+    stream: SelectInputReader,
     json_source: JsonSource,
-    input_metrics: Arc<SelectInputMetrics>,
+    memory_pool: Arc<dyn MemoryPool>,
+    query_tracker: Option<QueryExecutionTracker>,
+) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
+    json_document_ndjson_stream_with_parser(
+        stream,
+        JsonDocumentReadMode::Bounded,
+        json_source,
+        memory_pool,
+        query_tracker,
+        |all_bytes, json_source, cancellation| {
+            parse_json_document_to_lines_cancellable(&all_bytes, &json_source, cancellation.as_ref())
+        },
+    )
+}
+
+enum JsonDocumentReadMode {
+    Exact {
+        original_size: u64,
+        input_metrics: SelectInputMetricsRecorder,
+    },
+    Bounded,
+}
+
+fn json_document_ndjson_stream_with_parser<P>(
+    stream: SelectInputReader,
+    read_mode: JsonDocumentReadMode,
+    json_source: JsonSource,
     memory_pool: Arc<dyn MemoryPool>,
     query_tracker: Option<QueryExecutionTracker>,
     parser: P,
 ) -> futures_core::stream::BoxStream<'static, Result<Bytes>>
 where
-    P: FnOnce(Vec<u8>, JsonSource) -> std::io::Result<Vec<Bytes>> + Send + 'static,
+    P: FnOnce(Vec<u8>, JsonSource, Arc<AtomicBool>) -> std::io::Result<Vec<Bytes>> + Send + 'static,
 {
     AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
-        // Compact JSON can expand substantially into a serde_json DOM and
-        // per-record output buffers, so reserve a conservative upper bound
-        // before the source buffer is allocated.
-        let buffer_capacity = usize::try_from(original_size).map_err(|_| o_Error::Generic {
-            store: "EcObjectStore",
-            source: Box::new(DataFusionError::ResourcesExhausted(format!(
-                "JSON DOCUMENT input size {original_size} does not fit in memory"
-            ))),
-        })?;
-        let reservation_bytes =
-            json_document_memory_reservation_bytes(buffer_capacity, &json_source).map_err(|source| o_Error::Generic {
-                store: "EcObjectStore",
-                source: Box::new(source),
-            })?;
         let reservation = MemoryConsumer::new("S3 Select JSON document").register(&memory_pool);
-        reservation.try_resize(reservation_bytes).map_err(|err| o_Error::Generic {
-            store: "EcObjectStore",
-            source: Box::new(err),
-        })?;
 
         // ── 1. Read phase (lazy: only runs when the stream is polled) ────
         pin_mut!(stream);
-        let mut all_bytes = Vec::with_capacity(buffer_capacity);
-        let read_result = stream.take(original_size).read_to_end(&mut all_bytes).await;
-        input_metrics.record_uncompressed(all_bytes.len());
-        read_result.map_err(|e| o_Error::Generic {
-            store: "EcObjectStore",
-            source: Box::new(e),
-        })?;
-        if all_bytes.len() != buffer_capacity {
-            return Err(incomplete_object_stream_error(buffer_capacity - all_bytes.len()));
-        }
+        let all_bytes = match read_mode {
+            JsonDocumentReadMode::Exact {
+                original_size,
+                input_metrics,
+            } => {
+                let buffer_capacity = usize::try_from(original_size).map_err(|_| o_Error::Generic {
+                    store: "EcObjectStore",
+                    source: Box::new(DataFusionError::ResourcesExhausted(format!(
+                        "JSON DOCUMENT input size {original_size} does not fit in memory"
+                    ))),
+                })?;
+                resize_json_document_reservation(&reservation, buffer_capacity, &json_source)?;
+                let mut all_bytes = Vec::with_capacity(buffer_capacity);
+                let read_result = stream.take(original_size).read_to_end(&mut all_bytes).await;
+                input_metrics.record_uncompressed(all_bytes.len());
+                read_result.map_err(input_io_error)?;
+                if all_bytes.len() != buffer_capacity {
+                    return Err(incomplete_object_stream_error(buffer_capacity - all_bytes.len()));
+                }
+                all_bytes
+            }
+            JsonDocumentReadMode::Bounded => {
+                let mut all_bytes = Vec::new();
+                let mut buffer = vec![0; SELECT_DECODE_CHUNK_BYTES];
+                loop {
+                    let read = stream.read(&mut buffer).await.map_err(input_io_error)?;
+                    if read == 0 {
+                        break;
+                    }
+                    let new_len = all_bytes.len().checked_add(read).ok_or_else(|| o_Error::Generic {
+                        store: "EcObjectStore",
+                        source: Box::new(json_document_memory_reservation_overflow(all_bytes.len())),
+                    })?;
+                    let new_len_u64 = u64::try_from(new_len).map_err(|_| o_Error::Generic {
+                        store: "EcObjectStore",
+                        source: Box::new(DataFusionError::ResourcesExhausted(format!(
+                            "JSON DOCUMENT input size {new_len} does not fit in the object size type"
+                        ))),
+                    })?;
+                    validate_json_document_size(new_len_u64)?;
+                    grow_json_document_buffer(&mut all_bytes, new_len, &reservation, &json_source)?;
+                    all_bytes.extend_from_slice(&buffer[..read]);
+                }
+                all_bytes
+            }
+        };
 
         // ── 2. Parse phase (blocking thread pool, non-blocking runtime) ──
         let queued_query_guard = match query_tracker.as_ref() {
@@ -1275,11 +1410,24 @@ where
         };
         let pending_query_guard = PendingQueryExecutionGuard::new(query_tracker);
         let task_query_guard = pending_query_guard.task_state();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let queued_task = Arc::new(Mutex::new(Some(JsonDocumentParseTask {
+            parser,
+            all_bytes,
+            json_source,
+            task_resources,
+        })));
+        let _cancel_on_drop = JsonDocumentCancellation::new(Arc::clone(&cancellation), Arc::clone(&queued_task));
         let (lines, _task_resources) = SpawnedTask::spawn_blocking(move || {
+            let JsonDocumentParseTask {
+                parser,
+                all_bytes,
+                json_source,
+                mut task_resources,
+            } = queued_task.lock().take().ok_or_else(json_document_parse_interrupted_error)?;
             let query_guard = PendingQueryExecutionGuard::start(&task_query_guard)?;
-            let mut task_resources = task_resources;
             task_resources.query_guard = query_guard;
-            parser(all_bytes, json_source).map(|lines| (lines, task_resources))
+            parser(all_bytes, json_source, cancellation).map(|lines| (lines, task_resources))
         })
         .await
         .map_err(|e| o_Error::Generic {
@@ -1300,10 +1448,114 @@ where
     .boxed()
 }
 
+fn grow_json_document_buffer(
+    buffer: &mut Vec<u8>,
+    required_len: usize,
+    reservation: &MemoryReservation,
+    json_source: &JsonSource,
+) -> Result<()> {
+    if required_len <= buffer.capacity() {
+        return Ok(());
+    }
+
+    let max_capacity = usize::try_from(MAX_JSON_DOCUMENT_BYTES).map_err(|_| o_Error::Generic {
+        store: "EcObjectStore",
+        source: Box::new(DataFusionError::ResourcesExhausted(
+            "JSON DOCUMENT size limit does not fit in memory".to_string(),
+        )),
+    })?;
+    let target_capacity = required_len
+        .checked_next_power_of_two()
+        .ok_or_else(|| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(DataFusionError::ResourcesExhausted(format!(
+                "JSON DOCUMENT buffer capacity overflow at {required_len} bytes"
+            ))),
+        })?
+        .min(max_capacity);
+    if target_capacity < required_len {
+        return Err(o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(DataFusionError::ResourcesExhausted(format!(
+                "JSON DOCUMENT input size {required_len} exceeds the maximum buffer capacity"
+            ))),
+        });
+    }
+
+    resize_json_document_reservation(reservation, target_capacity, json_source)?;
+    buffer
+        .try_reserve_exact(target_capacity - buffer.len())
+        .map_err(|_| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(DataFusionError::ResourcesExhausted(format!(
+                "JSON DOCUMENT input buffer allocation failed at {target_capacity} bytes"
+            ))),
+        })?;
+    resize_json_document_reservation(reservation, buffer.capacity(), json_source)
+}
+
+fn resize_json_document_reservation(reservation: &MemoryReservation, input_bytes: usize, json_source: &JsonSource) -> Result<()> {
+    let reservation_bytes =
+        json_document_memory_reservation_bytes(input_bytes, json_source).map_err(|source| o_Error::Generic {
+            store: "EcObjectStore",
+            source: Box::new(source),
+        })?;
+    reservation.try_resize(reservation_bytes).map_err(|source| o_Error::Generic {
+        store: "EcObjectStore",
+        source: Box::new(source),
+    })
+}
+
 struct JsonDocumentTaskResources {
     // Struct fields drop in declaration order, so admission covers the reservation through teardown.
     _reservation: MemoryReservation,
     query_guard: Option<QueryExecutionGuard>,
+}
+
+struct JsonDocumentParseTask<P> {
+    parser: P,
+    all_bytes: Vec<u8>,
+    json_source: JsonSource,
+    task_resources: JsonDocumentTaskResources,
+}
+
+struct JsonDocumentCancellation<T> {
+    cancelled: Arc<AtomicBool>,
+    queued: Arc<Mutex<Option<T>>>,
+}
+
+impl<T> JsonDocumentCancellation<T> {
+    fn new(cancelled: Arc<AtomicBool>, queued: Arc<Mutex<Option<T>>>) -> Self {
+        Self { cancelled, queued }
+    }
+}
+
+impl<T> Drop for JsonDocumentCancellation<T> {
+    fn drop(&mut self) {
+        self.cancelled.store(true, std::sync::atomic::Ordering::Release);
+        let queued = self.queued.lock().take();
+        drop(queued);
+    }
+}
+
+struct CancellableJsonReader<'a> {
+    inner: std::io::Cursor<&'a [u8]>,
+    cancelled: &'a AtomicBool,
+}
+
+impl std::io::Read for CancellableJsonReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        ensure_json_parse_active(self.cancelled)?;
+        std::io::Read::read(&mut self.inner, buffer)
+    }
+}
+
+fn ensure_json_parse_active(cancelled: &AtomicBool) -> std::io::Result<()> {
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        Err(std::io::Error::new(std::io::ErrorKind::Interrupted, SelectError::Canceled))
+    } else {
+        Ok(())
+    }
 }
 
 fn json_document_memory_reservation_bytes(input_bytes: usize, json_source: &JsonSource) -> datafusion::common::Result<usize> {
@@ -1409,11 +1661,33 @@ impl Drop for PendingQueryExecutionGuard {
 ///
 /// - A JSON array → one line per element.
 /// - A JSON object or scalar root → one line.
+#[cfg(test)]
 fn parse_json_document_to_lines(bytes: &[u8], json_source: &JsonSource) -> std::io::Result<Vec<Bytes>> {
-    let root: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    parse_json_document_to_lines_cancellable(bytes, json_source, &AtomicBool::new(false))
+}
+
+fn parse_json_document_to_lines_cancellable(
+    bytes: &[u8],
+    json_source: &JsonSource,
+    cancelled: &AtomicBool,
+) -> std::io::Result<Vec<Bytes>> {
+    let reader = std::io::BufReader::with_capacity(
+        JSON_CANCELLATION_CHECK_BYTES,
+        CancellableJsonReader {
+            inner: std::io::Cursor::new(bytes),
+            cancelled,
+        },
+    );
+    let root: serde_json::Value = match serde_json::from_reader(reader) {
+        Ok(root) => root,
+        Err(error) => {
+            ensure_json_parse_active(cancelled)?;
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+    };
+    ensure_json_parse_active(cancelled)?;
     let json_source_path = json_source.path();
-    let values = expand_json_source(root, json_source_path)?;
+    let values = expand_json_source(root, json_source_path, cancelled)?;
     // Preserve the two pre-path-AST forms that flattened arrays implicitly.
     // Explicit indexes and wildcards already identify the intended records
     // and must not flatten an array-valued result a second time.
@@ -1424,19 +1698,25 @@ fn parse_json_document_to_lines(bytes: &[u8], json_source: &JsonSource) -> std::
     });
     let mut lines: Vec<Bytes> = Vec::new();
     for value in values {
+        ensure_json_parse_active(cancelled)?;
         match value {
             serde_json::Value::Array(array) if implicitly_expand_arrays => {
                 for item in array {
-                    lines.push(json_value_to_line(item, scalar_column)?);
+                    ensure_json_parse_active(cancelled)?;
+                    lines.push(json_value_to_line_cancellable(item, scalar_column, cancelled)?);
                 }
             }
-            other => lines.push(json_value_to_line(other, scalar_column)?),
+            other => lines.push(json_value_to_line_cancellable(other, scalar_column, cancelled)?),
         }
     }
     Ok(lines)
 }
 
-fn expand_json_source(root: serde_json::Value, json_source_path: &[JsonPathSegment]) -> std::io::Result<Vec<serde_json::Value>> {
+fn expand_json_source(
+    root: serde_json::Value,
+    json_source_path: &[JsonPathSegment],
+    cancelled: &AtomicBool,
+) -> std::io::Result<Vec<serde_json::Value>> {
     // S3Object[*] identifies the input record stream. JSON DOCUMENT already
     // presents the root value as that stream, so the leading marker is not a
     // lookup against the root object.
@@ -1454,11 +1734,13 @@ fn expand_json_source(root: serde_json::Value, json_source_path: &[JsonPathSegme
     };
 
     for segment in path {
+        ensure_json_parse_active(cancelled)?;
         let mut expanded = Vec::new();
         for value in values {
+            ensure_json_parse_active(cancelled)?;
             match (segment, value) {
                 (JsonPathSegment::Key { name, quoted }, serde_json::Value::Object(mut object)) => {
-                    if let Some(value) = remove_json_source_key(&mut object, name, *quoted)? {
+                    if let Some(value) = remove_json_source_key(&mut object, name, *quoted, cancelled)? {
                         expanded.push(value);
                     }
                 }
@@ -1495,21 +1777,69 @@ fn remove_json_source_key(
     object: &mut serde_json::Map<String, serde_json::Value>,
     name: &str,
     quoted: bool,
+    cancelled: &AtomicBool,
+) -> std::io::Result<Option<serde_json::Value>> {
+    let mut checkpoint = || ensure_json_parse_active(cancelled);
+    remove_json_source_key_with_checkpoint(object, name, quoted, &mut checkpoint)
+}
+
+fn remove_json_source_key_with_checkpoint(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    quoted: bool,
+    checkpoint: &mut impl FnMut() -> std::io::Result<()>,
 ) -> std::io::Result<Option<serde_json::Value>> {
     if quoted {
         return Ok(object.remove(name));
     }
 
-    let mut matches = object.keys().filter(|key| key.eq_ignore_ascii_case(name));
-    let matched = matches.next().cloned();
-    if matches.next().is_some() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::AmbiguousFieldName));
+    let mut matched = None;
+    for (index, key) in object.keys().enumerate() {
+        if index % JSON_CANCELLATION_CHECK_KEYS == 0 {
+            checkpoint()?;
+        }
+        if json_key_eq_ignore_ascii_case_with_checkpoint(key, name, checkpoint)? {
+            if matched.is_some() {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::AmbiguousFieldName));
+            }
+            matched = Some(key.clone());
+        }
     }
-    drop(matches);
     Ok(matched.and_then(|key| object.remove(&key)))
 }
 
+fn json_key_eq_ignore_ascii_case_with_checkpoint(
+    key: &str,
+    expected: &str,
+    checkpoint: &mut impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    if key.len() != expected.len() {
+        return Ok(false);
+    }
+
+    for (key_chunk, expected_chunk) in key
+        .as_bytes()
+        .chunks(JSON_CANCELLATION_CHECK_BYTES)
+        .zip(expected.as_bytes().chunks(JSON_CANCELLATION_CHECK_BYTES))
+    {
+        checkpoint()?;
+        if !key_chunk.eq_ignore_ascii_case(expected_chunk) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
 fn json_value_to_line(value: serde_json::Value, scalar_column: &str) -> std::io::Result<Bytes> {
+    json_value_to_line_cancellable(value, scalar_column, &AtomicBool::new(false))
+}
+
+fn json_value_to_line_cancellable(
+    value: serde_json::Value,
+    scalar_column: &str,
+    cancelled: &AtomicBool,
+) -> std::io::Result<Bytes> {
     let value = match value {
         value @ serde_json::Value::Object(_) => value,
         value => {
@@ -1518,9 +1848,60 @@ fn json_value_to_line(value: serde_json::Value, scalar_column: &str) -> std::io:
             serde_json::Value::Object(row)
         }
     };
-    let mut line = serde_json::to_vec(&value).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut line = Vec::new();
+    let (serialize_result, limit_exceeded) = {
+        let mut writer = CancellableJsonWriter {
+            inner: &mut line,
+            cancelled,
+            bytes_since_check: 0,
+            limit_exceeded: false,
+        };
+        let serialize_result = serde_json::to_writer(&mut writer, &value);
+        (serialize_result, writer.limit_exceeded)
+    };
+    if limit_exceeded {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::OverMaxRecordSize));
+    }
+    if let Err(error) = serialize_result {
+        ensure_json_parse_active(cancelled)?;
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+    }
+    ensure_json_parse_active(cancelled)?;
     line.push(b'\n');
     Ok(Bytes::from(line))
+}
+
+struct CancellableJsonWriter<'a> {
+    inner: &'a mut Vec<u8>,
+    cancelled: &'a AtomicBool,
+    bytes_since_check: usize,
+    limit_exceeded: bool,
+}
+
+impl std::io::Write for CancellableJsonWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let Some(new_len) = self.inner.len().checked_add(buffer.len()) else {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::OverMaxRecordSize));
+        };
+        if new_len > MAX_SELECT_RECORD_BYTES {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::OverMaxRecordSize));
+        }
+        self.bytes_since_check = self.bytes_since_check.saturating_add(buffer.len());
+        if self.bytes_since_check >= JSON_CANCELLATION_CHECK_BYTES {
+            ensure_json_parse_active(self.cancelled)?;
+            self.bytes_since_check %= JSON_CANCELLATION_CHECK_BYTES;
+        }
+        self.inner.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        ensure_json_parse_active(self.cancelled)?;
+        self.bytes_since_check = 0;
+        Ok(())
+    }
 }
 
 fn invalid_json_source_path(message: &'static str) -> std::io::Error {
@@ -1552,6 +1933,7 @@ where
     S: Stream<Item = std::result::Result<Bytes, E>> + Send + 'static,
     E: Send + 'static,
 {
+    let input_metrics = input_metrics.recorder();
     stream.inspect_ok(move |bytes| input_metrics.record_uncompressed(bytes.len()))
 }
 
@@ -1611,14 +1993,16 @@ fn incomplete_object_stream_error(remaining: impl std::fmt::Display) -> o_Error 
 #[cfg(test)]
 mod test {
     use super::{
-        EcObjectStore, EcObjectStoreBuildError, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, OnceCell,
+        EcObjectStore, EcObjectStoreBuildError, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, JsonDocumentReadMode, OnceCell,
         SELECT_DEFAULT_READ_BUFFER_SIZE, SelectObjectOptions, SelectObjectSnapshot, SelectScanRange, SnapshotConsistencyError,
-        bytes_stream, convert_csv_delimiter_stream, convert_field_delimiter_stream, convert_record_delimiter_stream,
-        find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range, json_document_ndjson_stream,
-        json_document_ndjson_stream_with_parser, legacy_json_source_from_input, map_storage_error,
-        meter_uncompressed_input_stream, scan_range_from_bounds, scan_range_stream, select_read_headers, snapshot_last_modified,
-        validate_json_document_size,
+        bytes_stream, compressed_json_document_ndjson_stream, convert_csv_delimiter_stream, convert_field_delimiter_stream,
+        convert_record_delimiter_stream, find_delimiter, flatten_json_document_to_ndjson, grow_json_document_buffer,
+        http_range_spec_from_get_range, json_document_ndjson_stream, json_document_ndjson_stream_with_parser,
+        json_key_eq_ignore_ascii_case_with_checkpoint, legacy_json_source_from_input, map_storage_error,
+        meter_uncompressed_input_stream, remove_json_source_key_with_checkpoint, scan_range_from_bounds, scan_range_stream,
+        select_read_headers, snapshot_last_modified, validate_json_document_size,
     };
+    use crate::input_stream::{CompressionFormat, MAX_SELECT_RECORD_BYTES, compressed_input_reader, encode_compressed_fixture};
     use crate::query::ast::{JsonPathSegment, JsonSource};
     use crate::query::session::{QueryExecutionGuard, QueryExecutionOwner, QueryExecutionTracker};
     use crate::storage_api::SelectPutObjReader;
@@ -1627,7 +2011,7 @@ mod test {
     use bytes::Bytes;
     use datafusion::{
         common::DataFusionError,
-        execution::memory_pool::{GreedyMemoryPool, MemoryLimit, MemoryPool, MemoryReservation},
+        execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation},
         execution::{config::SessionConfig, context::SessionContext},
         object_store::{self, GetOptions, GetRange, GetResultPayload, ObjectStore as _, path::Path},
         physical_plan::ExecutionPlanProperties,
@@ -1639,8 +2023,8 @@ mod test {
     use rustfs_test_utils::PutObjectCommitBarrier;
     use s3s::S3ErrorCode;
     use s3s::dto::{
-        CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput, JSONType,
-        OutputSerialization, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
+        CSVInput, CSVOutput, CompressionType, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput,
+        JSONType, OutputSerialization, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use s3s::header::{
         X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
@@ -3128,7 +3512,7 @@ mod test {
             Arc::new(GreedyMemoryPool::new(1024 * 1024)),
             None,
             Arc::clone(&input_metrics),
-            snapshot,
+            Arc::clone(&snapshot),
             JsonSource::default(),
         )
         .expect("build metrics-aware object store");
@@ -3173,6 +3557,152 @@ mod test {
         assert_eq!(range, b"id"[..]);
         assert_eq!(input_metrics.snapshot().bytes_scanned, 2);
         assert_eq!(input_metrics.snapshot().bytes_processed, 2);
+    }
+
+    #[tokio::test]
+    async fn compressed_object_uses_one_full_stream_and_rejects_internal_ranges() {
+        const BUCKET: &str = "s3select-compressed-object";
+        const OBJECT: &str = "input.csv";
+        const DATA: &[u8] = b"id,name\n1,Alice\n2,Bob\n";
+
+        let compressed = encode_compressed_fixture(CompressionFormat::Gzip, DATA).await;
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(compressed.clone());
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put compressed CSV fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let mut input = (*csv_input(BUCKET, OBJECT)).clone();
+        input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: None,
+        });
+        let input_metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            Arc::new(input),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::clone(&input_metrics),
+            Arc::clone(&snapshot),
+            JsonSource::default(),
+        )
+        .expect("build compressed object store");
+
+        let error = store
+            .get_opts(
+                &Path::from(OBJECT),
+                GetOptions {
+                    range: Some(GetRange::Bounded(0..1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("compressed input must reject DataFusion byte ranges");
+        assert_eq!(
+            QueryError::from(DataFusionError::ObjectStore(Box::new(error))).select_error(),
+            SelectError::UnsupportedScanRangeInput
+        );
+        assert_eq!(store.reader_open_count.load(Ordering::SeqCst), 0);
+
+        let mut scan_input = (*csv_input(BUCKET, OBJECT)).clone();
+        scan_input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        scan_input.request.scan_range = Some(ScanRange {
+            start: Some(1),
+            end: None,
+        });
+        let scan_store = EcObjectStore::build_with_snapshot(
+            Arc::new(scan_input),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+            Arc::new(SelectInputMetrics::default()),
+            snapshot,
+            JsonSource::default(),
+        )
+        .expect("build compressed ScanRange object store");
+        let error = scan_store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect_err("compressed request ScanRange must fail before object I/O");
+        assert_eq!(
+            QueryError::from(DataFusionError::ObjectStore(Box::new(error))).select_error(),
+            SelectError::UnsupportedScanRangeInput
+        );
+        assert_eq!(scan_store.reader_open_count.load(Ordering::SeqCst), 0);
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open full compressed object stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected compressed stream payload");
+        };
+        let body = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("decode compressed object")
+            .concat();
+
+        assert_eq!(body, DATA);
+        assert_eq!(store.reader_open_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            input_metrics.snapshot().bytes_scanned,
+            u64::try_from(compressed.len()).expect("compressed fixture length should fit in u64")
+        );
+        assert_eq!(
+            input_metrics.snapshot().bytes_processed,
+            u64::try_from(DATA.len()).expect("input fixture length should fit in u64")
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_stream_throughput_is_independent_of_query_memory_pool() {
+        const BUCKET: &str = "s3select-compressed-throughput";
+        const OBJECT: &str = "input.csv.gz";
+
+        let data = b"a\n".repeat(1024 * 1024);
+        let compressed = encode_compressed_fixture(CompressionFormat::Gzip, &data).await;
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        let mut reader = SelectPutObjReader::from_vec(compressed);
+        env.ecstore
+            .put_object(BUCKET, OBJECT, &mut reader, &Default::default())
+            .await
+            .expect("put compressed throughput fixture");
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let mut input = (*csv_input(BUCKET, OBJECT)).clone();
+        input.request.input_serialization.compression_type = Some(CompressionType::from_static(CompressionType::GZIP));
+        let metrics = Arc::new(SelectInputMetrics::default());
+        let store = EcObjectStore::build_with_snapshot(
+            Arc::new(input),
+            Arc::new(GreedyMemoryPool::new(1)),
+            None,
+            Arc::clone(&metrics),
+            snapshot,
+            JsonSource::default(),
+        )
+        .expect("build compressed throughput store");
+
+        let result = store
+            .get_opts(&Path::from(OBJECT), GetOptions::default())
+            .await
+            .expect("open compressed throughput stream");
+        let GetResultPayload::Stream(stream) = result.payload else {
+            panic!("expected compressed stream payload");
+        };
+        let decoded = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("streamed decoded bytes should not consume the query memory pool")
+            .concat();
+
+        assert_eq!(decoded, data);
+        assert_eq!(
+            metrics.snapshot().bytes_processed,
+            u64::try_from(data.len()).expect("fixture length should fit in u64")
+        );
     }
 
     #[tokio::test]
@@ -3354,6 +3884,125 @@ mod test {
     }
 
     #[tokio::test]
+    async fn compressed_json_document_uses_decoded_size_and_metric_boundaries() {
+        const INPUT: &[u8] = br#"[{"id":1},{"id":2}]"#;
+        const EXPECTED: &[u8] = b"{\"id\":1}\n{\"id\":2}\n";
+
+        for format in [CompressionFormat::Gzip, CompressionFormat::Bzip2] {
+            let compressed = encode_compressed_fixture(format, INPUT).await;
+            let compressed_len = u64::try_from(compressed.len()).expect("compressed fixture length should fit in u64");
+            let input_metrics = Arc::new(SelectInputMetrics::default());
+            let reader = compressed_input_reader(
+                Box::new(std::io::Cursor::new(compressed)),
+                compressed_len,
+                format,
+                Arc::clone(&input_metrics),
+                u64::MAX,
+                None,
+            );
+            let output = compressed_json_document_ndjson_stream(
+                reader,
+                JsonSource::default(),
+                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("compressed JSON DOCUMENT should decode and parse")
+            .concat();
+
+            assert_eq!(output, EXPECTED);
+            assert_eq!(input_metrics.snapshot().bytes_scanned, compressed_len);
+            assert_eq!(
+                input_metrics.snapshot().bytes_processed,
+                u64::try_from(INPUT.len()).expect("JSON fixture length should fit in u64")
+            );
+        }
+    }
+
+    async fn compressed_json_document_select_error(
+        format: CompressionFormat,
+        compressed: Vec<u8>,
+        max_processed_bytes: u64,
+    ) -> SelectError {
+        let compressed_len = u64::try_from(compressed.len()).expect("compressed fixture length should fit in u64");
+        let reader = compressed_input_reader(
+            Box::new(std::io::Cursor::new(compressed)),
+            compressed_len,
+            format,
+            Arc::new(SelectInputMetrics::default()),
+            max_processed_bytes,
+            None,
+        );
+        let mut output = compressed_json_document_ndjson_stream(
+            reader,
+            JsonSource::default(),
+            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            None,
+        );
+        let source = output
+            .next()
+            .await
+            .expect("decoder failure should produce one stream error")
+            .expect_err("compressed JSON DOCUMENT decoding must fail");
+        assert!(output.next().await.is_none());
+        QueryError::from(DataFusionError::ObjectStore(Box::new(source))).select_error()
+    }
+
+    #[tokio::test]
+    async fn compressed_json_document_preserves_decoder_select_errors() {
+        const INPUT: &[u8] = br#"[{"id":1}]"#;
+
+        for (format, compression) in [(CompressionFormat::Gzip, "GZIP"), (CompressionFormat::Bzip2, "BZIP2")] {
+            assert_eq!(
+                compressed_json_document_select_error(format, b"not compressed".to_vec(), u64::MAX).await,
+                SelectError::InvalidCompressionFormatForObject { compression }
+            );
+
+            let mut truncated = encode_compressed_fixture(format, INPUT).await;
+            truncated.truncate(truncated.len() - 1);
+            assert_eq!(
+                compressed_json_document_select_error(format, truncated, u64::MAX).await,
+                SelectError::TruncatedInput
+            );
+
+            let compressed = encode_compressed_fixture(format, INPUT).await;
+            let max_processed_bytes = u64::try_from(INPUT.len() - 1).expect("fixture length should fit in u64");
+            assert_eq!(
+                compressed_json_document_select_error(format, compressed, max_processed_bytes).await,
+                SelectError::ResourceExhausted
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_json_document_buffer_grows_amortized_and_reserves_capacity() {
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+        let reservation = MemoryConsumer::new("compressed JSON document test").register(&memory_pool);
+        let json_source = JsonSource::default();
+        let mut buffer = Vec::new();
+        let mut capacity_growths = 0;
+
+        for _ in 0..1025 {
+            let old_capacity = buffer.capacity();
+            let required_len = buffer.len() + 1;
+            grow_json_document_buffer(&mut buffer, required_len, &reservation, &json_source)
+                .expect("bounded JSON buffer should grow");
+            if buffer.capacity() != old_capacity {
+                capacity_growths += 1;
+            }
+            buffer.push(0);
+            assert_eq!(
+                reservation.size(),
+                super::json_document_memory_reservation_bytes(buffer.capacity(), &json_source)
+                    .expect("test reservation should fit")
+            );
+        }
+
+        assert!(capacity_growths <= 12, "power-of-two growth should stay logarithmic");
+    }
+
+    #[tokio::test]
     async fn scalar_alias_expansion_is_in_the_query_memory_reservation() {
         let input = b"[0,0]".to_vec();
         let alias = "alias".repeat(128);
@@ -3489,12 +4138,14 @@ mod test {
             Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
         let mut output = json_document_ndjson_stream_with_parser(
             Box::new(std::io::Cursor::new(input.clone())),
-            input.len() as u64,
+            JsonDocumentReadMode::Exact {
+                original_size: input.len() as u64,
+                input_metrics: SelectInputMetrics::default().recorder(),
+            },
             JsonSource::default(),
-            Arc::new(SelectInputMetrics::default()),
             memory_pool,
             None,
-            |_, _| Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::AmbiguousFieldName)),
+            |_, _, _| Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::AmbiguousFieldName)),
         );
 
         let source = output
@@ -3562,7 +4213,7 @@ mod test {
     }
 
     #[test]
-    fn test_json_document_queued_parse_retains_query_guard_until_dequeued() {
+    fn test_json_document_cancelled_queued_parse_releases_before_dequeue() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(1)
@@ -3614,29 +4265,22 @@ mod test {
             }
             drop(output);
 
-            assert_eq!(admission.available_permits(), 0);
-            assert!(memory_pool.reserved() > 0);
             assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), reservation_released)
+                    .await
+                    .expect("queued parse cancellation should release its memory immediately")
+                    .expect("memory reservation release observer should remain open"),
+                "query admission must cover the memory reservation through teardown"
+            );
+            assert_eq!(memory_pool.reserved(), 0);
+            let recovered_permit =
                 tokio::time::timeout(std::time::Duration::from_millis(100), Arc::clone(&admission).acquire_owned())
                     .await
-                    .is_err(),
-                "queued parse resources must remain covered by admission"
-            );
+                    .expect("queued parse cancellation should release admission before a worker is available")
+                    .expect("query admission should remain open");
+
             release_blocking_tx.send(()).expect("release blocking worker");
             blocker.await.expect("blocking worker should finish");
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_secs(5), reservation_released)
-                    .await
-                    .expect("cancelled JSON parse should release its memory reservation")
-                    .expect("memory reservation release observer should remain open"),
-                "query admission must cover the memory reservation through task teardown"
-            );
-            let recovered_permit =
-                tokio::time::timeout(std::time::Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
-                    .await
-                    .expect("cancelled JSON parse should be dequeued")
-                    .expect("query admission should remain open");
-            assert_eq!(memory_pool.reserved(), 0);
             drop(recovered_permit);
             assert_eq!(admission.available_permits(), 1);
         });
@@ -3679,12 +4323,14 @@ mod test {
             let parser_started_in_task = Arc::clone(&parser_started);
             let mut output = json_document_ndjson_stream_with_parser(
                 Box::new(std::io::Cursor::new(input.clone())),
-                input.len() as u64,
+                JsonDocumentReadMode::Exact {
+                    original_size: input.len() as u64,
+                    input_metrics: SelectInputMetrics::default().recorder(),
+                },
                 JsonSource::default(),
-                Arc::new(SelectInputMetrics::default()),
                 Arc::clone(&memory_pool),
                 Some(query_tracker.clone()),
-                move |_, _| {
+                move |_, _, _| {
                     parser_started_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(vec![Bytes::from_static(b"{}\n")])
                 },
@@ -3756,12 +4402,14 @@ mod test {
             let parser_started_in_task = Arc::clone(&parser_started);
             let mut output = json_document_ndjson_stream_with_parser(
                 Box::new(std::io::Cursor::new(input.clone())),
-                input.len() as u64,
+                JsonDocumentReadMode::Exact {
+                    original_size: input.len() as u64,
+                    input_metrics: SelectInputMetrics::default().recorder(),
+                },
                 JsonSource::default(),
-                Arc::new(SelectInputMetrics::default()),
                 Arc::clone(&memory_pool),
                 Some(query_tracker),
-                move |_, _| {
+                move |_, _, _| {
                     parser_started_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(vec![Bytes::from_static(b"{}\n")])
                 },
@@ -3787,7 +4435,7 @@ mod test {
     }
 
     #[test]
-    fn test_json_document_started_parse_retains_query_guard_when_cancelled() {
+    fn test_json_document_started_parse_cancels_and_releases_query_guard() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(1)
@@ -3812,18 +4460,21 @@ mod test {
             let memory_pool: Arc<dyn MemoryPool> =
                 Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
             let (parse_started_tx, parse_started_rx) = tokio::sync::oneshot::channel();
-            let (release_parse_tx, release_parse_rx) = std::sync::mpsc::channel();
             let mut output = json_document_ndjson_stream_with_parser(
                 Box::new(std::io::Cursor::new(input.clone())),
-                input.len() as u64,
+                JsonDocumentReadMode::Exact {
+                    original_size: input.len() as u64,
+                    input_metrics: SelectInputMetrics::default().recorder(),
+                },
                 JsonSource::default(),
-                Arc::new(SelectInputMetrics::default()),
                 memory_pool,
                 Some(query_tracker),
-                move |_, _| {
+                move |_, _, cancellation| {
                     let _ = parse_started_tx.send(());
-                    release_parse_rx.recv().expect("release JSON parser");
-                    Ok(vec![Bytes::from_static(b"{}\n")])
+                    while !cancellation.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    Err(std::io::Error::new(std::io::ErrorKind::Interrupted, SelectError::Canceled))
                 },
             );
 
@@ -3833,14 +4484,13 @@ mod test {
                 assert!(futures::poll!(next.as_mut()).is_pending());
             }
             parse_started_rx.await.expect("JSON parser should start");
+            assert!(Arc::clone(&admission).try_acquire_owned().is_err());
             drop(output);
 
-            assert!(Arc::clone(&admission).try_acquire_owned().is_err());
-            release_parse_tx.send(()).expect("release JSON parser");
             let recovered_permit =
                 tokio::time::timeout(std::time::Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
                     .await
-                    .expect("started JSON parse should release the query guard")
+                    .expect("cancelled JSON parse should release the query guard without an external unblock")
                     .expect("query admission should remain open");
             drop(recovered_permit);
             assert_eq!(admission.available_permits(), 1);
@@ -3929,6 +4579,32 @@ mod test {
         let input = b"{ not valid json }";
         let err = flatten_json_document_to_ndjson(input, &[]).expect_err("should fail on invalid JSON");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn json_document_logical_record_enforces_one_megabyte_limit() {
+        const OBJECT_OVERHEAD: usize = br#"{"v":""}"#.len();
+
+        let at_limit = serde_json::json!({"v": "x".repeat(MAX_SELECT_RECORD_BYTES - OBJECT_OVERHEAD)});
+        let line = super::json_value_to_line(at_limit, "_1").expect("one-megabyte logical record should be accepted");
+        assert_eq!(line.len(), MAX_SELECT_RECORD_BYTES + 1);
+
+        let over_limit = serde_json::json!({"v": "x".repeat(MAX_SELECT_RECORD_BYTES + 1 - OBJECT_OVERHEAD)});
+        let error = super::json_value_to_line(over_limit, "_1").expect_err("oversized logical record must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.get_ref().is_some_and(|source| {
+            source
+                .downcast_ref::<SelectError>()
+                .is_some_and(|error| error == &SelectError::OverMaxRecordSize)
+        }));
+
+        let escaped = serde_json::json!({"v": "\0".repeat(MAX_SELECT_RECORD_BYTES / 6)});
+        let error = super::json_value_to_line(escaped, "_1").expect_err("escaped output must be bounded while it is serialized");
+        assert!(error.get_ref().is_some_and(|source| {
+            source
+                .downcast_ref::<SelectError>()
+                .is_some_and(|error| error == &SelectError::OverMaxRecordSize)
+        }));
     }
 
     /// Completely empty input returns an error (not valid JSON).
@@ -4154,6 +4830,55 @@ mod test {
                 .and_then(|source| source.downcast_ref::<SelectError>())
                 .is_some_and(|error| *error == SelectError::AmbiguousFieldName)
         );
+    }
+
+    #[test]
+    fn unquoted_source_key_scan_honors_cancellation() {
+        let mut object = serde_json::Map::new();
+        for index in 0..=super::JSON_CANCELLATION_CHECK_KEYS {
+            object.insert(format!("field-{index}"), serde_json::Value::Null);
+        }
+        let mut checkpoints = 0;
+        let mut cancel_on_second_checkpoint = || {
+            checkpoints += 1;
+            if checkpoints == 2 {
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, SelectError::Canceled))
+            } else {
+                Ok(())
+            }
+        };
+
+        let error = remove_json_source_key_with_checkpoint(&mut object, "x", false, &mut cancel_on_second_checkpoint)
+            .expect_err("key scan should stop at its second cancellation checkpoint");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(checkpoints, 2);
+        assert!(
+            error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<SelectError>())
+                .is_some_and(|error| *error == SelectError::Canceled)
+        );
+    }
+
+    #[test]
+    fn long_json_key_comparison_honors_cancellation() {
+        let key = "x".repeat(super::JSON_CANCELLATION_CHECK_BYTES * 2);
+        let mut checkpoints = 0;
+        let mut cancel_on_second_checkpoint = || {
+            checkpoints += 1;
+            if checkpoints == 2 {
+                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, SelectError::Canceled))
+            } else {
+                Ok(())
+            }
+        };
+
+        let error = json_key_eq_ignore_ascii_case_with_checkpoint(&key, &key, &mut cancel_on_second_checkpoint)
+            .expect_err("long-key comparison should stop at its second cancellation checkpoint");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(checkpoints, 2);
     }
 
     #[test]

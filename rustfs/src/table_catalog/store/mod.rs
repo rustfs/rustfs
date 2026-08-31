@@ -57,6 +57,9 @@ fn validate_table_bucket_entry(entry: &TableBucketEntry) -> TableCatalogStoreRes
     if entry.catalog_type != TABLE_BUCKET_CATALOG_TYPE {
         return Err(TableCatalogStoreError::Invalid("unsupported table bucket catalog type".to_string()));
     }
+    if entry.active_rename_id.as_ref().is_some_and(String::is_empty) {
+        return Err(TableCatalogStoreError::Invalid("active table rename id cannot be empty".to_string()));
+    }
     Ok(())
 }
 
@@ -984,6 +987,15 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn table_rename_intent_path(&self, table_bucket: &str, rename_id: &str) -> String {
+        format!(
+            "{}{}/{}.json",
+            self.table_bucket_root_prefix(table_bucket),
+            TABLE_RENAME_ROOT,
+            table_catalog_path_hash(rename_id)
+        )
+    }
+
     pub fn backing_migration_fence_path(&self, table_bucket: &str) -> String {
         format!(
             "{}{}/{}",
@@ -1159,9 +1171,7 @@ where
         update: NamespacePropertiesUpdate,
     ) -> TableCatalogStoreResult<NamespacePropertiesUpdateResult> {
         match self {
-            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
-                "namespace property updates require durable-strong catalog backing".to_string(),
-            )),
+            Self::ObjectBacked(store) => store.update_namespace_properties(table_bucket, namespace, update).await,
             Self::DurableStrong(store) => store.update_namespace_properties(table_bucket, namespace, update).await,
         }
     }
@@ -1241,9 +1251,11 @@ where
         destination_table: &str,
     ) -> TableCatalogStoreResult<()> {
         match self {
-            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
-                "table rename requires durable-strong catalog backing".to_string(),
-            )),
+            Self::ObjectBacked(store) => {
+                store
+                    .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)
+                    .await
+            }
             Self::DurableStrong(store) => {
                 store
                     .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)

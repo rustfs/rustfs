@@ -539,7 +539,8 @@ pub(crate) mod ecstore_rpc {
         sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, sign_tonic_rpc_response_proof,
         tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
         verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
-        verify_tonic_mutation_body_digest, verify_tonic_rpc_signature_with_bootstrap,
+        verify_tonic_mutation_body_digest, verify_tonic_mutation_body_digest_reject_unsigned,
+        verify_tonic_rpc_signature_with_bootstrap,
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
@@ -593,8 +594,9 @@ pub(crate) mod ecstore_storage {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::storage::init_local_disks;
     pub(crate) use rustfs_ecstore::api::storage::{
-        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, all_local_disk, all_local_disk_path, find_local_disk_by_ref,
-        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map_with_instance_ctx,
+        ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk, all_local_disk_path,
+        find_local_disk_by_ref, init_local_disks_with_instance_ctx, init_lock_clients,
+        prewarm_local_disk_id_map_with_instance_ctx,
     };
 }
 
@@ -1901,6 +1903,13 @@ pub(crate) fn verify_tonic_canonical_body_digest<T>(request: &tonic::Request<T>,
 
 pub(crate) fn verify_tonic_mutation_body_digest<T>(request: &tonic::Request<T>, canonical_body: &[u8]) -> std::io::Result<()> {
     ecstore_rpc::verify_tonic_mutation_body_digest(request, canonical_body)
+}
+
+pub(crate) fn verify_tonic_mutation_body_digest_reject_unsigned<T>(
+    request: &tonic::Request<T>,
+    canonical_body: &[u8],
+) -> std::io::Result<()> {
+    ecstore_rpc::verify_tonic_mutation_body_digest_reject_unsigned(request, canonical_body)
 }
 
 #[cfg(test)]

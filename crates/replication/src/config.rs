@@ -1672,6 +1672,94 @@ mod tests {
     }
 
     #[test]
+    fn replication_writable_fields_bind_to_typed_dto_fields() {
+        let mut rule = replication_rule("id-marker", "arn:bucket-marker");
+        rule.priority = Some(37);
+        rule.filter = Some(s3s::dto::ReplicationRuleFilter {
+            prefix: Some("prefix-marker/".to_string()),
+            tag: Some(s3s::dto::Tag {
+                key: Some("tag-key-marker".to_string()),
+                value: Some("tag-value-marker".to_string()),
+            }),
+            and: Some(s3s::dto::ReplicationRuleAndOperator {
+                prefix: Some("and-prefix-marker/".to_string()),
+                tags: Some(vec![s3s::dto::Tag {
+                    key: Some("and-tag-key-marker".to_string()),
+                    value: Some("and-tag-value-marker".to_string()),
+                }]),
+            }),
+            ..Default::default()
+        });
+        rule.delete_marker_replication = Some(DeleteMarkerReplication {
+            status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+        });
+        rule.delete_replication = Some(DeleteReplication {
+            status: DeleteReplicationStatus::from_static(DeleteReplicationStatus::ENABLED),
+        });
+        rule.source_selection_criteria = Some(SourceSelectionCriteria {
+            replica_modifications: Some(ReplicaModifications {
+                status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+            }),
+            sse_kms_encrypted_objects: None,
+        });
+        let config = ReplicationConfiguration {
+            role: "role-marker".to_string(),
+            rules: vec![rule],
+        };
+
+        let rule = config.rules.first().expect("fixture should contain one rule");
+        let filter = rule.filter.as_ref().expect("fixture should contain a rule filter");
+        let field_hits = [
+            ("Role", config.role == "role-marker"),
+            ("Rule.ID", rule.id.as_deref() == Some("id-marker")),
+            ("Rule.Status", rule.status.as_str() == ReplicationRuleStatus::ENABLED),
+            ("Rule.Priority", rule.priority == Some(37)),
+            ("Rule.Filter.Prefix", filter.prefix.as_deref() == Some("prefix-marker/")),
+            (
+                "Rule.Filter.Tag",
+                filter.tag.as_ref().and_then(|tag| tag.key.as_deref()) == Some("tag-key-marker"),
+            ),
+            (
+                "Rule.Filter.And",
+                filter.and.as_ref().and_then(|and| and.prefix.as_deref()) == Some("and-prefix-marker/"),
+            ),
+            ("Rule.Destination.Bucket", rule.destination.bucket == "arn:bucket-marker"),
+            (
+                "Rule.ExistingObjectReplication.Status",
+                rule.existing_object_replication
+                    .as_ref()
+                    .is_some_and(|existing| existing.status.as_str() == ExistingObjectReplicationStatus::ENABLED),
+            ),
+            (
+                "Rule.DeleteMarkerReplication.Status",
+                rule.delete_marker_replication
+                    .as_ref()
+                    .and_then(|delete_marker| delete_marker.status.as_ref())
+                    .is_some_and(|status| status.as_str() == DeleteMarkerReplicationStatus::ENABLED),
+            ),
+            (
+                "Rule.DeleteReplication.Status",
+                rule.delete_replication
+                    .as_ref()
+                    .is_some_and(|delete| delete.status.as_str() == DeleteReplicationStatus::ENABLED),
+            ),
+            (
+                "Rule.SourceSelectionCriteria.ReplicaModifications.Status",
+                rule.source_selection_criteria
+                    .as_ref()
+                    .and_then(|criteria| criteria.replica_modifications.as_ref())
+                    .is_some_and(|modifications| modifications.status.as_str() == ReplicaModificationsStatus::ENABLED),
+            ),
+        ];
+        let bound_paths = field_hits.iter().map(|(path, _)| *path).collect::<Vec<_>>();
+        assert_eq!(bound_paths, REPLICATION_WRITABLE_FIELDS);
+
+        for (path, hit) in field_hits {
+            assert!(hit, "typed field probe did not reach {path}");
+        }
+    }
+
+    #[test]
     fn invalid_replication_status_fields_are_reported_before_persistence() {
         let arn = "arn:rustfs:replication:us-east-1:target:bucket";
         let mut config = ReplicationConfiguration {

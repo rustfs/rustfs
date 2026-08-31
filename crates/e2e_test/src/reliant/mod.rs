@@ -21,5 +21,6 @@ mod head_tls_bodyless_test;
 mod lifecycle;
 mod lock;
 mod node_interact_test;
+mod s3_select_compression;
 mod sql;
 mod tiering;

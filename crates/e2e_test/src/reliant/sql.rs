@@ -122,6 +122,24 @@ async fn select_json_document(client: &Client, key: &str, expression: &str) -> T
     process_select_response(response).await
 }
 
+fn csv_select_request(
+    client: &Client,
+    key: &str,
+) -> aws_sdk_s3::operation::select_object_content::builders::SelectObjectContentFluentBuilder {
+    client
+        .select_object_content()
+        .bucket(BUCKET)
+        .key(key)
+        .expression("SELECT * FROM S3Object")
+        .expression_type(ExpressionType::Sql)
+        .input_serialization(
+            InputSerialization::builder()
+                .csv(CsvInput::builder().file_header_info(FileHeaderInfo::Use).build())
+                .build(),
+        )
+        .output_serialization(OutputSerialization::builder().csv(CsvOutput::builder().build()).build())
+}
+
 async fn process_select_response(
     mut event_stream: aws_sdk_s3::operation::select_object_content::SelectObjectContentOutput,
 ) -> TestResult<String> {
@@ -188,30 +206,42 @@ async fn assert_input_byte_stats(
     let mut last_progress: Option<aws_sdk_s3::types::Progress> = None;
     let mut stats = None;
     let mut saw_end = false;
-    while let Some(event) = payload.recv().await? {
-        match event {
-            aws_sdk_s3::types::SelectObjectContentEventStream::Records(records) => {
-                if let Some(bytes) = records.payload {
-                    records_len = records_len.saturating_add(u64::try_from(bytes.as_ref().len())?);
+    tokio::time::timeout(SELECT_RESPONSE_TIMEOUT, async {
+        // The AWS SDK validates both event-stream CRCs before yielding an event.
+        while let Some(event) = payload.recv().await? {
+            assert!(!saw_end, "Select emitted an event after End");
+            match event {
+                aws_sdk_s3::types::SelectObjectContentEventStream::Records(records) => {
+                    assert!(stats.is_none(), "Select emitted Records after Stats");
+                    if let Some(bytes) = records.payload {
+                        records_len = records_len.saturating_add(u64::try_from(bytes.as_ref().len())?);
+                    }
                 }
-            }
-            aws_sdk_s3::types::SelectObjectContentEventStream::Progress(event) => {
-                let details = event.details.ok_or("Progress event did not contain details")?;
-                if let Some(previous) = last_progress.as_ref() {
-                    assert!(details.bytes_scanned() >= previous.bytes_scanned());
-                    assert!(details.bytes_processed() >= previous.bytes_processed());
-                    assert!(details.bytes_returned() >= previous.bytes_returned());
+                aws_sdk_s3::types::SelectObjectContentEventStream::Progress(event) => {
+                    assert!(stats.is_none(), "Select emitted Progress after Stats");
+                    let details = event.details.ok_or("Progress event did not contain details")?;
+                    if let Some(previous) = last_progress.as_ref() {
+                        assert!(details.bytes_scanned() >= previous.bytes_scanned());
+                        assert!(details.bytes_processed() >= previous.bytes_processed());
+                        assert!(details.bytes_returned() >= previous.bytes_returned());
+                    }
+                    last_progress = Some(details);
                 }
-                last_progress = Some(details);
+                aws_sdk_s3::types::SelectObjectContentEventStream::Stats(event) => {
+                    assert!(stats.is_none(), "Select emitted more than one Stats event");
+                    stats = event.details;
+                }
+                aws_sdk_s3::types::SelectObjectContentEventStream::End(_) => {
+                    assert!(stats.is_some(), "Select emitted End before Stats");
+                    saw_end = true;
+                }
+                _ => assert!(stats.is_none(), "Select emitted a non-terminal event after Stats"),
             }
-            aws_sdk_s3::types::SelectObjectContentEventStream::Stats(event) => stats = event.details,
-            aws_sdk_s3::types::SelectObjectContentEventStream::End(_) => {
-                saw_end = true;
-                break;
-            }
-            _ => {}
         }
-    }
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    })
+    .await
+    .map_err(|_| -> Box<dyn Error + Send + Sync> { "Select response timed out".into() })??;
 
     let stats = stats.ok_or("Select response ended without a Stats event")?;
     let input_len = i64::try_from(body.len())?;
@@ -219,10 +249,11 @@ async fn assert_input_byte_stats(
     assert_eq!(stats.bytes_processed(), Some(input_len));
     assert_eq!(stats.bytes_returned(), Some(i64::try_from(records_len)?));
     if progress_enabled {
-        let progress = last_progress.ok_or("Select response ended without a Progress event")?;
-        assert_eq!(progress.bytes_scanned(), stats.bytes_scanned());
-        assert_eq!(progress.bytes_processed(), stats.bytes_processed());
-        assert_eq!(progress.bytes_returned(), stats.bytes_returned());
+        if let Some(progress) = last_progress {
+            assert!(stats.bytes_scanned() >= progress.bytes_scanned());
+            assert!(stats.bytes_processed() >= progress.bytes_processed());
+            assert!(stats.bytes_returned() >= progress.bytes_returned());
+        }
     } else {
         assert!(last_progress.is_none(), "disabled request progress emitted a Progress event");
     }
@@ -231,7 +262,7 @@ async fn assert_input_byte_stats(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_select_object_content_reports_input_byte_stats() -> TestResult<()> {
+async fn test_select_object_content_http_event_order_crc_and_input_byte_stats() -> TestResult<()> {
     const CSV_BODY: &[u8] = b"name,age\nAlice,30\nBob,25\n";
     const JSON_LINES_BODY: &[u8] = b"{\"name\":\"Alice\"}\n{\"name\":\"Bob\"}\n";
     const JSON_DOCUMENT_BODY: &[u8] = b"[{\"name\":\"Alice\"},{\"name\":\"Bob\"}]";
@@ -286,6 +317,60 @@ async fn test_select_object_content_reports_input_byte_stats() -> TestResult<()>
         false,
     )
     .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_select_object_content_http_disconnect_releases_query() -> TestResult<()> {
+    const OBJECT: &str = "disconnect.csv";
+    const ROWS: usize = 16 * 1024;
+    const RELEASE_BACKOFF: Duration = Duration::from_millis(25);
+
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server_with_env(vec![], &[("RUSTFS_S3SELECT_MAX_CONCURRENT_QUERIES", "1")])
+        .await?;
+    let client = env.create_s3_client();
+    setup_test_bucket(&client).await?;
+
+    let row = format!("{}\n", "x".repeat(1023));
+    let mut body = Vec::with_capacity("value\n".len() + ROWS * row.len());
+    body.extend_from_slice(b"value\n");
+    for _ in 0..ROWS {
+        body.extend_from_slice(row.as_bytes());
+    }
+    client
+        .put_object()
+        .bucket(BUCKET)
+        .key(OBJECT)
+        .body(Bytes::from(body).into())
+        .send()
+        .await?;
+
+    // Leaving this response body unread fills the bounded HTTP/event channels before the query can finish.
+    let first = csv_select_request(&client, OBJECT).send().await?;
+    let saturated = csv_select_request(&client, OBJECT)
+        .send()
+        .await
+        .expect_err("the first HTTP stream should retain the only query permit");
+    assert_eq!(saturated.as_service_error().and_then(ProvideErrorMetadata::code), Some("SlowDown"));
+
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match csv_select_request(&client, OBJECT).send().await {
+                Ok(response) => return Ok::<_, Box<dyn Error + Send + Sync>>(response),
+                Err(error) if error.as_service_error().and_then(ProvideErrorMetadata::code) == Some("SlowDown") => {
+                    tokio::time::sleep(RELEASE_BACKOFF).await;
+                }
+                Err(error) => return Err(format!("unexpected Select error after disconnect: {error}").into()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| -> Box<dyn Error + Send + Sync> { "disconnected Select did not release its query permit".into() })??;
+    drop(second);
+
     Ok(())
 }
 

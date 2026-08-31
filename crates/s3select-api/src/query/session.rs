@@ -30,6 +30,7 @@ use datafusion::{
     prelude::SessionContext,
 };
 use parking_lot::Mutex;
+use s3s::dto::CompressionType;
 use std::sync::{
     Arc, Weak,
     atomic::{AtomicU8, Ordering},
@@ -446,11 +447,19 @@ impl SessionCtxFactory {
         let scan_range_requires_single_file_scan =
             context.input.request.scan_range.is_some() && context.input.request.input_serialization.parquet.is_none();
         let json_document_requires_single_file_scan = is_json_document_input(&context.input);
+        let compressed_input_requires_single_file_scan = context
+            .input
+            .request
+            .input_serialization
+            .compression_type
+            .as_ref()
+            .is_some_and(|compression| compression.as_str() != CompressionType::NONE);
         let metered_input_requires_single_file_scan =
             input_metrics.is_some() && context.input.request.input_serialization.parquet.is_none();
         let config = if custom_two_byte_record_delimiter
             || scan_range_requires_single_file_scan
             || json_document_requires_single_file_scan
+            || compressed_input_requires_single_file_scan
             || metered_input_requires_single_file_scan
         {
             config.with_repartition_file_scans(false)
@@ -845,6 +854,21 @@ mod tests {
             .expect("JSON LINES session should be created");
 
         assert!(session.inner().config().options().optimizer.repartition_file_scans);
+    }
+
+    #[tokio::test]
+    async fn compressed_input_disables_file_repartitioning_without_metrics() {
+        let mut context = test_context();
+        Arc::make_mut(&mut context.input).request.input_serialization.compression_type =
+            Some(CompressionType::from_static(CompressionType::GZIP));
+
+        let session = SessionCtxFactory::new(true)
+            .with_target_partitions(2)
+            .create_session_ctx(&context)
+            .await
+            .expect("compressed session should be created");
+
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
     }
 
     #[tokio::test]
