@@ -23,10 +23,10 @@
 //! ## Configuration
 //!
 //! All configuration is via environment variables (see `rustfs_config`):
-//! - `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` - Update interval in seconds (default: 120)
-//! - `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` - Write trigger delay (default: 5s)
-//! - `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` - Write frequency threshold (default: 5 writes/min)
-//! - `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` - Fast update threshold (default: 30s)
+//! - `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` - Update interval in seconds (default: 600)
+//! - `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` - Write trigger delay (default: 30s)
+//! - `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` - Write frequency threshold (default: 20 writes/min)
+//! - `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` - Fast update threshold (default: 120s)
 //! - `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` - Max files before sampling (default: 200,000)
 //! - `RUSTFS_CAPACITY_STAT_TIMEOUT` - Stat operation timeout (default: 3s)
 //! - `RUSTFS_CAPACITY_SAMPLE_RATE` - Sampling rate for metrics (default: 200)
