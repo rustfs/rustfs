@@ -1,20 +1,43 @@
-name: RustFS Heal Test
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: RustFS Security Test
 
 on:
   workflow_dispatch:
     inputs:
+      rustfs_version:
+        description: 'RustFS release tag to test (e.g. 1.0.0-rc.4-preview.1)'
+        required: false
+        default: '1.0.0-rc.4-preview.1'
       package_url:
-        description: 'Direct .deb URL (nightly/R2). Defaults to the latest nightly deb.'
+        description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
         type: string
-      stop_node_gb:
-        description: 'Stop the outage node when surviving nodes reach N GiB'
-        required: false
-        default: '15'
-      warp_stop_gb:
-        description: 'Stop warp when surviving nodes reach N GiB'
-        required: false
-        default: '40'
+      topology:
+        description: 'Topology to run (all = SNSD, SNMD, MNMD)'
+        type: choice
+        options:
+          - all
+          - single-single
+          - single-multi
+          - multi-multi
+        default: all
+      oidc_live:
+        description: 'Run the live Keycloak OIDC/SSO gate as part of the suite'
+        type: boolean
+        default: true
       cleanup_before:
         description: 'Reset the nodes before the test (DESTROYS existing data/config)'
         type: boolean
@@ -23,12 +46,16 @@ on:
         description: 'Reset the nodes after the test (DESTROYS test data/config)'
         type: boolean
         default: true
+  workflow_run:
+    # Same nightly trigger as the other functional suites.
+    workflows: ["Nightly GNU Build"]
+    types: [completed]
 
 permissions:
   contents: read
 
-# Only one test at a time: both this and the pool-expansion workflow mutate
-# the same test environment, so they share one concurrency group.
+# The security suite uses the same shared VMs as the other functional tests,
+# so it must serialize with them instead of running in parallel.
 concurrency:
   group: rustfs-shared-functional-tests
   cancel-in-progress: false
@@ -40,19 +67,17 @@ defaults:
 env:
   RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
   RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
-  RUSTFS_API_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
   RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
   RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
-  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
   RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
 jobs:
-  heal-test:
+  security-test:
     runs-on: smoke-testing
-    timeout-minutes: 480
-    # Manual-only standalone run. Nightly chain already runs heal in
-    # rustfs-pool-expand-test.yml to avoid duplicate heal executions.
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    continue-on-error: true
+    timeout-minutes: 360
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -63,16 +88,22 @@ jobs:
           persist-credentials: false
           token: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
+      - name: Checkout repository (for the OIDC live gate script)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
       - name: Show environment
         run: |
           uname -a
           jq --version
           openssl version
-          warp --version || true
+          aws --version || true
+          docker --version || true
           df -h /data | tail -1
 
       - name: Cleanup environment (before)
-        if: ${{ inputs.cleanup_before != 'false' }}
+        if: ${{ inputs.cleanup_before != 'false' || github.event_name != 'workflow_dispatch' }}
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -86,75 +117,62 @@ jobs:
                 ${SUDO} dpkg -P rustfs
               fi
               for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
-              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
             '
           done
 
-      - name: Install RustFS package & start cluster
-        run: |
-          ARGS=(--steps "1,2" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
-
-      - name: Preflight checks
-        run: |
-          ARGS=(--preflight --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
-          if [ -n "${{ inputs.package_url }}" ]; then
-            ARGS+=(--package-url "${{ inputs.package_url }}")
-          else
-            ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
-          fi
-          ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
-
-      - name: Run heal test (write -> outage -> heal -> verify)
+      - name: Run security suite
         id: test
+        continue-on-error: true
+        env:
+          REPORT_FILE: /tmp/rustfs-security-report.md
+          RUSTFS_SECURITY_OIDC_LIVE_SCRIPT: ${{ github.workspace }}/scripts/test/oidc_keycloak_live.sh
         run: |
-          ./auto-testing/rustfs_heal_test.sh \
-            --steps "3,4,5,6,7" -y \
-            --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
-            --stop-node-gb "${{ inputs.stop_node_gb }}" \
-            --warp-stop-gb "${{ inputs.warp_stop_gb }}" \
-            --log-file /tmp/rustfs-heal-test.log
+          set -euo pipefail
+          chmod +x auto-testing/rustfs-security-test.sh
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          TOPOLOGY='${{ inputs.topology }}'
+          ARGS=(-y)
+          if [ "${TOPOLOGY}" = "all" ] || [ -z "${TOPOLOGY}" ] || [ "${TOPOLOGY}" = "null" ]; then
+            ARGS+=(--all-topologies)
+          else
+            ARGS+=(--topology "${TOPOLOGY}")
+          fi
+          if [ "${{ inputs.oidc_live }}" = "true" ] || [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            ARGS+=(--oidc-live)
+          fi
+          if [ -n "${PACKAGE_URL}" ]; then
+            ARGS+=(--package-url "${PACKAGE_URL}")
+          elif [ -n "${RUSTFS_VERSION}" ] && [ "${RUSTFS_VERSION}" != "null" ]; then
+            ARGS+=(--version "${RUSTFS_VERSION}")
+          else
+            ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
+          fi
+          ./auto-testing/rustfs-security-test.sh "${ARGS[@]}"
 
       - name: Generate report
         if: always()
-        env:
-          LOG_FILE: /tmp/rustfs-heal-test.log
-          REPORT_FILE: /tmp/rustfs-heal-report.md
         run: |
           set -euo pipefail
-          PACKAGE_URL='${{ inputs.package_url }}'
-          if [ -n "${PACKAGE_URL}" ]; then
-            PACKAGE_SOURCE="${PACKAGE_URL}"
-          else
-            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          if [ ! -f /tmp/rustfs-security-report.md ]; then
+            {
+              echo "# RustFS security test report"
+              echo ""
+              echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              echo "- Trigger: ${{ github.event_name }}"
+              echo "- Test Step Outcome: failure (suite did not produce a report)"
+            } > /tmp/rustfs-security-report.md
           fi
-          {
-            echo "# RustFS heal test report"
-            echo ""
-            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo "- Trigger: ${{ github.event_name }}"
-            echo "- Package: ${PACKAGE_SOURCE}"
-            echo "- Test Step Outcome: ${{ steps.test.outcome }}"
-            echo ""
-            echo "## Log tail"
-            echo '```text'
-            tail -n 200 "${LOG_FILE}" || true
-            echo '```'
-          } | tee "${REPORT_FILE}"
-          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+          cat /tmp/rustfs-security-report.md >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload functional report to dashboard
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
-          REPORT_FILE: /tmp/rustfs-heal-report.md
-          SUITE: heal
+          REPORT_FILE: /tmp/rustfs-security-report.md
+          SUITE: security
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -324,18 +342,19 @@ jobs:
               | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
           fi
 
-      - name: Upload test logs
+      - name: Upload report and logs
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: rustfs-heal-test-${{ github.run_id }}
+          name: rustfs-security-test-${{ github.run_id }}
           path: |
-            /tmp/rustfs-heal-test*.log
-            /tmp/rustfs-warp.*.log
-          if-no-files-found: warn
+            /tmp/rustfs-security-report.md
+            /tmp/rustfs-security.*/*
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Cleanup environment (after)
-        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -349,13 +368,13 @@ jobs:
                 ${SUDO} dpkg -P rustfs
               fi
               for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
-              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
             '
           done
 
       - name: Notify on failure
         if: failure()
         run: |
-          echo "RustFS heal test failed"
+          echo "RustFS security test failed"
           echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
-          echo "See the uploaded log artifact for details."
+          echo "See the uploaded report and logs for details."
