@@ -1852,6 +1852,25 @@ enum RemoteTuplePublicationSource {
     Tiered(rustfs_filemeta::FileInfo),
 }
 
+/// A decommission migration may retain the fixed store domain as a read
+/// anchor while it streams bytes. This type cannot authorize publication: it
+/// must be consumed and dropped before the commit path acquires the fixed
+/// domain as a write lock.
+#[must_use = "the fixed read anchor must remain live until publication or migration abort"]
+pub(crate) struct DecommissionFixedReadAnchor {
+    guard: ObjectLockDiagGuard,
+}
+
+impl DecommissionFixedReadAnchor {
+    pub(crate) fn guard(&self) -> &ObjectLockDiagGuard {
+        &self.guard
+    }
+
+    fn is_lock_lost(&self) -> bool {
+        self.guard.is_lock_lost()
+    }
+}
+
 /// Opaque, non-cloneable capability retained by every background path that can
 /// publish an existing object identity into a new physical metadata owner.
 ///
@@ -1868,7 +1887,7 @@ pub(crate) struct RemoteTuplePublicationFence {
     source_pool_idx: usize,
     source: RemoteTuplePublicationSource,
     include_fixed_domain: bool,
-    preheld_fixed_domain_fence: Option<NamespaceLockFence>,
+    fixed_read_anchor: Option<DecommissionFixedReadAnchor>,
     backend_target: Option<(String, Option<TierDestinationId>)>,
 }
 
@@ -1877,7 +1896,6 @@ pub(crate) struct RemoteTuplePublicationFence {
 #[must_use = "the publication commit guard must live through the target metadata commit"]
 pub(crate) struct RemoteTuplePublicationCommitGuard {
     guards: Vec<ObjectLockDiagGuard>,
-    preheld_fixed_domain_fence: Option<NamespaceLockFence>,
     backend_lease: Option<TierOperationLease>,
     revalidated_tiered_source: Option<rustfs_filemeta::FileInfo>,
 }
@@ -1885,10 +1903,6 @@ pub(crate) struct RemoteTuplePublicationCommitGuard {
 impl RemoteTuplePublicationCommitGuard {
     pub(crate) fn is_lock_lost(&self) -> bool {
         self.guards.iter().any(ObjectLockDiagGuard::is_lock_lost)
-            || self
-                .preheld_fixed_domain_fence
-                .as_ref()
-                .is_some_and(NamespaceLockFence::is_lock_lost)
             || self
                 .backend_lease
                 .as_ref()
@@ -1898,9 +1912,6 @@ impl RemoteTuplePublicationCommitGuard {
     pub(crate) fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
         for guard in &self.guards {
             guard.add_namespace_lock_fence(opts);
-        }
-        if let Some(fence) = self.preheld_fixed_domain_fence.as_ref() {
-            opts.add_namespace_lock_fence(fence);
         }
     }
 
@@ -1970,21 +1981,24 @@ fn remote_tuple_publication_object_source_matches(expected: &ObjectInfo, current
 }
 
 impl RemoteTuplePublicationFence {
-    pub(crate) fn under_preheld_fixed_domain(mut self, guard: &ObjectLockDiagGuard) -> Result<Self> {
+    pub(crate) fn under_fixed_read_anchor(mut self, anchor: DecommissionFixedReadAnchor) -> Result<Self> {
         if self.include_fixed_domain {
             return Err(Error::other(
-                "data movement publication capability cannot both acquire and inherit the fixed domain",
+                "data movement publication capability cannot attach a fixed read anchor after requesting fixed write",
             ));
         }
-        if guard.is_lock_lost() {
+        if anchor.is_lock_lost() {
             return Err(Error::other(
-                "data movement publication capability inherited an already-lost fixed-domain fence",
+                "data movement publication capability received an already-lost fixed read anchor",
             ));
         }
-        let mut opts = ObjectOptions::default();
-        guard.add_namespace_lock_fence(&mut opts);
-        self.preheld_fixed_domain_fence = opts.namespace_lock_fence;
+        self.include_fixed_domain = self.backend_target.is_some();
+        self.fixed_read_anchor = Some(anchor);
         Ok(self)
+    }
+
+    pub(crate) fn fixed_read_anchor_guard(&self) -> Option<&ObjectLockDiagGuard> {
+        self.fixed_read_anchor.as_ref().map(DecommissionFixedReadAnchor::guard)
     }
 
     pub(crate) async fn into_commit_guard(
@@ -2000,7 +2014,7 @@ impl RemoteTuplePublicationFence {
             source_pool_idx,
             source,
             include_fixed_domain,
-            preheld_fixed_domain_fence,
+            fixed_read_anchor,
             backend_target,
         } = self;
         if bucket != expected_bucket || object != expected_object {
@@ -2009,12 +2023,16 @@ impl RemoteTuplePublicationFence {
                 format!("expected {expected_bucket}/{expected_object}, got {bucket}/{object}"),
             ));
         }
-        if preheld_fixed_domain_fence
+        if fixed_read_anchor
             .as_ref()
-            .is_some_and(NamespaceLockFence::is_lock_lost)
+            .is_some_and(DecommissionFixedReadAnchor::is_lock_lost)
         {
-            return Err(Error::other("data movement publication fixed-domain fence was lost before commit"));
+            return Err(Error::other("data movement publication fixed read anchor was lost before commit"));
         }
+        // Never upgrade a held read lock in place. Releasing here keeps the
+        // long transfer on a read anchor while the commit obtains a short
+        // fixed-domain write lock in the global tier -> namespace order.
+        drop(fixed_read_anchor);
         // Tier generation is acquired at the commit boundary, before any
         // namespace lock, preserving bucket -> tier -> namespace lock order.
         let backend_lease = if let Some((tier_name, backend_identity)) = backend_target {
@@ -2033,19 +2051,9 @@ impl RemoteTuplePublicationFence {
         };
 
         let guards = store
-            .acquire_data_movement_publication_write_locks(
-                bucket,
-                object,
-                source_pool_idx,
-                target_pool_idx,
-                include_fixed_domain,
-                preheld_fixed_domain_fence.is_some(),
-            )
+            .acquire_data_movement_publication_write_locks(bucket, object, source_pool_idx, target_pool_idx, include_fixed_domain)
             .await?;
         if guards.iter().any(ObjectLockDiagGuard::is_lock_lost)
-            || preheld_fixed_domain_fence
-                .as_ref()
-                .is_some_and(NamespaceLockFence::is_lock_lost)
             || backend_lease.as_ref().is_some_and(|lease| !lease.is_current_generation())
         {
             return Err(Error::other("data movement publication fence was lost before source revalidation"));
@@ -2103,7 +2111,6 @@ impl RemoteTuplePublicationFence {
 
         let commit_guard = RemoteTuplePublicationCommitGuard {
             guards,
-            preheld_fixed_domain_fence,
             backend_lease,
             revalidated_tiered_source,
         };
@@ -2141,7 +2148,7 @@ impl ECStore {
             source_pool_idx,
             source: RemoteTuplePublicationSource::Object(source.clone()),
             include_fixed_domain,
-            preheld_fixed_domain_fence: None,
+            fixed_read_anchor: None,
             backend_target,
         })
     }
@@ -2164,7 +2171,7 @@ impl ECStore {
             source_pool_idx,
             source: RemoteTuplePublicationSource::Tiered(source.clone()),
             include_fixed_domain: true,
-            preheld_fixed_domain_fence: None,
+            fixed_read_anchor: None,
             backend_target: Some((tier_name, backend_identity)),
         })
     }
@@ -2699,7 +2706,7 @@ impl ECStore {
         &self,
         bucket: &str,
         object: &str,
-    ) -> Result<ObjectLockDiagGuard> {
+    ) -> Result<DecommissionFixedReadAnchor> {
         if self.ctx.lock_manager().is_disabled() {
             return Err(Error::other("decommission object migration requires namespace locking"));
         }
@@ -2719,7 +2726,7 @@ impl ECStore {
             guard.test_namespace_lock_fence = test_namespace_lock_fence;
             guard
         };
-        Ok(guard)
+        Ok(DecommissionFixedReadAnchor { guard })
     }
 
     pub(super) async fn apply_decommission_target_mutation_fence(
@@ -2959,7 +2966,6 @@ impl ECStore {
         source_pool_idx: usize,
         target_pool_idx: usize,
         include_fixed_domain: bool,
-        fixed_domain_already_fenced: bool,
     ) -> Result<Vec<ObjectLockDiagGuard>> {
         if self.ctx.lock_manager().is_disabled() {
             return Err(Error::other("data movement publication requires namespace locking"));
@@ -2969,16 +2975,7 @@ impl ECStore {
         let mut pool_indices = [source_pool_idx, target_pool_idx];
         pool_indices.sort_unstable();
         let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
-        if include_fixed_domain && fixed_domain_already_fenced {
-            return Err(Error::other(
-                "data movement publication fixed domain cannot be both acquired and inherited",
-            ));
-        }
-        let mut locked_sets = if fixed_domain_already_fenced {
-            vec![Arc::clone(&fixed_set)]
-        } else {
-            Vec::with_capacity(3)
-        };
+        let mut locked_sets = Vec::with_capacity(3);
         let mut guards = Vec::with_capacity(3);
         #[cfg(test)]
         let test_namespace_lock_fence = decommission_mutation_fence_for_test(
@@ -3494,10 +3491,9 @@ impl ECStore {
         object: &str,
         data: &mut PutObjReader,
         opts: &ObjectOptions,
-        mutation_fence: Option<&ObjectLockDiagGuard>,
         publication_fence: RemoteTuplePublicationFence,
     ) -> Result<(usize, Result<ObjectInfo>)> {
-        self.put_object_for_data_movement_inner(bucket, object, data, opts, mutation_fence, Some(publication_fence))
+        self.put_object_for_data_movement_inner(bucket, object, data, opts, None, Some(publication_fence))
             .await
     }
 
@@ -3518,7 +3514,10 @@ impl ECStore {
         let idx = self
             .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
             .await?;
-        self.apply_decommission_target_mutation_fence(idx, object.as_str(), &mut opts, mutation_fence)
+        let fixed_read_anchor = publication_fence
+            .as_ref()
+            .and_then(RemoteTuplePublicationFence::fixed_read_anchor_guard);
+        self.apply_decommission_target_mutation_fence(idx, object.as_str(), &mut opts, mutation_fence.or(fixed_read_anchor))
             .await;
         let expected_data_bytes = usize::try_from(data.size()).ok();
         let result = self
@@ -5200,7 +5199,7 @@ mod tests {
             .find(|candidate| Arc::ptr_eq(&sets.get_disks_by_key(candidate), &sets.disk_set[1]))
             .expect("a key should hash to the second set namespace");
         let publication_guards = store
-            .acquire_data_movement_publication_write_locks("bucket", &encode_dir_object(&object), 0, 0, true, false)
+            .acquire_data_movement_publication_write_locks("bucket", &encode_dir_object(&object), 0, 0, true)
             .await
             .expect("the publication commit lock set should be acquired");
         let target_lock = sets.disk_set[1]
@@ -5255,7 +5254,7 @@ mod tests {
         // observation below.  Dropping a timed-out request can race with the
         // lock service granting it and would turn the test itself into an
         // abandoned-owner scenario.
-        let mut publication = Box::pin(store.acquire_data_movement_publication_write_locks(bucket, &encoded, 0, 0, true, false));
+        let mut publication = Box::pin(store.acquire_data_movement_publication_write_locks(bucket, &encoded, 0, 0, true));
         let blocked = tokio::time::timeout(Duration::from_millis(50), &mut publication).await;
         assert!(
             blocked.is_err(),

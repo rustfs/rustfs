@@ -375,8 +375,8 @@ pub(crate) mod list_objects;
 mod multipart;
 mod object;
 pub(crate) use object::{
-    ObjectLockDiagGuard, RemoteTuplePublicationCommitGuard, RemoteTuplePublicationFence, SourceCleanupMutationFence,
-    tiered_data_movement_source_matches,
+    DecommissionFixedReadAnchor, ObjectLockDiagGuard, RemoteTuplePublicationCommitGuard, RemoteTuplePublicationFence,
+    SourceCleanupMutationFence, tiered_data_movement_source_matches,
 };
 pub use object::{
     PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,

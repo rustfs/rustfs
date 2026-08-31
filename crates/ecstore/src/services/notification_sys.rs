@@ -33,7 +33,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
@@ -122,14 +125,86 @@ struct FleetCapabilityProof {
     topology_fingerprint: String,
     peer_epochs: Arc<BTreeMap<String, Uuid>>,
     expires_at: Instant,
+    generation: Arc<FleetCapabilityProofGeneration>,
 }
 
 impl FleetCapabilityProof {
+    fn new(topology_fingerprint: String, peer_epochs: Arc<BTreeMap<String, Uuid>>, expires_at: Instant) -> Self {
+        Self {
+            topology_fingerprint,
+            peer_epochs,
+            expires_at,
+            generation: FleetCapabilityProofGeneration::fresh(),
+        }
+    }
+
     fn token(&self) -> FleetCapabilityProofToken {
         FleetCapabilityProofToken {
             topology_fingerprint: self.topology_fingerprint.clone(),
             peer_epochs: self.peer_epochs.clone(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    fn with_fresh_generation(&self) -> Self {
+        Self::new(self.topology_fingerprint.clone(), Arc::clone(&self.peer_epochs), self.expires_at)
+    }
+}
+
+/// Admission generation for effects that must not straddle a fleet-proof
+/// replacement. Revocation is deliberately non-blocking: it closes admission
+/// immediately, while the proof slot withholds the successor generation until
+/// every admitted operation has drained.
+#[derive(Default)]
+struct FleetCapabilityProofGeneration {
+    accepting: AtomicBool,
+    active: AtomicUsize,
+}
+
+impl FleetCapabilityProofGeneration {
+    fn fresh() -> Arc<Self> {
+        Arc::new(Self {
+            accepting: AtomicBool::new(true),
+            active: AtomicUsize::new(0),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<FleetCapabilityProofPermit> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active.fetch_add(1, Ordering::AcqRel);
+        if self.accepting.load(Ordering::Acquire) {
+            Some(FleetCapabilityProofPermit {
+                generation: Arc::clone(self),
+            })
+        } else {
+            self.release();
+            None
+        }
+    }
+
+    fn revoke(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    fn is_drained(&self) -> bool {
+        self.active.load(Ordering::Acquire) == 0
+    }
+
+    fn release(&self) {
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "fleet capability permit count underflow");
+    }
+}
+
+struct FleetCapabilityProofPermit {
+    generation: Arc<FleetCapabilityProofGeneration>,
+}
+
+impl Drop for FleetCapabilityProofPermit {
+    fn drop(&mut self) {
+        self.generation.release();
     }
 }
 
@@ -139,10 +214,20 @@ struct FleetCapabilityProofToken {
     peer_epochs: Arc<BTreeMap<String, Uuid>>,
 }
 
-#[derive(Default)]
 struct FleetCapabilityProofState {
     proof: Option<FleetCapabilityProof>,
+    draining_generation: Option<Arc<FleetCapabilityProofGeneration>>,
     topology_conflict: bool,
+}
+
+impl Default for FleetCapabilityProofState {
+    fn default() -> Self {
+        Self {
+            proof: None,
+            draining_generation: None,
+            topology_conflict: false,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -154,7 +239,10 @@ pub struct CrossPoolFenceFleetProofToken(FleetCapabilityProofToken);
 /// A point-in-time proof that every current storage member implements the v6
 /// dispatch-manifest policy. It intentionally has no `Clone` implementation:
 /// one acquisition authorizes one manifest construction attempt.
-pub(crate) struct TierDeleteJournalFleetProofToken(FleetCapabilityProofToken);
+pub(crate) struct TierDeleteJournalFleetProofToken {
+    token: FleetCapabilityProofToken,
+    _permit: FleetCapabilityProofPermit,
+}
 
 static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static CROSS_POOL_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
@@ -173,8 +261,21 @@ fn tier_delete_journal_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCap
     TIER_DELETE_JOURNAL_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
-fn replace_fleet_capability_proof(slot: &std::sync::RwLock<FleetCapabilityProofState>, proof: Option<FleetCapabilityProof>) {
-    slot.write().unwrap_or_else(std::sync::PoisonError::into_inner).proof = proof;
+fn revoke_fleet_capability_proof(slot: &std::sync::RwLock<FleetCapabilityProofState>) {
+    let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(proof) = state.proof.take() {
+        proof.generation.revoke();
+        if !proof.generation.is_drained() {
+            state.draining_generation = Some(proof.generation);
+        }
+    }
+    if state
+        .draining_generation
+        .as_ref()
+        .is_some_and(|generation| generation.is_drained())
+    {
+        state.draining_generation = None;
+    }
 }
 
 fn publish_fleet_capability_probe_result(
@@ -186,21 +287,42 @@ fn publish_fleet_capability_probe_result(
     match result {
         Ok(peer_epochs) => {
             let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let peer_epochs = state
+            if let Some(current) = state
                 .proof
-                .as_ref()
+                .as_mut()
                 .filter(|proof| proof.topology_fingerprint == topology_fingerprint && proof.peer_epochs.as_ref() == &peer_epochs)
-                .map(|proof| Arc::clone(&proof.peer_epochs))
-                .unwrap_or_else(|| Arc::new(peer_epochs));
-            state.proof = Some(FleetCapabilityProof {
-                topology_fingerprint: topology_fingerprint.to_string(),
-                peer_epochs,
-                expires_at: observed_at + REMOTE_VERSION_STATE_PROOF_TTL,
-            });
+            {
+                current.expires_at = observed_at + REMOTE_VERSION_STATE_PROOF_TTL;
+                return None;
+            }
+
+            if let Some(previous) = state.proof.take() {
+                previous.generation.revoke();
+                if !previous.generation.is_drained() {
+                    state.draining_generation = Some(previous.generation);
+                }
+            }
+            if state
+                .draining_generation
+                .as_ref()
+                .is_some_and(|generation| generation.is_drained())
+            {
+                state.draining_generation = None;
+            }
+            if state.draining_generation.is_some() {
+                return Some(Error::other(
+                    "fleet capability proof successor waits for the previous generation to drain",
+                ));
+            }
+            state.proof = Some(FleetCapabilityProof::new(
+                topology_fingerprint.to_string(),
+                Arc::new(peer_epochs),
+                observed_at + REMOTE_VERSION_STATE_PROOF_TTL,
+            ));
             None
         }
         Err(err) => {
-            replace_fleet_capability_proof(slot, None);
+            revoke_fleet_capability_proof(slot);
             Some(err)
         }
     }
@@ -246,15 +368,27 @@ pub(crate) fn acquire_tier_delete_journal_fleet_proof() -> Option<TierDeleteJour
     let state = tier_delete_journal_fleet_proof_slot()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(TierDeleteJournalFleetProofToken)
+    acquire_tier_delete_journal_fleet_proof_from(&state, expected_topology, Instant::now())
+}
+
+fn acquire_tier_delete_journal_fleet_proof_from(
+    state: &FleetCapabilityProofState,
+    expected_topology: &str,
+    now: Instant,
+) -> Option<TierDeleteJournalFleetProofToken> {
+    let token = acquire_fleet_capability_proof_from(state, expected_topology, now)?;
+    let permit = state.proof.as_ref()?.generation.try_acquire()?;
+    Some(TierDeleteJournalFleetProofToken { token, _permit: permit })
 }
 
 pub(crate) fn tier_delete_journal_fleet_proof_matches(proof: &TierDeleteJournalFleetProofToken) -> bool {
-    fleet_capability_proof_matches(tier_delete_journal_fleet_proof_slot(), &proof.0)
+    REMOTE_VERSION_STATE_PROBE_TOPOLOGY
+        .get()
+        .is_some_and(|topology| topology == &proof.token.topology_fingerprint)
 }
 
 pub(crate) fn tier_delete_journal_topology_generation(proof: &TierDeleteJournalFleetProofToken) -> String {
-    stable_tier_delete_journal_topology_generation(&proof.0.topology_fingerprint)
+    stable_tier_delete_journal_topology_generation(&proof.token.topology_fingerprint)
 }
 
 fn stable_tier_delete_journal_topology_generation(topology_fingerprint: &str) -> String {
@@ -278,11 +412,11 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
     let proof = if !state.topology_conflict && fleet_capability_proof_valid_at(state.proof.as_ref(), &topology, now) {
         state.proof.clone()
     } else {
-        Some(FleetCapabilityProof {
-            topology_fingerprint: topology,
-            peer_epochs: Arc::new(BTreeMap::new()),
-            expires_at: now + Duration::from_secs(60 * 60),
-        })
+        Some(FleetCapabilityProof::new(
+            topology,
+            Arc::new(BTreeMap::new()),
+            now + Duration::from_secs(60 * 60),
+        ))
     };
     state.topology_conflict = false;
     state.proof = proof.clone();
@@ -290,8 +424,15 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
     let mut journal_state = tier_delete_journal_fleet_proof_slot()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    debug_assert!(
+        journal_state
+            .proof
+            .as_ref()
+            .is_none_or(|current| current.generation.is_drained())
+    );
     journal_state.topology_conflict = false;
-    journal_state.proof = proof;
+    journal_state.draining_generation = None;
+    journal_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
 }
 
 #[cfg(test)]
@@ -308,13 +449,23 @@ impl Drop for CrossPoolFenceFleetProofGuard {
         let mut state = cross_pool_fence_fleet_proof_slot()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.proof = self.previous_proof.take();
+        state.proof = self
+            .previous_proof
+            .take()
+            .as_ref()
+            .map(FleetCapabilityProof::with_fresh_generation);
+        state.draining_generation = None;
         state.topology_conflict = self.previous_topology_conflict;
         drop(state);
         let mut journal_state = tier_delete_journal_fleet_proof_slot()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        journal_state.proof = self.previous_journal_proof.take();
+        journal_state.proof = self
+            .previous_journal_proof
+            .take()
+            .as_ref()
+            .map(FleetCapabilityProof::with_fresh_generation);
+        journal_state.draining_generation = None;
         journal_state.topology_conflict = self.previous_journal_topology_conflict;
     }
 }
@@ -335,9 +486,19 @@ pub(crate) fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceF
         previous_journal_proof: journal_state.proof.clone(),
         previous_journal_topology_conflict: journal_state.topology_conflict,
     };
-    state.proof = None;
+    if let Some(proof) = state.proof.take() {
+        proof.generation.revoke();
+        if !proof.generation.is_drained() {
+            state.draining_generation = Some(proof.generation);
+        }
+    }
     state.topology_conflict = true;
-    journal_state.proof = None;
+    if let Some(proof) = journal_state.proof.take() {
+        proof.generation.revoke();
+        if !proof.generation.is_drained() {
+            journal_state.draining_generation = Some(proof.generation);
+        }
+    }
     journal_state.topology_conflict = true;
     guard
 }
@@ -350,18 +511,33 @@ pub fn rotate_cross_pool_fence_fleet_proof_for_test() -> bool {
     let Some(current) = state.proof.as_ref() else {
         return false;
     };
-    let proof = FleetCapabilityProof {
-        topology_fingerprint: current.topology_fingerprint.clone(),
-        peer_epochs: Arc::new(current.peer_epochs.as_ref().clone()),
-        expires_at: current.expires_at,
-    };
+    let proof = FleetCapabilityProof::new(
+        current.topology_fingerprint.clone(),
+        Arc::new(current.peer_epochs.as_ref().clone()),
+        current.expires_at,
+    );
     state.proof = Some(proof.clone());
     drop(state);
     let mut journal_state = tier_delete_journal_fleet_proof_slot()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     journal_state.topology_conflict = false;
-    journal_state.proof = Some(proof);
+    if let Some(previous) = journal_state.proof.take() {
+        previous.generation.revoke();
+        if !previous.generation.is_drained() {
+            journal_state.draining_generation = Some(previous.generation);
+        }
+    }
+    if journal_state
+        .draining_generation
+        .as_ref()
+        .is_some_and(|generation| generation.is_drained())
+    {
+        journal_state.draining_generation = None;
+    }
+    if journal_state.draining_generation.is_none() {
+        journal_state.proof = Some(proof.with_fresh_generation());
+    }
     true
 }
 
@@ -401,7 +577,7 @@ pub(crate) struct RemoteVersionStateFleetProofGuard;
 #[cfg(test)]
 impl Drop for RemoteVersionStateFleetProofGuard {
     fn drop(&mut self) {
-        replace_fleet_capability_proof(remote_version_state_fleet_proof_slot(), None);
+        revoke_fleet_capability_proof(remote_version_state_fleet_proof_slot());
     }
 }
 
@@ -487,9 +663,9 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .topology_conflict;
             if topology_conflict {
-                replace_fleet_capability_proof(remote_version_state_fleet_proof_slot(), None);
-                replace_fleet_capability_proof(cross_pool_fence_fleet_proof_slot(), None);
-                replace_fleet_capability_proof(tier_delete_journal_fleet_proof_slot(), None);
+                revoke_fleet_capability_proof(remote_version_state_fleet_proof_slot());
+                revoke_fleet_capability_proof(cross_pool_fence_fleet_proof_slot());
+                revoke_fleet_capability_proof(tier_delete_journal_fleet_proof_slot());
             } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
@@ -2611,11 +2787,7 @@ mod tests {
         let now = Instant::now();
         let mut peer_epochs = BTreeMap::new();
         peer_epochs.insert("peer-a".to_string(), Uuid::new_v4());
-        let proof = FleetCapabilityProof {
-            topology_fingerprint: "topology-a".to_string(),
-            peer_epochs: Arc::new(peer_epochs),
-            expires_at: now + Duration::from_secs(1),
-        };
+        let proof = FleetCapabilityProof::new("topology-a".to_string(), Arc::new(peer_epochs), now + Duration::from_secs(1));
 
         assert!(fleet_capability_proof_valid_at(Some(&proof), "topology-a", now));
         assert!(!fleet_capability_proof_valid_at(Some(&proof), "topology-b", now));
@@ -2634,11 +2806,7 @@ mod tests {
     #[test]
     fn remote_version_state_fleet_proof_accepts_single_node_membership() {
         let now = Instant::now();
-        let proof = FleetCapabilityProof {
-            topology_fingerprint: "topology-a".to_string(),
-            peer_epochs: Arc::new(BTreeMap::new()),
-            expires_at: now + Duration::from_secs(1),
-        };
+        let proof = FleetCapabilityProof::new("topology-a".to_string(), Arc::new(BTreeMap::new()), now + Duration::from_secs(1));
 
         assert!(fleet_capability_proof_valid_at(Some(&proof), "topology-a", now));
     }
@@ -2646,17 +2814,17 @@ mod tests {
     #[test]
     fn remote_version_state_fleet_proof_token_changes_with_process_epoch() {
         let now = Instant::now();
-        let proof = FleetCapabilityProof {
-            topology_fingerprint: "topology-a".to_string(),
-            peer_epochs: Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
-            expires_at: now + Duration::from_secs(1),
-        };
+        let proof = FleetCapabilityProof::new(
+            "topology-a".to_string(),
+            Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
+            now + Duration::from_secs(1),
+        );
         let captured = proof.token();
-        let restarted = FleetCapabilityProof {
-            topology_fingerprint: proof.topology_fingerprint.clone(),
-            peer_epochs: Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
-            expires_at: proof.expires_at,
-        };
+        let restarted = FleetCapabilityProof::new(
+            proof.topology_fingerprint.clone(),
+            Arc::new(BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())])),
+            proof.expires_at,
+        );
 
         assert!(captured != restarted.token());
     }
@@ -2665,24 +2833,24 @@ mod tests {
     fn tier_delete_journal_generation_is_stable_across_members_and_process_restarts() {
         let topology = "topology-a";
         let now = Instant::now();
-        let node_a_view = FleetCapabilityProof {
-            topology_fingerprint: topology.to_string(),
-            peer_epochs: Arc::new(BTreeMap::from([("node-b".to_string(), Uuid::new_v4())])),
-            expires_at: now + Duration::from_secs(1),
-        };
-        let node_b_view = FleetCapabilityProof {
-            topology_fingerprint: topology.to_string(),
-            peer_epochs: Arc::new(BTreeMap::from([("node-a".to_string(), Uuid::new_v4())])),
-            expires_at: now + Duration::from_secs(1),
-        };
-        let restarted_node_a_view = FleetCapabilityProof {
-            topology_fingerprint: topology.to_string(),
-            peer_epochs: Arc::new(BTreeMap::from([("node-b".to_string(), Uuid::new_v4())])),
-            expires_at: now + Duration::from_secs(1),
-        };
+        let node_a_view = FleetCapabilityProof::new(
+            topology.to_string(),
+            Arc::new(BTreeMap::from([("node-b".to_string(), Uuid::new_v4())])),
+            now + Duration::from_secs(1),
+        );
+        let node_b_view = FleetCapabilityProof::new(
+            topology.to_string(),
+            Arc::new(BTreeMap::from([("node-a".to_string(), Uuid::new_v4())])),
+            now + Duration::from_secs(1),
+        );
+        let restarted_node_a_view = FleetCapabilityProof::new(
+            topology.to_string(),
+            Arc::new(BTreeMap::from([("node-b".to_string(), Uuid::new_v4())])),
+            now + Duration::from_secs(1),
+        );
 
         let generations = [&node_a_view, &node_b_view, &restarted_node_a_view]
-            .map(|proof| tier_delete_journal_topology_generation(&TierDeleteJournalFleetProofToken(proof.token())));
+            .map(|proof| stable_tier_delete_journal_topology_generation(&proof.token().topology_fingerprint));
         assert_eq!(generations[0], generations[1]);
         assert_eq!(generations[0], generations[2]);
         assert_ne!(
@@ -2705,7 +2873,7 @@ mod tests {
             .as_ref()
             .expect("successful probe should publish proof")
             .token();
-        let original_generation = tier_delete_journal_topology_generation(&TierDeleteJournalFleetProofToken(original.clone()));
+        let original_generation = stable_tier_delete_journal_topology_generation(&original.topology_fingerprint);
 
         let restarted_peers = BTreeMap::from([("node-b".to_string(), Uuid::new_v4())]);
         assert!(
@@ -2733,7 +2901,7 @@ mod tests {
         ));
         assert_eq!(
             original_generation,
-            tier_delete_journal_topology_generation(&TierDeleteJournalFleetProofToken(fresh))
+            stable_tier_delete_journal_topology_generation(&fresh.topology_fingerprint)
         );
     }
 
@@ -2777,14 +2945,63 @@ mod tests {
     }
 
     #[test]
+    fn tier_delete_journal_successor_waits_for_inflight_generation_to_drain() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let original_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(original_peers), now).is_none());
+
+        let admitted = {
+            let state = slot.read().expect("proof slot should not poison");
+            acquire_tier_delete_journal_fleet_proof_from(&state, "topology-a", now)
+                .expect("a fresh proof should admit one journal operation")
+        };
+        {
+            let state = slot.read().expect("proof slot should not poison");
+            assert!(
+                acquire_tier_delete_journal_fleet_proof_from(&state, "topology-a", now + REMOTE_VERSION_STATE_PROOF_TTL,)
+                    .is_none(),
+                "TTL expiry must stop new admission"
+            );
+            assert!(!admitted._permit.generation.is_drained());
+        }
+
+        let restarted_peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        let blocked = publish_fleet_capability_probe_result(
+            &slot,
+            "topology-a",
+            Ok(restarted_peers.clone()),
+            now + Duration::from_millis(1),
+        )
+        .expect("a successor proof must wait for the admitted generation");
+        assert!(blocked.to_string().contains("previous generation to drain"));
+        {
+            let state = slot.read().expect("proof slot should not poison");
+            assert!(state.proof.is_none(), "new operations must remain closed while the predecessor drains");
+            assert!(state.draining_generation.is_some());
+        }
+
+        drop(admitted);
+        assert!(
+            publish_fleet_capability_probe_result(&slot, "topology-a", Ok(restarted_peers), now + Duration::from_millis(2),)
+                .is_none(),
+            "the successor may publish after the in-flight operation releases its permit"
+        );
+        let state = slot.read().expect("proof slot should not poison");
+        assert!(state.proof.is_some());
+        assert!(state.draining_generation.is_none());
+    }
+
+    #[test]
     fn remote_version_state_fleet_proof_conflict_revokes_atomic_snapshot() {
         let now = Instant::now();
         let mut state = FleetCapabilityProofState {
-            proof: Some(FleetCapabilityProof {
-                topology_fingerprint: "topology-a".to_string(),
-                peer_epochs: Arc::new(BTreeMap::new()),
-                expires_at: now + Duration::from_secs(1),
-            }),
+            proof: Some(FleetCapabilityProof::new(
+                "topology-a".to_string(),
+                Arc::new(BTreeMap::new()),
+                now + Duration::from_secs(1),
+            )),
+            draining_generation: None,
             topology_conflict: false,
         };
         assert!(acquire_fleet_capability_proof_from(&state, "topology-a", now).is_some());

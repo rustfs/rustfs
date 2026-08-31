@@ -27,7 +27,7 @@ use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
     object::{HTTPPreconditions, ObjectOperations as _},
 };
-use crate::store::{ECStore, ObjectLockDiagGuard, SourceCleanupMutationFence};
+use crate::store::{DecommissionFixedReadAnchor, ECStore, SourceCleanupMutationFence};
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
@@ -1537,7 +1537,7 @@ pub(crate) async fn migrate_decommission_object(
         op_label,
         None,
         capacity_owner,
-        Some(&mutation_fence),
+        Some(mutation_fence),
     )
     .await
 }
@@ -1588,8 +1588,9 @@ async fn migrate_object_inner(
     op_label: &str,
     lock_lost_signal: Option<Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     capacity_owner: Option<DecommissionCapacityOwner>,
-    mutation_fence: Option<&ObjectLockDiagGuard>,
+    mutation_fence: Option<DecommissionFixedReadAnchor>,
 ) -> Result<()> {
+    let mut mutation_fence = mutation_fence;
     let object_info = rd.object_info.clone();
     let capacity_owner = capacity_owner.map(|owner| {
         let version_id = object_info.version_id.map(|version_id| version_id.to_string());
@@ -1612,10 +1613,6 @@ async fn migrate_object_inner(
     let remote_tuple_publication_fence = store
         .acquire_remote_tuple_publication_fence(&bucket, pool_idx, &object_info, false)
         .await?;
-    let remote_tuple_publication_fence = match mutation_fence {
-        Some(mutation_fence) => remote_tuple_publication_fence.under_preheld_fixed_domain(mutation_fence)?,
-        None => remote_tuple_publication_fence,
-    };
     let has_part_checksums = object_info
         .parts
         .iter()
@@ -1667,8 +1664,8 @@ async fn migrate_object_inner(
             }
             let mut cleanup_opts =
                 data_movement_abort_opts(pool_idx, source_bucket_incarnation_id, lock_lost_signal.as_ref(), capacity_owner);
-            if let Some(fence) = mutation_fence {
-                fence.add_namespace_lock_fence(&mut cleanup_opts);
+            if let Some(anchor) = mutation_fence.as_ref() {
+                anchor.guard().add_namespace_lock_fence(&mut cleanup_opts);
             }
             if let Some(fence) = multipart_mutation_fence.as_ref() {
                 fence.add_namespace_lock_fence(&mut cleanup_opts);
@@ -1695,7 +1692,12 @@ async fn migrate_object_inner(
             }
         }
         let (res, target_pool_idx, expected_bucket_incarnation_id) = match store
-            .handle_new_multipart_upload_with_pool_idx(&bucket, &object_info.name, &new_multipart_opts, mutation_fence)
+            .handle_new_multipart_upload_with_pool_idx(
+                &bucket,
+                &object_info.name,
+                &new_multipart_opts,
+                mutation_fence.as_ref().map(DecommissionFixedReadAnchor::guard),
+            )
             .await
         {
             Ok(res) => res,
@@ -1808,10 +1810,14 @@ async fn migrate_object_inner(
             if let Some(fence) = multipart_mutation_fence.as_ref() {
                 fence.add_namespace_lock_fence(&mut complete_multipart_opts);
             }
+            let remote_tuple_publication_fence = match mutation_fence.take() {
+                Some(anchor) => remote_tuple_publication_fence.under_fixed_read_anchor(anchor)?,
+                None => remote_tuple_publication_fence,
+            };
             if let Err(err) = store
                 .clone()
                 .complete_multipart_upload_for_data_movement_with_publication_fence(
-                    (target_pool_idx, mutation_fence),
+                    target_pool_idx,
                     &bucket,
                     &object_info.name,
                     &res.upload_id,
@@ -1861,8 +1867,8 @@ async fn migrate_object_inner(
         if multipart_result.is_ok() && should_abort_multipart_upload(&abort_multipart_flag) {
             let mut abort_opts =
                 data_movement_abort_opts(pool_idx, expected_bucket_incarnation_id, lock_lost_signal.as_ref(), capacity_owner);
-            if let Some(fence) = mutation_fence {
-                fence.add_namespace_lock_fence(&mut abort_opts);
+            if let Some(anchor) = mutation_fence.as_ref() {
+                anchor.guard().add_namespace_lock_fence(&mut abort_opts);
             }
             if let Some(fence) = multipart_mutation_fence.as_ref() {
                 fence.add_namespace_lock_fence(&mut abort_opts);
@@ -1939,8 +1945,8 @@ async fn migrate_object_inner(
                 pause_data_movement_multipart_before_abort(&bucket, &object_info.name).await;
                 let mut abort_opts =
                     data_movement_abort_opts(pool_idx, expected_bucket_incarnation_id, lock_lost_signal.as_ref(), capacity_owner);
-                if let Some(fence) = mutation_fence {
-                    fence.add_namespace_lock_fence(&mut abort_opts);
+                if let Some(anchor) = mutation_fence.as_ref() {
+                    anchor.guard().add_namespace_lock_fence(&mut abort_opts);
                 }
                 if let Some(fence) = multipart_mutation_fence.as_ref() {
                     fence.add_namespace_lock_fence(&mut abort_opts);
@@ -1994,13 +2000,16 @@ async fn migrate_object_inner(
     if let Some(signal) = lock_lost_signal {
         put_opts.add_namespace_lock_lost_signal(signal);
     }
+    let remote_tuple_publication_fence = match mutation_fence.take() {
+        Some(anchor) => remote_tuple_publication_fence.under_fixed_read_anchor(anchor)?,
+        None => remote_tuple_publication_fence,
+    };
     let (target_pool_idx, put_result) = store
         .put_object_for_data_movement_with_publication_fence(
             &bucket,
             &object_info.name,
             &mut data,
             &put_opts,
-            mutation_fence,
             remote_tuple_publication_fence,
         )
         .await

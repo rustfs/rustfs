@@ -8542,18 +8542,11 @@ mod tests {
                 .await
                 .expect("journal copy should persist in each pool");
         }
-        let active_pool_meta = {
-            let mut pool_meta = store.pool_meta.write().await;
-            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
-                start_time: Some(OffsetDateTime::now_utc()),
-                ..Default::default()
-            });
-            pool_meta.clone()
-        };
-        active_pool_meta
-            .save(store.pools.clone())
-            .await
-            .expect("active decommission identity should persist");
+        // Exercise the same durable capacity reservation and identity that a
+        // real decommission start installs. A hand-written active flag makes
+        // every target mutation look external and masks whether recovery is
+        // correctly charged to the decommission owner.
+        mark_test_pool_decommissioning(&store, 0).await;
         for (path, data) in [
             (&manifest_name, manifest_data.as_slice()),
             (&journal_name, journal_data.as_slice()),

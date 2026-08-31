@@ -60,6 +60,7 @@ const EVENT_LIFECYCLE_TIER_DELETE_JOURNAL: &str = "lifecycle_tier_delete_journal
 pub const DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT: usize = 1_000;
 const TIER_DELETE_JOURNAL_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 const TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+const TIER_DELETE_REMOTE_DEADLINE: Duration = Duration::from_secs(30);
 const TIER_DELETE_JOURNAL_VERSION: u8 = 2;
 const TIER_DELETE_JOURNAL_EXACT_VERSION: u8 = 3;
 const TIER_DELETE_JOURNAL_STATE_VERSION: u8 = 4;
@@ -889,6 +890,11 @@ async fn delete_durable_config_if_match(
                 return Err(Error::other("durable ILM terminal cleanup fence changed during target cleanup"));
             }
         }
+        // The source pool remains the decommission owner's durable checkpoint
+        // until its verified cleanup consumes the terminal receipt. A global
+        // delete here would erase that source after only proving target-copy
+        // cleanup, defeating restart recovery.
+        return Ok(());
     }
 
     // A logical config key may be visible from more than one pool while a
@@ -1936,20 +1942,47 @@ pub async fn process_tier_delete_journal_entry(api: Arc<ECStore>, je: &Jentry) -
         .await
         .map_err(std::io::Error::other)?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "tier delete journal disappeared"))?;
-    if !same_tier_delete_journal_identity(&current, je) || current.persisted_version != TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION {
+    if !same_tier_delete_journal_identity(&current, je) {
         metrics::counter!(
             "rustfs_ilm_tier_delete_journal_quarantined_total",
-            "reason" => if current.persisted_version <= TIER_DELETE_JOURNAL_TRANSACTION_VERSION {
-                "legacy_version"
-            } else {
-                "identity_mismatch"
-            }
+            "reason" => "identity_mismatch"
         )
         .increment(1);
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
-            "legacy or mismatched tier delete journal is quarantined",
+            "mismatched tier delete journal is quarantined",
         ));
+    }
+    match current.persisted_version {
+        1 | TIER_DELETE_JOURNAL_VERSION => {
+            metrics::counter!(
+                "rustfs_ilm_tier_delete_journal_quarantined_total",
+                "reason" => "legacy_unknown_version_state"
+            )
+            .increment(1);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "v1/v2 tier delete journal with unknown remote version state is quarantined",
+            ));
+        }
+        TIER_DELETE_JOURNAL_EXACT_VERSION | TIER_DELETE_JOURNAL_STATE_VERSION => {
+            return process_committed_v3_v4_journal(api, current, journal_etag).await;
+        }
+        TIER_DELETE_JOURNAL_TRANSACTION_VERSION => {
+            return process_v5_journal(api, current, journal_etag).await;
+        }
+        TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION => {}
+        _ => {
+            metrics::counter!(
+                "rustfs_ilm_tier_delete_journal_quarantined_total",
+                "reason" => "unsupported_version"
+            )
+            .increment(1);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "unsupported tier delete journal version is quarantined",
+            ));
+        }
     }
     let manifest = load_manifest_for_journal(api.clone(), &journal_name, &current)
         .await
@@ -2034,6 +2067,181 @@ async fn tier_delete_has_durable_source_or_free_version(
         ));
     }
     Ok((has_durable_owner, read_guards))
+}
+
+async fn delete_remote_tier_journal_target_with_lease(
+    journal: &Jentry,
+    lease: &crate::services::tier::tier::TierOperationLease,
+) -> std::io::Result<()> {
+    let delete = async {
+        if journal.version_id_exact {
+            delete_confirmed_transition_candidate_exact_with_lease_idempotent(&journal.obj_name, &journal.version_id, lease).await
+        } else {
+            delete_object_from_remote_tier_with_lease_idempotent(&journal.obj_name, &journal.version_id, lease, false).await
+        }
+    };
+    tokio::time::timeout(TIER_DELETE_REMOTE_DEADLINE, delete)
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "remote tier delete exceeded its deadline"))??;
+    Ok(())
+}
+
+async fn process_committed_v3_v4_journal(api: Arc<ECStore>, current: Jentry, etag: String) -> std::io::Result<()> {
+    if current.state != TierDeleteJournalState::Committed
+        || current.version_state == rustfs_filemeta::TransitionVersionState::Unknown
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "v3/v4 tier delete journal has no committed exact remote-version state",
+        ));
+    }
+    let backend_identity = current
+        .backend_identity
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "v3/v4 journal has no backend identity"))?;
+    let lease =
+        TierConfigMgr::acquire_operation_lease_for_backend_identity(&api.tier_config_mgr(), &current.tier_name, backend_identity)
+            .await
+            .map_err(std::io::Error::other)?;
+    delete_remote_tier_journal_target_with_lease(&current, &lease).await?;
+    if !lease.is_current_generation() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "legacy tier generation changed after remote delete; journal retained",
+        ));
+    }
+
+    let path = tier_delete_journal_object_name(&current);
+    let (observed, observed_etag) = read_tier_delete_journal_with_etag(api.clone(), &path)
+        .await
+        .map_err(std::io::Error::other)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "legacy journal disappeared"))?;
+    if observed_etag != etag
+        || observed.state != TierDeleteJournalState::Committed
+        || !same_tier_delete_journal_identity(&observed, &current)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "legacy tier delete journal changed during remote deletion",
+        ));
+    }
+    let observed_data = encode_tier_delete_journal_entry(&observed).map_err(std::io::Error::other)?;
+    let fences_current = || lease.is_current_generation();
+    delete_durable_config_if_match(api, &path, &observed_data, &observed_etag, &fences_current)
+        .await
+        .map_err(std::io::Error::other)
+}
+
+async fn process_v5_journal(api: Arc<ECStore>, mut current: Jentry, mut etag: String) -> std::io::Result<()> {
+    let source = current
+        .source
+        .as_ref()
+        .filter(|source| source.has_stable_identity())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "v5 journal has no stable source identity"))?;
+    let bucket_guard = api
+        .acquire_bucket_lifecycle_read_lock(&source.bucket)
+        .await
+        .map_err(std::io::Error::other)?;
+    let backend_identity = current
+        .backend_identity
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "v5 journal has no backend identity"))?;
+    let lease =
+        TierConfigMgr::acquire_operation_lease_for_backend_identity(&api.tier_config_mgr(), &current.tier_name, backend_identity)
+            .await
+            .map_err(std::io::Error::other)?;
+    let (present, guards) = tier_delete_has_durable_source_or_free_version(&api, source, &current).await?;
+    let fences_current =
+        || !bucket_guard.is_lock_lost() && guards.iter().all(|guard| !guard.is_lock_lost()) && lease.is_current_generation();
+    if !fences_current() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "v5 tier delete recovery fence changed",
+        ));
+    }
+
+    match current.state {
+        TierDeleteJournalState::Prepared if present => {
+            let path = tier_delete_journal_object_name(&current);
+            let result = config_boundary::delete_config_if_match(api, &path, &etag).await;
+            if !fences_current() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "v5 prepared journal fence changed during abort",
+                ));
+            }
+            return match result {
+                Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
+                Err(Error::PreconditionFailed) => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "v5 prepared journal changed before abort",
+                )),
+                Err(err) => Err(std::io::Error::other(err)),
+            };
+        }
+        TierDeleteJournalState::Dispatched | TierDeleteJournalState::Committed if present => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "v5 tier delete journal retains a durable source or free-version owner",
+            ));
+        }
+        TierDeleteJournalState::Prepared | TierDeleteJournalState::Dispatched => {
+            current.state = TierDeleteJournalState::Committed;
+            let path = tier_delete_journal_object_name(&current);
+            save_config_if_match_fenced(
+                api.clone(),
+                &path,
+                encode_tier_delete_journal_entry(&current).map_err(std::io::Error::other)?,
+                &etag,
+                &fences_current,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+            let (observed, observed_etag) = read_tier_delete_journal_with_etag(api.clone(), &path)
+                .await
+                .map_err(std::io::Error::other)?
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "committed v5 journal disappeared"))?;
+            if observed.state != TierDeleteJournalState::Committed || !same_tier_delete_journal_identity(&observed, &current) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "v5 journal changed after committed CAS",
+                ));
+            }
+            current = observed;
+            etag = observed_etag;
+        }
+        TierDeleteJournalState::Committed => {}
+    }
+
+    if !fences_current() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "v5 tier delete fence changed before remote deletion",
+        ));
+    }
+    delete_remote_tier_journal_target_with_lease(&current, &lease).await?;
+    if !fences_current() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "v5 tier delete fence changed after remote deletion; journal retained",
+        ));
+    }
+    let path = tier_delete_journal_object_name(&current);
+    let (observed, observed_etag) = read_tier_delete_journal_with_etag(api.clone(), &path)
+        .await
+        .map_err(std::io::Error::other)?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "committed v5 journal disappeared"))?;
+    if observed_etag != etag
+        || observed.state != TierDeleteJournalState::Committed
+        || !same_tier_delete_journal_identity(&observed, &current)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "v5 tier delete journal changed during remote deletion",
+        ));
+    }
+    let observed_data = encode_tier_delete_journal_entry(&observed).map_err(std::io::Error::other)?;
+    delete_durable_config_if_match(api, &path, &observed_data, &observed_etag, &fences_current)
+        .await
+        .map_err(std::io::Error::other)
 }
 
 async fn load_manifest_for_journal(
@@ -2229,7 +2437,6 @@ async fn process_committed_v6_journal(
     .await
     .map_err(std::io::Error::other)?;
 
-    const REMOTE_DELETE_DEADLINE: Duration = Duration::from_secs(30);
     let remote_delete = async {
         if current.version_id_exact {
             delete_confirmed_transition_candidate_exact_with_lease_idempotent(&current.obj_name, &current.version_id, &lease)
@@ -2238,7 +2445,7 @@ async fn process_committed_v6_journal(
             delete_object_from_remote_tier_with_lease_idempotent(&current.obj_name, &current.version_id, &lease, false).await
         }
     };
-    tokio::time::timeout(REMOTE_DELETE_DEADLINE, remote_delete)
+    tokio::time::timeout(TIER_DELETE_REMOTE_DEADLINE, remote_delete)
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "remote tier delete exceeded its deadline"))??;
     if !fences_current() {

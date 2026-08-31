@@ -472,6 +472,11 @@ fn tier_mutation_definitely_rejected_error(message: String) -> Error {
     Error::other(TierMutationDefinitelyRejected { message })
 }
 
+#[cfg(test)]
+pub(crate) fn test_tier_mutation_definitely_rejected_error(message: &str) -> Error {
+    tier_mutation_definitely_rejected_error(message.to_string())
+}
+
 pub(crate) fn tier_mutation_error_is_definitely_rejected(error: &Error) -> bool {
     matches!(
         error,

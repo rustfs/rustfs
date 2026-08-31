@@ -3215,6 +3215,26 @@ impl TierConfigMgr {
             .is_some_and(|runtime| !lock_unpoisoned(&runtime).committed_mutation_blocks.is_empty())
     }
 
+    async fn has_retryable_terminal_mutation_cleanup<S>(api: Arc<S>) -> io::Result<bool>
+    where
+        S: EcstoreObjectIO + ListOperations<Error = Error, ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>>,
+    {
+        let now = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(i64::MAX);
+        let peer_cleanup = Self::load_tier_mutation_intents(api.clone())
+            .await?
+            .into_iter()
+            .any(|intent| {
+                intent.state != TierMutationIntentState::Prepared && Self::tier_mutation_tombstone_retention_elapsed(&intent, now)
+            });
+        if peer_cleanup {
+            return Ok(true);
+        }
+        Ok(Self::load_coordinator_mutation_intents(api)
+            .await?
+            .into_iter()
+            .any(|intent| intent.state != TierMutationIntentState::Prepared))
+    }
+
     async fn acquire_tier_config_write_lock<S>(
         api: Arc<S>,
     ) -> std::result::Result<rustfs_lock::NamespaceLockGuard, TierConfigUpdateError>
@@ -5051,7 +5071,7 @@ impl TierConfigMgr {
         Ok(())
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn install_test_driver(
         &mut self,
         tier_name: &str,
@@ -5472,13 +5492,17 @@ impl TierConfigMgr {
             match Self::reload_handle_with(handle, api.clone()).await {
                 Ok(()) => return,
                 Err(err) => {
-                    if !Self::has_committed_mutation_block(handle).await {
+                    let has_runtime_fence = Self::has_committed_mutation_block(handle).await;
+                    let has_cleanup = Self::has_retryable_terminal_mutation_cleanup(api.clone())
+                        .await
+                        .unwrap_or(false);
+                    if !has_runtime_fence && !has_cleanup {
                         warn!(
                             event = EVENT_TIER_CONFIG_REFRESH,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_TIER,
                             trigger = "committed_mutation",
-                            result = "failed_without_fence",
+                            result = "failed_without_retryable_state",
                             error = ?err,
                             "tier configuration refresh"
                         );
@@ -5513,7 +5537,11 @@ impl TierConfigMgr {
                         );
                     }
                     tokio::time::sleep(delay).await;
-                    if !Self::has_committed_mutation_block(handle).await {
+                    let has_runtime_fence = Self::has_committed_mutation_block(handle).await;
+                    let has_cleanup = Self::has_retryable_terminal_mutation_cleanup(api.clone())
+                        .await
+                        .unwrap_or(false);
+                    if !has_runtime_fence && !has_cleanup {
                         return;
                     }
                     retry_attempt = retry_attempt.saturating_add(1);
@@ -7617,6 +7645,7 @@ mod tests {
         label: &'static str,
         calls: Arc<Mutex<Vec<String>>>,
         prepare: std::result::Result<PeerTierMutationState, &'static str>,
+        prepare_definitely_rejected: bool,
         commit: std::result::Result<PeerTierMutationState, &'static str>,
         abort: std::result::Result<PeerTierMutationState, &'static str>,
     }
@@ -7640,6 +7669,7 @@ mod tests {
                 label,
                 calls,
                 prepare,
+                prepare_definitely_rejected: false,
                 commit,
                 abort: Ok(PeerTierMutationState::Aborted),
             })
@@ -7662,7 +7692,13 @@ mod tests {
             canonical_payload: Bytes,
         ) -> Result<PeerTierMutationState> {
             self.record(format!("{}:prepare:{}:{}", self.label, mutation_id, canonical_payload.len()));
-            self.prepare.map_err(Error::other)
+            match self.prepare {
+                Ok(state) => Ok(state),
+                Err(message) if self.prepare_definitely_rejected => Err(
+                    crate::cluster::rpc::peer_rest_client::test_tier_mutation_definitely_rejected_error(message),
+                ),
+                Err(message) => Err(Error::other(message)),
+            }
         }
 
         async fn commit_tier_mutation(&self, mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Result<PeerTierMutationState> {
@@ -8231,7 +8267,7 @@ mod tests {
                     FakeTierMutationPeer::boxed_with_prepare_commit(
                         "peer-b",
                         calls.clone(),
-                        Err("prepare unavailable"),
+                        Err("unsupported tier mutation peer protocol version: 4"),
                         Ok(PeerTierMutationState::Committed),
                     ),
                 ],
@@ -8259,6 +8295,10 @@ mod tests {
         assert!(calls.iter().any(|call| call.starts_with("peer-a:prepare:")), "{calls:?}");
         assert!(calls.iter().any(|call| call.starts_with("peer-b:prepare:")), "{calls:?}");
         assert!(calls.iter().any(|call| call.starts_with("peer-a:abort:")), "{calls:?}");
+        assert!(
+            calls.iter().any(|call| call.starts_with("peer-b:abort:")),
+            "plain error text must remain ambiguous and receive Abort: {calls:?}"
+        );
         assert!(!calls.iter().any(|call| call.contains(":commit:")), "{calls:?}");
         let (persisted, current_version) = load_tier_config_for_update(store.clone())
             .await
@@ -8296,11 +8336,12 @@ mod tests {
         let update = TierConfigMgr::admin_update_lock(&manager).await;
         let calls = Arc::new(Mutex::new(Vec::new()));
         let old_peer = Arc::new(FakeTierMutationPeer {
-            label: "peer-v1",
+            label: "peer-v3",
             calls: calls.clone(),
-            prepare: Err("unsupported tier mutation peer protocol version: 3"),
+            prepare: Err("unsupported tier mutation peer protocol version: 4"),
+            prepare_definitely_rejected: true,
             commit: Ok(PeerTierMutationState::Committed),
-            abort: Err("unsupported tier mutation peer protocol version: 3"),
+            abort: Err("unsupported tier mutation peer protocol version: 4"),
         }) as Arc<dyn TierMutationPeer>;
 
         let err = TIER_MUTATION_TEST_PEERS
@@ -8317,11 +8358,11 @@ mod tests {
                 .await
             })
             .await
-            .expect_err("an old protocol peer must reject the v3 mutation before config CAS");
+            .expect_err("an old v3 peer must reject the v4 mutation before config CAS");
         assert!(matches!(err, TierConfigUpdateError::Publish(_)));
         let calls = lock_unpoisoned(&calls).clone();
         assert_eq!(calls.len(), 1, "an explicit pre-dispatch rejection must not receive Abort: {calls:?}");
-        assert!(calls[0].starts_with("peer-v1:prepare:"), "{calls:?}");
+        assert!(calls[0].starts_with("peer-v3:prepare:"), "{calls:?}");
 
         let (unchanged, current_version) = load_tier_config_for_update(store.clone())
             .await
@@ -8368,6 +8409,7 @@ mod tests {
                         label: "peer-a",
                         calls: calls.clone(),
                         prepare: Ok(PeerTierMutationState::Prepared),
+                        prepare_definitely_rejected: false,
                         commit: Ok(PeerTierMutationState::Committed),
                         abort: Err("abort unavailable"),
                     }) as Arc<dyn TierMutationPeer>,
@@ -10573,6 +10615,7 @@ mod tests {
                     label: "peer-a",
                     calls: calls.clone(),
                     prepare: Ok(PeerTierMutationState::Prepared),
+                    prepare_definitely_rejected: false,
                     commit: Ok(PeerTierMutationState::Committed),
                     abort: Err("abort unavailable"),
                 }) as Arc<dyn TierMutationPeer>],
@@ -10774,10 +10817,17 @@ mod tests {
             .save_tiering_config_if_current(store.clone(), None)
             .await
             .expect("tier config fixture should persist");
+        let (_, old_config_etag) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should expose its real ETag");
+        let remove_candidate = empty_mgr();
+        let mut late_intent = prepared_remove_intent("COLD-A", uuid::Uuid::from_u128(0x82));
+        late_intent.old_config_etag = old_config_etag;
+        late_intent.candidate_digest =
+            tier_config_candidate_digest(&remove_candidate).expect("remove candidate digest should be canonical");
         let barrier = store
             .pause_list_with_prefix_after(TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX, 1)
             .await;
-        let mutation_id = uuid::Uuid::from_u128(0x82);
         let handle = TierConfigMgr::new();
 
         TIER_MUTATION_TEST_PEERS
@@ -10787,12 +10837,9 @@ mod tests {
                     tokio::time::timeout(Duration::from_secs(1), barrier.arrived.notified())
                         .await
                         .expect("reload should reach its final coordinator scan");
-                    save_tier_coordinator_mutation_intent_record_if_absent(
-                        store.clone(),
-                        &prepared_remove_intent("COLD-A", mutation_id),
-                    )
-                    .await
-                    .expect("racing coordinator intent should persist");
+                    save_tier_coordinator_mutation_intent_record_if_absent(store.clone(), &late_intent)
+                        .await
+                        .expect("racing coordinator intent should persist");
                     barrier.release.add_permits(1);
                 };
                 let (reload_result, ()) = tokio::join!(reload, inject);
@@ -14118,7 +14165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_mutation_refresh_keeps_fence_and_retries_after_cleanup_failure() {
+    async fn committed_mutation_refresh_clears_fence_and_retries_after_cleanup_failure() {
         let (manager, store, mutation_id) = committed_refresh_fixture(true).await;
         TIER_MUTATION_TEST_PEERS
             .scope(Vec::new(), async {
@@ -14148,21 +14195,18 @@ mod tests {
                     let guard = manager.read().await;
                     let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
                     assert!(
-                        lock_unpoisoned(&runtime)
-                            .committed_mutation_blocks
-                            .get("COLD-A")
-                            .is_some_and(|ids| ids.contains(&mutation_id)),
-                        "cleanup failure must retain the committed runtime fence"
+                        lock_unpoisoned(&runtime).committed_mutation_blocks.is_empty(),
+                        "a published configuration must not restore its committed runtime fence after cleanup failure"
                     );
                 }
 
                 tokio::time::timeout(Duration::from_secs(10), async {
                     loop {
-                        let converged = {
-                            let guard = manager.read().await;
-                            let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
-                            lock_unpoisoned(&runtime).committed_mutation_blocks.is_empty()
-                        };
+                        let converged = TierConfigMgr::load_tier_mutation_intents(store.clone())
+                            .await
+                            .expect("committed cleanup retry scan should succeed")
+                            .iter()
+                            .all(|intent| intent.mutation_id != mutation_id);
                         if converged {
                             break;
                         }

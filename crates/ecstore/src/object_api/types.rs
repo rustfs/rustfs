@@ -965,6 +965,7 @@ impl ObjectOptions {
         self.namespace_lock_fence.get_or_insert_with(NamespaceLockFence::new);
     }
 
+    #[cfg(test)]
     pub(crate) fn add_namespace_lock_fence(&mut self, fence: &NamespaceLockFence) {
         self.namespace_lock_fence
             .get_or_insert_with(NamespaceLockFence::new)

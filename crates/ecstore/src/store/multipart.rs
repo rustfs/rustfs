@@ -863,7 +863,7 @@ impl ECStore {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_multipart_upload_for_data_movement_with_publication_fence(
         self: Arc<Self>,
-        target: (usize, Option<&ObjectLockDiagGuard>),
+        target_pool_idx: usize,
         bucket: &str,
         object: &str,
         upload_id: &str,
@@ -872,7 +872,7 @@ impl ECStore {
         publication_fence: RemoteTuplePublicationFence,
     ) -> Result<ObjectInfo> {
         self.complete_multipart_upload_for_data_movement_inner(
-            target,
+            (target_pool_idx, None),
             bucket,
             object,
             upload_id,
@@ -924,7 +924,10 @@ impl ECStore {
             snapshot.add_lock_fences(&mut opts);
             opts.object_lock_config_snapshot = Some(snapshot);
         }
-        self.apply_decommission_target_mutation_fence(target_pool_idx, object, &mut opts, mutation_fence)
+        let fixed_read_anchor = publication_fence
+            .as_ref()
+            .and_then(RemoteTuplePublicationFence::fixed_read_anchor_guard);
+        self.apply_decommission_target_mutation_fence(target_pool_idx, object, &mut opts, mutation_fence.or(fixed_read_anchor))
             .await;
         // NewMultipart/UploadPart are staging only. Acquire and consume the
         // non-cloneable publication capability immediately before Complete,

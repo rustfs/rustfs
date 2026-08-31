@@ -5118,7 +5118,7 @@ pub(crate) async fn cleanup_rejected_transition_upload_durably(
 }
 
 async fn transition_cleanup_store(ctx: &Arc<crate::runtime::instance::InstanceContext>) -> Option<Arc<ECStore>> {
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pause_transition_cleanup_store().await;
 
     transition_object_store(ctx).await
@@ -5340,24 +5340,24 @@ async fn delete_transition_transaction_after_remote_cleanup(
     }
 }
 
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Default)]
 struct TransitionCleanupStoreBarrierState {
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
 
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 /// One-shot test barrier placed before transition cleanup resolves its ECStore.
 pub(crate) struct TransitionCleanupStoreBarrier {
     state: Arc<TransitionCleanupStoreBarrierState>,
 }
 
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 static TRANSITION_CLEANUP_STORE_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option<Arc<TransitionCleanupStoreBarrierState>>>> =
     std::sync::OnceLock::new();
 
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 impl TransitionCleanupStoreBarrier {
     /// Install the process-local barrier for the next cleanup-store resolution.
     pub(crate) fn install() -> Self {
@@ -5380,7 +5380,7 @@ impl TransitionCleanupStoreBarrier {
     }
 }
 
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for TransitionCleanupStoreBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -5394,7 +5394,7 @@ impl Drop for TransitionCleanupStoreBarrier {
     }
 }
 
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_transition_cleanup_store() {
     let barrier = TRANSITION_CLEANUP_STORE_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
