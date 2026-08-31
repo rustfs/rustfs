@@ -11445,10 +11445,10 @@ impl ECStore {
     ) -> Result<()> {
         {
             let mut cancelers = self.decommission_cancelers.write().await;
-            if cancelers.get(idx).and_then(Option::as_ref).is_none() {
-                if let Some(slot) = cancelers.get_mut(idx) {
-                    *slot = Some(DecommissionCanceler::new(CancellationToken::new()));
-                }
+            if cancelers.get(idx).and_then(Option::as_ref).is_none()
+                && let Some(slot) = cancelers.get_mut(idx)
+            {
+                *slot = Some(DecommissionCanceler::new(CancellationToken::new()));
             }
         }
         let needs_capacity_reservation = {
