@@ -422,6 +422,7 @@ mod decommission_lock_order_tests {
             pool_meta_save_gate: tokio::sync::Mutex::new(
                 other_store.pool_meta_save_gate.lock().await.independent_clone_for_test(),
             ),
+            decommission_capacity_entry_gate: tokio::sync::Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         });
