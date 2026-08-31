@@ -1084,8 +1084,6 @@ impl DefaultObjectUsecase {
         let ingress_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let should_compress =
             is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
-        let server_side_encryption_requested =
-            server_side_encryption.is_some() || sse_customer_algorithm.is_some() || ssekms_key_id.is_some();
 
         // Resolve the store through the request-bound server context
         // (backlog#1052 S6), not the process-global handle, so an embedded
@@ -1133,38 +1131,6 @@ impl DefaultObjectUsecase {
             base_buffer_size
         };
 
-        // Detect zero-copy opportunity before encryption/compression decisions
-        // Zero-copy is beneficial for large unencrypted, uncompressed objects
-        let enable_zero_copy = should_use_zero_copy(size, &req.headers);
-
-        if enable_zero_copy {
-            // Record zero-copy write attempt
-            counter!("rustfs_zero_copy_write_attempts_total").increment(1);
-            histogram!("rustfs_zero_copy_write_size_bytes").record(size as f64);
-            debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
-        }
-
-        let (put_path, zero_copy_eager_put_path_status, use_zero_copy_eager_put_path, use_empty_or_small_eager_put_path) =
-            select_put_path_with_concurrency(
-                size,
-                &req.headers,
-                server_side_encryption_requested,
-                should_compress,
-                false,
-                concurrent_put_requests,
-            );
-        if use_zero_copy_eager_put_path {
-            counter!(buffered_write::ATTEMPTS_TOTAL).increment(1);
-            histogram!(buffered_write::ATTEMPT_SIZE_BYTES).record(size as f64);
-        }
-        rustfs_io_metrics::record_put_object_diagnostics(
-            put_path,
-            zero_copy_eager_put_path_status,
-            size,
-            buffer_size,
-            use_large_put_concurrency_tuning,
-        );
-
         let sse_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let bucket_sse_config = metadata_sys::get_sse_config(&bucket).await.ok();
         rustfs_io_metrics::record_put_object_stage_duration_from("app_sse_config_lookup", sse_config_stage_start);
@@ -1202,6 +1168,32 @@ impl DefaultObjectUsecase {
             effective_sse = None;
             effective_kms_key_id = None;
         }
+
+        let server_side_encryption_requested =
+            effective_sse.is_some() || sse_customer_algorithm.is_some() || effective_kms_key_id.is_some();
+        let (put_path, zero_copy_eager_put_path_status, use_zero_copy_eager_put_path, use_empty_or_small_eager_put_path) =
+            select_put_path_with_concurrency(
+                size,
+                &req.headers,
+                server_side_encryption_requested,
+                should_compress,
+                false,
+                concurrent_put_requests,
+            );
+        if use_zero_copy_eager_put_path {
+            counter!("rustfs_zero_copy_write_attempts_total").increment(1);
+            histogram!("rustfs_zero_copy_write_size_bytes").record(size as f64);
+            debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
+            counter!(buffered_write::ATTEMPTS_TOTAL).increment(1);
+            histogram!(buffered_write::ATTEMPT_SIZE_BYTES).record(size as f64);
+        }
+        rustfs_io_metrics::record_put_object_diagnostics(
+            put_path,
+            zero_copy_eager_put_path_status,
+            size,
+            buffer_size,
+            use_large_put_concurrency_tuning,
+        );
 
         // Validate SSE-C headers early: reject partial/invalid combinations per S3 spec
         validate_sse_headers_for_write(
@@ -1739,7 +1731,7 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::record_put_object(
                 duration_ms,
                 size,
-                enable_zero_copy, // Track if zero-copy was enabled
+                use_zero_copy_eager_put_path, // Track if zero-copy was enabled
             );
         }
 
@@ -1776,7 +1768,10 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
-    use s3s::dto::{DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule};
+    use s3s::dto::{
+        DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ServerSideEncryptionByDefault,
+        ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    };
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
@@ -2390,6 +2385,36 @@ mod tests {
         assert_eq!(streaming_path, "streaming");
         assert!(!use_zero_copy);
         assert!(!use_small_eager);
+    }
+
+    #[test]
+    fn select_put_path_treats_bucket_default_sse_as_encrypted() {
+        for (algorithm, kms_key_id) in [
+            (ServerSideEncryption::AES256, None),
+            (ServerSideEncryption::AWS_KMS, Some("bucket-key")),
+        ] {
+            let config = ServerSideEncryptionConfiguration {
+                rules: vec![ServerSideEncryptionRule {
+                    apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                        sse_algorithm: ServerSideEncryption::from_static(algorithm),
+                        kms_master_key_id: kms_key_id.map(|id| SSEKMSKeyId::from(id.to_string())),
+                    }),
+                    bucket_key_enabled: None,
+                }],
+            };
+            let (effective_sse, effective_kms_key_id) = resolve_bucket_default_sse(Some(&config), None, None, false);
+            let encryption_requested = effective_sse.is_some() || effective_kms_key_id.is_some();
+
+            for size in [512 * 1024, 2 * 1024 * 1024] {
+                let (path, status, use_zero_copy, use_small_eager) =
+                    select_put_path_with_concurrency(size, &HeaderMap::new(), encryption_requested, false, false, 256);
+
+                assert_eq!(path, "streaming");
+                assert_eq!(status, PUT_EAGER_STATUS_ENCRYPTED);
+                assert!(!use_zero_copy);
+                assert!(!use_small_eager);
+            }
+        }
     }
 
     #[test]
