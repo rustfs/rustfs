@@ -16,6 +16,9 @@
 
 use super::*;
 use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecision;
+#[cfg(test)]
+use crate::storage::concurrency::manager::SNOWBALL_MEMBER_COMMIT_LIMIT;
+use crate::storage::concurrency::manager::SNOWBALL_STAGING_BYTES_LIMIT;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
 
@@ -370,8 +373,8 @@ fn normalize_put_object_extract_max_inflight(value: usize) -> usize {
     value.clamp(1, EXTRACT_BATCH_MAX_MEMBERS)
 }
 
-fn select_put_object_extract_max_inflight(configured: usize, ignore_errors: bool) -> usize {
-    if ignore_errors { configured } else { 1 }
+fn select_put_object_extract_max_inflight(configured: usize, ignore_errors: bool, quota_enabled: bool) -> usize {
+    if ignore_errors && !quota_enabled { configured } else { 1 }
 }
 
 struct ExtractPutRequestGuard {
@@ -437,7 +440,21 @@ where
     })
 }
 
-fn checked_extract_member_staging_weight(path: &str, size: usize, opts: &ObjectOptions) -> S3Result<usize> {
+fn checked_extract_hash_map_allocation<K, V>(map: &HashMap<K, V>) -> Option<usize> {
+    // HashMap does not expose its raw bucket allocation. Twice the advertised
+    // element capacity conservatively covers buckets plus control bytes while
+    // keeping the accounting independent of the current hashbrown layout.
+    map.capacity()
+        .checked_mul(2)?
+        .checked_mul(std::mem::size_of::<(K, V)>().checked_add(1)?)
+}
+
+fn checked_extract_member_staging_weight(
+    path: &str,
+    size: usize,
+    opts: &ObjectOptions,
+    replication: &ReplicateDecision,
+) -> S3Result<usize> {
     let body_reservation = if size == 0 { 0 } else { EXTRACT_SMALL_MEMBER_MAX_BYTES };
     // The authorization request is dropped before staging. Account the two
     // retained key copies plus all dynamic maps frozen into ObjectOptions;
@@ -459,7 +476,31 @@ fn checked_extract_member_staging_weight(path: &str, size: usize, opts: &ObjectO
                 .ok_or_else(|| s3_error!(InvalidArgument, "Snowball prepared member size overflowed"))?;
         }
     }
+    total = total
+        .checked_add(
+            checked_extract_hash_map_allocation(&replication.targets_map)
+                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball replication decision size overflowed"))?,
+        )
+        .ok_or_else(|| s3_error!(InvalidArgument, "Snowball prepared member size overflowed"))?;
+    for (target_name, target) in &replication.targets_map {
+        total = total
+            .checked_add(target_name.capacity())
+            .and_then(|bytes| bytes.checked_add(target.arn.capacity()))
+            .and_then(|bytes| bytes.checked_add(target.id.capacity()))
+            .ok_or_else(|| s3_error!(InvalidArgument, "Snowball replication decision size overflowed"))?;
+    }
     Ok(total)
+}
+
+fn try_acquire_extract_staging_permit(manager: &ConcurrencyManager, staging_weight: usize) -> S3Result<OwnedSemaphorePermit> {
+    if staging_weight > SNOWBALL_STAGING_BYTES_LIMIT {
+        return Err(s3_error!(SlowDown, "Snowball member retained state exceeds the global staging budget"));
+    }
+    let permits = u32::try_from(staging_weight)
+        .map_err(|_| s3_error!(SlowDown, "Snowball member retained state exceeds the global staging budget"))?;
+    manager
+        .try_acquire_snowball_staging_bytes(permits)
+        .ok_or_else(|| s3_error!(SlowDown, "Snowball staging budget is exhausted, please reduce your request rate"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -527,6 +568,7 @@ struct ExtractPreparedMember {
     opts: ObjectOptions,
     replication: ReplicateDecision,
     staging_permit: OwnedSemaphorePermit,
+    member_permit: OwnedSemaphorePermit,
 }
 
 struct ExtractCommitContext {
@@ -535,9 +577,8 @@ struct ExtractCommitContext {
     notify: Arc<dyn crate::runtime_sources::NotifyInterface>,
     bucket: String,
     quota_enabled: bool,
-    foreground_write_gated: bool,
     request_context: request_context::RequestContext,
-    req_params: HashMap<String, String>,
+    req_params: hashbrown::HashMap<String, String>,
     host: String,
     port: u16,
     user_agent: String,
@@ -578,42 +619,24 @@ struct ExtractCommitOutcome {
     error: Option<ExtractCommitError>,
 }
 
-async fn commit_extract_member_inner<R>(
+async fn run_extract_owned_task<T, F>(task: F) -> S3Result<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    spawn_traced_join(task)
+        .await
+        .map_err(|error| S3Error::with_message(S3ErrorCode::InternalError, format!("Snowball commit owner task failed: {error}")))
+}
+
+async fn complete_extract_member_post_commit(
     context: Arc<ExtractCommitContext>,
     key: String,
-    size: i64,
-    actual_size: i64,
-    body: R,
-    write_plan: WritePlan,
     opts: ObjectOptions,
     replication: ReplicateDecision,
-    staging_permit: Option<OwnedSemaphorePermit>,
-    foreground_permit: Option<OwnedSemaphorePermit>,
-) -> Result<ExtractCommitSuccess, ExtractCommitError>
-where
-    R: AsyncRead + Send + Sync + Unpin + 'static,
-{
-    let hrd = HashReader::from_stream(body, size, actual_size, None, None, false).map_err(ApiError::from)?;
-    let hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
-    let (hrd, member_read_failed) = track_extract_member_read_errors(hrd).map_err(ApiError::from)?;
-    let mut reader = PutObjReader::new(hrd);
-    let _ = invalidate_object_data_cache_before_mutation(&context.cache_adapter, &context.bucket, &key).await;
-
-    let (obj_info, backfilled_old_current_size) = match context
-        .store
-        .put_object_with_old_current_size(&context.bucket, &key, &mut reader, &opts)
-        .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            let error: S3Error = ApiError::from(error).into();
-            return Err(classify_extract_member_write_error(error, &member_read_failed));
-        }
-    };
-    drop(reader);
-    drop(staging_permit);
-    drop(foreground_permit);
-
+    obj_info: ObjectInfo,
+    backfilled_old_current_size: Option<OldCurrentSize>,
+) -> ExtractCommitSuccess {
     let extract_versioned = opts.versioned;
     let post_commit_error = match quota_accounting_object_size(&obj_info, context.quota_enabled) {
         Ok(committed_size) => {
@@ -639,10 +662,6 @@ where
         schedule_object_replication(obj_info.clone(), context.store.clone(), replication).await;
     }
 
-    if !context.wrote_any_entry.swap(true, Ordering::AcqRel) {
-        rustfs_scanner::record_dirty_usage_bucket(&context.bucket);
-    }
-
     let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
     let output = PutObjectOutput {
         e_tag,
@@ -663,10 +682,59 @@ where
         user_agent: context.user_agent.clone(),
     };
 
-    Ok(ExtractCommitSuccess {
+    ExtractCommitSuccess {
         event,
         post_commit_error,
-    })
+    }
+}
+
+async fn commit_extract_member_inner<R>(
+    context: Arc<ExtractCommitContext>,
+    key: String,
+    size: i64,
+    actual_size: i64,
+    body: R,
+    write_plan: WritePlan,
+    opts: ObjectOptions,
+    replication: ReplicateDecision,
+    staging_permit: OwnedSemaphorePermit,
+    foreground_permit: Option<OwnedSemaphorePermit>,
+    member_permit: OwnedSemaphorePermit,
+) -> Result<ExtractCommitSuccess, ExtractCommitError>
+where
+    R: AsyncRead + Send + Sync + Unpin + 'static,
+{
+    let hrd = HashReader::from_stream(body, size, actual_size, None, None, false).map_err(ApiError::from)?;
+    let hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
+    let (hrd, member_read_failed) = track_extract_member_read_errors(hrd).map_err(ApiError::from)?;
+    let mut reader = PutObjReader::new(hrd);
+    let _ = invalidate_object_data_cache_before_mutation(&context.cache_adapter, &context.bucket, &key).await;
+
+    let (obj_info, backfilled_old_current_size) = match context
+        .store
+        .put_object_with_old_current_size(&context.bucket, &key, &mut reader, &opts)
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let error: S3Error = ApiError::from(error).into();
+            return Err(classify_extract_member_write_error(error, &member_read_failed));
+        }
+    };
+    drop(reader);
+    drop(staging_permit);
+    drop(foreground_permit);
+
+    // The independently owned commit publishes the authoritative mutation to
+    // the scanner before its post-store awaits, then retains the lifecycle slot
+    // through quota, cache, replication, and event construction.
+    if !context.wrote_any_entry.swap(true, Ordering::AcqRel) {
+        rustfs_scanner::record_dirty_usage_bucket(&context.bucket);
+    }
+    let success =
+        complete_extract_member_post_commit(context, key, opts, replication, obj_info, backfilled_old_current_size).await;
+    drop(member_permit);
+    Ok(success)
 }
 
 async fn commit_extract_member<R>(
@@ -679,17 +747,26 @@ async fn commit_extract_member<R>(
     write_plan: WritePlan,
     opts: ObjectOptions,
     replication: ReplicateDecision,
-    staging_permit: Option<OwnedSemaphorePermit>,
+    staging_permit: OwnedSemaphorePermit,
+    member_permit: OwnedSemaphorePermit,
 ) -> ExtractCommitOutcome
 where
     R: AsyncRead + Send + Sync + Unpin + 'static,
 {
     let manager = get_concurrency_manager();
-    let foreground_permit = match manager
-        .acquire_snowball_foreground_write(context.foreground_write_gated)
-        .await
-    {
-        Ok(permit) => permit,
+    let foreground_permit = match manager.admit_snowball_foreground_write(actual_size).await {
+        Ok(ForegroundWriteAdmission::Disabled) => None,
+        Ok(ForegroundWriteAdmission::Admitted(permit)) => Some(permit),
+        Ok(ForegroundWriteAdmission::Rejected) => {
+            return ExtractCommitOutcome {
+                archive_seq,
+                event: None,
+                error: Some(ExtractCommitError::StorageWrite(s3_error!(
+                    SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate"
+                ))),
+            };
+        }
         Err(_) => {
             return ExtractCommitOutcome {
                 archive_seq,
@@ -701,20 +778,6 @@ where
             };
         }
     };
-    let _commit_permit = match manager.acquire_snowball_member_commit().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            return ExtractCommitOutcome {
-                archive_seq,
-                event: None,
-                error: Some(ExtractCommitError::Fatal(s3_error!(
-                    InternalError,
-                    "Snowball member commit admission closed"
-                ))),
-            };
-        }
-    };
-
     match commit_extract_member_inner(
         context,
         key,
@@ -726,6 +789,7 @@ where
         replication,
         staging_permit,
         foreground_permit,
+        member_permit,
     )
     .await
     {
@@ -797,6 +861,17 @@ fn finish_extract_outcomes(
     }
 }
 
+async fn run_extract_outcomes_owner<F>(context: Arc<ExtractCommitContext>, ignore_errors: bool, commits: F) -> S3Result<()>
+where
+    F: std::future::Future<Output = Vec<ExtractCommitOutcome>> + Send + 'static,
+{
+    run_extract_owned_task(async move {
+        let outcomes = commits.await;
+        finish_extract_outcomes(outcomes, &context, ignore_errors)
+    })
+    .await?
+}
+
 async fn drain_extract_commits<F>(mut commits: FuturesUnordered<F>) -> Vec<ExtractCommitOutcome>
 where
     F: std::future::Future<Output = ExtractCommitOutcome>,
@@ -813,7 +888,7 @@ where
     F: FnMut(T) -> Fut,
     Fut: std::future::Future<Output = ExtractCommitOutcome>,
 {
-    let mut commits = FuturesUnordered::new();
+    let commits = FuturesUnordered::new();
     for member in members {
         commits.push(commit(member));
     }
@@ -833,22 +908,48 @@ async fn flush_extract_batch(
 
     let members = batch.drain(..).collect::<Vec<_>>();
     batch_state.clear();
-    let outcomes = run_extract_commits(members, |member| {
-        commit_extract_member(
-            context.clone(),
-            member.archive_seq,
-            member.key,
-            member.size,
-            member.actual_size,
-            member.body,
-            member.write_plan,
-            member.opts,
-            member.replication,
-            Some(member.staging_permit),
-        )
+    let commit_context = context.clone();
+    run_extract_outcomes_owner(context.clone(), ignore_errors, async move {
+        run_extract_commits(members, |member| {
+            commit_extract_member(
+                commit_context.clone(),
+                member.archive_seq,
+                member.key,
+                member.size,
+                member.actual_size,
+                member.body,
+                member.write_plan,
+                member.opts,
+                member.replication,
+                member.staging_permit,
+                member.member_permit,
+            )
+        })
+        .await
     })
-    .await;
-    finish_extract_outcomes(outcomes, context, ignore_errors)
+    .await
+}
+
+async fn acquire_extract_member_lifecycle_permit(
+    batch: &mut Vec<ExtractPreparedMember>,
+    batch_state: &mut ExtractBatchState,
+    context: &Arc<ExtractCommitContext>,
+    ignore_errors: bool,
+) -> S3Result<OwnedSemaphorePermit> {
+    let manager = get_concurrency_manager();
+    if let Some(permit) = manager.try_acquire_snowball_member_commit() {
+        return Ok(permit);
+    }
+    if !batch.is_empty() {
+        flush_extract_batch(batch, batch_state, context, ignore_errors).await?;
+        if let Some(permit) = manager.try_acquire_snowball_member_commit() {
+            return Ok(permit);
+        }
+    }
+    manager
+        .acquire_snowball_member_commit()
+        .await
+        .map_err(|_| s3_error!(InternalError, "Snowball member lifecycle admission closed"))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1942,19 +2043,17 @@ impl DefaultObjectUsecase {
                 u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
             )
             .await?;
-        let foreground_write_gated = match get_concurrency_manager()
+        match get_concurrency_manager()
             .admit_put_object(size)
             .await
             .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
         {
-            ForegroundWriteAdmission::Disabled => false,
+            ForegroundWriteAdmission::Disabled => {}
             ForegroundWriteAdmission::Admitted(permit) => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "admitted").increment(1);
-                // The archive admission is a preflight. Member commits acquire
-                // this same gate individually so bounded parallelism cannot
-                // bypass an operator's strict or large-write PUT limit.
+                // The archive admission is a preflight. Each member later uses
+                // its own logical size against the same foreground PUT policy.
                 drop(permit);
-                true
             }
             ForegroundWriteAdmission::Rejected => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
@@ -1963,7 +2062,7 @@ impl DefaultObjectUsecase {
                     "foreground write concurrency limit reached, please reduce your request rate"
                 ));
             }
-        };
+        }
         let mut put_request_guard = ExtractPutRequestGuard::new();
 
         // Apply adaptive buffer sizing based on file size for optimal streaming performance.
@@ -2049,7 +2148,6 @@ impl DefaultObjectUsecase {
             notify,
             bucket: bucket.clone(),
             quota_enabled: extract_quota_enabled,
-            foreground_write_gated,
             request_context,
             req_params,
             host,
@@ -2063,9 +2161,16 @@ impl DefaultObjectUsecase {
         // Without ignore-errors, the legacy contract stops before attempting a
         // later member after the first storage failure. Parallel commits cannot
         // preserve that boundary, so concurrency requires both ignore-errors
-        // and an explicit max-inflight value above the serial default.
-        let max_inflight =
-            select_put_object_extract_max_inflight(put_object_extract_max_inflight(), extract_options.ignore_errors);
+        // and an explicit max-inflight value above the serial default. Quota
+        // accounting can fail after storage commit, so quota-enabled imports
+        // also remain serial. An opted-in micro-batch is always drained; a
+        // fatal outcome stops later batches but cannot roll back peers that
+        // already committed in the current batch.
+        let max_inflight = select_put_object_extract_max_inflight(
+            put_object_extract_max_inflight(),
+            extract_options.ignore_errors,
+            extract_quota_enabled,
+        );
         let mut batch = Vec::with_capacity(max_inflight);
         let mut batch_state = ExtractBatchState::default();
 
@@ -2075,13 +2180,9 @@ impl DefaultObjectUsecase {
                     Ok(value) => value,
                     Err(error) => {
                         let error: S3Error = error.into();
-                        if let Err(batch_error) = flush_extract_batch(
-                            &mut batch,
-                            &mut batch_state,
-                            &commit_context,
-                            extract_options.ignore_errors,
-                        )
-                        .await
+                        if let Err(batch_error) =
+                            flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors)
+                                .await
                         {
                             return Err(batch_error);
                         }
@@ -2096,13 +2197,8 @@ impl DefaultObjectUsecase {
                 Ok(f) => f,
                 Err(error) => {
                     error!(error = %error, "Archive entry read failed");
-                    if let Err(batch_error) = flush_extract_batch(
-                        &mut batch,
-                        &mut batch_state,
-                        &commit_context,
-                        extract_options.ignore_errors,
-                    )
-                    .await
+                    if let Err(batch_error) =
+                        flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors).await
                     {
                         return Err(batch_error);
                     }
@@ -2172,13 +2268,7 @@ impl DefaultObjectUsecase {
                 || (!is_dir && entry_size > EXTRACT_SMALL_MEMBER_MAX_BYTES as u64)
             {
                 extract_try!(
-                    flush_extract_batch(
-                        &mut batch,
-                        &mut batch_state,
-                        &commit_context,
-                        extract_options.ignore_errors,
-                    )
-                    .await
+                    flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors,).await
                 );
             }
             extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);
@@ -2385,6 +2475,20 @@ impl DefaultObjectUsecase {
             }
             opts.user_defined.extend(metadata);
 
+            // Reserve the global member lifecycle before constructing the
+            // potentially large replication decision. If this archive already
+            // owns a batch, drain it before waiting so requests cannot deadlock
+            // while each retains lifecycle capacity needed by its own batch.
+            let member_permit = extract_try!(
+                acquire_extract_member_lifecycle_permit(
+                    &mut batch,
+                    &mut batch_state,
+                    &commit_context,
+                    extract_options.ignore_errors,
+                )
+                .await
+            );
+
             // One immutable decision drives both the pending metadata and the
             // post-commit schedule, matching the regular PUT contract.
             let replication = must_replicate_object(
@@ -2405,96 +2509,96 @@ impl DefaultObjectUsecase {
                 );
             }
 
+            // Never wait while retaining a fully constructed replication
+            // decision. The lifecycle gate bounds builders, and this byte gate
+            // accounts every serial or staged member until storage returns.
+            let manager = get_concurrency_manager();
+
             let member_size = extract_try!(
                 usize::try_from(size).map_err(|_| s3_error!(InvalidArgument, "Snowball member size does not fit into usize"))
             );
-            let staging_weight = extract_try!(checked_extract_member_staging_weight(&fpath, member_size, &opts));
+            let staging_weight = extract_try!(checked_extract_member_staging_weight(&fpath, member_size, &opts, &replication,));
             let action = batch_state.action(&fpath, member_size, staging_weight, max_inflight, durable_quota);
 
             if matches!(action, ExtractBatchAction::FlushThenStage | ExtractBatchAction::SerialBarrier) {
                 extract_try!(
-                    flush_extract_batch(
-                        &mut batch,
-                        &mut batch_state,
-                        &commit_context,
-                        extract_options.ignore_errors,
-                    )
-                    .await
+                    flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors,).await
                 );
             }
+
+            let mut staging_permit = try_acquire_extract_staging_permit(manager, staging_weight);
+            if staging_permit.is_err() && !batch.is_empty() {
+                extract_try!(
+                    flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors,).await
+                );
+                staging_permit = try_acquire_extract_staging_permit(manager, staging_weight);
+            }
+            let staging_permit = match staging_permit {
+                Ok(permit) => permit,
+                Err(error) if extract_options.ignore_errors => {
+                    warn!(error = %error, "Archive object staging skipped due to ignore-errors");
+                    continue;
+                }
+                Err(error) => extract_try!(Err::<OwnedSemaphorePermit, _>(error)),
+            };
 
             if action == ExtractBatchAction::SerialBarrier {
                 // Large and durable-quota members retain the legacy streaming
-                // path. Await inline so the TAR Entry never enters a batch or
-                // a detached task before the producer advances the archive.
-                let outcome = if is_dir {
+                // path. Await the owner inline so the producer never advances
+                // the TAR while its Entry is alive. The complete commit and
+                // notification aggregation move into that owner before ECStore
+                // starts, so caller cancellation cannot interrupt a mutation
+                // after its quorum commit point.
+                let member_context = commit_context.clone();
+                let owner_context = commit_context.clone();
+                if is_dir {
                     drop(f);
-                    commit_extract_member(
-                        commit_context.clone(),
-                        extracted_entry_count,
-                        fpath,
-                        size,
-                        actual_size,
-                        std::io::Cursor::new(Vec::new()),
-                        write_plan,
-                        opts,
-                        replication,
-                        None,
-                    )
-                    .await
+                    extract_try!(
+                        run_extract_outcomes_owner(owner_context, extract_options.ignore_errors, async move {
+                            vec![
+                                commit_extract_member(
+                                    member_context,
+                                    extracted_entry_count,
+                                    fpath,
+                                    size,
+                                    actual_size,
+                                    std::io::Cursor::new(Vec::new()),
+                                    write_plan,
+                                    opts,
+                                    replication,
+                                    staging_permit,
+                                    member_permit,
+                                )
+                                .await,
+                            ]
+                        })
+                        .await
+                    );
                 } else {
-                    commit_extract_member(
-                        commit_context.clone(),
-                        extracted_entry_count,
-                        fpath,
-                        size,
-                        actual_size,
-                        f,
-                        write_plan,
-                        opts,
-                        replication,
-                        None,
-                    )
-                    .await
-                };
-                extract_try!(finish_extract_outcomes(
-                    vec![outcome],
-                    &commit_context,
-                    extract_options.ignore_errors,
-                ));
+                    extract_try!(
+                        run_extract_outcomes_owner(owner_context, extract_options.ignore_errors, async move {
+                            vec![
+                                commit_extract_member(
+                                    member_context,
+                                    extracted_entry_count,
+                                    fpath,
+                                    size,
+                                    actual_size,
+                                    f,
+                                    write_plan,
+                                    opts,
+                                    replication,
+                                    staging_permit,
+                                    member_permit,
+                                )
+                                .await,
+                            ]
+                        })
+                        .await
+                    );
+                }
                 continue;
             }
-
-            let staging_permits = extract_try!(
-                u32::try_from(staging_weight)
-                    .map_err(|_| s3_error!(InvalidArgument, "Snowball prepared member size exceeds semaphore capacity"))
-            );
-            let staging_permit = if batch.is_empty() {
-                extract_try!(
-                    get_concurrency_manager()
-                        .acquire_snowball_staging_bytes(staging_permits)
-                        .await
-                        .map_err(|_| s3_error!(InternalError, "Snowball staging admission closed"))
-                )
-            } else if let Some(permit) = get_concurrency_manager().try_acquire_snowball_staging_bytes(staging_permits) {
-                permit
-            } else {
-                extract_try!(
-                    flush_extract_batch(
-                        &mut batch,
-                        &mut batch_state,
-                        &commit_context,
-                        extract_options.ignore_errors,
-                    )
-                    .await
-                );
-                extract_try!(
-                    get_concurrency_manager()
-                        .acquire_snowball_staging_bytes(staging_permits)
-                        .await
-                        .map_err(|_| s3_error!(InternalError, "Snowball staging admission closed"))
-                )
-            };
 
             let body = if is_dir {
                 drop(f);
@@ -2513,17 +2617,10 @@ impl DefaultObjectUsecase {
                 opts,
                 replication,
                 staging_permit,
+                member_permit,
             });
         }
-        extract_try!(
-            flush_extract_batch(
-                &mut batch,
-                &mut batch_state,
-                &commit_context,
-                extract_options.ignore_errors,
-            )
-            .await
-        );
+        extract_try!(flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors,).await);
 
         let mut checksums = PutObjectChecksums {
             crc32: input.checksum_crc32,
@@ -2587,6 +2684,48 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
 
+    struct RecordingNotify {
+        events: tokio::sync::mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::runtime_sources::NotifyInterface for RecordingNotify {
+        async fn notify(&self, args: rustfs_notify::EventArgs) {
+            let _ = self.events.send(args.version_id);
+        }
+
+        async fn add_event_specific_rules(
+            &self,
+            _bucket_name: &str,
+            _region: &str,
+            _event_rules: &[(Vec<rustfs_targets::EventName>, String, String, Vec<rustfs_targets::arn::TargetID>)],
+        ) -> Result<(), rustfs_notify::NotificationError> {
+            Ok(())
+        }
+
+        async fn clear_bucket_notification_rules(&self, _bucket_name: &str) -> Result<(), rustfs_notify::NotificationError> {
+            Ok(())
+        }
+    }
+
+    async fn recording_extract_commit_context(
+        notify: Arc<dyn crate::runtime_sources::NotifyInterface>,
+    ) -> Arc<ExtractCommitContext> {
+        Arc::new(ExtractCommitContext {
+            store: crate::app::gating_test_env::shared_gating_ecstore().await,
+            cache_adapter: ObjectDataCacheAdapter::disabled_arc(),
+            notify,
+            bucket: "snowball-owner-test".to_string(),
+            quota_enabled: false,
+            request_context: request_context::RequestContext::from_headers(&HeaderMap::new()),
+            req_params: hashbrown::HashMap::new(),
+            host: String::new(),
+            port: 0,
+            user_agent: String::new(),
+            wrote_any_entry: AtomicBool::new(false),
+        })
+    }
+
     #[test]
     fn snowball_max_inflight_has_a_serial_compatibility_floor_and_bounded_ceiling() {
         assert_eq!(EXTRACT_DEFAULT_MAX_INFLIGHT, 1);
@@ -2594,14 +2733,19 @@ mod tests {
         assert_eq!(normalize_put_object_extract_max_inflight(1), 1);
         assert_eq!(normalize_put_object_extract_max_inflight(usize::MAX), EXTRACT_BATCH_MAX_MEMBERS);
         assert_eq!(
-            select_put_object_extract_max_inflight(EXTRACT_BATCH_MAX_MEMBERS, false),
+            select_put_object_extract_max_inflight(EXTRACT_BATCH_MAX_MEMBERS, false, false),
             1,
             "requests that stop on write errors must preserve serial member semantics"
         );
         assert_eq!(
-            select_put_object_extract_max_inflight(EXTRACT_BATCH_MAX_MEMBERS, true),
+            select_put_object_extract_max_inflight(EXTRACT_BATCH_MAX_MEMBERS, true, false),
             EXTRACT_BATCH_MAX_MEMBERS,
             "ignore-errors requests may use bounded parallel member commits"
+        );
+        assert_eq!(
+            select_put_object_extract_max_inflight(EXTRACT_BATCH_MAX_MEMBERS, true, true),
+            1,
+            "quota accounting can fail after storage commit and must remain serial"
         );
     }
 
@@ -2674,7 +2818,8 @@ mod tests {
         opts.user_defined.insert("x-amz-meta-one".to_string(), "value".to_string());
         opts.eval_metadata = Some(HashMap::from([("auth-view".to_string(), "retained".to_string())]));
         let path = "prefix/object";
-        let weight = checked_extract_member_staging_weight(path, 1, &opts).expect("valid metadata must have a weight");
+        let weight = checked_extract_member_staging_weight(path, 1, &opts, &ReplicateDecision::new())
+            .expect("valid metadata must have a weight");
         assert_eq!(
             weight,
             EXTRACT_SMALL_MEMBER_MAX_BYTES
@@ -2687,9 +2832,85 @@ mod tests {
                 + "retained".len()
                 + EXTRACT_METADATA_ENTRY_OVERHEAD_BYTES
         );
-        let empty_weight =
-            checked_extract_member_staging_weight(path, 0, &ObjectOptions::default()).expect("empty member must have a weight");
+        let empty_weight = checked_extract_member_staging_weight(path, 0, &ObjectOptions::default(), &ReplicateDecision::new())
+            .expect("empty member must have a weight");
         assert_eq!(empty_weight, EXTRACT_MEMBER_CONTEXT_OVERHEAD_BYTES + (2 * path.len()));
+    }
+
+    #[test]
+    fn snowball_staging_weight_accounts_replication_target_capacity() {
+        let path = "replicated/object";
+        let opts = ObjectOptions::default();
+        let baseline = checked_extract_member_staging_weight(path, 0, &opts, &ReplicateDecision::new())
+            .expect("empty replication decision must have a weight");
+
+        let mut target_name = String::with_capacity(128);
+        target_name.push_str("target");
+        let mut replication = ReplicateDecision::new();
+        replication.targets_map.insert(target_name, Default::default());
+        let map_allocation =
+            checked_extract_hash_map_allocation(&replication.targets_map).expect("target map allocation must fit");
+        let retained_strings = {
+            let (name, target) = replication.targets_map.iter_mut().next().expect("target must exist");
+            let mut arn = String::with_capacity(EXTRACT_BATCH_MAX_STAGING_BYTES);
+            arn.push('a');
+            target.arn = arn;
+            let mut id = String::with_capacity(256);
+            id.push_str("id");
+            target.id = id;
+            name.capacity() + target.arn.capacity() + target.id.capacity()
+        };
+        let weight = checked_extract_member_staging_weight(path, 0, &opts, &replication)
+            .expect("replication decision must have a bounded weight");
+        assert_eq!(weight, baseline + retained_strings + map_allocation);
+        assert_eq!(
+            ExtractBatchState::default().action("replicated/object", 0, weight, EXTRACT_BATCH_MAX_MEMBERS, false),
+            ExtractBatchAction::SerialBarrier,
+            "a retained target capacity above the micro-batch budget must remain serial"
+        );
+    }
+
+    #[test]
+    fn snowball_serial_members_consume_the_global_staging_budget() {
+        let manager = ConcurrencyManager::new();
+        let serial_weight = EXTRACT_BATCH_MAX_STAGING_BYTES + 1;
+        assert_eq!(
+            ExtractBatchState::default().action("large-context", 0, serial_weight, EXTRACT_BATCH_MAX_MEMBERS, false),
+            ExtractBatchAction::SerialBarrier
+        );
+
+        let first = try_acquire_extract_staging_permit(&manager, serial_weight)
+            .expect("the first serial member must reserve its retained context");
+        let error = try_acquire_extract_staging_permit(&manager, serial_weight)
+            .err()
+            .expect("a second serial member must not exceed the global staging budget");
+        assert_eq!(error.code(), &S3ErrorCode::SlowDown);
+
+        drop(first);
+        assert!(
+            try_acquire_extract_staging_permit(&manager, serial_weight).is_ok(),
+            "serial staging capacity must be reusable after storage releases it"
+        );
+    }
+
+    #[test]
+    fn snowball_staging_admission_rejects_without_retaining_waiters() {
+        let manager = ConcurrencyManager::new();
+        let full_budget = manager
+            .try_acquire_snowball_staging_bytes(
+                u32::try_from(SNOWBALL_STAGING_BYTES_LIMIT).expect("the staging budget must fit into u32"),
+            )
+            .expect("the exact global staging budget must be available");
+        let error = try_acquire_extract_staging_permit(&manager, 1)
+            .err()
+            .expect("a saturated staging budget must reject immediately");
+        assert_eq!(error.code(), &S3ErrorCode::SlowDown);
+        drop(full_budget);
+
+        let error = try_acquire_extract_staging_permit(&manager, SNOWBALL_STAGING_BYTES_LIMIT + 1)
+            .err()
+            .expect("a single retained context larger than the global budget must reject");
+        assert_eq!(error.code(), &S3ErrorCode::SlowDown);
     }
 
     #[tokio::test]
@@ -2795,24 +3016,97 @@ mod tests {
     #[tokio::test]
     async fn snowball_notification_dispatch_detaches_slow_delivery() {
         let started = Arc::new(tokio::sync::Notify::new());
-        spawn_extract_notification_batch(
-            None,
-            vec![EventArgsBuilder::default().version_id("slow-target").build()],
-            {
+        spawn_extract_notification_batch(None, vec![EventArgsBuilder::default().version_id("slow-target").build()], {
+            let started = started.clone();
+            move |_event| {
                 let started = started.clone();
-                move |_event| {
-                    let started = started.clone();
-                    async move {
-                        started.notify_one();
-                        std::future::pending::<()>().await;
-                    }
+                async move {
+                    started.notify_one();
+                    std::future::pending::<()>().await;
                 }
-            },
-        );
+            }
+        });
 
         tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
             .await
             .expect("detached notification delivery must start without blocking the caller");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_commit_owner_survives_request_cancellation() {
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let (events, mut received_events) = tokio::sync::mpsc::unbounded_channel();
+        let context = recording_extract_commit_context(Arc::new(RecordingNotify { events })).await;
+        let manager = ConcurrencyManager::new();
+        let owner_permit = manager
+            .acquire_snowball_member_commit()
+            .await
+            .expect("owner lifecycle admission must remain open");
+        let mut other_permits = Vec::with_capacity(SNOWBALL_MEMBER_COMMIT_LIMIT - 1);
+        for _ in 1..SNOWBALL_MEMBER_COMMIT_LIMIT {
+            other_permits.push(
+                manager
+                    .acquire_snowball_member_commit()
+                    .await
+                    .expect("remaining lifecycle admission must remain open"),
+            );
+        }
+
+        let request = spawn_traced_join({
+            let entered = entered.clone();
+            let release = release.clone();
+            async move {
+                run_extract_outcomes_owner(context, false, async move {
+                    let owner_permit = owner_permit;
+                    entered.wait().await;
+                    release.wait().await;
+                    let outcome = ExtractCommitOutcome {
+                        archive_seq: 1,
+                        event: Some(EventArgsBuilder::default().version_id("cancelled-owner-event").build()),
+                        error: None,
+                    };
+                    drop(owner_permit);
+                    vec![outcome]
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.wait())
+            .await
+            .expect("commit owner must start before the request waits for storage");
+        request.abort();
+        let join_error = request.await.expect_err("request task must be cancelled");
+        assert!(join_error.is_cancelled());
+        assert!(
+            manager.try_acquire_snowball_member_commit().is_none(),
+            "a cancelled request must not admit a 33rd member while its detached tail is running"
+        );
+        release.wait().await;
+        let replacement = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Some(permit) = manager.try_acquire_snowball_member_commit() {
+                    break permit;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("commit owner must finish after request cancellation");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), received_events.recv())
+            .await
+            .expect("the detached owner must dispatch its committed event")
+            .expect("the notification recorder must remain open");
+        assert_eq!(event, "cancelled-owner-event");
+        assert!(
+            matches!(
+                received_events.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty | tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "the detached owner must dispatch the committed event exactly once"
+        );
+        drop((replacement, other_permits));
     }
 
     #[test]
@@ -2834,6 +3128,20 @@ mod tests {
         assert!(error.is_none(), "ignore-errors must skip a storage-only write failure");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].version_id, "later-success");
+
+        let slowdown = ExtractCommitError::StorageWrite(s3_error!(SlowDown, "injected admission rejection"));
+        assert!(
+            slowdown.into_unignored(true).is_none(),
+            "ignore-errors must treat member admission rejection as a skipped write"
+        );
+        let slowdown = ExtractCommitError::StorageWrite(s3_error!(SlowDown, "injected admission rejection"));
+        assert_eq!(
+            slowdown
+                .into_unignored(false)
+                .expect("non-ignore requests must return admission rejection")
+                .code(),
+            &S3ErrorCode::SlowDown
+        );
     }
 
     #[test]
@@ -2876,8 +3184,7 @@ mod tests {
                         ExtractCommitOutcome {
                             archive_seq,
                             event: None,
-                            error: (archive_seq == 2)
-                                .then(|| ExtractCommitError::Fatal(s3_error!(InvalidArgument, "injected"))),
+                            error: (archive_seq == 2).then(|| ExtractCommitError::Fatal(s3_error!(InvalidArgument, "injected"))),
                         }
                     }
                 }

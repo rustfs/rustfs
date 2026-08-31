@@ -35,8 +35,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
 const DERIVED_LARGE_PUT_ADMISSION_LIMIT_MAX: usize = 32;
-const SNOWBALL_MEMBER_COMMIT_LIMIT: usize = 32;
-const SNOWBALL_STAGING_BYTES_LIMIT: usize = 4 * MI_B;
+pub(crate) const SNOWBALL_MEMBER_COMMIT_LIMIT: usize = 32;
+pub(crate) const SNOWBALL_STAGING_BYTES_LIMIT: usize = 4 * MI_B;
 
 /// Global concurrency manager instance
 pub(crate) static CONCURRENCY_MANAGER: LazyLock<ConcurrencyManager> = LazyLock::new(ConcurrencyManager::new);
@@ -72,7 +72,7 @@ pub struct ConcurrencyManager {
     /// Foreground write admission policy, resolved once at startup.
     foreground_write_admission_policy: ForegroundWriteAdmissionPolicy,
     /// Snowball members are internal PUTs, so they use a separate global gate
-    /// instead of recursively consuming foreground request admission.
+    /// from preparation through the independently owned post-commit tail.
     snowball_member_commit_semaphore: Arc<Semaphore>,
     /// Bounds the owned member bodies and metadata retained between TAR parsing
     /// and storage commit across all extract requests.
@@ -566,28 +566,26 @@ impl ConcurrencyManager {
             .await
     }
 
-    /// Acquire the foreground gate selected when a Snowball archive request was
-    /// admitted. The outer request releases its preflight permit before parsing;
-    /// each member then shares the same strict/large-write gate with ordinary
-    /// PUTs for the duration of its storage commit.
-    pub(crate) async fn acquire_snowball_foreground_write(
+    /// Admit a Snowball member through the foreground PUT policy using the
+    /// member's logical size. The outer archive has a separate preflight, while
+    /// every member shares the ordinary PUT gate and its wait/rejection policy.
+    pub(crate) async fn admit_snowball_foreground_write(
         &self,
-        gated: bool,
-    ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::AcquireError> {
-        if !gated {
-            return Ok(None);
-        }
-
-        let gate = match &self.foreground_write_admission_policy {
-            ForegroundWriteAdmissionPolicy::Strict(gate) | ForegroundWriteAdmissionPolicy::Large { gate, .. } => gate,
-            ForegroundWriteAdmissionPolicy::Disabled | ForegroundWriteAdmissionPolicy::LegacyCounterOnly => return Ok(None),
-        };
-        gate.semaphore.clone().acquire_owned().await.map(Some)
+        member_size: i64,
+    ) -> Result<ForegroundWriteAdmission, tokio::sync::AcquireError> {
+        self.foreground_write_admission_policy
+            .admit(ForegroundWriteAdmissionKind::PutObject, member_size)
+            .await
     }
 
-    /// Acquire one global Snowball member commit slot.
+    /// Acquire one global Snowball member lifecycle slot.
     pub(crate) async fn acquire_snowball_member_commit(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.snowball_member_commit_semaphore.clone().acquire_owned().await
+    }
+
+    /// Try to acquire one global Snowball member lifecycle slot.
+    pub(crate) fn try_acquire_snowball_member_commit(&self) -> Option<OwnedSemaphorePermit> {
+        self.snowball_member_commit_semaphore.clone().try_acquire_owned().ok()
     }
 
     /// Try to reserve prepared-member bytes without waiting.
@@ -600,14 +598,6 @@ impl ConcurrencyManager {
             .clone()
             .try_acquire_many_owned(bytes)
             .ok()
-    }
-
-    /// Wait for prepared-member bytes when the caller holds no staged batch.
-    pub(crate) async fn acquire_snowball_staging_bytes(
-        &self,
-        bytes: u32,
-    ) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
-        self.snowball_staging_bytes_semaphore.clone().acquire_many_owned(bytes).await
     }
 
     /// Admit a multipart UploadPart request under the configured write gate.
@@ -1146,15 +1136,32 @@ mod integration_tests {
     #[tokio::test]
     async fn test_snowball_members_share_the_strict_foreground_put_gate() {
         let manager = ConcurrencyManager::with_put_admission_for_test(true, 2, Duration::ZERO);
-        let outer = match manager.admit_put_object(1).await.expect("strict outer admission must remain open") {
+        let outer = match manager
+            .admit_put_object(1)
+            .await
+            .expect("strict outer admission must remain open")
+        {
             ForegroundWriteAdmission::Admitted(permit) => permit,
             outcome => panic!("strict outer admission must return a permit: {outcome:?}"),
         };
-        let member = manager
-            .acquire_snowball_foreground_write(true)
+        let member = match manager
+            .admit_snowball_foreground_write(1)
             .await
             .expect("strict member admission must remain open")
-            .expect("strict member admission must return a permit");
+        {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            outcome => panic!("strict member admission must return a permit: {outcome:?}"),
+        };
+        assert!(
+            matches!(
+                manager
+                    .admit_snowball_foreground_write(1)
+                    .await
+                    .expect("strict member admission must remain open"),
+                ForegroundWriteAdmission::Rejected
+            ),
+            "a saturated Snowball member admission must preserve the zero-wait rejection policy"
+        );
         assert!(
             matches!(
                 manager.admit_put_object(1).await.expect("strict gate must remain usable"),
@@ -1164,12 +1171,59 @@ mod integration_tests {
         );
 
         drop(outer);
-        let replacement = manager
-            .acquire_snowball_foreground_write(true)
+        let replacement = match manager
+            .admit_snowball_foreground_write(1)
             .await
             .expect("released strict capacity must be reusable")
-            .expect("strict replacement admission must return a permit");
+        {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            outcome => panic!("strict replacement admission must return a permit: {outcome:?}"),
+        };
         drop((member, replacement));
+    }
+
+    #[tokio::test]
+    async fn test_snowball_members_use_their_size_for_the_large_foreground_put_gate() {
+        let min_size = 16 * 1024 * 1024;
+        let manager = ConcurrencyManager::with_large_put_admission_for_test(true, 1, min_size, Duration::ZERO);
+
+        assert!(matches!(
+            manager
+                .admit_put_object((min_size - 1) as i64)
+                .await
+                .expect("small outer archive admission must remain open"),
+            ForegroundWriteAdmission::Disabled
+        ));
+        let large_member = match manager
+            .admit_snowball_foreground_write(min_size as i64)
+            .await
+            .expect("large Snowball member admission must remain open")
+        {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            outcome => panic!("large Snowball member must consume the large PUT gate: {outcome:?}"),
+        };
+        assert!(matches!(
+            manager
+                .admit_snowball_foreground_write(min_size as i64)
+                .await
+                .expect("saturated Snowball member admission must remain open"),
+            ForegroundWriteAdmission::Rejected
+        ));
+        assert!(matches!(
+            manager
+                .admit_put_object(min_size as i64)
+                .await
+                .expect("ordinary large PUT admission must remain open"),
+            ForegroundWriteAdmission::Rejected
+        ));
+        assert!(matches!(
+            manager
+                .admit_snowball_foreground_write((min_size - 1) as i64)
+                .await
+                .expect("small Snowball member admission must remain open"),
+            ForegroundWriteAdmission::Disabled
+        ));
+        drop(large_member);
     }
 
     #[tokio::test]
