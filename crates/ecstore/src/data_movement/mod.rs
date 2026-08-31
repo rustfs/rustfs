@@ -161,7 +161,7 @@ pub fn mark_multipart_upload_completed(flag: &Arc<AtomicBool>) {
     flag.store(false, Ordering::Relaxed);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 struct DataMovementMultipartAbortBarrierState {
     bucket: String,
     object: String,
@@ -169,17 +169,17 @@ struct DataMovementMultipartAbortBarrierState {
     release: tokio::sync::Notify,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) struct DataMovementMultipartAbortBarrier {
     state: Arc<DataMovementMultipartAbortBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 static DATA_MOVEMENT_MULTIPART_ABORT_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<Arc<DataMovementMultipartAbortBarrierState>>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl DataMovementMultipartAbortBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
         let state = Arc::new(DataMovementMultipartAbortBarrierState {
@@ -204,7 +204,7 @@ impl DataMovementMultipartAbortBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 impl Drop for DataMovementMultipartAbortBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -218,7 +218,7 @@ impl Drop for DataMovementMultipartAbortBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 async fn pause_data_movement_multipart_before_abort(bucket: &str, object: &str) {
     let barrier = DATA_MOVEMENT_MULTIPART_ABORT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -1518,7 +1518,7 @@ pub(crate) async fn migrate_decommission_object(
     capacity_owner: Option<DecommissionCapacityOwner>,
 ) -> Result<()> {
     let source = rd.object_info.clone();
-    let _mutation_fence = store
+    let mutation_fence = store
         .acquire_decommission_object_mutation_fence(&bucket, &source.name)
         .await?;
     let current = find_data_movement_target_info(store.as_ref(), pool_idx, &bucket, &source)
@@ -1537,7 +1537,7 @@ pub(crate) async fn migrate_decommission_object(
         op_label,
         None,
         capacity_owner,
-        Some(&_mutation_fence),
+        Some(&mutation_fence),
     )
     .await
 }
@@ -1605,6 +1605,17 @@ async fn migrate_object_inner(
         });
         owner.with_mutation_id(mutation_id)
     });
+    // Capture the exact source/tier identity before any client-paced read, but
+    // defer both the tier lease and source/target write locks to the final
+    // publication. Decommission already owns main's fixed-domain mutation
+    // fence, so reacquiring that domain as a write lock would self-deadlock.
+    let remote_tuple_publication_fence = store
+        .acquire_remote_tuple_publication_fence(&bucket, pool_idx, &object_info, false)
+        .await?;
+    let remote_tuple_publication_fence = match mutation_fence {
+        Some(mutation_fence) => remote_tuple_publication_fence.under_preheld_fixed_domain(mutation_fence)?,
+        None => remote_tuple_publication_fence,
+    };
     let has_part_checksums = object_info
         .parts
         .iter()
@@ -1799,13 +1810,14 @@ async fn migrate_object_inner(
             }
             if let Err(err) = store
                 .clone()
-                .complete_multipart_upload_for_data_movement(
+                .complete_multipart_upload_for_data_movement_with_publication_fence(
                     (target_pool_idx, mutation_fence),
                     &bucket,
                     &object_info.name,
                     &res.upload_id,
                     parts,
                     &complete_multipart_opts,
+                    remote_tuple_publication_fence,
                 )
                 .await
             {
@@ -1923,7 +1935,7 @@ async fn migrate_object_inner(
 
         if let Err(primary_err) = multipart_result {
             if should_abort_multipart_upload(&abort_multipart_flag) {
-                #[cfg(test)]
+                #[cfg(all(test, feature = "test-util"))]
                 pause_data_movement_multipart_before_abort(&bucket, &object_info.name).await;
                 let mut abort_opts =
                     data_movement_abort_opts(pool_idx, expected_bucket_incarnation_id, lock_lost_signal.as_ref(), capacity_owner);
@@ -1983,7 +1995,14 @@ async fn migrate_object_inner(
         put_opts.add_namespace_lock_lost_signal(signal);
     }
     let (target_pool_idx, put_result) = store
-        .put_object_for_data_movement(&bucket, &object_info.name, &mut data, &put_opts, mutation_fence)
+        .put_object_for_data_movement_with_publication_fence(
+            &bucket,
+            &object_info.name,
+            &mut data,
+            &put_opts,
+            mutation_fence,
+            remote_tuple_publication_fence,
+        )
         .await
         .map_err(|err| data_movement_stage_error(op_label, "prepare_put_object", &bucket, &object_info.name, err))?;
     if let Err(err) = put_result {

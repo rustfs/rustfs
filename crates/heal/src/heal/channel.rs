@@ -697,6 +697,11 @@ impl HealChannelProcessor {
             | HealRequestSource::Mrf => true,
         });
 
+        // `no_lock` is an internal coordination hint. An admin request can
+        // carry the legacy field over the wire, but cannot use it as ambient
+        // authority to bypass storage namespace locking.
+        let no_lock = request.no_lock.unwrap_or(false) && request.source != HealRequestSource::Admin;
+
         // Build HealOptions with all available fields
         let options = HealOptions {
             scan_mode: request.scan_mode.unwrap_or(HealScanMode::Normal),
@@ -705,7 +710,7 @@ impl HealChannelProcessor {
             update_parity: request.update_parity.unwrap_or(true),
             recursive,
             dry_run: request.dry_run.unwrap_or(false),
-            no_lock: request.no_lock.unwrap_or(false),
+            no_lock,
             timeout: request.timeout_seconds.map(std::time::Duration::from_secs),
             pool_index: request.pool_index,
             set_index: request.set_index,
@@ -988,6 +993,23 @@ mod tests {
         assert!(heal_request.options.remove_corrupted);
         assert!(heal_request.options.recreate_missing);
         assert!(heal_request.options.no_lock);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_admin_cannot_bypass_object_lock() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+        let channel_request = HealChannelRequest {
+            id: "admin-no-lock".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: Some("test-object".to_string()),
+            no_lock: Some(true),
+            source: HealRequestSource::Admin,
+            ..Default::default()
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+        assert!(!heal_request.options.no_lock, "admin nolock must not become storage lock authority");
     }
 
     #[tokio::test]

@@ -165,16 +165,30 @@ and all listing/GET paths exclude them.
 
 ### Lifecycle And Consumers
 
-Creation: any local delete that removes a version whose transition status is
-`complete` appends the record via `MetaObject::delete_version` →
-`init_free_version` (skipped only when `skip_tier_free_version` is set, as on
-data-movement copies). The same deletes also persist a durable tier-journal
-entry on every user-facing path: S3 single deletes (`execute_delete_object` →
-`delete_object_with_tier_delete_journal`), S3 batch deletes, lifecycle expiry,
-and lifecycle delete-all all prepare and commit a journal entry around the
-delete. A journal entry is omitted when the removed version's transition state
-decodes as `TransitionVersionState::Unknown`, or on internal journal-less
-delete paths that never touch transitioned user objects.
+Creation: a local delete that removes a version whose transition status is
+`complete` normally appends the record via `MetaObject::delete_version` →
+`init_free_version`. User-facing single and batch deletes always retain that
+historical owner when they actually remove a transitioned source; they do not
+create a tier journal, probe a fleet capability, or issue a peer mutation RPC.
+`TransitionVersionState::Unknown` and incomplete destination identities remain
+on the same conservative free-version path. Delete-marker creation on an Enabled
+bucket remains unchanged and does not schedule remote deletion.
+
+Recursive prefix/delete-all cannot preserve per-object markers across its
+physical directory purge, so it requires a v6 recoverable journal for every
+transitioned visible source plus a durable dispatch manifest for the complete
+operation. It fails closed before mutation on legacy metadata or any existing
+hidden tier free-version under the prefix. Its internal streaming walk
+discovers logical keys, then exact-loads every key from its authoritative set in
+every pool, including free versions; the S3 listing merge is never treated as a
+complete physical-owner inventory. Tier-operation leases remain held from that
+preflight through journal prepare and physical deletion. Once physical deletion
+starts, any error is mutation-ambiguous: authorized/dispatched journals remain
+for recovery to commit owners only after all physical sets prove both the source
+and exact free-version identity absent; uncertain owners are retained.
+Operators may retry after the legacy free-version worker has durably completed
+remote and local cleanup. Journal-less internal deletes and older nodes retain
+their established marker behavior.
 
 Consumption while the record exists: the background recovery loop started by
 `init_background_expiry` (spawned by `spawn_tier_free_version_recovery_once`,
@@ -209,16 +223,93 @@ only when its free-version identity matches; a conflicting ordinary version or
 different free record is an overwrite error. This makes retries idempotent and
 prevents a free record from replacing a user-visible version.
 
+### Remote-Tuple Publication Fence
+
+Cross-pool capability v3 includes a commit-late publication contract for every
+path that can copy an existing transition tuple to a new physical owner. This
+capability version is independent of the tier-mutation RPC protocol version.
+A mixed fleet whose minimum cross-pool capability is below v3 cannot authorize
+journal-v6 remote deletion.
+
+Data movement captures a non-cloneable, process-local source capability before
+copying, but it does not hold a namespace write lock or tier-operation lease
+while reading a large body or uploading multipart parts. `NewMultipartUpload`
+and `UploadPart` are staging only. Immediately before single-PUT rename,
+Multipart Complete, or a pure-remote/free-version metadata quorum write, the
+final consumer acquires the exact tier generation (when a remote tuple exists),
+then fixed/source/target write domains in stable order. The fixed domain is used
+only for a real remote-tuple decommission publisher; an ordinary local object
+keeps the lighter source/target commit scope.
+
+While that owned scope is held, the publisher re-reads the exact source pool and
+compares version, data directory, modification time, ETag, checksums, transition
+tuple, transition-version state, and destination identity. A missing or changed
+source, changed/revoked tier generation, bucket incarnation change, or lost lock
+fails before target rename. The scope remains owned through rename quorum and
+the existing rename-tail guard handoff. Consequently, recovery-first ordering
+cannot delete the remote object and then have a stale restored-transitioned
+rebalance recreate its tuple; publisher-first ordering makes recovery wait and
+rescan the newly committed owner.
+
+Full cross-key S3 Copy is not an ownership-sharing operation: it materializes
+local data and strips transition, destination, transaction, and free-version
+keys. Same-key metadata/version-only updates preserve the existing protected
+state. Admin heal keeps the legacy `nolock` request field for wire compatibility
+but ignores it as lock authority; final heal writes enter the normal locked
+path. Restore similarly ignores ambient `ObjectOptions.no_lock`, acquires its
+own commit-late PUT/Complete lock, validates the restore operation id, and keeps
+an exact tier generation lease through the local commit.
+
 ### Reference-Audit Result
 
 After migration, user-facing GET/list/transition/replication/restore paths still
 exclude the record. Recovery, usage scanning, lifecycle tier cleanup, and heal
-continue to see it when they request free versions, so an unresolved remote
-delete remains actionable on the target pool. The committed tier journal remains
-an independent retry source where one exists; it is not used as a reason to drop
-the xl.meta record. In particular, `Unknown` transition state records are
-migrated unchanged rather than discarded: the lifecycle worker retains them if
-remote identity validation cannot make a delete request.
+continue to see a legacy/fallback record when they request free versions, so an
+unresolved remote delete remains actionable on the target pool. Only an
+authorized recursive prefix/delete-all v6 transaction may instead use a
+per-source journal as the sole retry source; ordinary single/batch deletes never
+take that path. A journal discovered
+alongside an older or fallback free-version does not authorize dropping the
+record. In particular, `Unknown` transition state records are migrated unchanged
+rather than discarded: the lifecycle worker retains them if remote identity
+validation cannot make a delete request.
+
+Tier edit/remove/clear reference proof uses the internal walk with
+`include_free_versions = true`, in addition to persisted journal and transition
+transaction checks. Protocol v3 peer Prepare blocks new reference creators and
+drains existing tier-operation leases before this proof; protocol v4 preserves
+that state machine and adds a signed failure classification. Abort carries the
+canonical Prepare intent, so a peer can create an identity-bound `Aborted`
+tombstone even when Abort overtakes Prepare. A delayed matching Prepare then
+converges on `Aborted` instead of reinstalling the block; a conflicting intent
+with the same mutation id fails closed. The tombstone remains durable until the
+intent expiry plus the configured clock-skew allowance, including across reload
+and coordinator-record cleanup. After
+expiry, a missing-record replay of the original signed Prepare is rejected and
+cannot recreate a peer-only runtime fence. Abort checks an existing same-identity
+terminal record before consulting mutable current-config proof, and recovery
+reconstructs the original Prepared revision for Abort fanout.
+
+A new server accepts both v3 and v4 requests and selects the matching canonical
+response proof. During a mixed rollout, an older v3 server rejects a v4 request
+with an authenticated, byte-exact unsupported-version status before dispatch;
+the v4 coordinator treats only that exact rejection as definitely not installed,
+fails the admin mutation, and does not send the peer an incompatible Abort.
+There is deliberately no automatic v3 retry. `Unimplemented`, near-text,
+timeouts, missing/unknown failure classes, and other ambiguous outcomes still
+receive Abort and retain the coordinator retry record if Abort cannot be proven.
+Operators must pause and drain tier edit/remove/clear operations before starting
+the rolling upgrade, leave them disabled while any v3-only peer remains, and
+resume only after every topology member advertises the v4-capable release.
+Ordinary object I/O and free-version cleanup remain available; xl.meta is
+unchanged by the rejected mutation.
+
+Sole-owner transactions use journal v6: v5-and-older readers reject and retain
+those records, so an old recovery worker cannot bypass the all-pool proof. Older
+nodes may continue to create fallback free-versions until the rollout is
+homogeneous. A deployment must not downgrade every v6-aware recovery worker
+while any v6 record remains; drain the journal first or keep at least one v6-aware
+worker until cleanup converges.
 
 Each migrated record emits `state = "free_version_migrated"` with reason
 `tier_free_version_migrated`. A record consumed before migration emits

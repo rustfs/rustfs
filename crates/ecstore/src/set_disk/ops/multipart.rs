@@ -244,7 +244,7 @@ impl StaleMultipartCleanupGuard {
 }
 
 #[cfg(any(test, feature = "test-util"))]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MultipartCommitPause {
     NewUploadBeforeLockLost,
     PutPartBeforeLockAcquire,

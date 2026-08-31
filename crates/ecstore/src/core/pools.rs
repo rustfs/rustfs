@@ -7493,6 +7493,7 @@ impl DecommissionCapacityLockOrderBarrier {
         Self { state }
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) async fn wait_until_owner_paused(&self) {
         tokio::time::timeout(std::time::Duration::from_secs(30), self.state.owner_arrived.notified())
             .await
@@ -7505,6 +7506,7 @@ impl DecommissionCapacityLockOrderBarrier {
             .expect("external mutation should release capacity before waiting for the object namespace");
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) async fn wait_until_external_object_capacity_probe_acquired(&self) {
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -7514,6 +7516,7 @@ impl DecommissionCapacityLockOrderBarrier {
         .expect("external object mutation should acquire its no-active capacity probe");
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) async fn wait_until_external_object_commit_phase_started(&self) {
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -7538,24 +7541,29 @@ impl DecommissionCapacityLockOrderBarrier {
         .expect("external heal should attempt the target namespace lock after capacity admission");
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn release_owner(&self) {
         self.state.owner_release.notify_one();
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn pause_external_object_commit_phase(&self) {
         self.state.external_object_commit_phase_paused.store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn release_external_object_commit_phase(&self) {
         self.state.external_object_commit_phase_release.notify_one();
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn pause_external_object_capacity_probe(&self) {
         self.state
             .external_object_capacity_probe_paused
             .store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn release_external_object_capacity_probe(&self) {
         self.state.external_object_capacity_probe_release.notify_one();
     }
@@ -17371,11 +17379,15 @@ mod pools_tests {
             content_sha256: "b".repeat(64),
             identity_sha256: "c".repeat(64),
             committed: false,
+            dispatch_identity_sha256: None,
+            state: None,
         };
         let terminal_checkpoint = DurableIlmRecordCheckpoint::TierDeleteJournal {
             content_sha256: "d".repeat(64),
             identity_sha256: "c".repeat(64),
             committed: true,
+            dispatch_identity_sha256: None,
+            state: None,
         };
         let incoming = DecommissionDurableIlmReceipt {
             source_path,

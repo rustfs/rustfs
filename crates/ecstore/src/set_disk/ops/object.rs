@@ -200,14 +200,11 @@ use super::super::capacity_scope_from_disks;
 #[cfg(all(test, feature = "test-util"))]
 use super::super::get_lock_acquire_timeout;
 use crate::bucket::lifecycle::{
-    tier_delete_journal::{
-        enqueue_committed_tier_delete_journal_entry, persist_tier_delete_journal_entry,
-        record_tier_delete_journal_backend_identity, remove_tier_delete_journal_entry, tier_delete_journal_object_name,
-    },
+    tier_delete_journal::record_tier_delete_journal_backend_identity,
     tier_sweeper::{
-        Jentry, RemoteTierDeleteOutcome, TierDeleteJournalState, attach_tier_delete_source,
+        Jentry, RemoteTierDeleteOutcome, attach_tier_delete_source,
         delete_confirmed_transition_candidate_exact_with_lease_idempotent, delete_object_from_remote_tier_with_lease_idempotent,
-        transitioned_delete_journal_entry_for_source, transitioned_force_delete_journal_entry,
+        transitioned_force_delete_journal_entry,
     },
     transition_transaction::{
         TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
@@ -241,7 +238,7 @@ use crate::error::is_err_invalid_upload_id;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
 use crate::object_api::{NamespaceLockFence, SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY};
 use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
-use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
+use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
 use crate::set_disk::core::io_primitives::{RenameTailCleanup, finish_rename_tail_heal};
 #[cfg(test)]
 use crate::storage_api_contracts::namespace::NamespaceLocking;
@@ -249,6 +246,7 @@ use crate::storage_api_contracts::namespace::NamespaceLocking;
 use crate::storage_api_contracts::object::HTTPPreconditions;
 use crate::store::ECStore;
 use crate::store::utils::clean_metadata;
+use crate::store::{RemoteTuplePublicationCommitGuard, RemoteTuplePublicationFence};
 use futures::FutureExt as _;
 use http::HeaderValue;
 #[cfg(test)]
@@ -268,6 +266,49 @@ use tokio::io::{AsyncRead, ReadBuf};
 #[cfg(all(test, feature = "test-util"))]
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+
+fn record_transitioned_delete_cleanup_owner(bucket: &str, object: &str, batch: bool) {
+    metrics::counter!("rustfs_ilm_transitioned_delete_cleanup_owners_total", "owner" => "tier_free_version").increment(1);
+    debug!(
+        event = "lifecycle_transitioned_delete_cleanup_owner",
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_SET_DISK,
+        bucket,
+        object,
+        cleanup_owner = "tier_free_version",
+        batch,
+        "Selected the durable cleanup owner for a transitioned source delete"
+    );
+}
+
+async fn acquire_single_tier_delete_lease(
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+    source: &ObjectInfo,
+) -> Result<Option<TierOperationLease>> {
+    let Some(api) = opts.tier_delete_journal_api.as_ref() else {
+        return Ok(None);
+    };
+    if source.transitioned_object.status != TRANSITION_COMPLETE || set_disk_delete_creates_delete_marker(opts) {
+        return Ok(None);
+    }
+    let backend_identity = tier_destination_id_from_metadata(&source.user_defined).map_err(Error::other)?;
+    let lease = match backend_identity {
+        Some(backend_identity) => {
+            TierConfigMgr::acquire_operation_lease_for_backend_identity(
+                &api.tier_config_mgr(),
+                &source.transitioned_object.tier,
+                backend_identity,
+            )
+            .await
+        }
+        None => TierConfigMgr::acquire_operation_lease(&api.tier_config_mgr(), &source.transitioned_object.tier).await,
+    }
+    .map_err(Error::other)?;
+    record_transitioned_delete_cleanup_owner(bucket, object, false);
+    Ok(Some(lease))
+}
 
 const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES: usize = 64 * 1024;
@@ -447,23 +488,47 @@ fn lifecycle_delete_all_tier_journal_entry(
     object: &str,
     version: &FileInfo,
     opts: &ObjectOptions,
-) -> Result<Option<(String, Jentry)>> {
+) -> Result<Option<Jentry>> {
     if version.transition_status != rustfs_filemeta::TRANSITION_COMPLETE {
         return Ok(None);
-    }
-    if version.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown {
-        return Err(StorageError::PreconditionFailed);
     }
 
     let logical_object = decode_dir_object(object);
     let mut source = ObjectInfo::from_file_info(version, bucket, object, true);
     source.version_id = source.version_id.filter(|version_id| !version_id.is_nil());
-    let mut entry = transitioned_force_delete_journal_entry(&source.transitioned_object, source.transition_version_state)
-        .ok_or(StorageError::PreconditionFailed)?;
+    let Some(mut entry) = transitioned_force_delete_journal_entry(&source.transitioned_object, source.transition_version_state)
+    else {
+        return Ok(None);
+    };
     attach_tier_delete_source(&mut entry, bucket, &logical_object, &source, opts.versioned, opts.version_suspended);
     record_tier_delete_journal_backend_identity(&mut entry, &source.user_defined).map_err(Error::other)?;
-    let name = tier_delete_journal_object_name(&entry);
-    Ok(Some((name, entry)))
+    if !entry.can_replace_tier_free_version() {
+        return Ok(None);
+    }
+    Ok(Some(entry))
+}
+
+async fn acquire_lifecycle_delete_all_tier_lease(version: &FileInfo, opts: &ObjectOptions) -> Result<Option<TierOperationLease>> {
+    if version.transition_status != rustfs_filemeta::TRANSITION_COMPLETE {
+        return Ok(None);
+    }
+    let Some(api) = opts.tier_delete_journal_api.as_ref() else {
+        return Ok(None);
+    };
+    let backend_identity = tier_destination_id_from_metadata(&version.metadata).map_err(Error::other)?;
+    let lease = match backend_identity {
+        Some(backend_identity) => {
+            TierConfigMgr::acquire_operation_lease_for_backend_identity(
+                &api.tier_config_mgr(),
+                &version.transition_tier,
+                backend_identity,
+            )
+            .await
+        }
+        None => TierConfigMgr::acquire_operation_lease(&api.tier_config_mgr(), &version.transition_tier).await,
+    }
+    .map_err(Error::other)?;
+    Ok(Some(lease))
 }
 
 fn lifecycle_delete_all_replication_delete(
@@ -523,31 +588,6 @@ fn lifecycle_delete_all_replication_delete(
         }
     };
     Ok(Some((replication_state, deleted_object)))
-}
-
-async fn prepare_lifecycle_delete_all_tier_journals(
-    bucket: &str,
-    object: &str,
-    plan: &LifecycleDeleteAllPlan<'_>,
-    opts: &ObjectOptions,
-) -> Result<()> {
-    let Some(api) = opts.tier_delete_journal_api.as_ref() else {
-        return Ok(());
-    };
-    let journal = opts.lifecycle_delete_all_journal().ok_or(StorageError::PreconditionFailed)?;
-    for version in plan.history.iter().copied().chain(plan.trigger) {
-        let Some((name, entry)) = lifecycle_delete_all_tier_journal_entry(bucket, object, version, opts)? else {
-            continue;
-        };
-        if journal.lock().contains(&name) {
-            continue;
-        }
-        persist_tier_delete_journal_entry(Arc::clone(api), &entry)
-            .await
-            .map_err(Error::other)?;
-        journal.lock().insert(name, entry);
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -787,7 +827,7 @@ mod lifecycle_delete_all_plan_tests {
     }
 
     #[test]
-    fn tier_journal_coverage_is_source_exact_and_rejects_legacy_unknown_state() {
+    fn tier_journal_coverage_is_source_exact_and_falls_back_for_legacy_metadata() {
         let identity = [7_u8; 32];
         let version_id = Uuid::from_u128(1);
         let mut metadata = HashMap::new();
@@ -812,22 +852,29 @@ mod lifecycle_delete_all_plan_tests {
             ..Default::default()
         };
 
-        let (first_name, _) =
-            lifecycle_delete_all_tier_journal_entry("bucket", "object", &transitioned(Uuid::from_u128(2)), &opts)
-                .expect("exact transitioned source should be journalable")
-                .expect("completed transition should require a journal");
-        let (second_name, _) =
-            lifecycle_delete_all_tier_journal_entry("bucket", "object", &transitioned(Uuid::from_u128(3)), &opts)
-                .expect("second pool source should be journalable")
-                .expect("completed transition should require a journal");
-        assert_ne!(first_name, second_name, "each pool-local source needs independent coverage");
+        let first = lifecycle_delete_all_tier_journal_entry("bucket", "object", &transitioned(Uuid::from_u128(2)), &opts)
+            .expect("exact transitioned source should be journalable")
+            .expect("completed transition should require a journal");
+        let second = lifecycle_delete_all_tier_journal_entry("bucket", "object", &transitioned(Uuid::from_u128(3)), &opts)
+            .expect("second pool source should be journalable")
+            .expect("completed transition should require a journal");
+        assert_ne!(first.source, second.source, "each pool-local source needs independent coverage");
 
         let mut unknown = transitioned(Uuid::from_u128(4));
         unknown.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
-        assert!(matches!(
-            lifecycle_delete_all_tier_journal_entry("bucket", "object", &unknown, &opts),
-            Err(StorageError::PreconditionFailed)
-        ));
+        assert!(
+            lifecycle_delete_all_tier_journal_entry("bucket", "object", &unknown, &opts)
+                .expect("legacy Unknown metadata should use the free-version fallback")
+                .is_none()
+        );
+
+        let mut missing_identity = transitioned(Uuid::from_u128(5));
+        missing_identity.metadata.clear();
+        assert!(
+            lifecycle_delete_all_tier_journal_entry("bucket", "object", &missing_identity, &opts)
+                .expect("legacy metadata without destination identity should use the free-version fallback")
+                .is_none()
+        );
     }
 
     #[cfg(not(feature = "rio-v2"))]
@@ -2729,7 +2776,27 @@ impl SetDisks {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
-        self.put_object_with_old_current_size_boxed(bucket, object, data, opts).await
+        self.put_object_with_old_current_size_boxed(bucket, object, data, opts, None)
+            .await
+    }
+
+    pub(crate) async fn put_object_with_old_current_size_for_data_movement(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+        publication_fence: RemoteTuplePublicationFence,
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        if !opts.data_movement {
+            return Err(Error::other("publication-fenced PUT requires data_movement options"));
+        }
+        let mut opts = opts.clone();
+        // The owned publication capability supplies the exact target write
+        // domain at commit time; the generic PUT path must not reacquire it.
+        opts.no_lock = true;
+        self.put_object_with_old_current_size_boxed(bucket, object, data, &opts, Some(publication_fence))
+            .await
     }
 
     fn put_object_with_old_current_size_boxed<'a>(
@@ -2738,8 +2805,9 @@ impl SetDisks {
         object: &'a str,
         data: &'a mut PutObjReader,
         opts: &'a ObjectOptions,
+        publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> impl Future<Output = Result<(ObjectInfo, Option<OldCurrentSize>)>> + Send + 'a {
-        Box::pin(self.put_object_with_old_current_size_inner(bucket, object, data, opts))
+        Box::pin(self.put_object_with_old_current_size_inner(bucket, object, data, opts, publication_fence))
     }
 
     async fn put_object_with_old_current_size_inner(
@@ -2748,7 +2816,19 @@ impl SetDisks {
         object: &str,
         data: &mut PutObjReader,
         opts: &ObjectOptions,
+        mut publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        if publication_fence.is_none()
+            && opts.data_movement
+            && rustfs_utils::http::metadata_compat::contains_key_str(
+                &opts.user_defined,
+                rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
+            )
+        {
+            return Err(Error::other(
+                "data movement cannot publish transition ownership without a publication capability",
+            ));
+        }
         crate::hp_guard!("SetDisks::put_object");
         let mut scope_outcome_guard = opts
             .scanner_publication_commit_scope
@@ -2764,6 +2844,7 @@ impl SetDisks {
         let mut decommission_target_lock_covered = false;
         let mut decommission_capacity_guard = None;
         let mut bucket_lifecycle_guard = None;
+        let mut publication_commit_guard: Option<RemoteTuplePublicationCommitGuard> = None;
 
         // This pre-body check is advisory fast-fail only: the authoritative
         // precondition evaluation happens under the commit namespace lock
@@ -3233,7 +3314,8 @@ impl SetDisks {
                 decommission_target_lock_covered = target_lock_covered;
                 decommission_capacity_guard = capacity_guard;
             }
-            if !opts.no_lock && object_lock_guard.is_none() && !decommission_target_lock_covered {
+            if publication_fence.is_some() || (!opts.no_lock && object_lock_guard.is_none() && !decommission_target_lock_covered)
+            {
                 #[cfg(any(test, feature = "test-util"))]
                 pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
                 if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
@@ -3246,19 +3328,23 @@ impl SetDisks {
                             .await?,
                     );
                 }
-                #[cfg(any(test, feature = "test-util"))]
-                {
-                    object_lock_guard = Some(
-                        self.acquire_write_lock_diag_with_pending_hook("put_object_commit", bucket, object, || {
-                            notify_put_object_commit_namespace_pending(bucket, object);
-                        })
-                        .await?,
-                    );
-                    notify_put_object_commit_namespace_acquired(bucket, object);
-                }
-                #[cfg(not(any(test, feature = "test-util")))]
-                {
-                    object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
+                if let Some(fence) = publication_fence.take() {
+                    publication_commit_guard = Some(fence.into_commit_guard(self.pool_index, bucket, object).await?);
+                } else {
+                    #[cfg(any(test, feature = "test-util"))]
+                    {
+                        object_lock_guard = Some(
+                            self.acquire_write_lock_diag_with_pending_hook("put_object_commit", bucket, object, || {
+                                notify_put_object_commit_namespace_pending(bucket, object);
+                            })
+                            .await?,
+                        );
+                        notify_put_object_commit_namespace_acquired(bucket, object);
+                    }
+                    #[cfg(not(any(test, feature = "test-util")))]
+                    {
+                        object_lock_guard = Some(self.acquire_write_lock_diag("put_object_commit", bucket, object).await?);
+                    }
                 }
             }
             #[cfg(any(test, feature = "test-util"))]
@@ -3371,7 +3457,11 @@ impl SetDisks {
 
             // Fence every commit-time read before entering rename_data. Once
             // rename_data returns Ok the write is durable and must not be aborted.
-            if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            if object_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                || publication_commit_guard
+                    .as_ref()
+                    .is_some_and(RemoteTuplePublicationCommitGuard::is_lock_lost)
+            {
                 return Err(StorageError::NamespaceLockQuorumUnavailable {
                     mode: "put_object_commit",
                     bucket: bucket.to_string(),
@@ -3572,6 +3662,7 @@ impl SetDisks {
             let commit_tmp_dir = tmp_dir.clone();
             let commit_object_lock_guard = object_lock_guard.take();
             let commit_decommission_object_lock_guard = decommission_object_lock_guard.take();
+            let commit_publication_guard = publication_commit_guard.take();
             let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
             let commit_decommission_capacity_guard = decommission_capacity_guard.take();
             let commit_scanner_publication_scope = opts.scanner_publication_commit_scope.clone();
@@ -3580,7 +3671,9 @@ impl SetDisks {
             // its terminal state is known before the coordinator releases
             // remote leases.
             let commit_allows_early_ack = !(opts.data_movement && opts.has_decommission_capacity_reservation())
-                && (commit_object_lock_guard.is_some() || commit_decommission_object_lock_guard.is_some())
+                && (commit_object_lock_guard.is_some()
+                    || commit_decommission_object_lock_guard.is_some()
+                    || commit_publication_guard.is_some())
                 && commit_scanner_publication_scope.is_none();
             let detach_commit_owner = commit_scanner_publication_scope.is_some()
                 || commit_allows_early_ack
@@ -3602,6 +3695,7 @@ impl SetDisks {
             let commit = move |cancellation: Option<CancellationToken>| async move {
                 let mut _object_lock_guard = commit_object_lock_guard;
                 let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
+                let mut _publication_guard = commit_publication_guard;
                 let mut _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
                 let mut _decommission_capacity_guard = commit_decommission_capacity_guard;
                 let mut quota_reservation = quota_reservation;
@@ -3618,6 +3712,9 @@ impl SetDisks {
                         || _decommission_object_lock_guard
                             .as_ref()
                             .is_some_and(|guard| guard.is_lock_lost())
+                        || _publication_guard
+                            .as_ref()
+                            .is_some_and(RemoteTuplePublicationCommitGuard::is_lock_lost)
                         || commit_namespace_lock_fence
                             .as_ref()
                             .is_some_and(NamespaceLockFence::is_lock_lost)
@@ -3674,6 +3771,9 @@ impl SetDisks {
                         || _decommission_object_lock_guard
                             .as_ref()
                             .is_some_and(|guard| guard.is_lock_lost())
+                        || _publication_guard
+                            .as_ref()
+                            .is_some_and(RemoteTuplePublicationCommitGuard::is_lock_lost)
                         || commit_namespace_lock_fence
                             .as_ref()
                             .is_some_and(NamespaceLockFence::is_lock_lost)
@@ -3792,6 +3892,7 @@ impl SetDisks {
                             .or_else(|| commit_version_suspended.then(Uuid::nil))
                             .map(|version_id| version_id.to_string());
                         let object_lock_guard = _object_lock_guard.take();
+                        let publication_guard = _publication_guard.take();
                         let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
                         let decommission_object_lock_guard = _decommission_object_lock_guard.take();
                         let decommission_capacity_guard = _decommission_capacity_guard.take();
@@ -3811,6 +3912,7 @@ impl SetDisks {
                             guard_release_rx,
                             (
                                 object_lock_guard,
+                                publication_guard,
                                 bucket_lifecycle_guard,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
@@ -3830,12 +3932,14 @@ impl SetDisks {
                             },
                             move |(
                                 object_lock_guard,
+                                publication_guard,
                                 bucket_lifecycle_guard,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
                                   targets| async move {
                                 drop(object_lock_guard);
+                                drop(publication_guard);
                                 drop(bucket_lifecycle_guard);
                                 cleanup_set
                                     .cleanup_rename_tail(
@@ -3948,6 +4052,7 @@ impl SetDisks {
                 // The exact old-data-dir reclamation below is best-effort space
                 // cleanup; it must not serialize the next operation on this object.
                 drop(_object_lock_guard.take());
+                drop(_publication_guard.take());
                 drop(_bucket_lifecycle_guard.take());
 
                 rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", duration_millis_f64(rename_stage_elapsed));
@@ -4852,22 +4957,16 @@ pub(crate) struct TransitionUploadCleanup {
     lease: TierOperationLease,
     object: String,
     candidate: Option<TransitionUploadCandidate>,
-    cleanup_ctx: Arc<crate::runtime::instance::InstanceContext>,
     cleanup_api: Option<Arc<ECStore>>,
     armed: bool,
 }
 
 impl TransitionUploadCleanup {
-    pub(crate) fn new(
-        lease: TierOperationLease,
-        object: &str,
-        cleanup_ctx: Arc<crate::runtime::instance::InstanceContext>,
-    ) -> Self {
+    pub(crate) fn new(lease: TierOperationLease, object: &str) -> Self {
         Self {
             lease,
             object: object.to_string(),
             candidate: None,
-            cleanup_ctx,
             cleanup_api: None,
             armed: true,
         }
@@ -4900,10 +4999,17 @@ impl TransitionUploadCleanup {
         }
     }
 
-    async fn cleanup_rejected_upload(&mut self, api: Option<Arc<ECStore>>) -> std::io::Result<()> {
+    async fn cleanup_rejected_upload(
+        &mut self,
+        api: Option<Arc<ECStore>>,
+        transaction: &mut TransitionTransaction,
+    ) -> std::io::Result<()> {
         self.cleanup_api = api.clone();
-        let candidate = self.cleanup_candidate()?;
-        let result = cleanup_rejected_transition_upload_durably(
+        let candidate = self.cleanup_candidate()?.clone();
+        let owner_error = persist_rejected_transition_cleanup_owner(api.as_ref(), transaction, &candidate)
+            .await
+            .err();
+        let cleanup = cleanup_rejected_transition_upload_durably(
             &self.lease,
             &self.object,
             candidate.cleanup_version(),
@@ -4911,10 +5017,16 @@ impl TransitionUploadCleanup {
             api,
         )
         .await;
-        if result.is_ok() {
-            self.armed = false;
+        match (owner_error, cleanup) {
+            (_, Ok(())) => {
+                self.armed = false;
+                Ok(())
+            }
+            (None, Err(cleanup_error)) => Err(cleanup_error),
+            (Some(owner_error), Err(cleanup_error)) => Err(std::io::Error::other(format!(
+                "rejected transition upload cleanup failed after its transaction owner update failed: owner error: {owner_error}; cleanup error: {cleanup_error}"
+            ))),
         }
-        result
     }
 
     pub(crate) fn disarm(&mut self) {
@@ -4947,15 +5059,11 @@ impl Drop for TransitionUploadCleanup {
         let cleanup_version = candidate.cleanup_version().to_string();
         let version_id_exact = candidate.cleanup_version_is_exact();
         let cleanup_api = self.cleanup_api.clone();
-        let cleanup_ctx = self.cleanup_ctx.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let api = match cleanup_api {
-                    Some(api) => Some(api),
-                    None => transition_cleanup_store(&cleanup_ctx).await,
-                };
                 if let Err(err) =
-                    cleanup_rejected_transition_upload_durably(&lease, &object, &cleanup_version, version_id_exact, api).await
+                    cleanup_rejected_transition_upload_durably(&lease, &object, &cleanup_version, version_id_exact, cleanup_api)
+                        .await
                 {
                     warn!(
                         tier = lease.tier_name(),
@@ -4971,80 +5079,42 @@ impl Drop for TransitionUploadCleanup {
     }
 }
 
+async fn persist_rejected_transition_cleanup_owner(
+    api: Option<&Arc<ECStore>>,
+    transaction: &mut TransitionTransaction,
+    candidate: &TransitionUploadCandidate,
+) -> Result<()> {
+    match transaction.state {
+        TransitionTransactionState::UploadOutcomeUnknown => {
+            transaction
+                .advance(
+                    transaction.fence(),
+                    TransitionTransactionState::Uploaded,
+                    Some(TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string())),
+                )
+                .map_err(Error::other)?;
+        }
+        TransitionTransactionState::Uploaded => {}
+        state => {
+            return Err(Error::other(format!(
+                "transition transaction state {state:?} cannot own a rejected upload"
+            )));
+        }
+    }
+    save_transition_transaction_if_available(api, transaction).await
+}
+
 pub(crate) async fn cleanup_rejected_transition_upload_durably(
     lease: &TierOperationLease,
     object: &str,
     cleanup_version: &str,
     version_id_exact: bool,
-    api: Option<Arc<ECStore>>,
+    _api: Option<Arc<ECStore>>,
 ) -> std::io::Result<()> {
-    let journal_entry = Jentry {
-        obj_name: object.to_string(),
-        version_id: cleanup_version.to_string(),
-        tier_name: lease.tier_name().to_string(),
-        backend_identity: Some(lease.backend_identity()),
-        version_id_exact,
-        version_state: if !version_id_exact {
-            rustfs_filemeta::TransitionVersionState::KnownDisabled
-        } else if cleanup_version == "null" {
-            rustfs_filemeta::TransitionVersionState::SuspendedNull
-        } else {
-            rustfs_filemeta::TransitionVersionState::Exact
-        },
-        state: TierDeleteJournalState::Committed,
-        source: None,
-    };
-
-    let journal_error = if let Some(api) = api.as_ref() {
-        match persist_tier_delete_journal_entry(api.clone(), &journal_entry).await {
-            Ok(()) => {
-                match cleanup_uncommitted_transition_upload(lease, object, cleanup_version, version_id_exact).await {
-                    Ok(_) => {
-                        if let Err(err) = remove_tier_delete_journal_entry(api.clone(), &journal_entry).await {
-                            warn!(
-                                tier = lease.tier_name(),
-                                object,
-                                error = ?err,
-                                "rejected transition upload was deleted but its cleanup journal was retained"
-                            );
-                        }
-                    }
-                    Err(err) => log_transition_upload_cleanup_failure(lease, object, cleanup_version, &err),
-                }
-                return Ok(());
-            }
-            Err(err) => err,
-        }
-    } else {
-        std::io::Error::other("object store unavailable for rejected transition cleanup journal")
-    };
-    warn!(
-        tier = lease.tier_name(),
-        object,
-        error = ?journal_error,
-        "failed to persist rejected transition upload cleanup journal"
-    );
-
-    let cleanup_error = match cleanup_uncommitted_transition_upload(lease, object, cleanup_version, version_id_exact).await {
-        Ok(_) => return Ok(()),
-        Err(err) => {
-            log_transition_upload_cleanup_failure(lease, object, cleanup_version, &err);
-            err
-        }
-    };
-    if let Some(api) = api {
-        match persist_tier_delete_journal_entry(api, &journal_entry).await {
-            Ok(()) => return Ok(()),
-            Err(retry_error) => {
-                return Err(std::io::Error::other(format!(
-                    "rejected transition upload was neither deleted nor journaled: initial journal error: {journal_error}; cleanup error: {cleanup_error}; journal retry error: {retry_error}"
-                )));
-            }
-        }
-    }
-    Err(std::io::Error::other(format!(
-        "rejected transition upload was neither deleted nor journaled: journal error: {journal_error}; cleanup error: {cleanup_error}"
-    )))
+    cleanup_uncommitted_transition_upload(lease, object, cleanup_version, version_id_exact)
+        .await
+        .map(|_| ())
+        .inspect_err(|err| log_transition_upload_cleanup_failure(lease, object, cleanup_version, err))
 }
 
 async fn transition_cleanup_store(ctx: &Arc<crate::runtime::instance::InstanceContext>) -> Option<Arc<ECStore>> {
@@ -5791,6 +5861,7 @@ impl DeleteObjectCommitBarrier {
         Self::install_with_mode(bucket, object, false)
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn install_after_publish(bucket: &str, object: &str) -> Self {
         Self::install_with_mode(bucket, object, true)
     }
@@ -6812,7 +6883,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         };
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
-        let mut journal_entries: Vec<(usize, Jentry)> = Vec::new();
+        let mut tier_reference_leases: Vec<(usize, String, Option<TierDestinationId>)> = Vec::new();
+        let mut transitioned_cleanup_items = vec![false; objects.len()];
 
         for (i, dobj) in objects.iter().enumerate() {
             if del_errs[i].is_some() {
@@ -6898,20 +6970,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
 
             if opts.tier_delete_journal_api.is_some()
-                && let Some(mut je) = transitioned_delete_journal_entry_for_source(
-                    version_id,
-                    versioned,
-                    version_suspended,
-                    bucket,
-                    &replication_object_name,
-                    &goi,
-                )
+                && !source_missing
+                && goi.transitioned_object.status == TRANSITION_COMPLETE
+                && !set_disk_delete_creates_delete_marker(&check_opts)
             {
-                if let Err(err) = record_tier_delete_journal_backend_identity(&mut je, &goi.user_defined) {
-                    del_errs[i] = Some(Error::other(err));
-                    continue;
+                match tier_destination_id_from_metadata(&goi.user_defined) {
+                    Ok(identity) => {
+                        transitioned_cleanup_items[i] = true;
+                        tier_reference_leases.push((i, goi.transitioned_object.tier.clone(), identity));
+                    }
+                    Err(err) => {
+                        del_errs[i] = Some(Error::other(err));
+                        continue;
+                    }
                 }
-                journal_entries.push((i, je));
             }
 
             let mut admitted = dobj.clone();
@@ -7076,17 +7148,46 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             return (del_objects, del_errs, accounting);
         }
 
-        let mut persisted_journal_entries = Vec::with_capacity(journal_entries.len());
+        let mut tier_leases: Vec<TierOperationLease> = Vec::new();
         if let Some(api) = opts.tier_delete_journal_api.as_ref() {
-            for (idx, mut je) in journal_entries {
-                if let Err(err) = persist_tier_delete_journal_entry(Arc::clone(api), &je).await {
-                    del_errs[idx] = Some(Error::other(err));
-                    continue;
+            let mut reference_groups: HashMap<(String, Option<TierDestinationId>), Vec<usize>> = HashMap::new();
+            for (idx, tier_name, backend_identity) in tier_reference_leases {
+                reference_groups.entry((tier_name, backend_identity)).or_default().push(idx);
+            }
+            for ((tier_name, backend_identity), indices) in reference_groups {
+                let lease = match backend_identity {
+                    Some(backend_identity) => {
+                        TierConfigMgr::acquire_operation_lease_for_backend_identity(
+                            &api.tier_config_mgr(),
+                            &tier_name,
+                            backend_identity,
+                        )
+                        .await
+                    }
+                    None => TierConfigMgr::acquire_operation_lease(&api.tier_config_mgr(), &tier_name).await,
+                };
+                match lease {
+                    Ok(lease) => tier_leases.push(lease),
+                    Err(err) => {
+                        let message = err.to_string();
+                        for idx in indices {
+                            del_errs[idx] = Some(Error::other(message.clone()));
+                        }
+                    }
                 }
-                je.state = TierDeleteJournalState::Prepared;
-                persisted_journal_entries.push((idx, je));
             }
         }
+
+        for (idx, transitioned) in transitioned_cleanup_items.into_iter().enumerate() {
+            if transitioned && del_errs[idx].is_none() {
+                record_transitioned_delete_cleanup_owner(bucket, &decode_dir_object(&objects[idx].object_name), true);
+            }
+        }
+
+        // Keep backend generations pinned through the source mutation, its
+        // free-version write quorum, and any local rollback. Ordinary
+        // single/batch deletes never transfer cleanup ownership to a journal.
+        let _tier_leases = tier_leases;
 
         for fi_vers in &mut vers {
             fi_vers.versions.retain(|fi| del_errs[fi.idx].is_none());
@@ -7270,37 +7371,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // TODO(backlog): support partial object deletion for multi-part objects
 
-        if let Some(api) = opts.tier_delete_journal_api.as_ref() {
-            for (idx, je) in persisted_journal_entries {
-                if del_errs[idx].is_none() {
-                    let mut committed = je;
-                    committed.state = TierDeleteJournalState::Committed;
-                    if let Err(err) = persist_tier_delete_journal_entry(Arc::clone(api), &committed).await {
-                        warn!(
-                            object = %committed.obj_name,
-                            tier = %committed.tier_name,
-                            error = ?err,
-                            "batch tier delete committed locally but journal commit failed; recovery will retry"
-                        );
-                    } else if let Err(err) = enqueue_committed_tier_delete_journal_entry(&committed).await {
-                        warn!(
-                            object = %committed.obj_name,
-                            tier = %committed.tier_name,
-                            error = ?err,
-                            "batch tier delete journal committed but could not be queued; recovery will retry"
-                        );
-                    }
-                } else if let Err(err) = remove_tier_delete_journal_entry(Arc::clone(api), &je).await {
-                    warn!(
-                        object = %je.obj_name,
-                        tier = %je.tier_name,
-                        error = ?err,
-                        "failed to remove aborted batch tier delete journal"
-                    );
-                }
-            }
-        }
-
         if dist_erasure {
             self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
         }
@@ -7353,6 +7423,23 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             None
         };
         if opts.delete_prefix {
+            let destructive_dispatch_phase = opts.lifecycle_delete_all.as_ref().is_none_or(|request| {
+                matches!(
+                    request.phase,
+                    crate::object_api::LifecycleDeleteAllPhase::History | crate::object_api::LifecycleDeleteAllPhase::Trigger
+                )
+            });
+            if destructive_dispatch_phase && opts.tier_delete_journal_api.is_some() {
+                let authorization = opts
+                    .tier_delete_dispatch_authorization
+                    .as_ref()
+                    .ok_or(StorageError::PreconditionFailed)?;
+                let incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+                authorization.ensure_current(bucket, incarnation, object)?;
+                if !authorization.mutation_started() {
+                    return Err(StorageError::PreconditionFailed);
+                }
+            }
             if opts.delete_prefix_object && !is_meta_bucketname(bucket) {
                 let object_lock_config = if opts.data_movement {
                     None
@@ -7384,7 +7471,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     if let Some(trigger) = opts.lifecycle_delete_all.as_ref() {
                         let plan = lifecycle_delete_all_plan(&versions, trigger)?;
                         if trigger.phase == crate::object_api::LifecycleDeleteAllPhase::Preflight {
-                            prepare_lifecycle_delete_all_tier_journals(bucket, object, &plan, &opts).await?;
                             return Ok(ObjectInfo::default());
                         }
                         if trigger.phase == crate::object_api::LifecycleDeleteAllPhase::FinalPreflight {
@@ -7403,6 +7489,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         };
                         for version in plan {
                             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+                            // The lease closes the gap between the durable
+                            // reference proof and publishing either a committed
+                            // v6 journal or the legacy free-version fallback.
+                            let _tier_lease = acquire_lifecycle_delete_all_tier_lease(version, &opts).await?;
                             let replication_delete = lifecycle_delete_all_replication_delete(bucket, object, version, &opts)?;
                             let mut delete_request = FileInfo {
                                 name: object.to_string(),
@@ -7413,15 +7503,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 ..Default::default()
                             };
                             delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
-                            if opts.tier_delete_journal_api.is_some()
-                                && version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE
+                            if version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE
+                                && let Some(entry) = lifecycle_delete_all_tier_journal_entry(bucket, object, version, &opts)?
                             {
-                                let (name, _entry) = lifecycle_delete_all_tier_journal_entry(bucket, object, version, &opts)?
+                                let authorization = opts
+                                    .tier_delete_dispatch_authorization
+                                    .as_ref()
                                     .ok_or(StorageError::PreconditionFailed)?;
-                                let journal = opts.lifecycle_delete_all_journal().ok_or(StorageError::PreconditionFailed)?;
-                                if !journal.lock().contains(&name) {
-                                    return Err(StorageError::PreconditionFailed);
-                                }
+                                let incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+                                authorization.ensure_current(bucket, incarnation, object)?;
+                                authorization.authorized_journal_name(&entry)?;
                                 delete_request.set_skip_tier_free_version();
                             }
                             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
@@ -7616,10 +7707,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             fi.set_tier_free_version_id(&find_vid.to_string());
 
-            if opts.skip_free_version {
-                fi.set_skip_tier_free_version();
-            }
-
             fi.version_id = if let Some(vid) = opts.version_id.as_ref() {
                 let vid = Uuid::parse_str(vid.as_str())?;
                 (!opts.version_suspended || !vid.is_nil()).then_some(vid)
@@ -7633,6 +7720,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
+            let _tier_delete_lease = acquire_single_tier_delete_lease(bucket, object, &opts, &goi).await?;
+            if opts.skip_free_version {
+                fi.set_skip_tier_free_version();
+            }
             self.delete_object_version(bucket, object, &fi, should_force_delete_marker_for_missing_version(&opts))
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -7669,12 +7760,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         dfi.set_tier_free_version_id(&find_vid.to_string());
 
+        ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+        begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
+        let _tier_delete_lease = acquire_single_tier_delete_lease(bucket, object, &opts, &goi).await?;
         if opts.skip_free_version {
             dfi.set_skip_tier_free_version();
         }
-
-        ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
-        begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -8044,7 +8135,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Ok(writer.produced())
         };
 
-        let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj, self.ctx.clone());
+        let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj);
         advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
@@ -8070,7 +8161,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Err(failure) => {
                 if failure.candidate.is_some() {
                     let cleanup_api = transition_cleanup_store(&self.ctx).await;
-                    if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                    if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api, &mut transaction).await {
                         return Err(StorageError::Io(std::io::Error::other(format!(
                             "{}; rejected remote upload cleanup failed: {cleanup_err}",
                             failure.error
@@ -8085,7 +8176,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         if let Err(err) = upload_cleanup.lease.validate_remote_version_id(candidate.remote_version()) {
             let cleanup_api = transition_cleanup_store(&self.ctx).await;
-            if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+            if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api, &mut transaction).await {
                 return Err(StorageError::Io(std::io::Error::other(format!(
                     "{err}; rejected remote upload cleanup failed: {cleanup_err}"
                 ))));
@@ -8101,7 +8192,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 Ok(version) => version,
                 Err(err) => {
                     let cleanup_api = transition_cleanup_store(&self.ctx).await;
-                    if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+                    if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api, &mut transaction).await {
                         return Err(StorageError::Io(std::io::Error::other(format!(
                             "{err}; rejected remote upload cleanup failed: {cleanup_err}"
                         ))));
@@ -8120,7 +8211,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         .await
         {
             let cleanup_api = transition_cleanup_store(&self.ctx).await;
-            if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api).await {
+            if let Err(cleanup_err) = upload_cleanup.cleanup_rejected_upload(cleanup_api, &mut transaction).await {
                 return Err(StorageError::Io(std::io::Error::other(format!(
                     "{err}; uploaded transition transaction persist failed and cleanup failed: {cleanup_err}"
                 ))));
@@ -8399,6 +8490,25 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let actual_fi = actual.fi();
 
         oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        // The tier reader releases its own lease at EOF, before PUT or
+        // CompleteMultipartUpload necessarily reaches metadata quorum. Keep a
+        // second exact-generation lease for the whole restore so the final
+        // same-key write lock and this lease together fence remote-tuple
+        // publication through commit.
+        let expected_backend_identity = tier_destination_id_from_metadata(&oi.user_defined).map_err(Error::other)?;
+        let tier_config_mgr = self.ctx.tier_config_mgr();
+        let _remote_tuple_publication_lease = match expected_backend_identity {
+            Some(identity) => {
+                TierConfigMgr::acquire_operation_lease_for_backend_identity(
+                    &tier_config_mgr,
+                    &oi.transitioned_object.tier,
+                    identity,
+                )
+                .await
+            }
+            None => TierConfigMgr::acquire_operation_lease(&tier_config_mgr, &oi.transitioned_object.tier).await,
+        }
+        .map_err(Error::other)?;
         let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
         if let Some(expected_operation_id) = expected_operation_id {
             require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
@@ -8434,8 +8544,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         // Keep the public ECStore capacity admission attached to each local
         // commit. The tier reads below must remain outside the object write
-        // lock so HEAD/GET do not wait for a slow remote copy-back.
-        ropts.no_lock = opts.no_lock;
+        // lock so HEAD/GET do not wait for a slow remote copy-back. Restore
+        // does not hold an outer object write lock while copying bytes, so a
+        // caller-supplied boolean is not transferable lock authority: PUT and
+        // Complete must acquire their own commit-late write locks.
+        ropts.no_lock = false;
         ropts.expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
         ropts.bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.clone();
         ropts.namespace_lock_fence = opts.namespace_lock_fence.clone();
@@ -8577,7 +8690,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 expected_bucket_incarnation_id: opts.expected_bucket_incarnation_id,
                 bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
                 user_defined: restore_commit_metadata,
-                no_lock: opts.no_lock,
+                no_lock: false,
                 decommission_capacity_admission: opts.decommission_capacity_admission.clone(),
                 ..Default::default()
             };
@@ -11870,6 +11983,78 @@ mod transition_commit_failure_tests {
             "cancelled transition must clean up with the old driver"
         );
         assert_eq!(old_backend.object_count().await, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_keeps_remote_tuple_lease_after_reader_eof_until_local_commit() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-remote-tuple-publication-lease-bucket";
+        let object = "object.bin";
+        let payload = b"restore must retain its tier generation through metadata quorum".repeat(1024);
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(payload);
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let manager = runtime_sources::global_tier_config_mgr();
+        let _backend = register_mock_tier(&manager, &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.clone(),
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should transition before restore");
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier_name).await,
+            0,
+            "transition should release its operation lease before restore"
+        );
+
+        // BeforeNamespace is reached after the restore reader has drained but
+        // before the destination metadata write lock and quorum rename.
+        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+        let restore_set = Arc::clone(&set_disks);
+        let restore = tokio::spawn(async move {
+            let mut opts = ObjectOptions::default();
+            opts.transition.restore_request.days = Some(1);
+            restore_set.restore_transitioned_object(bucket, object, &opts).await
+        });
+        barrier.wait_until_paused().await;
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier_name).await,
+            1,
+            "the publication lease must outlive the EOF-scoped tier reader lease"
+        );
+
+        barrier.release();
+        restore
+            .await
+            .expect("restore task should join")
+            .expect("restore should commit after the barrier releases");
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier_name).await,
+            0,
+            "restore completion should release the publication lease"
+        );
     }
 
     #[tokio::test]

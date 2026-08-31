@@ -301,36 +301,23 @@ pub enum LifecycleDeleteAllPhase {
 #[doc(hidden)]
 #[derive(Default)]
 pub struct LifecycleDeleteAllJournalState {
-    prepared: HashMap<String, crate::bucket::lifecycle::tier_sweeper::Jentry>,
     mutation_started: bool,
 }
 
 impl Debug for LifecycleDeleteAllJournalState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LifecycleDeleteAllJournalState")
-            .field("prepared_count", &self.prepared.len())
             .field("mutation_started", &self.mutation_started)
             .finish()
     }
 }
 
 impl LifecycleDeleteAllJournalState {
-    pub(crate) fn contains(&self, name: &str) -> bool {
-        self.prepared.contains_key(name)
-    }
-
-    pub(crate) fn insert(&mut self, name: String, entry: crate::bucket::lifecycle::tier_sweeper::Jentry) {
-        self.prepared.insert(name, entry);
-    }
-
-    pub(crate) fn prepared_entries(&self) -> Vec<crate::bucket::lifecycle::tier_sweeper::Jentry> {
-        self.prepared.values().cloned().collect()
-    }
-
     pub(crate) fn mark_mutation_started(&mut self) {
         self.mutation_started = true;
     }
 
+    #[cfg(test)]
     pub(crate) fn mutation_started(&self) -> bool {
         self.mutation_started
     }
@@ -706,6 +693,12 @@ pub struct ObjectOptions {
     pub lifecycle_delete_all: Option<LifecycleDeleteAllRequest>,
     #[doc(hidden)]
     pub lifecycle_delete_all_journal: Option<Arc<parking_lot::Mutex<LifecycleDeleteAllJournalState>>>,
+    /// Whole-operation authorization created only by consuming a validated
+    /// v6 dispatch-manifest permit. Clones share the authorization, not the
+    /// one-shot permit itself.
+    #[doc(hidden)]
+    pub tier_delete_dispatch_authorization:
+        Option<crate::bucket::lifecycle::tier_delete_journal::TierDeleteDispatchAuthorization>,
     /// RustFS-only compare-and-set condition checked under the object write lock.
     pub expected_current_version_id: Option<String>,
     /// Persisted bucket incarnation observed before authorization.
@@ -847,6 +840,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("version_id", &self.version_id.is_some())
             .field("lifecycle_delete_all", &self.lifecycle_delete_all.is_some())
             .field("lifecycle_delete_all_journal", &self.lifecycle_delete_all_journal.is_some())
+            .field("tier_delete_dispatch_authorization", &self.tier_delete_dispatch_authorization.is_some())
             .field("expected_current_version_id", &self.expected_current_version_id.is_some())
             .field("expected_bucket_incarnation_id", &self.expected_bucket_incarnation_id)
             .field("no_lock", &self.no_lock)
@@ -971,8 +965,7 @@ impl ObjectOptions {
         self.namespace_lock_fence.get_or_insert_with(NamespaceLockFence::new);
     }
 
-    #[cfg(test)]
-    pub(crate) fn add_namespace_lock_fence_for_test(&mut self, fence: &NamespaceLockFence) {
+    pub(crate) fn add_namespace_lock_fence(&mut self, fence: &NamespaceLockFence) {
         self.namespace_lock_fence
             .get_or_insert_with(NamespaceLockFence::new)
             .extend(fence);

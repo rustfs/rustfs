@@ -1068,12 +1068,19 @@ enum TierMutationPeerState {
   TIER_MUTATION_PEER_STATE_ABORTED = 3;
 }
 
+enum TierMutationFailureClass {
+  TIER_MUTATION_FAILURE_CLASS_UNSPECIFIED = 0;
+  TIER_MUTATION_FAILURE_CLASS_PRE_DISPATCH_REJECTED = 1;
+  TIER_MUTATION_FAILURE_CLASS_AMBIGUOUS = 2;
+}
+
 message TierMutationControlResponse {
   bool success = 1;
   TierMutationPeerState state = 2;
   bool applied = 3;
   optional string error_info = 4;
   bytes response_proof = 5;
+  TierMutationFailureClass failure_class = 6;
 }
 
 message GetLiveEventsRequest {

@@ -65,7 +65,7 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_config::server_config::Config;
-use rustfs_filemeta::FileInfo;
+use rustfs_filemeta::{FileInfo, FileMeta};
 use rustfs_heal_contracts::heal_channel::{HealItemType, HealOpts};
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -88,25 +88,93 @@ type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 pub const SCANNER_PUBLICATION_LEASE_TTL_MS: u64 = 60_000;
+pub(crate) const BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES: usize = 4_096;
+pub(crate) const BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+pub(crate) struct BucketDeleteDiagnosticBudget {
+    deadline: tokio::time::Instant,
+    entries_remaining: usize,
+}
+
+impl BucketDeleteDiagnosticBudget {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED)
+    }
+
+    fn with_limits(entries: usize, elapsed: Duration) -> Self {
+        Self {
+            deadline: tokio::time::Instant::now() + elapsed,
+            entries_remaining: entries,
+        }
+    }
+
+    fn claim_entry(&mut self) -> bool {
+        if self.entries_remaining == 0 || tokio::time::Instant::now() >= self.deadline {
+            return false;
+        }
+        self.entries_remaining -= 1;
+        true
+    }
+
+    async fn run_io<T, F>(&self, future: F) -> std::io::Result<Option<T>>
+    where
+        F: std::future::Future<Output = std::io::Result<T>>,
+    {
+        if tokio::time::Instant::now() >= self.deadline {
+            return Ok(None);
+        }
+        match tokio::time::timeout_at(self.deadline, future).await {
+            Ok(result) => result.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct BucketMetadataLessResidue {
     pub(crate) xlmeta_found: bool,
+    pub(crate) xlmeta_blocker: Option<BucketDeleteBlockerKind>,
     pub(crate) files: usize,
     pub(crate) uuid_data_dirs: usize,
+    pub(crate) entries_scanned: usize,
+    pub(crate) diagnostic_bytes_read: u64,
+    pub(crate) diagnostic_truncated: bool,
     pub(crate) sample: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BucketDeleteBlockerKind {
+    VisibleVersion,
+    TierFreeVersion,
+    UnknownXlMeta,
+    OrphanDirectory,
+    DiagnosticBudgetExceeded,
+}
+
+impl BucketDeleteBlockerKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::VisibleVersion => "visible_version",
+            Self::TierFreeVersion => "tier_free_version",
+            Self::UnknownXlMeta => "unknown_xlmeta",
+            Self::OrphanDirectory => "orphan_directory",
+            Self::DiagnosticBudgetExceeded => "diagnostic_budget_exceeded",
+        }
+    }
 }
 
 impl BucketMetadataLessResidue {
     pub(crate) fn has_residue_without_xlmeta(&self) -> bool {
-        !self.xlmeta_found && self.files > 0
+        !self.xlmeta_found && (self.files > 0 || self.diagnostic_truncated)
     }
 
     pub(crate) fn describe(&self) -> String {
         let sample = self.sample.as_deref().unwrap_or("<none>");
         format!(
-            "metadata-less on-disk residue remains after empty-bucket verification: files={}, uuid_data_dirs={}, sample={sample}",
-            self.files, self.uuid_data_dirs
+            "metadata-less on-disk residue remains after empty-bucket verification: files={}, uuid_data_dirs={}, entries_scanned={}, diagnostic_bytes_read={}, diagnostic_truncated={}, sample={sample}",
+            self.files, self.uuid_data_dirs, self.entries_scanned, self.diagnostic_bytes_read, self.diagnostic_truncated,
         )
     }
 }
@@ -145,28 +213,112 @@ pub(crate) async fn has_xlmeta_files(path: &std::path::Path) -> std::io::Result<
     Ok(false)
 }
 
+#[cfg(test)]
 pub(crate) async fn scan_metadata_less_residue(path: &std::path::Path) -> std::io::Result<BucketMetadataLessResidue> {
+    let mut budget = BucketDeleteDiagnosticBudget::new();
+    scan_metadata_less_residue_with_budget(path, &mut budget).await
+}
+
+async fn scan_metadata_less_residue_with_budget(
+    path: &std::path::Path,
+    budget: &mut BucketDeleteDiagnosticBudget,
+) -> std::io::Result<BucketMetadataLessResidue> {
     use crate::disk::STORAGE_FORMAT_FILE;
     use tokio::fs;
+    use tokio::io::AsyncReadExt as _;
 
     let mut scan = BucketMetadataLessResidue::default();
     let mut stack = vec![path.to_path_buf()];
 
+    let mark_budget_exhausted = |scan: &mut BucketMetadataLessResidue| {
+        scan.diagnostic_truncated = true;
+        scan.sample.get_or_insert_with(|| "<diagnostic-budget-exceeded>".to_string());
+    };
+
     while let Some(current_path) = stack.pop() {
-        let mut entries = match fs::read_dir(&current_path).await {
-            Ok(entries) => entries,
+        let mut entries = match budget.run_io(fs::read_dir(&current_path)).await {
+            Ok(Some(entries)) => entries,
+            Ok(None) => {
+                mark_budget_exhausted(&mut scan);
+                return Ok(scan);
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
 
-        while let Some(entry) = entries.next_entry().await? {
-            let file_type = entry.file_type().await?;
+        loop {
+            let entry = match budget.run_io(entries.next_entry()).await? {
+                Some(Some(entry)) => entry,
+                Some(None) => break,
+                None => {
+                    mark_budget_exhausted(&mut scan);
+                    return Ok(scan);
+                }
+            };
+            if !budget.claim_entry() {
+                mark_budget_exhausted(&mut scan);
+                return Ok(scan);
+            }
+            scan.entries_scanned = scan.entries_scanned.saturating_add(1);
+            let Some(file_type) = budget.run_io(entry.file_type()).await? else {
+                mark_budget_exhausted(&mut scan);
+                return Ok(scan);
+            };
             let file_name = entry.file_name();
             let file_name_str = file_name.to_string_lossy();
 
             if file_name_str == STORAGE_FORMAT_FILE {
                 scan.xlmeta_found = true;
-                continue;
+                if scan.xlmeta_blocker.is_none() {
+                    let entry_path = entry.path();
+                    let Some(metadata) = budget.run_io(fs::metadata(&entry_path)).await? else {
+                        mark_budget_exhausted(&mut scan);
+                        scan.xlmeta_blocker = Some(BucketDeleteBlockerKind::DiagnosticBudgetExceeded);
+                        return Ok(scan);
+                    };
+                    scan.xlmeta_blocker = Some(if metadata.len() > BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES {
+                        BucketDeleteBlockerKind::UnknownXlMeta
+                    } else {
+                        match budget.run_io(fs::File::open(&entry_path)).await {
+                            Ok(Some(file)) => {
+                                let mut data = Vec::new();
+                                let read = budget
+                                    .run_io(file.take(BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES).read_to_end(&mut data))
+                                    .await;
+                                scan.diagnostic_bytes_read = data.len() as u64;
+                                match read {
+                                    Ok(Some(_)) => match FileMeta::load(&data) {
+                                        Ok(meta)
+                                            if !meta.versions.is_empty()
+                                                && meta.versions.iter().all(|version| version.header.free_version()) =>
+                                        {
+                                            BucketDeleteBlockerKind::TierFreeVersion
+                                        }
+                                        Ok(meta) if !meta.versions.is_empty() => BucketDeleteBlockerKind::VisibleVersion,
+                                        Ok(_) | Err(_) => BucketDeleteBlockerKind::UnknownXlMeta,
+                                    },
+                                    Ok(None) => {
+                                        mark_budget_exhausted(&mut scan);
+                                        BucketDeleteBlockerKind::DiagnosticBudgetExceeded
+                                    }
+                                    Err(_) => BucketDeleteBlockerKind::UnknownXlMeta,
+                                }
+                            }
+                            Ok(None) => {
+                                mark_budget_exhausted(&mut scan);
+                                BucketDeleteBlockerKind::DiagnosticBudgetExceeded
+                            }
+                            Err(_) => BucketDeleteBlockerKind::UnknownXlMeta,
+                        }
+                    });
+                    let sample = entry_path
+                        .strip_prefix(path)
+                        .unwrap_or(entry_path.as_path())
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/");
+                    scan.sample = Some(sample);
+                }
+                return Ok(scan);
             }
 
             if file_type.is_dir() {
@@ -222,7 +374,10 @@ pub(crate) mod init_format;
 pub(crate) mod list_objects;
 mod multipart;
 mod object;
-pub(crate) use object::{ObjectLockDiagGuard, SourceCleanupMutationFence, tiered_data_movement_source_matches};
+pub(crate) use object::{
+    ObjectLockDiagGuard, RemoteTuplePublicationCommitGuard, RemoteTuplePublicationFence, SourceCleanupMutationFence,
+    tiered_data_movement_source_matches,
+};
 pub use object::{
     PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
     SnapshotConsistencyError,

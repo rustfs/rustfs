@@ -255,6 +255,7 @@ impl ObjSweeper {
         }
         if del_tier {
             return Some(Jentry {
+                persisted_version: 0,
                 obj_name: self.remote_object.clone(),
                 version_id: self.transition_version_id.clone(),
                 tier_name: self.transition_tier.clone(),
@@ -266,6 +267,7 @@ impl ObjSweeper {
                 version_state: self.transition_version_state,
                 state: TierDeleteJournalState::Committed,
                 source: None,
+                dispatch: None,
             });
         }
         None
@@ -298,7 +300,16 @@ impl ObjSweeper {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum TierDeleteJournalState {
     Prepared,
+    Dispatched,
     Committed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TierDeleteDispatchBinding {
+    pub(crate) operation_id: Uuid,
+    pub(crate) manifest_object: String,
+    pub(crate) journal_set_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,6 +353,10 @@ impl TierDeleteSourceIdentity {
 #[derive(Debug, Clone)]
 #[allow(unused_assignments)]
 pub struct Jentry {
+    /// On-disk format version when decoded. Newly constructed entries use 0;
+    /// the encoder chooses their format from the durable ownership fields.
+    /// Recovery uses this value to quarantine v1-v5 without rewriting them.
+    pub(crate) persisted_version: u8,
     pub(crate) obj_name: String,
     pub(crate) version_id: String,
     pub(crate) tier_name: String,
@@ -350,6 +365,23 @@ pub struct Jentry {
     pub(crate) version_state: rustfs_filemeta::TransitionVersionState,
     pub(crate) state: TierDeleteJournalState,
     pub(crate) source: Option<TierDeleteSourceIdentity>,
+    pub(crate) dispatch: Option<TierDeleteDispatchBinding>,
+}
+
+impl Jentry {
+    /// Whether this prepared transaction is eligible to become the sole
+    /// cleanup owner for its transitioned source. The caller may use this to
+    /// decide whether to persist it, but must not set `skip_free_version`
+    /// until persistence succeeds.
+    pub(crate) fn can_replace_tier_free_version(&self) -> bool {
+        self.state == TierDeleteJournalState::Prepared
+            && self.backend_identity.is_some()
+            && self.version_state != rustfs_filemeta::TransitionVersionState::Unknown
+            && self
+                .source
+                .as_ref()
+                .is_some_and(TierDeleteSourceIdentity::has_stable_identity)
+    }
 }
 
 impl ExpiryOp for Jentry {
@@ -617,6 +649,7 @@ pub fn transitioned_force_delete_journal_entry(
     }
 
     Some(Jentry {
+        persisted_version: 0,
         obj_name: transitioned.name.clone(),
         version_id: transitioned.version_id.clone(),
         tier_name: transitioned.tier.clone(),
@@ -628,6 +661,7 @@ pub fn transitioned_force_delete_journal_entry(
         version_state: transition_version_state,
         state: TierDeleteJournalState::Committed,
         source: None,
+        dispatch: None,
     })
 }
 
@@ -673,16 +707,72 @@ mod test {
     use rustfs_s3_client::signer_error::invalid_utf8_header_error;
 
     use super::{
-        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES, ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED,
-        RemoteDeleteBreaker, RemoteTierDeleteOutcome, delete_confirmed_transition_candidate_exact_with_manager_and_identity,
-        delete_object_from_remote_tier_idempotent, delete_object_from_remote_tier_idempotent_with_manager_and_identity,
-        is_remote_tier_not_found_error, is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook,
-        should_record_remote_delete_failure, transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
+        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES, ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED, Jentry,
+        RemoteDeleteBreaker, RemoteTierDeleteOutcome, TierDeleteJournalState, TierDeleteSourceIdentity,
+        delete_confirmed_transition_candidate_exact_with_manager_and_identity, delete_object_from_remote_tier_idempotent,
+        delete_object_from_remote_tier_idempotent_with_manager_and_identity, is_remote_tier_not_found_error,
+        is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook, should_record_remote_delete_failure,
+        transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
     };
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
     use rustfs_filemeta::TransitionVersionState;
     use std::io::{Error, ErrorKind};
     use std::time::{Duration, Instant};
+
+    fn stable_prepared_journal() -> Jentry {
+        Jentry {
+            persisted_version: 0,
+            obj_name: "remote/object".to_string(),
+            version_id: "remote-version".to_string(),
+            tier_name: "WARM".to_string(),
+            backend_identity: Some([7; 32]),
+            version_id_exact: true,
+            version_state: TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Prepared,
+            source: Some(TierDeleteSourceIdentity {
+                bucket: "bucket".to_string(),
+                object: "object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                versioned: true,
+                version_suspended: false,
+                data_dir: None,
+                etag: None,
+                mod_time: None,
+            }),
+            dispatch: None,
+        }
+    }
+
+    #[test]
+    fn only_stable_prepared_journal_can_replace_tier_free_version() {
+        let stable = stable_prepared_journal();
+        assert!(stable.can_replace_tier_free_version());
+
+        let mut committed = stable.clone();
+        committed.state = TierDeleteJournalState::Committed;
+        assert!(!committed.can_replace_tier_free_version());
+
+        let mut unbound = stable.clone();
+        unbound.backend_identity = None;
+        assert!(!unbound.can_replace_tier_free_version());
+
+        let mut unknown = stable.clone();
+        unknown.version_state = TransitionVersionState::Unknown;
+        assert!(!unknown.can_replace_tier_free_version());
+
+        let mut unstable = stable;
+        unstable.source = Some(TierDeleteSourceIdentity {
+            bucket: "bucket".to_string(),
+            object: "object".to_string(),
+            version_id: None,
+            versioned: false,
+            version_suspended: false,
+            data_dir: None,
+            etag: Some("etag-only".to_string()),
+            mod_time: None,
+        });
+        assert!(!unstable.can_replace_tier_free_version());
+    }
 
     #[test]
     fn signer_header_error_detection_matches_utf8_failures() {

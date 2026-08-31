@@ -47,7 +47,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use crate::error::{Error, Result, StorageError};
+use crate::error::{Error, Result, StorageError, stable_io_error};
 use crate::services::tier::{
     tier_admin::TierCreds,
     tier_config::{TierConfig, TierType, TierWasabi},
@@ -69,7 +69,7 @@ use crate::{
         tier_delete_journal::{TIER_DELETE_JOURNAL_PREFIX, decode_tier_delete_journal_entry},
         transition_transaction::{TRANSITION_TRANSACTION_RECORD_PREFIX, decode_transition_transaction_record},
     },
-    cluster::rpc::peer_rest_client::{PeerRestClient, PeerTierMutationState},
+    cluster::rpc::peer_rest_client::{PeerRestClient, PeerTierMutationState, tier_mutation_error_is_definitely_rejected},
     config::com::{CONFIG_PREFIX, read_config, read_config_with_metadata},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
     layout::endpoints::EndpointServerPools,
@@ -88,10 +88,11 @@ use super::{
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_PERM_ERR},
     tier_mutation_intent::{
         TierMutationDigest, TierMutationIntent, TierMutationIntentKind, TierMutationIntentState, TierMutationIntentTarget,
-        advance_tier_coordinator_mutation_intent_record_idempotent, advance_tier_mutation_intent_record_idempotent,
-        delete_tier_coordinator_mutation_intent_record, delete_tier_mutation_intent_record,
-        list_tier_coordinator_mutation_intent_records, list_tier_mutation_intent_records,
-        save_tier_coordinator_mutation_intent_record_if_absent,
+        acquire_tier_mutation_mutex, advance_tier_coordinator_mutation_intent_record_idempotent,
+        advance_tier_mutation_intent_record_idempotent, delete_tier_coordinator_mutation_intent_record_if_current,
+        delete_tier_mutation_intent_record_if_current, list_tier_coordinator_mutation_intent_records,
+        list_tier_mutation_intent_records, load_tier_coordinator_mutation_intent_record_with_etag,
+        load_tier_mutation_intent_record_with_etag, save_tier_coordinator_mutation_intent_record_if_absent,
     },
     warm_backend::WarmBackendImpl,
 };
@@ -100,8 +101,10 @@ const TIER_CFG_REFRESH: Duration = Duration::from_secs(15 * 60);
 const TIER_OPERATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TIER_REMOTE_VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
 const TIER_REFERENCE_PROOF_LIST_LIMIT: i32 = 1000;
+const TIER_REFERENCE_PROOF_PHYSICAL_WALK_CONCURRENCY: usize = 4;
 const TIER_MUTATION_INTENT_RECOVERY_SCAN_LIMIT: usize = 1000;
 const TIER_MUTATION_INTENT_TTL: Duration = Duration::from_secs(15 * 60);
+const TIER_MUTATION_TOMBSTONE_CLOCK_SKEW: Duration = Duration::from_secs(5 * 60);
 const TIER_MUTATION_BLOCK_MESSAGE: &str = "Remote tier configuration is being replaced";
 const TIER_MUTATION_REFRESH_RETRY_BASE: Duration = Duration::from_secs(1);
 const TIER_MUTATION_REFRESH_RETRY_CAP: Duration = Duration::from_secs(30);
@@ -268,6 +271,12 @@ struct RecoveredTierMutationIntent {
     coordinator_state: Option<TierMutationIntentState>,
 }
 
+impl RecoveredTierMutationIntent {
+    fn is_peer_only_terminal(&self) -> bool {
+        self.has_peer_record && !self.has_coordinator_record && self.intent.state != TierMutationIntentState::Prepared
+    }
+}
+
 struct TierMutationRecoverySnapshot {
     coordinator_intents: Vec<TierMutationIntent>,
     intents: Vec<RecoveredTierMutationIntent>,
@@ -284,11 +293,7 @@ struct CommittedMutationRecoveryPlan {
 
 impl TierMutationRecoverySnapshot {
     fn requires_config_lock(&self) -> bool {
-        self.has_committed_mutation_blocks
-            || self
-                .intents
-                .iter()
-                .any(|recovered| recovered.has_coordinator_record || recovered.intent.state != TierMutationIntentState::Prepared)
+        self.has_committed_mutation_blocks || self.intents.iter().any(|recovered| recovered.has_coordinator_record)
     }
 
     fn allowance(&self) -> MutationBlockAllowance {
@@ -296,13 +301,14 @@ impl TierMutationRecoverySnapshot {
     }
 
     fn committed_intents(&self) -> impl Iterator<Item = &RecoveredTierMutationIntent> {
-        self.intents
-            .iter()
-            .filter(|recovered| recovered.intent.state == TierMutationIntentState::Committed)
+        self.intents.iter().filter(|recovered| {
+            recovered.intent.state == TierMutationIntentState::Committed
+                && (!recovered.is_peer_only_terminal() || self.allowance.mutation_ids.contains(&recovered.intent.mutation_id))
+        })
     }
 
     fn is_quiescent(&self) -> bool {
-        self.intents.is_empty() && self.allowance.mutation_ids.is_empty()
+        self.allowance.mutation_ids.is_empty() && self.intents.iter().all(RecoveredTierMutationIntent::is_peer_only_terminal)
     }
 }
 
@@ -720,17 +726,69 @@ trait TierReferenceProofStore:
     > + Send
     + Sync
 {
+    async fn authoritative_buckets_for_reference_proof(&self) -> Result<Vec<crate::storage_api_contracts::bucket::BucketInfo>> {
+        self.list_bucket(&crate::storage_api_contracts::bucket::BucketOptions {
+            deleted: true,
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+    }
+
     async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>>;
+
+    async fn authoritative_bucket_tier_reference(
+        self: Arc<Self>,
+        bucket: &str,
+        targets: &[TierMutationIntentTarget],
+    ) -> std::result::Result<Option<ObjectInfo>, AdminError>
+    where
+        Self: Sized,
+    {
+        find_authoritative_bucket_tier_reference_by_walk(self, bucket, targets).await
+    }
 }
 
 #[async_trait::async_trait]
 impl TierReferenceProofStore for ECStore {
+    async fn authoritative_buckets_for_reference_proof(&self) -> Result<Vec<crate::storage_api_contracts::bucket::BucketInfo>> {
+        let opts = crate::storage_api_contracts::bucket::BucketOptions {
+            deleted: true,
+            no_metadata: true,
+            ..Default::default()
+        };
+        let (logical, physical) = tokio::join!(
+            <ECStore as BucketOperations>::list_bucket(self, &opts),
+            self.list_bucket_for_scanner(&opts),
+        );
+        let logical = logical?;
+        let physical = physical?;
+        if !physical.topology_complete {
+            return Err(Error::other(
+                "tier reference proof cannot enumerate every physical bucket with complete set quorum",
+            ));
+        }
+        let mut buckets = BTreeMap::new();
+        for bucket in logical.into_iter().chain(physical.buckets) {
+            buckets.entry(bucket.name.clone()).or_insert(bucket);
+        }
+        Ok(buckets.into_values().collect())
+    }
+
     async fn lifecycle_config_for_reference_proof(&self, bucket: &str) -> Result<Option<BucketLifecycleConfiguration>> {
         match get_lifecycle_config(bucket).await {
             Ok((config, _updated_at)) => Ok(Some(config)),
             Err(Error::ConfigNotFound) => Ok(None),
             Err(err) => Err(err),
         }
+    }
+
+    async fn authoritative_bucket_tier_reference(
+        self: Arc<Self>,
+        bucket: &str,
+        targets: &[TierMutationIntentTarget],
+    ) -> std::result::Result<Option<ObjectInfo>, AdminError> {
+        find_authoritative_bucket_tier_reference_on_physical_sets(self, bucket, targets).await
     }
 }
 
@@ -762,7 +820,7 @@ where
     S: TierReferenceProofStore,
 {
     let buckets = api
-        .list_bucket(&Default::default())
+        .authoritative_buckets_for_reference_proof()
         .await
         .map_err(tier_reference_proof_admin_error)?;
     for bucket in buckets {
@@ -773,39 +831,169 @@ where
         if !force {
             ensure_no_authoritative_lifecycle_references(api.as_ref(), &bucket.name, targets).await?;
         }
-        let mut marker = None;
-        let mut version_marker = None;
-        loop {
-            let page = api
-                .clone()
-                .list_object_versions(
-                    &bucket.name,
-                    "",
-                    marker.take(),
-                    version_marker.take(),
-                    None,
-                    TIER_REFERENCE_PROOF_LIST_LIMIT,
-                )
-                .await
-                .map_err(tier_reference_proof_admin_error)?;
-            for object in &page.objects {
-                if tier_object_blocks_any_target_rebind(object, targets).map_err(tier_reference_proof_admin_error)? {
-                    return Err(tier_reference_proof_in_use_error(&object.transitioned_object.tier, object));
-                }
-            }
-            if !page.is_truncated {
-                break;
-            }
-            marker = page.next_marker;
-            version_marker = page.next_version_idmarker;
-            if marker.is_none() {
-                return Err(tier_reference_proof_admin_error(io::Error::other(
-                    "tier reference proof listing is truncated without a next marker",
-                )));
-            }
+        if let Some(object) = api.clone().authoritative_bucket_tier_reference(&bucket.name, targets).await? {
+            return Err(tier_reference_proof_in_use_error(&object.transitioned_object.tier, &object));
         }
     }
     ensure_no_authoritative_persisted_references(api, targets).await
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn ensure_no_authoritative_tier_references_for_test(
+    api: Arc<ECStore>,
+    tier_name: &str,
+    old_backend_identity: TierDestinationId,
+    force: bool,
+) -> std::result::Result<(), AdminError> {
+    ensure_no_authoritative_tier_object_references(
+        api,
+        &[TierMutationIntentTarget {
+            tier_name: tier_name.to_string(),
+            old_backend_identity: Some(old_backend_identity),
+            new_backend_identity: None,
+        }],
+        force,
+    )
+    .await
+}
+
+async fn find_authoritative_bucket_tier_reference_by_walk<S>(
+    api: Arc<S>,
+    bucket: &str,
+    targets: &[TierMutationIntentTarget],
+) -> std::result::Result<Option<ObjectInfo>, AdminError>
+where
+    S: TierReferenceProofStore,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<StorageObjectInfoOrErr<ObjectInfo, Error>>(100);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let walk = api.clone().walk(
+        cancellation.clone(),
+        bucket,
+        "",
+        tx,
+        TierReferenceProofWalkOptions {
+            include_free_versions: true,
+            // Namespace size determines total proof time. Drive-level progress
+            // stalls remain bounded by the walk implementation.
+            walkdir_timeout: Some(Duration::ZERO),
+            ..Default::default()
+        },
+    );
+    let collect = async {
+        while let Some(result) = rx.recv().await {
+            if let Some(err) = result.err {
+                cancellation.cancel();
+                return Err(err);
+            }
+            let Some(object) = result.item else {
+                continue;
+            };
+            match tier_object_blocks_any_target_rebind(&object, targets) {
+                Ok(true) => {
+                    cancellation.cancel();
+                    return Ok(Some(object));
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    cancellation.cancel();
+                    return Err(Error::other(err));
+                }
+            }
+        }
+        Ok(None)
+    };
+    let (walk_result, collect_result) = tokio::join!(walk, collect);
+    match collect_result.map_err(tier_reference_proof_admin_error)? {
+        Some(blocker) => Ok(Some(blocker)),
+        None => {
+            walk_result.map_err(tier_reference_proof_admin_error)?;
+            Ok(None)
+        }
+    }
+}
+
+async fn find_authoritative_bucket_tier_reference_on_physical_sets(
+    api: Arc<ECStore>,
+    bucket: &str,
+    targets: &[TierMutationIntentTarget],
+) -> std::result::Result<Option<ObjectInfo>, AdminError> {
+    use futures::StreamExt as _;
+
+    let physical_sets = api
+        .pools
+        .iter()
+        .flat_map(|pool| pool.disk_set.iter().cloned())
+        .collect::<Vec<_>>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<StorageObjectInfoOrErr<ObjectInfo, Error>>(100);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let walk_cancel = cancellation.clone();
+    let bucket_owned = bucket.to_string();
+    let walk = async move {
+        let results = futures::stream::iter(physical_sets.into_iter().map(|set| {
+            let tx = tx.clone();
+            let cancellation = walk_cancel.clone();
+            let bucket = bucket_owned.clone();
+            async move {
+                let result = set
+                    .walk(
+                        cancellation.clone(),
+                        &bucket,
+                        "",
+                        tx,
+                        TierReferenceProofWalkOptions {
+                            include_free_versions: true,
+                            // Total time scales with namespace size; every
+                            // underlying drive walk still carries its bounded
+                            // progress-stall timeout.
+                            walkdir_timeout: Some(Duration::ZERO),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                if result.is_err() {
+                    cancellation.cancel();
+                }
+                result
+            }
+        }))
+        .buffer_unordered(TIER_REFERENCE_PROOF_PHYSICAL_WALK_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        drop(tx);
+        results.into_iter().collect::<Result<Vec<_>>>().map(|_| ())
+    };
+    let collect = async {
+        while let Some(result) = rx.recv().await {
+            if let Some(err) = result.err {
+                cancellation.cancel();
+                return Err(err);
+            }
+            let Some(object) = result.item else {
+                continue;
+            };
+            match tier_object_blocks_any_target_rebind(&object, targets) {
+                Ok(true) => {
+                    cancellation.cancel();
+                    return Ok(Some(object));
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    cancellation.cancel();
+                    return Err(Error::other(err));
+                }
+            }
+        }
+        Ok(None)
+    };
+    let (walk_result, collect_result) = tokio::join!(walk, collect);
+    match collect_result.map_err(tier_reference_proof_admin_error)? {
+        Some(blocker) => Ok(Some(blocker)),
+        None => {
+            walk_result.map_err(tier_reference_proof_admin_error)?;
+            Ok(None)
+        }
+    }
 }
 
 async fn ensure_no_authoritative_lifecycle_references(
@@ -1038,7 +1226,11 @@ trait TierMutationPeer: Send + Sync {
     fn peer_label(&self) -> String;
     async fn prepare_tier_mutation(&self, mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Result<PeerTierMutationState>;
     async fn commit_tier_mutation(&self, mutation_id: uuid::Uuid, canonical_payload: Bytes) -> Result<PeerTierMutationState>;
-    async fn abort_tier_mutation(&self, mutation_id: uuid::Uuid) -> Result<PeerTierMutationState>;
+    async fn abort_tier_mutation(
+        &self,
+        mutation_id: uuid::Uuid,
+        canonical_prepare_payload: Bytes,
+    ) -> Result<PeerTierMutationState>;
 }
 
 #[async_trait::async_trait]
@@ -1059,8 +1251,14 @@ impl TierMutationPeer for PeerRestClient {
             .state)
     }
 
-    async fn abort_tier_mutation(&self, mutation_id: uuid::Uuid) -> Result<PeerTierMutationState> {
-        Ok(PeerRestClient::abort_tier_mutation(self, mutation_id).await?.state)
+    async fn abort_tier_mutation(
+        &self,
+        mutation_id: uuid::Uuid,
+        canonical_prepare_payload: Bytes,
+    ) -> Result<PeerTierMutationState> {
+        Ok(PeerRestClient::abort_tier_mutation(self, mutation_id, canonical_prepare_payload)
+            .await?
+            .state)
     }
 }
 
@@ -1121,6 +1319,18 @@ async fn prepare_tier_mutation_peers(
                 });
             }
             Err(err) => {
+                if tier_mutation_prepare_was_definitely_rejected(&err) {
+                    return Err(TierMutationPrepareFailure {
+                        error: tier_mutation_fanout_admin_error("prepare", format!("peer {label}: {err}")),
+                        prepared_peers: prepared,
+                    });
+                }
+                // The request may have reached the peer and installed its
+                // durable Prepared block before the response failed (for
+                // example while draining an in-flight lease). Include it in
+                // abort fanout so ambiguous prepare outcomes fail closed
+                // without stranding a runtime block.
+                prepared.push(peer);
                 return Err(TierMutationPrepareFailure {
                     error: tier_mutation_fanout_admin_error("prepare", format!("peer {label}: {err}")),
                     prepared_peers: prepared,
@@ -1131,16 +1341,22 @@ async fn prepare_tier_mutation_peers(
     Ok(prepared)
 }
 
+fn tier_mutation_prepare_was_definitely_rejected(err: &Error) -> bool {
+    tier_mutation_error_is_definitely_rejected(err)
+}
+
 struct TierMutationPrepareFailure {
     error: AdminError,
     prepared_peers: Vec<Arc<dyn TierMutationPeer>>,
 }
 
-async fn abort_tier_mutation_peers(mutation_id: uuid::Uuid, peers: Vec<Arc<dyn TierMutationPeer>>) -> io::Result<()> {
+async fn abort_tier_mutation_peers(intent: &TierMutationIntent, peers: Vec<Arc<dyn TierMutationPeer>>) -> io::Result<()> {
+    let prepared = intent.original_prepared().map_err(io::Error::other)?;
+    let payload = Bytes::from(prepared.encode().map_err(io::Error::other)?);
     let mut failures = Vec::new();
     for peer in peers {
         let label = peer.peer_label();
-        let result = peer.abort_tier_mutation(mutation_id).await;
+        let result = peer.abort_tier_mutation(intent.mutation_id, payload.clone()).await;
         match result {
             Ok(PeerTierMutationState::Aborted) => {}
             Ok(state) => {
@@ -1218,6 +1434,7 @@ where
     S: TierReferenceProofStore,
 {
     if let Some(intent) = intent {
+        let _mutation_guard = acquire_tier_mutation_mutex(intent.mutation_id).await;
         save_tier_coordinator_mutation_intent_record_if_absent(api, intent)
             .await
             .map_err(io::Error::other)?;
@@ -1234,6 +1451,7 @@ where
     S: TierReferenceProofStore,
 {
     if let Some(intent) = intent {
+        let _mutation_guard = acquire_tier_mutation_mutex(intent.mutation_id).await;
         advance_tier_coordinator_mutation_intent_record_idempotent(
             api,
             intent.mutation_id,
@@ -1253,6 +1471,7 @@ where
     let Some(intent) = intent else {
         return true;
     };
+    let _mutation_guard = acquire_tier_mutation_mutex(intent.mutation_id).await;
     match advance_tier_coordinator_mutation_intent_record_idempotent(
         api,
         intent.mutation_id,
@@ -1289,7 +1508,7 @@ where
     let Some(intent) = intent else {
         return true;
     };
-    if let Err(err) = abort_tier_mutation_peers(intent.mutation_id, prepared_peers).await {
+    if let Err(err) = abort_tier_mutation_peers(intent, prepared_peers).await {
         warn!(
             event = "tier_mutation_abort",
             component = LOG_COMPONENT_ECSTORE,
@@ -1299,12 +1518,25 @@ where
             error = ?err,
             "tier mutation abort incomplete"
         );
+        // The coordinator record remains Prepared so recovery can retry the
+        // genuinely ambiguous peer cleanup. The local data path must not stay
+        // fenced merely because a remote Abort response was lost.
+        if let Err(clear_err) = TierConfigMgr::clear_prepared_mutation_intent_block(handle, intent.mutation_id).await {
+            warn!(
+                event = "tier_mutation_abort",
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_TIER,
+                result = "runtime_fence_clear_failed",
+                mutation_id = %intent.mutation_id,
+                error = ?clear_err,
+                "tier mutation abort incomplete"
+            );
+        }
         return false;
     }
-    if !abort_coordinator_tier_mutation_intent(api, Some(intent)).await {
-        return false;
-    }
-    if let Err(err) = TierConfigMgr::clear_prepared_mutation_intent_block(handle, intent.mutation_id).await {
+    let coordinator_aborted = abort_coordinator_tier_mutation_intent(api, Some(intent)).await;
+    let runtime_cleared = if let Err(err) = TierConfigMgr::clear_prepared_mutation_intent_block(handle, intent.mutation_id).await
+    {
         warn!(
             event = "tier_mutation_abort",
             component = LOG_COMPONENT_ECSTORE,
@@ -1314,9 +1546,11 @@ where
             error = ?err,
             "tier mutation abort incomplete"
         );
-        return false;
-    }
-    true
+        false
+    } else {
+        true
+    };
+    coordinator_aborted && runtime_cleared
 }
 
 fn committed_tier_mutation_intent(
@@ -3376,12 +3610,13 @@ impl TierConfigMgr {
                     let affected_targets =
                         build_tier_mutation_affected_targets(mutation_kind, proof_targets, &current_for_targets, &candidate)
                             .map_err(TierConfigUpdateError::Publish)?;
-                    ensure_no_authoritative_tier_object_references(api.clone(), &affected_targets, mutation_force)
-                        .await
-                        .map_err(TierConfigUpdateError::Publish)?;
-                    let coordinator_intent =
-                        build_coordinator_tier_mutation_intent(mutation_kind, version.clone(), &candidate, affected_targets)
-                            .map_err(TierConfigUpdateError::Save)?;
+                    let coordinator_intent = build_coordinator_tier_mutation_intent(
+                        mutation_kind,
+                        version.clone(),
+                        &candidate,
+                        affected_targets.clone(),
+                    )
+                    .map_err(TierConfigUpdateError::Save)?;
                     save_coordinator_tier_mutation_intent(api.clone(), coordinator_intent.as_ref())
                         .await
                         .map_err(TierConfigUpdateError::Save)?;
@@ -3394,7 +3629,18 @@ impl TierConfigMgr {
                         let peers = match remote_tier_mutation_peers().await {
                             Ok(peers) => peers,
                             Err(err) => {
-                                TierConfigMgr::request_committed_mutation_refresh(&handle).await;
+                                if !abort_prepared_tier_mutation(&handle, api.clone(), coordinator_intent.as_ref(), Vec::new())
+                                    .await
+                                {
+                                    warn!(
+                                        event = "tier_mutation_abort",
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_TIER,
+                                        result = "prepared_intent_retained",
+                                        mutation_id = %intent.mutation_id,
+                                        "tier mutation peer discovery failed and local abort was incomplete"
+                                    );
+                                }
                                 return Err(TierConfigUpdateError::Publish(tier_mutation_fanout_admin_error("prepare", err)));
                             }
                         };
@@ -3428,6 +3674,22 @@ impl TierConfigMgr {
                     } else {
                         Vec::new()
                     };
+                    if let Err(proof_error) =
+                        ensure_no_authoritative_tier_object_references(api.clone(), &affected_targets, mutation_force).await
+                    {
+                        if !abort_prepared_tier_mutation(&handle, api.clone(), coordinator_intent.as_ref(), prepared_peers).await
+                        {
+                            warn!(
+                                event = "tier_mutation_abort",
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_TIER,
+                                result = "prepared_intent_retained",
+                                coordinator_intent = coordinator_intent.is_some(),
+                                "tier mutation reference proof failed and abort was incomplete"
+                            );
+                        }
+                        return Err(TierConfigUpdateError::Publish(proof_error));
+                    }
                     let candidate_digest = tier_config_candidate_digest(&candidate).map_err(TierConfigUpdateError::Save)?;
                     let saved = match candidate
                         .save_tiering_config_if_current_with_info(api.clone(), version.as_deref())
@@ -3628,7 +3890,8 @@ impl TierConfigMgr {
             .await?;
         Self::delete_finished_peer_mutation_intents(api.clone(), &snapshot, &recovery_plan.peer_cleanup_order).await?;
         if !snapshot.is_quiescent() {
-            Self::load_and_reconcile_mutation_recovery_snapshot(handle, api, false).await?;
+            let settled_snapshot = Self::load_and_reconcile_mutation_recovery_snapshot(handle, api.clone(), false).await?;
+            Self::delete_finished_peer_mutation_intents(api, &settled_snapshot, &[]).await?;
         }
         drop(config_lock);
         Ok(())
@@ -3755,6 +4018,87 @@ impl TierConfigMgr {
         )))
     }
 
+    fn tier_mutation_tombstone_retention_elapsed(intent: &TierMutationIntent, now_unix_nanos: i64) -> bool {
+        let clock_skew_nanos = i64::try_from(TIER_MUTATION_TOMBSTONE_CLOCK_SKEW.as_nanos()).unwrap_or(i64::MAX);
+        intent.expires_at_unix_nanos.saturating_add(clock_skew_nanos) <= now_unix_nanos
+    }
+
+    async fn delete_exact_peer_terminal_mutation_intent<S>(api: Arc<S>, expected: &TierMutationIntent) -> io::Result<bool>
+    where
+        S: EcstoreObjectIO + EcstoreObjectOperations,
+    {
+        if expected.state == TierMutationIntentState::Prepared {
+            return Err(io::Error::other("refusing to delete a non-terminal peer tier mutation intent"));
+        }
+        let (current, etag) = match load_tier_mutation_intent_record_with_etag(api.clone(), expected.mutation_id).await {
+            Ok(current) => current,
+            Err(Error::ConfigNotFound) => return Ok(true),
+            Err(err) => return Err(tier_mutation_replay_error(err)),
+        };
+        if current != *expected {
+            return Err(stable_io_error(
+                "peer tier mutation intent changed before terminal cleanup",
+                expected.mutation_id.to_string(),
+            ));
+        }
+        match delete_tier_mutation_intent_record_if_current(api, expected.mutation_id, &etag).await {
+            Ok(()) | Err(Error::ConfigNotFound) => Ok(true),
+            Err(Error::PreconditionFailed) => Ok(false),
+            Err(err) => Err(tier_mutation_replay_error(err)),
+        }
+    }
+
+    async fn delete_exact_coordinator_terminal_mutation_intent<S>(api: Arc<S>, expected: &TierMutationIntent) -> io::Result<bool>
+    where
+        S: EcstoreObjectIO + EcstoreObjectOperations,
+    {
+        if expected.state == TierMutationIntentState::Prepared {
+            return Err(io::Error::other("refusing to delete a non-terminal coordinator tier mutation intent"));
+        }
+        let (current, etag) =
+            match load_tier_coordinator_mutation_intent_record_with_etag(api.clone(), expected.mutation_id).await {
+                Ok(current) => current,
+                Err(Error::ConfigNotFound) => return Ok(true),
+                Err(err) => return Err(tier_mutation_replay_error(err)),
+            };
+        if current != *expected {
+            return Err(stable_io_error(
+                "coordinator tier mutation intent changed before terminal cleanup",
+                expected.mutation_id.to_string(),
+            ));
+        }
+        match delete_tier_coordinator_mutation_intent_record_if_current(api, expected.mutation_id, &etag).await {
+            Ok(()) | Err(Error::ConfigNotFound) => Ok(true),
+            Err(Error::PreconditionFailed) => Ok(false),
+            Err(err) => Err(tier_mutation_replay_error(err)),
+        }
+    }
+
+    async fn gc_peer_terminal_mutation_intent<S>(api: Arc<S>, mutation_id: uuid::Uuid, now_unix_nanos: i64) -> io::Result<()>
+    where
+        S: EcstoreObjectIO + EcstoreObjectOperations,
+    {
+        let (current, etag) = match load_tier_mutation_intent_record_with_etag(api.clone(), mutation_id).await {
+            Ok(current) => current,
+            Err(Error::ConfigNotFound) => return Ok(()),
+            Err(err) => return Err(tier_mutation_replay_error(err)),
+        };
+        if current.state == TierMutationIntentState::Prepared
+            || !Self::tier_mutation_tombstone_retention_elapsed(&current, now_unix_nanos)
+        {
+            return Ok(());
+        }
+        match load_tier_coordinator_mutation_intent_record_with_etag(api.clone(), mutation_id).await {
+            Ok(_) => return Ok(()),
+            Err(Error::ConfigNotFound) => {}
+            Err(err) => return Err(tier_mutation_replay_error(err)),
+        }
+        match delete_tier_mutation_intent_record_if_current(api, mutation_id, &etag).await {
+            Ok(()) | Err(Error::ConfigNotFound | Error::PreconditionFailed) => Ok(()),
+            Err(err) => Err(tier_mutation_replay_error(err)),
+        }
+    }
+
     async fn reconcile_terminal_dual_prefix_mutation_intents<S>(
         api: Arc<S>,
         snapshot: &mut TierMutationRecoverySnapshot,
@@ -3779,22 +4123,28 @@ impl TierConfigMgr {
                 .iter()
                 .find(|recovered| recovered.intent.mutation_id == intent.mutation_id)
                 .ok_or_else(|| io::Error::other("terminal tier mutation recovery lost its source record"))?;
-            if recovered.peer_state == Some(TierMutationIntentState::Aborted)
-                && recovered.coordinator_state == Some(TierMutationIntentState::Committed)
+            let stale_aborted_peer = recovered.peer_state == Some(TierMutationIntentState::Aborted)
+                && recovered.coordinator_state == Some(TierMutationIntentState::Committed);
             {
-                delete_tier_mutation_intent_record(api.clone(), intent.mutation_id)
-                    .await
-                    .map_err(tier_mutation_replay_error)?;
-                continue;
+                let _mutation_guard = acquire_tier_mutation_mutex(intent.mutation_id).await;
+                if stale_aborted_peer {
+                    let mut peer = intent.original_prepared().map_err(io::Error::other)?;
+                    peer.advance(TierMutationIntentState::Aborted, None)
+                        .map_err(io::Error::other)?;
+                    if !Self::delete_exact_peer_terminal_mutation_intent(api.clone(), &peer).await? {
+                        return Err(io::Error::other("stale aborted peer intent changed during conditional cleanup"));
+                    }
+                    continue;
+                }
+                advance_tier_mutation_intent_record_idempotent(
+                    api.clone(),
+                    intent.mutation_id,
+                    intent.state,
+                    intent.committed_config_etag.clone(),
+                )
+                .await
+                .map_err(io::Error::other)?;
             }
-            advance_tier_mutation_intent_record_idempotent(
-                api.clone(),
-                intent.mutation_id,
-                intent.state,
-                intent.committed_config_etag.clone(),
-            )
-            .await
-            .map_err(io::Error::other)?;
 
             if intent.state == TierMutationIntentState::Aborted {
                 let resolved = match &peers {
@@ -3805,13 +4155,14 @@ impl TierConfigMgr {
                         resolved
                     }
                 };
-                abort_tier_mutation_peers(intent.mutation_id, resolved).await?;
+                abort_tier_mutation_peers(&intent, resolved).await?;
                 if let Some(coordinator) = snapshot
                     .coordinator_intents
                     .iter_mut()
                     .find(|coordinator| coordinator.mutation_id == intent.mutation_id)
                     && coordinator.state == TierMutationIntentState::Prepared
                 {
+                    let _mutation_guard = acquire_tier_mutation_mutex(intent.mutation_id).await;
                     let (advanced, _) = advance_tier_coordinator_mutation_intent_record_idempotent(
                         api.clone(),
                         intent.mutation_id,
@@ -3920,6 +4271,7 @@ impl TierConfigMgr {
                     .etag
                     .as_ref()
                     .ok_or_else(|| io::Error::other("matching coordinator intent has no tier config ETag"))?;
+                let _mutation_guard = acquire_tier_mutation_mutex(intent.mutation_id).await;
                 let (advanced, _) = advance_tier_coordinator_mutation_intent_record_idempotent(
                     api.clone(),
                     intent.mutation_id,
@@ -3929,6 +4281,17 @@ impl TierConfigMgr {
                 .await
                 .map_err(io::Error::other)?;
                 *intent = advanced;
+                continue;
+            }
+
+            let abort_proof_matches = match intent.old_config_etag.as_deref() {
+                Some(old_config_etag) => loaded.etag.as_deref() == Some(old_config_etag),
+                None => intent.kind == TierMutationIntentKind::Add,
+            };
+            if !abort_proof_matches {
+                // A third configuration is neither the candidate nor the old
+                // configuration. Its history is uncertain, so retain the
+                // Prepared record and runtime block for a later proof.
                 continue;
             }
 
@@ -3943,11 +4306,12 @@ impl TierConfigMgr {
             let recovery = if intent.expires_at_unix_nanos <= now {
                 "expired"
             } else {
-                "unmatched"
+                "proven-old"
             };
-            abort_tier_mutation_peers(intent.mutation_id, peers)
+            abort_tier_mutation_peers(intent, peers)
                 .await
                 .map_err(|err| io::Error::other(format!("{recovery} coordinator tier mutation recovery abort failed: {err}")))?;
+            let _mutation_guard = acquire_tier_mutation_mutex(intent.mutation_id).await;
             let (advanced, _) = advance_tier_coordinator_mutation_intent_record_idempotent(
                 api.clone(),
                 intent.mutation_id,
@@ -4059,32 +4423,27 @@ impl TierConfigMgr {
     async fn delete_finished_peer_mutation_intents<S>(
         api: Arc<S>,
         snapshot: &TierMutationRecoverySnapshot,
-        peer_cleanup_order: &[uuid::Uuid],
+        _peer_cleanup_order: &[uuid::Uuid],
     ) -> io::Result<()>
     where
-        S: EcstoreObjectOperations,
+        S: EcstoreObjectIO + EcstoreObjectOperations,
     {
-        let mut mutation_ids = peer_cleanup_order.to_vec();
-        let scheduled = mutation_ids.iter().copied().collect::<HashSet<_>>();
-        let mut remaining = snapshot
+        let now = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(i64::MAX);
+        let mut mutation_ids = snapshot
             .intents
             .iter()
             .filter(|recovered| {
                 recovered.has_peer_record
-                    && matches!(
-                        recovered.intent.state,
-                        TierMutationIntentState::Committed | TierMutationIntentState::Aborted
-                    )
-                    && !scheduled.contains(&recovered.intent.mutation_id)
+                    && recovered.intent.state != TierMutationIntentState::Prepared
+                    && !snapshot.allowance.mutation_ids.contains(&recovered.intent.mutation_id)
             })
             .map(|recovered| recovered.intent.mutation_id)
             .collect::<Vec<_>>();
-        remaining.sort_unstable();
-        mutation_ids.extend(remaining);
+        mutation_ids.sort_unstable();
+        mutation_ids.dedup();
         for mutation_id in mutation_ids {
-            delete_tier_mutation_intent_record(api.clone(), mutation_id)
-                .await
-                .map_err(tier_mutation_replay_error)?;
+            let _mutation_guard = acquire_tier_mutation_mutex(mutation_id).await;
+            Self::gc_peer_terminal_mutation_intent(api.clone(), mutation_id, now).await?;
         }
         Ok(())
     }
@@ -4095,24 +4454,42 @@ impl TierConfigMgr {
         committed_cleanup_order: &[uuid::Uuid],
     ) -> io::Result<()>
     where
-        S: EcstoreObjectOperations,
+        S: EcstoreObjectIO + EcstoreObjectOperations,
     {
         for mutation_id in committed_cleanup_order {
-            delete_tier_coordinator_mutation_intent_record(api.clone(), *mutation_id)
-                .await
-                .map_err(tier_mutation_replay_error)?;
+            let _mutation_guard = acquire_tier_mutation_mutex(*mutation_id).await;
+            let expected = snapshot
+                .coordinator_intents
+                .iter()
+                .find(|intent| intent.mutation_id == *mutation_id)
+                .ok_or_else(|| io::Error::other("coordinator cleanup plan references a missing intent"))?;
+            if !Self::delete_exact_coordinator_terminal_mutation_intent(api.clone(), expected).await? {
+                return Err(stable_io_error(
+                    "coordinator tier mutation intent changed during conditional cleanup",
+                    mutation_id.to_string(),
+                ));
+            }
         }
         let mut aborted = snapshot
-            .intents
+            .coordinator_intents
             .iter()
-            .filter(|recovered| recovered.has_coordinator_record && recovered.intent.state == TierMutationIntentState::Aborted)
-            .map(|recovered| recovered.intent.mutation_id)
+            .filter(|intent| intent.state == TierMutationIntentState::Aborted)
+            .map(|intent| intent.mutation_id)
             .collect::<Vec<_>>();
         aborted.sort_unstable();
         for mutation_id in aborted {
-            delete_tier_coordinator_mutation_intent_record(api.clone(), mutation_id)
-                .await
-                .map_err(tier_mutation_replay_error)?;
+            let _mutation_guard = acquire_tier_mutation_mutex(mutation_id).await;
+            let expected = snapshot
+                .coordinator_intents
+                .iter()
+                .find(|intent| intent.mutation_id == mutation_id)
+                .ok_or_else(|| io::Error::other("aborted coordinator cleanup lost its source intent"))?;
+            if !Self::delete_exact_coordinator_terminal_mutation_intent(api.clone(), expected).await? {
+                return Err(stable_io_error(
+                    "aborted coordinator tier mutation intent changed during conditional cleanup",
+                    mutation_id.to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -4192,13 +4569,36 @@ impl TierConfigMgr {
         expected_revision: u64,
         retain_missing_mutation_blocks: bool,
     ) -> std::result::Result<Option<(MutationBlockAllowance, bool)>, AdminError> {
+        let manager = handle.read().await;
+        let published_digest = if intents
+            .iter()
+            .any(|recovered| recovered.is_peer_only_terminal() && recovered.intent.state == TierMutationIntentState::Committed)
+        {
+            Some(tier_config_candidate_digest(&manager).map_err(|err| {
+                let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+                admin_err.message = format!("Failed to classify retained tier mutation tombstones: {err}");
+                admin_err
+            })?)
+        } else {
+            None
+        };
         let mut prepared_mutation_blocks = HashMap::new();
         let mut committed_mutation_blocks: HashMap<String, HashSet<uuid::Uuid>> = HashMap::new();
         for recovered in intents {
+            let settled_tombstone = recovered.is_peer_only_terminal()
+                && match recovered.intent.state {
+                    TierMutationIntentState::Aborted => true,
+                    TierMutationIntentState::Committed => {
+                        !retain_missing_mutation_blocks || published_digest == Some(recovered.intent.candidate_digest)
+                    }
+                    TierMutationIntentState::Prepared => false,
+                };
+            if settled_tombstone {
+                continue;
+            }
             Self::collect_prepared_mutation_intent_block(&mut prepared_mutation_blocks, &recovered.intent)?;
             Self::collect_committed_mutation_intent_blocks(&mut committed_mutation_blocks, &recovered.intent);
         }
-        let manager = handle.read().await;
         let runtime = tier_driver_runtime(handle, &manager);
         let mut runtime = lock_unpoisoned(&runtime);
         if runtime.mutation_blocks_revision != expected_revision {
@@ -4275,6 +4675,35 @@ impl TierConfigMgr {
             err
         })?;
         runtime.prepared_mutation_blocks = prepared_mutation_blocks;
+        Ok(())
+    }
+
+    pub(crate) async fn wait_for_blocked_tier_operation_leases(
+        handle: &Arc<RwLock<Self>>,
+        intent: &TierMutationIntent,
+    ) -> std::result::Result<(), AdminError> {
+        let generations = {
+            let manager = handle.read().await;
+            let Some(runtime) = registered_tier_driver_runtime(&manager) else {
+                return Ok(());
+            };
+            let runtime = lock_unpoisoned(&runtime);
+            intent
+                .affected_targets
+                .iter()
+                .filter_map(|target| runtime.generations.get(&target.tier_name).cloned())
+                .collect::<Vec<_>>()
+        };
+        let drain = async {
+            for generation in generations {
+                generation.wait_for_no_active_leases().await;
+            }
+        };
+        if tokio::time::timeout(TIER_OPERATION_DRAIN_TIMEOUT, drain).await.is_err() {
+            let mut err = ERR_TIER_BACKEND_IN_USE.clone();
+            err.message = "Timed out waiting for in-flight remote tier operations before reference proof".to_string();
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -7246,7 +7675,15 @@ mod tests {
             self.commit.map_err(Error::other)
         }
 
-        async fn abort_tier_mutation(&self, mutation_id: uuid::Uuid) -> Result<PeerTierMutationState> {
+        async fn abort_tier_mutation(
+            &self,
+            mutation_id: uuid::Uuid,
+            canonical_prepare_payload: Bytes,
+        ) -> Result<PeerTierMutationState> {
+            let prepared = TierMutationIntent::decode(mutation_id, &canonical_prepare_payload).map_err(Error::other)?;
+            if prepared.state != TierMutationIntentState::Prepared || prepared.revision != 1 {
+                return Err(Error::other("test peer requires the original revision-1 Prepared abort payload"));
+            }
             self.record(format!("{}:abort:{}", self.label, mutation_id));
             self.abort.map_err(Error::other)
         }
@@ -7292,7 +7729,11 @@ mod tests {
             Ok(PeerTierMutationState::Committed)
         }
 
-        async fn abort_tier_mutation(&self, _mutation_id: uuid::Uuid) -> Result<PeerTierMutationState> {
+        async fn abort_tier_mutation(
+            &self,
+            _mutation_id: uuid::Uuid,
+            _canonical_prepare_payload: Bytes,
+        ) -> Result<PeerTierMutationState> {
             Ok(PeerTierMutationState::Aborted)
         }
     }
@@ -7345,7 +7786,11 @@ mod tests {
             Ok(PeerTierMutationState::Committed)
         }
 
-        async fn abort_tier_mutation(&self, _mutation_id: uuid::Uuid) -> Result<PeerTierMutationState> {
+        async fn abort_tier_mutation(
+            &self,
+            _mutation_id: uuid::Uuid,
+            _canonical_prepare_payload: Bytes,
+        ) -> Result<PeerTierMutationState> {
             self.track("abort").await;
             Ok(PeerTierMutationState::Aborted)
         }
@@ -7448,12 +7893,13 @@ mod tests {
     #[tokio::test]
     async fn abort_tier_mutation_peers_serializes_shared_record_writes() {
         let mutation_id = uuid::Uuid::from_u128(36);
+        let intent = prepared_remove_intent("COLD-A", mutation_id);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
 
         abort_tier_mutation_peers(
-            mutation_id,
+            &intent,
             vec![
                 ConcurrencyTrackingTierMutationPeer::boxed("peer-a", calls.clone(), active.clone(), max_active.clone()),
                 ConcurrencyTrackingTierMutationPeer::boxed("peer-b", calls.clone(), active.clone(), max_active.clone()),
@@ -7827,8 +8273,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn coordinator_old_protocol_rejection_does_not_leave_local_prepared_block() {
+        let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+        let (mut candidate, version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should reload");
+        let original_version = version.clone();
+        candidate
+            .driver_cache
+            .insert("COLD-A".to_string(), Box::new(LeaseTestBackend::ready("candidate")));
+        let update = TierConfigMgr::admin_update_lock(&manager).await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let old_peer = Arc::new(FakeTierMutationPeer {
+            label: "peer-v1",
+            calls: calls.clone(),
+            prepare: Err("unsupported tier mutation peer protocol version: 3"),
+            commit: Ok(PeerTierMutationState::Committed),
+            abort: Err("unsupported tier mutation peer protocol version: 3"),
+        }) as Arc<dyn TierMutationPeer>;
+
+        let err = TIER_MUTATION_TEST_PEERS
+            .scope(vec![old_peer], async {
+                TierConfigMgr::update_candidate_owned(
+                    &manager,
+                    store.clone(),
+                    candidate,
+                    version,
+                    TierCandidateMutation::Remove("COLD-A".to_string(), true),
+                    update,
+                    None,
+                )
+                .await
+            })
+            .await
+            .expect_err("an old protocol peer must reject the v3 mutation before config CAS");
+        assert!(matches!(err, TierConfigUpdateError::Publish(_)));
+        let calls = lock_unpoisoned(&calls).clone();
+        assert_eq!(calls.len(), 1, "an explicit pre-dispatch rejection must not receive Abort: {calls:?}");
+        assert!(calls[0].starts_with("peer-v1:prepare:"), "{calls:?}");
+
+        let (unchanged, current_version) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config should remain readable");
+        assert_eq!(current_version, original_version);
+        assert!(unchanged.tiers.contains_key("COLD-A"));
+        let intents = TierConfigMgr::load_coordinator_mutation_intents(store)
+            .await
+            .expect("coordinator intent should be readable");
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].state, TierMutationIntentState::Aborted);
+        TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+            .await
+            .expect("old-peer rejection must restore the local data path immediately");
+    }
+
+    #[tokio::test]
     async fn coordinator_prepare_abort_failure_retains_intent_until_reload_converges() {
         let manager = TierConfigMgr::new();
+        {
+            let mut guard = manager.write().await;
+            install_lease_backend(&mut guard, "COLD-A", LeaseTestBackend::ready("old"));
+        }
         let store = Arc::new(CasConfigStore::default());
         let mut persisted = empty_mgr();
         persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
@@ -7885,6 +8401,9 @@ mod tests {
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].state, TierMutationIntentState::Prepared);
         let mutation_id = intents[0].mutation_id;
+        TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+            .await
+            .expect("ambiguous peer cleanup must not leave the coordinator data path fenced");
 
         TIER_MUTATION_TEST_PEERS
             .scope(
@@ -8497,6 +9016,130 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tier_mutation_tombstone_retention_includes_clock_skew_boundary() {
+        let mut intent = prepared_remove_intent("COLD-A", uuid::Uuid::from_u128(0x151));
+        intent.expires_at_unix_nanos = 10_000;
+        intent
+            .advance(TierMutationIntentState::Aborted, None)
+            .expect("fixture should advance to an aborted tombstone");
+        let skew = i64::try_from(TIER_MUTATION_TOMBSTONE_CLOCK_SKEW.as_nanos()).expect("clock skew should fit i64");
+        assert!(!TierConfigMgr::tier_mutation_tombstone_retention_elapsed(
+            &intent,
+            intent.expires_at_unix_nanos.saturating_add(skew).saturating_sub(1),
+        ));
+        assert!(TierConfigMgr::tier_mutation_tombstone_retention_elapsed(
+            &intent,
+            intent.expires_at_unix_nanos.saturating_add(skew),
+        ));
+    }
+
+    #[tokio::test]
+    async fn published_peer_terminal_tombstone_is_retained_without_runtime_fence() {
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+        let (_, current_etag) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should load with metadata");
+        let current_etag = current_etag.expect("tier config fixture should have an ETag");
+        let handle = TierConfigMgr::new();
+        TierConfigMgr::reload_handle_with(&handle, store.clone())
+            .await
+            .expect("initial reload should publish the authoritative config");
+
+        let mutation_id = uuid::Uuid::from_u128(0x152);
+        let mut intent = committed_remove_intent("COLD-A", mutation_id, &current_etag);
+        intent.candidate_digest = tier_config_candidate_digest(&persisted).expect("fixture digest should build");
+        intent.expires_at_unix_nanos = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos())
+            .unwrap_or(i64::MAX)
+            .saturating_add(i64::try_from(TIER_MUTATION_INTENT_TTL.as_nanos()).expect("intent TTL should fit i64"));
+        crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("fresh terminal fixture should persist");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+
+        TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![FakeTierMutationPeer::boxed(
+                    "peer-a",
+                    calls.clone(),
+                    Ok(PeerTierMutationState::Committed),
+                )],
+                async {
+                    TierConfigMgr::reload_handle_with(&handle, store.clone())
+                        .await
+                        .expect("published terminal tombstone should reload");
+                    TierConfigMgr::reload_handle_with(&handle, store.clone())
+                        .await
+                        .expect("retained tombstone reload should be idempotent");
+                },
+            )
+            .await;
+
+        assert!(lock_unpoisoned(&calls).is_empty(), "a settled tombstone must not replay peer Commit");
+        let retained = TierConfigMgr::load_tier_mutation_intents(store)
+            .await
+            .expect("retained tombstone should remain readable");
+        assert_eq!(retained, vec![intent]);
+        let guard = handle.read().await;
+        let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
+        assert!(
+            lock_unpoisoned(&runtime).committed_mutation_blocks.is_empty(),
+            "a retained settled tombstone must not block the published runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_terminal_tombstone_gc_uses_etag_and_retains_racing_replacement() {
+        use crate::services::tier::tier_mutation_intent::{
+            save_tier_mutation_intent_record, tier_mutation_intent_record_object_name,
+        };
+
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+        let (_, current_etag) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should load with metadata");
+        let current_etag = current_etag.expect("tier config fixture should have an ETag");
+        let handle = TierConfigMgr::new();
+        TierConfigMgr::reload_handle_with(&handle, store.clone())
+            .await
+            .expect("initial reload should publish the authoritative config");
+
+        let mutation_id = uuid::Uuid::from_u128(0x153);
+        let mut original = committed_remove_intent("COLD-A", mutation_id, &current_etag);
+        original.candidate_digest = tier_config_candidate_digest(&persisted).expect("fixture digest should build");
+        original.expires_at_unix_nanos = 1;
+        save_tier_mutation_intent_record(store.clone(), &original)
+            .await
+            .expect("expired terminal fixture should persist");
+        let mut replacement = original.clone();
+        replacement.expires_at_unix_nanos = 2;
+        let object = tier_mutation_intent_record_object_name(mutation_id).expect("peer record path should build");
+        store
+            .rewrite_on_next_if_match(object, replacement.encode().expect("replacement should encode"))
+            .await;
+
+        TierConfigMgr::reload_handle_with(&handle, store.clone())
+            .await
+            .expect("a tombstone ETag race should retain the replacement and retry later");
+
+        let retained = TierConfigMgr::load_tier_mutation_intents(store)
+            .await
+            .expect("racing replacement should remain readable");
+        assert_eq!(retained, vec![replacement]);
+    }
+
     #[tokio::test]
     async fn quiescent_reload_scans_each_mutation_prefix_at_entry_and_final_race_check() {
         let store = Arc::new(CasConfigStore::default());
@@ -9098,9 +9741,12 @@ mod tests {
             .insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
         let first = committed_remove_intent("COLD-A", uuid::Uuid::from_u128(0x60), "etag-one");
         let second = committed_remove_intent("COLD-A", uuid::Uuid::from_u128(0x61), "etag-two");
-        TierConfigMgr::reconcile_prepared_mutation_intents(&manager, &[first.clone(), second.clone()])
+        TierConfigMgr::apply_committed_mutation_intent_block(&manager, &first)
             .await
-            .expect("multiple committed blocks for one tier should reconcile");
+            .expect("first committed block should apply");
+        TierConfigMgr::apply_committed_mutation_intent_block(&manager, &second)
+            .await
+            .expect("second committed block should apply");
         let revision = TierConfigMgr::mutation_blocks_revision(&manager).await;
         let update = TierConfigMgr::admin_update_lock(&manager).await;
         let err = TierConfigMgr::publish_candidate_owned_with_allowed_mutation_blocks(
@@ -9229,10 +9875,8 @@ mod tests {
             let guard = second_handle.read().await;
             let runtime = registered_tier_driver_runtime(&guard).expect("runtime should remain registered");
             assert!(
-                lock_unpoisoned(&runtime)
-                    .committed_mutation_blocks
-                    .get("COLD-A")
-                    .is_some_and(|ids| ids.contains(&second_id))
+                lock_unpoisoned(&runtime).committed_mutation_blocks.is_empty(),
+                "a failed tombstone GC must not restore a fence after the authoritative config was published"
             );
         }
         TIER_MUTATION_TEST_PEERS
@@ -9260,6 +9904,71 @@ mod tests {
                 .await
                 .expect("peer scan should succeed after retry")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_terminal_cleanup_uses_etag_and_retains_racing_replacement() {
+        use crate::services::tier::tier_mutation_intent::{
+            TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX, TIER_MUTATION_INTENT_RECORD_PREFIX, save_tier_mutation_intent_record,
+            tier_mutation_intent_record_object_name,
+        };
+
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("tier config fixture should persist");
+        let (_, current_etag) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("tier config fixture should load with metadata");
+        let current_etag = current_etag.expect("tier config fixture should have an ETag");
+        let mutation_id = uuid::Uuid::from_u128(0x154);
+        let mut intent = committed_remove_intent("COLD-A", mutation_id, &current_etag);
+        intent.old_config_etag = Some("previous-etag".to_string());
+        intent.candidate_digest = tier_config_candidate_digest(&persisted).expect("fixture digest should build");
+        save_tier_coordinator_mutation_intent_record_if_absent(store.clone(), &intent)
+            .await
+            .expect("coordinator fixture should persist");
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("peer fixture should persist");
+
+        let peer_object = tier_mutation_intent_record_object_name(mutation_id).expect("peer record path should build");
+        let coordinator_object =
+            peer_object.replacen(TIER_MUTATION_INTENT_RECORD_PREFIX, TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX, 1);
+        let mut replacement = intent.clone();
+        replacement.expires_at_unix_nanos = replacement.expires_at_unix_nanos.saturating_add(1);
+        store
+            .rewrite_on_next_if_match(coordinator_object, replacement.encode().expect("coordinator replacement should encode"))
+            .await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let handle = TierConfigMgr::new();
+        let err = TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![FakeTierMutationPeer::boxed(
+                    "peer-a",
+                    calls,
+                    Ok(PeerTierMutationState::Committed),
+                )],
+                async { TierConfigMgr::reload_handle_with(&handle, store.clone()).await },
+            )
+            .await
+            .expect_err("a coordinator ETag race must fail closed");
+        assert!(err.to_string().contains("changed during conditional cleanup"), "{err}");
+        assert_eq!(
+            TierConfigMgr::load_coordinator_mutation_intents(store.clone())
+                .await
+                .expect("coordinator replacement should remain readable"),
+            vec![replacement]
+        );
+        assert_eq!(
+            TierConfigMgr::load_tier_mutation_intents(store)
+                .await
+                .expect("peer terminal should remain while coordinator cleanup is unresolved"),
+            vec![intent]
         );
     }
 
@@ -9356,14 +10065,13 @@ mod tests {
             .into_iter()
             .filter(|object| object.starts_with(TIER_MUTATION_INTENT_RECORD_PREFIX))
             .collect::<Vec<_>>();
-        assert_eq!(peer_deletes, vec![first_object.clone(), first_object, second_object]);
+        assert_eq!(peer_deletes, vec![first_object.clone(), second_object, first_object]);
         assert_eq!(
             lock_unpoisoned(&calls).as_slice(),
             &[
                 format!("peer-a:commit:{first_id}:intermediate-etag"),
                 format!("peer-a:commit:{second_id}:{current_etag}"),
                 format!("peer-a:commit:{first_id}:intermediate-etag"),
-                format!("peer-a:commit:{second_id}:{current_etag}"),
             ]
         );
     }
@@ -9847,8 +10555,13 @@ mod tests {
             .save_tiering_config_if_current(store.clone(), None)
             .await
             .expect("tier config fixture should persist");
+        let (_, old_config_etag) = load_tier_config_for_update(store.clone())
+            .await
+            .expect("old tier config should load with metadata");
         let mutation_id = uuid::Uuid::from_u128(27);
-        save_tier_coordinator_mutation_intent_record_if_absent(store.clone(), &prepared_remove_intent("COLD-A", mutation_id))
+        let mut intent = prepared_remove_intent("COLD-A", mutation_id);
+        intent.old_config_etag = old_config_etag;
+        save_tier_coordinator_mutation_intent_record_if_absent(store.clone(), &intent)
             .await
             .expect("expired unmatched coordinator intent should persist");
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -9908,6 +10621,50 @@ mod tests {
             intents.is_empty(),
             "expired unmatched coordinator intent should be removed after abort convergence"
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_mutation_recovery_retains_prepared_on_third_config() {
+        let store = Arc::new(CasConfigStore::default());
+        let mut persisted = empty_mgr();
+        persisted.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        persisted
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("third tier config fixture should persist");
+
+        let mutation_id = uuid::Uuid::from_u128(0x94);
+        let mut intent = prepared_remove_intent("COLD-A", mutation_id);
+        intent.old_config_etag = Some("different-old-config-etag".to_string());
+        intent.candidate_digest = [0x94; 32];
+        save_tier_coordinator_mutation_intent_record_if_absent(store.clone(), &intent)
+            .await
+            .expect("prepared coordinator intent should persist");
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut intents = vec![intent];
+        TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![FakeTierMutationPeer::boxed(
+                    "peer-a",
+                    calls.clone(),
+                    Ok(PeerTierMutationState::Aborted),
+                )],
+                async {
+                    TierConfigMgr::recover_prepared_coordinator_mutation_intents(store.clone(), &mut intents)
+                        .await
+                        .expect("uncertain third config should be retained without fanout");
+                },
+            )
+            .await;
+
+        assert_eq!(intents[0].state, TierMutationIntentState::Prepared);
+        assert!(lock_unpoisoned(&calls).is_empty(), "uncertain recovery must not contact peers");
+        let persisted = TierConfigMgr::load_coordinator_mutation_intents(store)
+            .await
+            .expect("coordinator scan should retain uncertain evidence");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].state, TierMutationIntentState::Prepared);
     }
 
     #[tokio::test]
@@ -11461,7 +12218,8 @@ mod tests {
         delete_log: tokio::sync::Mutex<Vec<String>>,
         list_barrier: tokio::sync::Mutex<Option<Arc<CasListBarrier>>>,
         intent_list_calls: AtomicUsize,
-        truncate_reference_page_without_marker: AtomicBool,
+        fail_reference_walk: AtomicBool,
+        reference_walk_send_count: AtomicUsize,
         lock_manager: Arc<rustfs_lock::GlobalLockManager>,
         lock_requests: Mutex<Vec<(String, String)>>,
         listed_versions: Mutex<Vec<ObjectInfo>>,
@@ -11482,7 +12240,8 @@ mod tests {
                 delete_log: tokio::sync::Mutex::new(Vec::new()),
                 list_barrier: tokio::sync::Mutex::new(None),
                 intent_list_calls: AtomicUsize::new(0),
-                truncate_reference_page_without_marker: AtomicBool::new(false),
+                fail_reference_walk: AtomicBool::new(false),
+                reference_walk_send_count: AtomicUsize::new(0),
                 lock_manager: Arc::new(rustfs_lock::GlobalLockManager::new()),
                 lock_requests: Mutex::new(Vec::new()),
                 listed_versions: Mutex::new(Vec::new()),
@@ -11531,8 +12290,12 @@ mod tests {
             self.if_match_race_rewrite.lock().await.push_back((object, data));
         }
 
-        fn omit_truncated_reference_marker(&self) {
-            self.truncate_reference_page_without_marker.store(true, Ordering::SeqCst);
+        fn fail_reference_walk(&self) {
+            self.fail_reference_walk.store(true, Ordering::SeqCst);
+        }
+
+        fn reference_walk_send_count(&self) -> usize {
+            self.reference_walk_send_count.load(Ordering::SeqCst)
         }
 
         async fn fail_next_delete_with_prefix(&self, prefix: &str) {
@@ -11750,7 +12513,7 @@ mod tests {
             Err(Error::NotImplemented)
         }
 
-        async fn delete_object(&self, bucket: &str, object: &str, _opts: Self::ObjectOptions) -> Result<Self::ObjectInfo> {
+        async fn delete_object(&self, bucket: &str, object: &str, opts: Self::ObjectOptions) -> Result<Self::ObjectInfo> {
             self.delete_log.lock().await.push(object.to_string());
             let mut fail_delete_prefix = self.fail_delete_prefix.lock().await;
             let fail_now = match fail_delete_prefix.as_mut() {
@@ -11769,10 +12532,32 @@ mod tests {
                 return Err(Error::other("injected tier mutation intent delete failure"));
             }
             drop(fail_delete_prefix);
+            let race_rewrite = if opts
+                .http_preconditions
+                .as_ref()
+                .and_then(HTTPPreconditions::if_match_value)
+                .is_some()
+            {
+                self.if_match_race_rewrite.lock().await.pop_front()
+            } else {
+                None
+            };
             let mut objects = self.objects.lock().await;
+            if let Some((target, data)) = race_rewrite
+                && target == object
+            {
+                let etag = self.next_object_etag(&data);
+                objects.insert(object.to_string(), (data, etag));
+            }
             let (data, etag) = objects
-                .remove(object)
+                .get(object)
+                .cloned()
                 .ok_or_else(|| Error::ObjectNotFound(bucket.to_string(), object.to_string()))?;
+            opts.precondition_check(&ObjectInfo {
+                etag: Some(etag.clone()),
+                ..Default::default()
+            })?;
+            objects.remove(object);
             Ok(ObjectInfo {
                 bucket: bucket.to_string(),
                 name: object.to_string(),
@@ -12008,7 +12793,7 @@ mod tests {
             if is_truncated {
                 objects.truncate(limit);
             }
-            let (mut next_marker, next_version_idmarker) = if is_truncated {
+            let (next_marker, next_version_idmarker) = if is_truncated {
                 objects
                     .last()
                     .map(|object| (Some(object.name.clone()), object.version_id.map(|version| version.to_string())))
@@ -12016,9 +12801,6 @@ mod tests {
             } else {
                 (None, None)
             };
-            if is_truncated && self.truncate_reference_page_without_marker.load(Ordering::SeqCst) {
-                next_marker = None;
-            }
             Ok(StorageListObjectVersionsInfo {
                 is_truncated,
                 next_marker,
@@ -12030,13 +12812,57 @@ mod tests {
 
         async fn walk(
             self: Arc<Self>,
-            _rx: Self::WalkCancellation,
-            _bucket: &str,
-            _prefix: &str,
-            _result: Self::WalkResultSender,
-            _opts: Self::WalkOptions,
+            rx: Self::WalkCancellation,
+            bucket: &str,
+            prefix: &str,
+            result: Self::WalkResultSender,
+            opts: Self::WalkOptions,
         ) -> Result<()> {
-            Err(Error::NotImplemented)
+            if self.fail_reference_walk.load(Ordering::SeqCst) {
+                if result
+                    .send(StorageObjectInfoOrErr {
+                        item: None,
+                        err: Some(Error::other("injected tier reference walk failure")),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            let mut objects = self
+                .listed_versions
+                .lock()
+                .expect("tier reference fixture should not poison")
+                .iter()
+                .filter(|object| object.bucket == bucket && object.name.starts_with(prefix))
+                .filter(|object| opts.include_free_versions || !object.transitioned_object.free_version)
+                .cloned()
+                .collect::<Vec<_>>();
+            objects.sort_by(|left, right| tier_test_object_marker(left).cmp(&tier_test_object_marker(right)));
+            if let Some(marker) = opts.marker.as_deref() {
+                objects.retain(|object| object.name.as_str() > marker);
+            }
+            if opts.limit > 0 {
+                objects.truncate(opts.limit);
+            }
+            for object in objects {
+                if rx.is_cancelled() {
+                    return Err(Error::other("tier reference fixture walk cancelled"));
+                }
+                self.reference_walk_send_count.fetch_add(1, Ordering::SeqCst);
+                if result
+                    .send(StorageObjectInfoOrErr {
+                        item: Some(object),
+                        err: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            Ok(())
         }
     }
 
@@ -12172,6 +12998,13 @@ mod tests {
             .await
             .expect("reference proof fixture should persist");
         store.add_listed_version(transitioned_tier_object("photos", "2026/a.jpg", "COLD-A", Some(identity)));
+        for index in 0..500 {
+            store.add_listed_version(ObjectInfo {
+                bucket: "photos".to_string(),
+                name: format!("zz-safe/{index:04}.jpg"),
+                ..Default::default()
+            });
+        }
 
         let manager = TierConfigMgr::new();
         manager.write().await.tiers.insert("COLD-A".to_string(), tier);
@@ -12187,6 +13020,10 @@ mod tests {
             other => panic!("reference proof failures must be surfaced as publish errors: {other:?}"),
         }
         assert!(manager.read().await.tiers.contains_key("COLD-A"));
+        assert!(
+            store.reference_walk_send_count() < 501,
+            "the proof should cancel its internal walk after the first authoritative blocker"
+        );
         assert!(
             load_tier_config_for_update(store)
                 .await
@@ -12337,7 +13174,7 @@ mod tests {
             "COLD-A",
             Some(current_identity),
         ));
-        let err = ensure_no_authoritative_tier_object_references(store, &[target], false)
+        let err = ensure_no_authoritative_tier_object_references(store.clone(), &[target], false)
             .await
             .expect_err("references to the old destination identity must block rebind");
         assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
@@ -12497,6 +13334,7 @@ mod tests {
 
         let journal_store = Arc::new(CasConfigStore::default());
         let journal = crate::bucket::lifecycle::tier_sweeper::Jentry {
+            persisted_version: 0,
             obj_name: "remote/journal-object".to_string(),
             version_id: "v1".to_string(),
             tier_name: "COLD-A".to_string(),
@@ -12505,6 +13343,7 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
         journal_store
             .insert_config_object(
@@ -12573,7 +13412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_reference_proof_fails_closed_when_version_listing_marker_is_missing() {
+    async fn zero_reference_proof_fails_closed_when_internal_walk_fails() {
         let current = build_rustfs_tier("COLD-A");
         let current_identity = tier_backend_identity(&current).expect("current identity should encode");
         let target = TierMutationIntentTarget {
@@ -12582,23 +13421,32 @@ mod tests {
             new_backend_identity: None,
         };
         let store = Arc::new(CasConfigStore::default());
-        for index in 0..=TIER_REFERENCE_PROOF_LIST_LIMIT {
+        store.add_listed_version(ObjectInfo {
+            bucket: "photos".to_string(),
+            name: "safe/object.jpg".to_string(),
+            ..Default::default()
+        });
+        for index in 0..500 {
             store.add_listed_version(ObjectInfo {
                 bucket: "photos".to_string(),
-                name: format!("safe/{index:04}.jpg"),
+                name: format!("safe/trailing-{index:04}.jpg"),
                 ..Default::default()
             });
         }
-        store.omit_truncated_reference_marker();
+        store.fail_reference_walk();
 
-        let err = ensure_no_authoritative_tier_object_references(store, &[target], false)
+        let err = ensure_no_authoritative_tier_object_references(store.clone(), &[target], false)
             .await
-            .expect_err("truncated authoritative reference scan without a marker must fail closed");
+            .expect_err("authoritative internal walk failure must fail closed");
         assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
         assert!(
-            err.message.contains("truncated without a next marker"),
+            err.message.contains("injected tier reference walk failure"),
             "unexpected reference proof error: {}",
             err.message
+        );
+        assert!(
+            store.reference_walk_send_count() <= 100,
+            "the first terminal walk error may overshoot only by the bounded channel capacity"
         );
     }
 

@@ -356,7 +356,7 @@ impl ECStore {
             };
             run_guard.ensure_held("rebalance version migration")?;
             let result = migrate_entry_version(
-                &RebalanceMigrationBackend::new(set.as_ref(), self.as_ref(), lock_lost_signal.clone()),
+                &RebalanceMigrationBackend::new(set.as_ref(), self.clone(), lock_lost_signal.clone()),
                 bucket.clone(),
                 pool_index,
                 version,
