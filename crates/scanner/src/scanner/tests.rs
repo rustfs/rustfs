@@ -1287,6 +1287,7 @@ fn scanner_startup_fails_closed_on_nonempty_corrupt_cycle_state() {
 }
 
 #[tokio::test]
+#[serial]
 async fn corrupt_cycle_state_is_quarantined_once() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -1337,6 +1338,7 @@ async fn corrupt_cycle_state_is_quarantined_once() {
 }
 
 #[tokio::test]
+#[serial]
 async fn empty_cycle_state_object_is_quarantined_as_corrupt() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -1357,6 +1359,7 @@ async fn empty_cycle_state_object_is_quarantined_as_corrupt() {
 }
 
 #[tokio::test]
+#[serial]
 async fn future_cycle_state_schema_is_recovery_required() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -1375,6 +1378,7 @@ async fn future_cycle_state_schema_is_recovery_required() {
 }
 
 #[tokio::test]
+#[serial]
 async fn concurrent_leaders_cannot_quarantine_newer_cycle_state() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -1401,6 +1405,7 @@ async fn concurrent_leaders_cannot_quarantine_newer_cycle_state() {
 }
 
 #[tokio::test]
+#[serial]
 async fn cleanup_pending_marker_blocks_a_rewritten_primary_after_restart() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -1476,6 +1481,7 @@ fn full_rescan_reset_accepts_unknown_marker_fields_without_trusting_cursor() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rebuilds_after_malformed_marker_without_trusting_cursor() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0xff, 0x00, 0x01])
@@ -1502,6 +1508,7 @@ async fn full_rescan_reset_rebuilds_after_malformed_marker_without_trusting_curs
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_ignores_epoch_from_malformed_future_primary() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let mut future_primary = vec![0; 24];
@@ -1562,6 +1569,7 @@ async fn ecstore_exact_recovery_marker_delete_honors_etag() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rejects_corrupt_primary_under_stale_blocked_marker() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let corrupt_primary = vec![0xff, 0x00, 0x01];
@@ -1612,6 +1620,7 @@ async fn full_rescan_reset_rejects_corrupt_primary_under_stale_blocked_marker() 
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_preserves_valid_primary_when_marker_is_malformed() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let primary = CurrentCycle {
@@ -1683,6 +1692,7 @@ async fn full_rescan_reset_preserves_valid_primary_when_marker_is_malformed() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_resumes_cleanup_pending_preserved_primary() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let completed_at = Utc::now();
@@ -1762,6 +1772,7 @@ async fn full_rescan_reset_resumes_cleanup_pending_preserved_primary() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rebuilds_oversized_regular_primary_with_malformed_marker() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0; 1024 * 1024 + 1])
@@ -1788,6 +1799,7 @@ async fn full_rescan_reset_rebuilds_oversized_regular_primary_with_malformed_mar
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rebuilds_oversized_primary_after_cleanup_marker() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0; 1024 * 1024 + 1])
@@ -1838,6 +1850,7 @@ async fn full_rescan_reset_rebuilds_oversized_primary_after_cleanup_marker() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rebuilds_with_oversized_marker() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0xff, 0x00, 0x01])
@@ -1863,6 +1876,7 @@ async fn full_rescan_reset_rebuilds_with_oversized_marker() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rebuilds_with_empty_marker() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0xff, 0x00, 0x01])
@@ -1888,6 +1902,7 @@ async fn full_rescan_reset_rebuilds_with_empty_marker() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_keeps_cleanup_marker_when_preserved_epoch_is_exhausted() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let primary = CurrentCycle {
@@ -1927,6 +1942,7 @@ async fn full_rescan_reset_keeps_cleanup_marker_when_preserved_epoch_is_exhauste
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rejects_preserved_epoch_that_would_be_terminal() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let primary = CurrentCycle {
@@ -1963,6 +1979,7 @@ async fn full_rescan_reset_rejects_preserved_epoch_that_would_be_terminal() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rejects_usage_floor_that_would_be_terminal() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), vec![0xff, 0x00, 0x01])
@@ -1998,6 +2015,7 @@ async fn full_rescan_reset_rejects_usage_floor_that_would_be_terminal() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rebuilds_empty_primary_with_malformed_marker() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     save_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str(), Vec::new())
@@ -2024,6 +2042,7 @@ async fn full_rescan_reset_rebuilds_empty_primary_with_malformed_marker() {
 }
 
 #[tokio::test]
+#[serial]
 async fn full_rescan_reset_rebuilds_when_primary_cycle_state_is_missing() {
     let (_temp_dir, store) = setup_scanner_cycle_store().await;
     let marker = ScannerCycleRecoveryMarker {
@@ -2064,6 +2083,7 @@ async fn full_rescan_reset_rebuilds_when_primary_cycle_state_is_missing() {
 }
 
 #[tokio::test]
+#[serial]
 async fn corrupt_cycle_state_rename_or_marker_failure_stays_recovery_required() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -2089,6 +2109,7 @@ async fn corrupt_cycle_state_rename_or_marker_failure_stays_recovery_required() 
 }
 
 #[tokio::test]
+#[serial]
 async fn oversized_or_symlinked_cycle_state_is_rejected() {
     let store = Arc::new(MemoryConfigStore::default());
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -3328,6 +3349,7 @@ fn fenced_usage_bootstrap_retains_partial_cycle_progress() {
 }
 
 #[tokio::test]
+#[serial]
 async fn missing_usage_floor_rebuilds_persisted_cycle_before_leadership_claim() {
     let store = Arc::new(MemoryConfigStore::default());
     let state_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_BLOOM_NAME_PATH.as_str());
@@ -4283,6 +4305,7 @@ async fn cycle_budget_lease_takeover_rejects_old_generation() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_preserves_newer_snapshot() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(2);
@@ -4309,6 +4332,7 @@ async fn test_store_data_usage_in_backend_preserves_newer_snapshot() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_usage_save_object_not_found_defers_only_with_a_fresh_route_barrier() {
     for (route_blocked, expected) in [
         (true, DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::DataMovement)),
@@ -4368,6 +4392,7 @@ async fn test_usage_save_object_not_found_defers_only_with_a_fresh_route_barrier
 }
 
 #[tokio::test]
+#[serial]
 async fn test_usage_save_route_barrier_prevents_missing_snapshot_creation() {
     for observational in [false, true] {
         let store = Arc::new(MemoryConfigStore::default());
@@ -4407,6 +4432,7 @@ async fn test_usage_save_route_barrier_prevents_missing_snapshot_creation() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_observational_usage_defers_when_authoritative_baseline_is_missing() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(1);
@@ -4436,6 +4462,7 @@ async fn test_observational_usage_defers_when_authoritative_baseline_is_missing(
 }
 
 #[tokio::test]
+#[serial]
 async fn test_observational_usage_uses_fenced_backup_when_v2_primary_has_no_identity() {
     let store = Arc::new(MemoryConfigStore::default());
     let primary = DataUsageInfo {
@@ -4537,6 +4564,7 @@ async fn test_usage_route_barrier_precedes_durable_reconciliation() {
 }
 
 #[tokio::test]
+#[serial]
 async fn coordinator_does_not_put_after_remote_generation_flip() {
     let store = Arc::new(MemoryConfigStore::default());
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -4578,6 +4606,7 @@ async fn coordinator_does_not_put_after_remote_generation_flip() {
 }
 
 #[tokio::test]
+#[serial]
 async fn coordinator_classifies_an_expired_publication_lease() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(1);
@@ -4696,6 +4725,7 @@ async fn test_deferred_usage_save_keeps_last_real_save_metric() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_fences_interleaving_newer_writer() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(1);
@@ -4725,6 +4755,7 @@ async fn test_store_data_usage_in_backend_fences_interleaving_newer_writer() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_does_not_resurrect_deleted_bucket_after_conflict() {
     let store = Arc::new(MemoryConfigStore::default());
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -4796,6 +4827,7 @@ async fn test_store_data_usage_in_backend_does_not_resurrect_deleted_bucket_afte
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_updates_backup_with_new_bucket() {
     let store = Arc::new(MemoryConfigStore::default());
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -4856,6 +4888,7 @@ async fn test_store_data_usage_in_backend_updates_backup_with_new_bucket() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_repairs_backup_after_primary_only_commit() {
     let store = Arc::new(MemoryConfigStore::default());
     let main_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -4885,6 +4918,7 @@ async fn test_store_data_usage_in_backend_repairs_backup_after_primary_only_comm
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_copies_concurrent_bucket_removal_to_backup() {
     let store = Arc::new(MemoryConfigStore::default());
     let main_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -4951,6 +4985,7 @@ async fn test_store_data_usage_in_backend_copies_concurrent_bucket_removal_to_ba
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_retries_after_stale_interleaving_writer() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(1);
@@ -4991,6 +5026,7 @@ async fn test_store_data_usage_in_backend_retries_after_stale_interleaving_write
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_rejects_untimestamped_complete_snapshot() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(2);
@@ -5023,6 +5059,7 @@ async fn test_store_data_usage_in_backend_rejects_untimestamped_complete_snapsho
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_recognizes_already_durable_snapshot() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(1);
@@ -5053,6 +5090,7 @@ async fn test_store_data_usage_in_backend_recognizes_already_durable_snapshot() 
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_advances_past_changed_same_epoch_cycle() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(1);
@@ -5102,6 +5140,7 @@ async fn test_store_data_usage_in_backend_advances_past_changed_same_epoch_cycle
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_orders_scanner_cycles_before_wall_clock() {
     let store = Arc::new(MemoryConfigStore::default());
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -5162,6 +5201,7 @@ async fn test_store_data_usage_in_backend_orders_scanner_cycles_before_wall_cloc
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_orders_leader_epochs_before_cycles() {
     let store = Arc::new(MemoryConfigStore::default());
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -5224,6 +5264,7 @@ async fn test_store_data_usage_in_backend_orders_leader_epochs_before_cycles() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_keeps_first_same_cycle_snapshot() {
     let store = Arc::new(MemoryConfigStore::default());
     let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -5270,6 +5311,7 @@ async fn test_store_data_usage_in_backend_keeps_first_same_cycle_snapshot() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_rejects_incomplete_snapshot() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(2);
@@ -5302,6 +5344,7 @@ async fn test_store_data_usage_in_backend_rejects_incomplete_snapshot() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_preserves_superseded_status() {
     let store = Arc::new(MemoryConfigStore::default());
     let authoritative_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -5353,6 +5396,7 @@ async fn test_store_data_usage_in_backend_preserves_superseded_status() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_removes_observed_after_authoritative_save() {
     let store = Arc::new(MemoryConfigStore::default());
     let authoritative_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -5542,6 +5586,7 @@ fn test_stale_data_usage_update_reason_preserves_none_handling() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_keeps_backup_when_primary_save_fails() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(11);
@@ -5584,6 +5629,7 @@ async fn test_store_data_usage_in_backend_keeps_backup_when_primary_save_fails()
 }
 
 #[tokio::test]
+#[serial]
 async fn test_store_data_usage_in_backend_reports_missing_snapshot() {
     let store = Arc::new(MemoryConfigStore::default());
     let (sender, receiver) = mpsc::channel(1);

@@ -929,7 +929,7 @@ impl ECStore {
                 results.push(RebalanceDeletePoolResult {
                     pool_idx: idx,
                     result: self
-                        .run_external_decommission_capacity_object_mutation(
+                        .run_external_decommission_capacity_object_delete(
                             idx,
                             bucket,
                             object,

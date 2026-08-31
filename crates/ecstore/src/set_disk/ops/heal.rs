@@ -36,6 +36,20 @@ const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
 const HEAL_RENAME_INCOMPLETE: &str = "heal rename incomplete";
 const READ_REPAIR_DATA_PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+fn heal_drive_state_for_error(error: &DiskError) -> DriveState {
+    match error {
+        DiskError::DiskNotFound | DiskError::RemoteClientUnavailable(_) => DriveState::Offline,
+        DiskError::FaultyDisk | DiskError::FaultyRemoteDisk => DriveState::Faulty,
+        DiskError::FileNotFound
+        | DiskError::FileVersionNotFound
+        | DiskError::VolumeNotFound
+        | DiskError::PartMissingOrCorrupt
+        | DiskError::OutdatedXLMeta => DriveState::Missing,
+        DiskError::FileCorrupt => DriveState::Corrupt,
+        _ => DriveState::Unknown(error.to_string()),
+    }
+}
+
 #[cfg(test)]
 static HEAL_RENAME_FAILURES: std::sync::Mutex<Vec<(String, String, usize)>> = std::sync::Mutex::new(Vec::new());
 
@@ -892,16 +906,7 @@ impl SetDisks {
                             }
 
                             let drive_state = match reason {
-                                Some(err) => match err {
-                                    DiskError::DiskNotFound => DriveState::Offline.to_string(),
-                                    DiskError::FileNotFound
-                                    | DiskError::FileVersionNotFound
-                                    | DiskError::VolumeNotFound
-                                    | DiskError::PartMissingOrCorrupt
-                                    | DiskError::OutdatedXLMeta => DriveState::Missing.to_string(),
-                                    DiskError::FileCorrupt => DriveState::Corrupt.to_string(),
-                                    _ => DriveState::Unknown(err.to_string()).to_string(),
-                                },
+                                Some(err) => heal_drive_state_for_error(&err).to_string(),
                                 None => DriveState::Ok.to_string(),
                             };
                             result.before.drives.push(HealDriveInfo {
@@ -2671,6 +2676,17 @@ mod heal_result_report_tests {
         assert!(!super::metadata_less_part_file("part."));
         assert!(!super::metadata_less_part_file("part.x"));
         assert!(!super::metadata_less_part_file("xl.meta"));
+    }
+
+    #[test]
+    fn unavailable_heal_errors_use_stable_drive_states() {
+        for error in [DiskError::FaultyDisk, DiskError::FaultyRemoteDisk] {
+            assert_eq!(super::heal_drive_state_for_error(&error).to_string(), DriveState::Faulty.to_string());
+        }
+        assert_eq!(
+            super::heal_drive_state_for_error(&DiskError::RemoteClientUnavailable("peer restarting".to_string())).to_string(),
+            DriveState::Offline.to_string()
+        );
     }
 
     #[test]

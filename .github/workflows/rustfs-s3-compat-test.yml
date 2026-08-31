@@ -12,8 +12,8 @@ on:
         required: false
         type: string
   workflow_run:
-    # Run after the nightly build completes; the nightly deb is what the test installs.
-    workflows: ["Nightly GNU Build"]
+    # Run after upgrade compatibility completes; the nightly deb is what the test installs.
+    workflows: ["RustFS Upgrade Test"]
     types: [completed]
 
 permissions:
@@ -270,6 +270,7 @@ jobs:
                 { key: 'heal', label: 'Heal' },
                 { key: 'pool', label: 'Pool Expansion' },
                 { key: 'security', label: 'Security' },
+                { key: 'upgrade', label: 'Upgrade' },
               ];
               const tabs = document.getElementById('tabs');
               const list = document.getElementById('list');
