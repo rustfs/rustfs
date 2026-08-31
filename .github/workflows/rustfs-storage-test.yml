@@ -1,4 +1,4 @@
-name: RustFS S3 Compatibility Test
+name: RustFS Storage Engine Test
 
 on:
   workflow_dispatch:
@@ -11,9 +11,18 @@ on:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
         type: string
+      topology:
+        description: 'Topology to run (all = SNSD, SNMD, MNMD)'
+        type: choice
+        options:
+          - all
+          - single-single
+          - single-multi
+          - multi-multi
+        default: all
   workflow_run:
-    # Run after upgrade compatibility completes; the nightly deb is what the test installs.
-    workflows: ["RustFS Upgrade Test"]
+    # Strict shared-environment order: run after tier test completes.
+    workflows: ["RustFS Tier Test"]
     types: [completed]
 
 permissions:
@@ -36,7 +45,7 @@ env:
   PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
 jobs:
-  s3-compat-test:
+  storage-test:
     runs-on: smoke-testing
     continue-on-error: true
     timeout-minutes: 360
@@ -72,21 +81,27 @@ jobs:
                 ${SUDO} dpkg -P rustfs
               fi
               for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
-              ${SUDO} rm -rf /var/log/rustfs
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
             '
           done
 
-      - name: Run S3 compatibility suite
+      - name: Run storage engine suite
         id: test
         continue-on-error: true
         env:
-          LOG_FILE: /tmp/rustfs-s3-compat.log
+          LOG_FILE: /tmp/rustfs-storage.log
         run: |
           set -euo pipefail
-          chmod +x auto-testing/rustfs-s3-compat-test.sh
+          chmod +x auto-testing/rustfs-storage-test.sh
           PACKAGE_URL='${{ inputs.package_url }}'
           RUSTFS_VERSION='${{ inputs.rustfs_version }}'
-          ARGS=(--all-topologies -y --log-file "${LOG_FILE}")
+          TOPOLOGY='${{ inputs.topology }}'
+          ARGS=(-y --log-file "${LOG_FILE}")
+          if [ "${TOPOLOGY}" = "all" ] || [ -z "${TOPOLOGY}" ] || [ "${TOPOLOGY}" = "null" ]; then
+            ARGS+=(--all-topologies)
+          else
+            ARGS+=(--topology "${TOPOLOGY}")
+          fi
           if [ -n "${PACKAGE_URL}" ]; then
             ARGS+=(--package-url "${PACKAGE_URL}")
           elif [ -n "${RUSTFS_VERSION}" ]; then
@@ -94,13 +109,13 @@ jobs:
           else
             ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
           fi
-          ./auto-testing/rustfs-s3-compat-test.sh "${ARGS[@]}"
+          ./auto-testing/rustfs-storage-test.sh "${ARGS[@]}"
 
       - name: Generate report
         if: always()
         env:
-          LOG_FILE: /tmp/rustfs-s3-compat.log
-          REPORT_FILE: /tmp/rustfs-s3-compat-report.md
+          LOG_FILE: /tmp/rustfs-storage.log
+          REPORT_FILE: /tmp/rustfs-storage-report.md
         run: |
           set -euo pipefail
           PACKAGE_URL='${{ inputs.package_url }}'
@@ -122,7 +137,7 @@ jobs:
               RUSTFS_VERSION_INFO="${DETECTED_VERSION}"
             fi
           fi
-          CASE_TABLE="/tmp/rustfs-s3-compat-cases.md"
+          CASE_TABLE="/tmp/rustfs-storage-cases.md"
           python3 - "${LOG_FILE}" "${CASE_TABLE}" <<'PY'
           import re
           import sys
@@ -176,7 +191,7 @@ jobs:
               out.write(f'| {case_id} | {name} | {status} |\\n')
           PY
           {
-            echo "# RustFS S3 compatibility test report"
+            echo "# RustFS storage engine test report"
             echo ""
             echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "- Trigger: ${{ github.event_name }}"
@@ -198,8 +213,8 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
-          REPORT_FILE: /tmp/rustfs-s3-compat-report.md
-          SUITE: s3
+          REPORT_FILE: /tmp/rustfs-storage-report.md
+          SUITE: storage
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -267,6 +282,7 @@ jobs:
                 { key: 's3', label: 'S3 Compatibility' },
                 { key: 'kms', label: 'KMS' },
                 { key: 'tier', label: 'Tier' },
+                { key: 'storage', label: 'Storage Engine' },
                 { key: 'heal', label: 'Heal' },
                 { key: 'pool', label: 'Pool Expansion' },
                 { key: 'security', label: 'Security' },
@@ -374,10 +390,10 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: rustfs-s3-compat-${{ github.run_id }}
+          name: rustfs-storage-${{ github.run_id }}
           path: |
-            /tmp/rustfs-s3-compat.log
-            /tmp/rustfs-s3-compat-report.md
+            /tmp/rustfs-storage.log
+            /tmp/rustfs-storage-report.md
           if-no-files-found: warn
 
       - name: Cleanup environment (after)
@@ -402,5 +418,5 @@ jobs:
       - name: Notify on failure
         if: failure()
         run: |
-          echo "RustFS S3 compatibility suite failed"
+          echo "RustFS storage engine suite failed"
           echo "See the uploaded report and log artifacts for details."
