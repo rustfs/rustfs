@@ -125,6 +125,13 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup) | test(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page) | test(decommission_durable_ilm_recovery_keeps_multiple_active_sources))'
 test-group = 'ecstore-serial-flaky'
 
+# Decommission entry and marker/barrier tests share process-wide fault hooks and
+# deterministic commit barriers. Keep the whole init decommission family in one
+# nextest group; serial_test alone cannot isolate separate test processes.
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_|suspended_.*decommission)$/)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the bucket-incarnation / lifecycle-fence tests. They drive
 # init_bucket_metadata_sys and bucket_metadata_sys_of, i.e. process-global
 # OnceLock state that serial_test's #[serial] cannot protect across nextest's
@@ -263,6 +270,10 @@ test-group = 'ecstore-serial-flaky'
 
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & (test(decommission_migrates_and_verifies_registered_durable_ilm_records) | test(decommission_durable_ilm_target_read_error_is_not_masked_by_peer_success) | test(decommission_durable_ilm_terminal_receipt_recovers_failed_source_cleanup) | test(decommission_durable_ilm_receipt_pagination_fails_closed_on_second_page) | test(decommission_durable_ilm_recovery_keeps_multiple_active_sources))'
+test-group = 'ecstore-serial-flaky'
+
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^store::init::tests::(decommission_|suspended_.*decommission)$/)'
 test-group = 'ecstore-serial-flaky'
 
 # Serialize the bucket-incarnation / lifecycle-fence tests under the ci profile
