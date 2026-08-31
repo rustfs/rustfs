@@ -161,7 +161,7 @@ use rustfs_utils::http::{
 };
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_utils::retry::{DEFAULT_RETRY_CAP, DEFAULT_RETRY_UNIT, MAX_JITTER, RetryTimer};
-use rustfs_zip::{ArchiveLimits, CompressionFormat};
+use rustfs_zip::{ArchiveLimits, CompressionFormat, ZipError};
 use s3s::StdError;
 use s3s::dto::{
     CacheControl, Checksum, ChecksumAlgorithm, ChecksumType, ContentDisposition, ContentEncoding, ContentLanguage, ContentType,
