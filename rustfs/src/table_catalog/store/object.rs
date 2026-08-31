@@ -4636,6 +4636,66 @@ where
         Ok(None)
     }
 
+    async fn update_namespace_properties(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        update: NamespacePropertiesUpdate,
+    ) -> TableCatalogStoreResult<NamespacePropertiesUpdateResult> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        self.require_table_bucket(table_bucket).await?;
+        let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
+        let bucket_path = self.paths.table_bucket_entry_path(table_bucket);
+        let _bucket_guard = self.backend.acquire_write_lock(self.catalog_bucket(), &bucket_path).await?;
+        let namespace_path = self.paths.namespace_entry_path(table_bucket, &namespace);
+        let _namespace_guard = self
+            .backend
+            .acquire_write_lock(self.catalog_bucket(), &namespace_path)
+            .await?;
+
+        let current = self
+            .read_entry_unlocked::<NamespaceEntry>(self.catalog_bucket(), &namespace_path)
+            .await?;
+        let (mut next, precondition) = match current {
+            Some((entry, etag)) => {
+                validate_namespace_entry_object(&self.paths, &namespace_path, &entry)?;
+                validate_namespace_properties(&entry.properties)?;
+                if entry.state != TableCatalogEntryState::Active {
+                    return Err(TableCatalogStoreError::NotFound(format!(
+                        "namespace {table_bucket}/{}",
+                        namespace.public_name()
+                    )));
+                }
+                let etag = etag.ok_or_else(|| {
+                    TableCatalogStoreError::Internal(format!("catalog namespace entry has no etag: {namespace_path}"))
+                })?;
+                (entry, TableCatalogPutPrecondition::IfMatch(etag))
+            }
+            None => {
+                if !self.has_active_namespace_object(table_bucket, &namespace).await?
+                    && !self.has_active_namespace_descendant(table_bucket, &namespace).await?
+                {
+                    return Err(TableCatalogStoreError::NotFound(format!(
+                        "namespace {table_bucket}/{}",
+                        namespace.public_name()
+                    )));
+                }
+                (synthetic_namespace_entry(table_bucket, &namespace), TableCatalogPutPrecondition::IfAbsent)
+            }
+        };
+
+        let before = next.clone();
+        let result = update.apply_to(&mut next);
+        validate_namespace_entry_object(&self.paths, &namespace_path, &next)?;
+        validate_namespace_properties(&next.properties)?;
+        if before == next {
+            return Ok(result);
+        }
+        self.write_entry_unlocked(self.catalog_bucket(), &namespace_path, &next, precondition)
+            .await?;
+        Ok(result)
+    }
+
     async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
         let parent = parse_namespace_for_store(parent)?;
         let prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), parent.storage_id());
