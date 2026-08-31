@@ -47,7 +47,12 @@ pub struct ArchiveLimits {
     pub max_entries: usize,
     pub max_entry_size: u64,
     pub max_total_unpacked_size: u64,
+    pub max_decoded_size: u64,
     pub max_path_length: usize,
+    pub max_pax_metadata_size: u64,
+    pub max_total_pax_metadata_size: u64,
+    pub max_pax_metadata_records: usize,
+    pub max_total_pax_metadata_records: usize,
     pub validate_entry_paths: bool,
 }
 
@@ -57,7 +62,12 @@ impl Default for ArchiveLimits {
             max_entries: 100_000,
             max_entry_size: 1_073_741_824,
             max_total_unpacked_size: 10_737_418_240,
+            max_decoded_size: 11_811_160_064,
             max_path_length: 1024,
+            max_pax_metadata_size: 1_048_576,
+            max_total_pax_metadata_size: 67_108_864,
+            max_pax_metadata_records: 4_096,
+            max_total_pax_metadata_records: 100_000,
             validate_entry_paths: true,
         }
     }
@@ -100,11 +110,31 @@ impl CompressionFormat {
         let reader = BufReader::new(input);
 
         let decoder: Box<dyn AsyncRead + Send + Unpin + 'static> = match self {
-            CompressionFormat::Gzip => Box::new(GzipDecoder::new(reader)),
-            CompressionFormat::Bzip2 => Box::new(BzDecoder::new(reader)),
-            CompressionFormat::Zlib => Box::new(ZlibDecoder::new(reader)),
-            CompressionFormat::Xz => Box::new(XzDecoder::new(reader)),
-            CompressionFormat::Zstd => Box::new(ZstdDecoder::new(reader)),
+            CompressionFormat::Gzip => {
+                let mut decoder = GzipDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Bzip2 => {
+                let mut decoder = BzDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Zlib => {
+                let mut decoder = ZlibDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Xz => {
+                let mut decoder = XzDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
+            CompressionFormat::Zstd => {
+                let mut decoder = ZstdDecoder::new(reader);
+                decoder.multiple_members(true);
+                Box::new(decoder)
+            }
             CompressionFormat::Tar => Box::new(reader),
             CompressionFormat::Zip => {
                 return Err(ZipError::UnsupportedFormat {
@@ -158,6 +188,30 @@ mod tests {
         decoder.read_to_end(&mut decoded).await.expect("gzip decode should succeed");
 
         assert_eq!(decoded, b"payload");
+    }
+
+    #[tokio::test]
+    async fn test_get_decoder_consumes_concatenated_gzip_members() {
+        async fn gzip_member(payload: &[u8]) -> Vec<u8> {
+            let mut encoder = GzipEncoder::new(Vec::new());
+            encoder.write_all(payload).await.expect("gzip encode should succeed");
+            encoder.shutdown().await.expect("gzip encoder shutdown should succeed");
+            encoder.into_inner()
+        }
+
+        let mut encoded = gzip_member(b"first-").await;
+        encoded.extend(gzip_member(b"second").await);
+        let mut decoder = CompressionFormat::Gzip
+            .get_decoder(std::io::Cursor::new(encoded))
+            .expect("gzip decoder should be created");
+        let mut decoded = Vec::new();
+
+        decoder
+            .read_to_end(&mut decoded)
+            .await
+            .expect("concatenated gzip members should decode");
+
+        assert_eq!(decoded, b"first-second");
     }
 
     #[tokio::test]

@@ -131,6 +131,39 @@ pub(crate) async fn read_config_with_revision<S: ScannerObjectIO>(
     }
 }
 
+pub(crate) fn usage_floor_primary_read_error_allows_backup(err: &Error) -> bool {
+    match err {
+        Error::FileCorrupt
+        | Error::CorruptedFormat
+        | Error::CorruptedBackend
+        | Error::PartMissingOrCorrupt
+        | Error::LessData
+        | Error::MoreData => true,
+        Error::Io(io_error) => {
+            matches!(io_error.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof)
+                || error_chain_has_usage_floor_corruption_signature(io_error)
+        }
+        _ => false,
+    }
+}
+
+fn error_chain_has_usage_floor_corruption_signature(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        let message = err.to_string();
+        if message.contains("InlineData value out of range")
+            || message.contains("InlineData key out of range")
+            || message.contains("insufficient data for metadata")
+            || message.contains("insufficient data for meta length")
+            || message.contains("insufficient data for CRC")
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 /// Read only the object revision without materializing its body.
 pub(crate) async fn read_config_revision<S: ScannerObjectIO>(store: Arc<S>, path: &str) -> StorageResult<DataUsageCacheRevision> {
     match store

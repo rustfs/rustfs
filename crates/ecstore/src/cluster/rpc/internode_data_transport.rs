@@ -36,6 +36,7 @@ use rustfs_rio::{ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::task::{Context, Poll};
@@ -105,9 +106,13 @@ struct PutFileCapabilityCacheState {
     cached: Option<PutFileCapabilityState>,
     generation: u64,
     in_flight: Option<PutFileCapabilityFlight>,
+    rejected_server_epoch: Option<Uuid>,
 }
 
-type PutFileCapabilityCacheEntry = Arc<tokio::sync::RwLock<PutFileCapabilityCacheState>>;
+// The registry lock is released before taking an entry lock. Entry guards cover
+// only cache transitions, never a probe or await; poll-based writers must be
+// able to reject an epoch atomically with those transitions.
+type PutFileCapabilityCacheEntry = Arc<parking_lot::RwLock<PutFileCapabilityCacheState>>;
 
 static PUT_FILE_CAPABILITY_CACHE: LazyLock<parking_lot::RwLock<HashMap<String, PutFileCapabilityCacheEntry>>> =
     LazyLock::new(|| parking_lot::RwLock::new(HashMap::new()));
@@ -119,7 +124,7 @@ fn put_file_capability_cache_entry(endpoint: &str) -> PutFileCapabilityCacheEntr
     PUT_FILE_CAPABILITY_CACHE
         .write()
         .entry(endpoint.to_owned())
-        .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(PutFileCapabilityCacheState::default())))
+        .or_insert_with(|| Arc::new(parking_lot::RwLock::new(PutFileCapabilityCacheState::default())))
         .clone()
 }
 
@@ -131,6 +136,23 @@ fn fresh_put_file_capability(state: Option<PutFileCapabilityState>, now: Instant
         }) if now < revalidate_after => Some(Some(server_epoch)),
         Some(PutFileCapabilityState::LegacyUntil(expires_at)) if now < expires_at => Some(None),
         Some(PutFileCapabilityState::V1 { .. }) | Some(PutFileCapabilityState::LegacyUntil(_)) | None => None,
+    }
+}
+
+fn reject_put_file_server_epoch(endpoint: &str, server_epoch: Uuid) {
+    let entry = PUT_FILE_CAPABILITY_CACHE.read().get(endpoint).cloned();
+    if let Some(entry) = entry {
+        let mut state = entry.write();
+        if matches!(state.cached, Some(PutFileCapabilityState::V1 { server_epoch: cached, .. }) if cached == server_epoch) {
+            state.rejected_server_epoch = Some(server_epoch);
+        }
+    }
+}
+
+fn usable_put_file_capability(state: &PutFileCapabilityCacheState, now: Instant) -> Option<Option<Uuid>> {
+    match fresh_put_file_capability(state.cached, now)? {
+        Some(server_epoch) if state.rejected_server_epoch == Some(server_epoch) => None,
+        capability => Some(capability),
     }
 }
 
@@ -322,13 +344,14 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
         let server_epoch = self.put_file_auth_capability(&request.endpoint).await?;
-        let nonce = server_epoch.map(|_| Uuid::new_v4());
-        let url = build_put_file_stream_url(&request, nonce.zip(server_epoch));
+        let auth_scope = server_epoch.map(|server_epoch| (Uuid::new_v4(), server_epoch));
+        let url = build_put_file_stream_url(&request, auth_scope);
+        let endpoint = request.endpoint;
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::PUT, &mut headers)?;
         let writer = HttpWriter::new(url.clone(), Method::PUT, headers).await?;
-        match nonce {
-            Some(nonce) => Ok(Box::new(PutFileAuthWriter::new(writer, url, nonce))),
+        match auth_scope {
+            Some((nonce, server_epoch)) => Ok(Box::new(PutFileAuthWriter::new(writer, url, nonce, endpoint, server_epoch))),
             None => Ok(Box::new(writer)),
         }
     }
@@ -498,15 +521,15 @@ where
 {
     let entry = put_file_capability_cache_entry(endpoint);
     {
-        let state = entry.read().await;
-        if let Some(cached) = fresh_put_file_capability(state.cached, Instant::now()) {
+        let state = entry.read();
+        if let Some(cached) = usable_put_file_capability(&state, Instant::now()) {
             return Ok(cached);
         }
     }
 
     let flight = {
-        let mut state = entry.write().await;
-        if let Some(cached) = fresh_put_file_capability(state.cached, Instant::now()) {
+        let mut state = entry.write();
+        if let Some(cached) = usable_put_file_capability(&state, Instant::now()) {
             return Ok(cached);
         }
         if let Some(flight) = state.in_flight.clone() {
@@ -532,7 +555,7 @@ where
         .await;
 
     {
-        let mut state = entry.write().await;
+        let mut state = entry.write();
         let is_current_flight = state
             .in_flight
             .as_ref()
@@ -540,6 +563,9 @@ where
         if is_current_flight {
             match outcome {
                 Ok(Some(server_epoch)) => {
+                    if state.rejected_server_epoch != Some(*server_epoch) {
+                        state.rejected_server_epoch = None;
+                    }
                     state.cached = Some(PutFileCapabilityState::V1 {
                         server_epoch: *server_epoch,
                         revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
@@ -630,17 +656,23 @@ struct PutFileAuthWriter<W> {
     inner: W,
     url: String,
     nonce: Uuid,
+    endpoint: String,
+    server_epoch: Uuid,
+    server_epoch_rejected: bool,
     hasher: Sha256,
     trailer: Option<Vec<u8>>,
     trailer_offset: usize,
 }
 
 impl<W> PutFileAuthWriter<W> {
-    fn new(inner: W, url: String, nonce: Uuid) -> Self {
+    fn new(inner: W, url: String, nonce: Uuid, endpoint: String, server_epoch: Uuid) -> Self {
         Self {
             inner,
             url,
             nonce,
+            endpoint,
+            server_epoch,
+            server_epoch_rejected: false,
             hasher: Sha256::new(),
             trailer: None,
             trailer_offset: 0,
@@ -654,6 +686,14 @@ impl<W> PutFileAuthWriter<W> {
         let digest = hex_simd::encode_to_string(self.hasher.clone().finalize(), hex_simd::AsciiCase::Lower);
         self.trailer = Some(build_put_file_auth_trailer(&self.url, &Method::PUT, self.nonce, &digest)?);
         Ok(())
+    }
+
+    fn reject_server_epoch_on_conflict(&mut self, error: &io::Error) {
+        if self.server_epoch_rejected || !io_error_has_put_file_epoch_conflict(error) {
+            return;
+        }
+        reject_put_file_server_epoch(&self.endpoint, self.server_epoch);
+        self.server_epoch_rejected = true;
     }
 
     fn poll_write_trailer(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>>
@@ -673,13 +713,25 @@ impl<W> PutFileAuthWriter<W> {
                     )));
                 }
                 Poll::Ready(Ok(written)) => written,
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Err(err)) => {
+                    self.reject_server_epoch_on_conflict(&err);
+                    return Poll::Ready(Err(err));
+                }
                 Poll::Pending => return Poll::Pending,
             };
             self.trailer_offset += written;
         }
         Poll::Ready(Ok(()))
     }
+}
+
+fn io_error_has_put_file_epoch_conflict(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<rustfs_rio::InternodeHttpError>())
+        .is_some_and(
+            |error| matches!(error.kind(), rustfs_rio::InternodeHttpErrorKind::HttpStatus(status) if status.as_u16() == 409),
+        )
 }
 
 impl<W> AsyncWrite for PutFileAuthWriter<W>
@@ -698,12 +750,22 @@ where
                 self.hasher.update(&buf[..written]);
                 Poll::Ready(Ok(written))
             }
-            other => other,
+            Poll::Ready(Err(err)) => {
+                self.reject_server_epoch_on_conflict(&err);
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        match Pin::new(&mut self.inner).poll_flush(cx) {
+            Poll::Ready(Err(err)) => {
+                self.reject_server_epoch_on_conflict(&err);
+                Poll::Ready(Err(err))
+            }
+            other => other,
+        }
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -712,7 +774,13 @@ where
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
             Poll::Pending => return Poll::Pending,
         }
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        match Pin::new(&mut self.inner).poll_shutdown(cx) {
+            Poll::Ready(Err(err)) => {
+                self.reject_server_epoch_on_conflict(&err);
+                Poll::Ready(Err(err))
+            }
+            other => other,
+        }
     }
 }
 
@@ -840,7 +908,6 @@ mod tests {
             loop {
                 let strong_count = entry
                     .read()
-                    .await
                     .in_flight
                     .as_ref()
                     .map(|flight| Arc::strong_count(&flight.outcome))
@@ -857,6 +924,50 @@ mod tests {
 
     #[derive(Debug)]
     struct LegacyTestTransport;
+
+    #[derive(Clone, Copy, Debug)]
+    enum PutFileFailurePhase {
+        Write,
+        Flush,
+        Shutdown,
+    }
+
+    struct PutFileFailureWriter {
+        phase: PutFileFailurePhase,
+        status: reqwest::StatusCode,
+    }
+
+    impl PutFileFailureWriter {
+        fn error(&self) -> io::Error {
+            rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::HttpStatus(self.status))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for PutFileFailureWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(if matches!(self.phase, PutFileFailurePhase::Write) {
+                Err(self.error())
+            } else {
+                Ok(buf.len())
+            })
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(if matches!(self.phase, PutFileFailurePhase::Flush) {
+                Err(self.error())
+            } else {
+                Ok(())
+            })
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(if matches!(self.phase, PutFileFailurePhase::Shutdown) {
+                Err(self.error())
+            } else {
+                Ok(())
+            })
+        }
+    }
 
     #[async_trait::async_trait]
     impl InternodeDataTransport for LegacyTestTransport {
@@ -1048,7 +1159,7 @@ mod tests {
         let v1_endpoint = format!("http://v1-{}.invalid", Uuid::new_v4());
         let v1_entry = put_file_capability_cache_entry(&v1_endpoint);
         let server_epoch = Uuid::new_v4();
-        v1_entry.write().await.cached = Some(PutFileCapabilityState::V1 {
+        v1_entry.write().cached = Some(PutFileCapabilityState::V1 {
             server_epoch,
             revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
         });
@@ -1067,7 +1178,7 @@ mod tests {
             Some(server_epoch)
         );
         assert!(!cache_probe_called.load(Ordering::SeqCst));
-        v1_entry.write().await.cached = Some(PutFileCapabilityState::V1 {
+        v1_entry.write().cached = Some(PutFileCapabilityState::V1 {
             server_epoch,
             revalidate_after: Instant::now(),
         });
@@ -1086,8 +1197,7 @@ mod tests {
 
         let legacy_endpoint = format!("http://legacy-{}.invalid", Uuid::new_v4());
         let legacy_entry = put_file_capability_cache_entry(&legacy_endpoint);
-        legacy_entry.write().await.cached =
-            Some(PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL));
+        legacy_entry.write().cached = Some(PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL));
         assert!(
             transport
                 .put_file_auth_capability(&legacy_endpoint)
@@ -1098,7 +1208,7 @@ mod tests {
 
         let expired_endpoint = format!("http://expired-legacy-{}.invalid", Uuid::new_v4());
         let expired_entry = put_file_capability_cache_entry(&expired_endpoint);
-        expired_entry.write().await.cached = Some(PutFileCapabilityState::LegacyUntil(Instant::now()));
+        expired_entry.write().cached = Some(PutFileCapabilityState::LegacyUntil(Instant::now()));
         let reprobed = std::sync::atomic::AtomicBool::new(false);
         assert_eq!(
             resolve_put_file_auth_capability(&expired_endpoint, || async {
@@ -1349,7 +1459,7 @@ mod tests {
         };
         probe_started.notified().await;
         {
-            let mut state = entry.write().await;
+            let mut state = entry.write();
             state.generation = state.generation.checked_add(1).expect("test generation should advance");
             state.cached = Some(PutFileCapabilityState::V1 {
                 server_epoch: newer_epoch,
@@ -1362,10 +1472,7 @@ mod tests {
             task.await.expect("stale task should finish").expect("stale probe result"),
             Some(stale_epoch)
         );
-        assert_eq!(
-            fresh_put_file_capability(entry.read().await.cached, Instant::now()),
-            Some(Some(newer_epoch))
-        );
+        assert_eq!(fresh_put_file_capability(entry.read().cached, Instant::now()), Some(Some(newer_epoch)));
     }
 
     #[test]
@@ -1398,6 +1505,8 @@ mod tests {
 
         let _ = rustfs_credentials::set_global_rpc_secret("put-file-auth-writer-test-secret".to_string());
         let nonce = Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("nonce");
+        let server_epoch = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").expect("server epoch");
+        let endpoint = "http://node1:9000".to_string();
         let url = concat!(
             "http://node1:9000/rustfs/rpc/put_file_stream?disk=disk-a&volume=bucket&path=object%2Fpart.1",
             "&append=false&size=11&put_file_auth=digest-trailer-v1&put_file_nonce=11111111-2222-4333-8444-555555555555"
@@ -1406,7 +1515,7 @@ mod tests {
         let mut sink = Vec::new();
 
         {
-            let mut writer = PutFileAuthWriter::new(&mut sink, url.clone(), nonce);
+            let mut writer = PutFileAuthWriter::new(&mut sink, url.clone(), nonce, endpoint, server_epoch);
             writer.write_all(b"hello world").await.expect("body write should succeed");
             writer.shutdown().await.expect("shutdown should append auth trailer");
             let err = writer
@@ -1422,6 +1531,143 @@ mod tests {
         let verified = crate::cluster::rpc::verify_put_file_auth_trailer(&url, &Method::PUT, nonce, trailer)
             .expect("emitted trailer should verify");
         assert_eq!(verified, expected_digest);
+    }
+
+    #[tokio::test]
+    async fn put_file_auth_writer_reprobes_after_server_epoch_conflict() {
+        use tokio::io::AsyncWriteExt;
+
+        let _ = rustfs_credentials::set_global_rpc_secret("put-file-epoch-conflict-test-secret".to_string());
+        for status in [reqwest::StatusCode::CONFLICT, reqwest::StatusCode::BAD_REQUEST] {
+            for (phase, trailer_write) in [
+                (PutFileFailurePhase::Write, false),
+                (PutFileFailurePhase::Write, true),
+                (PutFileFailurePhase::Flush, false),
+                (PutFileFailurePhase::Shutdown, false),
+            ] {
+                let endpoint = format!("http://epoch-conflict-{}.invalid", Uuid::new_v4());
+                let stale_epoch = Uuid::new_v4();
+                let replacement_epoch = Uuid::new_v4();
+                resolve_put_file_auth_capability(&endpoint, || async { Ok(Some(stale_epoch)) })
+                    .await
+                    .expect("initial capability should resolve");
+                let mut writer = PutFileAuthWriter::new(
+                    PutFileFailureWriter { phase, status },
+                    format!("{endpoint}{PUT_FILE_AUTH_STREAM_PATH}"),
+                    Uuid::new_v4(),
+                    endpoint.clone(),
+                    stale_epoch,
+                );
+                let error = match (phase, trailer_write) {
+                    (PutFileFailurePhase::Write, false) => writer.write_all(b"body").await,
+                    (PutFileFailurePhase::Flush, _) => writer.flush().await,
+                    _ => writer.shutdown().await,
+                }
+                .expect_err("injected writer error must reach the caller");
+                let conflict = status == reqwest::StatusCode::CONFLICT;
+                assert_eq!(io_error_has_put_file_epoch_conflict(&error), conflict);
+
+                let probe_called = AtomicBool::new(false);
+                let resolved = resolve_put_file_auth_capability(&endpoint, || async {
+                    probe_called.store(true, Ordering::SeqCst);
+                    Ok(Some(replacement_epoch))
+                })
+                .await
+                .expect("capability should remain usable or be reprobed");
+                assert_eq!(probe_called.load(Ordering::SeqCst), conflict, "phase={phase:?}, trailer={trailer_write}");
+                assert_eq!(resolved, Some(if conflict { replacement_epoch } else { stale_epoch }));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_put_file_epoch_rejection_preserves_current_rejection() {
+        let endpoint = format!("http://late-epoch-conflict-{}.invalid", Uuid::new_v4());
+        let old_epoch = Uuid::new_v4();
+        let current_epoch = Uuid::new_v4();
+        let replacement_epoch = Uuid::new_v4();
+        assert_eq!(
+            resolve_put_file_auth_capability(&endpoint, || async { Ok(Some(old_epoch)) })
+                .await
+                .expect("initial epoch should be cached"),
+            Some(old_epoch)
+        );
+        reject_put_file_server_epoch(&endpoint, old_epoch);
+        assert_eq!(
+            resolve_put_file_auth_capability(&endpoint, || async { Ok(Some(current_epoch)) })
+                .await
+                .expect("first restart should install a new epoch"),
+            Some(current_epoch)
+        );
+
+        reject_put_file_server_epoch(&endpoint, current_epoch);
+        // A writer opened before the first restart can report its 409 after
+        // a newer writer has already rejected the second server incarnation.
+        reject_put_file_server_epoch(&endpoint, old_epoch);
+        let probe_called = AtomicBool::new(false);
+        let resolved = resolve_put_file_auth_capability(&endpoint, || async {
+            probe_called.store(true, Ordering::SeqCst);
+            Ok(Some(replacement_epoch))
+        })
+        .await
+        .expect("late old-epoch rejection must preserve the current rejection");
+
+        assert!(probe_called.load(Ordering::SeqCst), "known-rejected current epoch must be reprobed");
+        assert_eq!(resolved, Some(replacement_epoch));
+    }
+
+    #[tokio::test]
+    async fn put_file_epoch_rejection_is_endpoint_and_epoch_scoped() {
+        let endpoint = format!("http://scoped-epoch-{}.invalid", Uuid::new_v4());
+        let other_endpoint = format!("http://other-epoch-{}.invalid", Uuid::new_v4());
+        let current_epoch = Uuid::new_v4();
+        for endpoint in [&endpoint, &other_endpoint] {
+            resolve_put_file_auth_capability(endpoint, || async { Ok(Some(current_epoch)) })
+                .await
+                .expect("initial epoch should resolve");
+        }
+        reject_put_file_server_epoch(&endpoint, Uuid::new_v4());
+        assert_eq!(
+            resolve_put_file_auth_capability(&endpoint, || async { panic!("old writer must not invalidate a new epoch") })
+                .await
+                .expect("new epoch must remain cached"),
+            Some(current_epoch)
+        );
+        reject_put_file_server_epoch(&endpoint, current_epoch);
+        assert_eq!(
+            resolve_put_file_auth_capability(&other_endpoint, || async { panic!("another endpoint must stay cached") })
+                .await
+                .expect("other endpoint must remain cached"),
+            Some(current_epoch)
+        );
+    }
+
+    #[tokio::test]
+    async fn put_file_rejected_epoch_survives_failed_stale_and_downgrade_probes() {
+        let endpoint = format!("http://rejected-probe-{}.invalid", Uuid::new_v4());
+        let rejected_epoch = Uuid::new_v4();
+        let replacement_epoch = Uuid::new_v4();
+        resolve_put_file_auth_capability(&endpoint, || async { Ok(Some(rejected_epoch)) })
+            .await
+            .expect("initial epoch should resolve");
+        reject_put_file_server_epoch(&endpoint, rejected_epoch);
+        let failure = resolve_put_file_auth_capability(&endpoint, || async { Err(Error::other("injected probe failure")) })
+            .await
+            .expect_err("probe failure must be returned");
+        assert!(failure.to_string().contains("injected probe failure"));
+        let downgrade = resolve_put_file_auth_capability(&endpoint, || async { Ok(None) })
+            .await
+            .expect_err("rejection must not unpin authenticated v1");
+        assert!(downgrade.to_string().contains("downgrade rejected"));
+        resolve_put_file_auth_capability(&endpoint, || async { Ok(Some(rejected_epoch)) })
+            .await
+            .expect("a probe racing a restart can still return the old epoch");
+        assert_eq!(
+            resolve_put_file_auth_capability(&endpoint, || async { Ok(Some(replacement_epoch)) })
+                .await
+                .expect("same-epoch probe must not clear known rejection"),
+            Some(replacement_epoch)
+        );
     }
 
     #[test]

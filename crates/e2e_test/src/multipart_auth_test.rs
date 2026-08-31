@@ -3457,6 +3457,62 @@ async fn test_signed_put_object_extract_expands_tar_entries_with_prefix_headers(
 }
 
 #[tokio::test]
+async fn test_signed_put_object_extract_ignore_dirs_skips_unauthorized_directory()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-ignore-dirs-auth";
+    let archive_key = "bundle.tar";
+    let allowed_member = "allowed/member.txt";
+    let denied_directory = "denied/";
+    let username = "snowball-ignore-dirs";
+    let secret_key = "snowball-ignore-dirs-secret";
+    let expected_body = b"allowed-body";
+
+    let admin_client = env.create_s3_client();
+    admin_client.create_bucket().bucket(bucket).send().await?;
+    create_restricted_user(&env, username, secret_key).await?;
+
+    let policy = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "AWS": [username] },
+            "Action": ["s3:PutObject"],
+            "Resource": [
+                format!("arn:aws:s3:::{bucket}/{archive_key}"),
+                format!("arn:aws:s3:::{bucket}/{allowed_member}")
+            ]
+        }]
+    })
+    .to_string();
+    admin_client.put_bucket_policy().bucket(bucket).policy(policy).send().await?;
+
+    let restricted_client = restricted_user_client(&env, username, secret_key);
+    let tar_bytes = make_tar(&[(allowed_member, expected_body)], &[denied_directory]).await;
+    restricted_client
+        .put_object()
+        .bucket(bucket)
+        .key(archive_key)
+        .body(ByteStream::from(tar_bytes))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+            req.headers_mut().insert("x-amz-meta-snowball-ignore-dirs", "true");
+        })
+        .send()
+        .await?;
+
+    let stored = admin_client.get_object().bucket(bucket).key(allowed_member).send().await?;
+    assert_eq!(stored.body.collect().await?.into_bytes().as_ref(), expected_body);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_signed_put_object_extract_preserves_request_metadata_on_extracted_objects()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();

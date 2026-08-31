@@ -14,7 +14,9 @@
 /// Scanner cycle-state codec, persisted usage floors, and cycle-state persistence.
 use super::*;
 use crate::ScannerGetObjectReader;
-use crate::data_usage_define::{DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_RECOVERY_PATH};
+use crate::data_usage_define::{
+    DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_RECOVERY_PATH, usage_floor_primary_read_error_allows_backup,
+};
 use crate::storage_api::owner::ObjectIO as _;
 use tokio::io::AsyncReadExt as _;
 
@@ -1717,7 +1719,8 @@ pub(super) async fn persisted_usage_floor_for_startup(
         let backup_path = format!("{primary_path}.bkp");
         let is_v2_path = primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str();
         let mut recovered_primary_companion_epoch = None;
-        let primary_epoch = match read_usage_primary_or_legacy_backup(storeapi.clone(), primary_path).await {
+        let mut primary_read_error = None;
+        let primary_epoch = match read_config_with_revision(storeapi.clone(), primary_path).await {
             Ok((Some(data), revision)) => {
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {primary_path}: {err}"))
@@ -1776,6 +1779,12 @@ pub(super) async fn persisted_usage_floor_for_startup(
                 }
             }
             Ok((None, _)) => None,
+            Err(err) if !is_v2_path && usage_floor_primary_read_error_allows_backup(&err) => {
+                primary_read_error = Some(format!("failed to read scanner usage epoch floor from {primary_path}: {err}"));
+                invalid_baseline_path.get_or_insert_with(|| primary_path.to_string());
+                unrecoverable_baseline_path.get_or_insert_with(|| primary_path.to_string());
+                None
+            }
             Err(err) => {
                 return Err(ScannerError::Other(format!(
                     "failed to read scanner usage epoch floor from {primary_path}: {err}"
@@ -1854,6 +1863,14 @@ pub(super) async fn persisted_usage_floor_for_startup(
                     "failed to read scanner usage epoch floor from {backup_path}: {err}"
                 )));
             }
+        }
+        if let Some(primary_read_error) = primary_read_error
+            && !any_found
+        {
+            return Err(ScannerError::Other(format!(
+                "{}; no valid scanner usage floor backup was available at {backup_path}",
+                primary_read_error
+            )));
         }
         if any_found {
             if bootstrap_pending {

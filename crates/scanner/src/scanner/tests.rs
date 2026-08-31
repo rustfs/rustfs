@@ -575,6 +575,7 @@ struct MemoryConfigStore {
     get_errors: Mutex<HashMap<String, EcstoreError>>,
     revisions: Mutex<HashMap<String, u64>>,
     insert_after_gets: Mutex<HashMap<String, Vec<u8>>>,
+    read_errors: Mutex<HashMap<String, EcstoreError>>,
     delayed_gets: Mutex<HashMap<String, Duration>>,
     non_regular_objects: Mutex<HashSet<String>>,
     fail_put_number: Mutex<HashMap<String, usize>>,
@@ -624,7 +625,7 @@ impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         _opts: &ObjectOptions,
     ) -> EcstoreResult<GetObjectReader> {
         let key = memory_config_key(bucket, object);
-        if let Some(error) = self.get_errors.lock().await.get(&key).cloned() {
+        if let Some(error) = self.read_errors.lock().await.get(&key).cloned() {
             return Err(error);
         }
         if let Some(delay) = self.delayed_gets.lock().await.remove(&key) {
@@ -3159,6 +3160,147 @@ async fn scanner_usage_floor_recovers_from_incomplete_v2_primary_using_fenced_ba
     );
 }
 
+async fn seed_legacy_primary_read_error_with_backup(store: &Arc<MemoryConfigStore>, error: EcstoreError, epoch: u64, cycle: u64) {
+    let legacy_primary = LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str();
+    let legacy_backup = format!("{legacy_primary}.bkp");
+    let mut backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    backup.scanner_epoch = Some(epoch);
+    backup.scanner_cycle = Some(cycle);
+
+    store
+        .read_errors
+        .lock()
+        .await
+        .insert(memory_config_key(RUSTFS_META_BUCKET, legacy_primary), error);
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, &legacy_backup),
+        serde_json::to_vec(&backup).expect("legacy backup usage snapshot should encode"),
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_recovers_legacy_backup_after_primary_decode_error() {
+    let store = Arc::new(MemoryConfigStore::default());
+    seed_legacy_primary_read_error_with_backup(&store, EcstoreError::other("InlineData value out of range"), 19, 41).await;
+
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), true)
+        .await
+        .expect("valid legacy backup should recover the startup floor");
+    assert_eq!(state, PersistedUsageFloorStartup::Authoritative);
+    assert_eq!(
+        floor,
+        PersistedUsageFloor {
+            next_cycle: 42,
+            leader_epoch: 19,
+        }
+    );
+    assert_eq!(
+        persisted_usage_floor(store)
+            .await
+            .expect("valid legacy backup should recover the authoritative floor"),
+        floor
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_does_not_bootstrap_over_corrupt_legacy_primary_without_backup() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let legacy_primary = LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str();
+    store
+        .read_errors
+        .lock()
+        .await
+        .insert(memory_config_key(RUSTFS_META_BUCKET, legacy_primary), EcstoreError::FileCorrupt);
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("corrupt legacy primary without a valid backup must remain fail-closed");
+    assert!(err.to_string().contains("no valid scanner usage floor backup"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_does_not_fallback_to_legacy_after_corrupt_v2_primary() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let mut v2_backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    v2_backup.scanner_epoch = Some(8);
+    v2_backup.scanner_cycle = Some(11);
+    let mut legacy = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    legacy.scanner_epoch = Some(3);
+    legacy.scanner_cycle = Some(7);
+    store.read_errors.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        EcstoreError::FileCorrupt,
+    );
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, &format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str())),
+        serde_json::to_vec(&v2_backup).expect("v2 backup usage snapshot should encode"),
+    );
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&legacy).expect("legacy usage snapshot should encode"),
+    );
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("corrupt v2 primary must not recover without a primary revision");
+    assert!(
+        err.to_string().contains(&format!(
+            "failed to read scanner usage epoch floor from {}",
+            DATA_USAGE_OBJ_NAME_PATH.as_str()
+        )),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_keeps_transient_primary_read_error_fail_closed() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let legacy_primary = LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str();
+    seed_legacy_primary_read_error_with_backup(
+        &store,
+        EcstoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset while reading usage primary",
+        )),
+        19,
+        41,
+    )
+    .await;
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("transient primary errors must not be converted into backup recovery");
+    assert!(
+        err.to_string()
+            .contains(&format!("failed to read scanner usage epoch floor from {legacy_primary}")),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !err.to_string().contains("no valid scanner usage floor backup"),
+        "transient error should not enter corrupt-primary fallback: {err}"
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_keeps_outdated_primary_metadata_fail_closed() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let legacy_primary = LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str();
+    seed_legacy_primary_read_error_with_backup(&store, EcstoreError::OutdatedXLMeta, 19, 41).await;
+
+    let err = persisted_usage_floor_for_startup(store, true)
+        .await
+        .expect_err("outdated primary metadata must not be converted into backup recovery");
+    assert!(
+        err.to_string()
+            .contains(&format!("failed to read scanner usage epoch floor from {legacy_primary}")),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !err.to_string().contains("no valid scanner usage floor backup"),
+        "outdated metadata should not enter corrupt-primary fallback: {err}"
+    );
+}
+
 #[tokio::test]
 async fn scanner_usage_floor_does_not_bootstrap_over_incomplete_v2_primary() {
     let store = Arc::new(MemoryConfigStore::default());
@@ -3259,6 +3401,19 @@ async fn scanner_leadership_fencing_recovers_incomplete_v2_primary_from_backup()
         .expect("the fencing baseline should be present");
     assert_eq!(recovered.scanner_epoch, Some(7));
     assert_eq!(recovered.scanner_cycle, Some(103));
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_leadership_fencing_recovers_legacy_backup_after_primary_decode_error() {
+    let store = Arc::new(MemoryConfigStore::default());
+    seed_legacy_primary_read_error_with_backup(&store, EcstoreError::other("InlineData value out of range"), 19, 41).await;
+
+    let recovered = usage_snapshot_for_epoch_fence(store, None, false)
+        .await
+        .expect("a valid legacy backup should provide the fencing baseline")
+        .expect("the fencing baseline should be present");
+    assert_eq!(recovered.scanner_epoch, Some(19));
+    assert_eq!(recovered.scanner_cycle, Some(41));
 }
 
 #[tokio::test]
@@ -4210,6 +4365,43 @@ async fn scanner_defers_leadership_when_usage_snapshots_are_stably_absent() {
     );
     assert!(read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH).await.is_err());
     assert!(read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str()).await.is_err());
+}
+
+#[tokio::test]
+async fn scanner_usage_floor_leadership_claim_recovers_legacy_backup_after_primary_decode_error() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let ctx = CancellationToken::new();
+    seed_legacy_primary_read_error_with_backup(&store, EcstoreError::other("InlineData value out of range"), 19, 41).await;
+
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle::default();
+    let mut persisted_epoch = 19;
+    assert!(
+        claim_scanner_leadership(
+            &ctx,
+            store.clone(),
+            &mut cycle,
+            &mut revision,
+            &mut persisted_epoch,
+            false,
+            ScannerCycleResetPolicy::None,
+        )
+        .await
+    );
+
+    let state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("leadership claim should persist after legacy backup recovery");
+    let (_, claimed_epoch) = decode_scanner_cycle_state(&state).expect("leadership claim should decode");
+    assert_eq!(claimed_epoch, 20);
+    assert_eq!(persisted_epoch, 20);
+
+    let usage = read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("legacy backup recovery should publish a fenced v2 usage primary");
+    let usage = serde_json::from_slice::<DataUsageInfo>(&usage).expect("fenced v2 usage primary should decode");
+    assert_eq!(usage.scanner_epoch, Some(20));
+    assert_eq!(usage.scanner_cycle, Some(41));
 }
 
 #[tokio::test]
