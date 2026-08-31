@@ -446,6 +446,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/scanner/usage-state/reset",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/ilm/expiry/status",
         SERVER_INFO,
@@ -2105,6 +2111,12 @@ mod tests {
     fn route_policy_requires_config_update_for_scanner_cycle_reset() {
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/cycle-state/reset", CONFIG_UPDATE);
         assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/cycle-state/reset", SERVER_INFO);
+    }
+
+    #[test]
+    fn route_policy_requires_config_update_for_scanner_usage_reset() {
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/usage-state/reset", CONFIG_UPDATE);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/scanner/usage-state/reset", SERVER_INFO);
     }
 
     #[test]

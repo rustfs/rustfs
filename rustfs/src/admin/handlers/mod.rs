@@ -152,6 +152,7 @@ mod tests {
         let _remove_remote_target_handler = replication::RemoveRemoteTargetHandler {};
         let _scanner_status_handler = scanner::ScannerStatusHandler {};
         let _scanner_cycle_state_reset_handler = scanner::ScannerCycleStateResetHandler {};
+        let _scanner_usage_state_reset_handler = scanner::ScannerUsageStateResetHandler {};
         let _ilm_expiry_status_handler = scanner::IlmExpiryStatusHandler {};
         let _manual_transition_handler = ilm_transition::ManualTransitionRunHandler {};
         let _manual_transition_status_handler = ilm_transition::ManualTransitionJobStatusHandler {};
