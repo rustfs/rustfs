@@ -9692,11 +9692,23 @@ mod tests {
         let failure_hook = DecommissionCheckpointTargetFailureHook::install(2);
         let error = recover_test_tier_delete_dispatch_manifest(store.clone(), &manifest_name)
             .await
-            .expect_err("the injected second-target failure must reject the checkpoint")
-            .to_string();
+            .expect_err("the injected second-target failure must reject the checkpoint");
         assert!(
-            error.contains("injected decommission checkpoint target 2 failure"),
+            error.to_string().contains("injected decommission checkpoint target failure"),
             "unexpected partial checkpoint error: {error}"
+        );
+        let mut diagnostic = &error as &(dyn std::error::Error + 'static);
+        let mut target_context_found = false;
+        while let Some(source) = diagnostic.source() {
+            if source.to_string().contains("target pool 2") {
+                target_context_found = true;
+                break;
+            }
+            diagnostic = source;
+        }
+        assert!(
+            target_context_found,
+            "the stable checkpoint error must retain the failed target in its diagnostic source chain: {error:?}"
         );
         assert_eq!(
             com::read_config(store.pools[1].clone(), &manifest_name)

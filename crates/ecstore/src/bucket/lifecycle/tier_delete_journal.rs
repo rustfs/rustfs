@@ -1399,10 +1399,10 @@ async fn save_decommission_manifest_checkpoint_if_match(
         target.capacity_owner.apply_to(&mut opts);
         #[cfg(all(test, feature = "test-util"))]
         if fail_decommission_checkpoint_target_for_test(target.target_pool_index) {
-            first_write_error = Some(Error::other(format!(
-                "injected decommission checkpoint target {} failure",
-                target.target_pool_index
-            )));
+            first_write_error = Some(Error::other_with_context(
+                "injected decommission checkpoint target failure",
+                format!("target pool {}", target.target_pool_index),
+            ));
             break;
         }
         let write_data = next_data.to_vec();

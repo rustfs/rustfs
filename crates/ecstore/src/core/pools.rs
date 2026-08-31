@@ -2446,11 +2446,10 @@ impl DecommissionDurableIlmReceipt {
             .as_deref()
             .is_some_and(|generation| !is_sha256_checksum(generation))
         {
-            return Err(Error::other(format!(
-                "receipt fleet topology generation is invalid for source path `{}` {}",
-                self.source_path,
-                self.context()
-            )));
+            return Err(Error::other_with_context(
+                "receipt fleet topology generation is invalid",
+                format!("source path `{}` {}", self.source_path, self.context()),
+            ));
         }
         Ok(())
     }
@@ -2569,11 +2568,10 @@ fn merge_decommission_durable_ilm_receipts(
             }
             (None, None) => None,
             _ => {
-                return Err(Error::other(format!(
-                    "durable ILM receipt fleet topology conflict for source path `{}` {}",
-                    existing.source_path,
-                    existing.context()
-                )));
+                return Err(Error::other_with_context(
+                    "durable ILM receipt fleet topology conflict",
+                    format!("source path `{}` {}", existing.source_path, existing.context()),
+                ));
             }
         },
     };
@@ -13071,10 +13069,10 @@ impl ECStore {
             }
             if let Some(terminal_checkpoint) = receipt.terminal_checkpoint.as_ref() {
                 if !source_record.checkpoint.is_predecessor_of_terminal(terminal_checkpoint) {
-                    return Err(Error::other(format!(
-                        "terminal durable ILM decommission receipt does not cover source at path `{path}` {}",
-                        source_record.context()
-                    )));
+                    return Err(Error::other_with_context(
+                        "terminal durable ILM decommission receipt does not cover source",
+                        format!("path `{path}` {}", source_record.context()),
+                    ));
                 }
                 proof = Some(match proof {
                     Some(existing) => merge_decommission_durable_ilm_receipts(&existing, &receipt)?,
@@ -13085,10 +13083,10 @@ impl ECStore {
                     .checkpoint
                     .validate_successor(&receipt.checkpoint)
                     .map_err(|err| {
-                        Error::other(format!(
-                            "durable ILM decommission receipt does not cover source at path `{path}` {}: {err}",
-                            source_record.context()
-                        ))
+                        Error::other_with_context(
+                            "durable ILM decommission receipt does not cover source",
+                            format!("path `{path}` {}: {err}", source_record.context()),
+                        )
                     })?;
                 nonterminal_receipt_found = true;
             }
@@ -13278,11 +13276,10 @@ impl ECStore {
             })?;
             Self::validate_decommission_durable_ilm_receipt_locator(receipt_path, &locator, &receipt)?;
             if receipt.fleet_topology_generation.as_deref() != fleet_topology_generation {
-                return Err(Error::other(format!(
-                    "durable ILM decommission receipt fleet topology mismatch at path `{}` {}",
-                    receipt.source_path,
-                    receipt.context()
-                )));
+                return Err(Error::other_with_context(
+                    "durable ILM decommission receipt fleet topology mismatch",
+                    format!("path `{}` {}", receipt.source_path, receipt.context()),
+                ));
             }
             receipt.checkpoint.validate_successor(&record.checkpoint).map_err(|err| {
                 Error::other(format!(
@@ -13520,28 +13517,31 @@ impl ECStore {
                     || receipt.id_kind != next_record.id_kind
                     || receipt.id != next_record.id
                 {
-                    return Err(Error::other(format!(
-                        "durable ILM checkpoint receipt identity does not authorize `{path}` {}",
-                        next_record.context()
-                    )));
+                    return Err(Error::other_with_context(
+                        "durable ILM checkpoint receipt identity does not authorize source",
+                        format!("path `{path}` {}", next_record.context()),
+                    ));
                 }
                 if receipt.fleet_topology_generation != next_fleet_topology_generation {
-                    return Err(Error::other(format!(
-                        "durable ILM checkpoint receipt fleet topology does not authorize `{path}` {}",
-                        next_record.context()
-                    )));
+                    return Err(Error::other_with_context(
+                        "durable ILM checkpoint receipt fleet topology does not authorize source",
+                        format!("path `{path}` {}", next_record.context()),
+                    ));
                 }
                 receipt
                     .checkpoint
                     .validate_successor(&next_record.checkpoint)
                     .map_err(|err| {
-                        Error::other(format!(
-                            "durable ILM checkpoint receipt in target pool {} is not a predecessor of the requested generation at `{path}` {}; receipt checkpoint {:?}, requested checkpoint {:?}: {err}",
-                            allocation.pool_index,
-                            next_record.context(),
-                            receipt.checkpoint,
-                            next_record.checkpoint
-                        ))
+                        Error::other_with_context(
+                            "durable ILM checkpoint receipt is not a predecessor of the requested generation",
+                            format!(
+                                "target pool {}, path `{path}` {}; receipt checkpoint {:?}, requested checkpoint {:?}: {err}",
+                                allocation.pool_index,
+                                next_record.context(),
+                                receipt.checkpoint,
+                                next_record.checkpoint
+                            ),
+                        )
                     })?;
 
                 let (target_data, metadata) = read_config_limited_preserve_empty_with_metadata(
@@ -13555,41 +13555,40 @@ impl ECStore {
                     || target_record.id_kind != next_record.id_kind
                     || target_record.id != next_record.id
                 {
-                    return Err(Error::other(format!(
-                        "durable ILM checkpoint target identity does not match `{path}` {}",
-                        next_record.context()
-                    )));
+                    return Err(Error::other_with_context(
+                        "durable ILM checkpoint target identity does not match source",
+                        format!("path `{path}` {}", next_record.context()),
+                    ));
                 }
                 let already_committed = target_data.as_slice() == next_data;
-                let target_etag = metadata
-                    .etag
-                    .filter(|etag| !etag.trim().is_empty())
-                    .ok_or_else(|| Error::other(format!("durable ILM checkpoint target at `{path}` is missing an ETag")))?;
+                let target_etag = metadata.etag.filter(|etag| !etag.trim().is_empty()).ok_or_else(|| {
+                    Error::other_with_context("durable ILM checkpoint target is missing an ETag", format!("path `{path}`"))
+                })?;
                 if already_committed {
                     receipt
                         .checkpoint
                         .validate_successor(&target_record.checkpoint)
                         .map_err(|err| {
-                            Error::other(format!(
-                                "durable ILM checkpoint receipt is not a predecessor of the committed target generation at `{path}` {}: {err}",
-                                next_record.context()
-                            ))
+                            Error::other_with_context(
+                                "durable ILM checkpoint receipt is not a predecessor of the committed target generation",
+                                format!("path `{path}` {}: {err}", next_record.context()),
+                            )
                         })?;
                 } else {
                     if target_record.checkpoint != receipt.checkpoint {
-                        return Err(Error::other(format!(
-                            "durable ILM checkpoint target is not the receipt generation at `{path}` {}",
-                            next_record.context()
-                        )));
+                        return Err(Error::other_with_context(
+                            "durable ILM checkpoint target is not the receipt generation",
+                            format!("path `{path}` {}", next_record.context()),
+                        ));
                     }
                     target_record
                         .checkpoint
                         .validate_successor(&next_record.checkpoint)
                         .map_err(|err| {
-                            Error::other(format!(
-                                "durable ILM checkpoint target is not a predecessor of the requested generation at `{path}` {}: {err}",
-                                next_record.context()
-                            ))
+                            Error::other_with_context(
+                                "durable ILM checkpoint target is not a predecessor of the requested generation",
+                                format!("path `{path}` {}: {err}", next_record.context()),
+                            )
                         })?;
                     if next_data.len() > target_data.len() {
                         return Err(decommission_capacity_blocked_error(format!(
@@ -13607,9 +13606,10 @@ impl ECStore {
                     .find(|target| target.target_pool_index == allocation.pool_index)
                 {
                     if existing.already_committed != already_committed {
-                        return Err(Error::other(format!(
-                            "durable ILM checkpoint target state changed during authorization at `{path}`"
-                        )));
+                        return Err(Error::other_with_context(
+                            "durable ILM checkpoint target state changed during authorization",
+                            format!("path `{path}`"),
+                        ));
                     }
                     continue;
                 }
@@ -13691,7 +13691,7 @@ impl ECStore {
     /// logical record as terminal without deleting the source checkpoint.
     pub(crate) async fn durable_ilm_terminal_receipt_covers_active_source(&self, path: &str, data: &[u8]) -> Result<bool> {
         let namespace = classify_durable_ilm_record(path)?
-            .ok_or_else(|| Error::other(format!("path `{path}` is not a durable ILM record")))?;
+            .ok_or_else(|| Error::other_with_context("path is not a durable ILM record", format!("path `{path}`")))?;
         let source_record = validate_durable_ilm_record(path, data)?;
         let active_runs = {
             let pool_meta = self.pool_meta.read().await;
@@ -13821,10 +13821,10 @@ impl ECStore {
             let target_record = validate_decommission_durable_ilm_copy(path, &source_record, &target)?;
             let target_fleet_topology_generation = durable_ilm_v6_topology_generation(path, &target)?;
             if target_fleet_topology_generation != source_fleet_topology_generation {
-                return Err(Error::other(format!(
-                    "target durable ILM fleet topology generation differs at path `{path}` {}",
-                    source_record.context()
-                )));
+                return Err(Error::other_with_context(
+                    "target durable ILM fleet topology generation differs from source",
+                    format!("path `{path}` {}", source_record.context()),
+                ));
             }
             let receipt = DecommissionDurableIlmReceipt::new(path, &target_record, target_fleet_topology_generation);
             self.persist_decommission_durable_ilm_receipt_for_run(target_pool_idx, &receipt, run_token)
@@ -13841,10 +13841,10 @@ impl ECStore {
                 })?
         };
         if manifest_receipt.fleet_topology_generation != source_fleet_topology_generation {
-            return Err(Error::other(format!(
-                "terminal durable ILM receipt fleet topology generation does not cover source at path `{path}` {}",
-                source_record.context()
-            )));
+            return Err(Error::other_with_context(
+                "terminal durable ILM receipt fleet topology generation does not cover source",
+                format!("path `{path}` {}", source_record.context()),
+            ));
         }
         let fleet_proof = if let Some(expected_generation) = source_fleet_topology_generation.as_deref() {
             let proof = acquire_tier_delete_journal_fleet_proof()
@@ -13933,7 +13933,7 @@ impl ECStore {
             self.pools[target_pool_idx].clone(),
             source_path,
             classify_durable_ilm_record(source_path)?
-                .ok_or_else(|| Error::other(format!("path `{source_path}` is not a durable ILM record")))?
+                .ok_or_else(|| Error::other_with_context("path is not a durable ILM record", format!("path `{source_path}`")))?
                 .max_record_size,
         )
         .await
