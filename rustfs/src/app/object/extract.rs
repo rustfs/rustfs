@@ -476,10 +476,10 @@ fn extract_archive_entry_mod_time(header: &tokio_tar::Header) -> S3Result<Option
     }
 
     let modified_at_secs = i64::try_from(modified_at_secs)
-        .map_err(|_| s3_error!(InvalidArgument, "Archive entry modification time is out of range"))?;
+        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Archive entry modification time is out of range"))?;
     OffsetDateTime::from_unix_timestamp(modified_at_secs)
         .map(Some)
-        .map_err(|_| s3_error!(InvalidArgument, "Archive entry modification time is out of range"))
+        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Archive entry modification time is out of range"))
 }
 
 fn strict_extract_entry_path(path: &[u8]) -> Result<&str, ExtractEntryError> {
@@ -507,25 +507,34 @@ fn record_extract_pax_metadata_bytes(
         .checked_add(value_size)
         .and_then(|size| u64::try_from(size).ok())
         .ok_or_else(|| {
-            ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive PAX metadata size overflowed while processing entry"))
+            ExtractEntryError::Fatal(object_s3_error(
+                S3ErrorCode::InvalidArgument,
+                "Archive PAX metadata size overflowed while processing entry",
+            ))
         })?;
     *entry_size = (*entry_size).checked_add(record_size).ok_or_else(|| {
-        ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive PAX metadata size overflowed while processing entry"))
+        ExtractEntryError::Fatal(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Archive PAX metadata size overflowed while processing entry",
+        ))
     })?;
-    *total_size = (*total_size)
-        .checked_add(record_size)
-        .ok_or_else(|| ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive total PAX metadata size overflowed")))?;
+    *total_size = (*total_size).checked_add(record_size).ok_or_else(|| {
+        ExtractEntryError::Fatal(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Archive total PAX metadata size overflowed",
+        ))
+    })?;
 
     if *entry_size > limits.max_pax_metadata_size {
-        return Err(ExtractEntryError::Fatal(s3_error!(
-            InvalidArgument,
-            "Archive PAX metadata exceeds per-entry limit"
+        return Err(ExtractEntryError::Fatal(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Archive PAX metadata exceeds per-entry limit",
         )));
     }
     if *total_size > limits.max_total_pax_metadata_size {
-        return Err(ExtractEntryError::Fatal(s3_error!(
-            InvalidArgument,
-            "Archive total PAX metadata exceeds limit"
+        return Err(ExtractEntryError::Fatal(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Archive total PAX metadata exceeds limit",
         )));
     }
 
@@ -537,23 +546,29 @@ fn record_extract_pax_metadata_record(
     total_records: &mut usize,
     limits: ArchiveLimits,
 ) -> Result<(), ExtractEntryError> {
-    *entry_records = entry_records
-        .checked_add(1)
-        .ok_or_else(|| ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive PAX metadata record count overflowed")))?;
+    *entry_records = entry_records.checked_add(1).ok_or_else(|| {
+        ExtractEntryError::Fatal(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Archive PAX metadata record count overflowed",
+        ))
+    })?;
     *total_records = total_records.checked_add(1).ok_or_else(|| {
-        ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Archive total PAX metadata record count overflowed"))
+        ExtractEntryError::Fatal(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Archive total PAX metadata record count overflowed",
+        ))
     })?;
 
     if *entry_records > limits.max_pax_metadata_records {
-        return Err(ExtractEntryError::Fatal(s3_error!(
-            InvalidArgument,
-            "Archive PAX metadata record count exceeds per-entry limit"
+        return Err(ExtractEntryError::Fatal(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Archive PAX metadata record count exceeds per-entry limit",
         )));
     }
     if *total_records > limits.max_total_pax_metadata_records {
-        return Err(ExtractEntryError::Fatal(s3_error!(
-            InvalidArgument,
-            "Archive total PAX metadata record count exceeds limit"
+        return Err(ExtractEntryError::Fatal(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Archive total PAX metadata record count exceeds limit",
         )));
     }
 
@@ -624,11 +639,17 @@ where
     let mut pax_version_id = None;
     for ext in extensions {
         let ext = ext.map_err(|err| ExtractEntryError::Fatal(map_extract_archive_error(err)))?;
-        let key = ext
-            .key()
-            .map_err(|err| ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Failed to process archive PAX key: {}", err)))?;
+        let key = ext.key().map_err(|err| {
+            ExtractEntryError::Fatal(object_s3_error(
+                S3ErrorCode::InvalidArgument,
+                format!("Failed to process archive PAX key: {}", err),
+            ))
+        })?;
         let value = ext.value().map_err(|err| {
-            ExtractEntryError::Fatal(s3_error!(InvalidArgument, "Failed to process archive PAX value: {}", err))
+            ExtractEntryError::Fatal(object_s3_error(
+                S3ErrorCode::InvalidArgument,
+                format!("Failed to process archive PAX value: {}", err),
+            ))
         })?;
 
         if let Some(meta_key) = key.strip_prefix("minio.metadata.") {
@@ -1201,7 +1222,9 @@ impl DefaultObjectUsecase {
             if let Some(quota_check) = extract_quota_check.as_ref() {
                 let next_legacy_quota_growth = legacy_quota_growth
                     .checked_add(extract_entry_quota_growth(entry_type, entry_size))
-                    .ok_or_else(|| s3_error!(InvalidArgument, "Archive quota growth overflowed while processing entries"))?;
+                    .ok_or_else(|| {
+                        object_s3_error(S3ErrorCode::InvalidArgument, "Archive quota growth overflowed while processing entries")
+                    })?;
                 ensure_legacy_archive_size_within_quota(quota_check, next_legacy_quota_growth)?;
                 legacy_quota_growth = next_legacy_quota_growth;
             }
@@ -1427,9 +1450,12 @@ impl DefaultObjectUsecase {
         let archive_etag = {
             let state = archive_upload_state
                 .lock()
-                .map_err(|_| s3_error!(InternalError, "Archive upload state lock was poisoned"))?;
+                .map_err(|_| object_s3_error(S3ErrorCode::InternalError, "Archive upload state lock was poisoned"))?;
             if !state.body_complete {
-                return Err(s3_error!(UnexpectedContent, "Archive decoder did not consume the complete request body"));
+                return Err(object_s3_error(
+                    S3ErrorCode::UnexpectedContent,
+                    "Archive decoder did not consume the complete request body",
+                ));
             }
             state.etag.as_ref().map(|etag| to_s3s_etag(etag))
         };
@@ -2119,12 +2145,12 @@ mod tests {
 
     #[test]
     fn extract_entry_error_boundary_only_ignores_recoverable_members() {
-        let recoverable = ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "invalid member"));
+        let recoverable = ExtractEntryError::Recoverable(object_s3_error(S3ErrorCode::InvalidArgument, "invalid member"));
         recoverable
             .ignore_or_return(true)
             .expect("recoverable member should be skipped");
 
-        let recoverable = ExtractEntryError::Recoverable(s3_error!(InvalidArgument, "invalid member"));
+        let recoverable = ExtractEntryError::Recoverable(object_s3_error(S3ErrorCode::InvalidArgument, "invalid member"));
         assert_eq!(
             recoverable
                 .ignore_or_return(false)
@@ -2133,7 +2159,7 @@ mod tests {
             &S3ErrorCode::InvalidArgument
         );
 
-        let fatal = ExtractEntryError::Fatal(s3_error!(InvalidArgument, "invalid archive"));
+        let fatal = ExtractEntryError::Fatal(object_s3_error(S3ErrorCode::InvalidArgument, "invalid archive"));
         assert_eq!(
             fatal
                 .ignore_or_return(true)
