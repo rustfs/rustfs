@@ -1064,6 +1064,7 @@ fn apply_extract_pax_overrides(
         "x-amz-tagging",
         AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
     ] {
         if let Some(value) = canonical_headers.get(name) {
             try_insert_extract_header(&mut authorization_headers, http::HeaderName::from_static(name), value.clone())?;
@@ -2262,7 +2263,13 @@ mod tests {
                     assert!(authorization.headers.contains_key(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER));
                 }
                 "legal-hold" => {
-                    assert!(!authorization.headers.contains_key(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER));
+                    assert_eq!(
+                        authorization
+                            .headers
+                            .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("ON")
+                    );
                     assert!(authorization.object_lock_legal_hold_status.is_some());
                 }
                 "version-id" => assert_eq!(opts.version_id.as_deref(), Some(Uuid::nil().to_string().as_str())),

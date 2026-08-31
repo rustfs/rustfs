@@ -4467,11 +4467,13 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
     let context_archive_resources = [
         format!("arn:aws:s3:::{bucket}/tag-context.tar"),
         format!("arn:aws:s3:::{bucket}/lock-context.tar"),
+        format!("arn:aws:s3:::{bucket}/legal-hold-context.tar"),
         format!("arn:aws:s3:::{bucket}/user-agent-bypass.tar"),
         format!("arn:aws:s3:::{bucket}/sse-bypass.tar"),
     ];
     let tag_entry_resource = format!("arn:aws:s3:::{bucket}/tag-context-entry.txt");
     let lock_entry_resource = format!("arn:aws:s3:::{bucket}/lock-context-entry.txt");
+    let legal_hold_entry_resource = format!("arn:aws:s3:::{bucket}/legal-hold-context-entry.txt");
     let user_agent_entry_resource = format!("arn:aws:s3:::{bucket}/user-agent-bypass-entry.txt");
     let sse_entry_resource = format!("arn:aws:s3:::{bucket}/sse-bypass-entry.txt");
     let policy = serde_json::json!({
@@ -4533,7 +4535,7 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
                 "Sid": "PaxContextArchives",
                 "Effect": "Allow",
                 "Principal": { "AWS": [pax_context_user] },
-                "Action": ["s3:PutObject", "s3:PutObjectRetention", "s3:PutObjectTagging"],
+                "Action": ["s3:PutObject", "s3:PutObjectRetention", "s3:PutObjectLegalHold", "s3:PutObjectTagging"],
                 "Resource": context_archive_resources
             },
             {
@@ -4573,6 +4575,25 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
                 "Principal": { "AWS": [pax_context_user] },
                 "Action": ["s3:PutObjectRetention"],
                 "Resource": [lock_entry_resource]
+            },
+            {
+                "Sid": "PaxLegalHoldContextPut",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObject"],
+                "Resource": [legal_hold_entry_resource.clone()]
+            },
+            {
+                "Sid": "PaxLegalHoldContextAction",
+                "Effect": "Allow",
+                "Principal": { "AWS": [pax_context_user] },
+                "Action": ["s3:PutObjectLegalHold"],
+                "Resource": [legal_hold_entry_resource],
+                "Condition": {
+                    "StringEquals": {
+                        "s3:object-lock-legal-hold": "OFF"
+                    }
+                }
             },
             {
                 "Sid": "MemberUserAgentCondition",
@@ -4816,6 +4837,34 @@ async fn test_signed_put_object_extract_authorizes_each_pax_privilege_and_retent
             .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)?,
         pax_retain_until
     );
+
+    let legal_hold_pax = HashMap::from([("minio.metadata.x-amz-object-lock-legal-hold", "ON".to_string())]);
+    let archive = make_tar_with_pax_entry("legal-hold-context-entry.txt", b"must-not-write", None, &legal_hold_pax).await;
+    let err = pax_context_client
+        .put_object()
+        .bucket(bucket)
+        .key("legal-hold-context.tar")
+        .object_lock_legal_hold_status(aws_sdk_s3::types::ObjectLockLegalHoldStatus::Off)
+        .body(ByteStream::from(archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await
+        .expect_err("PAX legal hold must replace the outer value in the member IAM condition context");
+    assert_eq!(err.as_service_error().and_then(|error| error.meta().code()), Some("AccessDenied"));
+    let err = admin_client
+        .head_object()
+        .bucket(bucket)
+        .key("legal-hold-context-entry.txt")
+        .send()
+        .await
+        .expect_err("a denied PAX legal-hold member must not be written");
+    assert!(matches!(
+        err.as_service_error().and_then(|error| error.meta().code()),
+        Some("NoSuchKey" | "NotFound")
+    ));
 
     Ok(())
 }
