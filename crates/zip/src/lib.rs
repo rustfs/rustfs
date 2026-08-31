@@ -995,7 +995,17 @@ mod tests {
             bytes_read.load(Ordering::Relaxed) > TAR_HEADER_LEN,
             "manual polls must progress beyond TAR lookahead into the shared-frame payload"
         );
-        assert_eq!(wake_counter.0.load(Ordering::Relaxed), 10, "every voluntary yield must arrange a repoll");
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            0,
+            "Tokio defers the wake until the scheduler runs"
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            wake_counter.0.load(Ordering::Relaxed),
+            1,
+            "repeated voluntary yields with the same waker must coalesce into one scheduled repoll"
+        );
 
         let (format, sniffed) = sniff.await.expect("bounded inspection should eventually complete");
         assert_eq!(format, CompressionFormat::Lz4);
