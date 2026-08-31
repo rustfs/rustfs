@@ -308,14 +308,14 @@ pub(crate) fn guard_put_object_body_read_timeout(
     })
 }
 
-struct PooledBufferReader {
+pub(super) struct PooledBufferReader {
     buffer: PooledBuffer,
     len: usize,
     pos: usize,
 }
 
 impl PooledBufferReader {
-    fn new(buffer: PooledBuffer, len: usize) -> Self {
+    pub(super) fn new(buffer: PooledBuffer, len: usize) -> Self {
         Self { buffer, len, pos: 0 }
     }
 }
@@ -631,7 +631,7 @@ fn select_put_path_with_concurrency(
 /// where the allocation cost is negligible (≤4KiB memcpy).
 const POOL_BYPASS_MAX_SIZE: usize = 4 * 1024;
 
-async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> S3Result<()>
+pub(super) async fn read_small_put_body_into<R, B>(body: &mut R, buf: &mut B, size: usize) -> S3Result<()>
 where
     R: AsyncRead + Unpin,
     B: bytes::BufMut,
