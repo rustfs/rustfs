@@ -2,8 +2,8 @@ apiVersion: v2
 name: rustfs
 description: RustFS helm chart to deploy RustFS on kubernetes cluster.
 type: application
-version: "1.0.0-rc.4"
-appVersion: "1.0.0-rc.4"
+version: "1.0.0-rc.5"
+appVersion: "1.0.0-rc.5"
 home: https://rustfs.com
 icon: https://media.sys.truenas.net/apps/rustfs/icons/icon.svg
 maintainers:
