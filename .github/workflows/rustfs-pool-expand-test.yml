@@ -70,6 +70,7 @@ env:
   RUSTFS_API_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
   RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
   RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
   # Package used by the nightly run (workflow_dispatch inputs are empty for
   # workflow_run events), i.e. the latest nightly deb published by nightly-gnu.yml.
   RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
@@ -137,6 +138,7 @@ jobs:
           ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
 
       - name: Run heal test (write -> outage -> heal -> verify)
+        id: test
         run: |
           ARGS=(--steps "3,4,5,6,7" -y \
             --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
@@ -149,6 +151,61 @@ jobs:
             ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
           fi
           ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}"
+
+      - name: Generate report
+        if: always()
+        env:
+          LOG_FILE: /tmp/rustfs-heal-test.log
+          REPORT_FILE: /tmp/rustfs-heal-report.md
+        run: |
+          set -euo pipefail
+          PACKAGE_URL='${{ inputs.package_url }}'
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          fi
+          {
+            echo "# RustFS heal test report"
+            echo ""
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo ""
+            echo "## Log tail"
+            echo '```text'
+            tail -n 200 "${LOG_FILE}" || true
+            echo '```'
+          } | tee "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload functional report to dashboard
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          REPORT_FILE: /tmp/rustfs-heal-report.md
+          SUITE: heal
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
+            exit 0
+          fi
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
+          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          fi
 
       - name: Upload test logs
         if: always()
@@ -278,6 +335,64 @@ jobs:
             ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
           fi
           ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
+
+      - name: Generate report
+        if: always()
+        env:
+          LOG_FILE: /tmp/rustfs-pool-test.log
+          REPORT_FILE: /tmp/rustfs-pool-report.md
+        run: |
+          set -euo pipefail
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
+          fi
+          {
+            echo "# RustFS pool expansion test report"
+            echo ""
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- Test Step Outcome: ${{ steps.pool_test.outcome }}"
+            echo ""
+            echo "## Log tail"
+            echo '```text'
+            tail -n 200 "${LOG_FILE}" || true
+            echo '```'
+          } | tee "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload functional report to dashboard
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          REPORT_FILE: /tmp/rustfs-pool-report.md
+          SUITE: pool
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
+            exit 0
+          fi
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
+          CONTENT="$(python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}")"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" --arg sha "${SHA}" \
+              '{message:$msg, content:$content, sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --arg content "${CONTENT}" \
+              '{message:$msg, content:$content}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          fi
 
       - name: Upload test logs
         if: always()
