@@ -406,7 +406,10 @@ fn is_header_only_special_entry(entry_type: tokio_tar::EntryType) -> bool {
 
 fn validate_extract_special_entry_size(entry_type: tokio_tar::EntryType, size: u64) -> S3Result<()> {
     if is_header_only_special_entry(entry_type) && size != 0 {
-        return Err(s3_error!(InvalidArgument, "Snowball special archive member declares a non-zero body"));
+        return Err(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Snowball special archive member declares a non-zero body",
+        ));
     }
     Ok(())
 }
@@ -473,7 +476,10 @@ fn normalize_extract_version_id(value: &str) -> S3Result<ExtractNormalizedVersio
 fn apply_extract_version_id(value: &str, opts: &mut ObjectOptions) -> S3Result<String> {
     let normalized = normalize_extract_version_id(value)?;
     if normalized.requires_versioning && !opts.versioned {
-        return Err(s3_error!(InvalidArgument, "Snowball version ID requires bucket versioning to be enabled"));
+        return Err(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Snowball version ID requires bucket versioning to be enabled",
+        ));
     }
     opts.version_id = Some(normalized.storage_id);
     Ok(normalized.authorization_id)
@@ -572,7 +578,7 @@ fn map_extract_archive_error(err: std::io::Error) -> S3Error {
 }
 
 fn map_extract_pax_text_error(err: impl std::fmt::Display) -> S3Error {
-    s3_error!(InvalidArgument, "Failed to decode archive PAX metadata: {}", err)
+    object_s3_error(S3ErrorCode::InvalidArgument, format!("Failed to decode archive PAX metadata: {}", err))
 }
 
 #[derive(Debug)]
@@ -729,7 +735,10 @@ fn extract_pax_header_bytes(name: &http::HeaderName, value: &HeaderValue) -> usi
 
 fn validate_extract_pax_header_budget(headers: &HeaderMap) -> S3Result<()> {
     if headers.len() > EXTRACT_MAX_EFFECTIVE_PAX_FIELDS {
-        return Err(s3_error!(InvalidArgument, "Snowball PAX metadata field count exceeds limit"));
+        return Err(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Snowball PAX metadata field count exceeds limit",
+        ));
     }
 
     let mut header_bytes = 0usize;
@@ -738,19 +747,25 @@ fn validate_extract_pax_header_budget(headers: &HeaderMap) -> S3Result<()> {
         let field_bytes = extract_pax_header_bytes(name, value);
         header_bytes = header_bytes
             .checked_add(field_bytes)
-            .ok_or_else(|| s3_error!(InvalidArgument, "Snowball PAX metadata size overflowed"))?;
+            .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX metadata size overflowed"))?;
         if is_extract_user_metadata_header(name) {
             user_metadata_bytes = user_metadata_bytes
                 .checked_add(field_bytes)
-                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball PAX user metadata size overflowed"))?;
+                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX user metadata size overflowed"))?;
         }
     }
 
     if header_bytes > EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES {
-        return Err(s3_error!(InvalidArgument, "Snowball PAX metadata exceeds effective size limit"));
+        return Err(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Snowball PAX metadata exceeds effective size limit",
+        ));
     }
     if user_metadata_bytes > EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES {
-        return Err(s3_error!(InvalidArgument, "Snowball PAX user metadata exceeds effective size limit"));
+        return Err(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Snowball PAX user metadata exceeds effective size limit",
+        ));
     }
     Ok(())
 }
@@ -759,14 +774,14 @@ fn try_insert_extract_header(headers: &mut HeaderMap, name: http::HeaderName, va
     headers
         .try_insert(name, value)
         .map(|_| ())
-        .map_err(|_| s3_error!(InvalidArgument, "Snowball PAX metadata field count exceeds header capacity"))
+        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX metadata field count exceeds header capacity"))
 }
 
 fn replace_extract_header(headers: &mut HeaderMap, name: &'static str, value: &str) -> S3Result<()> {
-    let value =
-        HeaderValue::from_str(value).map_err(|_| s3_error!(InvalidArgument, "Invalid canonical Snowball PAX metadata value"))?;
+    let value = HeaderValue::from_str(value)
+        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid canonical Snowball PAX metadata value"))?;
     let name = http::HeaderName::from_bytes(name.as_bytes())
-        .map_err(|_| s3_error!(InvalidArgument, "Invalid canonical Snowball PAX metadata header"))?;
+        .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid canonical Snowball PAX metadata header"))?;
     try_insert_extract_header(headers, name, value)
 }
 
@@ -779,16 +794,19 @@ fn extract_pax_metadata_delta_bytes(baseline: &HashMap<String, String>, metadata
                 .len()
                 .checked_add(value.len())
                 .and_then(|size| u64::try_from(size).ok())
-                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball expanded PAX metadata size overflowed"))?;
+                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed"))?;
             total
                 .checked_add(field_bytes)
-                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball expanded PAX metadata size overflowed"))
+                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed"))
         })
 }
 
 fn validate_extract_expanded_pax_metadata_total(total: u64) -> S3Result<()> {
     if total > EXTRACT_MAX_EXPANDED_PAX_METADATA_BYTES {
-        return Err(s3_error!(InvalidArgument, "Snowball expanded PAX metadata exceeds archive limit"));
+        return Err(object_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "Snowball expanded PAX metadata exceeds archive limit",
+        ));
     }
     Ok(())
 }
@@ -826,8 +844,8 @@ impl ExtractPaxOverrides {
             }
             return Ok(());
         }
-        let header_value =
-            HeaderValue::from_str(value).map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball PAX metadata value"))?;
+        let header_value = HeaderValue::from_str(value)
+            .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball PAX metadata value"))?;
 
         let previous_bytes = self
             .headers
@@ -839,24 +857,33 @@ impl ExtractPaxOverrides {
             .header_bytes
             .checked_sub(previous_bytes)
             .and_then(|bytes| bytes.checked_add(next_bytes))
-            .ok_or_else(|| s3_error!(InvalidArgument, "Snowball PAX metadata size overflowed"))?;
+            .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX metadata size overflowed"))?;
         if next_header_bytes > EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES {
-            return Err(s3_error!(InvalidArgument, "Snowball PAX metadata exceeds effective size limit"));
+            return Err(object_s3_error(
+                S3ErrorCode::InvalidArgument,
+                "Snowball PAX metadata exceeds effective size limit",
+            ));
         }
 
         let next_user_metadata_bytes = if is_extract_user_metadata_header(&name) {
             self.user_metadata_bytes
                 .checked_sub(previous_bytes)
                 .and_then(|bytes| bytes.checked_add(next_bytes))
-                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball PAX user metadata size overflowed"))?
+                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball PAX user metadata size overflowed"))?
         } else {
             self.user_metadata_bytes
         };
         if next_user_metadata_bytes > EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES {
-            return Err(s3_error!(InvalidArgument, "Snowball PAX user metadata exceeds effective size limit"));
+            return Err(object_s3_error(
+                S3ErrorCode::InvalidArgument,
+                "Snowball PAX user metadata exceeds effective size limit",
+            ));
         }
         if !self.headers.contains_key(&name) && self.headers.len() >= EXTRACT_MAX_EFFECTIVE_PAX_FIELDS {
-            return Err(s3_error!(InvalidArgument, "Snowball PAX metadata field count exceeds limit"));
+            return Err(object_s3_error(
+                S3ErrorCode::InvalidArgument,
+                "Snowball PAX metadata field count exceeds limit",
+            ));
         }
 
         try_insert_extract_header(&mut self.headers, name, header_value)?;
@@ -946,12 +973,12 @@ fn apply_extract_pax_overrides(
                 .to_str()
                 .map(str::trim)
                 .map(str::to_owned)
-                .map_err(|_| s3_error!(InvalidStorageClass))
+                .map_err(|_| object_s3_error_default(S3ErrorCode::InvalidStorageClass))
         })
         .transpose()?;
     if let Some(storage_class) = storage_class.as_deref() {
         if !is_valid_storage_class(storage_class) {
-            return Err(s3_error!(InvalidStorageClass));
+            return Err(object_s3_error_default(S3ErrorCode::InvalidStorageClass));
         }
         replace_extract_header(&mut canonical_headers, AMZ_STORAGE_CLASS, storage_class)?;
     }
@@ -976,7 +1003,7 @@ fn apply_extract_pax_overrides(
                 .to_str()
                 .map(str::trim)
                 .map(str::to_ascii_uppercase)
-                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock mode"))?;
+                .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock mode"))?;
             match value.as_str() {
                 ObjectLockMode::GOVERNANCE => Ok(ObjectLockMode::from_static(ObjectLockMode::GOVERNANCE)),
                 ObjectLockMode::COMPLIANCE => Ok(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE)),
@@ -994,7 +1021,7 @@ fn apply_extract_pax_overrides(
             let value = value
                 .to_str()
                 .map(str::trim)
-                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))?;
+                .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock retain-until date"))?;
             Timestamp::parse(TimestampFormat::DateTime, value)
                 .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock retain-until date"))
         })
@@ -1010,11 +1037,10 @@ fn apply_extract_pax_overrides(
     let object_lock_legal_hold_status = canonical_headers
         .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
         .map(|value| {
-            let value = value
-                .to_str()
-                .map(str::trim)
-                .map(str::to_ascii_uppercase)
-                .map_err(|_| s3_error!(InvalidArgument, "Invalid Snowball Object Lock legal-hold status"))?;
+            let value =
+                value.to_str().map(str::trim).map(str::to_ascii_uppercase).map_err(|_| {
+                    object_s3_error(S3ErrorCode::InvalidArgument, "Invalid Snowball Object Lock legal-hold status")
+                })?;
             match value.as_str() {
                 ObjectLockLegalHoldStatus::ON => Ok(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
                 ObjectLockLegalHoldStatus::OFF => Ok(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
@@ -1630,7 +1656,7 @@ impl DefaultObjectUsecase {
             };
             total_expanded_pax_metadata = total_expanded_pax_metadata
                 .checked_add(pax_authorization.expanded_metadata_bytes)
-                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball expanded PAX metadata size overflowed"))?;
+                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball expanded PAX metadata size overflowed"))?;
             validate_extract_expanded_pax_metadata_total(total_expanded_pax_metadata)?;
             if let Some(quota_check) = extract_quota_check.as_ref() {
                 let next_legacy_quota_growth = legacy_quota_growth
@@ -1645,10 +1671,9 @@ impl DefaultObjectUsecase {
                 legacy_quota_growth = next_legacy_quota_growth;
             }
             for (name, value) in &pax_authorization.headers {
-                auth_req
-                    .headers
-                    .try_insert(name.clone(), value.clone())
-                    .map_err(|_| s3_error!(InvalidArgument, "Snowball IAM condition header capacity exceeded"))?;
+                auth_req.headers.try_insert(name.clone(), value.clone()).map_err(|_| {
+                    object_s3_error(S3ErrorCode::InvalidArgument, "Snowball IAM condition header capacity exceeded")
+                })?;
             }
             let explicit_version_id = pax_authorization.version_id.as_deref().or(outer_version_id.as_deref());
             let authorization_version_id = explicit_version_id
