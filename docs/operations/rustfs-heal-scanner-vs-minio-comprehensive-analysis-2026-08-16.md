@@ -503,7 +503,7 @@ scanner (admin subsystem `scanner`, `crates/config/src/constants/scanner.rs` + `
 | cycle_max_duration/objects/directories | …_MAX_* | 0 (unlimited) |
 | bitrot_cycle | …_BITROT_CYCLE_SECS | 2592000 (30d; 0/on=every cycle, off=disabled) |
 | idle_mode | …_IDLE_MODE | true |
-| cache_save_timeout | …_CACHE_SAVE_TIMEOUT_SECS | 30s |
+| cache_save_timeout | …_CACHE_SAVE_TIMEOUT_SECS | 14s |
 | max_concurrent_set_scans / disk_scans | …_MAX_CONCURRENT_* | 4/4 |
 | yield_every_n_objects | …_YIELD_EVERY_N_OBJECTS | 128 |
 | alert_excess_versions / version_size / folders | …_ALERT_* | 100 / 1TiB / 65538 |

@@ -4508,6 +4508,47 @@ async fn test_observational_usage_uses_fenced_backup_when_v2_primary_has_no_iden
 }
 
 #[tokio::test]
+#[serial]
+async fn test_observational_usage_uses_bootstrap_pending_primary_as_baseline() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let primary = DataUsageInfo {
+        last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+        scanner_epoch: Some(7),
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_bootstrap_pending: true,
+        ..Default::default()
+    };
+    assert!(data_usage_info_is_bootstrap_pending(&primary));
+    store.objects.lock().await.insert(
+        memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        serde_json::to_vec(&primary).expect("bootstrap primary should encode"),
+    );
+
+    let (sender, receiver) = mpsc::channel(1);
+    let mut observation = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)), 1);
+    observation.usage_snapshot_converged = Some(false);
+    sender.send(observation).await.expect("observation should enqueue");
+    drop(sender);
+
+    let outcome = store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe(
+        CancellationToken::new(),
+        store.clone(),
+        receiver,
+        None,
+        None,
+        || async { false },
+    )
+    .await;
+
+    assert_eq!(outcome, DataUsagePersistOutcome::Saved);
+    let observed = read_config(store, DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("observational snapshot should be persisted");
+    let observed = serde_json::from_slice::<DataUsageInfo>(&observed).expect("observational snapshot should decode");
+    assert_eq!(observed.usage_snapshot_authoritative_baseline, Some(primary.snapshot_identity()));
+}
+
+#[tokio::test]
 async fn usage_baseline_does_not_fall_back_to_older_legacy_snapshot() {
     let store = Arc::new(MemoryConfigStore::default());
     let primary = DataUsageInfo {
@@ -5920,6 +5961,21 @@ fn data_usage_persist_wait_covers_cache_retries_and_backup() {
     with_var(rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, Some("7"), || {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
         assert_eq!(data_usage_persist_timeout(), Duration::from_millis(31_350));
+    });
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+}
+
+#[test]
+#[serial]
+fn default_data_usage_persist_wait_fits_publication_lease_window() {
+    with_var_unset(rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, || {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        let effective_publication_lease_window =
+            Duration::from_millis(crate::storage_api::ECSTORE_SCANNER_PUBLICATION_LEASE_TTL_MS)
+                .saturating_sub(Duration::from_secs(5));
+
+        assert_eq!(data_usage_persist_timeout(), Duration::from_millis(52_350));
+        assert!(data_usage_persist_timeout() < effective_publication_lease_window);
     });
     crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
