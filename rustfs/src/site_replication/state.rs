@@ -41,6 +41,14 @@ pub(crate) struct SiteReplicationState {
     pub(crate) pending_endpoint_refresh: Option<PendingEndpointRefresh>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) retry_queue: Vec<SiteReplicationRetryEvent>,
+    /// Explicitly recorded IAM deletion events whose delivery to a peer
+    /// failed. The bootstrap snapshot cannot express "this entity no longer
+    /// exists", so these bodies are what makes a failed deletion replayable
+    /// by the retry drain instead of a permanent escalated marker
+    /// (backlog#2071). Only deletions recorded here are ever replayed — the
+    /// drain never derives deletions from a cross-site diff.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) iam_deletion_replays: Vec<SiteReplicationIamDeletionReplay>,
     #[serde(default)]
     pub(crate) sync_state_initialized: bool,
     /// Fencing token for peer-edit delivery, allocated inside the state
@@ -121,6 +129,14 @@ pub(crate) fn parse_site_replication_state(data: &[u8]) -> S3Result<SiteReplicat
     state
         .applied_edit_generations
         .retain(|origin, _| state.peers.contains_key(origin));
+    // Deletion replay records for a departed peer can never be replayed
+    // (remove_sites prunes them too; this covers any other membership
+    // change) — dropping them on load keeps the list bounded. Matching by
+    // id OR endpoint mirrors the retry queue, so identity re-keying does
+    // not orphan a live peer's records.
+    state
+        .iam_deletion_replays
+        .retain(|record| state.peers.values().any(|peer| iam_deletion_replay_matches(record, peer)));
     if !state.sync_state_initialized {
         if state.enabled() {
             mark_unknown_peer_sync_enabled(&mut state.peers);

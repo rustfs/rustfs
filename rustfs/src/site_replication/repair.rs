@@ -652,6 +652,13 @@ pub(crate) async fn persist_site_replication_repair_task(
             Some(error) => upsert_site_replication_retry_event(&mut state.retry_queue, &peer, &path, error, None),
             None => {
                 dequeue_site_replication_retry_events_including_escalated(&mut state.retry_queue, &peer, &path);
+                // A repair is the operator's accountability transfer for the
+                // possibly-unreplayed deletions too; keeping the records
+                // without their entry would strand them forever (the drain
+                // only visits queued entries).
+                if collapsed_retry_queue_path(&path) == Some(SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH) {
+                    clear_iam_deletion_replays_for_peer(state, &peer);
+                }
             }
         }
         Ok(())

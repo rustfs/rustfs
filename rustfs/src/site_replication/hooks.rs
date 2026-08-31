@@ -434,8 +434,43 @@ pub async fn site_replication_bucket_meta_hook(mut item: SRBucketMeta) -> S3Resu
     .await
 }
 
+/// Broadcast one IAM change to every peer. Unlike the generic JSON broadcast
+/// this attempts ALL peers instead of failing fast, and books every failure —
+/// transport construction included — through the deletion-aware recorder: a
+/// deletion body that failed to reach a peer must be persisted for the retry
+/// drain, or the peer keeps the deleted entity forever (backlog#2071).
 pub async fn site_replication_iam_change_hook(item: SRIAMItem) -> S3Result<()> {
-    broadcast_site_replication_json("/rustfs/admin/v3/site-replication/peer/iam-item", &item).await
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        return Ok(());
+    };
+    let mut first_error: Option<S3Error> = None;
+    for peer in runtime.state.peers.values() {
+        if peer.deployment_id == runtime.local_peer.deployment_id
+            || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        {
+            continue;
+        }
+        let sent = async {
+            let transport = PeerTransport::for_runtime_peer(peer).await?;
+            PeerAdminRequest::put(
+                &transport.connection,
+                SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH,
+                &runtime.state.service_account_access_key,
+            )
+            .with_client(&transport.client)
+            .send(&runtime.service_account_secret_key, &item)
+            .await
+        }
+        .await;
+        match sent {
+            Ok(_) => dequeue_site_replication_retry_event(peer, SITE_REPLICATION_PEER_IAM_ITEM_WIRE_PATH).await,
+            Err(err) => {
+                record_failed_site_replication_iam_delivery(peer, &item, &err).await;
+                first_error.get_or_insert(err);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
 }
 
 pub(crate) fn raw_config_to_string(raw: &[u8]) -> Option<String> {

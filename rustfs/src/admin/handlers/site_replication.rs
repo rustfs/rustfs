@@ -2739,6 +2739,7 @@ fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: Pendi
         last_error: "endpoint target refresh pending".to_string(),
         updated_at: Some(OffsetDateTime::now_utc()),
         edit_generation: None,
+        deletions_recorded: false,
     });
     state.pending_endpoint_refresh = Some(pending);
     Ok(())
@@ -3152,6 +3153,7 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         state.peers.clear();
         state.resync_status.clear();
         state.retry_queue.clear();
+        state.iam_deletion_replays.clear();
         state.pending_endpoint_refresh = None;
         state.updated_at = Some(OffsetDateTime::now_utc());
         return state;
@@ -3162,6 +3164,7 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         state.peers.clear();
         state.resync_status.clear();
         state.retry_queue.clear();
+        state.iam_deletion_replays.clear();
         state.pending_endpoint_refresh = None;
         state.updated_at = Some(OffsetDateTime::now_utc());
         return state;
@@ -3181,6 +3184,11 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
         !removed_peers
             .iter()
             .any(|(deployment_id, endpoint)| &event.peer_deployment_id == deployment_id || &event.peer_endpoint == endpoint)
+    });
+    state.iam_deletion_replays.retain(|record| {
+        !removed_peers
+            .iter()
+            .any(|(deployment_id, endpoint)| &record.peer_deployment_id == deployment_id || &record.peer_endpoint == endpoint)
     });
     state
         .resync_status
@@ -5407,7 +5415,14 @@ async fn apply_iam_policy_item(iam_sys: &IamSys<ObjectStore>, name: &str, policy
             serde_json::from_value(policy).map_err(|e| s3_error!(InvalidRequest, "invalid policy body: {}", e))?;
         iam_sys.set_policy(name, policy).await.map_err(ApiError::from)?;
     } else {
-        iam_sys.delete_policy(name, true).await.map_err(ApiError::from)?;
+        // Idempotent delete: the retry drain replays recorded deletions, and
+        // an entity already absent here IS the converged outcome — erroring
+        // would wedge the replay forever (backlog#2071).
+        match iam_sys.delete_policy(name, true).await {
+            Ok(()) => {}
+            Err(err) if rustfs_iam::error::is_err_no_such_policy(&err) => {}
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
     }
     Ok(())
 }
@@ -5430,10 +5445,26 @@ async fn apply_iam_group_info_item(iam_sys: &IamSys<ObjectStore>, group_info: Op
     };
     let update = group_info.update_req;
     if !group_info_requires_upsert(&update) {
-        iam_sys
-            .remove_users_from_group(&update.group, update.members)
-            .await
-            .map_err(ApiError::from)?;
+        // Idempotent removal: a replayed deletion may find the group or a
+        // member already gone (deleted here earlier, or the user tombstone
+        // was replayed first) — that IS the converged outcome, and erroring
+        // would wedge the retry drain forever (backlog#2071). Members absent
+        // here are dropped individually so one missing user cannot veto the
+        // removal of the members that do exist.
+        let mut members = Vec::with_capacity(update.members.len());
+        for member in update.members.iter() {
+            if iam_sys.get_user(member).await.is_some() {
+                members.push(member.clone());
+            }
+        }
+        if members.is_empty() && !update.members.is_empty() {
+            return Ok(());
+        }
+        match iam_sys.remove_users_from_group(&update.group, members).await {
+            Ok(_) => {}
+            Err(err) if rustfs_iam::error::is_err_no_such_group(&err) => {}
+            Err(err) => return Err(ApiError::from(err).into()),
+        }
         return Ok(());
     }
 
@@ -5841,6 +5872,7 @@ impl Operation for SiteReplicationAddHandler {
                 pending_remove: _,
                 pending_endpoint_refresh: _,
                 retry_queue: _,
+                iam_deletion_replays: _,
                 sync_state_initialized,
                 edit_generation: _,
                 applied_edit_generations: _,
@@ -9889,6 +9921,13 @@ mod tests {
                 path: "/rustfs/admin/v3/site-replication/peer/iam-item".to_string(),
                 ..Default::default()
             }],
+            iam_deletion_replays: vec![SiteReplicationIamDeletionReplay {
+                id: "record-1".to_string(),
+                peer_deployment_id: "remote-dep".to_string(),
+                peer_endpoint: "https://remote.example.com".to_string(),
+                entity: "iam-user:alice".to_string(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
 
@@ -9901,6 +9940,10 @@ mod tests {
         );
 
         assert!(state.retry_queue.is_empty());
+        assert!(
+            state.iam_deletion_replays.is_empty(),
+            "a departed peer's recorded deletions can never be replayed"
+        );
     }
 
     #[test]
@@ -12073,6 +12116,7 @@ mod tests {
                 last_error: "site replication is not enabled".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                deletions_recorded: false,
             }],
             ..Default::default()
         };
@@ -12270,6 +12314,7 @@ mod tests {
                 last_error: "peer offline".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                deletions_recorded: false,
             }],
             ..Default::default()
         };
