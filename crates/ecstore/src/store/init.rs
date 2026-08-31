@@ -8528,7 +8528,11 @@ mod tests {
         assert_eq!(deleted, 3);
         assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
         assert_eq!(tier_delete_dispatch_manifest_count(store).await, 0);
-        assert_eq!(backend.remove_count().await, 0, "rollback recovery must perform zero remote DELETEs");
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "rollback recovery must perform zero remote delete operations"
+        );
     }
 
     #[cfg(feature = "test-util")]
