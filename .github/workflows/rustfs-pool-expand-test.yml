@@ -25,6 +25,10 @@ on:
         description: 'warp write duration (e.g. 5m, 10m)'
         required: false
         default: '10m'
+      warp_concurrent:
+        description: 'Pool fill: concurrent warp operations'
+        required: false
+        default: '32'
       run_decommission:
         description: 'Run the pool decommission step (3-pool topology only)'
         type: boolean
@@ -257,6 +261,7 @@ jobs:
                 { key: 'heal', label: 'Heal' },
                 { key: 'pool', label: 'Pool Expansion' },
                 { key: 'security', label: 'Security' },
+                { key: 'upgrade', label: 'Upgrade' },
               ];
               const tabs = document.getElementById('tabs');
               const list = document.getElementById('list');
@@ -399,6 +404,12 @@ jobs:
     timeout-minutes: 360
     needs: heal-test
     if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run') }}
+    env:
+      RUSTFS_POOL_ADMIN_ENDPOINT: ${{ secrets.RUSTFS_POOL_ADMIN_ENDPOINT || vars.RUSTFS_POOL_ADMIN_ENDPOINT || 'http://rustfs-node1:9000' }}
+      RUSTFS_POOL_PROXY_ENDPOINT: http://127.0.0.1:19000
+      RUSTFS_POOL_WARP_ENDPOINT: http://127.0.0.1:19000
+      RUSTFS_SHARED_PROXY_ENDPOINT: ${{ secrets.RUSTFS_API_ENDPOINT || vars.RUSTFS_API_ENDPOINT || vars.RUSTFS_RC_ENDPOINT }}
+      RUSTFS_POOL_NODE_ENDPOINTS: ${{ secrets.RUSTFS_POOL_NODE_ENDPOINTS || vars.RUSTFS_POOL_NODE_ENDPOINTS || 'http://rustfs-node1:9000 http://rustfs-node2:9000 http://rustfs-node3:9000' }}
     steps:
       - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -408,6 +419,13 @@ jobs:
           path: auto-testing
           persist-credentials: false
           token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Initialize pool test artifacts
+        run: |
+          set -euo pipefail
+          ARTIFACT_DIR="${RUNNER_TEMP}/rustfs-pool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${ARTIFACT_DIR}"
+          echo "POOL_ARTIFACT_DIR=${ARTIFACT_DIR}" >> "${GITHUB_ENV}"
 
       - name: Show environment
         run: |
@@ -438,7 +456,11 @@ jobs:
 
       - name: Install RustFS package & start cluster
         run: |
-          ARGS=(--steps "1,2,3" -y --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          ARGS=(--steps "1,2,3" -y \
+            --admin-endpoint "${RUSTFS_POOL_ADMIN_ENDPOINT}" \
+            --warp-endpoint "${RUSTFS_POOL_WARP_ENDPOINT}" \
+            --node-endpoints "${RUSTFS_POOL_NODE_ENDPOINTS}" \
+            --log-file "${POOL_ARTIFACT_DIR}/pool-test.log")
           if [ -n "${{ inputs.package_url }}" ]; then
             ARGS+=(--package-url "${{ inputs.package_url }}")
           elif [ -n "${{ inputs.rustfs_version }}" ]; then
@@ -450,7 +472,11 @@ jobs:
 
       - name: Preflight checks
         run: |
-          ARGS=(--preflight --endpoint "${{ env.RUSTFS_API_ENDPOINT }}")
+          ARGS=(--preflight \
+            --admin-endpoint "${RUSTFS_POOL_ADMIN_ENDPOINT}" \
+            --warp-endpoint "${RUSTFS_POOL_WARP_ENDPOINT}" \
+            --node-endpoints "${RUSTFS_POOL_NODE_ENDPOINTS}" \
+            --log-file "${POOL_ARTIFACT_DIR}/pool-test.log")
           if [ -n "${{ inputs.package_url }}" ]; then
             ARGS+=(--package-url "${{ inputs.package_url }}")
           elif [ -n "${{ inputs.rustfs_version }}" ]; then
@@ -459,6 +485,60 @@ jobs:
             ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
           fi
           ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
+
+      - name: Reset dedicated pool proxy
+        run: |
+          set -euo pipefail
+          RUSTFS_POOL_NGINX_CONFIG_PATH=/etc/nginx/conf.d/rustfs-pool-test.conf \
+          RUSTFS_POOL_NGINX_LISTEN="${RUSTFS_POOL_PROXY_ENDPOINT#http://}" \
+          RUSTFS_POOL_NGINX_ACCESS_LOG=/var/log/nginx/rustfs-pool-test-access.log \
+          RUSTFS_POOL_NGINX_ERROR_LOG=/var/log/nginx/rustfs-pool-test-error.log \
+            ./auto-testing/rustfs_pool_nginx_stage.sh cleanup
+
+      - name: Capture pool test baseline
+        run: |
+          set -uo pipefail
+          BASELINE_FILE="${POOL_ARTIFACT_DIR}/pool-baseline.log"
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          read -r -a DIRECT_ENDPOINTS <<< "${RUSTFS_POOL_NODE_ENDPOINTS}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          failed=0
+          : > "${BASELINE_FILE}"
+
+          if [ "${#DIRECT_ENDPOINTS[@]}" -lt "${#NODES[@]}" ]; then
+            echo "not enough direct endpoints for the configured nodes" | tee -a "${BASELINE_FILE}" >&2
+            exit 1
+          fi
+
+          for index in "${!NODES[@]}"; do
+            node="${NODES[$index]}"
+            endpoint="${DIRECT_ENDPOINTS[$index]}"
+            body_file="${POOL_ARTIFACT_DIR}/ready-baseline-$((index + 1)).body"
+            {
+              echo "--- node=${node} endpoint=${endpoint} ---"
+              if ! ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+                "${SSH_USER}@${node}" '
+                  set -euo pipefail
+                  SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+                  echo "--- rustfs version ---"
+                  rustfs --version
+                  echo "--- systemd state ---"
+                  ${SUDO} systemctl show rustfs --no-pager \
+                    --property=ActiveState,SubState,Result,ExecMainPID,ExecMainStartTimestamp,NRestarts
+                '; then
+                echo "baseline collection failed for ${node}"
+                failed=1
+              fi
+              curl -sS --connect-timeout 5 --max-time 15 -o "${body_file}" \
+                -w "baseline_ready=${endpoint} http=%{http_code} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+                "${endpoint%/}/health/ready" || true
+              echo "--- readiness body ---"
+              cat "${body_file}" 2>/dev/null || true
+              echo
+            } >> "${BASELINE_FILE}" 2>&1
+          done
+
+          [ "${failed}" -eq 0 ] || exit 1
 
       - name: Run pool expansion & decommission test
         id: pool_test
@@ -472,10 +552,16 @@ jobs:
             fi
           fi
           ARGS=(--steps "$STEPS" --with-warp -y \
-            --endpoint "${{ env.RUSTFS_API_ENDPOINT }}" \
+            --admin-endpoint "${RUSTFS_POOL_ADMIN_ENDPOINT}" \
+            --warp-endpoint "${RUSTFS_POOL_WARP_ENDPOINT}" \
+            --node-endpoints "${RUSTFS_POOL_NODE_ENDPOINTS}" \
             --storage-threshold "${{ inputs.storage_threshold || '50' }}" \
             --warp-duration "${{ inputs.warp_duration || '10m' }}" \
-            --log-file /tmp/rustfs-pool-test.log)
+            --warp-concurrent "${{ inputs.warp_concurrent || '32' }}" \
+            --log-file "${POOL_ARTIFACT_DIR}/pool-test.log")
+          if [ -n "${RUSTFS_POOL_PROXY_ENDPOINT}" ]; then
+            ARGS+=(--proxy-endpoint "${RUSTFS_POOL_PROXY_ENDPOINT}")
+          fi
           if [ -n "${{ inputs.package_url }}" ]; then
             ARGS+=(--package-url "${{ inputs.package_url }}")
           elif [ -n "${{ inputs.rustfs_version }}" ]; then
@@ -483,15 +569,120 @@ jobs:
           else
             ARGS+=(--package-url "${{ env.RUSTFS_NIGHTLY_PACKAGE_URL }}")
           fi
-          ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
+          RUSTFS_WARP_LOG_FILE="${POOL_ARTIFACT_DIR}/warp.log" \
+          RUSTFS_PROXY_STAGE_HOOK=./auto-testing/rustfs_pool_nginx_stage.sh \
+          RUSTFS_POOL_NGINX_CONFIG_PATH=/etc/nginx/conf.d/rustfs-pool-test.conf \
+          RUSTFS_POOL_NGINX_LISTEN="${RUSTFS_POOL_PROXY_ENDPOINT#http://}" \
+          RUSTFS_POOL_NGINX_ACCESS_LOG=/var/log/nginx/rustfs-pool-test-access.log \
+          RUSTFS_POOL_NGINX_ERROR_LOG=/var/log/nginx/rustfs-pool-test-error.log \
+            ./auto-testing/rustfs_pool_expand.sh "${ARGS[@]}"
+
+      - name: Collect pool test diagnostics
+        if: always()
+        run: |
+          set -uo pipefail
+          ARTIFACT_DIR="${POOL_ARTIFACT_DIR:-${RUNNER_TEMP}/rustfs-pool-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}}"
+          mkdir -p "${ARTIFACT_DIR}"
+          echo "POOL_ARTIFACT_DIR=${ARTIFACT_DIR}" >> "${GITHUB_ENV}"
+
+          redact() {
+            sed -E \
+              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)=).*/\1[REDACTED]/Ig' \
+              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
+              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/(proxy_set_header[[:space:]]+Authorization[[:space:]]+).*/\1[REDACTED];/Ig' \
+              -e 's/^.*(password|secret|token).*/[REDACTED SENSITIVE LINE]/Ig'
+          }
+
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=()
+          else
+            SUDO=(sudo -n)
+          fi
+
+          {
+            echo "captured_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run_id=${GITHUB_RUN_ID}"
+            echo "run_attempt=${GITHUB_RUN_ATTEMPT}"
+            if command -v nginx >/dev/null 2>&1; then
+              "${SUDO[@]}" nginx -T 2>&1 || echo "nginx -T failed"
+            else
+              echo "nginx is not installed on the runner"
+            fi
+          } | redact > "${ARTIFACT_DIR}/nginx-config-redacted.txt"
+
+          for log_path in \
+            /var/log/nginx/access.log \
+            /var/log/nginx/error.log \
+            /var/log/nginx/rustfs-pool-test-access.log \
+            /var/log/nginx/rustfs-pool-test-error.log; do
+            log_name="$(basename "${log_path}")"
+            if "${SUDO[@]}" test -r "${log_path}" 2>/dev/null; then
+              "${SUDO[@]}" cat "${log_path}" 2>&1 | redact \
+                > "${ARTIFACT_DIR}/nginx-${log_name%.log}-redacted.log"
+            else
+              echo "unavailable: ${log_path}" > "${ARTIFACT_DIR}/nginx-${log_name%.log}-redacted.log"
+            fi
+          done
+          "${SUDO[@]}" journalctl -u nginx --no-pager -n 5000 2>&1 | redact \
+            > "${ARTIFACT_DIR}/nginx-journal-redacted.log" || true
+
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            safe_node="${node//[^A-Za-z0-9_.-]/_}"
+            {
+              if ! ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+                "${SSH_USER}@${node}" '
+                  SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+                  echo "--- rustfs version ---"
+                  rustfs --version 2>&1 || true
+                  echo "--- systemd state ---"
+                  ${SUDO} systemctl show rustfs --no-pager \
+                    --property=ActiveState,SubState,Result,ExecMainPID,ExecMainStartTimestamp,NRestarts 2>&1 || true
+                  echo "--- rustfs journal ---"
+                  ${SUDO} journalctl -u rustfs --no-pager -n 10000 2>&1 || true
+                  echo "--- rustfs file logs ---"
+                  if ${SUDO} test -d /var/log/rustfs; then
+                    ${SUDO} find /var/log/rustfs -maxdepth 2 -type f -print 2>/dev/null | while IFS= read -r file; do
+                      echo "--- ${file} (last 5000 lines) ---"
+                      ${SUDO} tail -n 5000 "${file}" 2>&1 || true
+                    done
+                  else
+                    echo "/var/log/rustfs is unavailable"
+                  fi
+                '; then
+                echo "SSH diagnostics failed for ${node}"
+              fi
+            } 2>&1 | redact > "${ARTIFACT_DIR}/${safe_node}-rustfs-redacted.log"
+          done
+
+          : > "${ARTIFACT_DIR}/endpoint-ready-probes.log"
+          read -r -a DIRECT_ENDPOINTS <<< "${RUSTFS_POOL_NODE_ENDPOINTS}"
+          probe_index=0
+          for endpoint in "${DIRECT_ENDPOINTS[@]}"; do
+            probe_index=$((probe_index + 1))
+            curl -sS --connect-timeout 5 --max-time 15 -o "${ARTIFACT_DIR}/ready-direct-${probe_index}.body" \
+              -w "direct[${probe_index}]=${endpoint} http=%{http_code} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+              "${endpoint%/}/health/ready" >> "${ARTIFACT_DIR}/endpoint-ready-probes.log" 2>&1 || true
+          done
+          if [ -n "${RUSTFS_POOL_PROXY_ENDPOINT}" ]; then
+            curl -sS --connect-timeout 5 --max-time 15 -o "${ARTIFACT_DIR}/ready-proxy.body" \
+              -w "proxy=${RUSTFS_POOL_PROXY_ENDPOINT} http=%{http_code} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+              "${RUSTFS_POOL_PROXY_ENDPOINT%/}/health/ready" >> "${ARTIFACT_DIR}/endpoint-ready-probes.log" 2>&1 || true
+          fi
+          if [ -n "${RUSTFS_SHARED_PROXY_ENDPOINT}" ]; then
+            curl -sS --connect-timeout 5 --max-time 15 -o "${ARTIFACT_DIR}/ready-shared-proxy.body" \
+              -w "shared_proxy=${RUSTFS_SHARED_PROXY_ENDPOINT} http=%{http_code} connect=%{time_connect} ttfb=%{time_starttransfer} total=%{time_total}\n" \
+              "${RUSTFS_SHARED_PROXY_ENDPOINT%/}/health/ready" >> "${ARTIFACT_DIR}/endpoint-ready-probes.log" 2>&1 || true
+          fi
 
       - name: Generate report
         if: always()
-        env:
-          LOG_FILE: /tmp/rustfs-pool-test.log
-          REPORT_FILE: /tmp/rustfs-pool-report.md
         run: |
           set -euo pipefail
+          LOG_FILE="${POOL_ARTIFACT_DIR}/pool-test.log"
+          REPORT_FILE="${POOL_ARTIFACT_DIR}/pool-report.md"
           PACKAGE_URL='${{ inputs.package_url }}'
           RUSTFS_VERSION='${{ inputs.rustfs_version }}'
           if [ -n "${PACKAGE_URL}" ]; then
@@ -507,6 +698,7 @@ jobs:
             echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "- Trigger: ${{ github.event_name }}"
             echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- Warp concurrent: ${{ inputs.warp_concurrent || '32' }}"
             echo "- Test Step Outcome: ${{ steps.pool_test.outcome }}"
             echo ""
             echo "## Log tail"
@@ -516,15 +708,90 @@ jobs:
           } | tee "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
 
+      - name: Validate pool diagnostic completeness
+        if: always()
+        run: |
+          set -euo pipefail
+          failed=0
+          require_nonempty() {
+            if [ ! -s "$1" ]; then
+              echo "required diagnostic is missing or empty: $1" >&2
+              failed=1
+            fi
+          }
+          require_available() {
+            if [ ! -e "$1" ]; then
+              echo "required diagnostic is missing: $1" >&2
+              failed=1
+            elif grep -Fq 'unavailable:' "$1" 2>/dev/null; then
+              echo "required diagnostic could not be collected: $1" >&2
+              failed=1
+            fi
+          }
+
+          require_nonempty "${POOL_ARTIFACT_DIR}/pool-test.log"
+          require_nonempty "${POOL_ARTIFACT_DIR}/warp.log"
+          require_nonempty "${POOL_ARTIFACT_DIR}/pool-report.md"
+          require_nonempty "${POOL_ARTIFACT_DIR}/pool-baseline.log"
+          require_nonempty "${POOL_ARTIFACT_DIR}/nginx-config-redacted.txt"
+          require_nonempty "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-access-redacted.log"
+          require_available "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-access-redacted.log"
+          require_available "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-error-redacted.log"
+          require_nonempty "${POOL_ARTIFACT_DIR}/endpoint-ready-probes.log"
+
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          if grep -Fq 'baseline collection failed' "${POOL_ARTIFACT_DIR}/pool-baseline.log" 2>/dev/null; then
+            echo "one or more node baselines could not be collected" >&2
+            failed=1
+          fi
+          for node in "${NODES[@]}"; do
+            safe_node="${node//[^A-Za-z0-9_.-]/_}"
+            node_log="${POOL_ARTIFACT_DIR}/${safe_node}-rustfs-redacted.log"
+            require_nonempty "${node_log}"
+            if grep -Fq "SSH diagnostics failed for ${node}" "${node_log}" 2>/dev/null; then
+              echo "node diagnostics failed: ${node_log}" >&2
+              failed=1
+            fi
+            if ! grep -Eq '^rustfs @' "${node_log}" 2>/dev/null \
+              || ! grep -Eq '^NRestarts=[0-9]+$' "${node_log}" 2>/dev/null; then
+              echo "node version or restart evidence is incomplete: ${node_log}" >&2
+              failed=1
+            elif grep -Eq '^NRestarts=[1-9][0-9]*$' "${node_log}"; then
+              echo "RustFS restarted unexpectedly during the run: ${node_log}" >&2
+              failed=1
+            fi
+          done
+
+          if ! grep -Fq "upstream_status=\"\$upstream_status\"" \
+            "${POOL_ARTIFACT_DIR}/nginx-config-redacted.txt"; then
+            echo "Nginx config does not expose upstream status fields" >&2
+            failed=1
+          fi
+          if ! grep -Eq '^proxy=.* http=200([[:space:]]|$)' "${POOL_ARTIFACT_DIR}/endpoint-ready-probes.log"; then
+            echo "dedicated proxy readiness probe did not return HTTP 200" >&2
+            failed=1
+          fi
+          if grep -Eq 'status=50(2|4)|upstream_status="[^"]*50(2|4)' \
+            "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-access-redacted.log"; then
+            echo "dedicated proxy access log contains a 502/504 response" >&2
+            failed=1
+          fi
+          if grep -Eiq 'upstream prematurely closed connection|upstream timed out|(connect\(\)|recv\(\)|send\(\)) failed.*upstream|connection reset by peer.*upstream' \
+            "${POOL_ARTIFACT_DIR}/nginx-rustfs-pool-test-error-redacted.log"; then
+            echo "dedicated proxy error log contains an upstream timeout or connection failure" >&2
+            failed=1
+          fi
+          [ "${failed}" -eq 0 ] || exit 1
+
       - name: Upload functional report to dashboard
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
-          REPORT_FILE: /tmp/rustfs-pool-report.md
           SUITE: pool
         run: |
           set -euo pipefail
+          REPORT_FILE="${POOL_ARTIFACT_DIR}/pool-report.md"
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
             exit 0
@@ -593,6 +860,7 @@ jobs:
                 { key: 'heal', label: 'Heal' },
                 { key: 'pool', label: 'Pool Expansion' },
                 { key: 'security', label: 'Security' },
+                { key: 'upgrade', label: 'Upgrade' },
               ];
               const tabs = document.getElementById('tabs');
               const list = document.getElementById('list');
@@ -696,11 +964,19 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: rustfs-pool-test-${{ github.run_id }}
-          path: |
-            /tmp/rustfs-pool-test*.log
-            /tmp/rustfs-warp.*.log
+          name: rustfs-pool-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rustfs-pool-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: warn
+
+      - name: Restore dedicated pool proxy
+        if: always()
+        run: |
+          set -euo pipefail
+          RUSTFS_POOL_NGINX_CONFIG_PATH=/etc/nginx/conf.d/rustfs-pool-test.conf \
+          RUSTFS_POOL_NGINX_LISTEN="${RUSTFS_POOL_PROXY_ENDPOINT#http://}" \
+          RUSTFS_POOL_NGINX_ACCESS_LOG=/var/log/nginx/rustfs-pool-test-access.log \
+          RUSTFS_POOL_NGINX_ERROR_LOG=/var/log/nginx/rustfs-pool-test-error.log \
+            ./auto-testing/rustfs_pool_nginx_stage.sh cleanup
 
       - name: Cleanup environment (after)
         if: ${{ always() && inputs.cleanup_after != 'false' }}

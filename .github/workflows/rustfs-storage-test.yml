@@ -1,4 +1,4 @@
-name: RustFS Tier Test
+name: RustFS Storage Engine Test
 
 on:
   workflow_dispatch:
@@ -11,9 +11,18 @@ on:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
         type: string
+      topology:
+        description: 'Topology to run (all = SNSD, SNMD, MNMD)'
+        type: choice
+        options:
+          - all
+          - single-single
+          - single-multi
+          - multi-multi
+        default: all
   workflow_run:
-    # Strict shared-environment order: run after KMS test completes.
-    workflows: ["RustFS KMS Test"]
+    # Strict shared-environment order: run after tier test completes.
+    workflows: ["RustFS Tier Test"]
     types: [completed]
 
 permissions:
@@ -36,11 +45,11 @@ env:
   PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
 jobs:
-  tier-test:
+  storage-test:
     runs-on: smoke-testing
     continue-on-error: true
-    timeout-minutes: 420
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run' }}
+    timeout-minutes: 360
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout auto-testing scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -61,8 +70,6 @@ jobs:
       - name: Cleanup environment (before)
         run: |
           set -euo pipefail
-          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
-          sudo rm -f /tmp/rustfs-mosquitto.conf
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
           SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
           for node in "${NODES[@]}"; do
@@ -74,49 +81,27 @@ jobs:
                 ${SUDO} dpkg -P rustfs
               fi
               for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
-              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
             '
           done
 
-      - name: Ensure MQTT broker + clients
-        run: |
-          set -euo pipefail
-          if ! command -v mosquitto_sub >/dev/null 2>&1; then
-            sudo apt-get update
-            sudo apt-get install -y mosquitto-clients
-          fi
-          command -v docker >/dev/null 2>&1 || { echo 'docker not found on runner'; exit 1; }
-          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
-          cat <<'EOF' | sudo tee /tmp/rustfs-mosquitto.conf >/dev/null
-          listener 1883 0.0.0.0
-          allow_anonymous true
-          EOF
-          sudo docker run -d --name rustfs-test-mqtt -p 1883:1883 \
-            -v /tmp/rustfs-mosquitto.conf:/mosquitto/config/mosquitto.conf:ro \
-            eclipse-mosquitto:2 >/dev/null
-          for _ in {1..10}; do
-            if ss -tln 2>/dev/null | grep -q ':1883'; then
-              break
-            fi
-            sleep 1
-          done
-          ss -tln 2>/dev/null | grep -q ':1883' || {
-            echo 'mosquitto container is not listening on 1883'
-            sudo docker logs rustfs-test-mqtt || true
-            exit 1
-          }
-
-      - name: Run tier suite
+      - name: Run storage engine suite
         id: test
         continue-on-error: true
         env:
-          LOG_FILE: /tmp/rustfs-tier.log
+          LOG_FILE: /tmp/rustfs-storage.log
         run: |
           set -euo pipefail
-          chmod +x auto-testing/rustfs-tier-test.sh
+          chmod +x auto-testing/rustfs-storage-test.sh
           PACKAGE_URL='${{ inputs.package_url }}'
           RUSTFS_VERSION='${{ inputs.rustfs_version }}'
-          ARGS=(--all-topologies -y --log-file "${LOG_FILE}")
+          TOPOLOGY='${{ inputs.topology }}'
+          ARGS=(-y --log-file "${LOG_FILE}")
+          if [ "${TOPOLOGY}" = "all" ] || [ -z "${TOPOLOGY}" ] || [ "${TOPOLOGY}" = "null" ]; then
+            ARGS+=(--all-topologies)
+          else
+            ARGS+=(--topology "${TOPOLOGY}")
+          fi
           if [ -n "${PACKAGE_URL}" ]; then
             ARGS+=(--package-url "${PACKAGE_URL}")
           elif [ -n "${RUSTFS_VERSION}" ]; then
@@ -124,13 +109,13 @@ jobs:
           else
             ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
           fi
-          ./auto-testing/rustfs-tier-test.sh "${ARGS[@]}"
+          ./auto-testing/rustfs-storage-test.sh "${ARGS[@]}"
 
       - name: Generate report
         if: always()
         env:
-          LOG_FILE: /tmp/rustfs-tier.log
-          REPORT_FILE: /tmp/rustfs-tier-report.md
+          LOG_FILE: /tmp/rustfs-storage.log
+          REPORT_FILE: /tmp/rustfs-storage-report.md
         run: |
           set -euo pipefail
           PACKAGE_URL='${{ inputs.package_url }}'
@@ -142,18 +127,29 @@ jobs:
           else
             PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
-          CASE_TABLE="/tmp/rustfs-tier-cases.md"
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          RUSTFS_VERSION_INFO="N/A"
+          if [ "${#NODES[@]}" -gt 0 ]; then
+            DETECTED_VERSION="$(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+              "${SSH_USER}@${NODES[0]}" 'rustfs --version' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+            if [ -n "${DETECTED_VERSION}" ]; then
+              RUSTFS_VERSION_INFO="${DETECTED_VERSION}"
+            fi
+          fi
+          CASE_TABLE="/tmp/rustfs-storage-cases.md"
           python3 - "${LOG_FILE}" "${CASE_TABLE}" <<'PY'
           import re
           import sys
 
           log_file, out_file = sys.argv[1], sys.argv[2]
           ansi = re.compile(r'\x1b\[[0-9;]*m')
-          start_re = re.compile(r'^---\s+([A-Z]+-[0-9]+)\s+(.+?)\s+---$')
-          done_re = re.compile(r'^\[(PASS|FAIL|UNSUPPORTED)\]\s+([A-Z]+-[0-9]+)\b')
+          start_re = re.compile(r'^---\s+([A-Z0-9]+-[0-9]+)\s+(.+?)\s+---$')
+          done_re = re.compile(r'^\[(PASS|FAIL|UNSUPPORTED)\]\s+([A-Z0-9]+-[0-9]+)\b')
 
           rows = []
           index = {}
+          current = None
           try:
             with open(log_file, 'r', encoding='utf-8', errors='replace') as fh:
               for raw in fh:
@@ -161,6 +157,7 @@ jobs:
                 m = start_re.match(line)
                 if m:
                   case_id, name = m.group(1), m.group(2)
+                  current = case_id
                   if case_id not in index:
                     index[case_id] = len(rows)
                     rows.append([case_id, name, 'RUNNING'])
@@ -173,6 +170,7 @@ jobs:
                   else:
                     rows.append([case_id, case_id, status])
                     index[case_id] = len(rows) - 1
+                  current = None
           except FileNotFoundError:
             rows = []
 
@@ -193,11 +191,12 @@ jobs:
               out.write(f'| {case_id} | {name} | {status} |\\n')
           PY
           {
-            echo "# RustFS tier test report"
+            echo "# RustFS storage engine test report"
             echo ""
             echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "- Trigger: ${{ github.event_name }}"
             echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- RustFS Version: ${RUSTFS_VERSION_INFO}"
             echo "- Test Step Outcome: ${{ steps.test.outcome }}"
             echo ""
             cat "${CASE_TABLE}" || true
@@ -214,8 +213,8 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
-          REPORT_FILE: /tmp/rustfs-tier-report.md
-          SUITE: tier
+          REPORT_FILE: /tmp/rustfs-storage-report.md
+          SUITE: storage
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -254,19 +253,28 @@ jobs:
               .tabs { display: flex; gap: 10px; margin: 14px 0 18px; flex-wrap: wrap; }
               button { border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 10px; padding: 8px 14px; cursor: pointer; }
               button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+              .report-btn { border: 0; background: transparent; padding: 0; color: var(--accent); }
               ul { list-style: none; margin: 0; padding: 0; }
               li { padding: 10px 0; border-bottom: 1px solid var(--line); }
               a { color: var(--accent); text-decoration: none; }
               a:hover { text-decoration: underline; }
+              .meta { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+              .kv { margin: 6px 0; color: var(--text); }
+              .muted { color: var(--muted); }
             </style>
           </head>
           <body>
             <div class="wrap">
               <div class="card">
                 <h1>RustFS Functional Test Reports</h1>
-                <p>S3, KMS, Tier report tabs. Each tab lists reports by date.</p>
+                <p>Select a suite and date to view the build version used in that run.</p>
                 <div class="tabs" id="tabs"></div>
                 <ul id="list"></ul>
+                <div class="meta">
+                  <div class="kv"><strong>Date:</strong> <span id="report-date" class="muted">N/A</span></div>
+                  <div class="kv"><strong>RustFS Version:</strong> <span id="report-version" class="muted">N/A</span></div>
+                  <div class="kv"><a id="report-link" href="#" target="_blank" rel="noreferrer">Open report</a></div>
+                </div>
               </div>
             </div>
             <script>
@@ -274,6 +282,7 @@ jobs:
                 { key: 's3', label: 'S3 Compatibility' },
                 { key: 'kms', label: 'KMS' },
                 { key: 'tier', label: 'Tier' },
+                { key: 'storage', label: 'Storage Engine' },
                 { key: 'heal', label: 'Heal' },
                 { key: 'pool', label: 'Pool Expansion' },
                 { key: 'security', label: 'Security' },
@@ -281,6 +290,31 @@ jobs:
               ];
               const tabs = document.getElementById('tabs');
               const list = document.getElementById('list');
+              const reportDate = document.getElementById('report-date');
+              const reportVersion = document.getElementById('report-version');
+              const reportLink = document.getElementById('report-link');
+
+              function parseVersion(markdown) {
+                const m = markdown.match(/^- RustFS Version:\s*(.+)$/m);
+                return m ? m[1].trim() : 'N/A';
+              }
+
+              async function showReport(report) {
+                reportDate.textContent = report.name.replace('.md', '');
+                reportVersion.textContent = 'Loading...';
+                reportLink.href = report.html_url;
+                try {
+                  const res = await fetch(report.download_url, { cache: 'no-store' });
+                  if (!res.ok) {
+                    reportVersion.textContent = 'N/A';
+                    return;
+                  }
+                  const text = await res.text();
+                  reportVersion.textContent = parseVersion(text);
+                } catch (_e) {
+                  reportVersion.textContent = 'N/A';
+                }
+              }
 
               async function loadSuite(suite) {
                 list.innerHTML = '<li>Loading...</li>';
@@ -295,11 +329,27 @@ jobs:
                   const files = data.filter(f => f.type === 'file' && f.name.endsWith('.md')).sort((a,b) => b.name.localeCompare(a.name));
                   if (!files.length) {
                     list.innerHTML = '<li>No reports yet.</li>';
+                    reportDate.textContent = 'N/A';
+                    reportVersion.textContent = 'N/A';
+                    reportLink.href = '#';
                     return;
                   }
-                  list.innerHTML = files.map(f => `<li><a href="${f.html_url}" target="_blank" rel="noreferrer">${f.name.replace('.md','')}</a></li>`).join('');
+                  list.innerHTML = '';
+                  files.forEach((f) => {
+                    const li = document.createElement('li');
+                    const btn = document.createElement('button');
+                    btn.className = 'report-btn';
+                    btn.textContent = f.name.replace('.md', '');
+                    btn.addEventListener('click', () => showReport(f));
+                    li.appendChild(btn);
+                    list.appendChild(li);
+                  });
+                  showReport(files[0]);
                 } catch (_e) {
                   list.innerHTML = '<li>Failed to load reports.</li>';
+                  reportDate.textContent = 'N/A';
+                  reportVersion.textContent = 'N/A';
+                  reportLink.href = '#';
                 }
               }
 
@@ -340,18 +390,16 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: rustfs-tier-test-${{ github.run_id }}
+          name: rustfs-storage-${{ github.run_id }}
           path: |
-            /tmp/rustfs-tier.log
-            /tmp/rustfs-tier-report.md
+            /tmp/rustfs-storage.log
+            /tmp/rustfs-storage-report.md
           if-no-files-found: warn
 
       - name: Cleanup environment (after)
         if: always()
         run: |
           set -euo pipefail
-          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
-          sudo rm -f /tmp/rustfs-mosquitto.conf
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
           SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
           for node in "${NODES[@]}"; do
@@ -363,12 +411,12 @@ jobs:
                 ${SUDO} dpkg -P rustfs
               fi
               for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
-              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
+              ${SUDO} rm -rf /var/log/rustfs
             '
           done
 
       - name: Notify on failure
         if: failure()
         run: |
-          echo "RustFS tier suite failed"
+          echo "RustFS storage engine suite failed"
           echo "See the uploaded report and log artifacts for details."

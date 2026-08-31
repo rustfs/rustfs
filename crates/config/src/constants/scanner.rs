@@ -198,11 +198,11 @@ pub const ENV_SCANNER_IDLE_MODE: &str = "RUSTFS_SCANNER_IDLE_MODE";
 /// Environment variable that controls scanner cache save timeout in seconds.
 /// The scanner enforces a minimum value of `1`.
 /// - Unit: seconds (u64).
-/// - Example: `export RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS=30`
+/// - Example: `export RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS=14`
 pub const ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS: &str = "RUSTFS_SCANNER_CACHE_SAVE_TIMEOUT_SECS";
 
 /// Default scanner cache save timeout in seconds.
-pub const DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_SCANNER_CACHE_SAVE_TIMEOUT_SECS: u64 = 14;
 
 /// Environment variable that caps concurrent scanner set tasks.
 /// A value of `0` keeps the existing topology-based concurrency.

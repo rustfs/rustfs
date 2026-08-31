@@ -1204,7 +1204,11 @@ fn delete_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions
 }
 
 fn should_delete_from_all_pools(opts: &ObjectOptions, pool_count: usize) -> bool {
-    pool_count > 0 && (!opts.versioned && !opts.version_suspended || opts.version_id.is_some())
+    pool_count > 0 && delete_only_releases_capacity(opts)
+}
+
+fn delete_only_releases_capacity(opts: &ObjectOptions) -> bool {
+    !opts.versioned && !opts.version_suspended || opts.version_id.is_some()
 }
 
 fn batch_delete_creates_latest_marker(object: &ObjectToDelete, delete_config_snapshot: &DeleteReplicationConfigSnapshot) -> bool {
@@ -2013,16 +2017,69 @@ impl ECStore {
         bucket: &str,
         lock_object: &str,
         target_object: &str,
-        mut opts: ObjectOptions,
+        opts: ObjectOptions,
         operation: F,
     ) -> Result<T>
     where
         F: FnOnce(ObjectOptions) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let (capacity_guard, has_active_decommission) = self
-            .acquire_external_decommission_capacity_fence_with_active_source(&[target_pool_idx], "mutation")
-            .await?;
+        self.run_external_decommission_capacity_object_operation(
+            target_pool_idx,
+            bucket,
+            (lock_object, target_object),
+            opts,
+            false,
+            operation,
+        )
+        .await
+    }
+
+    pub(super) async fn run_external_decommission_capacity_object_delete<T, F, Fut>(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        lock_object: &str,
+        target_object: &str,
+        opts: ObjectOptions,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(ObjectOptions) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let capacity_releasing = delete_only_releases_capacity(&opts);
+        self.run_external_decommission_capacity_object_operation(
+            target_pool_idx,
+            bucket,
+            (lock_object, target_object),
+            opts,
+            capacity_releasing,
+            operation,
+        )
+        .await
+    }
+
+    async fn run_external_decommission_capacity_object_operation<T, F, Fut>(
+        &self,
+        target_pool_idx: usize,
+        bucket: &str,
+        objects: (&str, &str),
+        mut opts: ObjectOptions,
+        capacity_releasing: bool,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(ObjectOptions) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let (lock_object, target_object) = objects;
+        let (capacity_guard, has_active_decommission) = if capacity_releasing {
+            self.acquire_decommission_capacity_release_fence_with_active_source().await?
+        } else {
+            self.acquire_external_decommission_capacity_fence_with_active_source(&[target_pool_idx], "mutation")
+                .await?
+        };
         let (capacity_guard, object_guard) = if has_active_decommission && !opts.no_lock {
             // Active migration acquires the object namespace before its capacity
             // write. Match that order, then recheck capacity admission.
@@ -2034,9 +2091,12 @@ impl ECStore {
                 .await?;
             self.apply_decommission_target_mutation_fence(target_pool_idx, target_object, &mut opts, Some(&guard))
                 .await;
-            let capacity_guard = self
-                .acquire_external_decommission_capacity_fence(&[target_pool_idx], "mutation")
-                .await?;
+            let capacity_guard = if capacity_releasing {
+                self.acquire_decommission_capacity_release_fence_with_active_source().await?.0
+            } else {
+                self.acquire_external_decommission_capacity_fence(&[target_pool_idx], "mutation")
+                    .await?
+            };
             (capacity_guard, Some(guard))
         } else {
             (capacity_guard, None)
@@ -2633,20 +2693,26 @@ impl ECStore {
             return Err(decommission_free_version_overwrite_error(bucket, &object, fi.version_id));
         }
 
+        let expected_data_bytes = usize::try_from(fi.size).ok();
         let result = self
-            .run_decommission_capacity_admitted_mutation(idx, DecommissionCapacityOwner::from_options(&opts), None, || async {
-                if is_free_version {
-                    self.pools[idx]
-                        .get_disks_by_key(&object)
-                        .decommission_tier_free_version(bucket, &object, &fi, &opts)
-                        .await
-                } else {
-                    self.pools[idx]
-                        .get_disks_by_key(&object)
-                        .decommission_tiered_object(bucket, &object, &fi, &opts)
-                        .await
-                }
-            })
+            .run_decommission_capacity_admitted_mutation(
+                idx,
+                DecommissionCapacityOwner::from_options(&opts),
+                expected_data_bytes,
+                || async {
+                    if is_free_version {
+                        self.pools[idx]
+                            .get_disks_by_key(&object)
+                            .decommission_tier_free_version(bucket, &object, &fi, &opts)
+                            .await
+                    } else {
+                        self.pools[idx]
+                            .get_disks_by_key(&object)
+                            .decommission_tiered_object(bucket, &object, &fi, &opts)
+                            .await
+                    }
+                },
+            )
             .await;
         if matches!(result, Err(Error::PreconditionFailed)) {
             if self
@@ -3572,7 +3638,7 @@ impl ECStore {
             let pool_idx = pool.pool_idx;
             let pool = pool.clone();
             match self
-                .run_external_decommission_capacity_object_mutation(
+                .run_external_decommission_capacity_object_delete(
                     pool_idx,
                     bucket,
                     object,
@@ -5823,6 +5889,7 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
+            decommission_capacity_entry_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -5886,6 +5953,7 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
+            decommission_capacity_entry_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }

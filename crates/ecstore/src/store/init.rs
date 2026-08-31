@@ -562,6 +562,7 @@ impl ECStore {
             decommission_cancelers,
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(PoolMetaWriteState::for_startup(deployment_id, fresh_bootstrap_proven)),
+            decommission_capacity_entry_gate: Mutex::default(),
             // Adopt the caller's context (the process bootstrap one on the
             // legacy path) so startup writes (erasure type recorded before
             // this point) and later reads share one cell.
@@ -837,8 +838,9 @@ mod tests {
     use crate::{
         bucket::replication::{ReplicationState, ReplicationStatusType, replication_statuses_map},
         core::pools::{
-            POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus,
-            pool_meta_identity_initialized_for_test, pool_meta_v3_commit_state_for_test,
+            DecommissionErasureLayout, DecommissionPoolCapacityInfo, POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_VERSION,
+            PoolDecommissionInfo, PoolMeta, PoolStatus, pool_meta_identity_initialized_for_test,
+            pool_meta_v3_commit_state_for_test, set_decommission_capacity_info_overrides_for_test,
         },
         disk::endpoint::Endpoint,
         error::{Error, Result, StorageError},
@@ -2033,6 +2035,18 @@ mod tests {
         .await
         .expect("store should build around the fresh context");
 
+        // Capacity admission in these local fixtures must not depend on the
+        // host volume's statvfs values. Keep enough identical snapshots for
+        // startup, recovery, and the mutation probes exercised by each test.
+        let layout = DecommissionErasureLayout { data: 2, parity: 2 };
+        let snapshot: Vec<DecommissionPoolCapacityInfo> = store
+            .pools
+            .iter()
+            .enumerate()
+            .map(|(pool_index, _)| DecommissionPoolCapacityInfo::for_test(pool_index, layout, 1 << 40, 1 << 40, 1 << 30))
+            .collect();
+        set_decommission_capacity_info_overrides_for_test(store.id, (0..128).map(|_| snapshot.clone()).collect());
+
         (instance_ctx, store, shutdown)
     }
 
@@ -2163,12 +2177,31 @@ mod tests {
         (source_version, expected_source_versions)
     }
 
+    fn set_test_decommission_capacity_override(store: &Arc<crate::store::ECStore>, pool_idx: usize) {
+        let layout = DecommissionErasureLayout { data: 2, parity: 2 };
+        let source_physical_bytes = 1024 * 1024 * 1024;
+        let target_physical_bytes = source_physical_bytes * 8;
+        let capacity: Vec<DecommissionPoolCapacityInfo> = store
+            .pools
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index == pool_idx {
+                    DecommissionPoolCapacityInfo::for_test(index, layout, 0, source_physical_bytes, source_physical_bytes)
+                } else {
+                    DecommissionPoolCapacityInfo::for_test(index, layout, target_physical_bytes, target_physical_bytes, 0)
+                }
+            })
+            .collect();
+        set_decommission_capacity_info_overrides_for_test(store.id, (0..128).map(|_| capacity.clone()).collect());
+    }
+
     async fn mark_test_pool_decommissioning(store: &Arc<crate::store::ECStore>, pool_idx: usize) {
-        let mut pool_meta = store.pool_meta.write().await;
-        pool_meta.pools[pool_idx].decommission = Some(PoolDecommissionInfo {
-            start_time: Some(OffsetDateTime::now_utc()),
-            ..Default::default()
-        });
+        set_test_decommission_capacity_override(store, pool_idx);
+        store
+            .save_current_pool_meta_for_decommission_start(&[pool_idx], Vec::new())
+            .await
+            .expect("test decommission capacity reservation should activate");
     }
 
     const DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER: &str = "delete_marker_copy";
@@ -2407,45 +2440,6 @@ mod tests {
         );
     }
 
-    async fn assert_suspended_decommission_converged(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
-        let source_versions = store.pools[0]
-            .get_disks_by_key(object)
-            .load_file_info_versions_exact(bucket, object)
-            .await
-            .expect("source versions should remain readable after suspended convergence");
-        assert!(
-            source_versions.is_none_or(|versions| versions.versions.is_empty()),
-            "worker convergence must remove only the decommissioned source null version"
-        );
-
-        let target_versions = store.pools[1]
-            .get_disks_by_key(object)
-            .load_file_info_versions_exact(bucket, object)
-            .await
-            .expect("active target versions should be readable")
-            .expect("active target must retain the suspended DELETE marker");
-        assert!(
-            matches!(target_versions.versions.as_slice(), [marker] if marker.deleted && marker.version_id.is_none_or(|version_id| version_id.is_nil())),
-            "active target must contain only its null delete marker: {target_versions:?}"
-        );
-
-        let err = store
-            .get_object_info(
-                bucket,
-                object,
-                &ObjectOptions {
-                    version_suspended: true,
-                    ..Default::default()
-                },
-            )
-            .await
-            .expect_err("the active null delete marker must hide the migrated source generation");
-        assert!(
-            matches!(err, StorageError::ObjectNotFound(_, _)),
-            "unexpected suspended latest-object result: {err:?}"
-        );
-    }
-
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn tag_updates_skip_active_rebalance_source_pool() {
@@ -2640,7 +2634,6 @@ mod tests {
         drop(lifecycle_guard);
 
         mark_test_pool_decommissioning(&store, 0).await;
-
         let err = store
             .ensure_decommission_multipart_uploads_drained_for_test(0)
             .await
@@ -4196,13 +4189,7 @@ mod tests {
             .put_object(&bucket, &object, &mut source, &ObjectOptions::default())
             .await
             .expect("write source object to the pool being decommissioned");
-        {
-            let mut pool_meta = store.pool_meta.write().await;
-            pool_meta.pools[0].decommission = Some(PoolDecommissionInfo {
-                start_time: Some(OffsetDateTime::now_utc()),
-                ..Default::default()
-            });
-        }
+        mark_test_pool_decommissioning(&store, 0).await;
         assert!(store.is_suspended(0).await, "pool 0 must be a suspended decommission source");
 
         let barrier = crate::set_disk::PutObjectCommitBarrier::install(
@@ -4938,9 +4925,10 @@ mod tests {
                 .then(|| crate::set_disk::NewMultipartUploadCommitObservation::install(&bucket, object));
             let barrier = crate::set_disk::MultipartCommitBarrier::install(&bucket, object, pause);
             let source_set = store.pools[0].get_disks_by_key(object);
+            let recovery_source_set = Arc::clone(&source_set);
             let worker_store = Arc::clone(&store);
             let worker_bucket = bucket.clone();
-            let worker = tokio::spawn(async move {
+            let mut worker = tokio::spawn(async move {
                 worker_store
                     .decommission_entry_for_test(
                         0,
@@ -4954,7 +4942,10 @@ mod tests {
                     .await
             });
 
-            barrier.wait_until_paused().await;
+            tokio::select! {
+                () = barrier.wait_until_paused() => {}
+                result = &mut worker => panic!("decommission multipart worker exited before the commit barrier: {result:?}"),
+            }
             loss_hook.mark_lost();
             barrier.release();
             drop(barrier);
@@ -4976,6 +4967,19 @@ mod tests {
                 .await
                 .expect("list target multipart uploads after fenced migration");
             assert!(uploads.uploads.is_empty(), "fenced multipart migration must not retain target staging");
+            drop(loss_hook);
+            store
+                .decommission_entry_for_test(
+                    0,
+                    MetaCacheEntry {
+                        name: object.to_string(),
+                        ..Default::default()
+                    },
+                    bucket.clone(),
+                    recovery_source_set,
+                )
+                .await
+                .expect("same-mutation retry should recover the durable capacity intent");
         }
 
         shutdown.cancel();
@@ -5183,6 +5187,12 @@ mod tests {
             .await
             .expect("self-copy should keep using the committed active target");
         assert_eq!(active_copy_result.data_dir, active_copy_data_dir);
+
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            pool_meta.pools[1].decommission = None;
+        }
+        mark_test_pool_decommissioning(&store, 1).await;
 
         let cleanup_barrier = crate::data_movement::SourceCleanupDeleteBarrier::install(&bucket, object);
         let commit_barrier = crate::set_disk::PutObjectCommitBarrier::install(
@@ -6197,28 +6207,27 @@ mod tests {
         write_suspended_decommission_source(&store, &bucket, object).await;
         mark_test_pool_decommissioning(&store, 0).await;
 
-        let delete_barrier = crate::store::object::VersionedDeleteMarkerCommitBarrier::install(&bucket, object);
-        let delete_store = Arc::clone(&store);
-        let delete_bucket = bucket.clone();
-        let delete = tokio::spawn(async move {
-            delete_store
-                .delete_object(
-                    &delete_bucket,
-                    object,
-                    ObjectOptions {
-                        version_suspended: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-        });
-        delete_barrier.wait_until_paused().await;
+        let delete_err = store
+            .delete_object(
+                &bucket,
+                object,
+                ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("capacity-reserved target must reject a concurrent suspended DELETE");
+        assert!(
+            matches!(delete_err, Error::SlowDown),
+            "unexpected suspended DELETE result: {delete_err:?}"
+        );
         assert_suspended_null_source_present(&store, &bucket, object).await;
 
         let source_set = store.pools[0].get_disks_by_key(object);
         let worker_store = Arc::clone(&store);
         let worker_bucket = bucket.clone();
-        let worker = tokio::spawn(async move {
+        tokio::spawn(async move {
             worker_store
                 .decommission_entry_for_test(
                     0,
@@ -6230,25 +6239,25 @@ mod tests {
                     source_set,
                 )
                 .await
-        });
+        })
+        .await
+        .expect("suspended decommission worker should join")
+        .expect("worker must migrate the fenced suspended source");
 
-        delete_barrier.release();
-        let marker = delete
-            .await
-            .expect("suspended DELETE task should join")
-            .expect("suspended DELETE should commit its active-pool marker");
-        drop(delete_barrier);
-        assert!(marker.delete_marker, "suspended DELETE must create a marker");
-        assert!(
-            marker.version_id.is_none_or(|version_id| version_id.is_nil()),
-            "suspended DELETE marker must keep the null version identity"
+        assert_decommission_source_absent(
+            &store,
+            &bucket,
+            object,
+            &ObjectOptions {
+                version_suspended: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            read_decommission_target_body(&store, &bucket, object, &ObjectOptions::default()).await,
+            b"suspended source generation"
         );
-        worker
-            .await
-            .expect("suspended decommission worker should join")
-            .expect("worker must treat the newer active null marker as a completed migration");
-
-        assert_suspended_decommission_converged(&store, &bucket, object).await;
         shutdown.cancel();
     }
 
@@ -6281,31 +6290,29 @@ mod tests {
                 },
                 None,
             ));
-        let delete_barrier = crate::store::object::VersionedDeleteMarkerCommitBarrier::install(&bucket, object);
-        let delete_store = Arc::clone(&store);
-        let delete_bucket = bucket.clone();
-        let delete = tokio::spawn(async move {
-            delete_store
-                .delete_objects(
-                    &delete_bucket,
-                    vec![ObjectToDelete {
-                        object_name: object.to_string(),
-                        ..Default::default()
-                    }],
-                    ObjectOptions {
-                        delete_replication_config_snapshot: Some(delete_config_snapshot),
-                        ..Default::default()
-                    },
-                )
-                .await
-        });
-        delete_barrier.wait_until_paused().await;
+        let (_deleted, errors) = store
+            .delete_objects(
+                &bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions {
+                    delete_replication_config_snapshot: Some(delete_config_snapshot),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(errors.as_slice(), [Some(Error::SlowDown)]),
+            "unexpected suspended batch DELETE result: {errors:?}"
+        );
         assert_suspended_null_source_present(&store, &bucket, object).await;
 
         let source_set = store.pools[0].get_disks_by_key(object);
         let worker_store = Arc::clone(&store);
         let worker_bucket = bucket.clone();
-        let worker = tokio::spawn(async move {
+        tokio::spawn(async move {
             worker_store
                 .decommission_entry_for_test(
                     0,
@@ -6317,22 +6324,25 @@ mod tests {
                     source_set,
                 )
                 .await
-        });
+        })
+        .await
+        .expect("suspended batch decommission worker should join")
+        .expect("worker must migrate the batch-fenced suspended source");
 
-        delete_barrier.release();
-        let (deleted, errors) = delete.await.expect("suspended batch DELETE task should join");
-        drop(delete_barrier);
-        assert!(errors.iter().all(Option::is_none), "suspended batch DELETE should succeed: {errors:?}");
-        assert!(
-            matches!(deleted.as_slice(), [marker] if marker.delete_marker && marker.delete_marker_version_id.is_none_or(|version_id| version_id.is_nil())),
-            "suspended batch DELETE must create one null marker: {deleted:?}"
+        assert_decommission_source_absent(
+            &store,
+            &bucket,
+            object,
+            &ObjectOptions {
+                version_suspended: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            read_decommission_target_body(&store, &bucket, object, &ObjectOptions::default()).await,
+            b"suspended source generation"
         );
-        worker
-            .await
-            .expect("suspended batch decommission worker should join")
-            .expect("worker must treat the newer batch null marker as a completed migration");
-
-        assert_suspended_decommission_converged(&store, &bucket, object).await;
         shutdown.cancel();
     }
 
@@ -7325,6 +7335,7 @@ mod tests {
             .await
             .expect("legacy decommission queue should reload after restart");
         *store.pool_meta.write().await = restarted_pool_meta;
+        set_test_decommission_capacity_override(&store, 0);
         store
             .promote_queued_decommission_for_test(0)
             .await

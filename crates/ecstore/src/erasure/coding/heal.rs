@@ -108,6 +108,13 @@ where
     (shards, errs)
 }
 
+fn heal_writer_failure(writers: &mut MultiWriter<'_>, error: io::Error) -> Error {
+    writers
+        .take_retryable_internode_write_failure()
+        .map(|error| Error::RemoteClientUnavailable(error.to_string()))
+        .unwrap_or_else(|| error.into())
+}
+
 impl super::Erasure {
     pub async fn heal<R>(
         &self,
@@ -202,10 +209,14 @@ impl super::Erasure {
                 .map(|s| Bytes::from(s.unwrap_or_default()))
                 .collect::<Vec<_>>();
 
-            writers.write(shards).await?;
+            if let Err(error) = writers.write(shards).await {
+                return Err(heal_writer_failure(&mut writers, error));
+            }
         }
 
-        writers.shutdown().await?;
+        if let Err(error) = writers.shutdown().await {
+            return Err(heal_writer_failure(&mut writers, error));
+        }
         Ok(())
     }
 }
@@ -243,6 +254,35 @@ mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    struct InternodeFailureWriter {
+        fail_on_write: bool,
+        status: http::StatusCode,
+    }
+
+    impl InternodeFailureWriter {
+        fn error(&self) -> io::Error {
+            rustfs_rio::new_test_internode_http_io_error(rustfs_rio::InternodeHttpErrorKind::HttpStatus(self.status))
+        }
+    }
+
+    impl AsyncWrite for InternodeFailureWriter {
+        fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(if self.fail_on_write {
+                Err(self.error())
+            } else {
+                Ok(buf.len())
+            })
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(self.error()))
         }
     }
 
@@ -329,6 +369,94 @@ mod tests {
             .expect("empty object heal should only close writers");
 
         assert!(writers.iter().all(Option::is_some));
+    }
+
+    #[tokio::test]
+    async fn heal_maps_put_file_epoch_conflict_to_retryable_remote_unavailable() {
+        for status in [http::StatusCode::CONFLICT, http::StatusCode::BAD_REQUEST] {
+            for (fail_on_write, data) in [
+                (false, b"".as_slice()),
+                (false, b"payload".as_slice()),
+                (true, b"payload".as_slice()),
+            ] {
+                let erasure = Erasure::new(2, 1, 64);
+                let encoded = erasure.encode_data(data).expect("source shards should encode");
+                let readers = encoded
+                    .iter()
+                    .enumerate()
+                    .map(|(index, shard)| {
+                        (index < erasure.data_shards).then(|| {
+                            BitrotReader::new(Cursor::new(shard.to_vec()), erasure.shard_size(), HashAlgorithm::None, false)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut writers = (0..erasure.total_shard_count())
+                    .map(|index| {
+                        (index == erasure.data_shards).then(|| {
+                            BitrotWriterWrapper::new(
+                                CustomWriter::new_tokio_writer(InternodeFailureWriter { fail_on_write, status }),
+                                erasure.shard_size(),
+                                HashAlgorithm::None,
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let error = erasure
+                    .heal(&mut writers, readers, data.len(), &[])
+                    .await
+                    .expect_err("failed sole target must not satisfy heal write quorum");
+                assert_eq!(
+                    matches!(error, Error::RemoteClientUnavailable(_)),
+                    status == http::StatusCode::CONFLICT,
+                    "status={status}, fail_on_write={fail_on_write}, len={}, error={error:?}",
+                    data.len()
+                );
+                assert!(writers.iter().all(Option::is_none), "failed target must not be committed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn heal_epoch_conflict_does_not_abort_healthy_target() {
+        for fail_on_write in [false, true] {
+            let erasure = Erasure::new(2, 2, 64);
+            let data = b"healthy target must retain exact reconstructed bytes";
+            let encoded = erasure.encode_data(data).expect("source shards should encode");
+            let readers = encoded
+                .iter()
+                .enumerate()
+                .map(|(index, shard)| {
+                    (index < erasure.data_shards)
+                        .then(|| BitrotReader::new(Cursor::new(shard.to_vec()), erasure.shard_size(), HashAlgorithm::None, false))
+                })
+                .collect::<Vec<_>>();
+            let mut writers = vec![
+                None,
+                None,
+                Some(BitrotWriterWrapper::new(
+                    CustomWriter::new_tokio_writer(InternodeFailureWriter {
+                        fail_on_write,
+                        status: http::StatusCode::CONFLICT,
+                    }),
+                    erasure.shard_size(),
+                    HashAlgorithm::None,
+                )),
+                Some(inline_writer(erasure.shard_size())),
+            ];
+            erasure
+                .heal(&mut writers, readers, data.len(), &[])
+                .await
+                .expect("one healthy target must still satisfy the existing heal quorum");
+            assert!(writers[2].is_none(), "conflicting target must be dropped");
+            assert_eq!(
+                writers[3]
+                    .take()
+                    .expect("healthy target remains")
+                    .into_inline_data()
+                    .expect("inline target data"),
+                encoded[3].to_vec()
+            );
+        }
     }
 
     #[tokio::test]

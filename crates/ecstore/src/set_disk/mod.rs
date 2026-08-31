@@ -42,7 +42,8 @@ use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::object_lock::objectlock_sys::{
-    check_object_lock_for_deletion_with_state, check_retention_for_modification, replication_write_may_pass_worm_gate,
+    check_object_lock_for_deletion_with_state, check_retention_for_modification, replication_delete_may_bypass_governance,
+    replication_write_may_pass_worm_gate,
 };
 #[cfg(test)]
 use crate::bucket::replication::ReplicationState;
@@ -5578,10 +5579,15 @@ async fn check_object_lock_delete(
         return Ok(());
     }
 
+    // An authorized replicated version purge already passed this gate on the
+    // source with the bypass it carried there, so it clears GOVERNANCE
+    // retention here without the header; COMPLIANCE and legal hold still
+    // block below (see `replication_delete_may_bypass_governance`, #6850).
     let bypass_governance = opts
         .object_lock_delete
         .as_ref()
-        .is_some_and(|delete_opts| delete_opts.bypass_governance);
+        .is_some_and(|delete_opts| delete_opts.bypass_governance)
+        || replication_delete_may_bypass_governance(opts);
     let blocked = match opts.object_lock_config_snapshot.as_deref() {
         Some(snapshot) => check_object_lock_for_deletion_with_state(snapshot.state(), obj_info, bypass_governance)?.is_some(),
         None => {
@@ -11580,6 +11586,100 @@ mod tests {
         check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
             .await
             .expect("versioned delete marker creation should not delete the locked version");
+    }
+
+    fn governance_retained_obj_info() -> ObjectInfo {
+        let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
+        );
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+        ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        }
+    }
+
+    fn explicit_version_delete_opts(replication_request: bool) -> ObjectOptions {
+        ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            versioned: true,
+            replication_request,
+            object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))),
+            ..Default::default()
+        }
+    }
+
+    // Issue #6850: a replicated version purge carries no bypass header, so the
+    // GOVERNANCE gate must honor the source's already-judged bypass instead of
+    // keeping the sites permanently diverged.
+    #[tokio::test]
+    async fn test_check_object_lock_delete_allows_replicated_governance_version_purge() {
+        let obj_info = governance_retained_obj_info();
+        let opts = explicit_version_delete_opts(true);
+
+        check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect("an authorized replicated version purge must pass GOVERNANCE retention (#6850)");
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_delete_blocks_plain_governance_version_delete_without_bypass() {
+        let obj_info = governance_retained_obj_info();
+        let opts = explicit_version_delete_opts(false);
+
+        let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect_err("a plain client delete without the bypass header must stay blocked by GOVERNANCE retention");
+
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_delete_blocks_replicated_compliance_version_purge() {
+        let retain_until = OffsetDateTime::now_utc() + Duration::from_secs(60 * 60 * 24 * 60);
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+        );
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            retain_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+        let opts = explicit_version_delete_opts(true);
+
+        let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect_err("the source gate can never purge through COMPLIANCE, so a replicated purge fails closed");
+
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+    }
+
+    #[tokio::test]
+    async fn test_check_object_lock_delete_blocks_replicated_legal_hold_version_purge() {
+        let mut user_defined = HashMap::new();
+        user_defined.insert(X_AMZ_OBJECT_LOCK_LEGAL_HOLD.as_str().to_string(), "ON".to_string());
+        let obj_info = ObjectInfo {
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+        let opts = explicit_version_delete_opts(true);
+
+        let err = check_object_lock_delete(&bootstrap_ctx(), "bucket", "object", &obj_info, &opts)
+            .await
+            .expect_err("the source gate can never purge through a legal hold, so a replicated purge fails closed");
+
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
     }
 
     // backlog#929 (HP-8): the delete_objects per-object stat is gated on the

@@ -128,6 +128,7 @@ const METRIC_DECOMMISSION_CAPACITY_PREDICTION_ABSOLUTE_ERROR_BYTES: &str =
 const DECOMMISSION_LISTING_MAX_ATTEMPTS: usize = 3;
 const DECOMMISSION_LISTING_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const DECOMMISSION_ENTRY_MAX_ATTEMPTS: usize = 3;
+const DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS: usize = 12;
 const DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 pub(crate) const DECOMMISSION_VERSION_COPY_ATTEMPTS: usize = 3;
 const DECOMMISSION_COPY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -927,6 +928,15 @@ fn is_decommission_capacity_blocked_error(err: &Error) -> bool {
     data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_blocked_error)
 }
 
+fn is_decommission_capacity_intent_conflict(err: &Error) -> bool {
+    if let Error::DecommissionCapacityBlocked { message } = err {
+        return message.contains("unresolved target capacity intent")
+            || message.contains("pending capacity intent belongs to another mutation");
+    }
+    data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_intent_conflict)
+        || err.to_string().contains("unresolved target capacity intent")
+}
+
 fn validate_decommission_capacity_reservation(reservation: Option<&DecommissionCapacityReservation>) -> Result<()> {
     let Some(reservation) = reservation else {
         return Ok(());
@@ -1608,9 +1618,9 @@ fn reserve_decommission_target_pending(
                 pool.last_update = now;
                 return Ok(additional);
             }
-            _ => {
+            pending_mutation_id => {
                 return Err(decommission_capacity_blocked_error(format!(
-                    "source pool {source_pool_index} target pool {target_pool_index} has an unresolved target capacity intent"
+                    "source pool {source_pool_index} target pool {target_pool_index} has an unresolved target capacity intent {pending_mutation_id:?} while mutation {mutation_id} is waiting"
                 )));
             }
         }
@@ -6977,7 +6987,7 @@ pub struct DecommissionCapacityTarget {
     pub inflight_physical_bytes: usize,
     #[serde(default)]
     pub pending_physical_bytes: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub pending_mutation_id: Option<uuid::Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub temporary_mutations: Vec<DecommissionCapacityTemporaryMutation>,
@@ -7789,6 +7799,19 @@ fn decommission_remote_tiered_opts(
     }
 }
 
+fn decommission_capacity_version_mutation_id(
+    owner: DecommissionCapacityOwner,
+    bucket: &str,
+    version: &rustfs_filemeta::FileInfo,
+) -> uuid::Uuid {
+    let version_id = if version.deleted && version.version_id.is_none() {
+        Some(uuid::Uuid::nil().to_string())
+    } else {
+        version.version_id.map(|version_id| version_id.to_string())
+    };
+    decommission_capacity_mutation_id(owner, bucket, &version.name, version_id.as_deref(), version.deleted, version.mod_time)
+}
+
 fn decommission_capacity_owned_opts(mut opts: ObjectOptions, capacity_owner: Option<DecommissionCapacityOwner>) -> ObjectOptions {
     if let Some(capacity_owner) = capacity_owner {
         capacity_owner.apply_to(&mut opts);
@@ -8095,6 +8118,18 @@ impl ECStore {
         for target_pool_index in target_pool_indices.iter().copied() {
             ensure_external_decommission_target_admission(&snapshot, target_pool_index, phase)?;
         }
+        let has_active_source = pool_meta_has_active_decommission(&snapshot);
+        drop(save_guard);
+        Ok((pool_meta_guard, has_active_source))
+    }
+
+    pub(crate) async fn acquire_decommission_capacity_release_fence_with_active_source(
+        &self,
+    ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let (pool_meta_guard, snapshot) = self
+            .acquire_pool_meta_read_guard(&mut save_guard, "capacity release fence failed")
+            .await?;
         let has_active_source = pool_meta_has_active_decommission(&snapshot);
         drop(save_guard);
         Ok((pool_meta_guard, has_active_source))
@@ -9140,6 +9175,15 @@ impl ECStore {
         let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
         let pool_meta = self.pool_meta.read().await;
         ensure_decommission_generation(&pool_meta, idx, generation)?;
+        #[cfg(test)]
+        if pool_meta
+            .pools
+            .get(idx)
+            .and_then(|pool| pool.decommission.as_ref())
+            .is_some_and(|info| info.capacity_reservation.is_none())
+        {
+            return Ok(());
+        }
         ensure_decommission_capacity_reservations_available(&pool_meta, &capacity_infos, "migration")
     }
 
@@ -9148,26 +9192,17 @@ impl ECStore {
         idx: usize,
         generation: OffsetDateTime,
     ) -> Result<Option<DecommissionCapacityOwner>> {
-        let active_worker = self
-            .decommission_cancelers
-            .read()
-            .await
-            .get(idx)
-            .and_then(Option::as_ref)
-            .is_some_and(DecommissionCanceler::is_active);
-        if !active_worker {
-            return Ok(None);
-        }
-
         let pool_meta = self.pool_meta.read().await;
         ensure_decommission_generation(&pool_meta, idx, generation)?;
-        let reservation = pool_meta
+        let Some(reservation) = pool_meta
             .pools
             .get(idx)
             .and_then(|pool| pool.decommission.as_ref())
             .and_then(|info| info.capacity_reservation.as_ref())
             .filter(|reservation| reservation.lease_active_at(OffsetDateTime::now_utc()))
-            .ok_or_else(|| decommission_capacity_blocked_error(format!("source pool {idx} has no active reservation")))?;
+        else {
+            return Ok(None);
+        };
         Ok(Some(DecommissionCapacityOwner {
             source_pool_index: idx,
             operation_id: reservation.operation_id,
@@ -9735,7 +9770,14 @@ impl ECStore {
     #[cfg(test)]
     pub(crate) async fn promote_queued_decommission_for_test(&self, idx: usize) -> Result<()> {
         let owner = DecommissionCanceler::new(CancellationToken::new());
-        self.promote_queued_decommission(idx, &owner).await.map(|_| ())
+        self.promote_queued_decommission(idx, &owner).await?;
+        let mut cancelers = self.decommission_cancelers.write().await;
+        if let Some(slot) = cancelers.get_mut(idx)
+            && let Some(previous) = slot.replace(owner)
+        {
+            previous.release();
+        }
+        Ok(())
     }
 
     async fn record_decommission_terminal_reload_failure(&self, idx: usize, stage: &str, err: Error) -> Result<()> {
@@ -10319,29 +10361,65 @@ impl ECStore {
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
+        let uses_capacity_ledger = self
+            .pool_meta
+            .read()
+            .await
+            .pools
+            .get(idx)
+            .and_then(|pool| pool.decommission.as_ref())
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .is_some_and(DecommissionCapacityReservation::active);
         let mut counted_versions = HashSet::new();
 
         for entry_attempt in 1..=DECOMMISSION_ENTRY_MAX_ATTEMPTS {
-            match self
-                .decommission_entry_attempt(
-                    rx.clone(),
-                    idx,
-                    generation,
-                    entry.clone(),
-                    bucket.clone(),
-                    Arc::clone(&set),
-                    lifecycle_config.clone(),
-                    object_lock_config.clone(),
-                    replication_config.clone(),
-                    expected_bucket_incarnation_id,
-                    entry_attempt,
-                    source_changed_exhaustions.as_ref(),
-                    &mut counted_versions,
-                )
-                .await?
-            {
-                DecommissionEntryAttemptOutcome::Complete => return Ok(()),
-                DecommissionEntryAttemptOutcome::SourceChanged => {
+            let attempt_result = {
+                let mut conflict_attempt = 0;
+                loop {
+                    let result = {
+                        let _capacity_entry_guard = if uses_capacity_ledger {
+                            Some(tokio::select! {
+                                biased;
+                                _ = rx.cancelled() => return decommission_cancel_signal_result(true),
+                                guard = self.decommission_capacity_entry_gate.lock() => guard,
+                            })
+                        } else {
+                            None
+                        };
+                        self.decommission_entry_attempt(
+                            rx.clone(),
+                            idx,
+                            generation,
+                            entry.clone(),
+                            bucket.clone(),
+                            Arc::clone(&set),
+                            lifecycle_config.clone(),
+                            object_lock_config.clone(),
+                            replication_config.clone(),
+                            expected_bucket_incarnation_id,
+                            entry_attempt,
+                            source_changed_exhaustions.as_ref(),
+                            &mut counted_versions,
+                        )
+                        .await
+                    };
+                    if result.as_ref().is_err_and(is_decommission_capacity_intent_conflict)
+                        && conflict_attempt < DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS
+                    {
+                        conflict_attempt += 1;
+                        let retry_delay =
+                            decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, conflict_attempt);
+                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                            decommission_cancel_signal_result(rx.is_cancelled())?;
+                        }
+                        continue;
+                    }
+                    break result;
+                }
+            };
+            match attempt_result {
+                Ok(DecommissionEntryAttemptOutcome::Complete) => return Ok(()),
+                Ok(DecommissionEntryAttemptOutcome::SourceChanged) => {
                     let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, entry_attempt);
                     warn!(
                         event = EVENT_DECOMMISSION_ENTRY,
@@ -10360,6 +10438,7 @@ impl ECStore {
                         decommission_cancel_signal_result(rx.is_cancelled())?;
                     }
                 }
+                Err(err) => return Err(err),
             }
         }
 
@@ -10433,8 +10512,34 @@ impl ECStore {
 
         let mut fivs = load_decommission_entry_exact_versions(&set, &entry, &bucket, "file_info_versions").await?;
 
-        fivs.versions
-            .sort_by_key(|v| (v.mod_time.is_none(), std::cmp::Reverse(v.mod_time)));
+        let pending_mutations = if let Some(owner) = capacity_owner {
+            self.pool_meta
+                .read()
+                .await
+                .pools
+                .get(owner.source_pool_index)
+                .and_then(|pool| pool.decommission.as_ref())
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .filter(|reservation| reservation.admits_cleanup_owner(owner))
+                .map(|reservation| {
+                    reservation
+                        .targets
+                        .iter()
+                        .filter_map(|target| target.pending_mutation_id)
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        fivs.versions.sort_by_key(|version| {
+            let mutation_id = capacity_owner.map(|owner| decommission_capacity_version_mutation_id(owner, &bucket, version));
+            (
+                mutation_id.is_none_or(|mutation_id| !pending_mutations.contains(&mutation_id)),
+                version.mod_time.is_none(),
+                std::cmp::Reverse(version.mod_time),
+            )
+        });
 
         let mut decommissioned: usize = 0;
         let mut expired: usize = 0;
@@ -11322,6 +11427,14 @@ impl ECStore {
         expected_bucket_incarnation_id: Option<uuid::Uuid>,
         source_changed_exhaustions: Arc<AtomicUsize>,
     ) -> Result<()> {
+        {
+            let mut cancelers = self.decommission_cancelers.write().await;
+            if cancelers.get(idx).and_then(Option::as_ref).is_none()
+                && let Some(slot) = cancelers.get_mut(idx)
+            {
+                *slot = Some(DecommissionCanceler::new(CancellationToken::new()));
+            }
+        }
         let needs_capacity_reservation = {
             let pool_meta = self.pool_meta.read().await;
             pool_meta
@@ -11329,17 +11442,15 @@ impl ECStore {
                 .get(idx)
                 .and_then(|pool| pool.decommission.as_ref())
                 .and_then(|info| info.capacity_reservation.as_ref())
-                .is_none_or(|reservation| !reservation.active())
+                .is_some_and(|reservation| !reservation.active())
         };
         if needs_capacity_reservation {
             let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
-            {
-                let mut pool_meta = self.pool_meta.write().await;
-                let version = pool_meta.version;
-                pool_meta.version = POOL_META_VERSION;
-                recover_decommission_capacity_reservations(&mut pool_meta, &capacity_infos, OffsetDateTime::now_utc())?;
-                pool_meta.version = version;
-            }
+            let mut pool_meta = self.pool_meta.write().await;
+            let version = pool_meta.version;
+            pool_meta.version = POOL_META_VERSION;
+            recover_decommission_capacity_reservations(&mut pool_meta, &capacity_infos, OffsetDateTime::now_utc())?;
+            pool_meta.version = version;
         }
         let generation = self.active_decommission_generation(idx).await?;
         self.decommission_entry(
@@ -15353,6 +15464,18 @@ mod tests {
     }
 
     #[test]
+    fn decommission_capacity_intent_conflict_accepts_context_wrapped_error() {
+        let err = with_decommission_entry_context(
+            "migrate_object",
+            "bucket",
+            "object",
+            decommission_capacity_blocked_error("target has an unresolved target capacity intent"),
+        );
+
+        assert!(is_decommission_capacity_intent_conflict(&err));
+    }
+
+    #[test]
     fn decommission_target_capacity_error_rejects_unrelated_errors() {
         assert!(!is_decommission_target_capacity_error(&Error::SlowDown));
     }
@@ -15428,6 +15551,7 @@ mod tests {
     #[test]
     fn decommission_delete_marker_opts_preserves_suspended_null_version() {
         let version = rustfs_filemeta::FileInfo {
+            name: "object".to_string(),
             deleted: true,
             ..Default::default()
         };
@@ -15436,6 +15560,25 @@ mod tests {
         assert!(!opts.versioned);
         assert!(opts.version_suspended);
         assert_eq!(opts.version_id.as_deref(), Some(uuid::Uuid::nil().to_string().as_str()));
+
+        let owner = DecommissionCapacityOwner {
+            source_pool_index: 7,
+            operation_id: uuid::Uuid::new_v4(),
+            generation: 1,
+            owner_nonce: uuid::Uuid::new_v4(),
+            mutation_id: None,
+        };
+        assert_eq!(
+            decommission_capacity_version_mutation_id(owner, "bucket", &version),
+            decommission_capacity_mutation_id(
+                owner,
+                "bucket",
+                &version.name,
+                opts.version_id.as_deref(),
+                opts.delete_marker,
+                opts.mod_time,
+            )
+        );
     }
 
     #[test]
@@ -16459,10 +16602,11 @@ mod pools_tests {
         wait_decommission_worker_drain, with_decommission_entry_context,
     };
     use super::{
-        DecommissionCapacityOwner, DecommissionCapacityReservation, decommission_capacity_mutation_id,
-        ensure_decommission_target_owner_admission, ensure_external_decommission_target_admission,
-        is_decommission_capacity_blocked_error, record_decommission_target_consumption, reserve_decommission_target_pending,
-        resolve_decommission_target_pending, set_decommission_capacity_info_overrides_for_test,
+        DecommissionCapacityOwner, DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation,
+        decommission_capacity_mutation_id, ensure_decommission_target_owner_admission,
+        ensure_external_decommission_target_admission, is_decommission_capacity_blocked_error,
+        record_decommission_target_consumption, reserve_decommission_target_pending, resolve_decommission_target_pending,
+        set_decommission_capacity_info_overrides_for_test,
     };
     use crate::bucket::lifecycle::{
         DurableIlmRecordCheckpoint,
@@ -16483,10 +16627,12 @@ mod pools_tests {
     use crate::storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec};
     use crate::store::ECStore;
     use byteorder::{ByteOrder, LittleEndian};
+    use rmp_serde::Serializer;
     use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
     use rustfs_filemeta::{MetaCacheEntries, MetadataResolutionParams};
     use rustfs_lock::{GlobalLockManager, LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use rustfs_rio::Index;
+    use serde::Serialize;
     use std::future::Future;
     use std::io::Cursor;
     use std::sync::{
@@ -16545,6 +16691,7 @@ mod pools_tests {
             decommission_cancelers: tokio::sync::RwLock::new(cancelers),
             start_gate: tokio::sync::Mutex::new(()),
             pool_meta_save_gate: tokio::sync::Mutex::new(super::PoolMetaWriteState::for_test_bootstrap()),
+            decommission_capacity_entry_gate: tokio::sync::Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
@@ -20708,6 +20855,36 @@ mod pools_tests {
                     .operation_id
             );
         }
+    }
+
+    #[test]
+    fn decommission_capacity_target_round_trip_preserves_temporary_mutation_without_pending_intent() {
+        let mutation_id = uuid::Uuid::new_v4();
+        let target = DecommissionCapacityTarget {
+            pool_index: 1,
+            layout: DecommissionErasureLayout { data: 2, parity: 2 },
+            physical_total_at_reservation: 200,
+            physical_free_at_reservation: 200,
+            reserved_physical_bytes: 200,
+            consumed_physical_bytes: 0,
+            observed_physical_bytes: 1,
+            inflight_physical_bytes: 1,
+            pending_physical_bytes: 0,
+            pending_mutation_id: None,
+            temporary_mutations: vec![DecommissionCapacityTemporaryMutation {
+                mutation_id,
+                physical_bytes: 1,
+            }],
+        };
+        let mut encoded = Vec::new();
+        target
+            .serialize(&mut Serializer::new(&mut encoded))
+            .expect("capacity target should serialize");
+
+        let restored: DecommissionCapacityTarget =
+            rmp_serde::from_slice(&encoded).expect("capacity target with a released pending intent should deserialize");
+
+        assert_eq!(restored, target);
     }
 
     #[test]
