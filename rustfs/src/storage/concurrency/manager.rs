@@ -566,6 +566,25 @@ impl ConcurrencyManager {
             .await
     }
 
+    /// Acquire the foreground gate selected when a Snowball archive request was
+    /// admitted. The outer request releases its preflight permit before parsing;
+    /// each member then shares the same strict/large-write gate with ordinary
+    /// PUTs for the duration of its storage commit.
+    pub(crate) async fn acquire_snowball_foreground_write(
+        &self,
+        gated: bool,
+    ) -> Result<Option<OwnedSemaphorePermit>, tokio::sync::AcquireError> {
+        if !gated {
+            return Ok(None);
+        }
+
+        let gate = match &self.foreground_write_admission_policy {
+            ForegroundWriteAdmissionPolicy::Strict(gate) | ForegroundWriteAdmissionPolicy::Large { gate, .. } => gate,
+            ForegroundWriteAdmissionPolicy::Disabled | ForegroundWriteAdmissionPolicy::LegacyCounterOnly => return Ok(None),
+        };
+        gate.semaphore.clone().acquire_owned().await.map(Some)
+    }
+
     /// Acquire one global Snowball member commit slot.
     pub(crate) async fn acquire_snowball_member_commit(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
         self.snowball_member_commit_semaphore.clone().acquire_owned().await
@@ -1122,6 +1141,35 @@ mod integration_tests {
         );
         drop(staging_permit);
         assert!(clone.try_acquire_snowball_staging_bytes(1).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_snowball_members_share_the_strict_foreground_put_gate() {
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 2, Duration::ZERO);
+        let outer = match manager.admit_put_object(1).await.expect("strict outer admission must remain open") {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            outcome => panic!("strict outer admission must return a permit: {outcome:?}"),
+        };
+        let member = manager
+            .acquire_snowball_foreground_write(true)
+            .await
+            .expect("strict member admission must remain open")
+            .expect("strict member admission must return a permit");
+        assert!(
+            matches!(
+                manager.admit_put_object(1).await.expect("strict gate must remain usable"),
+                ForegroundWriteAdmission::Rejected
+            ),
+            "outer PUTs and Snowball members must exhaust the same strict gate"
+        );
+
+        drop(outer);
+        let replacement = manager
+            .acquire_snowball_foreground_write(true)
+            .await
+            .expect("released strict capacity must be reusable")
+            .expect("strict replacement admission must return a permit");
+        drop((member, replacement));
     }
 
     #[tokio::test]

@@ -348,11 +348,11 @@ const EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES: usize = 2 * 1024;
 const EXTRACT_MAX_EFFECTIVE_PAX_FIELDS: usize = 4096;
 const EXTRACT_MAX_EXPANDED_PAX_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 const EXTRACT_SMALL_MEMBER_MAX_BYTES: usize = 64 * 1024;
+const EXTRACT_DEFAULT_MAX_INFLIGHT: usize = 1;
 const EXTRACT_BATCH_MAX_MEMBERS: usize = 16;
 const EXTRACT_BATCH_MAX_STAGING_BYTES: usize = 2 * 1024 * 1024;
 const EXTRACT_MEMBER_CONTEXT_OVERHEAD_BYTES: usize = 512;
 const EXTRACT_METADATA_ENTRY_OVERHEAD_BYTES: usize = 64;
-const EXTRACT_NOTIFICATION_BATCH_QUEUE: usize = 4;
 const ENV_RUSTFS_SNOWBALL_EXTRACT_MAX_INFLIGHT: &str = "RUSTFS_SNOWBALL_EXTRACT_MAX_INFLIGHT";
 const TAR_TYPEFLAG_OFFSET: usize = 156;
 
@@ -361,13 +361,17 @@ fn put_object_extract_max_inflight() -> usize {
     *MAX_INFLIGHT.get_or_init(|| {
         normalize_put_object_extract_max_inflight(rustfs_utils::get_env_usize(
             ENV_RUSTFS_SNOWBALL_EXTRACT_MAX_INFLIGHT,
-            EXTRACT_BATCH_MAX_MEMBERS,
+            EXTRACT_DEFAULT_MAX_INFLIGHT,
         ))
     })
 }
 
 fn normalize_put_object_extract_max_inflight(value: usize) -> usize {
     value.clamp(1, EXTRACT_BATCH_MAX_MEMBERS)
+}
+
+fn select_put_object_extract_max_inflight(configured: usize, ignore_errors: bool) -> usize {
+    if ignore_errors { configured } else { 1 }
 }
 
 struct ExtractPutRequestGuard {
@@ -528,8 +532,10 @@ struct ExtractPreparedMember {
 struct ExtractCommitContext {
     store: Arc<ECStore>,
     cache_adapter: Arc<ObjectDataCacheAdapter>,
+    notify: Arc<dyn crate::runtime_sources::NotifyInterface>,
     bucket: String,
     quota_enabled: bool,
+    foreground_write_gated: bool,
     request_context: request_context::RequestContext,
     req_params: HashMap<String, String>,
     host: String,
@@ -582,6 +588,7 @@ async fn commit_extract_member_inner<R>(
     opts: ObjectOptions,
     replication: ReplicateDecision,
     staging_permit: Option<OwnedSemaphorePermit>,
+    foreground_permit: Option<OwnedSemaphorePermit>,
 ) -> Result<ExtractCommitSuccess, ExtractCommitError>
 where
     R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -605,6 +612,7 @@ where
     };
     drop(reader);
     drop(staging_permit);
+    drop(foreground_permit);
 
     let extract_versioned = opts.versioned;
     let post_commit_error = match quota_accounting_object_size(&obj_info, context.quota_enabled) {
@@ -676,7 +684,24 @@ async fn commit_extract_member<R>(
 where
     R: AsyncRead + Send + Sync + Unpin + 'static,
 {
-    let _commit_permit = match get_concurrency_manager().acquire_snowball_member_commit().await {
+    let manager = get_concurrency_manager();
+    let foreground_permit = match manager
+        .acquire_snowball_foreground_write(context.foreground_write_gated)
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ExtractCommitOutcome {
+                archive_seq,
+                event: None,
+                error: Some(ExtractCommitError::Fatal(s3_error!(
+                    InternalError,
+                    "Snowball foreground write admission closed"
+                ))),
+            };
+        }
+    };
+    let _commit_permit = match manager.acquire_snowball_member_commit().await {
         Ok(permit) => permit,
         Err(_) => {
             return ExtractCommitOutcome {
@@ -690,7 +715,19 @@ where
         }
     };
 
-    match commit_extract_member_inner(context, key, size, actual_size, body, write_plan, opts, replication, staging_permit).await
+    match commit_extract_member_inner(
+        context,
+        key,
+        size,
+        actual_size,
+        body,
+        write_plan,
+        opts,
+        replication,
+        staging_permit,
+        foreground_permit,
+    )
+    .await
     {
         Ok(success) => ExtractCommitOutcome {
             archive_seq,
@@ -705,11 +742,10 @@ where
     }
 }
 
-async fn finish_extract_outcomes(
+fn ordered_extract_outcomes(
     mut outcomes: Vec<ExtractCommitOutcome>,
-    notification_tx: &tokio::sync::mpsc::Sender<Vec<rustfs_notify::EventArgs>>,
     ignore_errors: bool,
-) -> S3Result<()> {
+) -> (Vec<rustfs_notify::EventArgs>, Option<S3Error>) {
     outcomes.sort_by_key(|outcome| outcome.archive_seq);
     let mut events = Vec::with_capacity(outcomes.len());
     let mut earliest_error = None;
@@ -722,8 +758,38 @@ async fn finish_extract_outcomes(
             earliest_error = error;
         }
     }
+    (events, earliest_error)
+}
+
+fn spawn_extract_notification_batch<F, Fut>(
+    request_context: Option<request_context::RequestContext>,
+    events: Vec<rustfs_notify::EventArgs>,
+    notify: F,
+) where
+    F: Fn(rustfs_notify::EventArgs) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    spawn_background_with_context(request_context, async move {
+        for event in events {
+            notify(event).await;
+        }
+    });
+}
+
+fn finish_extract_outcomes(
+    outcomes: Vec<ExtractCommitOutcome>,
+    context: &Arc<ExtractCommitContext>,
+    ignore_errors: bool,
+) -> S3Result<()> {
+    let (events, earliest_error) = ordered_extract_outcomes(outcomes, ignore_errors);
     if !events.is_empty() {
-        let _ = notification_tx.send(events).await;
+        let notify = context.notify.clone();
+        spawn_extract_notification_batch(Some(context.request_context.clone()), events, move |event| {
+            let notify = notify.clone();
+            async move {
+                notify.notify(event).await;
+            }
+        });
     }
     match earliest_error {
         Some(error) => Err(error),
@@ -742,11 +808,22 @@ where
     outcomes
 }
 
+async fn run_extract_commits<T, F, Fut>(members: impl IntoIterator<Item = T>, mut commit: F) -> Vec<ExtractCommitOutcome>
+where
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = ExtractCommitOutcome>,
+{
+    let mut commits = FuturesUnordered::new();
+    for member in members {
+        commits.push(commit(member));
+    }
+    drain_extract_commits(commits).await
+}
+
 async fn flush_extract_batch(
     batch: &mut Vec<ExtractPreparedMember>,
     batch_state: &mut ExtractBatchState,
     context: &Arc<ExtractCommitContext>,
-    notification_tx: &tokio::sync::mpsc::Sender<Vec<rustfs_notify::EventArgs>>,
     ignore_errors: bool,
 ) -> S3Result<()> {
     if batch.is_empty() {
@@ -754,9 +831,10 @@ async fn flush_extract_batch(
         return Ok(());
     }
 
-    let mut commits = FuturesUnordered::new();
-    for member in batch.drain(..) {
-        commits.push(commit_extract_member(
+    let members = batch.drain(..).collect::<Vec<_>>();
+    batch_state.clear();
+    let outcomes = run_extract_commits(members, |member| {
+        commit_extract_member(
             context.clone(),
             member.archive_seq,
             member.key,
@@ -767,12 +845,10 @@ async fn flush_extract_batch(
             member.opts,
             member.replication,
             Some(member.staging_permit),
-        ));
-    }
-    batch_state.clear();
-
-    let outcomes = drain_extract_commits(commits).await;
-    finish_extract_outcomes(outcomes, notification_tx, ignore_errors).await
+        )
+    })
+    .await;
+    finish_extract_outcomes(outcomes, context, ignore_errors)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1866,15 +1942,19 @@ impl DefaultObjectUsecase {
                 u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?,
             )
             .await?;
-        let _put_admission = match get_concurrency_manager()
+        let foreground_write_gated = match get_concurrency_manager()
             .admit_put_object(size)
             .await
             .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
         {
-            ForegroundWriteAdmission::Disabled => None,
+            ForegroundWriteAdmission::Disabled => false,
             ForegroundWriteAdmission::Admitted(permit) => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "admitted").increment(1);
-                Some(permit)
+                // The archive admission is a preflight. Member commits acquire
+                // this same gate individually so bounded parallelism cannot
+                // bypass an operator's strict or large-write PUT limit.
+                drop(permit);
+                true
             }
             ForegroundWriteAdmission::Rejected => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
@@ -1955,15 +2035,6 @@ impl DefaultObjectUsecase {
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
         let user_agent = get_request_user_agent(&req.headers);
-        let (notification_tx, mut notification_rx) =
-            tokio::sync::mpsc::channel::<Vec<rustfs_notify::EventArgs>>(EXTRACT_NOTIFICATION_BATCH_QUEUE);
-        spawn_background_with_context(Some(request_context.clone()), async move {
-            while let Some(events) = notification_rx.recv().await {
-                for event in events {
-                    notify.notify(event).await;
-                }
-            }
-        });
         let mut extracted_entry_count = 0usize;
         let mut resource_total_size = 0u64;
         let mut legacy_quota_growth = 0u64;
@@ -1975,8 +2046,10 @@ impl DefaultObjectUsecase {
         let commit_context = Arc::new(ExtractCommitContext {
             store,
             cache_adapter: self.object_data_cache(),
+            notify,
             bucket: bucket.clone(),
             quota_enabled: extract_quota_enabled,
+            foreground_write_gated,
             request_context,
             req_params,
             host,
@@ -1987,7 +2060,12 @@ impl DefaultObjectUsecase {
         let durable_quota = extract_quota_check
             .as_ref()
             .is_some_and(|result| result.uses_durable_reservations);
-        let max_inflight = put_object_extract_max_inflight();
+        // Without ignore-errors, the legacy contract stops before attempting a
+        // later member after the first storage failure. Parallel commits cannot
+        // preserve that boundary, so concurrency requires both ignore-errors
+        // and an explicit max-inflight value above the serial default.
+        let max_inflight =
+            select_put_object_extract_max_inflight(put_object_extract_max_inflight(), extract_options.ignore_errors);
         let mut batch = Vec::with_capacity(max_inflight);
         let mut batch_state = ExtractBatchState::default();
 
@@ -2001,7 +2079,6 @@ impl DefaultObjectUsecase {
                             &mut batch,
                             &mut batch_state,
                             &commit_context,
-                            &notification_tx,
                             extract_options.ignore_errors,
                         )
                         .await
@@ -2023,7 +2100,6 @@ impl DefaultObjectUsecase {
                         &mut batch,
                         &mut batch_state,
                         &commit_context,
-                        &notification_tx,
                         extract_options.ignore_errors,
                     )
                     .await
@@ -2100,7 +2176,6 @@ impl DefaultObjectUsecase {
                         &mut batch,
                         &mut batch_state,
                         &commit_context,
-                        &notification_tx,
                         extract_options.ignore_errors,
                     )
                     .await
@@ -2342,7 +2417,6 @@ impl DefaultObjectUsecase {
                         &mut batch,
                         &mut batch_state,
                         &commit_context,
-                        &notification_tx,
                         extract_options.ignore_errors,
                     )
                     .await
@@ -2383,7 +2457,11 @@ impl DefaultObjectUsecase {
                     )
                     .await
                 };
-                extract_try!(finish_extract_outcomes(vec![outcome], &notification_tx, extract_options.ignore_errors,).await);
+                extract_try!(finish_extract_outcomes(
+                    vec![outcome],
+                    &commit_context,
+                    extract_options.ignore_errors,
+                ));
                 continue;
             }
 
@@ -2406,7 +2484,6 @@ impl DefaultObjectUsecase {
                         &mut batch,
                         &mut batch_state,
                         &commit_context,
-                        &notification_tx,
                         extract_options.ignore_errors,
                     )
                     .await
@@ -2443,7 +2520,6 @@ impl DefaultObjectUsecase {
                 &mut batch,
                 &mut batch_state,
                 &commit_context,
-                &notification_tx,
                 extract_options.ignore_errors,
             )
             .await
@@ -2513,9 +2589,20 @@ mod tests {
 
     #[test]
     fn snowball_max_inflight_has_a_serial_compatibility_floor_and_bounded_ceiling() {
+        assert_eq!(EXTRACT_DEFAULT_MAX_INFLIGHT, 1);
         assert_eq!(normalize_put_object_extract_max_inflight(0), 1);
         assert_eq!(normalize_put_object_extract_max_inflight(1), 1);
         assert_eq!(normalize_put_object_extract_max_inflight(usize::MAX), EXTRACT_BATCH_MAX_MEMBERS);
+        assert_eq!(
+            select_put_object_extract_max_inflight(EXTRACT_BATCH_MAX_MEMBERS, false),
+            1,
+            "requests that stop on write errors must preserve serial member semantics"
+        );
+        assert_eq!(
+            select_put_object_extract_max_inflight(EXTRACT_BATCH_MAX_MEMBERS, true),
+            EXTRACT_BATCH_MAX_MEMBERS,
+            "ignore-errors requests may use bounded parallel member commits"
+        );
     }
 
     #[test]
@@ -2664,9 +2751,8 @@ mod tests {
         assert!(archive.into_inner().is_ok(), "no TAR entry may escape the sequential producer");
     }
 
-    #[tokio::test]
-    async fn snowball_batch_error_selection_uses_archive_order() {
-        let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(1);
+    #[test]
+    fn snowball_batch_error_selection_uses_archive_order() {
         let outcomes = vec![
             ExtractCommitOutcome {
                 archive_seq: 2,
@@ -2679,15 +2765,13 @@ mod tests {
                 error: Some(ExtractCommitError::Fatal(s3_error!(NoSuchKey, "earlier"))),
             },
         ];
-        let error = finish_extract_outcomes(outcomes, &notification_tx, false)
-            .await
-            .expect_err("the earliest archive error must be returned");
+        let (_, error) = ordered_extract_outcomes(outcomes, false);
+        let error = error.expect("the earliest archive error must be returned");
         assert_eq!(error.code(), &S3ErrorCode::NoSuchKey);
     }
 
-    #[tokio::test]
-    async fn snowball_batch_notifications_follow_archive_order() {
-        let (notification_tx, mut notification_rx) = tokio::sync::mpsc::channel(1);
+    #[test]
+    fn snowball_batch_notifications_follow_archive_order() {
         let outcomes = vec![
             ExtractCommitOutcome {
                 archive_seq: 2,
@@ -2700,13 +2784,8 @@ mod tests {
                 error: None,
             },
         ];
-        finish_extract_outcomes(outcomes, &notification_tx, false)
-            .await
-            .expect("successful outcomes must be accepted");
-        let events = notification_rx
-            .recv()
-            .await
-            .expect("one ordered notification batch must be queued");
+        let (events, error) = ordered_extract_outcomes(outcomes, false);
+        assert!(error.is_none(), "successful outcomes must be accepted");
         assert_eq!(
             events.iter().map(|event| event.version_id.as_str()).collect::<Vec<_>>(),
             ["first", "second"]
@@ -2714,8 +2793,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snowball_ignore_errors_skips_storage_write_failure_and_keeps_later_success() {
-        let (notification_tx, mut notification_rx) = tokio::sync::mpsc::channel(1);
+    async fn snowball_notification_dispatch_detaches_slow_delivery() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        spawn_extract_notification_batch(
+            None,
+            vec![EventArgsBuilder::default().version_id("slow-target").build()],
+            {
+                let started = started.clone();
+                move |_event| {
+                    let started = started.clone();
+                    async move {
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                }
+            },
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("detached notification delivery must start without blocking the caller");
+    }
+
+    #[test]
+    fn snowball_ignore_errors_skips_storage_write_failure_and_keeps_later_success() {
         let outcomes = vec![
             ExtractCommitOutcome {
                 archive_seq: 1,
@@ -2729,50 +2830,64 @@ mod tests {
             },
         ];
 
-        finish_extract_outcomes(outcomes, &notification_tx, true)
-            .await
-            .expect("ignore-errors must skip a storage-only write failure");
-        let events = notification_rx.recv().await.expect("the later success must still notify");
+        let (events, error) = ordered_extract_outcomes(outcomes, true);
+        assert!(error.is_none(), "ignore-errors must skip a storage-only write failure");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].version_id, "later-success");
     }
 
-    #[tokio::test]
-    async fn snowball_ignore_errors_never_skips_reader_or_other_fatal_failures() {
-        let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(1);
+    #[test]
+    fn snowball_ignore_errors_never_skips_reader_or_other_fatal_failures() {
         let outcomes = vec![ExtractCommitOutcome {
             archive_seq: 1,
             event: None,
             error: Some(ExtractCommitError::Fatal(s3_error!(IncompleteBody, "injected reader failure"))),
         }];
 
-        let error = finish_extract_outcomes(outcomes, &notification_tx, true)
-            .await
-            .expect_err("ignore-errors must not hide reader, codec, length, resource, or post-commit failures");
+        let (_, error) = ordered_extract_outcomes(outcomes, true);
+        let error = error.expect("ignore-errors must not hide reader, codec, length, resource, or post-commit failures");
         assert_eq!(error.code(), &S3ErrorCode::IncompleteBody);
     }
 
     #[tokio::test]
-    async fn snowball_commit_drain_waits_for_every_outcome() {
+    async fn snowball_batch_runner_polls_commits_concurrently_and_drains_every_outcome() {
         let completed = Arc::new(AtomicUsize::new(0));
-        let commits = (1..=3)
-            .map(|archive_seq| {
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let outcomes = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_extract_commits(1..=3, {
+                let active = active.clone();
+                let max_active = max_active.clone();
+                let barrier = barrier.clone();
                 let completed = completed.clone();
-                async move {
-                    tokio::task::yield_now().await;
-                    completed.fetch_add(1, Ordering::Relaxed);
-                    ExtractCommitOutcome {
-                        archive_seq,
-                        event: None,
-                        error: (archive_seq == 2).then(|| ExtractCommitError::Fatal(s3_error!(InvalidArgument, "injected"))),
+                move |archive_seq| {
+                    let active = active.clone();
+                    let max_active = max_active.clone();
+                    let barrier = barrier.clone();
+                    let completed = completed.clone();
+                    async move {
+                        let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        max_active.fetch_max(current, Ordering::AcqRel);
+                        barrier.wait().await;
+                        active.fetch_sub(1, Ordering::AcqRel);
+                        completed.fetch_add(1, Ordering::Relaxed);
+                        ExtractCommitOutcome {
+                            archive_seq,
+                            event: None,
+                            error: (archive_seq == 2)
+                                .then(|| ExtractCommitError::Fatal(s3_error!(InvalidArgument, "injected"))),
+                        }
                     }
                 }
-            })
-            .collect::<FuturesUnordered<_>>();
-
-        let outcomes = drain_extract_commits(commits).await;
+            }),
+        )
+        .await
+        .expect("the production batch runner must poll all commits concurrently");
         assert_eq!(outcomes.len(), 3);
         assert_eq!(completed.load(Ordering::Relaxed), 3);
+        assert_eq!(max_active.load(Ordering::Acquire), 3);
         assert_eq!(outcomes.iter().filter(|outcome| outcome.error.is_some()).count(), 1);
     }
 
