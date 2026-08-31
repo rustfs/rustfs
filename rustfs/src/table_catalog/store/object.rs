@@ -4659,6 +4659,7 @@ where
         let (mut next, precondition) = match current {
             Some((entry, etag)) => {
                 validate_namespace_entry_object(&self.paths, &namespace_path, &entry)?;
+                validate_namespace_properties(&entry.properties)?;
                 if entry.state != TableCatalogEntryState::Active {
                     return Err(TableCatalogStoreError::NotFound(format!(
                         "namespace {table_bucket}/{}",

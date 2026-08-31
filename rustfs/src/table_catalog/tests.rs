@@ -16945,6 +16945,46 @@ async fn object_catalog_namespace_property_update_rejects_missing_inactive_and_c
             .await,
         Err(TableCatalogStoreError::Invalid(_))
     );
+
+    let semantically_corrupt = Namespace::parse("semantically_corrupt").expect("corrupt namespace should parse");
+    let mut semantically_corrupt_entry = test_namespace_entry(bucket, &semantically_corrupt);
+    semantically_corrupt_entry.properties = (0..=NAMESPACE_PROPERTIES_MAX_ENTRIES)
+        .map(|index| (format!("key{index}"), "value".to_string()))
+        .collect();
+    let semantically_corrupt_path = store.paths.namespace_entry_path(bucket, &semantically_corrupt);
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &semantically_corrupt_path,
+            serde_json::to_vec(&semantically_corrupt_entry).expect("corrupt namespace should encode"),
+        )
+        .await;
+    let put_attempts = backend
+        .put_attempt_count(RUSTFS_META_BUCKET, &semantically_corrupt_path)
+        .await;
+    let repair_update =
+        NamespacePropertiesUpdate::try_new(vec![format!("key{NAMESPACE_PROPERTIES_MAX_ENTRIES}")], BTreeMap::new())
+            .expect("repair request should validate structurally");
+
+    assert_matches!(
+        store
+            .update_namespace_properties(bucket, &semantically_corrupt.public_name(), repair_update,)
+            .await,
+        Err(TableCatalogStoreError::Invalid(_))
+    );
+    assert_eq!(
+        backend
+            .put_attempt_count(RUSTFS_META_BUCKET, &semantically_corrupt_path)
+            .await,
+        put_attempts
+    );
+    let persisted = store
+        .read_entry::<NamespaceEntry>(RUSTFS_META_BUCKET, &semantically_corrupt_path)
+        .await
+        .expect("corrupt namespace lookup should succeed")
+        .expect("corrupt namespace should remain")
+        .0;
+    assert_eq!(persisted.properties.len(), NAMESPACE_PROPERTIES_MAX_ENTRIES + 1);
 }
 
 #[tokio::test]
