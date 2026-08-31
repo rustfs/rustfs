@@ -1205,6 +1205,23 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
+    #[test]
+    fn g_d2_008_default_versioning_config_keeps_persisted_bytes() {
+        let bytes = crate::bucket::utils::serialize::<VersioningConfiguration>(&ENABLED_VERSIONING_CONFIG)
+            .expect("the default Versioning configuration must serialize");
+        assert_eq!(bytes, b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>");
+    }
+
+    #[test]
+    fn g_d2_009_default_object_lock_config_keeps_persisted_bytes() {
+        let bytes = crate::bucket::utils::serialize::<ObjectLockConfiguration>(&ENABLED_OBJECT_LOCK_CONFIG)
+            .expect("the default Object Lock configuration must serialize");
+        assert_eq!(
+            bytes,
+            b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>"
+        );
+    }
+
     #[tokio::test]
     async fn test_get_disk_infos() {
         let disks = vec![None, None]; // Empty disks for testing

@@ -25,6 +25,7 @@ const METRIC_SCANNER_CYCLE_RECOVERY_REQUIRED: &str = "rustfs_scanner_cycle_recov
 const METRIC_SCANNER_CYCLE_RECOVERY_RETRY_COUNT: &str = "rustfs_scanner_cycle_recovery_retry_count";
 const USAGE_FLOOR_LOAD_FAILED: &str = "usage_floor_load_failed";
 const LEGACY_EMPTY_USAGE_FLOOR_RECOVERY: &str = "legacy_empty_usage_floor";
+const CACHE_CYCLE_AHEAD: &str = "cache_cycle_ahead";
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScannerCycleRecoveryStatus {
@@ -40,6 +41,7 @@ pub struct ScannerCycleRecoveryStatus {
     pub first_detected_at_unix_secs: Option<u64>,
     pub last_attempt_at_unix_secs: Option<u64>,
     pub retry_count: u64,
+    /// Maximum automatic retries, or zero when the recovery is unbounded.
     pub max_retries: u32,
     /// Whether the scanner may retry this state automatically.
     pub retryable: bool,
@@ -72,6 +74,7 @@ fn set_scanner_cycle_recovery_status(status: ScannerCycleRecoveryStatus) {
             | "cleanup-pending"
             | "usage_floor_load_failed"
             | "usage_floor_recovery_pending"
+            | "cache_cycle_ahead"
     ) {
         1.0
     } else {
@@ -113,6 +116,51 @@ pub(super) fn clear_scanner_usage_floor_failure() {
     }
 }
 
+pub(super) fn record_scanner_cache_cycle_ahead(requested_cycle: u64, required_cycle: u64, leader_epoch: u64) {
+    let previous = scanner_cycle_recovery_status();
+    let same_floor = previous.classification.as_deref() == Some(CACHE_CYCLE_AHEAD)
+        && previous.generation == Some(required_cycle)
+        && previous.leader_epoch == Some(leader_epoch);
+    let now = unix_now_secs();
+    let (first_detected_at_unix_secs, retry_count) = if same_floor {
+        (previous.first_detected_at_unix_secs.or(Some(now)), previous.retry_count)
+    } else {
+        (Some(now), 0)
+    };
+    set_scanner_cycle_recovery_status(ScannerCycleRecoveryStatus {
+        path: DATA_USAGE_BLOOM_NAME_PATH.clone(),
+        state: CACHE_CYCLE_AHEAD.to_string(),
+        classification: Some(CACHE_CYCLE_AHEAD.to_string()),
+        generation: Some(required_cycle),
+        leader_epoch: Some(leader_epoch),
+        first_detected_at_unix_secs,
+        last_attempt_at_unix_secs: Some(now),
+        retry_count,
+        max_retries: 0,
+        retryable: true,
+        reason: Some(format!(
+            "persisted scanner cache cycle {required_cycle} is ahead of requested cycle {requested_cycle}"
+        )),
+        ..Default::default()
+    });
+}
+
+pub(super) fn record_scanner_cache_cycle_recovery_attempt() {
+    let mut status = scanner_cycle_recovery_status();
+    if status.classification.as_deref() != Some(CACHE_CYCLE_AHEAD) {
+        return;
+    }
+    status.retry_count = status.retry_count.saturating_add(1);
+    status.last_attempt_at_unix_secs = Some(unix_now_secs());
+    set_scanner_cycle_recovery_status(status);
+}
+
+pub(super) fn clear_scanner_cache_cycle_ahead() {
+    if scanner_cycle_recovery_status().classification.as_deref() == Some(CACHE_CYCLE_AHEAD) {
+        set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
+    }
+}
+
 pub(super) fn record_legacy_empty_usage_floor_recovery_pending(leader_epoch: u64) {
     let previous = scanner_cycle_recovery_status();
     let same_recovery = previous.classification.as_deref() == Some(LEGACY_EMPTY_USAGE_FLOOR_RECOVERY)
@@ -147,9 +195,12 @@ pub(super) fn clear_legacy_empty_usage_floor_recovery_status() {
 
 pub(super) fn record_scanner_cycle_recovery_retry(attempt: u32) -> bool {
     let mut status = scanner_cycle_recovery_status();
-    status.retry_count = u64::from(attempt);
+    if status.classification.as_deref() == Some(CACHE_CYCLE_AHEAD) {
+        return true;
+    }
+    status.retry_count = status.retry_count.max(u64::from(attempt));
     status.last_attempt_at_unix_secs = Some(unix_now_secs());
-    if attempt >= MAX_SCANNER_CYCLE_RECOVERY_RETRIES {
+    if status.max_retries != 0 && status.retry_count >= u64::from(status.max_retries) {
         status.state = "paused".to_string();
         status.retryable = false;
         status.reason = Some("scanner cycle recovery retry budget reached; sparse backend probes continue".to_string());
