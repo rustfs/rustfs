@@ -146,7 +146,7 @@ pub(super) async fn usage_snapshot_for_epoch_fence(
         LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
         format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
     ] {
-        let (legacy, _) = read_config_with_revision(storeapi.clone(), &path)
+        let (legacy, _) = read_usage_primary_or_legacy_backup(storeapi.clone(), &path)
             .await
             .map_err(|err| ScannerError::Other(format!("failed to read legacy scanner usage epoch fence: {err}")))?;
         if let Some(legacy) = legacy.as_deref() {
@@ -257,6 +257,11 @@ pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
             }
             Some(epoch) if epoch == claimed_epoch => return Ok(()),
             Some(_) | None => {}
+        }
+        // A validated pre-marker baseline needs its explicit identity before
+        // acquiring an epoch, which makes it ineligible for legacy decoding.
+        if !usage.usage_snapshot_bootstrap_pending {
+            usage.usage_snapshot_complete = true;
         }
         usage.scanner_epoch = Some(claimed_epoch);
         let data = serde_json::to_vec(&usage)

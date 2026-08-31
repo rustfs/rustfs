@@ -1717,7 +1717,7 @@ pub(super) async fn persisted_usage_floor_for_startup(
         let backup_path = format!("{primary_path}.bkp");
         let is_v2_path = primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str();
         let mut recovered_primary_companion_epoch = None;
-        let primary_epoch = match read_config_with_revision(storeapi.clone(), primary_path).await {
+        let primary_epoch = match read_usage_primary_or_legacy_backup(storeapi.clone(), primary_path).await {
             Ok((Some(data), revision)) => {
                 let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
                     ScannerError::Other(format!("failed to decode scanner usage floor from {primary_path}: {err}"))

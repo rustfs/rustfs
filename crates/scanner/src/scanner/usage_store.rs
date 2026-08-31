@@ -68,7 +68,7 @@ pub(super) async fn read_data_usage_persist_baseline(
             LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
             format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
         ] {
-            let (candidate, _) = read_config_with_revision(storeapi.clone(), &path).await?;
+            let (candidate, _) = read_usage_primary_or_legacy_backup(storeapi.clone(), &path).await?;
             let Some(candidate) = candidate else {
                 continue;
             };
@@ -107,7 +107,7 @@ pub(super) async fn read_data_usage_persist_baseline(
         LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
         format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
     ] {
-        let (candidate, _) = read_config_with_revision(storeapi.clone(), &path).await?;
+        let (candidate, _) = read_usage_primary_or_legacy_backup(storeapi.clone(), &path).await?;
         let Some(candidate) = candidate else {
             continue;
         };
