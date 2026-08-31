@@ -185,6 +185,12 @@ pub enum StorageError {
     DecommissionAlreadyRunning,
     #[error("Rebalance already running")]
     RebalanceAlreadyRunning,
+    #[error("{operation}: stale pool metadata update rejected for pool {pool_index}; {reason}")]
+    StalePoolMetadataUpdate {
+        operation: String,
+        pool_index: usize,
+        reason: &'static str,
+    },
     #[error("Operation canceled")]
     OperationCanceled,
     #[error("No heal required")]
@@ -564,6 +570,15 @@ impl Clone for StorageError {
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
             StorageError::RebalanceAlreadyRunning => StorageError::RebalanceAlreadyRunning,
+            StorageError::StalePoolMetadataUpdate {
+                operation,
+                pool_index,
+                reason,
+            } => StorageError::StalePoolMetadataUpdate {
+                operation: operation.clone(),
+                pool_index: *pool_index,
+                reason,
+            },
             StorageError::OperationCanceled => StorageError::OperationCanceled,
             StorageError::ErasureReadQuorum => StorageError::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => StorageError::ErasureWriteQuorum,
@@ -667,6 +682,7 @@ impl StorageError {
             StorageError::DoneForNow => StorageErrorCode::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageErrorCode::DecommissionAlreadyRunning,
             StorageError::RebalanceAlreadyRunning => StorageErrorCode::RebalanceAlreadyRunning,
+            StorageError::StalePoolMetadataUpdate { .. } => StorageErrorCode::InvalidArgument,
             StorageError::OperationCanceled => StorageErrorCode::OperationCanceled,
             StorageError::ErasureReadQuorum => StorageErrorCode::ErasureReadQuorum,
             StorageError::ErasureWriteQuorum => StorageErrorCode::ErasureWriteQuorum,

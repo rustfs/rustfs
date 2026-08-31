@@ -845,7 +845,7 @@ impl ECStore {
 
         let mut pool_stats = Vec::with_capacity(self.pools.len());
 
-        let now = OffsetDateTime::now_utc();
+        let now = self.next_scanner_data_movement_update(OffsetDateTime::now_utc()).await;
 
         for disk_stat in disk_stats.iter() {
             let mut pool_stat = RebalanceStats {
@@ -868,8 +868,10 @@ impl ECStore {
             pool_stats.push(pool_stat);
         }
 
+        let has_participating_pool = pool_stats.iter().any(|pool_stat| pool_stat.participating);
         let meta = RebalanceMeta {
             id: Uuid::new_v4().to_string(),
+            stopped_at: (!has_participating_pool).then_some(now),
             percent_free_goal,
             pool_stats,
             ..Default::default()
@@ -963,6 +965,18 @@ impl ECStore {
                 )));
             }
             if meta.stopped_at.is_some() {
+                if !is_rebalance_conflicting_with_decommission(meta) {
+                    debug!(
+                        event = EVENT_REBALANCE_STATE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REBALANCE,
+                        state = "start_skipped",
+                        reason = "not_started_terminal",
+                        rebalance_id = %expected_id,
+                        "Skipped rebalance start because metadata is already terminal"
+                    );
+                    return Ok(());
+                }
                 return Err(Error::other(format!("rebalance {expected_id} was stopped before start")));
             }
         }
@@ -1214,11 +1228,11 @@ impl ECStore {
         };
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.write().await;
+        let stopped_at = self.next_scanner_data_movement_update(OffsetDateTime::now_utc()).await;
         let (previous_meta, meta_to_save) = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             let previous_meta = rebalance_meta.clone();
-            let meta_to_save =
-                stop_rebalance_meta_snapshot_for_id(rebalance_meta.as_mut(), OffsetDateTime::now_utc(), expected_id)?;
+            let meta_to_save = stop_rebalance_meta_snapshot_for_id(rebalance_meta.as_mut(), stopped_at, expected_id)?;
             (previous_meta, meta_to_save)
         };
 
@@ -1250,14 +1264,10 @@ impl ECStore {
             .await?;
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.write().await;
+        let failed_at = self.next_scanner_data_movement_update(OffsetDateTime::now_utc()).await;
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
-            rollback_rebalance_start_meta_snapshot_for_id(
-                rebalance_meta.as_mut(),
-                OffsetDateTime::now_utc(),
-                expected_id,
-                start_error,
-            )
+            rollback_rebalance_start_meta_snapshot_for_id(rebalance_meta.as_mut(), failed_at, expected_id, start_error)
         };
 
         if let Some(meta_to_save) = meta_to_save {
@@ -1400,6 +1410,62 @@ mod tests {
             .await
             .expect("retrying admission cancellation should be idempotent");
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn equal_free_ratio_admin_no_participant_rebalance_succeeds_and_persists_terminal_generation_after_restart() {
+        let (_temp_dirs, store, restarted) =
+            crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+        let movement_floor = OffsetDateTime::from_unix_timestamp(4_100_000_000).expect("future test timestamp should be valid");
+        *store.rebalance_meta.write().await = Some(RebalanceMeta {
+            id: "previous-terminal-rebalance".to_string(),
+            stopped_at: Some(movement_floor),
+            ..Default::default()
+        });
+        set_rebalance_disk_stats_override_for_test(
+            store.id,
+            vec![
+                DiskStat {
+                    total_space: 100,
+                    available_space: 50,
+                },
+                DiskStat {
+                    total_space: 100,
+                    available_space: 50,
+                },
+            ],
+        );
+
+        let rebalance_id = store
+            .init_and_start_rebalance(vec!["equal-ratio-no-op".to_string()])
+            .await
+            .expect("equal free ratio admin rebalance should succeed as a terminal no-op");
+        let stopped_at = {
+            let local = store.rebalance_meta.read().await;
+            let local = local.as_ref().expect("no-op rebalance metadata should remain available");
+            assert_eq!(local.id, rebalance_id);
+            assert!(local.pool_stats.iter().all(|pool_stat| !pool_stat.participating));
+            let stopped_at = local.stopped_at.expect("no-op rebalance must persist a terminal timestamp");
+            assert_eq!(stopped_at, movement_floor + time::Duration::nanoseconds(1));
+            stopped_at
+        };
+
+        let stopped_generation =
+            u64::try_from(stopped_at.unix_timestamp_nanos()).expect("terminal timestamp should map to scanner generation");
+        let live_status = store.scanner_data_movement_pause_status().await;
+        assert!(!live_status.paused);
+        assert_eq!(live_status.movement_generation, stopped_generation);
+
+        restarted
+            .load_rebalance_meta()
+            .await
+            .expect("restarted store should load the persisted no-op rebalance metadata");
+        let status = restarted.scanner_data_movement_pause_status().await;
+
+        assert!(!status.paused);
+        assert_eq!(status.movement_generation, stopped_generation);
+        assert_eq!(restarted.scanner_data_movement_generation(), stopped_generation);
     }
 
     #[tokio::test]
