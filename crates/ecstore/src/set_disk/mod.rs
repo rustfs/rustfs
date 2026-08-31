@@ -894,7 +894,10 @@ struct OwnedGetObjectFileInfo {
     fi: FileInfo,
     parts_metadata: Vec<FileInfo>,
     online_disks: Vec<Option<DiskStore>>,
+    late_metadata_fanout_disks: Option<Vec<Option<DiskStore>>>,
 }
+
+type OwnedGetObjectFileInfoParts = (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>, Option<Vec<Option<DiskStore>>>);
 
 impl GetObjectFileInfo {
     fn owned(fi: FileInfo, parts_metadata: Vec<FileInfo>, online_disks: Vec<Option<DiskStore>>) -> Self {
@@ -903,6 +906,24 @@ impl GetObjectFileInfo {
                 fi,
                 parts_metadata,
                 online_disks,
+                late_metadata_fanout_disks: None,
+            }),
+            shared: None,
+        }
+    }
+
+    fn owned_with_late_metadata_fanout(
+        fi: FileInfo,
+        parts_metadata: Vec<FileInfo>,
+        online_disks: Vec<Option<DiskStore>>,
+        late_metadata_fanout_disks: Vec<Option<DiskStore>>,
+    ) -> Self {
+        Self {
+            owned: Some(OwnedGetObjectFileInfo {
+                fi,
+                parts_metadata,
+                online_disks,
+                late_metadata_fanout_disks: Some(late_metadata_fanout_disks),
             }),
             shared: None,
         }
@@ -939,19 +960,28 @@ impl GetObjectFileInfo {
         }
     }
 
+    fn has_late_metadata_fanout(&self) -> bool {
+        self.owned
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.late_metadata_fanout_disks.is_some())
+    }
+
     fn into_owned(self) -> (FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>) {
+        let (fi, parts_metadata, online_disks, _) = self.into_owned_with_late_metadata_fanout();
+        (fi, parts_metadata, online_disks)
+    }
+
+    fn into_owned_with_late_metadata_fanout(self) -> OwnedGetObjectFileInfoParts {
         match (self.owned, self.shared) {
-            (Some(snapshot), None) => {
-                let OwnedGetObjectFileInfo {
-                    fi,
-                    parts_metadata,
-                    online_disks,
-                } = snapshot;
-                (fi, parts_metadata, online_disks)
-            }
+            (Some(snapshot), None) => (
+                snapshot.fi,
+                snapshot.parts_metadata,
+                snapshot.online_disks,
+                snapshot.late_metadata_fanout_disks,
+            ),
             (None, Some(entry)) => match Arc::try_unwrap(entry) {
-                Ok(entry) => (entry.fi, entry.parts_metadata, entry.online_disks),
-                Err(entry) => (entry.fi.clone(), entry.parts_metadata.clone(), entry.online_disks.clone()),
+                Ok(entry) => (entry.fi, entry.parts_metadata, entry.online_disks, None),
+                Err(entry) => (entry.fi.clone(), entry.parts_metadata.clone(), entry.online_disks.clone(), None),
             },
             _ => unreachable!("GET metadata snapshot representation must be exclusive"),
         }
@@ -1227,6 +1257,278 @@ mod prepared_get_object_metadata_tests {
                     calls.total(disk_call_counters::KIND_READ_VERSION) < 4,
                     "non-inline quorum GET should retain a reconstruction reserve"
                 );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn non_inline_two_phase_read_fetches_late_parity_after_two_selected_shards_fail() {
+        let (dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "non-inline-read-late-parity";
+        let object = object_with_initial_data_shards(bucket, "late-parity-object");
+        let payload = vec![0x5a; 1024 * 1024];
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let order = bounded_metadata_fanout_order(bucket, &object, 4, 2);
+        let distribution = FileInfo::new(&[bucket, object.as_str()].join("/"), 2, 2).erasure.distribution;
+        assert!(
+            order.iter().take(2).all(|disk_index| distribution[*disk_index] <= 2),
+            "the two failed selected shards must be data shards"
+        );
+        assert!(
+            distribution[order[3]] > 2,
+            "the metadata shard omitted by the plan must be healthy parity"
+        );
+        for disk_index in order.iter().take(2) {
+            let object_dir = dirs[*disk_index].path().join(bucket).join(&object);
+            let data_dir = std::fs::read_dir(&object_dir)
+                .expect("object directory should be readable")
+                .find_map(|entry| {
+                    let entry = entry.expect("object directory entry should be readable");
+                    entry
+                        .file_type()
+                        .expect("object directory entry type should be readable")
+                        .is_dir()
+                        .then(|| entry.path())
+                })
+                .expect("object data directory should exist");
+            let part_path = data_dir.join("part.1");
+            let mut shard = std::fs::read(&part_path).expect("selected data shard should be readable before corruption");
+            shard[0] ^= 0xff;
+            std::fs::write(part_path, shard).expect("selected data shard should be corrupted after metadata was written");
+        }
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(&object);
+                let mut reader = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("two-phase GET should recover using late parity");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("late parity should restore the exact GET body");
+                assert_eq!(restored, payload);
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 7);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn non_inline_two_phase_read_fetches_late_parity_when_selected_parts_are_missing() {
+        let (dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "non-inline-read-late-parity-missing";
+        let object = object_with_initial_data_shards(bucket, "late-parity-missing-object");
+        let payload = vec![0x3c; 1024 * 1024];
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let order = bounded_metadata_fanout_order(bucket, &object, 4, 2);
+        for disk_index in order.iter().take(2) {
+            let object_dir = dirs[*disk_index].path().join(bucket).join(&object);
+            let data_dir = std::fs::read_dir(&object_dir)
+                .expect("object directory should be readable")
+                .find_map(|entry| {
+                    let entry = entry.expect("object directory entry should be readable");
+                    entry
+                        .file_type()
+                        .expect("entry type should be readable")
+                        .is_dir()
+                        .then(|| entry.path())
+                })
+                .expect("object data directory should exist");
+            std::fs::remove_file(data_dir.join("part.1")).expect("selected data shard should be removed");
+        }
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(&object);
+                let mut reader = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("two-phase GET should recover using late parity");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("late parity should restore the exact GET body");
+                assert_eq!(restored, payload);
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 7);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn four_data_two_parity_two_phase_read_recovers_one_failed_data_shard() {
+        let (dirs, set_disks) = make_local_set_disks(6, 2).await;
+        let bucket = "four-data-two-parity-late-read";
+        let object = object_with_initial_data_shards_for_geometry(bucket, "one-failed-data", 4, 2);
+        let payload = vec![0x7a; 1024 * 1024];
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload.clone());
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let order = bounded_metadata_fanout_order(bucket, &object, 6, 2);
+        let distribution = FileInfo::new(&[bucket, object.as_str()].join("/"), 4, 2).erasure.distribution;
+        let failed_disk = *order
+            .iter()
+            .take(4)
+            .find(|disk_index| distribution[**disk_index] <= 4)
+            .expect("initial fanout should include a data shard");
+        assert!(
+            order.iter().take(4).all(|disk_index| distribution[*disk_index] <= 4),
+            "initial fanout should cover all four data shards"
+        );
+        assert!(distribution[order[5]] > 4, "the final deferred metadata shard should be parity");
+
+        let object_dir = dirs[failed_disk].path().join(bucket).join(&object);
+        let data_dir = std::fs::read_dir(&object_dir)
+            .expect("object directory should be readable")
+            .find_map(|entry| {
+                let entry = entry.expect("object directory entry should be readable");
+                entry
+                    .file_type()
+                    .expect("object directory entry type should be readable")
+                    .is_dir()
+                    .then(|| entry.path())
+            })
+            .expect("object data directory should exist");
+        let part_path = data_dir.join("part.1");
+        let mut shard = std::fs::read(&part_path).expect("selected data shard should be readable before corruption");
+        shard[0] ^= 0xff;
+        std::fs::write(part_path, shard).expect("selected data shard should be corrupted after metadata was written");
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let calls = disk_call_counters::observe(&object);
+                let mut reader = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await
+                    .expect("two-phase GET should recover with one failed data shard");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("late parity should restore the exact GET body");
+                assert_eq!(restored, payload);
+                assert_eq!(calls.total(disk_call_counters::KIND_READ_VERSION), 11);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn four_data_two_parity_two_phase_read_rejects_below_read_quorum() {
+        let (dirs, set_disks) = make_local_set_disks(6, 2).await;
+        let bucket = "four-data-two-parity-quorum-minus-one";
+        let object = object_with_initial_data_shards_for_geometry(bucket, "quorum-minus-one", 4, 2);
+        let payload = vec![0x4b; 1024 * 1024];
+        let opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut put_reader = PutObjReader::from_vec(payload);
+        set_disks
+            .put_object(bucket, &object, &mut put_reader, &opts)
+            .await
+            .expect("object should be written");
+
+        let order = bounded_metadata_fanout_order(bucket, &object, 6, 2);
+        for disk_index in order.iter().take(3) {
+            let object_dir = dirs[*disk_index].path().join(bucket).join(&object);
+            let data_dir = std::fs::read_dir(&object_dir)
+                .expect("object directory should be readable")
+                .find_map(|entry| {
+                    let entry = entry.expect("object directory entry should be readable");
+                    entry
+                        .file_type()
+                        .expect("entry type should be readable")
+                        .is_dir()
+                        .then(|| entry.path())
+                })
+                .expect("object data directory should exist");
+            std::fs::remove_file(data_dir.join("part.1")).expect("selected shard should be removed");
+        }
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+            ],
+            async {
+                let result = set_disks
+                    .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                    .await;
+                assert!(result.is_err(), "quorum-minus-one read must fail closed without exposing a body");
             },
         )
         .await;
@@ -2338,6 +2640,15 @@ fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, buc
 /// Should this specific request use codec streaming?
 fn should_use_codec_streaming(config: GetCodecStreamingConfig, bucket: &str, object: &str) -> bool {
     is_optimization_enabled_for_request(config.enabled, config.rollout_pct, bucket, object)
+}
+
+pub(in crate::set_disk) fn codec_streaming_rollout_applies(bucket: &str, object: &str) -> bool {
+    let config = get_codec_streaming_config();
+    config.enabled
+        && config.body_compat_confirmed
+        && config.header_compat_confirmed
+        && config.rollout.is_opted_in()
+        && should_use_codec_streaming(config, bucket, object)
 }
 
 /// Should this specific request use metadata early-stop?
@@ -12250,6 +12561,7 @@ mod tests {
                 0,
                 true,
                 false,
+                false,
                 GET_OBJECT_PATH_LEGACY_DUPLEX,
                 GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
                 metrics_size_bucket,
@@ -12361,6 +12673,7 @@ mod tests {
                 0,
                 0,
                 true,
+                false,
                 false,
                 GET_OBJECT_PATH_LEGACY_DUPLEX,
                 GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,

@@ -46,6 +46,7 @@ type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Re
 type OwnedShardReadFuture<'a, R> =
     Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, Option<BitrotReader<R>>, bool)> + Send + 'a>>;
 pub(crate) type DeferredReaderReopener<R> = Arc<dyn Fn(usize) -> Option<BitrotReader<R>> + Send + Sync>;
+pub(crate) type DecodeOutcome = (usize, Option<std::io::Error>, bool);
 
 type ShardIndexes = SmallVec<[usize; INLINE_SHARD_SLOTS]>;
 type ActiveReaders = SmallVec<[bool; INLINE_SHARD_SLOTS]>;
@@ -2190,8 +2191,10 @@ impl Erasure {
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
     {
-        self.decode_inner(writer, readers, offset, length, total_length, None, Vec::new(), Vec::new())
-            .await
+        let (written, error, _) = self
+            .decode_inner(writer, readers, offset, length, total_length, None, Vec::new(), Vec::new())
+            .await;
+        (written, error)
     }
 
     #[allow(dead_code, reason = "read-cost decode path asserted by this file's tests (backlog#1823)")]
@@ -2208,8 +2211,10 @@ impl Erasure {
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
     {
-        self.decode_inner(writer, readers, offset, length, total_length, Some(read_costs), Vec::new(), Vec::new())
-            .await
+        let (written, error, _) = self
+            .decode_inner(writer, readers, offset, length, total_length, Some(read_costs), Vec::new(), Vec::new())
+            .await;
+        (written, error)
     }
 
     /// GET decode entry point that also carries the deferred-parity stripe
@@ -2262,6 +2267,37 @@ impl Erasure {
         deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
         deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
     ) -> (usize, Option<std::io::Error>)
+    where
+        W: AsyncWrite + Send + Sync + Unpin,
+        R: crate::erasure::coding::ShardSource,
+    {
+        let (written, error, _) = self
+            .decode_inner(
+                writer,
+                readers,
+                offset,
+                length,
+                total_length,
+                read_costs,
+                deferred_handles,
+                deferred_reopeners,
+            )
+            .await;
+        (written, error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn decode_with_stripe_handles_and_reopeners_with_diagnostics<W, R>(
+        &self,
+        writer: &mut W,
+        readers: Vec<Option<BitrotReader<R>>>,
+        offset: usize,
+        length: usize,
+        total_length: usize,
+        read_costs: Option<Vec<ShardReadCost>>,
+        deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
+        deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
+    ) -> DecodeOutcome
     where
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
@@ -2411,36 +2447,48 @@ impl Erasure {
         read_costs: Option<Vec<ShardReadCost>>,
         deferred_handles: Vec<Option<DeferredReaderStripeHandle>>,
         deferred_reopeners: Vec<Option<DeferredReaderReopener<R>>>,
-    ) -> (usize, Option<std::io::Error>)
+    ) -> DecodeOutcome
     where
         W: AsyncWrite + Send + Sync + Unpin,
         R: crate::erasure::coding::ShardSource,
     {
         if readers.len() != self.data_shards + self.parity_shards {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
-            return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")));
+            return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")), false);
         }
 
         // block_size/data_shards come from on-disk metadata; a corrupt FileInfo with a
         // zero here must surface as an error, not a divide-by-zero panic on every GET.
         if self.block_size == 0 || self.data_shards == 0 {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
-            return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid erasure coding parameters")));
+            return (
+                0,
+                Some(io::Error::new(ErrorKind::InvalidInput, "Invalid erasure coding parameters")),
+                false,
+            );
         }
 
         let Some(end_offset) = offset.checked_add(length) else {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
-            return (0, Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")));
+            return (
+                0,
+                Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")),
+                false,
+            );
         };
         if end_offset > total_length {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
-            return (0, Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")));
+            return (
+                0,
+                Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")),
+                false,
+            );
         }
 
         let mut ret_err = None;
 
         if length == 0 {
-            return (0, ret_err);
+            return (0, ret_err, false);
         }
 
         let mut written = 0;
@@ -2480,6 +2528,7 @@ impl Erasure {
             }
         };
 
+        let mut exact_quorum = false;
         if legacy_stripe_prefetch_enabled() {
             // Depth-1 stripe prefetch (backlog#930 HP-9 step 2): while the current
             // stripe is reconstructed and emitted, the next stripe's shard reads
@@ -2522,6 +2571,7 @@ impl Erasure {
                     let Some((mut shards, errs)) = current.take() else {
                         break;
                     };
+                    exact_quorum |= shards.iter().filter(|shard| shard.is_some()).count() == self.data_shards;
 
                     if idx + 1 < blocks.len() {
                         // Overlap: read stripe idx+1 while reconstructing/emitting idx.
@@ -2636,6 +2686,7 @@ impl Erasure {
                 let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
                 let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
                 let (mut shards, errs) = reader.read().await;
+                exact_quorum |= shards.iter().filter(|shard| shard.is_some()).count() == self.data_shards;
                 record_get_stage_duration_if_enabled(
                     GET_OBJECT_PATH_LEGACY_DUPLEX,
                     GET_STAGE_STRIPE_READ,
@@ -2665,14 +2716,14 @@ impl Erasure {
         }
 
         if ret_err.is_some() {
-            return (written, ret_err);
+            return (written, ret_err, exact_quorum);
         }
 
         if written < length {
             ret_err = Some(Error::LessData.into());
         }
 
-        (written, ret_err)
+        (written, ret_err, exact_quorum)
     }
 }
 
