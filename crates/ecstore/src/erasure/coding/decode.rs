@@ -2299,6 +2299,7 @@ impl Erasure {
         written: &mut usize,
         ret_err: &mut Option<std::io::Error>,
         stage_metrics_enabled: bool,
+        require_surplus_source: bool,
     ) -> StripeFlow
     where
         W: AsyncWrite + Send + Sync + Unpin,
@@ -2336,7 +2337,12 @@ impl Erasure {
         // missing data shard and an extra source shard was available, verify
         // the reconstructed data against that source before streaming bytes.
         let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        if let Err(e) = self.decode_data_with_reconstruction_verification(shards) {
+        let decode_result = if require_surplus_source {
+            self.decode_data_with_reconstruction_verification_for_lockstep(shards)
+        } else {
+            self.decode_data_with_reconstruction_verification(shards)
+        };
+        if let Err(e) = decode_result {
             record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
             let reason = GetObjectFailureReason::DecodeError;
             error!(
@@ -2547,6 +2553,7 @@ impl Erasure {
                         // `shards` are borrowed again below. In the `Stop` case that
                         // drop is what cancels the still-in-flight prefetch read.
                         let (flow, next): (Option<StripeFlow>, Option<StripeReadOutput>) = {
+                            let require_surplus_source = reader.demand_bound_lockstep;
                             let read_fut = read_stripe_timed(&mut reader, stage_metrics_enabled);
                             let emit_fut = self.emit_decoded_stripe(
                                 writer,
@@ -2557,6 +2564,7 @@ impl Erasure {
                                 &mut written,
                                 &mut ret_err,
                                 stage_metrics_enabled,
+                                require_surplus_source,
                             );
                             tokio::pin!(read_fut);
                             tokio::pin!(emit_fut);
@@ -2604,6 +2612,7 @@ impl Erasure {
                                 &mut written,
                                 &mut ret_err,
                                 stage_metrics_enabled,
+                                reader.demand_bound_lockstep,
                             )
                             .await
                         {
@@ -2643,6 +2652,7 @@ impl Erasure {
                         &mut written,
                         &mut ret_err,
                         stage_metrics_enabled,
+                        reader.demand_bound_lockstep,
                     )
                     .await
                 {
@@ -2867,6 +2877,7 @@ mod tests {
             cursor: Cursor<Vec<u8>>,
             stall: Duration,
             sleep: Option<Pin<Box<Sleep>>>,
+            stall_polls: Arc<AtomicUsize>,
         },
     }
 
@@ -2905,7 +2916,12 @@ mod tests {
                 TestShardReader::TerminalFileNotFound => {
                     Poll::Ready(Err(crate::disk::error::terminal_read_error_to_io(Error::FileNotFound)))
                 }
-                TestShardReader::PrefixThenSlow { cursor, stall, sleep } => {
+                TestShardReader::PrefixThenSlow {
+                    cursor,
+                    stall,
+                    sleep,
+                    stall_polls,
+                } => {
                     let before = buf.filled().len();
                     match Pin::new(cursor).poll_read(cx, buf) {
                         // Cursor still has bytes for the current stripe: serve them.
@@ -2915,6 +2931,7 @@ mod tests {
                         // the task cleanly (no busy `wake_by_ref` spin), letting the
                         // `#[tokio::test(start_paused = true)]` clock auto-advance.
                         Poll::Ready(Ok(())) => {
+                            stall_polls.fetch_add(1, Ordering::SeqCst);
                             let stall = *stall;
                             let sleeper = sleep.get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
                             let _ = sleeper.as_mut().poll(cx);
@@ -2932,6 +2949,29 @@ mod tests {
     impl AsyncWrite for FailingEmitWriter {
         fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
             Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "injected emit failure")))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct YieldOnceThenFailWriter {
+        yielded: bool,
+    }
+
+    impl AsyncWrite for YieldOnceThenFailWriter {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, _buf: &[u8]) -> Poll<io::Result<usize>> {
+            if !self.yielded {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "injected emit failure after prefetch poll")))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -3879,6 +3919,7 @@ mod tests {
             (rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some(READ_TIMEOUT_SECS)),
         ];
         temp_env::async_with_vars(vars, async {
+            let stall_polls = Arc::new(AtomicUsize::new(0));
             let readers: Vec<Option<BitrotReader<TestShardReader>>> = shard_bufs
                 .iter()
                 .map(|buf| {
@@ -3888,12 +3929,13 @@ mod tests {
                         cursor: Cursor::new(prefix),
                         stall: STALL,
                         sleep: None,
+                        stall_polls: Arc::clone(&stall_polls),
                     };
                     Some(BitrotReader::new(reader, shard_size, hash_algo.clone(), false))
                 })
                 .collect();
 
-            let mut writer = FailingEmitWriter;
+            let mut writer = YieldOnceThenFailWriter { yielded: false };
             let start = TokioInstant::now();
             let (written, err) = erasure.decode(&mut writer, readers, 0, total_len, total_len).await;
             let elapsed = start.elapsed();
@@ -3901,6 +3943,10 @@ mod tests {
             // Emit failed on stripe 0, so the GET fails with no bytes emitted.
             assert!(err.is_some(), "emit failure must surface as an error");
             assert_eq!(written, 0, "the failing writer accepts no bytes");
+            assert!(
+                stall_polls.load(Ordering::SeqCst) > 0,
+                "the speculative next-stripe read must be in flight before emit fails"
+            );
             // The decisive assertion: the prefetch read was cancelled rather than
             // awaited. Without cancel-safety this would take READ_TIMEOUT_SECS.
             assert!(
@@ -5268,6 +5314,58 @@ mod tests {
         assert_eq!(written, BLOCK_SIZE);
         assert_eq!(output.len(), BLOCK_SIZE);
         assert!(error.is_none(), "a failed disposable hedge must not fail a recovered stripe: {error:?}");
+    }
+
+    /// Rollout guard for backlog#1308: when a data shard and the first parity
+    /// hedge both fail, the gate-on path must not settle at decode quorum and
+    /// emit an unverified body. The second parity can restore decode quorum but
+    /// cannot provide the extra source required for reconstruction verification,
+    /// so the stripe must fail before exposing bytes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_data_shards_only_gate_data_and_parity_failure_fails_before_output() {
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, Some("true"))], async {
+            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+            let payload = (0..BLOCK_SIZE).map(|value| value as u8).collect::<Vec<_>>();
+            let shards = erasure.encode_data(&payload).expect("test payload should encode");
+            let shard_size = erasure.shard_size();
+
+            let readers = vec![
+                Some(BitrotReader::new(TestShardReader::TimedOut, shard_size, HashAlgorithm::None, false)),
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(shards[1].to_vec())),
+                    shard_size,
+                    HashAlgorithm::None,
+                    false,
+                )),
+                Some(BitrotReader::new(
+                    TestShardReader::TerminalFileNotFound,
+                    shard_size,
+                    HashAlgorithm::None,
+                    false,
+                )),
+                Some(BitrotReader::new(
+                    TestShardReader::Ready(Cursor::new(shards[3].to_vec())),
+                    shard_size,
+                    HashAlgorithm::None,
+                    false,
+                )),
+            ];
+
+            let mut output = Vec::new();
+            let (written, error) = erasure.decode(&mut output, readers, 0, payload.len(), payload.len()).await;
+
+            assert_eq!(written, 0, "an unverified stripe must not report body bytes");
+            assert!(output.is_empty(), "an unverified stripe must not expose a clean short body");
+            let error = error.expect("data plus parity loss must fail closed");
+            assert_eq!(error.kind(), ErrorKind::InvalidData);
+            assert!(error.to_string().contains("insufficient source shards"));
+        })
+        .await;
     }
 
     /// Lockstep verification-quorum regression (backlog#1156). When a data shard is

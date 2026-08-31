@@ -30,10 +30,10 @@ use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_object_config::{ReplicationConfig, get_replication_config, must_replicate};
 use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationMultipartPartInput, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
-    delete_replication_creates_marker, heal_uses_delete_replication_path, is_retryable_delete_replication_head_error,
-    is_version_delete_replication, replicate_delete_outcome, replication_etags_match, replication_multipart_complete_actual_size,
-    replication_multipart_part_plan, resync_existing_delete_replication_info, should_retry_delete_marker_purge,
-    target_delete_version_id,
+    delete_replication_creates_marker, heal_uses_delete_replication_path, is_object_lock_denied_delete,
+    is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome, replication_etags_match,
+    replication_multipart_complete_actual_size, replication_multipart_part_plan, resync_existing_delete_replication_info,
+    should_retry_delete_marker_purge, single_part_replica_etag_mismatch, target_delete_version_id,
 };
 use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
 use super::replication_resync_boundary::ResyncStatusType;
@@ -54,7 +54,7 @@ use super::replication_storage_boundary::{
 };
 use super::replication_target_boundary::{
     ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions,
-    ReplicationTargetStore, S3ClientError, SsecPassthroughCapability, SsecPassthroughGate, TargetClient,
+    RemotePutObjectResponse, ReplicationTargetStore, S3ClientError, SsecPassthroughCapability, SsecPassthroughGate, TargetClient,
     is_replication_target_offline_error, replication_action_for_target_head, replication_complete_multipart_options,
     replication_delete_marker_purge_remove_options, replication_delete_remove_options, replication_force_delete_remove_options,
     replication_object_is_ssec_encrypted, replication_put_object_header_size, replication_put_object_options,
@@ -118,6 +118,7 @@ const EVENT_DELETE_MARKER_PURGE_FAILED: &str = "replication_delete_marker_purge_
 const EVENT_DELETE_MARKER_PURGE_MRF: &str = "replication_delete_marker_purge_mrf";
 const METRIC_DELETE_MARKER_PURGE_TOTAL: &str = "rustfs_replication_delete_marker_purge_total";
 const EVENT_REPLICATION_VERSION_IDENTITY_DRIFT: &str = "replication_version_identity_drift";
+const EVENT_REPLICATION_PURGE_OBJECT_LOCK_DENIED: &str = "replication_purge_object_lock_denied";
 
 #[allow(
     dead_code,
@@ -194,6 +195,123 @@ const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_id
 /// counts every drifting PUT), so a reconfigured target re-warning only
 /// after a restart is acceptable.
 static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<HashSet<String>>> = LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+/// Version purges the peer denied under object lock (#6850). Replication
+/// carries no governance bypass, so such a purge cannot succeed until the
+/// lock on the replica lapses — retrying every heal cycle only burns
+/// bandwidth and failure counters. Entries suppress heal requeues for the
+/// backoff window; after it expires one probe runs again, so the purge still
+/// converges on its own once retention ends. In-process only: a restart
+/// costs at most one extra probe per entry.
+const OBJECT_LOCK_DENIED_PURGE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const OBJECT_LOCK_DENIED_PURGE_CACHE_MAX: usize = 4096;
+type ObjectLockDeniedPurgeKey = (String, String, String);
+
+struct ObjectLockDeniedPurge {
+    denied_at: std::time::Instant,
+    denied_arns: HashSet<String>,
+}
+
+static OBJECT_LOCK_DENIED_PURGES: LazyLock<StdMutex<HashMap<ObjectLockDeniedPurgeKey, ObjectLockDeniedPurge>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn object_lock_denied_purge_key(dobj: &DeletedObjectReplicationInfo) -> ObjectLockDeniedPurgeKey {
+    let version_id = dobj
+        .delete_object
+        .delete_marker_version_id
+        .or(dobj.delete_object.version_id)
+        .unwrap_or_default();
+    (dobj.bucket.clone(), dobj.delete_object.object_name.clone(), version_id.to_string())
+}
+
+fn record_object_lock_denied_purge(dobj: &DeletedObjectReplicationInfo, arn: &str) {
+    let mut denied = OBJECT_LOCK_DENIED_PURGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if denied.len() >= OBJECT_LOCK_DENIED_PURGE_CACHE_MAX {
+        denied.retain(|_, entry| entry.denied_at.elapsed() < OBJECT_LOCK_DENIED_PURGE_BACKOFF);
+    }
+    let key = object_lock_denied_purge_key(dobj);
+    if denied.len() < OBJECT_LOCK_DENIED_PURGE_CACHE_MAX || denied.contains_key(&key) {
+        let entry = denied.entry(key).or_insert_with(|| ObjectLockDeniedPurge {
+            denied_at: std::time::Instant::now(),
+            denied_arns: HashSet::new(),
+        });
+        entry.denied_at = std::time::Instant::now();
+        entry.denied_arns.insert(arn.to_string());
+    }
+    // Still full after dropping expired entries: skip recording — the purge
+    // then simply keeps retrying, which is the pre-#6850 behavior.
+}
+
+/// Whether a heal requeue of this delete can only reach targets that denied
+/// it under object lock within the backoff window. A target the entry does
+/// not cover (another peer, or one whose denial expired) keeps the requeue
+/// flowing — suppressing it would delay a purge that could succeed there.
+pub(crate) fn object_lock_denied_purge_backoff_active(dobj: &DeletedObjectReplicationInfo) -> bool {
+    let key = object_lock_denied_purge_key(dobj);
+    let mut denied = OBJECT_LOCK_DENIED_PURGES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match denied.get(&key) {
+        Some(entry) if entry.denied_at.elapsed() < OBJECT_LOCK_DENIED_PURGE_BACKOFF => {
+            let admitted = dobj.admitted_target_arns();
+            !admitted.is_empty() && admitted.iter().all(|arn| entry.denied_arns.contains(arn))
+        }
+        Some(_) => {
+            denied.remove(&key);
+            false
+        }
+        None => false,
+    }
+}
+
+const REPLICA_ETAG_VERIFY_ENV: &str = "RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY";
+
+/// Escape hatch for a target whose 32-hex ETags are legitimately not the
+/// content MD5 (e.g. a gateway hashing its own ciphertext without announcing
+/// SSE in the response) — such a target would otherwise fail every object.
+fn replica_etag_verification_enabled() -> bool {
+    std::env::var(REPLICA_ETAG_VERIFY_ENV)
+        .map(|v| !(v.eq_ignore_ascii_case("false") || v == "0"))
+        .unwrap_or(true)
+}
+
+/// A 200 from the target is not proof the replica holds the source bytes: a
+/// target that stores a transformed payload (e.g. undecoded `aws-chunked`
+/// frames, #6853) returns the ETag of what it actually wrote. Reporting
+/// COMPLETED over such a replica is silent corruption, so a decidable
+/// mismatch fails the replication instead. An SSE-C ciphertext passthrough
+/// transfer is exempt: the wire bytes are ciphertext while the source ETag is
+/// the plaintext MD5, and that path has its own HEAD-back audit.
+fn verify_single_part_replica(
+    object_info: &ObjectInfo,
+    response: &RemotePutObjectResponse,
+    ciphertext_passthrough: bool,
+) -> std::result::Result<(), std::io::Error> {
+    if ciphertext_passthrough || !replica_etag_verification_enabled() {
+        return Ok(());
+    }
+    if single_part_replica_etag_mismatch(object_info.etag.as_deref(), response.etag.as_deref()) {
+        // The differing ETags go into the structured log; the error message
+        // stays constant so same-cause failures bucket together downstream.
+        warn!(
+            event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            bucket = %object_info.bucket,
+            object = %object_info.name,
+            source_etag = ?object_info.etag,
+            replica_etag = ?response.etag,
+            operation = "verify_replica_etag",
+            "Replication target operation failed"
+        );
+        return Err(std::io::Error::other(REPLICA_ETAG_MISMATCH_ERROR));
+    }
+    Ok(())
+}
+
+const REPLICA_ETAG_MISMATCH_ERROR: &str = "replica etag mismatch: the target persisted different bytes than were sent";
 
 fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &str, assigned_version_id: Option<&str>) {
     if !version_identity_drifted(source_version_id, assigned_version_id) {
@@ -2709,19 +2827,42 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             }
         }
         Err(e) => {
-            warn!(
-                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = tgt_client.bucket,
-                object = dobj.delete_object.object_name,
-                version_id = ?version_id,
-                delete_marker = dobj.delete_object.delete_marker,
-                is_version_purge,
-                error = %e,
-                operation = "replicate_delete_to_target",
-                "Replication target operation failed"
-            );
+            let object_lock_denied = is_version_purge && is_object_lock_denied_delete(e.code.as_deref(), e.message.as_deref());
+            if object_lock_denied {
+                // Terminal for as long as the lock holds: the peer retains
+                // this version and replication carries no governance bypass
+                // (#6850), so the sites stay diverged until the retention or
+                // legal hold on the replica lapses. Surface it loudly instead
+                // of letting a silent failed counter and a hot heal-retry
+                // loop stand in for the divergence.
+                record_object_lock_denied_purge(dobj, &tgt_client.arn);
+                error!(
+                    event = EVENT_REPLICATION_PURGE_OBJECT_LOCK_DENIED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = tgt_client.bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = ?version_id,
+                    arn = %tgt_client.arn,
+                    error = %e,
+                    operation = "replicate_delete_to_target",
+                    "Replicated version purge denied by object lock on the target; the sites stay diverged until the lock lapses"
+                );
+            } else {
+                warn!(
+                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = tgt_client.bucket,
+                    object = dobj.delete_object.object_name,
+                    version_id = ?version_id,
+                    delete_marker = dobj.delete_object.delete_marker,
+                    is_version_purge,
+                    error = %e,
+                    operation = "replicate_delete_to_target",
+                    "Replication target operation failed"
+                );
+            }
             rinfo.error = Some(e.to_string());
             if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Failed;
@@ -3275,14 +3416,15 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             let result = tgt_client
                 .put_object(&tgt_client.bucket, &object, transfer_size, byte_stream, &put_opts)
                 .await
-                .map(|assigned_version_id| {
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .and_then(|response| {
                     audit_target_version_identity(
                         &tgt_client,
                         &put_opts.internal.source_version_id,
-                        assigned_version_id.as_deref(),
-                    )
-                })
-                .map_err(|e| std::io::Error::other(e.to_string()));
+                        response.version_id.as_deref(),
+                    );
+                    verify_single_part_replica(&object_info, &response, obj_opts.raw_data_movement_read)
+                });
             result.err()
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
@@ -3943,14 +4085,15 @@ async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
             .tgt_client
             .put_object(&ctx.tgt_client.bucket, ctx.object, ctx.transfer_size, byte_stream, &ctx.put_opts)
             .await
-            .map(|assigned_version_id| {
+            .map_err(|e| std::io::Error::other(e.to_string()))
+            .and_then(|response| {
                 audit_target_version_identity(
                     ctx.tgt_client,
                     &ctx.put_opts.internal.source_version_id,
-                    assigned_version_id.as_deref(),
-                )
-            })
-            .map_err(|e| std::io::Error::other(e.to_string()));
+                    response.version_id.as_deref(),
+                );
+                verify_single_part_replica(ctx.object_info, &response, ctx.obj_opts.raw_data_movement_read)
+            });
         result.err()
     }
 }
@@ -5460,6 +5603,35 @@ mod tests {
         assert!(resync_state_accepts_update(&TargetReplicationResyncStatus::default(), &matching));
         assert!(resync_state_accepts_update(&current, &matching));
         assert!(!resync_state_accepts_update(&current, &stale));
+    }
+
+    #[test]
+    fn object_lock_denied_purge_backoff_tracks_version_and_target() {
+        let denied = DeletedObjectReplicationInfo {
+            bucket: "worm-backoff-test-bucket".to_string(),
+            target_arn: "arn:rustfs:replication::worm-test:t1".to_string(),
+            delete_object: ReplicationDeletedObject {
+                object_name: "locked-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!object_lock_denied_purge_backoff_active(&denied));
+
+        record_object_lock_denied_purge(&denied, "arn:rustfs:replication::worm-test:t1");
+        assert!(object_lock_denied_purge_backoff_active(&denied));
+
+        // A requeue that can also reach a target this denial does not cover
+        // must keep flowing: the purge may succeed there.
+        let mut other_target = denied.clone();
+        other_target.target_arn = "arn:rustfs:replication::worm-test:t2".to_string();
+        assert!(!object_lock_denied_purge_backoff_active(&other_target));
+
+        // A different version of the same object must not be suppressed.
+        let mut other_version = denied;
+        other_version.delete_object.version_id = Some(uuid::Uuid::new_v4());
+        assert!(!object_lock_denied_purge_backoff_active(&other_version));
     }
 
     #[tokio::test]

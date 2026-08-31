@@ -34,6 +34,7 @@ use serde_json;
 use std::ffi::OsStr;
 use std::fs as stdfs;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
@@ -1214,6 +1215,9 @@ pub struct RustFSTestClusterEnvironment {
     pub node_extra_env: Vec<Vec<(String, String)>>,
     pub node_capture_log_paths: Vec<Option<String>>,
     pub topology: ClusterTopology,
+    /// Optional socket proxies used for the corresponding node's volume
+    /// endpoints. Proxies must be installed before [`Self::start`].
+    volume_proxy_addresses: Vec<Option<SocketAddr>>,
 }
 
 impl RustFSTestClusterEnvironment {
@@ -1305,6 +1309,7 @@ impl RustFSTestClusterEnvironment {
             extra_env.push(("RUSTFS_UNSAFE_BYPASS_DISK_CHECK".to_string(), "true".to_string()));
         }
 
+        let node_count = topology.node_count;
         Ok(Self {
             nodes,
             temp_dir,
@@ -1314,6 +1319,7 @@ impl RustFSTestClusterEnvironment {
             node_extra_env: vec![Vec::new(); topology.node_count],
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
+            volume_proxy_addresses: vec![None; node_count],
         })
     }
 
@@ -1381,6 +1387,34 @@ impl RustFSTestClusterEnvironment {
         self.build_volumes_arg()
     }
 
+    /// Start a socket proxy for one node's volume endpoints and route all
+    /// subsequent `RUSTFS_VOLUMES` references for that node through it.
+    ///
+    /// Call this before [`Self::start`], then use the returned proxy's
+    /// [`crate::fault_proxy::FaultProxy::set_mode`] to inject latency,
+    /// blackhole, or one-way partition faults. The node's own listen address
+    /// remains direct, so S3 clients can still reach it while peer disk/RPC
+    /// traffic is steered through the proxy.
+    pub async fn start_volume_proxy_for_node(
+        &mut self,
+        node_idx: usize,
+    ) -> Result<crate::fault_proxy::FaultProxy, Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_node_index(node_idx)?;
+        if self.volume_proxy_addresses[node_idx].is_some() {
+            return Err(format!("a volume proxy is already configured for node {node_idx}").into());
+        }
+        let target = self.nodes[node_idx].address.parse::<SocketAddr>()?;
+        let proxy = crate::fault_proxy::FaultProxy::start(target).await?;
+        self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
+        Ok(proxy)
+    }
+
+    fn volume_address(&self, node_idx: usize) -> String {
+        self.volume_proxy_addresses[node_idx]
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| self.nodes[node_idx].address.clone())
+    }
+
     fn build_volumes_arg(&self) -> String {
         let pools = self.topology.normalized_pools();
 
@@ -1389,7 +1423,11 @@ impl RustFSTestClusterEnvironment {
             return self
                 .nodes
                 .iter()
-                .flat_map(|n| n.data_dirs.iter().map(move |dir| format!("http://{}{}", n.address, dir)))
+                .enumerate()
+                .flat_map(|(node_idx, n)| {
+                    let address = self.volume_address(node_idx);
+                    n.data_dirs.iter().map(move |dir| format!("http://{}{}", address, dir))
+                })
                 .collect::<Vec<_>>()
                 .join(" ");
         }
@@ -1400,13 +1438,19 @@ impl RustFSTestClusterEnvironment {
         pools
             .iter()
             .map(|nodes| {
-                let node = &self.nodes[nodes[0]];
+                let node_idx = nodes[0];
+                let node = &self.nodes[node_idx];
                 let base = node
                     .data_dirs
                     .first()
                     .and_then(|d| d.rsplit_once('/').map(|(parent, _)| parent))
                     .unwrap_or(&node.data_dir);
-                format!("http://{}{}/drive{{0...{}}}", node.address, base, self.topology.drives_per_node - 1)
+                format!(
+                    "http://{}{}/drive{{0...{}}}",
+                    self.volume_address(node_idx),
+                    base,
+                    self.topology.drives_per_node - 1
+                )
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -2000,7 +2044,7 @@ mod tests {
         }
         let multidrive = topology.drives_per_node > 1;
 
-        let nodes = (0..topology.node_count)
+        let nodes: Vec<ClusterNode> = (0..topology.node_count)
             .map(|i| {
                 let address = format!("127.0.0.1:{}", 9000 + i);
                 let data_dirs: Vec<String> = if multidrive {
@@ -2021,6 +2065,7 @@ mod tests {
             })
             .collect();
 
+        let node_count = nodes.len();
         RustFSTestClusterEnvironment {
             nodes,
             temp_dir,
@@ -2030,6 +2075,7 @@ mod tests {
             node_extra_env: vec![Vec::new(); topology.node_count],
             node_capture_log_paths: vec![None; topology.node_count],
             topology,
+            volume_proxy_addresses: vec![None; node_count],
         }
     }
 
@@ -2112,6 +2158,25 @@ mod tests {
         assert!(ClusterTopology::single_pool(4).validate().is_ok());
         assert!(ClusterTopology::single_pool_multidrive(4, 4).validate().is_ok());
         assert!(ClusterTopology::single_pool_multidrive(1, 1).validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn volume_proxy_rewrites_cluster_volume_endpoint() {
+        let mut env = RustFSTestClusterEnvironment::new(1)
+            .await
+            .expect("cluster environment should allocate a node");
+        let direct = env.nodes[0].address.clone();
+        let proxy = env
+            .start_volume_proxy_for_node(0)
+            .await
+            .expect("volume proxy should bind before the target server starts");
+        let proxied = proxy.local_addr().to_string();
+        let volumes = env.rustfs_volumes_arg();
+
+        assert!(volumes.contains(&proxied), "volumes must use the proxy address: {volumes}");
+        assert!(!volumes.contains(&direct), "volumes must not retain the direct address: {volumes}");
+
+        proxy.shutdown().await;
     }
 
     #[test]

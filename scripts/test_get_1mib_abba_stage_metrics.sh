@@ -25,7 +25,7 @@ trap cleanup EXIT
   --skip-build \
   --dry-run >/dev/null
 
-rg -qx 'issue=rustfs/backlog#1434' "${OUT_DIR}/manifest.env"
+rg -qx 'issue=rustfs/backlog#2093' "${OUT_DIR}/manifest.env"
 rg -qx 'exact_size=1MiB' "${OUT_DIR}/manifest.env"
 rg -qx 'exact_size_bytes=1048576' "${OUT_DIR}/manifest.env"
 rg -qx 'read_path_profiles=legacy,codec-legacy' "${OUT_DIR}/manifest.env"
@@ -41,6 +41,11 @@ rg -qx 'diagnostic_obs_metric_endpoint=http://127.0.0.1:4318/v1/metrics' "${OUT_
 rg -qx 'diagnostic_obs_meter_interval=1' "${OUT_DIR}/manifest.env"
 rg -qx 'compressed_fallback_probe=true' "${OUT_DIR}/manifest.env"
 rg -qx 'performance_conclusion=not_encoded_by_harness_collect_raw_abba_stage_metrics_first' "${OUT_DIR}/manifest.env"
+rg -qx 'get_seek_buffer_enable=unset' "${OUT_DIR}/manifest.env"
+rg -qx 'get_small_body_once_enable=unset' "${OUT_DIR}/manifest.env"
+rg -qx 'get_lockstep_data_shards_only_enable=unset' "${OUT_DIR}/manifest.env"
+rg -qx 'get_metadata_read_version_coalesce=unset' "${OUT_DIR}/manifest.env"
+rg -qx 'object_data_cache_mode=unset' "${OUT_DIR}/manifest.env"
 rg -Fq '("service.name", "service_name", "job", "otel_scope_name")' "${SCRIPT_DIR}/run_get_codec_streaming_smoke.sh"
 rg -Fq '("service_name", "service.name", "job", "otel_scope_name")' "${SCRIPT_DIR}/run_get_codec_streaming_smoke.sh"
 rg -Fq 'compressed_size = max(object_size, codec_min_size, 128 * 1024)' "${SCRIPT_DIR}/run_get_codec_streaming_smoke.sh"
