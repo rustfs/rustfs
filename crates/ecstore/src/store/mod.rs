@@ -260,6 +260,12 @@ pub struct ECStore {
     /// Lock order: acquire `pool_meta_save_gate`, then the distributed
     /// `pool.bin` fence, then clone `pool_meta` under a short read lock.
     pub(crate) pool_meta_save_gate: Mutex<PoolMetaWriteState>,
+    /// Serializes decommission entries while the durable capacity ledger has
+    /// one target mutation intent slot.
+    ///
+    /// Lock order: acquire this gate before object namespaces or
+    /// `pool_meta_save_gate`.
+    pub(crate) decommission_capacity_entry_gate: Mutex<()>,
     /// Per-instance runtime state (Phase 5, backlog#939).
     ///
     /// Carries this instance's identity/runtime out of the process globals so
@@ -1514,6 +1520,7 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
+            decommission_capacity_entry_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         };
@@ -1589,6 +1596,7 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
+            decommission_capacity_entry_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
