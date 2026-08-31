@@ -11,6 +11,18 @@ on:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
         type: string
+      enforce_sse_key_policy:
+        description: 'Enable RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY (runs KMS-401/402)'
+        type: boolean
+        default: false
+      frame_v2:
+        description: 'Enable RUSTFS_ENCRYPTION_FRAME_V2 (runs KMS-318)'
+        type: boolean
+        default: false
+      config_secret:
+        description: 'Set RUSTFS_KMS_CONFIG_SECRET (runs KMS-107 config sealing)'
+        required: false
+        type: string
   workflow_run:
     # Strict shared-environment order: run after S3 compatibility test completes.
     workflows: ["RustFS S3 Compatibility Test"]
@@ -96,6 +108,19 @@ jobs:
           PACKAGE_URL='${{ inputs.package_url }}'
           RUSTFS_VERSION='${{ inputs.rustfs_version }}'
           ARGS=(--all-topologies --backends "local,vault-kv2" -y --log-file "${LOG_FILE}")
+          EXTRA_ENV=""
+          if [ "${{ inputs.enforce_sse_key_policy }}" = "true" ]; then
+            EXTRA_ENV+="RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY=true"$'\n'
+          fi
+          if [ "${{ inputs.frame_v2 }}" = "true" ]; then
+            EXTRA_ENV+="RUSTFS_ENCRYPTION_FRAME_V2=true"$'\n'
+          fi
+          if [ -n "${{ inputs.config_secret }}" ]; then
+            EXTRA_ENV+="RUSTFS_KMS_CONFIG_SECRET=${{ inputs.config_secret }}"$'\n'
+          fi
+          if [ -n "${EXTRA_ENV}" ]; then
+            ARGS+=(--extra-env "${EXTRA_ENV}")
+          fi
           if [ -n "${PACKAGE_URL}" ]; then
             ARGS+=(--package-url "${PACKAGE_URL}")
           elif [ -n "${RUSTFS_VERSION}" ]; then
