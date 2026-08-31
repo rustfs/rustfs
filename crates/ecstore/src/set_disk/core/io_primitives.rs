@@ -1149,18 +1149,10 @@ fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Op
     None
 }
 
-const NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE: i64 = 512 * 1024 + 1;
-
-fn non_inline_data_read_early_stop_allowed(read_data: bool, bucket: &str, object: &str) -> bool {
-    read_data && is_get_metadata_non_inline_data_read_early_stop_enabled() && !codec_streaming_rollout_applies(bucket, object)
-}
-
 pub(in crate::set_disk) fn non_inline_data_read_candidate_is_safe(candidate: &FileInfo) -> bool {
     if candidate.inline_data()
         || candidate.is_compressed()
         || candidate.is_remote()
-        || candidate.size < NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE
-        || !object_fits_single_block(candidate.size, candidate.erasure.block_size)
         || candidate
             .metadata
             .keys()
@@ -1170,6 +1162,16 @@ pub(in crate::set_disk) fn non_inline_data_read_candidate_is_safe(candidate: &Fi
         return false;
     }
     candidate.has_valid_erasure_geometry()
+}
+
+pub(in crate::set_disk) fn late_materialization_candidate_is_safe(candidate: &FileInfo) -> bool {
+    non_inline_data_read_candidate_is_safe(candidate)
+        && candidate.size > 512 * 1024
+        && object_fits_single_block(candidate.size, candidate.erasure.block_size)
+}
+
+pub(in crate::set_disk) fn non_inline_data_read_early_stop_allowed(read_data: bool, bucket: &str, object: &str) -> bool {
+    read_data && is_get_metadata_non_inline_data_read_early_stop_enabled() && !codec_streaming_rollout_applies(bucket, object)
 }
 
 const NON_INLINE_SINGLE_PENDING_HEDGE_DELAY: Duration = Duration::from_millis(100);
@@ -3040,7 +3042,9 @@ impl SetDisks {
             }))
         });
 
+        // Wait for all futures to complete
         let results = join_all(futures).await;
+
         for join_result in results {
             match join_result {
                 Ok((res, elapsed)) => match res {
@@ -7045,6 +7049,27 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
 
+    #[test]
+    #[serial_test::serial(codec_streaming_env)]
+    fn non_inline_early_stop_is_mutually_exclusive_with_codec_rollout() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_ROLLOUT", Some("on")),
+                ("RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED", Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED", Some("true")),
+            ],
+            || assert!(!non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
+        );
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_ROLLOUT", Some("off")),
+            ],
+            || assert!(non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
+        );
+    }
+
     #[tokio::test]
     async fn scanner_delete_owner_survives_waiter_cancellation() {
         let movement_gate = Arc::new(tokio::sync::RwLock::new(()));
@@ -7985,16 +8010,6 @@ mod tests {
                 .await
                 .expect("part data should be installed on every disk");
             let mut file_info = valid_metadata_fanout_fileinfo(bucket, object, version_id, data_dir, mod_time);
-            file_info.size = NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE;
-            file_info.add_object_part(
-                1,
-                "part-etag".to_string(),
-                usize::try_from(NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE).expect("test object size should fit usize"),
-                file_info.mod_time,
-                NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE,
-                None,
-                None,
-            );
             file_info.erasure.distribution = distribution.clone();
             file_info.erasure.index = *distribution
                 .get(index)
@@ -8184,25 +8199,6 @@ mod tests {
         assert_eq!(order.len(), 16);
         assert_eq!(order.iter().copied().collect::<HashSet<_>>().len(), 16);
         assert_eq!(initial_blocks, (1..=12).collect());
-    }
-
-    #[test]
-    #[serial_test::serial(codec_streaming_env)]
-    fn non_inline_two_phase_is_mutually_exclusive_with_codec_rollout() {
-        temp_env::with_vars(
-            [
-                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
-                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
-            ],
-            || assert!(!non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
-        );
-        temp_env::with_vars(
-            [
-                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
-                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("off")),
-            ],
-            || assert!(non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
-        );
     }
 
     #[test]

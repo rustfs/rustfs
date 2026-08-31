@@ -611,9 +611,8 @@ impl SetDisks {
 
         if !metadata_fanout_complete
             && allow_early_stop
-            && read_data
-            && super::is_get_metadata_non_inline_data_read_early_stop_enabled()
-            && non_inline_data_read_candidate_is_safe(&fi)
+            && non_inline_data_read_early_stop_allowed(read_data, bucket, object)
+            && late_materialization_candidate_is_safe(&fi)
         {
             Ok(GetObjectFileInfo::owned_with_late_metadata_fanout(
                 fi,
@@ -819,6 +818,7 @@ impl SetDisks {
     #[allow(clippy::too_many_arguments)]
     #[hotpath::measure(impl_type = "SetDisks")]
     pub(super) async fn get_object_with_fileinfo<W>(
+        // &self,
         bucket: &str,
         object: &str,
         erasure_cache: Arc<ErasureCache>,
@@ -832,6 +832,7 @@ impl SetDisks {
         pool_index: usize,
         skip_verify_bitrot: bool,
         prefer_data_blocks_first_reader_setup: bool,
+        require_reconstruction_surplus: bool,
         metrics_path: &'static str,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
@@ -1096,6 +1097,9 @@ impl SetDisks {
             }
 
             let nil_count = reader_setup.available_shards();
+            if require_reconstruction_surplus && nil_count <= erasure.data_shards {
+                return Err(Error::other("insufficient reconstruction surplus for two-phase read"));
+            }
             if nil_count < erasure.data_shards {
                 if let Some(read_err) = reduce_read_quorum_errs(&reader_setup.errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards)
                 {
@@ -1203,18 +1207,34 @@ impl SetDisks {
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
             let deferred_reopeners = reader_setup.deferred_reopeners;
-            let (written, err) = erasure
-                .decode_with_stripe_handles_and_reopeners(
-                    writer,
-                    readers,
-                    part_offset,
-                    part_length,
-                    part_size,
-                    read_costs,
-                    deferred_stripe_handles,
-                    deferred_reopeners,
-                )
-                .await;
+            let (written, err, exact_quorum) = if require_reconstruction_surplus {
+                erasure
+                    .decode_with_stripe_handles_and_reopeners_with_diagnostics(
+                        writer,
+                        readers,
+                        part_offset,
+                        part_length,
+                        part_size,
+                        read_costs,
+                        deferred_stripe_handles,
+                        deferred_reopeners,
+                    )
+                    .await
+            } else {
+                let (written, err) = erasure
+                    .decode_with_stripe_handles_and_reopeners(
+                        writer,
+                        readers,
+                        part_offset,
+                        part_length,
+                        part_size,
+                        read_costs,
+                        deferred_stripe_handles,
+                        deferred_reopeners,
+                    )
+                    .await;
+                (written, err, false)
+            };
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -1224,6 +1244,9 @@ impl SetDisks {
                 metrics_size_bucket,
                 decode_elapsed.as_secs_f64(),
             );
+            if exact_quorum && err.is_none() {
+                return Err(Error::other("two-phase read completed with exact reconstruction quorum"));
+            }
             if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD && err.is_none() {
                 warn!(
                     event = EVENT_SET_DISK_READ,
@@ -1771,18 +1794,43 @@ fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool 
     policy.allows_multipart_setup_prefetch() && is_multipart_reader_setup_prefetch_enabled()
 }
 
-fn late_metadata_read_identity_matches(expected: &FileInfo, actual: &FileInfo) -> bool {
-    expected.volume == actual.volume
-        && expected.name == actual.name
-        && expected.erasure.algorithm == actual.erasure.algorithm
-        && expected.erasure.block_size == actual.erasure.block_size
-        && expected.uses_legacy_checksum == actual.uses_legacy_checksum
-        && SetDisks::file_info_quorum_hash(expected) == SetDisks::file_info_quorum_hash(actual)
+pub(super) struct LateMetadataIdentity {
+    volume: String,
+    name: String,
+    algorithm: String,
+    block_size: usize,
+    uses_legacy_checksum: bool,
+    quorum_hash: [u8; 32],
+    distribution: Vec<usize>,
+    parity_blocks: usize,
 }
 
-fn late_metadata_shard_matches(expected: &FileInfo, actual: &FileInfo, disk_index: usize) -> bool {
+impl LateMetadataIdentity {
+    pub(super) fn from_file_info(file_info: &FileInfo) -> Self {
+        Self {
+            volume: file_info.volume.clone(),
+            name: file_info.name.clone(),
+            algorithm: file_info.erasure.algorithm.clone(),
+            block_size: file_info.erasure.block_size,
+            uses_legacy_checksum: file_info.uses_legacy_checksum,
+            quorum_hash: SetDisks::file_info_quorum_hash(file_info),
+            distribution: file_info.erasure.distribution.clone(),
+            parity_blocks: file_info.erasure.parity_blocks,
+        }
+    }
+}
+
+fn late_metadata_read_identity_matches(expected: &LateMetadataIdentity, actual: &FileInfo) -> bool {
+    expected.volume == actual.volume
+        && expected.name == actual.name
+        && expected.algorithm == actual.erasure.algorithm
+        && expected.block_size == actual.erasure.block_size
+        && expected.uses_legacy_checksum == actual.uses_legacy_checksum
+        && expected.quorum_hash == SetDisks::file_info_quorum_hash(actual)
+}
+
+fn late_metadata_shard_matches(expected: &LateMetadataIdentity, actual: &FileInfo, disk_index: usize) -> bool {
     expected
-        .erasure
         .distribution
         .get(disk_index)
         .is_some_and(|mapped_index| *mapped_index == actual.erasure.index)
@@ -1794,9 +1842,9 @@ impl SetDisks {
         fallback_disks: &[Option<DiskStore>],
         bucket: &str,
         object: &str,
-        expected: &FileInfo,
+        expected: &LateMetadataIdentity,
         metrics_path: &'static str,
-    ) -> Result<(Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+    ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
         let (mut parts_metadata, errs, diagnostics) = SetDisks::read_all_fileinfo_observed(
             fallback_disks,
             "",
@@ -1807,14 +1855,13 @@ impl SetDisks {
             false,
             false,
             false,
-            expected.erasure.parity_blocks,
+            expected.parity_blocks,
         )
         .await?;
         diagnostics.record(metrics_path);
 
-        let (read_quorum, write_quorum) =
-            SetDisks::object_quorum_from_meta(&parts_metadata, &errs, expected.erasure.parity_blocks)
-                .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
+        let (read_quorum, write_quorum) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, expected.parity_blocks)
+            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
         let read_quorum =
             usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
         let write_quorum = usize::try_from(write_quorum)
@@ -1839,7 +1886,7 @@ impl SetDisks {
             return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
         }
 
-        Ok((parts_metadata, online_disks))
+        Ok((full_fi, parts_metadata, online_disks))
     }
 }
 
@@ -2414,35 +2461,6 @@ mod metadata_cache_tests {
         fi
     }
 
-    #[test]
-    fn late_metadata_shard_identity_ignores_replication_state_but_rejects_data_mismatch() {
-        let expected = valid_test_fileinfo("object");
-        let disk_index = expected
-            .erasure
-            .distribution
-            .iter()
-            .position(|mapped_index| *mapped_index == expected.erasure.index)
-            .expect("test shard index should be present in the distribution");
-        let mut replication_only = expected.clone();
-        replication_only.metadata.insert(
-            format!(
-                "{}{}",
-                rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
-                rustfs_utils::http::SUFFIX_REPLICATION_STATUS
-            ),
-            "COMPLETED".to_string(),
-        );
-        assert!(late_metadata_shard_matches(&expected, &replication_only, disk_index));
-
-        let mut wrong_data_dir = expected.clone();
-        wrong_data_dir.data_dir = Some(Uuid::new_v4());
-        assert!(!late_metadata_shard_matches(&expected, &wrong_data_dir, disk_index));
-
-        let mut wrong_shard = expected.clone();
-        wrong_shard.erasure.index = 2;
-        assert!(!late_metadata_shard_matches(&expected, &wrong_shard, disk_index));
-    }
-
     #[tokio::test]
     async fn get_object_with_fileinfo_rejects_positive_size_without_parts() {
         let mut fi = valid_test_fileinfo("object");
@@ -2461,6 +2479,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             GET_OBJECT_PATH_SET_DISK,
@@ -2494,6 +2513,7 @@ mod metadata_cache_tests {
             0,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2518,6 +2538,7 @@ mod metadata_cache_tests {
             0,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "small",
@@ -2538,6 +2559,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             GET_OBJECT_PATH_SET_DISK,
@@ -2562,6 +2584,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             GET_OBJECT_PATH_SET_DISK,
@@ -2602,6 +2625,7 @@ mod metadata_cache_tests {
             0,
             false,
             false,
+            false,
             GET_OBJECT_PATH_SET_DISK,
             "plain",
             "empty",
@@ -2633,6 +2657,7 @@ mod metadata_cache_tests {
             &[],
             0,
             0,
+            false,
             false,
             false,
             GET_OBJECT_PATH_SET_DISK,
@@ -4994,6 +5019,7 @@ mod tests {
             &disks,
             0,
             0,
+            false,
             false,
             false,
             GET_OBJECT_PATH_SET_DISK,

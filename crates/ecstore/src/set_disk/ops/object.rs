@@ -2029,41 +2029,18 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         }
 
         if snapshot.has_late_metadata_fanout() {
-            let object_size = usize::try_from(object_info.size)
-                .map_err(|_| to_object_err(Error::other("two-phase GET object size is invalid"), vec![bucket, object]))?;
-            let mut output = Vec::with_capacity(object_size);
-            let (fi, files, disks, late_metadata_fanout_disks) = snapshot.into_owned_with_late_metadata_fanout();
-            let late_metadata_fanout_disks = late_metadata_fanout_disks
-                .ok_or_else(|| to_object_err(Error::other("two-phase GET fallback context is missing"), vec![bucket, object]))?;
-            let initial_result = Self::get_object_with_fileinfo(
-                bucket,
-                object,
-                Arc::clone(&self.erasure_cache),
-                0,
-                object_info.size,
-                &mut output,
-                fi.clone(),
-                files,
-                &disks,
-                self.set_index,
-                self.pool_index,
-                opts.skip_verify_bitrot,
-                true,
-                GET_OBJECT_PATH_LEGACY_DUPLEX,
-                object_class.as_str(),
-                size_bucket,
-            )
-            .await;
-            if prepare_late_materialized_retry(&initial_result, &mut output, object_size) {
-                let (full_parts_metadata, full_online_disks) = Self::refresh_late_metadata_fanout(
-                    &late_metadata_fanout_disks,
-                    bucket,
-                    object,
-                    &fi,
-                    GET_OBJECT_PATH_LEGACY_DUPLEX,
-                )
-                .await?;
-                Self::get_object_with_fileinfo(
+            // Keep refresh plus the second decode off the default GET poll stack.
+            // The allocation is limited to the opt-in late-materialization path.
+            return Box::pin(async move {
+                let object_size = usize::try_from(object_info.size)
+                    .map_err(|_| to_object_err(Error::other("two-phase GET object size is invalid"), vec![bucket, object]))?;
+                let mut output = Vec::with_capacity(object_size);
+                let (fi, files, disks, late_metadata_fanout_disks) = snapshot.into_owned_with_late_metadata_fanout();
+                let expected_identity = super::super::read::LateMetadataIdentity::from_file_info(&fi);
+                let late_metadata_fanout_disks = late_metadata_fanout_disks.ok_or_else(|| {
+                    to_object_err(Error::other("two-phase GET fallback context is missing"), vec![bucket, object])
+                })?;
+                let initial_result = Self::get_object_with_fileinfo(
                     bucket,
                     object,
                     Arc::clone(&self.erasure_cache),
@@ -2071,34 +2048,66 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     object_info.size,
                     &mut output,
                     fi,
-                    full_parts_metadata,
-                    &full_online_disks,
+                    files,
+                    &disks,
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
+                    true,
                     true,
                     GET_OBJECT_PATH_LEGACY_DUPLEX,
                     object_class.as_str(),
                     size_bucket,
                 )
-                .await?;
-            }
-            if output.len() != object_size {
-                return Err(to_object_err(Error::other("two-phase GET decoded length mismatch"), vec![bucket, object]));
-            }
+                .await;
+                if prepare_late_materialized_retry(&initial_result, &mut output, object_size) {
+                    let (full_fi, full_parts_metadata, full_online_disks) = Self::refresh_late_metadata_fanout(
+                        &late_metadata_fanout_disks,
+                        bucket,
+                        object,
+                        &expected_identity,
+                        GET_OBJECT_PATH_LEGACY_DUPLEX,
+                    )
+                    .await?;
+                    Self::get_object_with_fileinfo(
+                        bucket,
+                        object,
+                        Arc::clone(&self.erasure_cache),
+                        0,
+                        object_info.size,
+                        &mut output,
+                        full_fi,
+                        full_parts_metadata,
+                        &full_online_disks,
+                        self.set_index,
+                        self.pool_index,
+                        opts.skip_verify_bitrot,
+                        true,
+                        false,
+                        GET_OBJECT_PATH_LEGACY_DUPLEX,
+                        object_class.as_str(),
+                        size_bucket,
+                    )
+                    .await?;
+                }
+                if output.len() != object_size {
+                    return Err(to_object_err(Error::other("two-phase GET decoded length mismatch"), vec![bucket, object]));
+                }
 
-            record_get_object_reader_path_observation(GET_OBJECT_PATH_LEGACY_DUPLEX, object_class, size_bucket);
-            let body = Bytes::from(output);
-            let reader = GetObjectReader {
-                stream: Box::new(Cursor::new(body.clone())),
-                object_info,
-                buffered_body: Some(body),
-                body_source,
-            };
-            if lock_optimization_enabled {
-                release_materialized_read_lock(bucket, object, read_lock_guard.take());
-            }
-            return Ok(reader);
+                record_get_object_reader_path_observation(GET_OBJECT_PATH_LEGACY_DUPLEX, object_class, size_bucket);
+                let body = Bytes::from(output);
+                let reader = GetObjectReader {
+                    stream: Box::new(Cursor::new(body.clone())),
+                    object_info,
+                    buffered_body: Some(body),
+                    body_source,
+                };
+                if lock_optimization_enabled {
+                    release_materialized_read_lock(bucket, object, read_lock_guard.take());
+                }
+                Ok(reader)
+            })
+            .await;
         }
 
         let direct_memory_decision = get_small_object_direct_memory_decision_with_threshold_and_plan(
@@ -2162,6 +2171,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 self.pool_index,
                 opts.skip_verify_bitrot,
                 true,
+                false,
                 GET_OBJECT_PATH_DIRECT_MEMORY,
                 object_class.as_str(),
                 size_bucket,
@@ -2360,6 +2370,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         set_index,
                         pool_index,
                         skip_verify,
+                        false,
                         false,
                         GET_OBJECT_PATH_LEGACY_DUPLEX,
                         object_class.as_str(),
@@ -7910,6 +7921,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 pool_index,
                 skip_verify,
                 false,
+                false,
                 GET_OBJECT_PATH_LEGACY_DUPLEX,
                 GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
                 metrics_size_bucket,
@@ -9880,6 +9892,9 @@ mod inline_put_commit_path_tests {
     use super::*;
     use crate::config::storageclass::{INLINE_BLOCK_ENV, lookup_config_for_pools, lookup_config_for_pools_without_env};
     use crate::disk::ReadOptions;
+    use crate::ecstore_validation_blackbox::make_local_set_disks;
+    use crate::set_disk::disk_call_counters;
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
     use rustfs_config::server_config::KVS;
     use serial_test::serial;
     use tokio::io::AsyncReadExt;
@@ -10046,6 +10061,69 @@ mod inline_put_commit_path_tests {
                     crate::set_disk::test_get_object_reader_path_id(),
                     8,
                     "1 MiB must bypass mid-size and use legacy duplex when codec rollout is off"
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn get_object_reader_codec_rollout_excludes_late_metadata_refresh() {
+        let (_temp_dirs, set_disks) = make_local_set_disks(4, 2).await;
+        let bucket = "one-mib-codec-reader";
+        let object = "object.bin";
+        let payload = vec![0x6b; 1024 * 1024];
+        set_disks
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("codec bucket should be created");
+        let storage_class = temp_env::with_var(INLINE_BLOCK_ENV, Some("1KiB"), || lookup_config_for_pools(&KVS::new(), &[4]))
+            .expect("test storage class should resolve");
+        set_disks.set_test_storage_class_config(storage_class);
+
+        let mut writer = PutObjReader::from_vec(payload.clone());
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE", Some("true")),
+                (ENV_RUSTFS_GET_MID_SIZE_STREAMING_ENABLE, Some("false")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some("legacy")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE, Some("false")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
+                (rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true")),
+            ],
+            async {
+                set_disks
+                    .put_object(bucket, object, &mut writer, &ObjectOptions::default())
+                    .await
+                    .expect("codec fixture should commit");
+                crate::set_disk::reset_test_get_object_reader_path();
+                let calls = disk_call_counters::observe(object);
+                let mut reader = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await
+                    .expect("codec GET should succeed");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("codec GET should stream");
+                assert_eq!(restored, payload);
+                assert_eq!(
+                    crate::set_disk::test_get_object_reader_path_id(),
+                    5,
+                    "codec path must win over late refresh"
+                );
+                assert_eq!(
+                    calls.total(disk_call_counters::KIND_READ_VERSION),
+                    4,
+                    "codec path must use full metadata fanout and must not trigger a second late refresh"
                 );
             },
         )
