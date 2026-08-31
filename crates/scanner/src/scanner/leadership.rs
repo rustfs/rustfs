@@ -13,6 +13,7 @@
 // limitations under the License.
 /// Leader-lock claiming, usage-epoch fencing, and lock-loss handling.
 use super::*;
+use crate::data_usage_define::usage_floor_primary_read_error_allows_backup;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ScannerLeadershipClaimReconcile {
@@ -142,19 +143,33 @@ pub(super) async fn usage_snapshot_for_epoch_fence(
         }
     }
 
-    for path in [
-        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
-        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
-    ] {
-        let (legacy, _) = read_config_with_revision(storeapi.clone(), &path)
-            .await
-            .map_err(|err| ScannerError::Other(format!("failed to read legacy scanner usage epoch fence: {err}")))?;
+    let legacy_primary_path = LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string();
+    let legacy_backup_path = format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let mut legacy_primary_read_error = None;
+    for path in [&legacy_primary_path, &legacy_backup_path] {
+        let legacy = match read_config_with_revision(storeapi.clone(), path).await {
+            Ok((legacy, _)) => legacy,
+            Err(err) if path == &legacy_primary_path && usage_floor_primary_read_error_allows_backup(&err) => {
+                legacy_primary_read_error = Some(format!("failed to read legacy scanner usage epoch fence from {path}: {err}"));
+                continue;
+            }
+            Err(err) => {
+                return Err(ScannerError::Other(format!(
+                    "failed to read legacy scanner usage epoch fence from {path}: {err}"
+                )));
+            }
+        };
         if let Some(legacy) = legacy.as_deref() {
             let usage = decode_usage_snapshot_for_epoch_fence(legacy, &path, false)?;
             if invalid_primary_epoch.is_none_or(|epoch| usage.scanner_epoch.unwrap_or_default() >= epoch) {
                 return Ok(Some(usage));
             }
         }
+    }
+    if let Some(legacy_primary_read_error) = legacy_primary_read_error {
+        return Err(ScannerError::Other(format!(
+            "{legacy_primary_read_error}; no valid legacy scanner usage epoch fence backup was available at {legacy_backup_path}"
+        )));
     }
     // A missing usage snapshot is an uninitialized state, not an empty
     // snapshot. Leadership fencing may proceed without creating a plausible
