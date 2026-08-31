@@ -83,6 +83,7 @@ pub async fn test_store_with_persisted_rebalance_meta(
         decommission_cancelers: tokio::sync::RwLock::new(vec![None]),
         start_gate: tokio::sync::Mutex::new(()),
         pool_meta_save_gate: tokio::sync::Mutex::default(),
+        decommission_capacity_entry_gate: tokio::sync::Mutex::default(),
         ctx,
         bucket_fence_registry: std::sync::Arc::default(),
     });
@@ -232,6 +233,7 @@ async fn test_pool_stores_with_contexts(
             decommission_cancelers: tokio::sync::RwLock::new(vec![None; pool_count]),
             start_gate: tokio::sync::Mutex::new(()),
             pool_meta_save_gate: tokio::sync::Mutex::new(pool_meta_write_state.independent_clone_for_test()),
+            decommission_capacity_entry_gate: tokio::sync::Mutex::default(),
             ctx: store_ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         })

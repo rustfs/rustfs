@@ -225,6 +225,7 @@ jobs:
                 { key: 'heal', label: 'Heal' },
                 { key: 'pool', label: 'Pool Expansion' },
                 { key: 'security', label: 'Security' },
+                { key: 'upgrade', label: 'Upgrade' },
               ];
               const tabs = document.getElementById('tabs');
               const list = document.getElementById('list');

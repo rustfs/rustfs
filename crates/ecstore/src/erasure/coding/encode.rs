@@ -321,6 +321,13 @@ impl<'a> MultiWriter<'a> {
         }
     }
 
+    pub(super) fn take_retryable_internode_write_failure(&mut self) -> Option<Error> {
+        self.errs
+            .iter_mut()
+            .find(|error| error.as_ref().is_some_and(Error::is_retryable_internode_write_failure))
+            .and_then(Option::take)
+    }
+
     /// Effective budget for one shard operation: the smaller of the per-shard
     /// stall timeout and the time remaining until the object's absolute cap.
     /// Returns `None` when neither deadline is configured (wait indefinitely).
