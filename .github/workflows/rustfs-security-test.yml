@@ -47,8 +47,8 @@ on:
         type: boolean
         default: true
   workflow_run:
-    # Same nightly trigger as the other functional suites.
-    workflows: ["Nightly GNU Build"]
+    # Runs last in the functional chain, after pool/heal, on the shared VMs.
+    workflows: ["RustFS Pool Expansion / Heal Test"]
     types: [completed]
 
 permissions:
@@ -243,6 +243,7 @@ jobs:
                 { key: 'heal', label: 'Heal' },
                 { key: 'pool', label: 'Pool Expansion' },
                 { key: 'security', label: 'Security' },
+                { key: 'upgrade', label: 'Upgrade' },
               ];
               const tabs = document.getElementById('tabs');
               const list = document.getElementById('list');
