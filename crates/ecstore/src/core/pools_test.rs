@@ -1707,7 +1707,6 @@ mod decommission_lock_order_tests {
         set_decommission_capacity_info_overrides_for_test(lossy_store.id, (0..40).map(|_| capacity_snapshot()).collect());
         let part_barrier = MultipartCommitBarrier::install(&bucket, object, MultipartCommitPause::PutPartAfterRename);
         let abort_barrier = data_movement::DataMovementMultipartAbortBarrier::install(&bucket, object);
-        tokio::time::pause();
         let migration = tokio::spawn({
             let migration_store = Arc::clone(&lossy_store);
             let migration_bucket = bucket.clone();
@@ -1725,6 +1724,7 @@ mod decommission_lock_order_tests {
             }
         });
         part_barrier.wait_until_paused().await;
+        tokio::time::pause();
         tokio::task::yield_now().await;
         refresh_calls.arm();
         tokio::time::advance(Duration::from_secs(11)).await;
