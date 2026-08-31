@@ -101,7 +101,7 @@ aws-sdk-sts = { workspace = true, default-features = false, features = ["default
 aws-config = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
 aws-smithy-types.workspace = true
-async-compression = { workspace = true, features = ["tokio", "bzip2", "xz"] }
+async-compression = { workspace = true, features = ["tokio", "bzip2", "lz4", "xz"] }
 async-trait = { workspace = true }
 flate2.workspace = true
 http.workspace = true
@@ -115,6 +115,7 @@ rustfs-signer.workspace = true
 # server's implementation: a shared helper could agree with a bug on both sides.
 data-encoding = { workspace = true }
 hmac = { workspace = true }
+minlz.workspace = true
 sha1 = { workspace = true }
 serde_urlencoded = { workspace = true }
 tracing = { workspace = true }

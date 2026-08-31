@@ -63,6 +63,22 @@ struct ExtractArchiveUploadState {
     body_complete: bool,
 }
 
+fn resolve_extract_archive_format(key: &str, detected: CompressionFormat) -> CompressionFormat {
+    // Zlib has no unambiguous magic. Preserve the legacy zlib/zz suffix
+    // contract without letting other misleading suffixes override content
+    // detection.
+    if detected == CompressionFormat::Tar
+        && Path::new(key)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| CompressionFormat::from_extension(extension) == CompressionFormat::Zlib)
+    {
+        CompressionFormat::Zlib
+    } else {
+        detected
+    }
+}
+
 impl<R> ExtractArchiveEtagReader<R> {
     fn new(inner: R, expected_length: u64, state: Arc<Mutex<ExtractArchiveUploadState>>) -> Self {
         Self {
@@ -1008,12 +1024,6 @@ impl DefaultObjectUsecase {
         let body =
             tokio::io::BufReader::with_capacity(buffer_size, StreamReader::new(body.map(|f| f.map_err(s3s_body_error_to_io))));
 
-        let Some(ext) = Path::new(&key).extension().and_then(|s| s.to_str()) else {
-            return Err(s3_error!(InvalidArgument, "key extension not found"));
-        };
-
-        let ext = ext.to_owned();
-
         let md5hex = if let Some(base64_md5) = content_md5 {
             let md5 = base64_simd::STANDARD
                 .decode_to_vec(base64_md5.as_bytes())
@@ -1036,16 +1046,18 @@ impl DefaultObjectUsecase {
         let expected_archive_length = u64::try_from(size).map_err(|_| S3Error::new(S3ErrorCode::UnexpectedContent))?;
         let archive_upload_state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
         let extract_limits = put_object_extract_limits();
-        let decoder = CompressionFormat::from_extension(&ext)
-            .get_decoder(ExtractArchiveEtagReader::new(
-                archive_reader,
-                expected_archive_length,
-                archive_upload_state.clone(),
-            ))
-            .map_err(|e| {
-                error!(error = ?e, "Archive decoder creation failed");
-                s3_error!(InvalidArgument, "get_decoder err")
+        let tracked_archive =
+            ExtractArchiveEtagReader::new(archive_reader, expected_archive_length, archive_upload_state.clone());
+        let (detected_archive_format, sniffed_archive) =
+            CompressionFormat::sniff(tracked_archive).await.map_err(|err| match err {
+                ZipError::InspectStream(source) => map_extract_archive_error(source),
+                _ => s3_error!(InvalidArgument, "Failed to detect archive compression"),
             })?;
+        let archive_format = resolve_extract_archive_format(&key, detected_archive_format);
+        let decoder = archive_format.get_decoder(sniffed_archive).map_err(|e| {
+            error!(error = ?e, "Archive decoder creation failed");
+            s3_error!(InvalidArgument, "get_decoder err")
+        })?;
         let decoder = ExtractDecodedLimitReader::new(decoder, extract_limits.max_decoded_size);
 
         let mut ar = build_put_object_extract_archive(decoder, extract_limits);
@@ -1487,6 +1499,92 @@ mod tests {
     use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
     use tokio::io::AsyncReadExt;
     use tokio_tar::{Builder, EntryType, Header};
+
+    #[test]
+    fn archive_format_uses_only_the_ambiguous_zlib_extension_as_a_fallback() {
+        assert_eq!(
+            resolve_extract_archive_format("archive.zlib", CompressionFormat::Tar),
+            CompressionFormat::Zlib
+        );
+        assert_eq!(
+            resolve_extract_archive_format("archive.zz", CompressionFormat::Tar),
+            CompressionFormat::Zlib
+        );
+        assert_eq!(
+            resolve_extract_archive_format("raw-but-named.tar.gz", CompressionFormat::Tar),
+            CompressionFormat::Tar
+        );
+        assert_eq!(
+            resolve_extract_archive_format("gzip-but-named.zlib", CompressionFormat::Gzip),
+            CompressionFormat::Gzip
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_tar_member_names_starting_with_codec_magic_are_not_misdetected() {
+        let cases = [
+            ("PK\u{3}\u{4}-member.txt", b"PK\x03\x04".as_slice()),
+            ("BZh9-report.txt", b"BZh9".as_slice()),
+            ("\u{4}\"M\u{18}-report.txt", b"\x04\x22\x4d\x18".as_slice()),
+        ];
+
+        for (path, expected_prefix) in cases {
+            let mut builder = Builder::new(Vec::new());
+            let mut header = Header::new_gnu();
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, &b""[..])
+                .await
+                .expect("raw TAR fixture should accept the codec-like member name");
+            let bytes = builder.into_inner().await.expect("raw TAR fixture should finalize");
+            assert_eq!(&bytes[..expected_prefix.len()], expected_prefix);
+
+            let (format, sniffed) = CompressionFormat::sniff(std::io::Cursor::new(bytes))
+                .await
+                .expect("raw TAR prefix should be inspected");
+            assert_eq!(format, CompressionFormat::Tar, "member path={path:?}");
+            let decoder = format.get_decoder(sniffed).expect("raw TAR decoder should be created");
+            let mut archive = Archive::new(decoder);
+            let mut entries = archive.entries().expect("raw TAR entry stream should be created");
+            let entry = entries
+                .next()
+                .await
+                .expect("raw TAR should contain its first member")
+                .expect("raw TAR member should parse");
+
+            assert_eq!(entry.path_bytes().expect("raw TAR member path should parse").as_ref(), path.as_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_etag_reader_validates_sha256_before_completion() {
+        let payload = b"archive-with-wrong-sha256".to_vec();
+        let expected_length = i64::try_from(payload.len()).expect("fixture length must fit i64");
+        let hash_reader = HashReader::from_stream(
+            std::io::Cursor::new(payload),
+            expected_length,
+            expected_length,
+            None,
+            Some("00".repeat(32)),
+            false,
+        )
+        .expect("hash reader should be created");
+        let state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let mut reader = ExtractArchiveEtagReader::new(
+            hash_reader,
+            u64::try_from(expected_length).expect("fixture length must fit u64"),
+            state.clone(),
+        );
+        let mut output = Vec::new();
+        let err = reader
+            .read_to_end(&mut output)
+            .await
+            .expect_err("SHA-256 must be checked before upload completion");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!state.lock().expect("archive state lock must remain healthy").body_complete);
+    }
 
     fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
         let body_len = 1 + key.len() + 1 + value.len() + 1;

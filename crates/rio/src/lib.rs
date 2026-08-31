@@ -100,6 +100,9 @@ mod limit_reader;
 
 pub use limit_reader::LimitReader;
 
+mod s2_decoder;
+pub use s2_decoder::{MAX_S2_DECOMPRESSED_BLOCK_SIZE, S2Decoder};
+
 mod etag_reader;
 pub use etag_reader::EtagReader;
 

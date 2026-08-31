@@ -15,7 +15,7 @@
 //! Regression coverage for anonymous access on multipart control APIs.
 
 use crate::common::{RustFSTestEnvironment, init_logging, local_http_client};
-use async_compression::tokio::write::{BzEncoder, XzEncoder};
+use async_compression::tokio::write::{BzEncoder, Lz4Encoder, XzEncoder};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
@@ -23,7 +23,10 @@ use aws_sdk_s3::types::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
 use chrono::{Duration as ChronoDuration, Utc};
-use flate2::{Compression, write::GzEncoder};
+use flate2::{
+    Compression,
+    write::{GzEncoder, ZlibEncoder},
+};
 use http::HeaderValue;
 use http::header::{CONTENT_TYPE, HOST};
 use md5::{Digest as Md5Digest, Md5};
@@ -187,6 +190,12 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     encoder.finish().expect("gzip encoder should finish")
 }
 
+fn zlib_bytes(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("zlib encoder should accept input");
+    encoder.finish().expect("zlib encoder should finish")
+}
+
 fn zstd_bytes(data: &[u8]) -> Vec<u8> {
     let mut encoder = zstd::Encoder::new(Vec::new(), 0).expect("zstd encoder should initialize");
     encoder.write_all(data).expect("zstd encoder should accept input");
@@ -207,6 +216,45 @@ async fn xz_bytes(data: &[u8]) -> Vec<u8> {
     encoder.write_all(data).await.expect("xz encoder should accept input");
     encoder.shutdown().await.expect("xz encoder should finish");
     encoder.into_inner().into_inner()
+}
+
+async fn lz4_bytes(data: &[u8]) -> Vec<u8> {
+    let cursor = Cursor::new(Vec::new());
+    let mut encoder = Lz4Encoder::new(cursor);
+    encoder.write_all(data).await.expect("LZ4 encoder should accept input");
+    encoder.shutdown().await.expect("LZ4 encoder should finish");
+    encoder.into_inner().into_inner()
+}
+
+/// Encode the S2 framed stream shape emitted by minio-go PutObjectsSnowball
+/// with `Compress: true`: 1 MiB independent blocks, better compression,
+/// masked CRC-32C, and the `S2sTwO` stream identifier.
+fn minio_go_snowball_s2_bytes(data: &[u8]) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 1 << 20;
+    const CHECKSUM_SIZE: usize = 4;
+
+    let mut output = b"\xff\x06\x00\x00S2sTwO".to_vec();
+    let mut encoder = minlz::Encoder::new();
+    for block in data.chunks(BLOCK_SIZE) {
+        let compressed = encoder.encode_better(block);
+        let compressed_limit = block.len().saturating_sub(block.len() / 32).saturating_sub(5);
+        let (chunk_type, payload) = if compressed.len() <= compressed_limit {
+            (0x00, compressed.as_slice())
+        } else {
+            (0x01, block)
+        };
+        let chunk_len = payload.len() + CHECKSUM_SIZE;
+        assert!(chunk_len < 1 << 24, "S2 fixture chunk must fit the 24-bit frame length");
+        output.extend_from_slice(&[
+            chunk_type,
+            (chunk_len & 0xff) as u8,
+            ((chunk_len >> 8) & 0xff) as u8,
+            ((chunk_len >> 16) & 0xff) as u8,
+        ]);
+        output.extend_from_slice(&minlz::crc::crc(block).to_le_bytes());
+        output.extend_from_slice(payload);
+    }
+    output
 }
 
 fn assert_s3_error_code<T, E>(result: Result<T, SdkError<E>>, code: &str)
@@ -4242,6 +4290,60 @@ async fn test_signed_put_object_extract_returns_archive_etag() -> Result<(), Box
 }
 
 #[tokio::test]
+async fn test_signed_put_object_extract_expands_s2_and_lz4_by_magic_with_raw_etags()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+
+    let mut env = RustFSTestEnvironment::new().await?;
+    env.start_rustfs_server(vec![]).await?;
+
+    let bucket = "signed-extract-magic-codecs";
+    let client = env.create_s3_client();
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let s2_tar = make_tar(&[("s2/object.txt", b"s2-body")], &[]).await;
+    let s2_archive = minio_go_snowball_s2_bytes(&s2_tar);
+    let expected_s2_etag = format!("\"{}\"", md5_hex(&s2_archive));
+    let s2_response = client
+        .put_object()
+        .bucket(bucket)
+        // minio-go intentionally uploads a compressed S2 stream with a .tar key.
+        .key("snowball-upload-0123456789abcdef.tar")
+        .body(ByteStream::from(s2_archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+    assert_eq!(s2_response.e_tag(), Some(expected_s2_etag.as_str()));
+
+    let s2_object = client.get_object().bucket(bucket).key("s2/object.txt").send().await?;
+    assert_eq!(s2_object.body.collect().await?.into_bytes().as_ref(), b"s2-body");
+
+    let lz4_tar = make_tar(&[("lz4/object.txt", b"lz4-body")], &[]).await;
+    let lz4_archive = lz4_bytes(&lz4_tar).await;
+    let expected_lz4_etag = format!("\"{}\"", md5_hex(&lz4_archive));
+    let lz4_response = client
+        .put_object()
+        .bucket(bucket)
+        .key("also-looks-like-a-plain.tar")
+        .body(ByteStream::from(lz4_archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+    assert_eq!(lz4_response.e_tag(), Some(expected_lz4_etag.as_str()));
+
+    let lz4_object = client.get_object().bucket(bucket).key("lz4/object.txt").send().await?;
+    assert_eq!(lz4_object.body.collect().await?.into_bytes().as_ref(), b"lz4-body");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_signed_put_object_extract_preserves_entry_mtime() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
@@ -5106,8 +5208,8 @@ async fn test_signed_put_object_extract_expands_tzst_archive() -> Result<(), Box
 }
 
 #[tokio::test]
-async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-{
+async fn test_signed_put_object_extract_uses_magic_without_requiring_or_trusting_extension()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
@@ -5120,8 +5222,7 @@ async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> R
     admin_client.create_bucket().bucket(bucket).send().await?;
 
     let tar_bytes = make_tar(&[("plain.txt", b"plain-body")], &[]).await;
-
-    let result = admin_client
+    admin_client
         .put_object()
         .bucket(bucket)
         .key(archive_key)
@@ -5131,15 +5232,80 @@ async fn test_signed_put_object_extract_rejects_missing_archive_extension() -> R
             req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
         })
         .send()
-        .await;
+        .await?;
 
-    assert_s3_error_code(result, "InvalidArgument");
+    let plain = admin_client.get_object().bucket(bucket).key("plain.txt").send().await?;
+    assert_eq!(plain.body.collect().await?.into_bytes().as_ref(), b"plain-body");
+
+    let raw_with_gzip_suffix = make_tar(&[("raw-with-wrong-suffix.txt", b"raw-body")], &[]).await;
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key("raw-but-named.tar.gz")
+        .body(ByteStream::from(raw_with_gzip_suffix))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let raw = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key("raw-with-wrong-suffix.txt")
+        .send()
+        .await?;
+    assert_eq!(raw.body.collect().await?.into_bytes().as_ref(), b"raw-body");
+
+    let gzip_with_tar_suffix = gzip_bytes(&make_tar(&[("gzip-with-wrong-suffix.txt", b"gzip-body")], &[]).await);
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key("gzip-but-named.tar")
+        .body(ByteStream::from(gzip_with_tar_suffix))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let gzip = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key("gzip-with-wrong-suffix.txt")
+        .send()
+        .await?;
+    assert_eq!(gzip.body.collect().await?.into_bytes().as_ref(), b"gzip-body");
+
+    let zlib_archive = zlib_bytes(&make_tar(&[("zlib-extension.txt", b"zlib-body")], &[]).await);
+    admin_client
+        .put_object()
+        .bucket(bucket)
+        .key("bundle.zlib")
+        .body(ByteStream::from(zlib_archive))
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-amz-meta-snowball-auto-extract", "true");
+        })
+        .send()
+        .await?;
+
+    let zlib = admin_client
+        .get_object()
+        .bucket(bucket)
+        .key("zlib-extension.txt")
+        .send()
+        .await?;
+    assert_eq!(zlib.body.collect().await?.into_bytes().as_ref(), b"zlib-body");
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_signed_put_object_extract_rejects_invalid_tar_gz_payload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_signed_put_object_extract_rejects_invalid_archive_payload() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     init_logging();
 
     let mut env = RustFSTestEnvironment::new().await?;
