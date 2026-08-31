@@ -463,44 +463,51 @@ fn checked_extract_member_staging_weight(
         .checked_add(
             path.len()
                 .checked_mul(2)
-                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball prepared member path size overflowed"))?,
+                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball prepared member path size overflowed"))?,
         )
         .and_then(|bytes| bytes.checked_add(EXTRACT_MEMBER_CONTEXT_OVERHEAD_BYTES))
-        .ok_or_else(|| s3_error!(InvalidArgument, "Snowball prepared member size overflowed"))?;
+        .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball prepared member size overflowed"))?;
     for metadata in std::iter::once(&opts.user_defined).chain(opts.eval_metadata.iter()) {
         for (name, value) in metadata {
             total = total
                 .checked_add(name.len())
                 .and_then(|bytes| bytes.checked_add(value.len()))
                 .and_then(|bytes| bytes.checked_add(EXTRACT_METADATA_ENTRY_OVERHEAD_BYTES))
-                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball prepared member size overflowed"))?;
+                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball prepared member size overflowed"))?;
         }
     }
     total = total
         .checked_add(
             checked_extract_hash_map_allocation(&replication.targets_map)
-                .ok_or_else(|| s3_error!(InvalidArgument, "Snowball replication decision size overflowed"))?,
+                .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball replication decision size overflowed"))?,
         )
-        .ok_or_else(|| s3_error!(InvalidArgument, "Snowball prepared member size overflowed"))?;
+        .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball prepared member size overflowed"))?;
     for (target_name, target) in &replication.targets_map {
         total = total
             .checked_add(target_name.capacity())
             .and_then(|bytes| bytes.checked_add(target.arn.capacity()))
             .and_then(|bytes| bytes.checked_add(target.id.capacity()))
-            .ok_or_else(|| s3_error!(InvalidArgument, "Snowball replication decision size overflowed"))?;
+            .ok_or_else(|| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball replication decision size overflowed"))?;
     }
     Ok(total)
 }
 
 fn try_acquire_extract_staging_permit(manager: &ConcurrencyManager, staging_weight: usize) -> S3Result<OwnedSemaphorePermit> {
     if staging_weight > SNOWBALL_STAGING_BYTES_LIMIT {
-        return Err(s3_error!(SlowDown, "Snowball member retained state exceeds the global staging budget"));
+        return Err(object_s3_error(
+            S3ErrorCode::SlowDown,
+            "Snowball member retained state exceeds the global staging budget",
+        ));
     }
-    let permits = u32::try_from(staging_weight)
-        .map_err(|_| s3_error!(SlowDown, "Snowball member retained state exceeds the global staging budget"))?;
-    manager
-        .try_acquire_snowball_staging_bytes(permits)
-        .ok_or_else(|| s3_error!(SlowDown, "Snowball staging budget is exhausted, please reduce your request rate"))
+    let permits = u32::try_from(staging_weight).map_err(|_| {
+        object_s3_error(S3ErrorCode::SlowDown, "Snowball member retained state exceeds the global staging budget")
+    })?;
+    manager.try_acquire_snowball_staging_bytes(permits).ok_or_else(|| {
+        object_s3_error(
+            S3ErrorCode::SlowDown,
+            "Snowball staging budget is exhausted, please reduce your request rate",
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,9 +768,9 @@ where
             return ExtractCommitOutcome {
                 archive_seq,
                 event: None,
-                error: Some(ExtractCommitError::StorageWrite(s3_error!(
-                    SlowDown,
-                    "foreground write concurrency limit reached, please reduce your request rate"
+                error: Some(ExtractCommitError::StorageWrite(object_s3_error(
+                    S3ErrorCode::SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate",
                 ))),
             };
         }
@@ -771,9 +778,9 @@ where
             return ExtractCommitOutcome {
                 archive_seq,
                 event: None,
-                error: Some(ExtractCommitError::Fatal(s3_error!(
-                    InternalError,
-                    "Snowball foreground write admission closed"
+                error: Some(ExtractCommitError::Fatal(object_s3_error(
+                    S3ErrorCode::InternalError,
+                    "Snowball foreground write admission closed",
                 ))),
             };
         }
@@ -949,7 +956,7 @@ async fn acquire_extract_member_lifecycle_permit(
     manager
         .acquire_snowball_member_commit()
         .await
-        .map_err(|_| s3_error!(InternalError, "Snowball member lifecycle admission closed"))
+        .map_err(|_| object_s3_error(S3ErrorCode::InternalError, "Snowball member lifecycle admission closed"))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2046,7 +2053,7 @@ impl DefaultObjectUsecase {
         match get_concurrency_manager()
             .admit_put_object(size)
             .await
-            .map_err(|_| s3_error!(InternalError, "foreground write admission closed"))?
+            .map_err(|_| object_s3_error(S3ErrorCode::InternalError, "foreground write admission closed"))?
         {
             ForegroundWriteAdmission::Disabled => {}
             ForegroundWriteAdmission::Admitted(permit) => {
@@ -2057,9 +2064,9 @@ impl DefaultObjectUsecase {
             }
             ForegroundWriteAdmission::Rejected => {
                 counter!("rustfs.put_object.foreground_admission.total", "result" => "rejected").increment(1);
-                return Err(s3_error!(
-                    SlowDown,
-                    "foreground write concurrency limit reached, please reduce your request rate"
+                return Err(object_s3_error(
+                    S3ErrorCode::SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate",
                 ));
             }
         }
@@ -2515,7 +2522,8 @@ impl DefaultObjectUsecase {
             let manager = get_concurrency_manager();
 
             let member_size = extract_try!(
-                usize::try_from(size).map_err(|_| s3_error!(InvalidArgument, "Snowball member size does not fit into usize"))
+                usize::try_from(size)
+                    .map_err(|_| object_s3_error(S3ErrorCode::InvalidArgument, "Snowball member size does not fit into usize"))
             );
             let staging_weight = extract_try!(checked_extract_member_staging_weight(&fpath, member_size, &opts, &replication,));
             let action = batch_state.action(&fpath, member_size, staging_weight, max_inflight, durable_quota);
@@ -2978,12 +2986,12 @@ mod tests {
             ExtractCommitOutcome {
                 archive_seq: 2,
                 event: None,
-                error: Some(ExtractCommitError::Fatal(s3_error!(InvalidArgument, "later"))),
+                error: Some(ExtractCommitError::Fatal(object_s3_error(S3ErrorCode::InvalidArgument, "later"))),
             },
             ExtractCommitOutcome {
                 archive_seq: 1,
                 event: None,
-                error: Some(ExtractCommitError::Fatal(s3_error!(NoSuchKey, "earlier"))),
+                error: Some(ExtractCommitError::Fatal(object_s3_error(S3ErrorCode::NoSuchKey, "earlier"))),
             },
         ];
         let (_, error) = ordered_extract_outcomes(outcomes, false);
@@ -3115,7 +3123,10 @@ mod tests {
             ExtractCommitOutcome {
                 archive_seq: 1,
                 event: None,
-                error: Some(ExtractCommitError::StorageWrite(s3_error!(InternalError, "injected write failure"))),
+                error: Some(ExtractCommitError::StorageWrite(object_s3_error(
+                    S3ErrorCode::InternalError,
+                    "injected write failure",
+                ))),
             },
             ExtractCommitOutcome {
                 archive_seq: 2,
@@ -3129,12 +3140,12 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].version_id, "later-success");
 
-        let slowdown = ExtractCommitError::StorageWrite(s3_error!(SlowDown, "injected admission rejection"));
+        let slowdown = ExtractCommitError::StorageWrite(object_s3_error(S3ErrorCode::SlowDown, "injected admission rejection"));
         assert!(
             slowdown.into_unignored(true).is_none(),
             "ignore-errors must treat member admission rejection as a skipped write"
         );
-        let slowdown = ExtractCommitError::StorageWrite(s3_error!(SlowDown, "injected admission rejection"));
+        let slowdown = ExtractCommitError::StorageWrite(object_s3_error(S3ErrorCode::SlowDown, "injected admission rejection"));
         assert_eq!(
             slowdown
                 .into_unignored(false)
@@ -3149,7 +3160,10 @@ mod tests {
         let outcomes = vec![ExtractCommitOutcome {
             archive_seq: 1,
             event: None,
-            error: Some(ExtractCommitError::Fatal(s3_error!(IncompleteBody, "injected reader failure"))),
+            error: Some(ExtractCommitError::Fatal(object_s3_error(
+                S3ErrorCode::IncompleteBody,
+                "injected reader failure",
+            ))),
         }];
 
         let (_, error) = ordered_extract_outcomes(outcomes, true);
@@ -3184,7 +3198,8 @@ mod tests {
                         ExtractCommitOutcome {
                             archive_seq,
                             event: None,
-                            error: (archive_seq == 2).then(|| ExtractCommitError::Fatal(s3_error!(InvalidArgument, "injected"))),
+                            error: (archive_seq == 2)
+                                .then(|| ExtractCommitError::Fatal(object_s3_error(S3ErrorCode::InvalidArgument, "injected"))),
                         }
                     }
                 }
@@ -4543,14 +4558,14 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(failed.load(Ordering::Acquire));
-        let classified = classify_extract_member_write_error(s3_error!(IncompleteBody), &failed)
+        let classified = classify_extract_member_write_error(object_s3_error_default(S3ErrorCode::IncompleteBody), &failed)
             .into_unignored(true)
             .expect("a reader-backed store error must remain fatal");
         assert_eq!(classified.code(), &S3ErrorCode::IncompleteBody);
 
         let storage_only_failure = AtomicBool::new(false);
         assert!(
-            classify_extract_member_write_error(s3_error!(InternalError), &storage_only_failure)
+            classify_extract_member_write_error(object_s3_error_default(S3ErrorCode::InternalError), &storage_only_failure)
                 .into_unignored(true)
                 .is_none(),
             "a storage-only write failure may be ignored"
