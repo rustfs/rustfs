@@ -1014,6 +1014,66 @@ mod imported_config_apply_tests {
     }
 
     #[test]
+    fn g_d3_005_new_writer_backup_payloads_pass_old_import_validators() {
+        // Captured from the gateway persistence writers at a16e94426b36c6a454dc200a5639c711b590e1eb.
+        // Keep these bytes independent of RustFS's old serializer so rollback drift stays visible.
+        let new_writer_payloads: [(&str, &[u8]); 7] = [
+            (
+                BUCKET_NOTIFICATION_CONFIG,
+                b"<NotificationConfiguration></NotificationConfiguration>",
+            ),
+            (
+                BUCKET_LIFECYCLE_CONFIG,
+                b"<LifecycleConfiguration><Rule><Expiration><Days>30</Days></Expiration><Filter><Prefix>logs/</Prefix></Filter><ID>expire</ID><Status>Enabled</Status></Rule></LifecycleConfiguration>",
+            ),
+            (
+                BUCKET_SSECONFIG,
+                b"<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>",
+            ),
+            (
+                BUCKET_TAGGING_CONFIG,
+                b"<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
+            ),
+            (
+                OBJECT_LOCK_CONFIG,
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+            ),
+            (
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            ),
+            (
+                BUCKET_REPLICATION_CONFIG,
+                b"<ReplicationConfiguration><Role>arn:aws:iam::123456789012:role/replication</Role><Rule><DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication><Destination><Bucket>arn:aws:s3:::backup</Bucket></Destination><Filter><Prefix></Prefix></Filter><Priority>1</Priority><Status>Enabled</Status></Rule></ReplicationConfiguration>",
+            ),
+        ];
+
+        let imported_xml_cases = import_cases()
+            .into_iter()
+            .filter(|case| case.conf_name != BUCKET_TARGETS_FILE)
+            .collect::<Vec<_>>();
+        assert_eq!(new_writer_payloads.len(), imported_xml_cases.len());
+        assert!(
+            imported_xml_cases
+                .iter()
+                .all(|case| new_writer_payloads.iter().any(|(name, _)| *name == case.conf_name))
+        );
+
+        let mut metadatas = imported_bucket();
+        for (conf_name, payload) in new_writer_payloads {
+            assert!(
+                apply_imported_bucket_config(&mut metadatas, BUCKET, conf_name, payload.to_vec(), imported_at())
+                    .unwrap_or_else(|error| panic!("new-writer {conf_name} must pass the old import validator: {error}"))
+            );
+            let case = imported_xml_cases
+                .iter()
+                .find(|case| case.conf_name == conf_name)
+                .unwrap_or_else(|| panic!("{conf_name} must have an import mapping"));
+            assert_eq!((case.payload)(&metadatas[BUCKET]), payload);
+        }
+    }
+
+    #[test]
     fn a_rejected_payload_leaves_the_field_untouched() {
         for case in import_cases() {
             let mut metadatas = imported_bucket();
