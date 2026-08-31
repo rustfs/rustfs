@@ -16445,7 +16445,7 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await",
         "validate_table_catalog_object_mutation(&bucket, &object).await?;",
         "validate_object_key(&key, \"PUT\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
-        "validate_table_catalog_object_mutation(&bucket, &fpath).await?;",
+        "extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);",
     ] {
         assert!(source.contains(expected), "missing object mutation guard: {expected}");
     }

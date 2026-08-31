@@ -21,6 +21,53 @@ mod tests {
     use std::error::Error;
     use std::io::{Cursor, Write};
 
+    fn pax_record(key: &str, value: &str) -> Vec<u8> {
+        let payload = format!("{key}={value}\n");
+        let mut len = payload.len() + 3;
+        loop {
+            let record = format!("{len} {payload}");
+            if record.len() == len {
+                return record.into_bytes();
+            }
+            len = record.len();
+        }
+    }
+
+    async fn append_pax_header(
+        builder: &mut tokio_tar::Builder<Cursor<Vec<u8>>>,
+        entry_type: tokio_tar::EntryType,
+        records: &[(&str, &str)],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut payload = Vec::new();
+        for (key, value) in records {
+            payload.extend(pax_record(key, value));
+        }
+        let mut header = tokio_tar::Header::new_ustar();
+        header.set_entry_type(entry_type);
+        header.set_size(u64::try_from(payload.len()).expect("PAX payload length should fit in u64"));
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "PaxHeaders.X/snowball", Cursor::new(payload))
+            .await?;
+        Ok(())
+    }
+
+    async fn append_typed_entry(
+        builder: &mut tokio_tar::Builder<Cursor<Vec<u8>>>,
+        path: &str,
+        entry_type: tokio_tar::EntryType,
+        body: &[u8],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut header = tokio_tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(u64::try_from(body.len()).expect("TAR member length should fit in u64"));
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, Cursor::new(body)).await?;
+        Ok(())
+    }
+
     async fn build_test_archive() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
         let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
 
@@ -147,6 +194,57 @@ mod tests {
         archive
     }
 
+    async fn build_member_semantics_archive() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+        append_pax_header(
+            &mut builder,
+            tokio_tar::EntryType::XGlobalHeader,
+            &[
+                ("minio.metadata.x-amz-meta-owner", "global"),
+                ("minio.metadata.x-amz-meta-snowball-auto-extract", "true"),
+            ],
+        )
+        .await?;
+        append_pax_header(
+            &mut builder,
+            tokio_tar::EntryType::XHeader,
+            &[("minio.metadata.x-amz-meta-owner", "local")],
+        )
+        .await?;
+        append_typed_entry(&mut builder, "regular.txt", tokio_tar::EntryType::Regular, b"regular-body").await?;
+        for (path, entry_type) in [
+            ("char", tokio_tar::EntryType::Char),
+            ("block", tokio_tar::EntryType::Block),
+            ("fifo", tokio_tar::EntryType::Fifo),
+        ] {
+            append_typed_entry(&mut builder, path, entry_type, b"").await?;
+        }
+        let mut directory = tokio_tar::Header::new_gnu();
+        directory.set_entry_type(tokio_tar::EntryType::Directory);
+        directory.set_size(0);
+        directory.set_mode(0o755);
+        directory.set_cksum();
+        builder
+            .append_data(&mut directory, "directory/", Cursor::new(Vec::new()))
+            .await?;
+        for (path, entry_type) in [
+            ("hard-link", tokio_tar::EntryType::Link),
+            ("symlink", tokio_tar::EntryType::Symlink),
+            ("continuous", tokio_tar::EntryType::Continuous),
+            ("unknown", tokio_tar::EntryType::Other(b'9')),
+        ] {
+            append_typed_entry(&mut builder, path, entry_type, b"").await?;
+        }
+        Ok(builder.into_inner().await?.into_inner())
+    }
+
+    async fn build_versioned_member_archive(path: &str, version_id: &str) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+        append_pax_header(&mut builder, tokio_tar::EntryType::XHeader, &[("minio.versionId", version_id)]).await?;
+        append_typed_entry(&mut builder, path, tokio_tar::EntryType::Regular, b"versioned-body").await?;
+        Ok(builder.into_inner().await?.into_inner())
+    }
+
     fn build_archive_with_invalid_utf8_entry() -> Vec<u8> {
         let mut archive = Vec::new();
         append_raw_tar_entry(&mut archive, b"invalid-\xff.txt", b"ignored-body");
@@ -194,6 +292,147 @@ mod tests {
 
         let dir_marker = client.head_object().bucket(bucket).key("tenant-a/empty-dir/").send().await?;
         assert_eq!(dir_marker.content_length(), Some(0));
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_applies_member_semantics_and_metadata_precedence() -> Result<(), Box<dyn Error + Send + Sync>>
+    {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-member-semantics";
+        client.create_bucket().bucket(bucket).send().await?;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .metadata("Minio-Snowball-Prefix", "members")
+            .metadata("owner", "outer")
+            .body(ByteStream::from(build_member_semantics_archive().await?))
+            .send()
+            .await?;
+
+        let regular = client.head_object().bucket(bucket).key("members/regular.txt").send().await?;
+        let regular_metadata = regular.metadata().expect("regular member should expose metadata");
+        assert_eq!(regular_metadata.get("owner").map(String::as_str), Some("local"));
+        assert!(!regular_metadata.contains_key("snowball-auto-extract"));
+        assert!(!regular_metadata.contains_key("minio-snowball-prefix"));
+
+        for key in ["char", "block", "fifo"] {
+            let head = client
+                .head_object()
+                .bucket(bucket)
+                .key(format!("members/{key}"))
+                .send()
+                .await?;
+            assert_eq!(head.content_length(), Some(0), "{key} should be materialized as an empty object");
+            assert_eq!(
+                head.metadata().and_then(|metadata| metadata.get("owner")).map(String::as_str),
+                Some("outer"),
+                "{key} should not inherit global PAX metadata"
+            );
+        }
+        let directory = client.head_object().bucket(bucket).key("members/directory/").send().await?;
+        assert_eq!(directory.content_length(), Some(0));
+
+        for key in ["hard-link", "symlink", "continuous", "unknown"] {
+            let error = client
+                .head_object()
+                .bucket(bucket)
+                .key(format!("members/{key}"))
+                .send()
+                .await
+                .expect_err("unsupported TAR entry type must be skipped");
+            assert_eq!(error.into_service_error().code(), Some("NotFound"), "{key}");
+        }
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_validates_pax_version_id_against_bucket_state() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-version-semantics";
+        client.create_bucket().bucket(bucket).send().await?;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("null.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .body(ByteStream::from(build_versioned_member_archive("null.txt", "null").await?))
+            .send()
+            .await?;
+        let null_member = client.get_object().bucket(bucket).key("null.txt").send().await?;
+        assert_eq!(null_member.body.collect().await?.into_bytes().as_ref(), b"versioned-body");
+
+        for (archive_key, member_key, version_id) in [
+            ("uuid.tar", "uuid.txt", uuid::Uuid::new_v4().to_string()),
+            ("uppercase-null.tar", "uppercase-null.txt", "NULL".to_string()),
+        ] {
+            let error = client
+                .put_object()
+                .bucket(bucket)
+                .key(archive_key)
+                .metadata("Snowball-Auto-Extract", "true")
+                .body(ByteStream::from(build_versioned_member_archive(member_key, &version_id).await?))
+                .send()
+                .await
+                .expect_err("invalid or unversioned UUID import must be rejected");
+            assert_eq!(error.into_service_error().code(), Some("InvalidArgument"), "{archive_key}");
+            let missing = client
+                .head_object()
+                .bucket(bucket)
+                .key(member_key)
+                .send()
+                .await
+                .expect_err("rejected version import must not create an object");
+            assert_eq!(missing.into_service_error().code(), Some("NotFound"), "{member_key}");
+        }
+
+        client
+            .put_bucket_versioning()
+            .bucket(bucket)
+            .versioning_configuration(
+                aws_sdk_s3::types::VersioningConfiguration::builder()
+                    .status(aws_sdk_s3::types::BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await?;
+        let imported_version_id = uuid::Uuid::new_v4().to_string();
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("versioned-uuid.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .body(ByteStream::from(
+                build_versioned_member_archive("versioned-uuid.txt", &imported_version_id).await?,
+            ))
+            .send()
+            .await?;
+        let imported = client
+            .get_object()
+            .bucket(bucket)
+            .key("versioned-uuid.txt")
+            .version_id(&imported_version_id)
+            .send()
+            .await?;
+        assert_eq!(imported.version_id(), Some(imported_version_id.as_str()));
+        assert_eq!(imported.body.collect().await?.into_bytes().as_ref(), b"versioned-body");
 
         env.stop_server();
         Ok(())

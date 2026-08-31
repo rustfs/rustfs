@@ -1,9 +1,9 @@
 %global _enable_debug_packages 0
 %global _empty_manifest_terminate_build 0
-%global prerelease rc.4
+%global prerelease rc.5
 Name:           rustfs
 Version:        1.0.0
-Release:        rc.4
+Release:        rc.5
 Summary:       High-performance distributed object storage for MinIO alternative
 
 License:        Apache-2.0
@@ -58,6 +58,9 @@ install %_builddir/%{name}-%{version}-%{prerelease}/target/%_arch/%_arch-unknown
 %_bindir/rustfs
 
 %changelog
+* Mon Aug 31 2026 overtrue <anzhengchao@gmail.com>
+- Update RPM package to RustFS 1.0.0-rc.5
+
 * Thu Aug 27 2026 overtrue <anzhengchao@gmail.com>
 - Update RPM package to RustFS 1.0.0-rc.4
 

@@ -125,9 +125,12 @@ pub(crate) mod access_consumer {
 }
 
 pub(crate) mod concurrency_consumer {
+    #[cfg(test)]
+    pub(crate) use super::super::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
     pub(crate) use super::super::concurrency::{
         ConcurrencyManager, DiskReadAdmission, ForegroundWriteAdmission, GetObjectGuard, IoQueueStatus, IoStrategy,
-        PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
+        PutObjectGuard, SNOWBALL_STAGING_BYTES_LIMIT, get_concurrency_aware_buffer_size, get_concurrency_manager,
+        get_put_concurrency_aware_buffer_size,
     };
 }
 
@@ -350,7 +353,7 @@ pub(crate) mod s3_api_consumer {
     }
 
     pub(crate) mod tagging {
-        pub(crate) use super::super::super::s3_api::tagging::resolve_copy_object_tags;
+        pub(crate) use super::super::super::s3_api::tagging::{parse_copy_object_tags, resolve_copy_object_tags};
     }
 }
 

@@ -13,6 +13,7 @@
 // limitations under the License.
 /// Data-usage snapshot persistence: CAS store pipeline, epoch baselines, and observed-snapshot cleanup.
 use super::*;
+use crate::data_usage_define::usage_floor_primary_read_error_allows_backup;
 use crate::storage_api::owner::ScannerPublicationCommitState;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -53,6 +54,30 @@ pub(super) struct DataUsagePersistBaseline {
     pub(super) revision: DataUsageCacheRevision,
 }
 
+async fn read_usage_persist_candidate(
+    storeapi: Arc<impl ScannerObjectIO>,
+    path: &str,
+) -> Result<(Option<Vec<u8>>, DataUsageCacheRevision), EcstoreError> {
+    let primary = read_config_with_revision(storeapi.clone(), path).await;
+    if path != LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str() {
+        return primary;
+    }
+    let Err(primary_error) = &primary else {
+        return primary;
+    };
+    if !usage_floor_primary_read_error_allows_backup(primary_error) {
+        return primary;
+    }
+    let backup_path = format!("{path}.bkp");
+    let backup = read_config_with_revision(storeapi, &backup_path).await?;
+    if backup.0.as_deref().is_some_and(|data| {
+        serde_json::from_slice::<DataUsageInfo>(data).is_ok_and(|usage| data_usage_info_has_persisted_baseline_identity(&usage))
+    }) {
+        return Ok(backup);
+    }
+    primary
+}
+
 /// Read the bytes used as the baseline for a usage publication while keeping
 /// the v2 primary revision as the CAS fence. During an interrupted upgrade the
 /// primary can be valid JSON without a baseline identity; in that case a
@@ -68,7 +93,7 @@ pub(super) async fn read_data_usage_persist_baseline(
             LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
             format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
         ] {
-            let (candidate, _) = read_config_with_revision(storeapi.clone(), &path).await?;
+            let (candidate, _) = read_usage_persist_candidate(storeapi.clone(), &path).await?;
             let Some(candidate) = candidate else {
                 continue;
             };
@@ -107,7 +132,7 @@ pub(super) async fn read_data_usage_persist_baseline(
         LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
         format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
     ] {
-        let (candidate, _) = read_config_with_revision(storeapi.clone(), &path).await?;
+        let (candidate, _) = read_usage_persist_candidate(storeapi.clone(), &path).await?;
         let Some(candidate) = candidate else {
             continue;
         };

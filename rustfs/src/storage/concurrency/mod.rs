@@ -51,6 +51,9 @@ pub use io_schedule::{
 pub use request_guard::{GetObjectGuard, PutObjectGuard};
 
 // Concurrency manager
+#[cfg(test)]
+pub(crate) use manager::SNOWBALL_MEMBER_COMMIT_LIMIT;
+pub(crate) use manager::SNOWBALL_STAGING_BYTES_LIMIT;
 pub use manager::{ConcurrencyManager, DiskReadAdmission, ForegroundWriteAdmission};
 
 // ============================================
