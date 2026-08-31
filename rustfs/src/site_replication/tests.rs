@@ -862,6 +862,59 @@ fn test_actionable_site_replication_retry_events_filters() {
     assert_eq!(actionable[0].path, SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH);
 }
 
+/// The deferred subset is the probe's territory: replayable events held back
+/// only by backoff, at least one base interval after their last failure. A
+/// recovered peer's bucket-op stuck behind a 2400s+ backoff (the round-four
+/// R1.6 shape: three outage-window failures, then a 900s test window) must
+/// appear here so the probe can promote it at the first tick.
+#[test]
+fn test_deferred_site_replication_retry_events_partition() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let mut state = SiteReplicationState::default();
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+    let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+    state.retry_queue = vec![
+        // retry_count 3 => 2400s backoff; failed 700s ago: deferred.
+        drain_event("remote", bucket_make, 3, Some(now - time::Duration::seconds(700))),
+        // Failed less than one base interval ago: neither due nor probed.
+        drain_event(
+            "remote",
+            SITE_REPLICATION_RETRY_IAM_SNAPSHOT_PATH,
+            3,
+            Some(now - time::Duration::seconds(300)),
+        ),
+        // Past its own backoff: actionable, not deferred.
+        drain_event(
+            "remote",
+            "/rustfs/admin/v3/site-replication/peer/bucket-meta",
+            1,
+            Some(now - time::Duration::seconds(700)),
+        ),
+        // Unknown peer: never probed.
+        drain_event("gone", bucket_make, 3, Some(now - time::Duration::seconds(700))),
+    ];
+    // Escalated marker: not replayable, never probed.
+    let mut escalated = drain_event(
+        "remote",
+        SITE_REPLICATION_RETRY_BUCKET_METADATA_SNAPSHOT_PATH,
+        3,
+        Some(now - time::Duration::seconds(700)),
+    );
+    escalated.last_error = SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER.to_string();
+    state.retry_queue.push(escalated);
+
+    let deferred = deferred_site_replication_retry_events(&state, now);
+    assert_eq!(deferred.len(), 1, "only the backed-off, replayable, known-peer event defers");
+    assert_eq!(deferred[0].path, bucket_make);
+
+    let actionable = actionable_site_replication_retry_events(&state, now);
+    assert_eq!(actionable.len(), 1);
+    assert_eq!(actionable[0].path, "/rustfs/admin/v3/site-replication/peer/bucket-meta");
+}
+
 /// The drain settles a peer-edit success under a freshly allocated
 /// generation; legacy queue entries carry `edit_generation: None` and
 /// must be cleared by that generation-scoped settlement (`(Some, None)`

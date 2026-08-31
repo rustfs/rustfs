@@ -16,6 +16,10 @@ use super::*;
 
 pub(crate) const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
 
+/// Attempts before an entry reports as `failed` in retryStats. Visibility
+/// only: a `failed` entry stays drain-eligible, and the reachability probe
+/// short-circuits its backoff once the peer answers again — so an early
+/// `failed` mark is a timely operator signal, not a dead end.
 pub(crate) const SITE_REPLICATION_RETRY_FAILED_AFTER: u32 = 3;
 
 pub(crate) const SITE_REPLICATION_ENDPOINT_REFRESH_RETRY_PATH: &str = "internal:endpoint-target-refresh";
@@ -642,7 +646,10 @@ pub(crate) fn retry_event_replayed_by_bootstrap(event: &SiteReplicationRetryEven
 /// reconcile cadence (`site_replication_reconcile::RECONCILE_INTERVAL`).
 pub(crate) const SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS: i64 = 600;
 
-/// Backoff ceiling: a permanently failed peer is still probed daily.
+/// Backoff ceiling for *replay attempts*: a permanently failed peer still
+/// gets a full replay daily. Reachability is separately probed every tick
+/// ([`promote_reachable_deferred_retry_events`]), so a peer that recovers
+/// converges at the next tick instead of waiting out this ceiling.
 pub(crate) const SITE_REPLICATION_RETRY_DRAIN_MAX_BACKOFF_SECS: i64 = 86_400;
 
 /// What the background drain may do for one retry event. Everything not
@@ -978,6 +985,138 @@ pub(crate) fn actionable_site_replication_retry_events(
         .collect()
 }
 
+/// Replayable events currently held back only by backoff. The exponential
+/// backoff exists to spare a *dead* peer the expensive replay (plan build,
+/// snapshot resend) — it must not delay convergence to a peer that has
+/// already RECOVERED, or a failure window ends in up to a day of silent
+/// divergence (backlog#2071). The drain probes each such peer with one cheap
+/// request per tick and promotes its backlog when the probe succeeds. The
+/// base backoff still floors individual re-attempts so a reachable peer that
+/// keeps failing a delivery is not hammered faster than before.
+pub(crate) fn deferred_site_replication_retry_events(
+    state: &SiteReplicationState,
+    now: OffsetDateTime,
+) -> Vec<SiteReplicationRetryEvent> {
+    state
+        .retry_queue
+        .iter()
+        .filter(|event| classify_site_replication_retry_event(event).is_some())
+        .filter(|event| state.peers.contains_key(&event.peer_deployment_id))
+        .filter(|event| !site_replication_retry_backoff_elapsed(event, now))
+        .filter(|event| {
+            event.updated_at.is_none_or(|updated_at| {
+                now.unix_timestamp().saturating_sub(updated_at.unix_timestamp()) >= SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Peer link-check upload drain: a bodiless-in-spirit POST every peer accepts
+/// with the replication service account, discarding the payload. The cheapest
+/// authenticated proof that the peer is reachable again.
+pub(crate) const SITE_REPLICATION_PEER_DEVNULL_PATH: &str = "/rustfs/admin/v3/site-replication/devnull";
+
+pub(crate) async fn probe_site_replication_peer_reachable(runtime: &SiteReplicationRuntime, peer: &PeerInfo) -> bool {
+    let Ok(transport) = PeerTransport::for_runtime_peer(peer).await else {
+        return false;
+    };
+    PeerAdminRequest::post(
+        &transport.connection,
+        SITE_REPLICATION_PEER_DEVNULL_PATH,
+        &runtime.state.service_account_access_key,
+    )
+    .with_client(&transport.client)
+    .send(&runtime.service_account_secret_key, &serde_json::json!({}))
+    .await
+    .is_ok()
+}
+
+/// Probe the peers whose whole backlog is deferred and promote the backlog of
+/// every peer that answers. A probe failure advances nothing: retry counts
+/// only move on real delivery attempts, so the per-event backoff is intact
+/// when the peer is genuinely down.
+pub(crate) async fn promote_reachable_deferred_retry_events(
+    runtime: &SiteReplicationRuntime,
+    actionable: &mut Vec<SiteReplicationRetryEvent>,
+    deferred: Vec<SiteReplicationRetryEvent>,
+) {
+    let due_peers: HashSet<String> = actionable.iter().map(|event| event.peer_deployment_id.clone()).collect();
+    let mut deferred_by_peer: BTreeMap<String, Vec<SiteReplicationRetryEvent>> = BTreeMap::new();
+    for event in deferred {
+        if due_peers.contains(&event.peer_deployment_id) {
+            // The peer is being dialed this tick anyway; its other events keep
+            // their own backoff.
+            continue;
+        }
+        deferred_by_peer
+            .entry(event.peer_deployment_id.clone())
+            .or_default()
+            .push(event);
+    }
+    for (deployment_id, events) in deferred_by_peer {
+        let Some(peer) = runtime.state.peers.get(&deployment_id) else {
+            continue;
+        };
+        if deployment_id == runtime.local_peer.deployment_id
+            || same_identity_endpoint(&peer.endpoint, &runtime.local_peer.endpoint)
+        {
+            continue;
+        }
+        if probe_site_replication_peer_reachable(runtime, peer).await {
+            info!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                peer = %peer.endpoint,
+                deployment_id = %deployment_id,
+                promoted = events.len(),
+                result = "retry_backoff_probe_promoted",
+                "peer reachable again; replaying its backed-off retry events this tick"
+            );
+            actionable.extend(events);
+        }
+    }
+}
+
+/// Operator-visible per-tick alert for retry entries that no longer converge
+/// on their own: `failed` deliveries deep in backoff and snapshot-escalated
+/// markers awaiting a repair. Healthy pending entries stay silent.
+pub(crate) fn log_site_replication_retry_liabilities(state: &SiteReplicationState) {
+    let escalated = state
+        .retry_queue
+        .iter()
+        .filter(|event| event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER)
+        .count();
+    let failed = state
+        .retry_queue
+        .iter()
+        .filter(|event| event.failed && event.last_error != SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER)
+        .count();
+    if failed == 0 && escalated == 0 {
+        return;
+    }
+    let pending = state.retry_queue.len().saturating_sub(failed + escalated);
+    let oldest_updated_at = state
+        .retry_queue
+        .iter()
+        .filter(|event| event.failed || event.last_error == SITE_REPLICATION_RETRY_SNAPSHOT_REPLAYED_MARKER)
+        .filter_map(|event| event.updated_at)
+        .min();
+    warn!(
+        component = LOG_COMPONENT_ADMIN,
+        subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+        event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+        failed,
+        escalated,
+        pending,
+        oldest_updated_at = ?oldest_updated_at,
+        recorded_deletions = state.iam_deletion_replays.len(),
+        result = "retry_liabilities_outstanding",
+        "site replication retry queue holds failed or escalated deliveries; peer convergence is degraded"
+    );
+}
+
 /// Background consumer for the retry queue, run from the reconcile tick.
 ///
 /// Scope: this settles "delivered once and failed" entries whose replay is
@@ -1007,8 +1146,13 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
-    let actionable = actionable_site_replication_retry_events(&runtime.state, OffsetDateTime::now_utc());
-    if actionable.is_empty() {
+    // The alert must fire even when nothing is drainable this tick —
+    // escalated markers are exactly the entries the drain skips.
+    log_site_replication_retry_liabilities(&runtime.state);
+    let now = OffsetDateTime::now_utc();
+    let mut actionable = actionable_site_replication_retry_events(&runtime.state, now);
+    let deferred = deferred_site_replication_retry_events(&runtime.state, now);
+    if actionable.is_empty() && deferred.is_empty() {
         return Ok(());
     }
     let Some(store) = current_object_store_handle() else {
@@ -1021,6 +1165,12 @@ pub(crate) async fn drain_site_replication_retry_queue_inner() -> S3Result<()> {
         // The tick-level gate ran before the reconcilers; a multi-step flow
         // (endpoint refresh commits its pending marker without the lifecycle
         // guard) may have started since. Re-check on the fresh state.
+        return Ok(());
+    }
+    // Probe before taking the repair lock: probes are read-only peer traffic
+    // and a dead peer's connect timeout must not hold the lock.
+    promote_reachable_deferred_retry_events(&runtime, &mut actionable, deferred).await;
+    if actionable.is_empty() {
         return Ok(());
     }
     // Serialize against operator repair execution. This does NOT close the
