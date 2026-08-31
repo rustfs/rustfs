@@ -3065,9 +3065,20 @@ mod heal_result_report_tests {
 
             let payload = vec![0x5a; 1024 * 1024];
             let mut reader = PutObjReader::from_vec(payload);
-            set.put_object(&bucket, object, &mut reader, &ObjectOptions::default())
-                .await
-                .expect("source object should be written");
+            // This fixture removes physical shards immediately after PUT. A
+            // lock-owning PUT may quorum-ack before its rename tail drains, so
+            // keep the isolated setup on the full-fanout commit path.
+            set.put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should be written");
             let source = disks[2]
                 .read_version("", &bucket, object, "", &ReadOptions::default())
                 .await
