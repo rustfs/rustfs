@@ -160,7 +160,7 @@ pub(super) async fn usage_snapshot_for_epoch_fence(
             }
         };
         if let Some(legacy) = legacy.as_deref() {
-            let usage = decode_usage_snapshot_for_epoch_fence(legacy, &path, false)?;
+            let usage = decode_usage_snapshot_for_epoch_fence(legacy, path, false)?;
             if invalid_primary_epoch.is_none_or(|epoch| usage.scanner_epoch.unwrap_or_default() >= epoch) {
                 return Ok(Some(usage));
             }
