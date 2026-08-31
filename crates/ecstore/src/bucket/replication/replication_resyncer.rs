@@ -196,13 +196,17 @@ const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_id
 /// after a restart is acceptable.
 static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<HashSet<String>>> = LazyLock::new(|| StdMutex::new(HashSet::new()));
 
-/// Version purges the peer denied under object lock (#6850). Replication
-/// carries no governance bypass, so such a purge cannot succeed until the
-/// lock on the replica lapses — retrying every heal cycle only burns
-/// bandwidth and failure counters. Entries suppress heal requeues for the
-/// backoff window; after it expires one probe runs again, so the purge still
-/// converges on its own once retention ends. In-process only: a restart
-/// costs at most one extra probe per entry.
+/// Version purges the peer denied under object lock (#6850). A RustFS peer
+/// with the replicated-purge GOVERNANCE exemption
+/// (`replication_delete_may_bypass_governance`) no longer produces this for
+/// governance retention, but COMPLIANCE retention, legal hold, and targets
+/// without the exemption (older RustFS, MinIO, generic S3) still deny — and
+/// such a purge cannot succeed until the lock on the replica lapses, so
+/// retrying every heal cycle only burns bandwidth and failure counters.
+/// Entries suppress heal requeues for the backoff window; after it expires
+/// one probe runs again, so the purge still converges on its own once
+/// retention ends. In-process only: a restart costs at most one extra probe
+/// per entry.
 const OBJECT_LOCK_DENIED_PURGE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 const OBJECT_LOCK_DENIED_PURGE_CACHE_MAX: usize = 4096;
 type ObjectLockDeniedPurgeKey = (String, String, String);
@@ -2830,11 +2834,12 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             let object_lock_denied = is_version_purge && is_object_lock_denied_delete(e.code.as_deref(), e.message.as_deref());
             if object_lock_denied {
                 // Terminal for as long as the lock holds: the peer retains
-                // this version and replication carries no governance bypass
-                // (#6850), so the sites stay diverged until the retention or
-                // legal hold on the replica lapses. Surface it loudly instead
-                // of letting a silent failed counter and a hot heal-retry
-                // loop stand in for the divergence.
+                // this version under COMPLIANCE retention or legal hold, or
+                // is a target without the replicated-purge GOVERNANCE
+                // exemption (#6850), so the sites stay diverged until the
+                // lock on the replica lapses. Surface it loudly instead of
+                // letting a silent failed counter and a hot heal-retry loop
+                // stand in for the divergence.
                 record_object_lock_denied_purge(dobj, &tgt_client.arn);
                 error!(
                     event = EVENT_REPLICATION_PURGE_OBJECT_LOCK_DENIED,

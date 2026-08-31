@@ -177,6 +177,28 @@ pub fn replication_write_may_pass_worm_gate(
     Ok(!(retention_locked && opts.replication_retention_timestamp.is_none()))
 }
 
+/// Whether an authorized replication delete (`ObjectOptions::replication_request`)
+/// addressed to an explicit version may bypass GOVERNANCE retention on the
+/// local replica, exactly as an `x-amz-bypass-governance-retention` caller
+/// with the bypass permission would.
+///
+/// The source is authoritative for a replicated version purge (issue #6850):
+/// the same WORM deletion gate already ran there, and GOVERNANCE retention
+/// with an authorized bypass is the only lock state it can purge through.
+/// Requiring the bypass header again here makes the purge permanently
+/// undeliverable — replication senders never carry it — and the sites diverge
+/// forever. COMPLIANCE retention and legal hold stay blocking: the source
+/// gate can never purge through them, so a replication purge that meets one
+/// here is divergence or forgery and fails closed.
+///
+/// The trust judgment is the same one the write-path exemption uses:
+/// `replication_request` is only set once the receiving handler has
+/// authorized the caller for the replication action
+/// (`ReplicateDeleteAction`), never straight from request headers.
+pub fn replication_delete_may_bypass_governance(opts: &ObjectOptions) -> bool {
+    opts.replication_request && opts.version_id.is_some()
+}
+
 /// Check if an object is locked based on its metadata.
 /// This is a common function used by both lifecycle evaluation and deletion checks.
 ///
@@ -678,6 +700,32 @@ mod tests {
         let err = replication_write_may_pass_worm_gate(&state, &no_mod_time, &opts)
             .expect_err("default retention without a modification time must not be judged");
         assert!(err.to_string().contains("modification time"));
+    }
+
+    /// The replicated-purge GOVERNANCE bypass (#6850) applies only to an
+    /// authorized replication delete addressed to an explicit version: a
+    /// local delete never gets it, and a replicated delete without a version
+    /// id creates a delete marker rather than purging anything.
+    #[test]
+    fn replication_delete_bypasses_governance_only_for_authorized_version_purges() {
+        let version_purge = ObjectOptions {
+            replication_request: true,
+            version_id: Some("6b6ffbc0-b0d3-4a86-8f6c-fe19163b8dcd".to_string()),
+            ..Default::default()
+        };
+        assert!(replication_delete_may_bypass_governance(&version_purge));
+
+        let local_version_delete = ObjectOptions {
+            replication_request: false,
+            ..version_purge.clone()
+        };
+        assert!(!replication_delete_may_bypass_governance(&local_version_delete));
+
+        let replicated_marker_creation = ObjectOptions {
+            version_id: None,
+            ..version_purge
+        };
+        assert!(!replication_delete_may_bypass_governance(&replicated_marker_creation));
     }
 
     /// A local PutObjectRetention / PutObjectLegalHold "clear" persists the
