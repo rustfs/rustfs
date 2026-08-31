@@ -100,6 +100,7 @@ aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a",
 aws-sdk-sts = { workspace = true, default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-config = { workspace = true }
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
+aws-smithy-types.workspace = true
 async-compression = { workspace = true, features = ["tokio", "bzip2", "xz"] }
 async-trait = { workspace = true }
 flate2.workspace = true
