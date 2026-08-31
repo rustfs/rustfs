@@ -79,7 +79,16 @@ jobs:
     timeout-minutes: 360
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - name: Checkout repository
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: main
+          path: auto-testing
+          persist-credentials: false
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Checkout repository (for the OIDC live gate script)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
@@ -117,9 +126,10 @@ jobs:
         continue-on-error: true
         env:
           REPORT_FILE: /tmp/rustfs-security-report.md
+          RUSTFS_SECURITY_OIDC_LIVE_SCRIPT: ${{ github.workspace }}/scripts/test/oidc_keycloak_live.sh
         run: |
           set -euo pipefail
-          chmod +x scripts/test/rustfs_security_test.sh
+          chmod +x auto-testing/rustfs-security-test.sh
           PACKAGE_URL='${{ inputs.package_url }}'
           RUSTFS_VERSION='${{ inputs.rustfs_version }}'
           TOPOLOGY='${{ inputs.topology }}'
@@ -139,7 +149,7 @@ jobs:
           else
             ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
           fi
-          ./scripts/test/rustfs_security_test.sh "${ARGS[@]}"
+          ./auto-testing/rustfs-security-test.sh "${ARGS[@]}"
 
       - name: Generate report
         if: always()
