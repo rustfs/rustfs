@@ -837,8 +837,9 @@ mod tests {
     use crate::{
         bucket::replication::{ReplicationState, ReplicationStatusType, replication_statuses_map},
         core::pools::{
-            POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus,
-            pool_meta_identity_initialized_for_test, pool_meta_v3_commit_state_for_test,
+            DecommissionErasureLayout, DecommissionPoolCapacityInfo, POOL_META_IDENTITY_NAME, POOL_META_NAME, POOL_META_VERSION,
+            PoolDecommissionInfo, PoolMeta, PoolStatus, pool_meta_identity_initialized_for_test,
+            pool_meta_v3_commit_state_for_test, set_decommission_capacity_info_overrides_for_test,
         },
         disk::endpoint::Endpoint,
         error::{Error, Result, StorageError},
@@ -2163,12 +2164,31 @@ mod tests {
         (source_version, expected_source_versions)
     }
 
+    fn set_test_decommission_capacity_override(store: &Arc<crate::store::ECStore>, pool_idx: usize) {
+        let layout = DecommissionErasureLayout { data: 2, parity: 2 };
+        let source_physical_bytes = 1024 * 1024 * 1024;
+        let target_physical_bytes = source_physical_bytes * 8;
+        let capacity = store
+            .pools
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index == pool_idx {
+                    DecommissionPoolCapacityInfo::for_test(index, layout, 0, source_physical_bytes, source_physical_bytes)
+                } else {
+                    DecommissionPoolCapacityInfo::for_test(index, layout, target_physical_bytes, target_physical_bytes, 0)
+                }
+            })
+            .collect();
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacity]);
+    }
+
     async fn mark_test_pool_decommissioning(store: &Arc<crate::store::ECStore>, pool_idx: usize) {
-        let mut pool_meta = store.pool_meta.write().await;
-        pool_meta.pools[pool_idx].decommission = Some(PoolDecommissionInfo {
-            start_time: Some(OffsetDateTime::now_utc()),
-            ..Default::default()
-        });
+        set_test_decommission_capacity_override(store, pool_idx);
+        store
+            .save_current_pool_meta_for_decommission_start(&[pool_idx], Vec::new())
+            .await
+            .expect("test decommission capacity reservation should activate");
     }
 
     const DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER: &str = "delete_marker_copy";
@@ -7325,6 +7345,7 @@ mod tests {
             .await
             .expect("legacy decommission queue should reload after restart");
         *store.pool_meta.write().await = restarted_pool_meta;
+        set_test_decommission_capacity_override(&store, 0);
         store
             .promote_queued_decommission_for_test(0)
             .await
