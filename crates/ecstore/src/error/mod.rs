@@ -183,6 +183,10 @@ pub enum StorageError {
     DecommissionNotStarted,
     #[error("Decommission already running")]
     DecommissionAlreadyRunning,
+    #[error("Decommission capacity error: {0}")]
+    DecommissionCapacity(String),
+    #[error("decommission_capacity_blocked: Storage reached its minimum free drive threshold.: {message}")]
+    DecommissionCapacityBlocked { message: String },
     #[error("Rebalance already running")]
     RebalanceAlreadyRunning,
     #[error("{operation}: stale pool metadata update rejected for pool {pool_index}; {reason}")]
@@ -569,6 +573,10 @@ impl Clone for StorageError {
             StorageError::EntityTooLarge(a, b) => StorageError::EntityTooLarge(*a, *b),
             StorageError::DoneForNow => StorageError::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageError::DecommissionAlreadyRunning,
+            StorageError::DecommissionCapacity(message) => StorageError::DecommissionCapacity(message.clone()),
+            StorageError::DecommissionCapacityBlocked { message } => StorageError::DecommissionCapacityBlocked {
+                message: message.clone(),
+            },
             StorageError::RebalanceAlreadyRunning => StorageError::RebalanceAlreadyRunning,
             StorageError::StalePoolMetadataUpdate {
                 operation,
@@ -681,6 +689,8 @@ impl StorageError {
             StorageError::InvalidPart(_, _, _) => StorageErrorCode::InvalidPart,
             StorageError::DoneForNow => StorageErrorCode::DoneForNow,
             StorageError::DecommissionAlreadyRunning => StorageErrorCode::DecommissionAlreadyRunning,
+            StorageError::DecommissionCapacity(_) => StorageErrorCode::InvalidArgument,
+            StorageError::DecommissionCapacityBlocked { .. } => StorageErrorCode::StorageFull,
             StorageError::RebalanceAlreadyRunning => StorageErrorCode::RebalanceAlreadyRunning,
             StorageError::StalePoolMetadataUpdate { .. } => StorageErrorCode::InvalidArgument,
             StorageError::OperationCanceled => StorageErrorCode::OperationCanceled,

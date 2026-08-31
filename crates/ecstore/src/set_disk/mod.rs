@@ -857,7 +857,7 @@ static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod core;
 #[cfg(test)]
-pub(crate) use core::io_primitives::disk_call_counters;
+pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, disk_call_counters, rename_fanout_barrier};
 mod ctx;
 mod metadata;
 mod ops;

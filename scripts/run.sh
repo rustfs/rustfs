@@ -312,46 +312,46 @@ export RUSTFS_TRUST_SYSTEM_CA=true
 # --- Basic Configuration ---
 # Scheduled update interval (seconds)
 # How often to perform full capacity recalculation
-# Default: 300 (5 minutes)
+# Default: 600 (10 minutes)
 # Recommended: 300-600 for production, 60-120 for testing
-export RUSTFS_CAPACITY_SCHEDULED_INTERVAL=300
+export RUSTFS_CAPACITY_SCHEDULED_INTERVAL=600
 
 # Write trigger delay (seconds)
 # Delay after write operation before triggering capacity update
-# Default: 10
-# Recommended: 5-15
-export RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY=10
+# Default: 30
+# Recommended: 5-30
+export RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY=30
 
 # Write frequency threshold (writes per minute)
 # Threshold for triggering fast updates during high write frequency
-# Default: 10
+# Default: 20
 # Recommended: 5-20
-export RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD=10
+export RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD=20
 
 # Fast update threshold (seconds)
 # Cache age threshold for considering data as fresh
-# Default: 60
+# Default: 120
 # Recommended: 30-120
-export RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD=60
+export RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD=120
 
 # --- Performance Protection ---
 # Maximum files threshold
 # When file count exceeds this, sampling is used for performance
-# Default: 1000000 (1 million)
-# Recommended: 500000-2000000
-export RUSTFS_CAPACITY_MAX_FILES_THRESHOLD=1000000
+# Default: 200000
+# Recommended: 200000-2000000
+export RUSTFS_CAPACITY_MAX_FILES_THRESHOLD=200000
 
 # Statistics timeout (seconds)
 # Maximum time to wait for capacity calculation
-# Default: 5
+# Default: 3
 # Recommended: 3-10
-export RUSTFS_CAPACITY_STAT_TIMEOUT=5
+export RUSTFS_CAPACITY_STAT_TIMEOUT=3
 
 # Sample rate
 # When sampling is enabled, check every N files
-# Default: 100
+# Default: 200
 # Recommended: 50-200
-export RUSTFS_CAPACITY_SAMPLE_RATE=100
+export RUSTFS_CAPACITY_SAMPLE_RATE=200
 
 # --- Monitoring Configuration ---
 # Metrics logging interval (seconds)

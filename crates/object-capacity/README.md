@@ -282,10 +282,10 @@ The configuration constants are defined in `crates/config/src/constants/capacity
 
 | Environment Variable | Default | Description |
 | --- | --- | --- |
-| `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` | `120s` | Scheduled refresh interval |
-| `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` | `5s` | Debounce delay after writes |
-| `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` | `5` | Recent 60-second write-frequency threshold |
-| `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` | `30s` | Cache age required before fast refresh is considered |
+| `RUSTFS_CAPACITY_SCHEDULED_INTERVAL` | `600s` | Scheduled refresh interval |
+| `RUSTFS_CAPACITY_WRITE_TRIGGER_DELAY` | `30s` | Debounce delay after writes |
+| `RUSTFS_CAPACITY_WRITE_FREQUENCY_THRESHOLD` | `20` | Recent 60-second write-frequency threshold |
+| `RUSTFS_CAPACITY_FAST_UPDATE_THRESHOLD` | `120s` | Cache age required before fast refresh is considered |
 | `RUSTFS_CAPACITY_MAX_FILES_THRESHOLD` | `200000` | Exact-count file threshold |
 | `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3s` (`60s` with `RUSTFS_DRIVE_TIMEOUT_PROFILE=high_latency`) | Base scan timeout |
 | `RUSTFS_CAPACITY_SAMPLE_RATE` | `200` | Overflow-file sampling interval |
