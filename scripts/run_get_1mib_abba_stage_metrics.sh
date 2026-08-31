@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Dedicated exact-1MiB GET attribution harness for rustfs/backlog#1434.
+# Dedicated exact-1MiB GET attribution harness for rustfs/backlog#2093.
 #
 # The heavy lifting stays in run_get_codec_streaming_smoke.sh. This wrapper only
 # fixes the experiment matrix so a reviewer can reproduce the isolated-host
@@ -59,7 +59,7 @@ Usage:
   scripts/run_get_1mib_abba_stage_metrics.sh [options]
 
 Purpose:
-  Run the rustfs/backlog#1434 exact-1MiB isolated-host GET attribution matrix:
+  Run the rustfs/backlog#2093 exact-1MiB isolated-host GET attribution matrix:
   - object size fixed to 1MiB / 1048576 bytes
   - legacy and codec-legacy read-path profiles
   - normal and reverse profile ordering for ABBA order-bias checks
@@ -256,7 +256,7 @@ rustc_version="$(rustc --version 2>/dev/null || echo unavailable)"
 cargo_version="$(cargo --version 2>/dev/null || echo unavailable)"
 
 cat >"${OUT_DIR}/manifest.env" <<EOF
-issue=rustfs/backlog#1434
+issue=rustfs/backlog#2093
 generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 branch=${branch}
 git_head=${git_head}
@@ -297,6 +297,11 @@ warp_object_lifecycle=${WARP_OBJECT_LIFECYCLE}
 warp_prepare_duration=${WARP_PREPARE_DURATION}
 warp_extra_args=${WARP_EXTRA_ARGS}
 warp_warmup_get_before_bench=${WARP_WARMUP_GET_BEFORE_BENCH}
+get_seek_buffer_enable=${RUSTFS_GET_SEEK_BUFFER_ENABLE:-unset}
+get_small_body_once_enable=${RUSTFS_GET_SMALL_BODY_ONCE_ENABLE:-unset}
+get_lockstep_data_shards_only_enable=${RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE:-unset}
+get_metadata_read_version_coalesce=${RUSTFS_GET_METADATA_READ_VERSION_COALESCE:-unset}
+object_data_cache_mode=${RUSTFS_OBJECT_DATA_CACHE_MODE:-unset}
 skip_build=${SKIP_BUILD}
 dry_run=${DRY_RUN}
 rustfs_bin=${RUSTFS_BIN}

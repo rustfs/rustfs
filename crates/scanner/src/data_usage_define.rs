@@ -175,6 +175,11 @@ pub static DATA_USAGE_BUCKET: LazyLock<String> =
 pub static DATA_USAGE_OBJ_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBJECT_NAME}"));
 
+/// Durable evidence for recovery of the exact empty usage fence written by
+/// rc.2/rc.3 bucket cleanup before the first authoritative scanner snapshot.
+pub static DATA_USAGE_RECOVERY_PATH: LazyLock<String> =
+    LazyLock::new(|| format!("{}.recovery-pending.json", DATA_USAGE_OBJ_NAME_PATH.as_str()));
+
 pub static DATA_USAGE_OBSERVED_OBJ_NAME_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}{DATA_USAGE_OBSERVED_OBJECT_NAME}"));
 

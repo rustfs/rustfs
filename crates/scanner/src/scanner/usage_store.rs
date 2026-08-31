@@ -420,7 +420,17 @@ where
                 break 'updates;
             };
             let authoritative = match serde_json::from_slice::<DataUsageInfo>(&authoritative_data) {
-                Ok(info) if data_usage_info_has_persisted_baseline_identity(&info) => info,
+                // The bootstrap placeholder is a valid baseline identity: on a
+                // site that has never converged (every cycle superseded by a
+                // sustained write stream, #6852) it is the only authoritative
+                // object that will ever exist, and refusing it here means the
+                // observed snapshot — the only usage data such a site can
+                // produce — is never published at all.
+                Ok(info)
+                    if data_usage_info_has_persisted_baseline_identity(&info) || data_usage_info_is_bootstrap_pending(&info) =>
+                {
+                    info
+                }
                 Ok(_) => {
                     error!(
                         target: "rustfs::scanner",

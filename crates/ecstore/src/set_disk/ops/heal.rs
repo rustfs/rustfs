@@ -2751,6 +2751,26 @@ mod heal_result_report_tests {
         }
     }
 
+    async fn remove_current_object_part(temp_dir: &TempDir, bucket: &str, object: &str) -> std::io::Result<()> {
+        let object_dir = temp_dir.path().join(bucket).join(object);
+        let mut entries = tokio::fs::read_dir(&object_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if !entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let part = entry.path().join("part.1");
+            match tokio::fs::remove_file(&part).await {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no current part.1 found under {}", object_dir.display()),
+        ))
+    }
+
     #[test]
     fn heal_writer_error_summary_redacts_io_message() {
         let error = DiskError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "/sensitive/storage/path"));
@@ -2783,21 +2803,13 @@ mod heal_result_report_tests {
                 .read_version("", &bucket, object, "", &ReadOptions::default())
                 .await
                 .expect("source metadata should be readable");
-            let data_dir = source.data_dir.expect("non-inline source should have a data directory");
             let mut target_slots = [source.erasure.distribution[0] - 1, source.erasure.distribution[1] - 1];
             target_slots.sort_unstable();
 
             for index in [0, 1] {
-                tokio::fs::remove_file(
-                    temp_dirs[index]
-                        .path()
-                        .join(&bucket)
-                        .join(object)
-                        .join(data_dir.to_string())
-                        .join("part.1"),
-                )
-                .await
-                .expect("target shard should be removed before heal");
+                remove_current_object_part(&temp_dirs[index], &bucket, object)
+                    .await
+                    .expect("target shard should be removed before heal");
             }
 
             let failed_slots = &target_slots[..failed_target_count];
@@ -3053,9 +3065,20 @@ mod heal_result_report_tests {
 
             let payload = vec![0x5a; 1024 * 1024];
             let mut reader = PutObjReader::from_vec(payload);
-            set.put_object(&bucket, object, &mut reader, &ObjectOptions::default())
-                .await
-                .expect("source object should be written");
+            // This fixture removes physical shards immediately after PUT. A
+            // lock-owning PUT may quorum-ack before its rename tail drains, so
+            // keep the isolated setup on the full-fanout commit path.
+            set.put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should be written");
             let source = disks[2]
                 .read_version("", &bucket, object, "", &ReadOptions::default())
                 .await

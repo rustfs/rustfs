@@ -17,18 +17,17 @@ use crate::core::pools::{
     PoolMetaReplicaState, PoolMetaWriteState, load_pool_meta_identity_observing, local_decommission_queue_prefix,
     persist_pool_meta_identity_for_startup, pool_meta_has_active_decommission,
 };
-use crate::error::is_err_decommission_running;
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::object::EcstoreObjectIO;
 use rustfs_config::server_config::KVS;
 use rustfs_credentials::{RPC_SECRET_REQUIRED_OPERATOR_MESSAGE, try_get_rpc_token};
+use std::future::Future;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_STORE_INIT: &str = "store_init";
 const EVENT_DECOMMISSION_RESUME_RETRY: &str = "decommission_resume_retry";
-const EVENT_DECOMMISSION_RESUME_FAILED: &str = "decommission_resume_failed";
 const EVENT_STORE_FORMAT_RETRY: &str = "store_format_retry";
 const EVENT_ECSTORE_INIT_STATUS: &str = "ecstore_init_status";
 const EVENT_STORE_RPC_SECRET_PREFLIGHT_FAILED: &str = "store_rpc_secret_preflight_failed";
@@ -96,15 +95,12 @@ fn preflight_startup_rpc_secret_with(
     }
 }
 
-const LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES: usize = 6;
 const LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(60 * 3);
 const LOCAL_DECOMMISSION_RESUME_RETRY_DELAY: Duration = Duration::from_secs(30);
+const LOCAL_DECOMMISSION_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
+const LOCAL_DECOMMISSION_WATCHDOG_MAX_RETRY_DELAY: Duration = Duration::from_secs(60 * 5);
 const REBALANCE_INITIAL_RESUME_DELAY: Duration = Duration::from_secs(10);
 const REBALANCE_RESUME_RETRY_DELAY: Duration = Duration::from_secs(10);
-
-fn should_retry_local_decommission_resume(err: &Error, attempt: usize) -> bool {
-    matches!(err, Error::ConfigNotFound) && attempt < LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
-}
 
 fn should_retry_format_load(err: &Error) -> bool {
     !matches!(err, Error::CorruptedFormat)
@@ -118,19 +114,18 @@ fn should_defer_rebalance_auto_start(distributed: bool, fleet_proof_available: b
     distributed && !fleet_proof_available
 }
 
-fn should_schedule_local_decommission_resume(
-    pool_indices: &[usize],
-    pool_meta_replica_state: PoolMetaReplicaState,
-    pool_meta_write_safe: bool,
-) -> bool {
-    !pool_indices.is_empty() && pool_meta_replica_state.repair_write_safe && pool_meta_write_safe
-}
-
 async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
     tokio::select! {
         _ = rx.cancelled() => false,
         _ = tokio::time::sleep(delay) => true,
     }
+}
+
+fn local_decommission_watchdog_retry_delay(consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(4);
+    LOCAL_DECOMMISSION_RESUME_RETRY_DELAY
+        .saturating_mul(1_u32 << exponent)
+        .min(LOCAL_DECOMMISSION_WATCHDOG_MAX_RETRY_DELAY)
 }
 
 async fn wait_for_rebalance_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
@@ -235,69 +230,61 @@ where
     Ok(committed)
 }
 
-async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken, pool_indices: Vec<usize>) {
-    for attempt in 0..=LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES {
+async fn run_local_decommission_watchdog<F, Fut>(rx: CancellationToken, mut reconcile: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut consecutive_failures = 0_u32;
+
+    loop {
         if rx.is_cancelled() {
             return;
         }
 
-        let result = if pool_indices.len() > 1 {
-            store
-                .spawn_decommission_routines(store.clone(), rx.clone(), pool_indices.clone())
-                .await
-        } else {
-            store.decommission(rx.clone(), pool_indices.clone()).await
-        };
-
-        match result {
-            Ok(()) => return,
-            Err(err) if is_err_decommission_running(&err) => {
-                if let Err(spawn_err) = store
-                    .spawn_decommission_routines(store.clone(), rx.clone(), pool_indices.clone())
-                    .await
-                {
-                    error!(
-                        event = EVENT_DECOMMISSION_RESUME_FAILED,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_STORE_INIT,
-                        pool_indices = ?pool_indices,
-                        error = %spawn_err,
-                        reason = "spawn_workers_failed",
-                        "Failed to resume decommission workers"
-                    );
-                }
-                return;
+        let delay = match reconcile().await {
+            Ok(()) => {
+                consecutive_failures = 0;
+                LOCAL_DECOMMISSION_WATCHDOG_INTERVAL
             }
-            Err(err) if should_retry_local_decommission_resume(&err, attempt) => {
+            Err(err) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                let retry_delay = local_decommission_watchdog_retry_delay(consecutive_failures);
                 warn!(
                     event = EVENT_DECOMMISSION_RESUME_RETRY,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_STORE_INIT,
-                    pool_indices = ?pool_indices,
-                    retry_count = attempt + 1,
-                    retry_limit = LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES + 1,
+                    consecutive_failures,
+                    retry_delay_secs = retry_delay.as_secs(),
                     error = %err,
-                    "Retrying decommission resume after missing config"
+                    "Retrying decommission worker recovery"
                 );
-                tokio::select! {
-                    _ = rx.cancelled() => return,
-                    _ = tokio::time::sleep(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY) => {}
-                }
+                retry_delay
             }
-            Err(err) => {
-                error!(
-                    event = EVENT_DECOMMISSION_RESUME_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_STORE_INIT,
-                    pool_indices = ?pool_indices,
-                    error = %err,
-                    reason = "resume_failed",
-                    "Failed to resume decommission"
-                );
-                return;
-            }
+        };
+
+        if !wait_for_local_decommission_resume_delay(&rx, delay).await {
+            return;
         }
     }
+}
+
+async fn supervise_local_decommission_after_init(store: Arc<ECStore>, rx: CancellationToken) {
+    run_local_decommission_watchdog(rx.clone(), || {
+        let store = store.clone();
+        let worker_rx = rx.clone();
+        async move {
+            store
+                .ensure_pool_meta_side_effects_safe("decommission worker recovery blocked while pool metadata requires recovery")
+                .await?;
+            if store.has_active_local_decommission_worker().await {
+                return Ok(());
+            }
+            store.refresh_pool_status_meta().await?;
+            store.spawn_missing_local_decommission_routines_with_token(worker_rx).await
+        }
+    })
+    .await;
 }
 
 async fn resume_rebalance_after_init(store: Arc<ECStore>, rx: CancellationToken) {
@@ -729,30 +716,31 @@ impl ECStore {
         }
 
         let local_pool_indices = local_decommission_queue_prefix(&endpoints, &pool_indices)?;
+        let has_local_decommission_leadership = endpoints.as_ref().iter().any(pool_first_endpoint_is_local);
         let pool_meta_write_safe = self
             .ensure_pool_meta_side_effects_safe("decommission resume blocked while pool metadata requires recovery")
             .await
             .is_ok();
-        if should_schedule_local_decommission_resume(&local_pool_indices, pool_meta_replica_state, pool_meta_write_safe) {
-            let store = self.clone();
-            let decommission_rx = rx.clone();
-
-            tokio::spawn(async move {
-                if !wait_for_local_decommission_resume_delay(&decommission_rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
-                    return;
-                }
-                resume_local_decommission_after_init(store, decommission_rx, local_pool_indices).await;
-            });
-        } else if !local_pool_indices.is_empty() {
-            error!(
-                event = EVENT_DECOMMISSION_RESUME_FAILED,
+        if !pool_meta_replica_state.repair_write_safe || !pool_meta_write_safe {
+            warn!(
+                event = EVENT_DECOMMISSION_RESUME_RETRY,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_STORE_INIT,
                 state = "blocked",
                 pool_indices = ?local_pool_indices,
                 reason = "pool_meta_write_blocked",
-                "Decommission resume blocked until pool metadata replicas are readable and consistent"
+                "Decommission watchdog waiting for pool metadata recovery"
             );
+        }
+        if has_local_decommission_leadership {
+            let store = self.clone();
+            let decommission_rx = rx.clone();
+            tokio::spawn(async move {
+                if !wait_for_local_decommission_resume_delay(&decommission_rx, LOCAL_DECOMMISSION_INITIAL_RESUME_DELAY).await {
+                    return;
+                }
+                supervise_local_decommission_after_init(store, decommission_rx).await;
+            });
         }
 
         runtime_sources::init_bucket_monitor_for_current_endpoints();
@@ -786,12 +774,12 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES, PoolMetaWriteState, establish_pool_meta_bootstrap_identity_if_proven,
-        load_pool_meta_for_startup, persist_pool_meta_for_startup_if_safe, pool_first_endpoint_is_local,
-        pool_meta_has_active_decommission, preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with,
-        resolve_store_init_stage_result, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
-        should_defer_rebalance_auto_start, should_retry_format_load, should_retry_local_decommission_resume,
-        wait_for_local_decommission_resume_delay,
+        LOCAL_DECOMMISSION_RESUME_RETRY_DELAY, LOCAL_DECOMMISSION_WATCHDOG_MAX_RETRY_DELAY, PoolMetaWriteState,
+        establish_pool_meta_bootstrap_identity_if_proven, load_pool_meta_for_startup, local_decommission_watchdog_retry_delay,
+        persist_pool_meta_for_startup_if_safe, pool_first_endpoint_is_local, pool_meta_has_active_decommission,
+        preflight_startup_rpc_secret_with, resolve_startup_pool_defaults_with, resolve_store_init_stage_result,
+        run_local_decommission_watchdog, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
+        should_defer_rebalance_auto_start, should_retry_format_load, wait_for_local_decommission_resume_delay,
     };
     #[cfg(feature = "test-util")]
     use crate::disk::DiskAPI;
@@ -1481,15 +1469,6 @@ mod tests {
         assert!(err.to_string().contains("cannot overwrite an unreadable replica"));
         assert!(!valid.wrote_without_lock.load(Ordering::SeqCst));
         assert!(!unreadable.wrote_without_lock.load(Ordering::SeqCst));
-        assert!(!super::should_schedule_local_decommission_resume(&[0], replica_state, true));
-        assert!(!super::should_schedule_local_decommission_resume(
-            &[0],
-            crate::core::pools::PoolMetaReplicaState {
-                needs_repair: false,
-                repair_write_safe: true,
-            },
-            false,
-        ));
     }
 
     #[tokio::test]
@@ -1517,7 +1496,6 @@ mod tests {
                 .contains("restart after all replicas are readable and consistent")
         );
         assert!(!repaired.wrote_without_lock.load(Ordering::SeqCst));
-        assert!(!super::should_schedule_local_decommission_resume(&[0], replica_state, false));
     }
 
     #[test]
@@ -1551,21 +1529,66 @@ mod tests {
     }
 
     #[test]
-    fn test_should_retry_local_decommission_resume_accepts_config_not_found_before_retry_limit() {
-        assert!(should_retry_local_decommission_resume(&StorageError::ConfigNotFound, 0));
+    fn test_local_decommission_watchdog_retry_delay_is_bounded() {
+        assert_eq!(local_decommission_watchdog_retry_delay(1), LOCAL_DECOMMISSION_RESUME_RETRY_DELAY);
+        assert_eq!(
+            local_decommission_watchdog_retry_delay(u32::MAX),
+            LOCAL_DECOMMISSION_WATCHDOG_MAX_RETRY_DELAY
+        );
     }
 
-    #[test]
-    fn test_should_retry_local_decommission_resume_rejects_config_not_found_at_retry_limit() {
-        assert!(!should_retry_local_decommission_resume(
-            &StorageError::ConfigNotFound,
-            LOCAL_DECOMMISSION_RESUME_MAX_CONFIG_RETRIES
-        ));
+    #[tokio::test(start_paused = true)]
+    async fn test_local_decommission_watchdog_retries_general_failures_until_cancelled() {
+        let rx = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(run_local_decommission_watchdog(rx.clone(), {
+            let attempts = attempts.clone();
+            let rx = rx.clone();
+            move || {
+                let attempts = attempts.clone();
+                let rx = rx.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Err(StorageError::SlowDown)
+                    } else {
+                        rx.cancel();
+                        Ok(())
+                    }
+                }
+            }
+        }));
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        tokio::time::advance(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY).await;
+        task.await.expect("watchdog task should exit after cancellation");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
-    fn test_should_retry_local_decommission_resume_rejects_non_config_errors() {
-        assert!(!should_retry_local_decommission_resume(&StorageError::SlowDown, 0));
+    #[tokio::test(start_paused = true)]
+    async fn test_local_decommission_watchdog_rescans_after_success() {
+        let rx = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(run_local_decommission_watchdog(rx.clone(), {
+            let attempts = attempts.clone();
+            let rx = rx.clone();
+            move || {
+                let attempts = attempts.clone();
+                let rx = rx.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 1 {
+                        rx.cancel();
+                    }
+                    Ok(())
+                }
+            }
+        }));
+
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        tokio::time::advance(super::LOCAL_DECOMMISSION_WATCHDOG_INTERVAL).await;
+        task.await.expect("watchdog task should exit after cancellation");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]

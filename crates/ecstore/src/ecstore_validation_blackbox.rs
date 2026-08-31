@@ -16,9 +16,142 @@ use rustfs_filemeta::{MetacacheReader, MetacacheWriter};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
+
+/// Test-only lock client whose refresh path can be rejected independently of
+/// every other lock operation. The observed event is awaitable so lock-loss
+/// tests do not depend on sleeps or scheduler timing.
+#[derive(Debug)]
+pub(crate) struct RefreshLossLockClient {
+    inner: rustfs_lock::LocalClient,
+    reject_refresh: AtomicBool,
+    rejected_refresh: AtomicBool,
+    rejected_refresh_notify: tokio::sync::Notify,
+}
+
+impl RefreshLossLockClient {
+    pub(crate) fn with_manager(manager: Arc<rustfs_lock::GlobalLockManager>) -> Self {
+        Self {
+            inner: rustfs_lock::LocalClient::with_manager(manager),
+            reject_refresh: AtomicBool::new(false),
+            rejected_refresh: AtomicBool::new(false),
+            rejected_refresh_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub(crate) fn reject_refreshes(&self) {
+        self.reject_refresh.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn refreshes_rejected(&self) -> bool {
+        self.rejected_refresh.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_rejected_refresh(
+        &self,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.rejected_refresh_notify.notified();
+                if self.refreshes_rejected() {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl rustfs_lock::LockClient for RefreshLossLockClient {
+    async fn acquire_lock(&self, request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<rustfs_lock::LockResponse> {
+        rustfs_lock::LockClient::acquire_lock(&self.inner, request).await
+    }
+
+    async fn release(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+        rustfs_lock::LockClient::release(&self.inner, lock_id).await
+    }
+
+    async fn refresh(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+        if self.reject_refresh.load(Ordering::Acquire) {
+            self.rejected_refresh.store(true, Ordering::Release);
+            self.rejected_refresh_notify.notify_waiters();
+            return Ok(false);
+        }
+        rustfs_lock::LockClient::refresh(&self.inner, lock_id).await
+    }
+
+    async fn force_release(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+        rustfs_lock::LockClient::force_release(&self.inner, lock_id).await
+    }
+
+    async fn check_status(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<rustfs_lock::LockInfo>> {
+        rustfs_lock::LockClient::check_status(&self.inner, lock_id).await
+    }
+
+    async fn list_lock_leases(&self) -> Vec<rustfs_lock::LockLeaseInfo> {
+        rustfs_lock::LockClient::list_lock_leases(&self.inner).await
+    }
+
+    async fn get_stats(&self) -> rustfs_lock::Result<rustfs_lock::LockStats> {
+        rustfs_lock::LockClient::get_stats(&self.inner).await
+    }
+
+    async fn close(&self) -> rustfs_lock::Result<()> {
+        rustfs_lock::LockClient::close(&self.inner).await
+    }
+
+    async fn is_online(&self) -> bool {
+        rustfs_lock::LockClient::is_online(&self.inner).await
+    }
+
+    async fn is_local(&self) -> bool {
+        rustfs_lock::LockClient::is_local(&self.inner).await
+    }
+}
+
+#[tokio::test]
+async fn refresh_loss_lock_client_keeps_rejection_observable_for_late_waiters() {
+    let manager = Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
+        rustfs_lock::FastObjectLockManager::new(),
+    )));
+    let client = RefreshLossLockClient::with_manager(manager);
+    let resource = rustfs_lock::ObjectKey::new("bucket", "object");
+    let response = rustfs_lock::LockClient::acquire_lock(
+        &client,
+        &rustfs_lock::LockRequest::new(resource, rustfs_lock::LockType::Shared, "refresh-loss-harness"),
+    )
+    .await
+    .expect("acquire should reach the inner local client");
+    let lock_id = response.lock_info.expect("the inner local client should acquire the lock").id;
+    assert_eq!(
+        rustfs_lock::LockClient::list_lock_leases(&client).await.len(),
+        1,
+        "lease diagnostics must remain transparent through the refresh wrapper"
+    );
+
+    client.reject_refreshes();
+    assert!(
+        !rustfs_lock::LockClient::refresh(&client, &lock_id)
+            .await
+            .expect("refresh should return a response")
+    );
+    client
+        .wait_for_rejected_refresh(std::time::Duration::from_millis(50))
+        .await
+        .expect("a waiter registered after rejection must still observe the event");
+    assert!(client.refreshes_rejected());
+    assert!(
+        rustfs_lock::LockClient::release(&client, &lock_id)
+            .await
+            .expect("release should reach the inner local client")
+    );
+}
 
 /// Returns the backing [`tempfile::TempDir`]s alongside the set so callers keep
 /// them alive for the test's duration and the directories are removed on drop.
