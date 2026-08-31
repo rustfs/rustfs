@@ -17,8 +17,9 @@
 #[cfg(test)]
 mod tests {
     use crate::chaos::{VersionShardCensus, census_object_version_on_disk, signed_admin_post};
-    use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging};
+    use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, admin_request, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
+    use http::Method;
     use std::collections::HashSet;
     use std::error::Error;
     use std::path::{Path, PathBuf};
@@ -93,6 +94,24 @@ mod tests {
             status["detail"].as_str(),
             items.map_or(0, Vec::len)
         )
+    }
+
+    async fn replacement_recovery_status(
+        cluster: &RustFSTestClusterEnvironment,
+    ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+        let (status, body) = admin_request(
+            &cluster.nodes[0].url,
+            Method::GET,
+            "/rustfs/admin/v4/heal/replacement-recovery",
+            None,
+            &cluster.access_key,
+            &cluster.secret_key,
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(format!("replacement recovery status failed: {status} {body}").into());
+        }
+        serde_json::from_str(&body).map_err(|err| format!("replacement recovery status is not JSON ({err}): {body}").into())
     }
 
     async fn assert_object_body(env: &RustFSTestEnvironment, bucket: &str, key: &str, expected: &[u8]) {
@@ -376,10 +395,131 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_cluster_root_heal_resumes_replaced_remote_disk_after_node_restart() -> Result<(), Box<dyn Error + Send + Sync>>
+    async fn test_cluster_root_heal_rebuilds_replaced_remote_disk() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        info!("Root recursive heal should rebuild data on a remote node after its disk is replaced and the node rejoins");
+
+        let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
+        cluster.set_env("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true");
+        cluster.set_env("RUSTFS_HEAL_ENABLED", "true");
+        cluster.set_env("RUSTFS_SCANNER_ENABLED", "true");
+        cluster.start().await?;
+        let clients = cluster.create_all_clients()?;
+
+        let bucket = "heal-replaced-remote-disk";
+        clients[0].create_bucket().bucket(bucket).send().await?;
+
+        let online_key = "cluster/online-before-replacement.bin";
+        let online_body = b"object written while all cluster nodes are online".to_vec();
+        clients[0]
+            .put_object()
+            .bucket(bucket)
+            .key(online_key)
+            .body(ByteStream::from(online_body.clone()))
+            .send()
+            .await?;
+
+        let replaced_disk = PathBuf::from(&cluster.nodes[1].data_dir);
+        assert!(
+            object_metadata_exists_on_disk(&replaced_disk, bucket, online_key),
+            "node 1 should contain metadata before disk replacement"
+        );
+
+        cluster.stop_node(1)?;
+        std::fs::remove_dir_all(&replaced_disk)?;
+        std::fs::create_dir_all(&replaced_disk)?;
+        assert!(!has_file_under(&replaced_disk), "replacement disk must start empty");
+
+        let outage_key = "cluster/written-while-node-down.bin";
+        let outage_body = b"object written while one remote node is offline".to_vec();
+        timeout(Duration::from_secs(30), async {
+            clients[0]
+                .put_object()
+                .bucket(bucket)
+                .key(outage_key)
+                .body(ByteStream::from(outage_body.clone()))
+                .send()
+                .await
+        })
+        .await??;
+
+        cluster.start_node(1).await?;
+
+        let status_url = format!("{}/rustfs/admin/v3/background-heal/status", cluster.nodes[0].url);
+        let mut recovered = serde_json::Value::Null;
+        for _ in 0..60 {
+            let status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
+            assert!(
+                !status_body.contains("MissingContentLength"),
+                "background heal status should not fail without an explicit Content-Length: {status_body}"
+            );
+            recovered = serde_json::from_str(&status_body)
+                .map_err(|err| format!("background heal status is not JSON ({err}): {status_body}"))?;
+            if recovered["clusterStatusComplete"] == serde_json::Value::Bool(true) {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            recovered["clusterStatusComplete"],
+            serde_json::Value::Bool(true),
+            "cluster heal status should recover before root heal starts: {recovered}"
+        );
+
+        let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
+        let heal_url = format!("{}/rustfs/admin/v3/heal/?forceStart=true", cluster.nodes[0].url);
+        signed_admin_post(&heal_url, Some(heal_body), &cluster.access_key, &cluster.secret_key).await?;
+
+        let expected_objects = [(online_key, online_body.as_slice()), (outage_key, outage_body.as_slice())];
+        let mut remaining_rebuild_keys: HashSet<&str> = expected_objects.iter().map(|(key, _)| *key).collect();
+        let heal_timeout_secs = std::env::var("RUSTFS_HEAL_REPLACED_DISK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(90);
+
+        for _ in 0..heal_timeout_secs {
+            for (key, body) in &expected_objects {
+                let response = clients[0].get_object().bucket(bucket).key(*key).send().await?;
+                let actual = response.body.collect().await?.into_bytes();
+                assert_eq!(actual.as_ref(), *body, "object body changed for {key}");
+            }
+
+            if !remaining_rebuild_keys.is_empty() {
+                let rebuilt = remaining_rebuild_keys
+                    .iter()
+                    .copied()
+                    .filter(|key| object_metadata_exists_on_disk(&replaced_disk, bucket, key))
+                    .collect::<Vec<_>>();
+                for key in rebuilt {
+                    let _ = remaining_rebuild_keys.remove(key);
+                }
+            }
+
+            if remaining_rebuild_keys.is_empty() {
+                return Ok(());
+            }
+
+            sleep(Duration::from_secs(1)).await;
+        }
+
+        Err(format!(
+            "admin deep heal did not rebuild replaced remote disk metadata for {remaining_rebuild_keys:?} within timeout"
+        )
+        .into())
+    }
+
+    // Keep the original unformatted-disk scenario above. This case retains the
+    // format identity so only the explicit admin task can rebuild missing data.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_resumes_missing_remote_shards_after_node_restart() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         init_logging();
-        info!("Root recursive heal should resume after its replacement target restarts during a partial rebuild");
+        info!(
+            event = "heal_restart_started",
+            component = "e2e_test",
+            subsystem = "heal",
+            "Starting root-heal restart test"
+        );
 
         let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
         cluster.set_env("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true");
@@ -390,7 +530,15 @@ mod tests {
         cluster.set_env("RUSTFS_HEAL_MAX_CONCURRENT_PER_SET", "1");
         cluster.set_env("RUSTFS_HEAL_PAGE_OBJECT_CONCURRENCY", "1");
         cluster.set_env("RUSTFS_HEAL_PAGE_PARALLEL_ENABLE", "false");
-        cluster.set_env("RUST_LOG", "rustfs::heal::task=info,rustfs=error");
+        let server_rust_log = std::env::var("RUSTFS_HEAL_CHAOS_SERVER_RUST_LOG")
+            .unwrap_or_else(|_| "rustfs::heal::task=info,rustfs=error".to_string());
+        cluster.set_env("RUST_LOG", server_rust_log);
+        if let Ok(log_dir) = std::env::var("RUSTFS_HEAL_CHAOS_LOG_DIR") {
+            std::fs::create_dir_all(&log_dir)?;
+            for node_index in 0..cluster.nodes.len() {
+                cluster.set_node_capture_log_path(node_index, format!("{log_dir}/node{node_index}.log"))?;
+            }
+        }
         cluster.start().await?;
         let clients = cluster.create_all_clients()?;
 
@@ -398,6 +546,10 @@ mod tests {
         clients[0].create_bucket().bucket(bucket).send().await?;
 
         let replaced_disk = PathBuf::from(&cluster.nodes[1].data_dir);
+        let replacement_format_path = replaced_disk.join(".rustfs.sys").join("format.json");
+        let replacement_format = std::fs::read(&replacement_format_path).map_err(|err| {
+            format!("failed to capture target format before replacement wipe at {replacement_format_path:?}: {err}")
+        })?;
         let online_object_count = std::env::var("RUSTFS_HEAL_CHAOS_OBJECT_COUNT")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -433,8 +585,16 @@ mod tests {
 
         cluster.stop_node(1)?;
         std::fs::remove_dir_all(&replaced_disk)?;
-        std::fs::create_dir_all(&replaced_disk)?;
-        assert!(!has_file_under(&replaced_disk), "replacement disk must start empty");
+        std::fs::create_dir_all(
+            replacement_format_path
+                .parent()
+                .ok_or("replacement format path has no parent")?,
+        )?;
+        std::fs::write(&replacement_format_path, replacement_format)?;
+        assert!(
+            replacement_format_path.is_file(),
+            "replacement target must retain only its preformatted topology identity"
+        );
 
         let outage_key = "cluster/written-while-node-down.bin";
         timeout(
@@ -510,6 +670,22 @@ mod tests {
             !census_object_version_on_disk(&replaced_disk, bucket, outage_key, None)?.has_xl_meta,
             "the object written during the outage must be absent before the explicit root heal"
         );
+        let recovered_operations = &recovered["healOperations"];
+        assert_eq!(
+            recovered_operations["queuedBySource"]["autoHeal"].as_u64(),
+            Some(0),
+            "preformatted target must not queue automatic replacement work before root heal: {recovered}"
+        );
+        assert_eq!(
+            recovered_operations["activeBySource"]["autoHeal"].as_u64(),
+            Some(0),
+            "preformatted target must not run automatic replacement work before root heal: {recovered}"
+        );
+        assert_eq!(
+            recovered_operations["retryingBySource"]["autoHeal"].as_u64(),
+            Some(0),
+            "preformatted target must not retry automatic replacement work before root heal: {recovered}"
+        );
 
         let heal_body = r#"{"recursive":true,"dryRun":false,"remove":false,"recreate":true,"scanMode":2,"updateParity":false,"nolock":false}"#;
         let heal_url = format!("{}/rustfs/admin/v3/heal/?forceStart=true", cluster.nodes[0].url);
@@ -569,6 +745,44 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         };
 
+        let pre_interrupt_status_body = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key).await?;
+        let pre_interrupt_status: serde_json::Value = serde_json::from_str(&pre_interrupt_status_body)
+            .map_err(|err| format!("pre-interrupt background heal status is not JSON ({err}): {pre_interrupt_status_body}"))?;
+        let pre_interrupt_replacement = replacement_recovery_status(&cluster).await?;
+        let pre_interrupt_operations = &pre_interrupt_status["healOperations"];
+        assert_eq!(
+            pre_interrupt_operations["activeBySource"]["admin"].as_u64(),
+            Some(1),
+            "root-heal interruption point must retain exactly one active admin owner: {pre_interrupt_status}"
+        );
+        assert_eq!(
+            pre_interrupt_operations["queuedBySource"]["autoHeal"].as_u64(),
+            Some(0),
+            "root-heal interruption point must not have queued automatic replacement work: {pre_interrupt_status}"
+        );
+        assert_eq!(
+            pre_interrupt_operations["activeBySource"]["autoHeal"].as_u64(),
+            Some(0),
+            "root-heal interruption point must have the admin task as its only rebuild owner: {pre_interrupt_status}"
+        );
+        assert_eq!(
+            pre_interrupt_operations["retryingBySource"]["autoHeal"].as_u64(),
+            Some(0),
+            "root-heal interruption point must not have retrying automatic replacement work: {pre_interrupt_status}"
+        );
+        assert_eq!(
+            pre_interrupt_replacement["cluster"]["records"].as_array().map(Vec::len),
+            Some(0),
+            "root-heal interruption point must not retain an automatic replacement generation: {pre_interrupt_replacement}"
+        );
+        info!(
+            event = "heal_restart_checkpoint",
+            component = "e2e_test",
+            subsystem = "heal",
+            partial_count,
+            "Verified unique admin owner before target interruption"
+        );
+
         cluster.stop_node(1)?;
         let stopped_count = matching_manifest_count(&replaced_disk, bucket, &expected_manifests)?;
         assert!(
@@ -576,6 +790,17 @@ mod tests {
             "the target must stop after a partial rebuild, observed before stop={partial_count}, after stop={stopped_count}, total={}",
             expected_manifests.len()
         );
+        let unclean_shutdown_marker = replaced_disk.join(".rustfs.sys").join("unclean-shutdown");
+        match std::fs::remove_file(&unclean_shutdown_marker) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "failed to remove generic unclean-shutdown marker before focused root-heal continuation restart at {unclean_shutdown_marker:?}: {err}"
+                )
+                .into());
+            }
+        }
         cluster.start_node(1).await?;
 
         let heal_timeout_secs = std::env::var("RUSTFS_HEAL_REPLACED_DISK_TIMEOUT_SECS")
@@ -599,13 +824,23 @@ mod tests {
                 let final_status = signed_admin_post(&status_url, None, &cluster.access_key, &cluster.secret_key)
                     .await
                     .unwrap_or_else(|err| format!("status request failed: {err}"));
-                let task_status = match signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key).await
+                let task_status = match timeout(
+                    Duration::from_secs(5),
+                    signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key),
+                )
+                .await
                 {
-                    Ok(body) => heal_task_status_diagnostic(&body),
-                    Err(err) => format!("task status request failed: {err}"),
+                    Ok(Ok(body)) => heal_task_status_diagnostic(&body),
+                    Ok(Err(err)) => format!("task status request failed: {err}"),
+                    Err(_) => "task status request exceeded 5s diagnostic budget".to_string(),
+                };
+                let replacement_status = match timeout(Duration::from_secs(5), replacement_recovery_status(&cluster)).await {
+                    Ok(Ok(status)) => status.to_string(),
+                    Ok(Err(err)) => format!("replacement status request failed: {err}"),
+                    Err(_) => "replacement status request exceeded 5s diagnostic budget".to_string(),
                 };
                 return Err(format!(
-                    "root heal did not resume after target restart within {heal_timeout_secs}s: baseline={matching}/{}, outage={outage_census:?}, status={final_status}, task_status={task_status}",
+                    "root heal did not resume after target restart within {heal_timeout_secs}s: baseline={matching}/{}, outage={outage_census:?}, status={final_status}, task_status={task_status}, pre_interrupt_status={pre_interrupt_status}, pre_interrupt_replacement={pre_interrupt_replacement}, replacement_status={replacement_status}",
                     expected_manifests.len()
                 )
                 .into());

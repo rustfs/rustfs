@@ -57,7 +57,7 @@
 | group_delete_test | 4 |  |
 | head_object_consistency_test | 1 | ✅ |
 | head_object_range_test | 1 | ✅ |
-| heal_erasure_disk_rebuild_test | 4 | 🌙 |
+| heal_erasure_disk_rebuild_test | 5 | 🌙 |
 | inline_fast_path_cluster_test | 16 |  |
 | internode_rpc_signature_e2e_test | 5 |  |
 | kms | 50 |  |

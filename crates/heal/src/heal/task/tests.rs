@@ -1546,6 +1546,90 @@ async fn recursive_bucket_heal_skips_dangling_delete_grace_without_batch_failure
 }
 
 #[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_preserves_non_recreate_and_non_availability_results() {
+    for (dry_run, recreate_missing, state) in [
+        (true, true, DriveState::Offline),
+        (true, true, DriveState::Faulty),
+        (false, false, DriveState::Offline),
+        (false, false, DriveState::Faulty),
+        (false, true, DriveState::Ok),
+        (false, true, DriveState::Missing),
+        (false, true, DriveState::Corrupt),
+        (false, true, DriveState::PermissionDenied),
+        (false, true, DriveState::Unknown("other failure".to_string())),
+    ] {
+        let storage = Arc::new(MockStorage::default());
+        storage
+            .heal_object_outcomes
+            .lock()
+            .expect("test outcome lock")
+            .insert("object-a".to_string(), VecDeque::from([MockHealObjectOutcome::UnavailableDrive(state)]));
+        let task = HealTask::from_request(
+            HealRequest::new(
+                HealType::Bucket {
+                    bucket: "bucket-a".to_string(),
+                },
+                HealOptions {
+                    recursive: true,
+                    dry_run,
+                    recreate_missing,
+                    timeout: None,
+                    ..Default::default()
+                },
+                HealPriority::Normal,
+            ),
+            storage.clone(),
+        );
+        task.heal_bucket("bucket-a")
+            .await
+            .expect("unchanged best-effort result should not schedule an availability retry");
+        assert_eq!(
+            storage.heal_object_calls.lock().expect("test call lock").as_slice(),
+            ["object-a".to_string(), "object-b".to_string()]
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn recursive_bucket_heal_exhausts_unavailable_target_without_rescanning_healthy_objects() {
+    let storage = Arc::new(MockStorage::default());
+    storage.heal_object_outcomes.lock().expect("test outcome lock").insert(
+        "object-a".to_string(),
+        (0..4)
+            .map(|_| MockHealObjectOutcome::UnavailableDrive(DriveState::Faulty))
+            .collect(),
+    );
+    let task = HealTask::from_request(
+        HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        ),
+        storage.clone(),
+    );
+    let error = task
+        .heal_bucket("bucket-a")
+        .await
+        .expect_err("persistent unavailable target must not report success");
+    assert!(matches!(error, Error::TaskExecutionFailed { .. }));
+    let failure = task
+        .take_batch_failure()
+        .await
+        .expect("exhausted availability failure should be retained");
+    assert_eq!((failure.failed, failure.retryable, failure.permanent), (1, 1, 0));
+    let calls = storage.heal_object_calls.lock().expect("test call lock");
+    assert_eq!(calls.iter().filter(|object| object.as_str() == "object-a").count(), 4);
+    assert_eq!(calls.iter().filter(|object| object.as_str() == "object-b").count(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn test_recursive_bucket_heal_reports_typed_exhausted_and_permanent_failures() {
     let storage = Arc::new(MockStorage::default());
     storage.heal_object_outcomes.lock().unwrap().insert(
