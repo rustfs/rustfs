@@ -2213,7 +2213,7 @@ impl DefaultObjectUsecase {
                 let fpath = match normalize_extract_entry_key(path, extract_options.prefix.as_deref(), is_dir) {
                     Ok(fpath) => fpath,
                     Err(error) => {
-                        extract_try!(ExtractEntryError::Recoverable(error).ignore_or_return(extract_options.ignore_errors));
+                        extract_try!(ExtractEntryError::Fatal(error).ignore_or_return(extract_options.ignore_errors));
                         continue;
                     }
                 };
