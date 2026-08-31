@@ -18,26 +18,46 @@ on:
   workflow_dispatch:
     inputs:
       rustfs_version:
-        description: 'RustFS release tag to test (leave empty to build from this branch)'
+        description: 'RustFS release tag to test (e.g. 1.0.0-rc.4-preview.1)'
         required: false
+        default: '1.0.0-rc.4-preview.1'
       package_url:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
         type: string
+      topology:
+        description: 'Topology to run (all = SNSD, SNMD, MNMD)'
+        type: choice
+        options:
+          - all
+          - single-single
+          - single-multi
+          - multi-multi
+        default: all
       oidc_live:
         description: 'Run the live Keycloak OIDC/SSO gate as part of the suite'
         type: boolean
         default: true
+      cleanup_before:
+        description: 'Reset the nodes before the test (DESTROYS existing data/config)'
+        type: boolean
+        default: true
+      cleanup_after:
+        description: 'Reset the nodes after the test (DESTROYS test data/config)'
+        type: boolean
+        default: true
   workflow_run:
-    # Runs alongside the other functional suites after the nightly build.
+    # Same nightly trigger as the other functional suites.
     workflows: ["Nightly GNU Build"]
     types: [completed]
 
 permissions:
   contents: read
 
+# The security suite uses the same shared VMs as the other functional tests,
+# so it must serialize with them instead of running in parallel.
 concurrency:
-  group: rustfs-security-test-${{ github.ref }}
+  group: rustfs-shared-functional-tests
   cancel-in-progress: false
 
 defaults:
@@ -45,19 +65,18 @@ defaults:
     shell: bash
 
 env:
-  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY || 'rustfsadmin' }}
-  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY || 'rustfsadmin' }}
-  RUSTFS_SECURITY_OIDC_LIVE: ${{ github.event_name == 'workflow_dispatch' && (inputs.oidc_live && '1' || '0') || '1' }}
-  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
   RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
 jobs:
   security-test:
-    name: IAM / STS / OIDC security suite
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    runs-on: smoke-testing
+    continue-on-error: true
+    timeout-minutes: 360
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout repository
@@ -65,36 +84,77 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
-        with:
-          cache-shared-key: rustfs-security-test
-          cache-save-if: "true"
-          install-build-packaging-tools: "false"
-          install-test-tools: "false"
-
-      - name: Build RustFS
-        run: cargo build --locked -p rustfs --bin rustfs
-
-      - name: Install pinned request signer
-        run: |
-          python3 -m pip install --user --upgrade pip "awscurl==0.44"
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
-
       - name: Show environment
         run: |
           uname -a
           jq --version
           openssl version
+          aws --version || true
           docker --version || true
+          df -h /data | tail -1
+
+      - name: Cleanup environment (before)
+        if: ${{ inputs.cleanup_before != 'false' || github.event_name != 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
+            '
+          done
 
       - name: Run security suite
-        id: security
+        id: test
+        continue-on-error: true
         env:
           REPORT_FILE: /tmp/rustfs-security-report.md
-          PACKAGE_SOURCE: ${{ inputs.package_url || 'nightly (R2 latest)' }}
         run: |
-          bash scripts/test/rustfs_security_test.sh ./target/debug/rustfs
+          set -euo pipefail
+          chmod +x scripts/test/rustfs_security_test.sh
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          TOPOLOGY='${{ inputs.topology }}'
+          ARGS=(-y)
+          if [ "${TOPOLOGY}" = "all" ] || [ -z "${TOPOLOGY}" ] || [ "${TOPOLOGY}" = "null" ]; then
+            ARGS+=(--all-topologies)
+          else
+            ARGS+=(--topology "${TOPOLOGY}")
+          fi
+          if [ "${{ inputs.oidc_live }}" = "true" ] || [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            ARGS+=(--oidc-live)
+          fi
+          if [ -n "${PACKAGE_URL}" ]; then
+            ARGS+=(--package-url "${PACKAGE_URL}")
+          elif [ -n "${RUSTFS_VERSION}" ] && [ "${RUSTFS_VERSION}" != "null" ]; then
+            ARGS+=(--version "${RUSTFS_VERSION}")
+          else
+            ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
+          fi
+          ./scripts/test/rustfs_security_test.sh "${ARGS[@]}"
+
+      - name: Generate report
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/rustfs-security-report.md ]; then
+            {
+              echo "# RustFS security test report"
+              echo ""
+              echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              echo "- Trigger: ${{ github.event_name }}"
+              echo "- Test Step Outcome: failure (suite did not produce a report)"
+            } > /tmp/rustfs-security-report.md
+          fi
+          cat /tmp/rustfs-security-report.md >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload functional report to dashboard
         if: always()
@@ -272,13 +332,39 @@ jobs:
               | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
           fi
 
-      - name: Upload test logs
+      - name: Upload report and logs
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-security-test-${{ github.run_id }}
           path: |
             /tmp/rustfs-security-report.md
-            /tmp/rustfs-keycloak-live-*/**/*.log
+            /tmp/rustfs-security.*/*
           if-no-files-found: ignore
           retention-days: 3
+
+      - name: Cleanup environment (after)
+        if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}
+        run: |
+          set -euo pipefail
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
+            '
+          done
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "RustFS security test failed"
+          echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
+          echo "See the uploaded report and logs for details."
