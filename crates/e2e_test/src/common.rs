@@ -1505,7 +1505,7 @@ impl RustFSTestClusterEnvironment {
 
             let mut command = Command::new(&binary_path);
             command
-                .env("RUSTFS_VOLUMES", &volumes_arg)
+                .env("RUSTFS_VOLUMES", volumes_arg)
                 .env("RUSTFS_ADDRESS", &node.address)
                 .env("RUSTFS_ACCESS_KEY", &self.access_key)
                 .env("RUSTFS_SECRET_KEY", &self.secret_key)
