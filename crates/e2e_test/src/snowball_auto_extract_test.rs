@@ -17,8 +17,9 @@ mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
+    use flate2::{Compression, write::GzEncoder};
     use std::error::Error;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
 
     async fn build_test_archive() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
         let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
@@ -69,12 +70,50 @@ mod tests {
         Ok(builder.into_inner().await?.into_inner())
     }
 
-    fn build_archive_with_parent_dir_entry(victim_bucket: &str) -> Vec<u8> {
-        let path = format!("../{victim_bucket}/evil-injected.txt");
-        let data = b"injected-body";
+    async fn build_archive_with_invalid_checksum() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut archive = build_test_archive().await?;
+        archive[0] ^= 1;
+        Ok(archive)
+    }
+
+    async fn build_archive_with_negative_gnu_mtime() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut builder = tokio_tar::Builder::new(Cursor::new(Vec::new()));
+        let mut header = tokio_tar::Header::new_gnu();
+        header.set_size(b"negative-mtime-body".len() as u64);
+        header.set_mode(0o644);
+        header.as_old_mut().mtime.fill(0xff);
+        builder
+            .append_data(&mut header, "negative-mtime.txt", Cursor::new(b"negative-mtime-body".as_slice()))
+            .await?;
+        Ok(builder.into_inner().await?.into_inner())
+    }
+
+    fn gzip_member(payload: &[u8]) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(payload)?;
+        Ok(encoder.finish()?)
+    }
+
+    async fn build_concatenated_gzip_archive() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let archive = build_test_archive().await?;
+        let split_at = archive.len() / 2;
+        let mut encoded = gzip_member(&archive[..split_at])?;
+        encoded.extend(gzip_member(&archive[split_at..])?);
+        Ok(encoded)
+    }
+
+    async fn build_gzip_archive_with_invalid_crc() -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+        let mut encoded = gzip_member(&build_test_archive().await?)?;
+        let crc_offset = encoded.len().checked_sub(8).expect("gzip fixture must contain a trailer");
+        encoded[crc_offset] ^= 1;
+        Ok(encoded)
+    }
+
+    fn append_raw_tar_entry_with_type(archive: &mut Vec<u8>, path: &[u8], data: &[u8], entry_type: u8) {
+        assert!(path.len() <= 100, "raw TAR fixture path must fit in the name field");
         let mut header = [0u8; 512];
 
-        header[..path.len()].copy_from_slice(path.as_bytes());
+        header[..path.len()].copy_from_slice(path);
         header[100..108].copy_from_slice(b"0000644\0");
         header[108..116].copy_from_slice(b"0000000\0");
         header[116..124].copy_from_slice(b"0000000\0");
@@ -82,7 +121,7 @@ mod tests {
         header[124..136].copy_from_slice(size.as_bytes());
         header[136..148].copy_from_slice(b"00000000000\0");
         header[148..156].fill(b' ');
-        header[156] = b'0';
+        header[156] = entry_type;
         header[257..263].copy_from_slice(b"ustar\0");
         header[263..265].copy_from_slice(b"00");
 
@@ -90,11 +129,36 @@ mod tests {
         let checksum = format!("{:06o}\0 ", checksum);
         header[148..156].copy_from_slice(checksum.as_bytes());
 
-        let mut archive = Vec::new();
         archive.extend_from_slice(&header);
         archive.extend_from_slice(data);
         let padding = (512 - (data.len() % 512)) % 512;
         archive.extend(std::iter::repeat_n(0, padding));
+    }
+
+    fn append_raw_tar_entry(archive: &mut Vec<u8>, path: &[u8], data: &[u8]) {
+        append_raw_tar_entry_with_type(archive, path, data, b'0');
+    }
+
+    fn build_archive_with_parent_dir_entry(victim_bucket: &str) -> Vec<u8> {
+        let path = format!("../{victim_bucket}/evil-injected.txt");
+        let mut archive = Vec::new();
+        append_raw_tar_entry(&mut archive, path.as_bytes(), b"injected-body");
+        archive.extend_from_slice(&[0u8; 1024]);
+        archive
+    }
+
+    fn build_archive_with_invalid_utf8_entry() -> Vec<u8> {
+        let mut archive = Vec::new();
+        append_raw_tar_entry(&mut archive, b"invalid-\xff.txt", b"ignored-body");
+        append_raw_tar_entry(&mut archive, b"valid.txt", b"valid-body");
+        archive.extend_from_slice(&[0u8; 1024]);
+        archive
+    }
+
+    fn build_archive_with_invalid_utf8_symlink() -> Vec<u8> {
+        let mut archive = Vec::new();
+        append_raw_tar_entry_with_type(&mut archive, b"invalid-\xff-link", b"", b'2');
+        append_raw_tar_entry(&mut archive, b"valid.txt", b"valid-body");
         archive.extend_from_slice(&[0u8; 1024]);
         archive
     }
@@ -264,6 +328,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snowball_auto_extract_accepts_negative_gnu_mtime() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-negative-mtime";
+        client.create_bucket().bucket(bucket).send().await?;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .body(ByteStream::from(build_archive_with_negative_gnu_mtime().await?))
+            .send()
+            .await?;
+
+        let object = client.get_object().bucket(bucket).key("negative-mtime.txt").send().await?;
+        assert_eq!(object.body.collect().await?.into_bytes().as_ref(), b"negative-mtime-body");
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_consumes_concatenated_gzip_members() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-concatenated-gzip";
+        client.create_bucket().bucket(bucket).send().await?;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar.gz")
+            .metadata("Snowball-Auto-Extract", "true")
+            .body(ByteStream::from(build_concatenated_gzip_archive().await?))
+            .send()
+            .await?;
+
+        let object = client.get_object().bucket(bucket).key("root.txt").send().await?;
+        assert_eq!(object.body.collect().await?.into_bytes().as_ref(), b"root payload\n");
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_rejects_gzip_crc_error_when_ignore_errors_enabled() -> Result<(), Box<dyn Error + Send + Sync>>
+    {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-gzip-crc-ignore-errors";
+        client.create_bucket().bucket(bucket).send().await?;
+        let err = client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar.gz")
+            .metadata("Snowball-Auto-Extract", "true")
+            .metadata("Minio-Snowball-Ignore-Errors", "true")
+            .body(ByteStream::from(build_gzip_archive_with_invalid_crc().await?))
+            .send()
+            .await
+            .expect_err("gzip integrity failures must remain fatal under ignore-errors");
+
+        assert_eq!(err.into_service_error().code(), Some("InvalidArgument"));
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_rejects_mismatched_content_md5() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-content-md5";
+        client.create_bucket().bucket(bucket).send().await?;
+        let err = client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .content_md5("AAAAAAAAAAAAAAAAAAAAAA==")
+            .body(ByteStream::from(build_test_archive().await?))
+            .send()
+            .await
+            .expect_err("mismatched Content-MD5 must fail after the raw body reaches EOF");
+
+        assert_eq!(err.into_service_error().code(), Some("BadDigest"));
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn snowball_auto_extract_ignores_invalid_entries_when_requested() -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 
@@ -299,7 +470,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snowball_auto_extract_rejects_parent_dir_entry_without_cross_bucket_write()
+    async fn snowball_auto_extract_skips_non_utf8_symlink_without_ignore_errors() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-invalid-utf8-link";
+        client.create_bucket().bucket(bucket).send().await?;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .body(ByteStream::from(build_archive_with_invalid_utf8_symlink()))
+            .send()
+            .await?;
+
+        let valid = client.get_object().bucket(bucket).key("valid.txt").send().await?;
+        assert_eq!(valid.body.collect().await?.into_bytes().as_ref(), b"valid-body");
+        let listed = client.list_objects_v2().bucket(bucket).send().await?;
+        let keys: Vec<_> = listed.contents().iter().filter_map(|entry| entry.key()).collect();
+        assert_eq!(keys, vec!["valid.txt"]);
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_skips_non_utf8_member_without_lossy_key_collision() -> Result<(), Box<dyn Error + Send + Sync>>
+    {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-invalid-utf8";
+        client.create_bucket().bucket(bucket).send().await?;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .metadata("Minio-Snowball-Ignore-Errors", "true")
+            .body(ByteStream::from(build_archive_with_invalid_utf8_entry()))
+            .send()
+            .await?;
+
+        let valid = client.get_object().bucket(bucket).key("valid.txt").send().await?;
+        assert_eq!(valid.body.collect().await?.into_bytes().as_ref(), b"valid-body");
+        let listed = client.list_objects_v2().bucket(bucket).send().await?;
+        let keys: Vec<_> = listed.contents().iter().filter_map(|entry| entry.key()).collect();
+        assert_eq!(keys, vec!["valid.txt"]);
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_rejects_corrupt_tar_when_ignore_errors_enabled() -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec![]).await?;
+
+        let client = env.create_s3_client();
+        let bucket = "snowball-corrupt-ignore-errors";
+        let archive = build_archive_with_invalid_checksum().await?;
+        client.create_bucket().bucket(bucket).send().await?;
+
+        let err = client
+            .put_object()
+            .bucket(bucket)
+            .key("fixture.tar")
+            .metadata("Snowball-Auto-Extract", "true")
+            .metadata("Minio-Snowball-Ignore-Errors", "true")
+            .body(ByteStream::from(archive))
+            .send()
+            .await
+            .expect_err("corrupt TAR structure must remain fatal under ignore-errors");
+        assert_eq!(err.into_service_error().code(), Some("InvalidArgument"));
+
+        let listed = client.list_objects_v2().bucket(bucket).send().await?;
+        assert!(listed.contents().is_empty(), "corrupt archive must not produce objects");
+
+        env.stop_server();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snowball_auto_extract_rejects_parent_dir_entry_even_when_ignore_errors_enabled()
     -> Result<(), Box<dyn Error + Send + Sync>> {
         init_logging();
 
@@ -319,6 +583,7 @@ mod tests {
             .bucket(attacker_bucket)
             .key("fixture.tar")
             .metadata("Snowball-Auto-Extract", "true")
+            .metadata("Minio-Snowball-Ignore-Errors", "true")
             .body(ByteStream::from(archive))
             .send()
             .await
