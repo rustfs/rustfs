@@ -1379,6 +1379,14 @@ fn data_read_metadata_early_stop_request_shape_allowed(range: &Option<HTTPRangeS
         && !crate::object_api::restore_request_active(opts)
 }
 
+fn prepare_late_materialized_retry(initial_result: &Result<()>, output: &mut Vec<u8>, expected_size: usize) -> bool {
+    if initial_result.is_ok() && output.len() == expected_size {
+        return false;
+    }
+    output.clear();
+    true
+}
+
 #[cfg(test)]
 mod data_read_metadata_early_stop_request_shape_tests {
     use super::*;
@@ -1433,6 +1441,14 @@ mod data_read_metadata_early_stop_request_shape_tests {
         let mut restore_opts = ObjectOptions::default();
         restore_opts.transition.restore_request.days = Some(1);
         assert!(!data_read_metadata_early_stop_request_shape_allowed(&None, &restore_opts));
+    }
+
+    #[test]
+    fn late_materialized_retry_clears_partial_buffer_after_error() {
+        let mut output = b"partial-prefix".to_vec();
+        let result = Err(Error::FileCorrupt);
+        assert!(prepare_late_materialized_retry(&result, &mut output, 1024));
+        assert!(output.is_empty());
     }
 }
 
@@ -2010,6 +2026,79 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     body_source = GetObjectBodySource::HookMissed;
                 }
             }
+        }
+
+        if snapshot.has_late_metadata_fanout() {
+            let object_size = usize::try_from(object_info.size)
+                .map_err(|_| to_object_err(Error::other("two-phase GET object size is invalid"), vec![bucket, object]))?;
+            let mut output = Vec::with_capacity(object_size);
+            let (fi, files, disks, late_metadata_fanout_disks) = snapshot.into_owned_with_late_metadata_fanout();
+            let late_metadata_fanout_disks = late_metadata_fanout_disks
+                .ok_or_else(|| to_object_err(Error::other("two-phase GET fallback context is missing"), vec![bucket, object]))?;
+            let initial_result = Self::get_object_with_fileinfo(
+                bucket,
+                object,
+                Arc::clone(&self.erasure_cache),
+                0,
+                object_info.size,
+                &mut output,
+                fi.clone(),
+                files,
+                &disks,
+                self.set_index,
+                self.pool_index,
+                opts.skip_verify_bitrot,
+                true,
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                object_class.as_str(),
+                size_bucket,
+            )
+            .await;
+            if prepare_late_materialized_retry(&initial_result, &mut output, object_size) {
+                let (full_parts_metadata, full_online_disks) = Self::refresh_late_metadata_fanout(
+                    &late_metadata_fanout_disks,
+                    bucket,
+                    object,
+                    &fi,
+                    GET_OBJECT_PATH_LEGACY_DUPLEX,
+                )
+                .await?;
+                Self::get_object_with_fileinfo(
+                    bucket,
+                    object,
+                    Arc::clone(&self.erasure_cache),
+                    0,
+                    object_info.size,
+                    &mut output,
+                    fi,
+                    full_parts_metadata,
+                    &full_online_disks,
+                    self.set_index,
+                    self.pool_index,
+                    opts.skip_verify_bitrot,
+                    true,
+                    GET_OBJECT_PATH_LEGACY_DUPLEX,
+                    object_class.as_str(),
+                    size_bucket,
+                )
+                .await?;
+            }
+            if output.len() != object_size {
+                return Err(to_object_err(Error::other("two-phase GET decoded length mismatch"), vec![bucket, object]));
+            }
+
+            record_get_object_reader_path_observation(GET_OBJECT_PATH_LEGACY_DUPLEX, object_class, size_bucket);
+            let body = Bytes::from(output);
+            let reader = GetObjectReader {
+                stream: Box::new(Cursor::new(body.clone())),
+                object_info,
+                buffered_body: Some(body),
+                body_source,
+            };
+            if lock_optimization_enabled {
+                release_materialized_read_lock(bucket, object, read_lock_guard.take());
+            }
+            return Ok(reader);
         }
 
         let direct_memory_decision = get_small_object_direct_memory_decision_with_threshold_and_plan(

@@ -48,14 +48,15 @@ use super::super::{
     ObjectPartInfo, OffsetDateTime, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RawFileInfo, ReadMultipleReq,
     ReadMultipleResp, ReadOptions, Result, SLASH_SEPARATOR, STORAGE_FORMAT_FILE, SetDisks, SnapshotLeaseToken, StorageError,
     UpdateMetadataOpts, Uuid, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
-    capacity_scope_from_disks, coding, collect_inline_data_shard_fileinfos_by_index_or_reason, current_dirty_generation, debug,
-    disk, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info, inline_erasure_shard_file_offset,
-    inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found, is_get_metadata_data_read_early_stop_enabled,
-    is_get_metadata_early_stop_bounded_fanout_enabled, is_get_metadata_early_stop_enabled,
-    is_get_metadata_non_inline_data_read_early_stop_enabled, is_object_dangling, is_version_early_stop_enabled,
-    issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure, merge_file_meta_versions, path_join_buf,
-    record_global_dirty_scope, reduce_read_quorum_errs, reduce_write_quorum_errs, send_heal_request_with_admission,
-    should_prevent_write, to_object_err, try_read_inline_data_shards_direct, warn,
+    capacity_scope_from_disks, codec_streaming_rollout_applies, coding, collect_inline_data_shard_fileinfos_by_index_or_reason,
+    current_dirty_generation, debug, disk, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info,
+    inline_erasure_shard_file_offset, inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found,
+    is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
+    is_get_metadata_early_stop_enabled, is_get_metadata_non_inline_data_read_early_stop_enabled, is_object_dangling,
+    is_version_early_stop_enabled, issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure,
+    merge_file_meta_versions, object_fits_single_block, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs,
+    reduce_write_quorum_errs, send_heal_request_with_admission, should_prevent_write, to_object_err,
+    try_read_inline_data_shards_direct, warn,
 };
 #[cfg(test)]
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
@@ -451,6 +452,22 @@ pub(in crate::set_disk) fn bounded_metadata_fanout_order(
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::task::JoinSet;
+
+struct AbortOnDropJoinHandle<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Future for AbortOnDropJoinHandle<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 pub(in crate::set_disk) const EVENT_SET_DISK_READ: &str = "set_disk_read";
 pub(in crate::set_disk) const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
@@ -1132,10 +1149,18 @@ fn data_read_early_stop_inline_candidate_miss_reason(candidate: &FileInfo) -> Op
     None
 }
 
-fn non_inline_data_read_candidate_is_safe(candidate: &FileInfo) -> bool {
+const NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE: i64 = 512 * 1024 + 1;
+
+fn non_inline_data_read_early_stop_allowed(read_data: bool, bucket: &str, object: &str) -> bool {
+    read_data && is_get_metadata_non_inline_data_read_early_stop_enabled() && !codec_streaming_rollout_applies(bucket, object)
+}
+
+pub(in crate::set_disk) fn non_inline_data_read_candidate_is_safe(candidate: &FileInfo) -> bool {
     if candidate.inline_data()
         || candidate.is_compressed()
         || candidate.is_remote()
+        || candidate.size < NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE
+        || !object_fits_single_block(candidate.size, candidate.erasure.block_size)
         || candidate
             .metadata
             .keys()
@@ -2931,7 +2956,7 @@ impl SetDisks {
                 read_data,
                 healing,
                 incl_free_versions,
-                read_data && is_get_metadata_non_inline_data_read_early_stop_enabled(),
+                non_inline_data_read_early_stop_allowed(read_data, bucket, object),
                 default_parity_count,
                 allow_coalescing,
             )
@@ -2997,7 +3022,7 @@ impl SetDisks {
             let object = object.clone();
             let version_id = version_id.clone();
             let slowtail_fault = slowtail_fault.clone();
-            tokio::spawn(async move {
+            AbortOnDropJoinHandle(tokio::spawn(async move {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
                     Self::record_read_version_call(&object, disk_index);
@@ -3012,12 +3037,10 @@ impl SetDisks {
                 };
                 let elapsed = response_start.map(|start| start.elapsed());
                 (result, elapsed)
-            })
+            }))
         });
 
-        // Wait for all futures to complete
         let results = join_all(futures).await;
-
         for join_result in results {
             match join_result {
                 Ok((res, elapsed)) => match res {
@@ -7962,6 +7985,16 @@ mod tests {
                 .await
                 .expect("part data should be installed on every disk");
             let mut file_info = valid_metadata_fanout_fileinfo(bucket, object, version_id, data_dir, mod_time);
+            file_info.size = NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE;
+            file_info.add_object_part(
+                1,
+                "part-etag".to_string(),
+                usize::try_from(NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE).expect("test object size should fit usize"),
+                file_info.mod_time,
+                NON_INLINE_TWO_PHASE_MIN_OBJECT_SIZE,
+                None,
+                None,
+            );
             file_info.erasure.distribution = distribution.clone();
             file_info.erasure.index = *distribution
                 .get(index)
@@ -8151,6 +8184,25 @@ mod tests {
         assert_eq!(order.len(), 16);
         assert_eq!(order.iter().copied().collect::<HashSet<_>>().len(), 16);
         assert_eq!(initial_blocks, (1..=12).collect());
+    }
+
+    #[test]
+    #[serial_test::serial(codec_streaming_env)]
+    fn non_inline_two_phase_is_mutually_exclusive_with_codec_rollout() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("on")),
+            ],
+            || assert!(!non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
+        );
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE, Some("true")),
+                (crate::set_disk::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("off")),
+            ],
+            || assert!(non_inline_data_read_early_stop_allowed(true, "bucket", "object")),
+        );
     }
 
     #[test]

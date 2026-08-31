@@ -609,7 +609,21 @@ impl SetDisks {
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
 
-        Ok(GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks))
+        if !metadata_fanout_complete
+            && allow_early_stop
+            && read_data
+            && super::is_get_metadata_non_inline_data_read_early_stop_enabled()
+            && non_inline_data_read_candidate_is_safe(&fi)
+        {
+            Ok(GetObjectFileInfo::owned_with_late_metadata_fanout(
+                fi,
+                parts_metadata,
+                op_online_disks,
+                disks,
+            ))
+        } else {
+            Ok(GetObjectFileInfo::owned(fi, parts_metadata, op_online_disks))
+        }
     }
 
     #[hotpath::measure(impl_type = "SetDisks")]
@@ -805,7 +819,6 @@ impl SetDisks {
     #[allow(clippy::too_many_arguments)]
     #[hotpath::measure(impl_type = "SetDisks")]
     pub(super) async fn get_object_with_fileinfo<W>(
-        // &self,
         bucket: &str,
         object: &str,
         erasure_cache: Arc<ErasureCache>,
@@ -1758,6 +1771,78 @@ fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool 
     policy.allows_multipart_setup_prefetch() && is_multipart_reader_setup_prefetch_enabled()
 }
 
+fn late_metadata_read_identity_matches(expected: &FileInfo, actual: &FileInfo) -> bool {
+    expected.volume == actual.volume
+        && expected.name == actual.name
+        && expected.erasure.algorithm == actual.erasure.algorithm
+        && expected.erasure.block_size == actual.erasure.block_size
+        && expected.uses_legacy_checksum == actual.uses_legacy_checksum
+        && SetDisks::file_info_quorum_hash(expected) == SetDisks::file_info_quorum_hash(actual)
+}
+
+fn late_metadata_shard_matches(expected: &FileInfo, actual: &FileInfo, disk_index: usize) -> bool {
+    expected
+        .erasure
+        .distribution
+        .get(disk_index)
+        .is_some_and(|mapped_index| *mapped_index == actual.erasure.index)
+        && late_metadata_read_identity_matches(expected, actual)
+}
+
+impl SetDisks {
+    pub(super) async fn refresh_late_metadata_fanout(
+        fallback_disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        expected: &FileInfo,
+        metrics_path: &'static str,
+    ) -> Result<(Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+        let (mut parts_metadata, errs, diagnostics) = SetDisks::read_all_fileinfo_observed(
+            fallback_disks,
+            "",
+            bucket,
+            object,
+            "",
+            true,
+            false,
+            false,
+            false,
+            expected.erasure.parity_blocks,
+        )
+        .await?;
+        diagnostics.record(metrics_path);
+
+        let (read_quorum, write_quorum) =
+            SetDisks::object_quorum_from_meta(&parts_metadata, &errs, expected.erasure.parity_blocks)
+                .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
+        let read_quorum =
+            usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
+        let write_quorum = usize::try_from(write_quorum)
+            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
+        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+            return Err(to_object_err(err.into(), vec![bucket, object]));
+        }
+
+        let (mut online_disks, full_fi, _) =
+            SetDisks::select_valid_fileinfo(fallback_disks, &parts_metadata, &errs, "", read_quorum, write_quorum)?;
+        if !late_metadata_read_identity_matches(expected, &full_fi) {
+            return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
+        }
+
+        for (disk_index, (metadata, disk)) in parts_metadata.iter_mut().zip(online_disks.iter_mut()).enumerate() {
+            if !late_metadata_shard_matches(expected, metadata, disk_index) {
+                *metadata = FileInfo::default();
+                *disk = None;
+            }
+        }
+        if online_disks.iter().filter(|disk| disk.is_some()).count() < read_quorum {
+            return Err(to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]));
+        }
+
+        Ok((parts_metadata, online_disks))
+    }
+}
+
 /// Run one part's bitrot reader setup and measure its wall-clock duration.
 ///
 /// Shared by the synchronous path and the prefetch task in
@@ -2327,6 +2412,35 @@ mod metadata_cache_tests {
         fi.metadata.insert("etag".to_string(), "etag-1".to_string());
         fi.add_object_part(1, "part-etag".to_string(), 1, fi.mod_time, 1, None, None);
         fi
+    }
+
+    #[test]
+    fn late_metadata_shard_identity_ignores_replication_state_but_rejects_data_mismatch() {
+        let expected = valid_test_fileinfo("object");
+        let disk_index = expected
+            .erasure
+            .distribution
+            .iter()
+            .position(|mapped_index| *mapped_index == expected.erasure.index)
+            .expect("test shard index should be present in the distribution");
+        let mut replication_only = expected.clone();
+        replication_only.metadata.insert(
+            format!(
+                "{}{}",
+                rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+                rustfs_utils::http::SUFFIX_REPLICATION_STATUS
+            ),
+            "COMPLETED".to_string(),
+        );
+        assert!(late_metadata_shard_matches(&expected, &replication_only, disk_index));
+
+        let mut wrong_data_dir = expected.clone();
+        wrong_data_dir.data_dir = Some(Uuid::new_v4());
+        assert!(!late_metadata_shard_matches(&expected, &wrong_data_dir, disk_index));
+
+        let mut wrong_shard = expected.clone();
+        wrong_shard.erasure.index = 2;
+        assert!(!late_metadata_shard_matches(&expected, &wrong_shard, disk_index));
     }
 
     #[tokio::test]
