@@ -20,8 +20,8 @@ use time::OffsetDateTime;
 
 mod ecstore_bucket {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, quota, replication, target, utils,
-        versioning, versioning_sys,
+        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, object_lock, quota, replication, target,
+        utils, versioning, versioning_sys,
     };
 }
 
@@ -182,6 +182,16 @@ pub(crate) trait AdminVersioningConfigExt {
 impl AdminVersioningConfigExt for s3s::dto::VersioningConfiguration {
     fn enabled(&self) -> bool {
         <s3s::dto::VersioningConfiguration as ecstore_bucket::versioning::VersioningApi>::enabled(self)
+    }
+}
+
+pub(crate) trait AdminObjectLockConfigExt {
+    fn enabled(&self) -> bool;
+}
+
+impl AdminObjectLockConfigExt for s3s::dto::ObjectLockConfiguration {
+    fn enabled(&self) -> bool {
+        <s3s::dto::ObjectLockConfiguration as ecstore_bucket::object_lock::ObjectLockApi>::enabled(self)
     }
 }
 
@@ -863,7 +873,9 @@ pub(crate) mod bucket {
     pub(crate) use super::replication;
     pub(crate) use super::target;
     pub(crate) use super::versioning_sys;
-    pub(crate) use super::{AdminReplicationConfigExt, AdminVersioningConfigExt, is_reserved_or_invalid_bucket};
+    pub(crate) use super::{
+        AdminObjectLockConfigExt, AdminReplicationConfigExt, AdminVersioningConfigExt, is_reserved_or_invalid_bucket,
+    };
 
     pub(crate) mod utils {
         pub(crate) use super::super::ecstore_utils::{deserialize, is_valid_object_prefix, serialize};
