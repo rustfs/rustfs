@@ -273,6 +273,12 @@ pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
             Some(epoch) if epoch == claimed_epoch => return Ok(()),
             Some(_) | None => {}
         }
+        // A validated pre-marker legacy baseline needs an explicit complete
+        // identity before acquiring an epoch. Otherwise the v2 reader would
+        // reject the fenced value on its next startup.
+        if !usage.usage_snapshot_bootstrap_pending {
+            usage.usage_snapshot_complete = true;
+        }
         usage.scanner_epoch = Some(claimed_epoch);
         let data = serde_json::to_vec(&usage)
             .map_err(|err| ScannerError::Other(format!("failed to encode scanner usage epoch fence: {err}")))?;
