@@ -548,12 +548,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn s2_decompress_reader_accepts_legacy_block_above_writer_limit() {
-        let plaintext = vec![b'x'; MAX_S2_DECOMPRESSED_BLOCK_SIZE + 1];
+    async fn s2_decompress_reader_accepts_legacy_block_above_16_mib() {
+        const PRE_CAP_LEGACY_BLOCK_SIZE: usize = (16 << 20) + 1;
+        let plaintext = vec![b'x'; PRE_CAP_LEGACY_BLOCK_SIZE];
         let mut encoder = S2BlockEncoder::new();
         let mut fixture = MAGIC_CHUNK.to_vec();
         fixture.extend_from_slice(
-            &build_s2_chunk(&plaintext, &mut encoder).expect("the pre-cap writer format should encode a block just above 4 MiB"),
+            &build_s2_chunk(&plaintext, &mut encoder).expect("the pre-cap writer format should encode a block above 16 MiB"),
         );
         assert_eq!(fixture[MAGIC_CHUNK.len()], CHUNK_TYPE_COMPRESSED_DATA);
 

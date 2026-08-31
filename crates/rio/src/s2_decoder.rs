@@ -14,7 +14,7 @@
 
 //! Bounded asynchronous decoder for the S2/Snappy framed stream format.
 
-use minlz::{crc::crc, decode, decode_into, decode_len};
+use minlz::{MAX_DECODE_DST_SIZE, crc::crc, decode, decode_into, decode_len};
 use pin_project_lite::pin_project;
 use std::cmp::min;
 use std::io;
@@ -35,7 +35,7 @@ const MAX_CHUNKS_PER_POLL: usize = 64;
 const MAX_INPUT_BYTES_PER_POLL: usize = 256 * 1024;
 const MAX_SNAPPY_DECOMPRESSED_BLOCK_SIZE: usize = 64 << 10;
 const MAX_FRAMED_CHUNK_SIZE: usize = (1 << 24) - 1;
-const MAX_LEGACY_S2_DECOMPRESSED_BLOCK_SIZE: usize = 1 << 24;
+const MAX_LEGACY_S2_DECOMPRESSED_BLOCK_SIZE: usize = MAX_DECODE_DST_SIZE;
 
 // This is checksum size + klauspost/s2 MaxEncodedLen(4 MiB).
 // MaxEncodedLen adds a four-byte varint and four-byte literal header. The Go
@@ -123,9 +123,12 @@ impl<R> S2Decoder<R> {
     /// Create a bounded decoder for rio-v2 data written before its block-size
     /// API was capped at 4 MiB.
     ///
-    /// This compatibility mode accepts decoded S2 blocks up to 16 MiB and an
-    /// encoded chunk up to the format's 24-bit framing limit. New streams and
-    /// general S2 consumers should use the stricter constructors above.
+    /// This compatibility mode accepts decoded S2 blocks up to the block
+    /// decoder's 256 MiB safety cap and an encoded chunk up to the format's
+    /// 24-bit framing limit. That preserves streams written through rio-v2's
+    /// former uncapped block-size API without restoring unbounded allocation.
+    /// New streams and general S2 consumers should use the stricter
+    /// constructors above.
     pub fn new_at_legacy_chunk_boundary(inner: R) -> Self {
         Self::with_limits(
             inner,
@@ -712,7 +715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_chunk_boundary_mode_rejects_blocks_above_compatibility_limit() {
+    async fn legacy_chunk_boundary_mode_rejects_blocks_above_decoder_safety_limit() {
         let mut chunk = vec![0u8; CHECKSUM_SIZE];
         append_uvarint(&mut chunk, MAX_LEGACY_S2_DECOMPRESSED_BLOCK_SIZE + 1);
         let mut fixture = Vec::new();
@@ -726,7 +729,7 @@ mod tests {
             .expect_err("legacy compatibility must remain bounded before allocation");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("limit=16777216"));
+        assert!(err.to_string().contains(&format!("limit={MAX_DECODE_DST_SIZE}")));
         assert!(output.is_empty());
     }
 
