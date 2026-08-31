@@ -41,22 +41,22 @@ use super::super::ENV_RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE;
 #[cfg(test)]
 use super::super::get_metadata_slowtail_fault_delay;
 use super::super::{
-    Bytes, CHECK_PART_DISK_NOT_FOUND, DeleteOptions, DiskError, DiskStore, EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
-    EVENT_SET_DISK_WRITE, Error, FileInfo, FileMeta, FileMetaShallowVersion, GetCodecStreamingFallbackReason,
-    GetObjectMetadataCacheEntry, HTTPPreconditions, HashAlgorithm, HealAdmissionResult, HealChannelPriority, HealRequestSource,
-    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, MultipartWriteQuorumContext, OBJECT_OP_IGNORED_ERRS, ObjectOptions,
-    ObjectPartInfo, OffsetDateTime, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RawFileInfo, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, Result, SLASH_SEPARATOR, STORAGE_FORMAT_FILE, SetDisks, SnapshotLeaseToken, StorageError,
-    UpdateMetadataOpts, Uuid, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
-    capacity_scope_from_disks, codec_streaming_rollout_applies, coding, collect_inline_data_shard_fileinfos_by_index_or_reason,
-    current_dirty_generation, debug, disk, file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info,
-    inline_erasure_shard_file_offset, inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found,
-    is_get_metadata_data_read_early_stop_enabled, is_get_metadata_early_stop_bounded_fanout_enabled,
-    is_get_metadata_early_stop_enabled, is_get_metadata_non_inline_data_read_early_stop_enabled, is_object_dangling,
-    is_version_early_stop_enabled, issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure,
-    merge_file_meta_versions, object_fits_single_block, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs,
-    reduce_write_quorum_errs, send_heal_request_with_admission, should_prevent_write, to_object_err,
-    try_read_inline_data_shards_direct, warn,
+    Bytes, CHECK_PART_DISK_NOT_FOUND, DeleteOptions, DiskError, DiskStore, EVENT_SET_DISK_ORPHAN_PURGE_SKIPPED,
+    EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED, EVENT_SET_DISK_WRITE, Error, FileInfo, FileMeta, FileMetaShallowVersion,
+    GetCodecStreamingFallbackReason, GetObjectMetadataCacheEntry, HTTPPreconditions, HashAlgorithm, HealAdmissionResult,
+    HealChannelPriority, HealRequestSource, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, MultipartWriteQuorumContext,
+    OBJECT_OP_IGNORED_ERRS, ObjectOptions, ObjectPartInfo, OffsetDateTime, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET,
+    RawFileInfo, ReadMultipleReq, ReadMultipleResp, ReadOptions, Result, SLASH_SEPARATOR, STORAGE_FORMAT_FILE, SetDisks,
+    SnapshotLeaseToken, StorageError, UpdateMetadataOpts, Uuid, build_inline_bitrot_readers_from_refs,
+    can_try_inline_data_shards_direct, capacity_scope_from_disks, codec_streaming_rollout_applies, coding,
+    collect_inline_data_shard_fileinfos_by_index_or_reason, current_dirty_generation, debug, disk,
+    file_info_is_valid_for_metadata, get_metadata_slowtail_fault_request, info, inline_erasure_shard_file_offset,
+    inline_erasure_shard_size, is_err_object_not_found, is_err_version_not_found, is_get_metadata_data_read_early_stop_enabled,
+    is_get_metadata_early_stop_bounded_fanout_enabled, is_get_metadata_early_stop_enabled,
+    is_get_metadata_non_inline_data_read_early_stop_enabled, is_object_dangling, is_version_early_stop_enabled,
+    issue3031_diag_enabled, join_all, join_errs, log_multipart_write_quorum_failure, merge_file_meta_versions,
+    object_fits_single_block, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    send_heal_request_with_admission, should_prevent_write, to_object_err, try_read_inline_data_shards_direct, warn,
 };
 #[cfg(test)]
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
@@ -3733,14 +3733,32 @@ fn dangling_delete_grace() -> time::Duration {
 /// Result of scanning one disk's copy of a directory prefix while deciding
 /// whether an orphan (metadata-less) directory tree can be safely purged.
 enum OrphanDirScan {
-    /// The subtree holds at least one regular file (object metadata or data), so
-    /// it is a real object and must not be purged.
+    /// The subtree holds object metadata or uncommitted data, so it must not be
+    /// purged.
     HasData,
-    /// The prefix exists on this disk and contains only nested empty directories.
-    /// Carries every directory path in pre-order (parents before children).
-    Empty(Vec<String>),
+    /// The prefix contains only empty directories and/or UUID data directories
+    /// carrying a committed delete marker.
+    Purgeable {
+        empty_dirs: Vec<String>,
+        committed_files: Vec<String>,
+    },
     /// The prefix does not exist on this disk.
     Missing,
+}
+
+fn is_safe_orphan_dir_entry(entry: &str) -> bool {
+    let component = entry.strip_suffix(SLASH_SEPARATOR).unwrap_or(entry);
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.contains(SLASH_SEPARATOR)
+        && !component.contains('\\')
+}
+
+fn is_committed_delete_marker(entry: &str) -> bool {
+    entry
+        .strip_prefix(DELETE_DATA_DIR_MARKER_PREFIX)
+        .is_some_and(|transaction| Uuid::parse_str(transaction).is_ok_and(|uuid| !uuid.is_nil()))
 }
 
 /// Outcome of a *post-quorum* `rename_data` commit, classifying whether the
@@ -6125,52 +6143,151 @@ impl SetDisks {
     }
 
     /// Scan a single disk's copy of `prefix` and decide whether it is an orphan
-    /// (metadata-less) directory subtree. Walks the tree iteratively and returns
-    /// [`OrphanDirScan::HasData`] as soon as any regular file is found.
+    /// directory subtree. Only empty directories and UUID data directories with
+    /// valid committed delete markers are purgeable; every child is still scanned.
     async fn scan_orphan_dir(disk: &DiskStore, bucket: &str, prefix: &str) -> OrphanDirScan {
         let root = prefix.trim_end_matches(SLASH_SEPARATOR).to_string();
         let mut stack = vec![root.clone()];
         // Pre-order list of directories (a parent always precedes its descendants),
         // so reversing it yields a safe children-first removal order.
         let mut dirs: Vec<String> = Vec::new();
+        let mut committed_files: Vec<String> = Vec::new();
         let mut existed = false;
 
         while let Some(dir) = stack.pop() {
             let entries = match disk.list_dir("", bucket, &dir, 0).await {
                 Ok(entries) => entries,
-                Err(_) => {
-                    // The root missing (or never existing) means there is nothing to
-                    // purge on this disk. A nested directory vanishing mid-scan is a
-                    // benign race, so skip it and keep walking.
+                Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => {
                     if dir == root {
                         return OrphanDirScan::Missing;
                     }
+                    // A nested directory vanishing mid-scan is a benign race.
                     continue;
                 }
+                // Classification must fail closed: committed residue is safe to
+                // remove only after every reachable child was inspected.
+                Err(_) => return OrphanDirScan::HasData,
             };
 
             existed = true;
-            dirs.push(dir.clone());
+            let mut child_dirs = Vec::new();
+            let mut files = Vec::new();
 
             for entry in entries {
+                if !is_safe_orphan_dir_entry(&entry) {
+                    return OrphanDirScan::HasData;
+                }
                 match entry.strip_suffix(SLASH_SEPARATOR) {
-                    // `read_dir` marks directories with a trailing slash; anything else
-                    // is a regular file, which means real object data lives here.
-                    Some(child) => stack.push(format!("{dir}{SLASH_SEPARATOR}{child}")),
-                    None => return OrphanDirScan::HasData,
+                    Some(child) => child_dirs.push(format!("{dir}{SLASH_SEPARATOR}{child}")),
+                    None => files.push(entry),
                 }
             }
+
+            if !files.is_empty() {
+                let data_dir_name = dir.rsplit(SLASH_SEPARATOR).next().unwrap_or_default();
+                let is_uuid_data_dir = Uuid::parse_str(data_dir_name).is_ok_and(|uuid| !uuid.is_nil());
+                let has_committed_delete = files.iter().any(|entry| is_committed_delete_marker(entry));
+
+                if !is_uuid_data_dir || !has_committed_delete || files.iter().any(|entry| entry == STORAGE_FORMAT_FILE) {
+                    return OrphanDirScan::HasData;
+                }
+
+                committed_files.extend(files.into_iter().map(|entry| path_join_buf(&[&dir, &entry])));
+                dirs.push(dir);
+                stack.extend(child_dirs);
+                continue;
+            }
+
+            dirs.push(dir);
+            stack.extend(child_dirs);
         }
 
         if existed {
-            OrphanDirScan::Empty(dirs)
+            OrphanDirScan::Purgeable {
+                empty_dirs: dirs,
+                committed_files,
+            }
         } else {
             OrphanDirScan::Missing
         }
     }
 
+    async fn delete_purgeable_orphan_entries(
+        disk: &DiskStore,
+        bucket: &str,
+        object: &str,
+        mut empty_dirs: Vec<String>,
+        committed_files: Vec<String>,
+    ) {
+        // Keep every committed marker until all ordinary residue files are gone.
+        // If any delete fails, a later request can still recognize and retry the
+        // committed cleanup instead of stranding an unmarked partial residue.
+        for delete_markers in [false, true] {
+            for file in &committed_files {
+                let is_marker = file.rsplit(SLASH_SEPARATOR).next().is_some_and(is_committed_delete_marker);
+                if is_marker != delete_markers {
+                    continue;
+                }
+                if let Err(err) = disk
+                    .delete(
+                        bucket,
+                        file,
+                        DeleteOptions {
+                            recursive: false,
+                            immediate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    debug!(
+                        event = EVENT_SET_DISK_ORPHAN_PURGE_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        bucket,
+                        object,
+                        path = file,
+                        error = ?err,
+                        "Orphan prefix purge skipped"
+                    );
+                    return;
+                }
+            }
+        }
+        empty_dirs.reverse();
+        for dir in empty_dirs {
+            if let Err(err) = disk
+                .delete(
+                    bucket,
+                    &dir,
+                    DeleteOptions {
+                        recursive: false,
+                        immediate: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                // Best effort: a sibling removal may have already cleared a shared
+                // parent, or a concurrent writer repopulated the directory. Neither
+                // is fatal to purging the orphan tree.
+                debug!(
+                    event = EVENT_SET_DISK_ORPHAN_PURGE_SKIPPED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    path = dir,
+                    error = ?err,
+                    "Orphan prefix purge skipped"
+                );
+            }
+        }
+    }
+
     /// Purge an orphan directory prefix — a trailing-slash key that exists on disk
-    /// as an empty directory tree with no object metadata on any disk of this set.
+    /// as empty directories or committed delete residue, with no object metadata
+    /// or uncommitted data on any disk of this set.
     /// Such prefixes are listable (see `scan_dir`) yet are not real objects, so the
     /// normal delete path returns NotFound and leaves them stranded (issue #4189).
     ///
@@ -6187,15 +6304,18 @@ impl SetDisks {
         // Phase 1: classify every online disk. Refuse to purge if ANY disk holds
         // object data under the prefix, so a degraded/healable object is never
         // destroyed.
-        let mut per_disk_dirs: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut per_disk_dirs: Vec<(usize, Vec<String>, Vec<String>)> = Vec::new();
         let mut existed = false;
         for (i, disk) in disks.iter().enumerate() {
             let Some(disk) = disk else { continue };
             match Self::scan_orphan_dir(disk, bucket, object).await {
                 OrphanDirScan::HasData => return Ok(false),
-                OrphanDirScan::Empty(dirs) => {
+                OrphanDirScan::Purgeable {
+                    empty_dirs,
+                    committed_files,
+                } => {
                     existed = true;
-                    per_disk_dirs.push((i, dirs));
+                    per_disk_dirs.push((i, empty_dirs, committed_files));
                 }
                 OrphanDirScan::Missing => {}
             }
@@ -6205,32 +6325,14 @@ impl SetDisks {
             return Ok(false);
         }
 
-        // Phase 2: remove the empty directories children-first on each disk. A
-        // non-recursive delete performs an empty-only `rmdir`, so a directory that
-        // concurrently gained an object fails with DirectoryNotEmpty and is skipped —
-        // a racing PutObject is never clobbered.
-        for (i, mut dirs) in per_disk_dirs {
+        // Phase 2: remove only the files classified as committed residue, then
+        // remove directories children-first. Every directory delete is
+        // non-recursive, so a directory that concurrently gained an object fails
+        // with DirectoryNotEmpty and is skipped — a racing PutObject is never
+        // clobbered.
+        for (i, empty_dirs, committed_files) in per_disk_dirs {
             let Some(disk) = disks[i].as_ref() else { continue };
-            dirs.reverse();
-            for dir in dirs {
-                if let Err(err) = disk
-                    .delete(
-                        bucket,
-                        &dir,
-                        DeleteOptions {
-                            recursive: false,
-                            immediate: true,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    // Best effort: a sibling removal may have already cleared a shared
-                    // parent, or a concurrent writer repopulated the directory. Neither
-                    // is fatal to purging the orphan tree.
-                    debug!(bucket, object, dir, error = ?err, "purge_orphan_dir_object: skipped non-empty/absent directory");
-                }
-            }
+            Self::delete_purgeable_orphan_entries(disk, bucket, object, empty_dirs, committed_files).await;
         }
 
         Ok(true)
@@ -7050,6 +7152,16 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     #[test]
+    fn orphan_dir_entries_must_be_single_relative_components() {
+        for entry in ["part.1", "child/", "delete-data.00000000-0000-0000-0000-000000000001"] {
+            assert!(is_safe_orphan_dir_entry(entry), "{entry:?} should be accepted");
+        }
+        for entry in ["", "/", ".", "..", "../", "child//", "a/b", r"a\b", "./"] {
+            assert!(!is_safe_orphan_dir_entry(entry), "{entry:?} should be rejected");
+        }
+    }
+
+    #[test]
     #[serial_test::serial(codec_streaming_env)]
     fn non_inline_early_stop_is_mutually_exclusive_with_codec_rollout() {
         temp_env::with_vars(
@@ -7225,6 +7337,96 @@ mod tests {
         }
 
         (dir, disk)
+    }
+
+    #[tokio::test]
+    async fn orphan_cleanup_preserves_object_published_after_scan() {
+        let (dir, disk) = read_multiple_test_disk("bucket", &[]).await;
+        let transaction = Uuid::new_v4();
+        let residue = dir
+            .path()
+            .join("bucket")
+            .join("pfx")
+            .join("object")
+            .join(Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&residue)
+            .await
+            .expect("committed data directory should be created");
+        tokio::fs::write(residue.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        tokio::fs::write(residue.join(format!("{DELETE_DATA_DIR_MARKER_PREFIX}{transaction}")), [])
+            .await
+            .expect("committed delete marker should be written");
+
+        let OrphanDirScan::Purgeable {
+            empty_dirs,
+            committed_files,
+        } = SetDisks::scan_orphan_dir(&disk, "bucket", "pfx/").await
+        else {
+            panic!("committed residue should be classified as purgeable");
+        };
+
+        let nested_object = residue.join("nested");
+        tokio::fs::create_dir_all(&nested_object)
+            .await
+            .expect("concurrent object directory should be created");
+        tokio::fs::write(nested_object.join(STORAGE_FORMAT_FILE), b"new metadata")
+            .await
+            .expect("concurrent object metadata should be written");
+
+        SetDisks::delete_purgeable_orphan_entries(&disk, "bucket", "pfx/", empty_dirs, committed_files).await;
+
+        assert!(
+            nested_object.join(STORAGE_FORMAT_FILE).exists(),
+            "an object published after classification must survive cleanup"
+        );
+        assert!(!residue.join("part.1").exists(), "classified stale data should be reclaimed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orphan_cleanup_keeps_commit_marker_when_residue_delete_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, disk) = read_multiple_test_disk("bucket", &[]).await;
+        let marker_name = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4());
+        let residue = dir
+            .path()
+            .join("bucket")
+            .join("pfx")
+            .join("object")
+            .join(Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&residue)
+            .await
+            .expect("committed data directory should be created");
+        tokio::fs::write(residue.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        tokio::fs::write(residue.join(&marker_name), [])
+            .await
+            .expect("committed delete marker should be written");
+
+        let OrphanDirScan::Purgeable {
+            empty_dirs,
+            committed_files,
+        } = SetDisks::scan_orphan_dir(&disk, "bucket", "pfx/").await
+        else {
+            panic!("committed residue should be classified as purgeable");
+        };
+        tokio::fs::set_permissions(&residue, std::fs::Permissions::from_mode(0o555))
+            .await
+            .expect("residue directory should become read-only");
+
+        SetDisks::delete_purgeable_orphan_entries(&disk, "bucket", "pfx/", empty_dirs, committed_files).await;
+
+        let part_remains = residue.join("part.1").exists();
+        let marker_remains = residue.join(marker_name).exists();
+        tokio::fs::set_permissions(&residue, std::fs::Permissions::from_mode(0o755))
+            .await
+            .expect("residue directory permissions should be restored");
+        assert!(part_remains, "the injected residue delete failure should retain the part");
+        assert!(marker_remains, "the commit marker must remain so a later cleanup can retry");
     }
 
     async fn io_primitives_test_set(disks: Vec<Option<DiskStore>>, default_parity_count: usize) -> Arc<SetDisks> {
