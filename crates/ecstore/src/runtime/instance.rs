@@ -368,6 +368,19 @@ impl InstanceContext {
         Arc::clone(&self.data_movement_generation_notify)
     }
 
+    pub(crate) fn observe_durable_data_movement_generation(&self, generation: u64) {
+        if generation == 0 || self.data_movement_generation_exhausted.load(Ordering::Acquire) {
+            return;
+        }
+        let previous = self.data_movement_generation.fetch_max(generation, Ordering::AcqRel);
+        if generation == u64::MAX {
+            self.data_movement_generation_exhausted.store(true, Ordering::Release);
+        }
+        if generation > previous {
+            self.data_movement_generation_notify.notify_waiters();
+        }
+    }
+
     pub(crate) fn scanner_publication_state_allowed(&self) -> bool {
         !self.data_movement_operation_epoch_exhausted()
             && !self.data_movement_generation_exhausted()
@@ -386,6 +399,20 @@ impl InstanceContext {
     }
 
     pub(crate) fn advance_data_movement_operation_epoch(&self) -> u64 {
+        let (previous, result) = self.advance_data_movement_operation_epoch_only();
+        if result != previous {
+            let _ = self.advance_data_movement_generation();
+        }
+        result
+    }
+
+    pub(crate) fn advance_data_movement_operation_epoch_to_durable_generation(&self, generation: u64) -> u64 {
+        let (_, result) = self.advance_data_movement_operation_epoch_only();
+        self.observe_durable_data_movement_generation(generation);
+        result
+    }
+
+    fn advance_data_movement_operation_epoch_only(&self) -> (u64, u64) {
         self.scanner_publication_state
             .store(SCANNER_PUBLICATION_STATE_UNKNOWN, Ordering::Release);
         let previous = self.data_movement_operation_epoch.load(Ordering::Acquire);
@@ -396,10 +423,7 @@ impl InstanceContext {
         if result == u64::MAX {
             self.data_movement_operation_epoch_exhausted.store(true, Ordering::Release);
         }
-        if result != previous {
-            let _ = self.advance_data_movement_generation();
-        }
-        result
+        (previous, result)
     }
 
     /// Advance the movement generation after a durable movement transition.

@@ -161,6 +161,7 @@ impl ECStore {
 
         let cancel_tx = CancellationToken::new();
         let rx = cancel_tx.clone();
+        let activation_at = self.next_scanner_data_movement_update(OffsetDateTime::now_utc()).await;
         let activation_outcome;
         let candidate;
         let expected_cancel;
@@ -185,12 +186,8 @@ impl ECStore {
                 return Ok(false);
             }
             expected_cancel = meta.cancel.clone();
-            (candidate, activation_outcome, must_persist) = stage_local_rebalance_worker_activation(
-                meta,
-                expected_id.as_ref(),
-                cancel_tx.clone(),
-                OffsetDateTime::now_utc(),
-            )?;
+            (candidate, activation_outcome, must_persist) =
+                stage_local_rebalance_worker_activation(meta, expected_id.as_ref(), cancel_tx.clone(), activation_at)?;
             if let Err(err) = activation_fence.ensure_held() {
                 cancel_tx.cancel();
                 return Err(err);
@@ -384,11 +381,11 @@ impl ECStore {
                 tokio::select! {
                     result = done_rx.recv() => {
                         quit = true;
-                        let now = OffsetDateTime::now_utc();
-                        let terminal_event = classify_rebalance_terminal_event(result, now);
-                        msg = terminal_event.message().to_string();
                         let movement_gate = store.ctx.data_movement_operation_gate();
                         let movement_guard = movement_gate.write().await;
+                        let terminal_at = store.next_scanner_data_movement_update(OffsetDateTime::now_utc()).await;
+                        let terminal_event = classify_rebalance_terminal_event(result, terminal_at);
+                        msg = terminal_event.message().to_string();
                         let previous_meta = store.rebalance_meta.read().await.clone();
                         let terminal_state_present = {
                             let mut rebalance_meta = store.rebalance_meta.write().await;
@@ -405,7 +402,7 @@ impl ECStore {
                                     {
                                         pool_stat.info.stopping = false;
                                         pool_stat.info.status = RebalStatus::Failed;
-                                        pool_stat.info.end_time = Some(now);
+                                        pool_stat.info.end_time = Some(terminal_at);
                                         pool_stat.info.last_error = Some(
                                             pool_stat
                                                 .cleanup_warnings
@@ -433,7 +430,7 @@ impl ECStore {
                                             &mut pool_stat.info.end_time,
                                             &mut pool_stat.info.last_error,
                                             terminal_event,
-                                            now,
+                                            terminal_at,
                                         );
                                     }
                                     true
@@ -835,6 +832,10 @@ impl ECStore {
         opt: RebalSaveOpt,
         expected_id: Option<&str>,
     ) -> Result<()> {
+        let now = match opt {
+            RebalSaveOpt::Stats => OffsetDateTime::now_utc(),
+            RebalSaveOpt::StoppedAt => self.next_scanner_data_movement_update(OffsetDateTime::now_utc()).await,
+        };
         let meta_to_save = {
             let mut rebalance_meta = self.rebalance_meta.write().await;
             if let Some(expected_id) = expected_id {
@@ -844,7 +845,6 @@ impl ECStore {
                 return Ok(());
             };
 
-            let now = OffsetDateTime::now_utc();
             apply_rebalance_save_option(meta, pool_idx, opt, now);
             meta.clone()
         };
