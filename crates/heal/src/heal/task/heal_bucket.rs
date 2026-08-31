@@ -16,6 +16,22 @@ use super::*;
 use crate::heal::progress::{add_bytes, increment_counter, stable_generation};
 use crate::heal::utils::format_set_disk_id;
 
+fn unavailable_recreate_error(result: &HealResultItem, opts: &HealOpts) -> Option<Error> {
+    if opts.dry_run || !opts.recreate {
+        return None;
+    }
+
+    let mut offline = false;
+    for drive in &result.after.drives {
+        if drive.state == DriveState::Faulty.to_str() {
+            return Some(Error::Disk(DiskError::FaultyDisk));
+        }
+        offline |= drive.state == DriveState::Offline.to_str();
+    }
+
+    offline.then_some(Error::Disk(DiskError::DiskNotFound))
+}
+
 impl HealTask {
     pub(super) async fn heal_bucket(&self, bucket: &str) -> Result<()> {
         debug!(
@@ -335,13 +351,16 @@ impl HealTask {
                             )
                             .await
                         {
-                            Ok((result, None)) => {
-                                telemetry_unknown |= !increment_counter(&mut healed);
-                                telemetry_unknown |=
-                                    !add_bytes(&mut bytes, u64::try_from(result.object_size).unwrap_or(u64::MAX));
-                                self.record_result_item(result).await;
-                                None
-                            }
+                            Ok((result, None)) => match unavailable_recreate_error(&result, &heal_opts) {
+                                Some(error) => Some(error),
+                                None => {
+                                    telemetry_unknown |= !increment_counter(&mut healed);
+                                    telemetry_unknown |=
+                                        !add_bytes(&mut bytes, u64::try_from(result.object_size).unwrap_or(u64::MAX));
+                                    self.record_result_item(result).await;
+                                    None
+                                }
+                            },
                             Ok((_, Some(err))) if is_missing_object_dir_heal_result(object, &err) => {
                                 telemetry_unknown |= !increment_counter(&mut healed);
                                 debug!(
