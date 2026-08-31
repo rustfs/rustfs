@@ -182,6 +182,10 @@ fn object_s3_error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'stati
     S3Error::with_message(code, message)
 }
 
+fn object_s3_error_default(code: S3ErrorCode) -> S3Error {
+    S3Error::new(code)
+}
+
 mod copy;
 mod delete;
 mod extract;

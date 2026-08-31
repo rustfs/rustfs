@@ -350,7 +350,7 @@ pub(crate) mod s3_api_consumer {
     }
 
     pub(crate) mod tagging {
-        pub(crate) use super::super::super::s3_api::tagging::resolve_copy_object_tags;
+        pub(crate) use super::super::super::s3_api::tagging::{parse_copy_object_tags, resolve_copy_object_tags};
     }
 }
 

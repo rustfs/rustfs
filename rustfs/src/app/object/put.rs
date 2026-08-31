@@ -958,11 +958,9 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
         // An authorized inbound replication PUT must store the replica verbatim.
-        // A snowball-extracted member object keeps `x-amz-meta-snowball-auto-extract`
-        // in its user metadata, and the replication client replays stored metadata
-        // as headers — re-dispatching that PUT into the extract path would try to
-        // untar the member's own bytes (failing replication for any non-archive
-        // member) instead of writing the replica.
+        // Legacy snowball-extracted members may still carry the auto-extract
+        // metadata, which replication replays as a header. Do not interpret that
+        // historical user metadata as a request to untar the member again.
         let inbound_replication_put = replication_request_authorized(&req)
             && get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
         if max_content_length.is_some() && is_put_object_extract_requested(&req.headers) {

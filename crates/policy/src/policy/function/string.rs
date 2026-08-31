@@ -287,7 +287,7 @@ mod tests {
     };
     use std::collections::HashMap;
 
-    use crate::policy::function::key_name::S3KeyName::{S3LocationConstraint, S3ObjectLockMode};
+    use crate::policy::function::key_name::S3KeyName::{S3LocationConstraint, S3ObjectLockLegalHold, S3ObjectLockMode};
     use test_case::test_case;
 
     fn new_func(name: KeyName, variable: Option<String>, values: Vec<&str>) -> StringFunc {
@@ -309,6 +309,7 @@ mod tests {
     #[test_case(r#"{"aws:username/value": ["johndoe", "aaa"]}"#, new_func(Aws(AWSUsername), Some("value".into()), vec!["johndoe", "aaa"]
     ))]
     #[test_case(r#"{"s3:object-lock-mode": "COMPLIANCE"}"#, new_func(S3(S3ObjectLockMode), None, vec!["COMPLIANCE"]))]
+    #[test_case(r#"{"s3:object-lock-legal-hold": "ON"}"#, new_func(S3(S3ObjectLockLegalHold), None, vec!["ON"]))]
     fn test_deser(input: &str, expect: StringFunc) -> Result<(), serde_json::Error> {
         let v: StringFunc = serde_json::from_str(input)?;
         assert_eq!(v, expect);

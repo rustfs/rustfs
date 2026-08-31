@@ -815,7 +815,15 @@ pub fn get_condition_values_with_query_and_client_info(
 /// `key`, either because the server already derived that key from verified state or
 /// because it is a well-known identity/context key that only the server may populate.
 fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<String>>) -> bool {
-    server_derived.contains_key(key) || is_server_derived_condition_key(key)
+    server_derived.contains_key(key)
+        || [
+            AMZ_OBJECT_LOCK_MODE_LOWER,
+            AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+            AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        ]
+        .iter()
+        .any(|header| key.eq_ignore_ascii_case(header.trim_start_matches("x-amz-")))
+        || is_server_derived_condition_key(key)
 }
 
 /// Get request authentication type
@@ -1670,15 +1678,35 @@ mod tests {
         let cred = create_test_credentials();
         let mut headers = HeaderMap::new();
         headers.insert(AMZ_OBJECT_LOCK_MODE_LOWER, HeaderValue::from_static("GOVERNANCE"));
+        headers.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, HeaderValue::from_static("OFF"));
         headers.insert(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, HeaderValue::from_static("2024-12-31T23:59:59Z"));
+        headers.insert("object-lock-mode", HeaderValue::from_static("COMPLIANCE"));
+        headers.insert("object-lock-legal-hold", HeaderValue::from_static("ON"));
+        headers.insert("object-lock-retain-until-date", HeaderValue::from_static("2099-12-31T23:59:59Z"));
 
         let conditions = get_condition_values(&headers, &cred, None, None, None);
 
         assert_eq!(conditions.get("object-lock-mode"), Some(&vec!["GOVERNANCE".to_string()]));
+        assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["OFF".to_string()]));
         assert_eq!(
             conditions.get("object-lock-retain-until-date"),
             Some(&vec!["2024-12-31T23:59:59Z".to_string()])
         );
+    }
+
+    #[test]
+    fn object_lock_condition_aliases_cannot_spoof_canonical_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("object-lock-mode", HeaderValue::from_static("COMPLIANCE"));
+        headers.insert("object-lock-legal-hold", HeaderValue::from_static("ON"));
+        headers.insert("object-lock-retain-until-date", HeaderValue::from_static("2099-12-31T23:59:59Z"));
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("object-lock-mode"), None);
+        assert_eq!(conditions.get("object-lock-legal-hold"), None);
+        assert_eq!(conditions.get("object-lock-retain-until-date"), None);
     }
 
     #[test]
