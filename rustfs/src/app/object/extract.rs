@@ -565,12 +565,12 @@ impl ExtractBatchState {
     }
 }
 
-struct ExtractPreparedMember {
+struct ExtractPreparedMember<R = ExtractStagedBody> {
     archive_seq: usize,
     key: String,
     size: i64,
     actual_size: i64,
-    body: ExtractStagedBody,
+    body: R,
     write_plan: WritePlan,
     opts: ObjectOptions,
     replication: ReplicateDecision,
@@ -697,20 +697,24 @@ async fn complete_extract_member_post_commit(
 
 async fn commit_extract_member_inner<R>(
     context: Arc<ExtractCommitContext>,
-    key: String,
-    size: i64,
-    actual_size: i64,
-    body: R,
-    write_plan: WritePlan,
-    opts: ObjectOptions,
-    replication: ReplicateDecision,
-    staging_permit: OwnedSemaphorePermit,
+    member: ExtractPreparedMember<R>,
     foreground_permit: Option<OwnedSemaphorePermit>,
-    member_permit: OwnedSemaphorePermit,
 ) -> Result<ExtractCommitSuccess, ExtractCommitError>
 where
     R: AsyncRead + Send + Sync + Unpin + 'static,
 {
+    let ExtractPreparedMember {
+        archive_seq: _,
+        key,
+        size,
+        actual_size,
+        body,
+        write_plan,
+        opts,
+        replication,
+        staging_permit,
+        member_permit,
+    } = member;
     let hrd = HashReader::from_stream(body, size, actual_size, None, None, false).map_err(ApiError::from)?;
     let hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
     let (hrd, member_read_failed) = track_extract_member_read_errors(hrd).map_err(ApiError::from)?;
@@ -744,24 +748,13 @@ where
     Ok(success)
 }
 
-async fn commit_extract_member<R>(
-    context: Arc<ExtractCommitContext>,
-    archive_seq: usize,
-    key: String,
-    size: i64,
-    actual_size: i64,
-    body: R,
-    write_plan: WritePlan,
-    opts: ObjectOptions,
-    replication: ReplicateDecision,
-    staging_permit: OwnedSemaphorePermit,
-    member_permit: OwnedSemaphorePermit,
-) -> ExtractCommitOutcome
+async fn commit_extract_member<R>(context: Arc<ExtractCommitContext>, member: ExtractPreparedMember<R>) -> ExtractCommitOutcome
 where
     R: AsyncRead + Send + Sync + Unpin + 'static,
 {
+    let archive_seq = member.archive_seq;
     let manager = get_concurrency_manager();
-    let foreground_permit = match manager.admit_snowball_foreground_write(actual_size).await {
+    let foreground_permit = match manager.admit_snowball_foreground_write(member.actual_size).await {
         Ok(ForegroundWriteAdmission::Disabled) => None,
         Ok(ForegroundWriteAdmission::Admitted(permit)) => Some(permit),
         Ok(ForegroundWriteAdmission::Rejected) => {
@@ -785,21 +778,7 @@ where
             };
         }
     };
-    match commit_extract_member_inner(
-        context,
-        key,
-        size,
-        actual_size,
-        body,
-        write_plan,
-        opts,
-        replication,
-        staging_permit,
-        foreground_permit,
-        member_permit,
-    )
-    .await
-    {
+    match commit_extract_member_inner(context, member, foreground_permit).await {
         Ok(success) => ExtractCommitOutcome {
             archive_seq,
             event: Some(success.event),
@@ -913,26 +892,11 @@ async fn flush_extract_batch(
         return Ok(());
     }
 
-    let members = batch.drain(..).collect::<Vec<_>>();
+    let members = batch.split_off(0);
     batch_state.clear();
     let commit_context = context.clone();
     run_extract_outcomes_owner(context.clone(), ignore_errors, async move {
-        run_extract_commits(members, |member| {
-            commit_extract_member(
-                commit_context.clone(),
-                member.archive_seq,
-                member.key,
-                member.size,
-                member.actual_size,
-                member.body,
-                member.write_plan,
-                member.opts,
-                member.replication,
-                member.staging_permit,
-                member.member_permit,
-            )
-        })
-        .await
+        run_extract_commits(members, |member| commit_extract_member(commit_context.clone(), member)).await
     })
     .await
 }
@@ -2187,12 +2151,7 @@ impl DefaultObjectUsecase {
                     Ok(value) => value,
                     Err(error) => {
                         let error: S3Error = error.into();
-                        if let Err(batch_error) =
-                            flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors)
-                                .await
-                        {
-                            return Err(batch_error);
-                        }
+                        flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors).await?;
                         return Err(error);
                     }
                 }
@@ -2204,11 +2163,7 @@ impl DefaultObjectUsecase {
                 Ok(f) => f,
                 Err(error) => {
                     error!(error = %error, "Archive entry read failed");
-                    if let Err(batch_error) =
-                        flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors).await
-                    {
-                        return Err(batch_error);
-                    }
+                    flush_extract_batch(&mut batch, &mut batch_state, &commit_context, extract_options.ignore_errors).await?;
                     return Err(s3_error!(InvalidArgument, "Failed to read archive entry: {:?}", error));
                 }
             };
@@ -2566,16 +2521,18 @@ impl DefaultObjectUsecase {
                             vec![
                                 commit_extract_member(
                                     member_context,
-                                    extracted_entry_count,
-                                    fpath,
-                                    size,
-                                    actual_size,
-                                    std::io::Cursor::new(Vec::new()),
-                                    write_plan,
-                                    opts,
-                                    replication,
-                                    staging_permit,
-                                    member_permit,
+                                    ExtractPreparedMember {
+                                        archive_seq: extracted_entry_count,
+                                        key: fpath,
+                                        size,
+                                        actual_size,
+                                        body: std::io::Cursor::new(Vec::new()),
+                                        write_plan,
+                                        opts,
+                                        replication,
+                                        staging_permit,
+                                        member_permit,
+                                    },
                                 )
                                 .await,
                             ]
@@ -2588,16 +2545,18 @@ impl DefaultObjectUsecase {
                             vec![
                                 commit_extract_member(
                                     member_context,
-                                    extracted_entry_count,
-                                    fpath,
-                                    size,
-                                    actual_size,
-                                    f,
-                                    write_plan,
-                                    opts,
-                                    replication,
-                                    staging_permit,
-                                    member_permit,
+                                    ExtractPreparedMember {
+                                        archive_seq: extracted_entry_count,
+                                        key: fpath,
+                                        size,
+                                        actual_size,
+                                        body: f,
+                                        write_plan,
+                                        opts,
+                                        replication,
+                                        staging_permit,
+                                        member_permit,
+                                    },
                                 )
                                 .await,
                             ]
@@ -2890,8 +2849,7 @@ mod tests {
         let first = try_acquire_extract_staging_permit(&manager, serial_weight)
             .expect("the first serial member must reserve its retained context");
         let error = try_acquire_extract_staging_permit(&manager, serial_weight)
-            .err()
-            .expect("a second serial member must not exceed the global staging budget");
+            .expect_err("a second serial member must not exceed the global staging budget");
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
 
         drop(first);
@@ -2909,15 +2867,13 @@ mod tests {
                 u32::try_from(SNOWBALL_STAGING_BYTES_LIMIT).expect("the staging budget must fit into u32"),
             )
             .expect("the exact global staging budget must be available");
-        let error = try_acquire_extract_staging_permit(&manager, 1)
-            .err()
-            .expect("a saturated staging budget must reject immediately");
+        let error =
+            try_acquire_extract_staging_permit(&manager, 1).expect_err("a saturated staging budget must reject immediately");
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
         drop(full_budget);
 
         let error = try_acquire_extract_staging_permit(&manager, SNOWBALL_STAGING_BYTES_LIMIT + 1)
-            .err()
-            .expect("a single retained context larger than the global budget must reject");
+            .expect_err("a single retained context larger than the global budget must reject");
         assert_eq!(error.code(), &S3ErrorCode::SlowDown);
     }
 
