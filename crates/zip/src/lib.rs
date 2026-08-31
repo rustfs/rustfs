@@ -198,7 +198,7 @@ fn tar_numeric_field_has_shape(field: &[u8]) -> bool {
     if field.first().is_some_and(|byte| byte & 0x80 != 0) {
         return true;
     }
-    tar_octal_field(field).is_some()
+    tar_octal_field(field).is_some() || field.iter().all(|byte| matches!(*byte, b' ' | 0))
 }
 
 fn is_tar_header(prefix: &[u8]) -> bool {
