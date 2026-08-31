@@ -169,7 +169,7 @@ the same profile for membership and execution with one nightly worker.
 | `s3s-e2e` black-box | `e2e-tests` + `e2e-tests-rio-v2` jobs | **Active** (external conformance tool) |
 | ILM / lifecycle (ignored) | `test-ilm-integration-serial` lane, `-j1` | **Active** (backlog#1148 ilm-1) |
 | KMS suite | `e2e-full` job, merge queue + main | **Active** |
-| Direct upgrade from pinned previous release | `e2e-upgrade.yml`, storage-sensitive PRs + release tags + weekly | **Active** |
+| Direct and mixed-version rolling upgrades from pinned previous release | `e2e-upgrade.yml`, storage-sensitive PRs + release tags + weekly | **Active** |
 | Cluster faults (`e2e-nightly` profile) | consolidated nightly workflow | **Active** (backlog#1149 ci-7) |
 | Protocols (FTPS/WebDAV/SFTP) | consolidated nightly workflow, serial | **Active** (backlog#1149 ci-7) |
 | Replication (fast subset) | `e2e-smoke` profile, `e2e-tests` job, every PR | **Active** (backlog#1147 repl-1) |

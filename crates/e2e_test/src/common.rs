@@ -1469,31 +1469,18 @@ impl RustFSTestClusterEnvironment {
     ///   times out, or cluster service readiness times out.
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let binary_path = rustfs_binary_path();
+        self.start_with_binary(&binary_path).await
+    }
+
+    /// Start every cluster node with a specific RustFS binary.
+    ///
+    /// Upgrade compatibility tests use this to initialize a cluster with a
+    /// pinned previous release before replacing nodes with the workspace build.
+    pub async fn start_with_binary(&mut self, binary_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let volumes_arg = self.build_volumes_arg();
 
-        for (i, node) in self.nodes.iter_mut().enumerate() {
-            info!("Starting cluster node {} on {}", i, node.address);
-
-            let mut command = Command::new(&binary_path);
-            command
-                .env("RUSTFS_VOLUMES", &volumes_arg)
-                .env("RUSTFS_ADDRESS", &node.address)
-                .env("RUSTFS_ACCESS_KEY", &self.access_key)
-                .env("RUSTFS_SECRET_KEY", &self.secret_key)
-                .env("RUSTFS_CONSOLE_ENABLE", "false")
-                .env("RUST_LOG", "rustfs=info,rustfs_notify=debug");
-
-            for (key, value) in &self.extra_env {
-                command.env(key, value);
-            }
-            for (key, value) in &self.node_extra_env[i] {
-                command.env(key, value);
-            }
-            capture_command_logs(&mut command, self.node_capture_log_paths[i].as_deref())?;
-
-            let process = command.current_dir(&node.data_dir).spawn()?;
-
-            node.process = Some(process);
+        for node_idx in 0..self.nodes.len() {
+            self.spawn_node(node_idx, binary_path, &volumes_arg)?;
         }
 
         for (i, node) in self.nodes.iter().enumerate() {
@@ -1509,20 +1496,46 @@ impl RustFSTestClusterEnvironment {
 
     /// Start one node process using the cluster's existing volume layout.
     pub async fn start_node(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        self.start_node_from_binary(node_idx, &binary_path).await
+    }
+
+    /// Start one stopped cluster node with a specific RustFS binary while
+    /// preserving the cluster's volume layout and that node's data directory.
+    pub async fn start_node_from_binary(
+        &mut self,
+        node_idx: usize,
+        binary_path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let volumes_arg = self.build_volumes_arg();
+        self.spawn_node(node_idx, binary_path, &volumes_arg)?;
+
+        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await?;
+        self.wait_for_node_service_ready(node_idx).await?;
+        Ok(())
+    }
+
+    fn spawn_node(
+        &mut self,
+        node_idx: usize,
+        binary_path: &Path,
+        volumes_arg: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.ensure_node_index(node_idx)?;
         if self.nodes[node_idx].process.is_some() {
             return Err(format!("cluster node {node_idx} is already running").into());
         }
+        if !binary_path.is_file() {
+            return Err(format!("RustFS binary does not exist: {}", binary_path.display()).into());
+        }
 
-        let binary_path = rustfs_binary_path();
-        let volumes_arg = self.build_volumes_arg();
         let log_path = self.node_capture_log_paths[node_idx].clone();
         let node = &mut self.nodes[node_idx];
-        info!("Starting cluster node {} on {}", node_idx, node.address);
+        info!("Starting cluster node {} on {} with {}", node_idx, node.address, binary_path.display());
 
-        let mut command = Command::new(&binary_path);
+        let mut command = Command::new(binary_path);
         command
-            .env("RUSTFS_VOLUMES", &volumes_arg)
+            .env("RUSTFS_VOLUMES", volumes_arg)
             .env("RUSTFS_ADDRESS", &node.address)
             .env("RUSTFS_ACCESS_KEY", &self.access_key)
             .env("RUSTFS_SECRET_KEY", &self.secret_key)
@@ -1539,9 +1552,6 @@ impl RustFSTestClusterEnvironment {
 
         let process = command.current_dir(&node.data_dir).spawn()?;
         node.process = Some(process);
-
-        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await?;
-        self.wait_for_node_service_ready(node_idx).await?;
         Ok(())
     }
 

@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{RustFSTestEnvironment, init_logging};
+use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging, rustfs_binary_path};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, ServerSideEncryption, VersioningConfiguration,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tokio::task::JoinSet;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -28,6 +29,10 @@ const SSE_MASTER_KEY_ENV: &str = "RUSTFS_SSE_S3_MASTER_KEY";
 const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 const PLAIN_BUCKET: &str = "upgrade-plain-data";
 const VERSIONED_BUCKET: &str = "upgrade-versioned-data";
+const MIXED_BUCKET: &str = "upgrade-mixed-version-data";
+const MIXED_NODE_COUNT: usize = 4;
+const MULTIPART_WORKERS: usize = 16;
+const MULTIPART_UPLOADS_PER_WORKER: usize = 16;
 
 fn source_binary() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let path = std::env::var_os(SOURCE_BINARY_ENV)
@@ -100,6 +105,99 @@ async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<
         .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
         .send()
         .await?;
+    Ok(())
+}
+
+fn configure_cluster_logs(cluster: &mut RustFSTestClusterEnvironment) -> TestResult {
+    let Some(log_dir) = std::env::var_os("RUSTFS_E2E_LOG_DIR") else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&log_dir)?;
+    for node_idx in 0..cluster.nodes.len() {
+        let path = Path::new(&log_dir).join(format!("mixed-upgrade-node-{node_idx}.log"));
+        cluster.set_node_capture_log_path(node_idx, path.to_string_lossy().into_owned())?;
+    }
+    Ok(())
+}
+
+async fn write_multipart_load(clients: &[Client], phase: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut tasks = JoinSet::new();
+    for worker in 0..MULTIPART_WORKERS {
+        let client = clients[worker % clients.len()].clone();
+        let phase = phase.to_string();
+        tasks.spawn(async move {
+            let mut keys = Vec::with_capacity(MULTIPART_UPLOADS_PER_WORKER);
+            for upload in 0..MULTIPART_UPLOADS_PER_WORKER {
+                let key = format!("{phase}/multipart/{worker:02}/{upload:02}");
+                let part = vec![u8::try_from(worker)?; 64 * 1024];
+                write_multipart(&client, MIXED_BUCKET, &key, &[part]).await?;
+                keys.push(key);
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(keys)
+        });
+    }
+
+    let mut keys = Vec::with_capacity(MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER);
+    while let Some(result) = tasks.join_next().await {
+        keys.extend(result??);
+    }
+    Ok(keys)
+}
+
+async fn exercise_mixed_cluster(
+    cluster: &RustFSTestClusterEnvironment,
+    phase: &str,
+    current_node: usize,
+    previous_node: usize,
+) -> TestResult {
+    let clients = cluster.create_all_clients()?;
+    let current_client = &clients[current_node];
+    let previous_client = &clients[previous_node];
+
+    let current_key = format!("{phase}/written-by-current");
+    let current_body = format!("{phase}: current RustFS build").into_bytes();
+    current_client
+        .put_object()
+        .bucket(MIXED_BUCKET)
+        .key(&current_key)
+        .body(ByteStream::from(current_body.clone()))
+        .send()
+        .await?;
+    assert_eq!(read_object(previous_client, MIXED_BUCKET, &current_key, None).await?.1, current_body);
+
+    let previous_key = format!("{phase}/written-by-previous");
+    let previous_body = format!("{phase}: previous RustFS release").into_bytes();
+    previous_client
+        .put_object()
+        .bucket(MIXED_BUCKET)
+        .key(&previous_key)
+        .body(ByteStream::from(previous_body.clone()))
+        .send()
+        .await?;
+    assert_eq!(read_object(current_client, MIXED_BUCKET, &previous_key, None).await?.1, previous_body);
+
+    let multipart_keys = write_multipart_load(&clients, phase).await?;
+    let expected_count = multipart_keys.len() + 2;
+    for client in [current_client, previous_client] {
+        let listed = client
+            .list_objects_v2()
+            .bucket(MIXED_BUCKET)
+            .prefix(format!("{phase}/"))
+            .send()
+            .await?;
+        assert_eq!(
+            listed.contents().len(),
+            expected_count,
+            "both RustFS versions must stream the complete mixed-version listing"
+        );
+    }
+
+    let last_multipart_key = format!("{phase}/multipart/{:02}/{:02}", MULTIPART_WORKERS - 1, MULTIPART_UPLOADS_PER_WORKER - 1);
+    assert_eq!(
+        read_object(previous_client, MIXED_BUCKET, &last_multipart_key, None).await?.1,
+        vec![u8::try_from(MULTIPART_WORKERS - 1)?; 64 * 1024]
+    );
+
     Ok(())
 }
 
@@ -249,6 +347,50 @@ async fn direct_upgrade_from_rc2_preserves_object_contracts() -> TestResult {
         read_object(&current_client, PLAIN_BUCKET, post_upgrade_key, None).await?.1,
         post_upgrade_bytes
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a pinned previous RustFS release binary"]
+async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestResult {
+    init_logging();
+    let previous_binary = source_binary()?;
+    let current_binary = rustfs_binary_path();
+    let mut cluster = RustFSTestClusterEnvironment::new(MIXED_NODE_COUNT).await?;
+    cluster.set_env("RUST_LOG", "rustfs=warn,rustfs_notify=warn");
+    configure_cluster_logs(&mut cluster)?;
+    cluster.start_with_binary(&previous_binary).await?;
+    cluster.create_test_bucket(MIXED_BUCKET).await?;
+
+    cluster.stop_node(0)?;
+    cluster.start_node_from_binary(0, &current_binary).await?;
+    exercise_mixed_cluster(&cluster, "one-current-node", 0, 1).await?;
+
+    for node_idx in [1, 2] {
+        cluster.stop_node(node_idx)?;
+        cluster.start_node_from_binary(node_idx, &current_binary).await?;
+    }
+    exercise_mixed_cluster(&cluster, "one-previous-node", 0, 3).await?;
+
+    cluster.stop_node(3)?;
+    cluster.start_node_from_binary(3, &current_binary).await?;
+
+    for client in cluster.create_all_clients()? {
+        for phase in ["one-current-node", "one-previous-node"] {
+            let listed = client
+                .list_objects_v2()
+                .bucket(MIXED_BUCKET)
+                .prefix(format!("{phase}/"))
+                .send()
+                .await?;
+            assert_eq!(
+                listed.contents().len(),
+                MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2,
+                "the homogeneous current cluster must preserve every object from {phase}"
+            );
+        }
+    }
 
     Ok(())
 }
