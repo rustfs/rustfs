@@ -978,9 +978,12 @@ pub(crate) mod bucket {
 }
 
 pub(crate) mod concurrency {
+    #[cfg(test)]
+    pub(crate) use crate::storage::storage_api::concurrency_consumer::SNOWBALL_MEMBER_COMMIT_LIMIT;
     pub(crate) use crate::storage::storage_api::concurrency_consumer::{
         ConcurrencyManager, DiskReadAdmission, ForegroundWriteAdmission, GetObjectGuard, IoQueueStatus, IoStrategy,
-        PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager, get_put_concurrency_aware_buffer_size,
+        PutObjectGuard, SNOWBALL_STAGING_BYTES_LIMIT, get_concurrency_aware_buffer_size, get_concurrency_manager,
+        get_put_concurrency_aware_buffer_size,
     };
 }
 

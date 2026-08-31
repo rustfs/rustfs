@@ -17,8 +17,8 @@
 use super::*;
 use crate::app::storage_api::object_usecase::bucket::replication::ReplicateDecision;
 #[cfg(test)]
-use crate::storage::concurrency::manager::SNOWBALL_MEMBER_COMMIT_LIMIT;
-use crate::storage::concurrency::manager::SNOWBALL_STAGING_BYTES_LIMIT;
+use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_MEMBER_COMMIT_LIMIT;
+use crate::app::storage_api::object_usecase::concurrency::SNOWBALL_STAGING_BYTES_LIMIT;
 use futures::stream::FuturesUnordered;
 use std::collections::HashSet;
 
