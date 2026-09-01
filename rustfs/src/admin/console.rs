@@ -26,7 +26,7 @@ use crate::server::{
     HeaderMapCarrier, HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX, RequestContextLayer, VERSION, build_health_response_parts,
     collect_probe_readiness,
 };
-use crate::version::build;
+use crate::version::{self, build};
 use axum::{
     Extension, Json, Router,
     body::Body,
@@ -262,15 +262,7 @@ static CONSOLE_CONFIG: OnceLock<Config> = OnceLock::new();
 #[allow(clippy::const_is_empty)]
 pub(crate) fn init_console_cfg(local_ip: IpAddr, port: u16) {
     CONSOLE_CONFIG.get_or_init(|| {
-        let ver = {
-            if !build::TAG.is_empty() {
-                build::TAG.to_string()
-            } else if !build::SHORT_COMMIT.is_empty() {
-                format!("@{}", build::SHORT_COMMIT)
-            } else {
-                build::PKG_VERSION.to_string()
-            }
-        };
+        let ver = version::DISPLAY_VERSION.to_string();
 
         Config::new(local_ip, port, ver.as_str(), build::COMMIT_DATE_3339)
     });

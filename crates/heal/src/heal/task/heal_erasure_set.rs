@@ -492,6 +492,7 @@ impl HealTask {
             }
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
+            Err(e) if e.is_recoverable_heal() => Err(e),
             Err(e) => {
                 error!(
                     target: "rustfs::heal::task",

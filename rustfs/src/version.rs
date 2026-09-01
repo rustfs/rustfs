@@ -12,16 +12,59 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use const_str::concat;
 use shadow_rs::shadow;
 use std::path::Path;
 use std::process::Command;
 
 shadow!(build);
 
+const BUILD_VERSION_OVERRIDE: Option<&str> = option_env!("RUSTFS_BUILD_VERSION");
+
+#[allow(clippy::const_is_empty)]
+const DEFAULT_DISPLAY_VERSION: &str = {
+    if !build::TAG.is_empty() {
+        build::TAG
+    } else if !build::SHORT_COMMIT.is_empty() {
+        concat!("@", build::SHORT_COMMIT)
+    } else {
+        build::PKG_VERSION
+    }
+};
+
+#[allow(clippy::const_is_empty)]
+pub const DISPLAY_VERSION: &str = {
+    if let Some(version) = BUILD_VERSION_OVERRIDE {
+        if !version.is_empty() {
+            version
+        } else {
+            DEFAULT_DISPLAY_VERSION
+        }
+    } else {
+        DEFAULT_DISPLAY_VERSION
+    }
+};
+
 type VersionParseResult = Result<(u32, u32, u32, Option<String>), Box<dyn std::error::Error>>;
+
+fn build_version_override() -> Option<&'static str> {
+    BUILD_VERSION_OVERRIDE.filter(|version| !version.is_empty())
+}
+
+fn version_ref(version: &str) -> String {
+    if version.starts_with("refs/tags/") || version.starts_with('@') {
+        version.to_string()
+    } else {
+        format!("refs/tags/{version}")
+    }
+}
 
 #[allow(clippy::const_is_empty)]
 pub fn get_version() -> String {
+    if let Some(version) = build_version_override() {
+        return version_ref(version);
+    }
+
     // Get the latest tag
     if let Ok(latest_tag) = get_latest_tag() {
         // Check if current commit is newer than the latest tag
@@ -260,6 +303,20 @@ mod tests {
         run_git(repo.path(), &["commit", "--allow-empty", "--quiet", "-m", "newer commit"]);
 
         assert!(is_head_newer_than_tag_in(repo.path(), "1.2.3"));
+    }
+
+    #[test]
+    fn build_version_override_is_used_for_current_version_when_set() {
+        if let Some(version) = build_version_override() {
+            assert_eq!(get_version(), version_ref(version));
+        }
+    }
+
+    #[test]
+    fn version_ref_keeps_existing_ref_prefixes() {
+        assert_eq!(version_ref("1.2.3"), "refs/tags/1.2.3");
+        assert_eq!(version_ref("refs/tags/1.2.3"), "refs/tags/1.2.3");
+        assert_eq!(version_ref("@abc123"), "@abc123");
     }
 
     #[test]
