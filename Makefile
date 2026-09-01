@@ -23,6 +23,12 @@ SHELL := $(shell which bash)
 .SHELLFLAGS = -eu -o pipefail -c
 
 DOCKER_CLI ?= docker
+# Python interpreter for the repository's helper scripts. They import tomllib
+# (Python 3.11+), while macOS still ships /usr/bin/python3 at 3.9, so calls go
+# through a resolver that picks a new-enough interpreter (or falls back to uv).
+# Override with RUSTFS_PYTHON=/path/to/python3.12, or replace the resolver via
+# RUSTFS_PYTHON_BIN=<command>.
+RUSTFS_PYTHON_BIN ?= ./scripts/python_bin.sh
 IMAGE_NAME ?= rustfs:v1.0.0
 CONTAINER_NAME ?= rustfs-dev
 # Docker build configurations
