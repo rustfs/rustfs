@@ -71,13 +71,20 @@ jobs:
       - name: Checkout auto-testing scripts (with retry)
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          AUTO_TESTING_REF: cxymds/fix-2132-tier-log-isolation
+          AUTO_TESTING_COMMIT: 02da54dd62110649dc2860fc5fcd9e08d2e9a1ca
         run: |
           set -euo pipefail
           rm -rf auto-testing
           for attempt in 1 2 3 4 5; do
-            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
-              echo "auto-testing cloned (attempt ${attempt})"
-              exit 0
+            if gh repo clone rustfs/auto-testing auto-testing -- \
+              --branch "${AUTO_TESTING_REF}" --single-branch --depth 1 --quiet; then
+              actual_commit="$(git -C auto-testing rev-parse HEAD)"
+              if [[ "${actual_commit}" == "${AUTO_TESTING_COMMIT}" ]]; then
+                echo "auto-testing ${actual_commit} cloned (attempt ${attempt})"
+                exit 0
+              fi
+              echo "auto-testing commit mismatch: expected ${AUTO_TESTING_COMMIT}, got ${actual_commit}" >&2
             fi
             rm -rf auto-testing
             echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
