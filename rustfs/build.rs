@@ -13,6 +13,17 @@
 // limitations under the License.
 
 fn main() -> shadow_rs::SdResult<()> {
+    println!("cargo:rerun-if-env-changed=RUSTFS_BUILD_VERSION");
+    if let Ok(version) = std::env::var("RUSTFS_BUILD_VERSION")
+        && !version.is_empty()
+    {
+        assert!(
+            !version.contains(['\n', '\r']),
+            "RUSTFS_BUILD_VERSION must be a single-line version string"
+        );
+        println!("cargo:rustc-env=RUSTFS_BUILD_VERSION={version}");
+    }
+
     shadow_rs::ShadowBuilder::builder().build()?;
     Ok(())
 }
