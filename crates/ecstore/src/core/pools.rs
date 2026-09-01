@@ -7420,6 +7420,9 @@ type DecommissionCapacityInfoOverrides =
 #[cfg(test)]
 static DECOMMISSION_CAPACITY_INFO_OVERRIDES: std::sync::OnceLock<DecommissionCapacityInfoOverrides> = std::sync::OnceLock::new();
 
+/// Queues capacity snapshots consumed in order by `get_decommission_all_pool_capacity_infos`;
+/// the final snapshot is retained and replayed for every subsequent sample, so tests never
+/// fall back to the host's real disk statistics once an override is installed.
 #[cfg(test)]
 pub(crate) fn set_decommission_capacity_info_overrides_for_test(
     store_id: uuid::Uuid,
@@ -7438,11 +7441,15 @@ fn take_decommission_capacity_info_override_for_test(store_id: uuid::Uuid) -> Op
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .expect("decommission capacity info override should not be poisoned");
-    let snapshot = overrides.get_mut(&store_id)?.pop_front();
-    if overrides.get(&store_id).is_some_and(std::collections::VecDeque::is_empty) {
-        overrides.remove(&store_id);
+    let queue = overrides.get_mut(&store_id)?;
+    if queue.len() > 1 {
+        queue.pop_front()
+    } else {
+        // The final snapshot is replayed forever: extra sampling points added to
+        // the decommission paths must keep observing injected capacity instead of
+        // silently falling back to the host's real statfs numbers (see #6989).
+        queue.front().cloned()
     }
-    snapshot
 }
 
 #[cfg(test)]
