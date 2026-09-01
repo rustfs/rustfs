@@ -460,6 +460,28 @@ pub struct EncryptionRequest<'a> {
 }
 
 impl EncryptionRequest<'_> {
+    pub fn validate_complete_multipart_ssec(&self, user_defined: &HashMap<String, String>) -> Result<(), ApiError> {
+        let request_uses_ssec =
+            self.sse_customer_algorithm.is_some() || self.sse_customer_key.is_some() || self.sse_customer_key_md5.is_some();
+        if !request_uses_ssec {
+            let stored_algorithm = user_defined.get("x-amz-server-side-encryption-customer-algorithm");
+            let stored_key_md5 = user_defined.get("x-amz-server-side-encryption-customer-key-md5");
+            return match (stored_algorithm, stored_key_md5) {
+                (None, None) => Ok(()),
+                (Some(algorithm), Some(key_md5))
+                    if algorithm == DEFAULT_SSE_ALGORITHM
+                        && BASE64_STANDARD
+                            .decode_to_vec(key_md5)
+                            .is_ok_and(|decoded| decoded.len() == 16) =>
+                {
+                    Ok(())
+                }
+                _ => Err(ssec_invalid_request("The multipart upload contains invalid SSE-C metadata.")),
+            };
+        }
+        self.validate_multipart_ssec(user_defined)
+    }
+
     pub fn validate_multipart_ssec(&self, user_defined: &HashMap<String, String>) -> Result<(), ApiError> {
         let stored_algorithm = user_defined.get("x-amz-server-side-encryption-customer-algorithm");
         let stored_key_md5 = user_defined.get("x-amz-server-side-encryption-customer-key-md5");
@@ -6371,6 +6393,61 @@ mod tests {
             multipart_ssec_request(42)
                 .validate_multipart_ssec(&multipart_ssec_metadata(42))
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_complete_multipart_ssec_allows_omitted_parameters() {
+        let no_ssec = EncryptionRequest {
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            ..multipart_ssec_request(42)
+        };
+
+        assert!(no_ssec.validate_complete_multipart_ssec(&multipart_ssec_metadata(42)).is_ok());
+        assert!(no_ssec.validate_complete_multipart_ssec(&HashMap::new()).is_ok());
+
+        for invalid_metadata in [
+            HashMap::from([("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string())]),
+            HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES128".to_string()),
+                ("x-amz-server-side-encryption-customer-key-md5".to_string(), md5_base64([42u8; 32])),
+            ]),
+            HashMap::from([
+                ("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string()),
+                ("x-amz-server-side-encryption-customer-key-md5".to_string(), "invalid".to_string()),
+            ]),
+        ] {
+            assert_eq!(
+                no_ssec
+                    .validate_complete_multipart_ssec(&invalid_metadata)
+                    .expect_err("corrupt SSE-C session metadata must fail closed")
+                    .code,
+                S3ErrorCode::InvalidRequest
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_complete_multipart_ssec_still_validates_present_parameters() {
+        let partial = EncryptionRequest {
+            sse_customer_key: None,
+            ..multipart_ssec_request(42)
+        };
+        assert_eq!(
+            partial
+                .validate_complete_multipart_ssec(&multipart_ssec_metadata(42))
+                .expect_err("partial SSE-C parameters must fail")
+                .code,
+            S3ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            multipart_ssec_request(43)
+                .validate_complete_multipart_ssec(&multipart_ssec_metadata(42))
+                .expect_err("wrong SSE-C parameters must fail")
+                .code,
+            S3ErrorCode::InvalidRequest
         );
     }
 

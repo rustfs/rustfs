@@ -1447,6 +1447,10 @@ impl DefaultObjectUsecase {
             let encryption_metadata = encryption_material_to_metadata(&material)?;
             metadata.extend(encryption_metadata.clone());
             opts.user_defined.extend(encryption_metadata);
+            if opts.want_checksum.is_some() {
+                insert_str(&mut metadata, SUFFIX_PLAINTEXT_CHECKSUM, "true".to_string());
+                insert_str(&mut opts.user_defined, SUFFIX_PLAINTEXT_CHECKSUM, "true".to_string());
+            }
         }
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
