@@ -1178,6 +1178,8 @@ mod tests {
             disk: Some("pool_0_set_1".to_string()),
             heal_endpoints: vec!["http://node0:9000/drive1".to_string()],
             priority: HealChannelPriority::Critical,
+            pool_index: Some(0),
+            set_index: Some(1),
             scan_mode: None,
             remove_corrupted: None,
             recreate_missing: None,
@@ -1186,10 +1188,8 @@ mod tests {
             dry_run: None,
             no_lock: None,
             timeout_seconds: None,
-            pool_index: None,
-            set_index: None,
             force_start: false,
-            source: HealRequestSource::Internal,
+            source: HealRequestSource::AutoHeal,
         };
 
         let heal_request = processor.convert_to_heal_request(channel_request).unwrap();

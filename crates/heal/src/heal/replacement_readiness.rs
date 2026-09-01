@@ -72,10 +72,6 @@ pub(crate) async fn auto_replacement_target_identity(
     .flatten()
 }
 
-pub(crate) async fn auto_replacement_targets_ready(targets: &[String]) -> bool {
-    auto_replacement_target_identities(targets).await.is_some()
-}
-
 fn local_replacement_endpoint(target: &str, local_grid_hosts: &[String]) -> Option<Endpoint> {
     let mut endpoint = Endpoint::try_from(target).ok()?;
     if endpoint.is_local {

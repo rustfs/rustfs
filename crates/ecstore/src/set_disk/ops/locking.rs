@@ -370,19 +370,12 @@ impl SetDisks {
                 }
 
                 info!("renew_disk attached unformatted replacement and will trigger heal_disk, {:?}", ep);
-                let set_disk_id = format!("pool_{}_set_{}", ep.pool_idx, ep.set_idx);
                 let (Ok(pool_index), Ok(set_index)) = (usize::try_from(ep.pool_idx), usize::try_from(ep.set_idx)) else {
                     warn!("renew_disk: replacement target has invalid pool or set index, {:?}", ep);
                     return;
                 };
-                let _ = send_heal_replacement_disk(
-                    set_disk_id,
-                    ep.to_string(),
-                    pool_index,
-                    set_index,
-                    Some(HealChannelPriority::Normal),
-                )
-                .await;
+                let _ =
+                    send_heal_replacement_disk(pool_index, set_index, ep.to_string(), Some(HealChannelPriority::Normal)).await;
                 return;
             }
         };
