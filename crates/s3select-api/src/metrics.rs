@@ -14,8 +14,8 @@
 
 use arc_swap::ArcSwap;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
