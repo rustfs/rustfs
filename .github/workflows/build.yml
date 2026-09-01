@@ -408,9 +408,9 @@ jobs:
 
           if [[ "${{ matrix.cross }}" == "true" ]]; then
             # All cross targets in the matrix are Linux; zigbuild handles them.
-            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bins
+            cargo zigbuild --release --target ${{ matrix.target }} -p rustfs --bin rustfs
           else
-            cargo build --release --target ${{ matrix.target }} -p rustfs --bins
+            cargo build --release --target ${{ matrix.target }} -p rustfs --bin rustfs
           fi
 
       - name: Create release package

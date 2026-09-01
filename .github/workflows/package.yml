@@ -21,10 +21,10 @@
 # - workflow_run: automatically package after "Build and Release" completes
 #   for a release tag (the mac/windows/linux binaries are already uploaded
 #   to the GitHub release before packaging starts)
-# - workflow_dispatch: manual fallback (backfill / re-run) with optional tag/run_id
+# - workflow_dispatch: manual fallback with a release tag and/or exact build run ID
 #
 # Flow:
-# 1. Resolve the triggering Build workflow run for the release tag
+# 1. Resolve and validate the selected Build workflow run and source identity
 # 2. Download Linux binaries (x86_64-gnu, aarch64-gnu) from build artifacts
 # 3. Build DEB packages for amd64 and arm64
 # 4. Build RPM packages for x86_64 and aarch64
@@ -51,7 +51,7 @@ on:
         required: false
         type: string
       build_run_id:
-        description: "Build workflow run ID (overrides tag lookup)"
+        description: "Build workflow run ID (when combined with tag, both must identify the same release commit)"
         required: false
         type: string
 
@@ -82,6 +82,9 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
       build_type: ${{ steps.resolve.outputs.build_type }}
       build_run_id: ${{ steps.resolve.outputs.build_run_id }}
+      build_run_number: ${{ steps.resolve.outputs.build_run_number }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      dev_sequence: ${{ steps.resolve.outputs.dev_sequence }}
       tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - name: Resolve build run
@@ -89,90 +92,129 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
           INPUT_RUN_ID: ${{ github.event.inputs.build_run_id }}
         run: |
           set -euo pipefail
 
-          # Determine tag
-          if [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            TAG="${HEAD_BRANCH}"
-          elif [[ -n "$INPUT_TAG" ]]; then
-            TAG="$INPUT_TAG"
+          fail() {
+            echo "❌ $1" >&2
+            exit 1
+          }
+
+          TAG=""
+          BUILD_RUN_ID=""
+          case "$EVENT_NAME" in
+            workflow_run)
+              TAG="$HEAD_BRANCH"
+              BUILD_RUN_ID="$WORKFLOW_RUN_ID"
+              ;;
+            workflow_dispatch)
+              TAG="$INPUT_TAG"
+              BUILD_RUN_ID="$INPUT_RUN_ID"
+              ;;
+            *) fail "unsupported event: $EVENT_NAME" ;;
+          esac
+
+          # Validate and classify tags before using them in API paths or logs.
+          semver_core='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+          prerelease_id='(alpha|beta|rc)\.(0|[1-9][0-9]*)'
+          if [[ -n "$TAG" ]]; then
+            if [[ "$TAG" =~ ^${semver_core}-${prerelease_id}-preview\.(0|[1-9][0-9]*)$ ]]; then
+              BUILD_TYPE=preview
+            elif [[ "$TAG" =~ ^${semver_core}-${prerelease_id}$ ]]; then
+              BUILD_TYPE=prerelease
+            elif [[ "$TAG" =~ ^${semver_core}$ ]]; then
+              BUILD_TYPE=release
+            else
+              fail "tag is not a supported strict package version"
+            fi
           else
-            TAG=""
+            BUILD_TYPE=development
           fi
 
-          echo "Tag: ${TAG:-<none>}"
-
-          # Determine build run ID
-          BUILD_RUN_ID=""
-
-          if [[ -n "$INPUT_RUN_ID" ]]; then
-            # Explicit run ID takes priority
-            BUILD_RUN_ID="$INPUT_RUN_ID"
-            echo "Using explicit build run ID: $BUILD_RUN_ID"
-
-          elif [[ "${{ github.event_name }}" == "workflow_run" ]]; then
-            # Use the Build and Release run that triggered this workflow
-            BUILD_RUN_ID="${WORKFLOW_RUN_ID}"
-            echo "Using triggering workflow run: $BUILD_RUN_ID"
-
+          if [[ -n "$BUILD_RUN_ID" ]]; then
+            [[ "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "build run ID must be a positive decimal integer"
+            echo "Using selected build run: $BUILD_RUN_ID"
           elif [[ -n "$TAG" ]]; then
-            # Find the build run that produced this tag
             echo "Looking for build run for tag: $TAG"
-            BUILD_RUN_ID=$(gh api \
-              "repos/${{ github.repository }}/actions/workflows/build.yml/runs?branch=${TAG}&status=success&per_page=1" \
-              --jq '.workflow_runs[0].id' 2>/dev/null || echo "")
+            BUILD_RUN_ID=$(gh api --method GET \
+              "repos/${REPOSITORY}/actions/workflows/build.yml/runs" \
+              -f branch="$TAG" -f status=success -F per_page=1 \
+              --jq '.workflow_runs[0].id // empty' 2>/dev/null || true)
 
-            if [[ -z "$BUILD_RUN_ID" || "$BUILD_RUN_ID" == "null" ]]; then
-              # Tag might not be a branch; try event=push with head_branch matching
-              BUILD_RUN_ID=$(gh api \
-                "repos/${{ github.repository }}/actions/workflows/build.yml/runs?event=push&status=success&per_page=100" \
-                --jq ".workflow_runs[] | select(.head_branch == \"$TAG\") | .id" 2>/dev/null | head -1 || echo "")
+            if [[ -z "$BUILD_RUN_ID" ]]; then
+              BUILD_RUN_ID=$(gh api --method GET \
+                "repos/${REPOSITORY}/actions/workflows/build.yml/runs" \
+                -f event=push -f status=success -F per_page=100 2>/dev/null |
+                jq -r --arg tag "$TAG" \
+                  '[.workflow_runs[] | select(.head_branch == $tag)][0].id // empty' || true)
             fi
-
-            if [[ -z "$BUILD_RUN_ID" || "$BUILD_RUN_ID" == "null" ]]; then
-              echo "❌ No successful build run found for tag: $TAG"
-              exit 1
-            fi
+            [[ "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "no successful build run found for tag"
             echo "Found build run: $BUILD_RUN_ID"
-
           else
-            # No tag — latest successful main build
             echo "No tag specified, looking for latest main build"
-            BUILD_RUN_ID=$(gh api \
-              "repos/${{ github.repository }}/actions/workflows/build.yml/runs?branch=main&status=success&per_page=1" \
-              --jq '.workflow_runs[0].id' 2>/dev/null || echo "")
-
-            if [[ -z "$BUILD_RUN_ID" || "$BUILD_RUN_ID" == "null" ]]; then
-              echo "❌ No successful main build found"
-              exit 1
-            fi
+            BUILD_RUN_ID=$(gh api --method GET \
+              "repos/${REPOSITORY}/actions/workflows/build.yml/runs" \
+              -f branch=main -f status=success -F per_page=1 \
+              --jq '.workflow_runs[0].id // empty' 2>/dev/null || true)
+            [[ "$BUILD_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "no successful main build found"
             echo "Latest main build: $BUILD_RUN_ID"
           fi
 
-          # Determine version and build type
+          # Fetch once and use the same immutable run metadata for identity,
+          # ordering, workflow provenance, and release-channel validation.
+          RUN_JSON=$(gh api "repos/${REPOSITORY}/actions/runs/${BUILD_RUN_ID}") ||
+            fail "cannot read selected build run"
+          RUN_ID=$(jq -r '.id // empty' <<<"$RUN_JSON")
+          RUN_NUMBER=$(jq -r '.run_number // empty' <<<"$RUN_JSON")
+          RUN_STATUS=$(jq -r '.status // empty' <<<"$RUN_JSON")
+          RUN_CONCLUSION=$(jq -r '.conclusion // empty' <<<"$RUN_JSON")
+          RUN_PATH=$(jq -r '.path // empty' <<<"$RUN_JSON")
+          HEAD_SHA=$(jq -r '.head_sha // empty' <<<"$RUN_JSON")
+          RUN_HEAD_BRANCH=$(jq -r '.head_branch // empty' <<<"$RUN_JSON")
+
+          [[ "$RUN_ID" == "$BUILD_RUN_ID" ]] || fail "run metadata ID mismatch"
+          [[ "$RUN_NUMBER" =~ ^[1-9][0-9]*$ ]] || fail "build run number must be a positive decimal integer"
+          [[ "$RUN_STATUS" == completed && "$RUN_CONCLUSION" == success ]] || fail "selected build run is not successful"
+          [[ "$RUN_PATH" == .github/workflows/build.yml ]] || fail "selected run is not Build and Release"
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "selected build run has an invalid head SHA"
+          [[ "$RUN_HEAD_BRANCH" != *$'\n'* && -n "$RUN_HEAD_BRANCH" ]] || fail "selected build run has an invalid head branch"
+
           if [[ -n "$TAG" ]]; then
+            [[ "$RUN_HEAD_BRANCH" == "$TAG" ]] || fail "tag and build run head branch do not match"
+
+            TAG_REF_JSON=$(gh api "repos/${REPOSITORY}/git/ref/tags/${TAG}") ||
+              fail "cannot resolve release tag ref"
+            TAG_OBJECT_TYPE=$(jq -r '.object.type // empty' <<<"$TAG_REF_JSON")
+            TAG_OBJECT_SHA=$(jq -r '.object.sha // empty' <<<"$TAG_REF_JSON")
+            depth=0
+            while [[ "$TAG_OBJECT_TYPE" == tag && $depth -lt 5 ]]; do
+              TAG_OBJECT_JSON=$(gh api "repos/${REPOSITORY}/git/tags/${TAG_OBJECT_SHA}") ||
+                fail "cannot peel annotated release tag"
+              TAG_OBJECT_TYPE=$(jq -r '.object.type // empty' <<<"$TAG_OBJECT_JSON")
+              TAG_OBJECT_SHA=$(jq -r '.object.sha // empty' <<<"$TAG_OBJECT_JSON")
+              depth=$((depth + 1))
+            done
+            [[ "$TAG_OBJECT_TYPE" == commit && "$TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]] ||
+              fail "release tag does not resolve to a commit"
+            [[ "$TAG_OBJECT_SHA" == "$HEAD_SHA" ]] || fail "release tag commit and build run head SHA do not match"
             VERSION="$TAG"
-            if [[ "$TAG" == *"-preview"* ]]; then
-              BUILD_TYPE="preview"
-            elif [[ "$TAG" == *"alpha"* || "$TAG" == *"beta"* || "$TAG" == *"rc"* ]]; then
-              BUILD_TYPE="prerelease"
-            else
-              BUILD_TYPE="release"
-            fi
+            DEV_SEQUENCE=""
           else
-            SHORT_SHA=$(gh api "repos/${{ github.repository }}/actions/runs/${BUILD_RUN_ID}" \
-              --jq '.head_sha' 2>/dev/null | head -c 7)
-            VERSION="dev-${SHORT_SHA}"
-            BUILD_TYPE="development"
+            VERSION="dev-${HEAD_SHA}"
+            DEV_SEQUENCE="$RUN_NUMBER"
           fi
 
           {
             echo "version=$VERSION"
             echo "build_type=$BUILD_TYPE"
             echo "build_run_id=$BUILD_RUN_ID"
+            echo "build_run_number=$RUN_NUMBER"
+            echo "head_sha=$HEAD_SHA"
+            echo "dev_sequence=$DEV_SEQUENCE"
             echo "tag=${TAG}"
           } >> "$GITHUB_OUTPUT"
 
@@ -180,6 +222,7 @@ jobs:
           echo "  Version: $VERSION"
           echo "  Build type: $BUILD_TYPE"
           echo "  Build run ID: $BUILD_RUN_ID"
+          echo "  Build run number: $RUN_NUMBER"
 
   # Build DEB and RPM packages for each architecture
   package:
@@ -205,6 +248,22 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+
+      - name: Normalize package metadata
+        id: versions
+        shell: bash
+        env:
+          BUILD_TYPE: ${{ needs.resolve.outputs.build_type }}
+          SOURCE_VERSION: ${{ needs.resolve.outputs.version }}
+          DEV_SEQUENCE: ${{ needs.resolve.outputs.dev_sequence }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+        run: |
+          set -euo pipefail
+
+          normalized=$(./scripts/release/package_versions.sh \
+            "$BUILD_TYPE" "$SOURCE_VERSION" "$DEV_SEQUENCE" "$DEB_ARCH" "$RPM_ARCH")
+          printf '%s\n' "$normalized" >> "$GITHUB_OUTPUT"
 
       - name: Download binary artifact from build run
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -245,18 +304,16 @@ jobs:
       - name: Build DEB package
         id: deb
         shell: bash
+        env:
+          DEB_VERSION: ${{ steps.versions.outputs.deb_version }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          DEB_FILE: ${{ steps.versions.outputs.deb_file }}
         run: |
           set -euo pipefail
 
-          VERSION="${{ needs.resolve.outputs.version }}"
-          DEB_ARCH="${{ matrix.deb_arch }}"
-          # DEB version: replace - with ~ (1.0.0-beta.12 -> 1.0.0~beta.12)
-          # Use a variable for ~ to prevent tilde expansion by bash
-          TILDE='~'
-          DEB_VERSION="${VERSION/-/$TILDE}"
-          PKG_DIR="rustfs_${DEB_VERSION}_${DEB_ARCH}"
+          PKG_DIR="${DEB_FILE%.deb}"
 
-          echo "Building DEB: ${PKG_DIR}.deb"
+          echo "Building DEB: ${DEB_FILE}"
 
           mkdir -p "${PKG_DIR}/DEBIAN"
           mkdir -p "${PKG_DIR}/usr/bin"
@@ -333,9 +390,12 @@ jobs:
           cp LICENSE "${PKG_DIR}/usr/share/doc/rustfs/"
           cp README.md "${PKG_DIR}/usr/share/doc/rustfs/"
 
-          fakeroot dpkg-deb --build "${PKG_DIR}"
+          fakeroot dpkg-deb --build "${PKG_DIR}" "$DEB_FILE"
 
-          DEB_FILE="${PKG_DIR}.deb"
+          [[ $(dpkg-deb -f "$DEB_FILE" Package) == rustfs ]]
+          [[ $(dpkg-deb -f "$DEB_FILE" Version) == "$DEB_VERSION" ]]
+          [[ $(dpkg-deb -f "$DEB_FILE" Architecture) == "$DEB_ARCH" ]]
+          dpkg-deb --fsys-tarfile "$DEB_FILE" | tar -tf - | grep -Fx './usr/bin/rustfs' >/dev/null
           stat --printf='%n %s bytes\n' "$DEB_FILE"
           echo "deb_file=$DEB_FILE" >> "$GITHUB_OUTPUT"
           echo "✅ DEB built: $DEB_FILE"
@@ -343,16 +403,19 @@ jobs:
       - name: Build RPM package
         id: rpm
         shell: bash
+        env:
+          RPM_VERSION: ${{ steps.versions.outputs.rpm_version }}
+          RPM_RELEASE: ${{ steps.versions.outputs.rpm_release }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+          RPM_FILE: ${{ steps.versions.outputs.rpm_file }}
         run: |
           set -euo pipefail
 
-          VERSION="${{ needs.resolve.outputs.version }}"
-          RPM_ARCH="${{ matrix.rpm_arch }}"
-
           echo "Building RPM for ${RPM_ARCH}"
 
-          sudo apt-get update && sudo apt-get install -y ruby ruby-dev build-essential
+          sudo apt-get update && sudo apt-get install -y ruby ruby-dev build-essential rpm
           sudo gem install fpm
+          ./scripts/test_package_versions.sh --require-package-managers
 
           # Create config file for fpm (DEB build creates it in its package dir structure,
           # but fpm needs the file to exist before packaging)
@@ -367,8 +430,10 @@ jobs:
 
           fpm -s dir -t rpm \
             --name rustfs \
-            --version "$VERSION" \
+            --version "$RPM_VERSION" \
+            --iteration "$RPM_RELEASE" \
             --architecture "$RPM_ARCH" \
+            --package "$RPM_FILE" \
             --depends "glibc >= 2.31" \
             --maintainer "RustFS Team <support@rustfs.com>" \
             --description "High-performance distributed object storage" \
@@ -410,13 +475,15 @@ jobs:
             LICENSE=/usr/share/doc/rustfs/LICENSE \
             README.md=/usr/share/doc/rustfs/README.md
 
-            RPM_FILE=$(find . -maxdepth 1 -type f -name 'rustfs-*.rpm' -print | head -1)
-            RPM_FILE="${RPM_FILE#./}"
-          if [[ -z "$RPM_FILE" ]]; then
+          if [[ ! -f "$RPM_FILE" ]]; then
             echo "❌ RPM build failed"
             exit 1
           fi
 
+          RPM_METADATA=$(rpm -qp --qf '%{NAME}\n%{VERSION}\n%{RELEASE}\n%{ARCH}\n' "$RPM_FILE")
+          EXPECTED_METADATA=$(printf 'rustfs\n%s\n%s\n%s' "$RPM_VERSION" "$RPM_RELEASE" "$RPM_ARCH")
+          [[ "$RPM_METADATA" == "$EXPECTED_METADATA" ]]
+          rpm -qpl "$RPM_FILE" | grep -Fx '/usr/bin/rustfs' >/dev/null
           stat --printf='%n %s bytes\n' "$RPM_FILE"
           echo "rpm_file=$RPM_FILE" >> "$GITHUB_OUTPUT"
           echo "✅ RPM built: $RPM_FILE"
@@ -438,6 +505,9 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           AWS_EC2_METADATA_DISABLED: true
+          BUILD_TYPE: ${{ needs.resolve.outputs.build_type }}
+          DEB_FILE: ${{ steps.deb.outputs.deb_file }}
+          RPM_FILE: ${{ steps.rpm.outputs.rpm_file }}
         shell: bash
         run: |
           set -euo pipefail
@@ -455,7 +525,6 @@ jobs:
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export AWS_DEFAULT_REGION="auto"
 
-          BUILD_TYPE="${{ needs.resolve.outputs.build_type }}"
           if [[ "$BUILD_TYPE" == "development" ]]; then
             R2_PREFIX="artifacts/rustfs/packages/dev"
           else
@@ -464,9 +533,6 @@ jobs:
           R2_PATH="s3://${R2_BUCKET}/${R2_PREFIX}/"
 
           echo "📤 Uploading to $R2_PATH"
-
-          DEB_FILE="${{ steps.deb.outputs.deb_file }}"
-          RPM_FILE="${{ steps.rpm.outputs.rpm_file }}"
 
           for f in "$DEB_FILE" "$RPM_FILE"; do
             if [[ -n "$f" && -f "$f" ]]; then
@@ -493,13 +559,12 @@ jobs:
         if: needs.resolve.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          DEB_FILE: ${{ steps.deb.outputs.deb_file }}
+          RPM_FILE: ${{ steps.rpm.outputs.rpm_file }}
         shell: bash
         run: |
           set -euo pipefail
-
-          TAG="${{ needs.resolve.outputs.tag }}"
-          DEB_FILE="${{ steps.deb.outputs.deb_file }}"
-          RPM_FILE="${{ steps.rpm.outputs.rpm_file }}"
 
           # Upload the packages, then refresh the release checksums so the new
           # assets are covered, matching the binary release flow.
@@ -552,14 +617,19 @@ jobs:
     steps:
       - name: Print summary
         shell: bash
+        env:
+          SUMMARY_VERSION: ${{ needs.resolve.outputs.version }}
+          SUMMARY_BUILD_TYPE: ${{ needs.resolve.outputs.build_type }}
+          SUMMARY_BUILD_RUN_ID: ${{ needs.resolve.outputs.build_run_id }}
+          SUMMARY_PACKAGE_STATUS: ${{ needs.package.result }}
         run: |
           {
             echo "## 📦 Package Summary"
             echo ""
             echo "| Item | Value |"
             echo "|------|-------|"
-            echo "| Version | \`${{ needs.resolve.outputs.version }}\` |"
-            echo "| Build Type | ${{ needs.resolve.outputs.build_type }} |"
-            echo "| Build Run | #${{ needs.resolve.outputs.build_run_id }} |"
-            echo "| Package Status | ${{ needs.package.result }} |"
+            echo "| Version | \`${SUMMARY_VERSION}\` |"
+            echo "| Build Type | ${SUMMARY_BUILD_TYPE} |"
+            echo "| Build Run | #${SUMMARY_BUILD_RUN_ID} |"
+            echo "| Package Status | ${SUMMARY_PACKAGE_STATUS} |"
           } >> "$GITHUB_STEP_SUMMARY"
