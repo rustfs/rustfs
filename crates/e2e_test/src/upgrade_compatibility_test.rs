@@ -20,7 +20,9 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, ServerSideEncryption, VersioningConfiguration,
 };
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::task::JoinSet;
+use tokio::time::{Instant, sleep};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -33,6 +35,10 @@ const MIXED_BUCKET: &str = "upgrade-mixed-version-data";
 const MIXED_NODE_COUNT: usize = 4;
 const MULTIPART_WORKERS: usize = 16;
 const MULTIPART_UPLOADS_PER_WORKER: usize = 16;
+// Peers keep a restarted node's drive in Suspect/Returning for roughly
+// probe_interval (2s) x success_threshold (3) after it comes back; 30s
+// comfortably covers that window plus CI scheduling jitter.
+const LISTING_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn source_binary() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     let path = std::env::var_os(SOURCE_BINARY_ENV)
@@ -144,6 +150,43 @@ async fn write_multipart_load(clients: &[Client], phase: &str) -> Result<Vec<Str
     Ok(keys)
 }
 
+/// Assert that `client` eventually lists exactly `expected` objects under
+/// `{phase}/`, polling until [`LISTING_CONVERGENCE_TIMEOUT`].
+///
+/// A single-snapshot assertion here is racy by construction: each phase both
+/// writes and lists within seconds of a node restart. While a peer still holds
+/// the restarted node's drive in Suspect/Returning, strict-quorum listing
+/// consults only the remaining three drives and drops any object that was
+/// itself legally written at write quorum (3/4 drives) during an earlier
+/// node's identical post-restart window — its xl.meta is then visible on only
+/// two of the three consulted drives, below the required object quorum of
+/// three. GET still succeeds for such objects; only the listing under-counts
+/// until drive health converges. A genuine upgrade data-loss regression still
+/// fails after the deadline.
+async fn wait_for_phase_listing(client: &Client, phase: &str, expected: usize, context: &str) -> TestResult {
+    let deadline = Instant::now() + LISTING_CONVERGENCE_TIMEOUT;
+    loop {
+        let listed = client
+            .list_objects_v2()
+            .bucket(MIXED_BUCKET)
+            .prefix(format!("{phase}/"))
+            .send()
+            .await?;
+        let count = listed.contents().len();
+        if count == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{context}: listing under {phase}/ returned {count} of {expected} objects even after {}s of post-restart convergence",
+                LISTING_CONVERGENCE_TIMEOUT.as_secs()
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 async fn exercise_mixed_cluster(
     cluster: &RustFSTestClusterEnvironment,
     phase: &str,
@@ -178,18 +221,14 @@ async fn exercise_mixed_cluster(
 
     let multipart_keys = write_multipart_load(&clients, phase).await?;
     let expected_count = multipart_keys.len() + 2;
-    for client in [current_client, previous_client] {
-        let listed = client
-            .list_objects_v2()
-            .bucket(MIXED_BUCKET)
-            .prefix(format!("{phase}/"))
-            .send()
-            .await?;
-        assert_eq!(
-            listed.contents().len(),
+    for (label, client) in [("current", current_client), ("previous", previous_client)] {
+        wait_for_phase_listing(
+            client,
+            phase,
             expected_count,
-            "both RustFS versions must stream the complete mixed-version listing"
-        );
+            &format!("the {label} RustFS version must stream the complete mixed-version listing"),
+        )
+        .await?;
     }
 
     let last_multipart_key = format!("{phase}/multipart/{:02}/{:02}", MULTIPART_WORKERS - 1, MULTIPART_UPLOADS_PER_WORKER - 1);
@@ -376,19 +415,15 @@ async fn rolling_upgrade_from_rc2_preserves_mixed_version_contracts() -> TestRes
     cluster.stop_node(3)?;
     cluster.start_node_from_binary(3, &current_binary).await?;
 
-    for client in cluster.create_all_clients()? {
+    for (node_idx, client) in cluster.create_all_clients()?.iter().enumerate() {
         for phase in ["one-current-node", "one-previous-node"] {
-            let listed = client
-                .list_objects_v2()
-                .bucket(MIXED_BUCKET)
-                .prefix(format!("{phase}/"))
-                .send()
-                .await?;
-            assert_eq!(
-                listed.contents().len(),
+            wait_for_phase_listing(
+                client,
+                phase,
                 MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2,
-                "the homogeneous current cluster must preserve every object from {phase}"
-            );
+                &format!("node {node_idx}: the homogeneous current cluster must preserve every object"),
+            )
+            .await?;
         }
     }
 
