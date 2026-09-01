@@ -50,6 +50,11 @@ pub const SUFFIX_ACTUAL_OBJECT_SIZE: &str = "actual-object-size";
 /// Used by replication; key stored with capital A
 pub const SUFFIX_ACTUAL_OBJECT_SIZE_CAP: &str = "Actual-Object-Size";
 pub const SUFFIX_CRC: &str = "crc";
+/// Marks checksum bytes produced by RustFS as plaintext checksum metadata.
+///
+/// MinIO encrypts the same on-disk field for SSE objects, so readers must not
+/// decode encrypted-object checksums unless this marker is present.
+pub const SUFFIX_PLAINTEXT_CHECKSUM: &str = "plaintext-checksum";
 /// JSON-encoded per-part S3 checksum maps retained across raw data movement.
 pub const SUFFIX_PART_CHECKSUMS: &str = "part-checksums";
 pub const SUFFIX_TRANSITION_STATUS: &str = "transition-status";

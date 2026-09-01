@@ -1771,9 +1771,10 @@ impl ObjectInfo {
         }
 
         if let Some(data) = &self.checksum {
-            if self.is_encrypted() {
+            if self.is_encrypted() && get_consistent_str(&self.user_defined, SUFFIX_PLAINTEXT_CHECKSUM) != Some("true") {
                 // Object-level encrypted checksum bytes require SSE decrypt material,
-                // so do not expose them as plaintext checksum headers here. The
+                // unless RustFS marked the stored bytes as plaintext. Do not expose
+                // unmarked bytes as checksum headers here. The
                 // `false` multipart flag feeds the response-path COMPOSITE
                 // fallback; callers that need accurate multipart routing must
                 // consult `is_multipart()` instead of this value.
@@ -2477,6 +2478,31 @@ mod tests {
 
         assert!(!is_multipart);
         assert!(checksums.is_empty());
+    }
+
+    #[test]
+    fn decrypt_checksums_reads_marked_rustfs_encrypted_object_checksum() {
+        let checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"encrypted-object")
+            .expect("test checksum should be valid");
+        let checksum_key = checksum.checksum_type.to_string();
+        let expected_checksum = checksum.encoded.clone();
+        let mut user_defined =
+            HashMap::from([(rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string())]);
+        rustfs_utils::http::insert_str(&mut user_defined, SUFFIX_PLAINTEXT_CHECKSUM, "true".to_string());
+        assert_eq!(user_defined.get("x-rustfs-internal-plaintext-checksum").map(String::as_str), Some("true"));
+        assert_eq!(user_defined.get("x-minio-internal-plaintext-checksum").map(String::as_str), Some("true"));
+        let info = ObjectInfo {
+            checksum: Some(checksum.to_bytes(&[])),
+            user_defined: Arc::new(user_defined),
+            ..Default::default()
+        };
+
+        let (checksums, is_multipart) = info
+            .decrypt_checksums(0, &HeaderMap::new())
+            .expect("marked RustFS checksum should decode");
+
+        assert!(!is_multipart);
+        assert_eq!(checksums.get(&checksum_key), Some(&expected_checksum));
     }
 
     #[test]
