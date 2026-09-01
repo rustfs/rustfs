@@ -53,11 +53,9 @@ on:
         description: 'Reset the nodes after the test (DESTROYS test data/config)'
         type: boolean
         default: true
-  workflow_run:
-    # Runs first in the functional chain: upgrade compatibility gates the
-    # nightly suites that follow (S3 -> KMS -> Tier -> Pool/Heal -> Security).
-    workflows: ["Nightly GNU Build"]
-    types: [completed]
+  repository_dispatch:
+    # Functional-chain entry: dispatched by rustfs-functional-chain.yml.
+    types: [rustfs-chain-upgrade]
 
 permissions:
   contents: read
@@ -83,16 +81,27 @@ jobs:
     runs-on: smoke-testing
     continue-on-error: true
     timeout-minutes: 420
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
-      - name: Checkout auto-testing scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: rustfs/auto-testing
-          ref: main
-          path: auto-testing
-          persist-credentials: false
-          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+      # auto-testing is private: clone it with the dedicated PF token (not
+      # GITHUB_TOKEN) and retry transient GitHub/network failures.
+      - name: Checkout auto-testing scripts (with retry)
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf auto-testing
+          for attempt in 1 2 3 4 5; do
+            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
+              echo "auto-testing cloned (attempt ${attempt})"
+              exit 0
+            fi
+            rm -rf auto-testing
+            echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
+            sleep $((attempt * 15))
+          done
+          echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
+          exit 1
 
       - name: Show environment
         run: |
@@ -288,155 +297,64 @@ jobs:
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           fi
 
-          cat > /tmp/rustfs-functional-index.html <<'EOF'
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8" />
-            <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>RustFS Functional Test Reports</title>
-            <style>
-              :root { --bg:#f4f6fb; --card:#fff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb; --accent:#0f766e; }
-              * { box-sizing: border-box; }
-              body { margin: 0; font-family: ui-sans-serif, -apple-system, Segoe UI, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
-              .wrap { max-width: 980px; margin: 32px auto; padding: 0 16px; }
-              .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px; }
-              h1 { margin: 0 0 8px; font-size: 26px; }
-              p { margin: 0 0 14px; color: var(--muted); }
-              .tabs { display: flex; gap: 10px; margin: 14px 0 18px; flex-wrap: wrap; }
-              button { border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 10px; padding: 8px 14px; cursor: pointer; }
-              button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-              .report-btn { border: 0; background: transparent; padding: 0; color: var(--accent); }
-              ul { list-style: none; margin: 0; padding: 0; }
-              li { padding: 10px 0; border-bottom: 1px solid var(--line); }
-              a { color: var(--accent); text-decoration: none; }
-              a:hover { text-decoration: underline; }
-              .meta { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
-              .kv { margin: 6px 0; color: var(--text); }
-              .muted { color: var(--muted); }
-            </style>
-          </head>
-          <body>
-            <div class="wrap">
-              <div class="card">
-                <h1>RustFS Functional Test Reports</h1>
-                <p>Select a suite and date to view the build version used in that run.</p>
-                <div class="tabs" id="tabs"></div>
-                <ul id="list"></ul>
-                <div class="meta">
-                  <div class="kv"><strong>Date:</strong> <span id="report-date" class="muted">N/A</span></div>
-                  <div class="kv"><strong>RustFS Version:</strong> <span id="report-version" class="muted">N/A</span></div>
-                  <div class="kv"><a id="report-link" href="#" target="_blank" rel="noreferrer">Open report</a></div>
-                </div>
-              </div>
-            </div>
-            <script>
-              const suites = [
-                { key: 'upgrade', label: 'Upgrade' },
-                { key: 's3', label: 'S3 Compatibility' },
-                { key: 'kms', label: 'KMS' },
-                { key: 'tier', label: 'Tier' },
-                { key: 'heal', label: 'Heal' },
-                { key: 'pool', label: 'Pool Expansion' },
-                { key: 'security', label: 'Security' },
-              ];
-              const tabs = document.getElementById('tabs');
-              const list = document.getElementById('list');
-              const reportDate = document.getElementById('report-date');
-              const reportVersion = document.getElementById('report-version');
-              const reportLink = document.getElementById('report-link');
-
-              function parseVersion(markdown) {
-                const m = markdown.match(/^- RustFS Version:\s*(.+)$/m);
-                return m ? m[1].trim() : 'N/A';
-              }
-
-              async function showReport(report) {
-                reportDate.textContent = report.name.replace('.md', '');
-                reportVersion.textContent = 'Loading...';
-                reportLink.href = report.html_url;
-                try {
-                  const res = await fetch(report.download_url, { cache: 'no-store' });
-                  if (!res.ok) {
-                    reportVersion.textContent = 'N/A';
-                    return;
-                  }
-                  const text = await res.text();
-                  reportVersion.textContent = parseVersion(text);
-                } catch (_e) {
-                  reportVersion.textContent = 'N/A';
-                }
-              }
-
-              async function loadSuite(suite) {
-                list.innerHTML = '<li>Loading...</li>';
-                const api = `https://api.github.com/repos/rustfs/dashboard/contents/functional-reports/${suite}`;
-                try {
-                  const res = await fetch(api);
-                  if (!res.ok) {
-                    list.innerHTML = '<li>No reports yet.</li>';
-                    return;
-                  }
-                  const data = await res.json();
-                  const files = data.filter(f => f.type === 'file' && f.name.endsWith('.md')).sort((a,b) => b.name.localeCompare(a.name));
-                  if (!files.length) {
-                    list.innerHTML = '<li>No reports yet.</li>';
-                    reportDate.textContent = 'N/A';
-                    reportVersion.textContent = 'N/A';
-                    reportLink.href = '#';
-                    return;
-                  }
-                  list.innerHTML = '';
-                  files.forEach((f) => {
-                    const li = document.createElement('li');
-                    const btn = document.createElement('button');
-                    btn.className = 'report-btn';
-                    btn.textContent = f.name.replace('.md', '');
-                    btn.addEventListener('click', () => showReport(f));
-                    li.appendChild(btn);
-                    list.appendChild(li);
-                  });
-                  showReport(files[0]);
-                } catch (_e) {
-                  list.innerHTML = '<li>Failed to load reports.</li>';
-                  reportDate.textContent = 'N/A';
-                  reportVersion.textContent = 'N/A';
-                  reportLink.href = '#';
-                }
-              }
-
-              function setActive(key) {
-                for (const btn of tabs.querySelectorAll('button')) {
-                  btn.classList.toggle('active', btn.dataset.key === key);
-                }
-                loadSuite(key);
-              }
-
-              for (const suite of suites) {
-                const btn = document.createElement('button');
-                btn.textContent = suite.label;
-                btn.dataset.key = suite.key;
-                btn.addEventListener('click', () => setActive(suite.key));
-                tabs.appendChild(btn);
-              }
-              setActive('upgrade');
-            </script>
-          </body>
-          </html>
-          EOF
-
-          INDEX_PATH="functional/index.html"
-          INDEX_CONTENT="$(python3 -c 'import base64;print(base64.b64encode(open("/tmp/rustfs-functional-index.html","rb").read()).decode())')"
-          INDEX_SHA="$(gh api "repos/rustfs/dashboard/contents/${INDEX_PATH}" -q '.sha' 2>/dev/null || true)"
-          if [ -n "${INDEX_SHA}" ]; then
-            jq -n --arg msg "functional ui update" --arg content "${INDEX_CONTENT}" --arg sha "${INDEX_SHA}" \
-              '{message:$msg, content:$content, sha:$sha}' \
-              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
-          else
-            jq -n --arg msg "functional ui init" --arg content "${INDEX_CONTENT}" \
-              '{message:$msg, content:$content}' \
-              | gh api --method PUT "repos/rustfs/dashboard/contents/${INDEX_PATH}" --input - >/dev/null
+      - name: File failure issue in rustfs/backlog
+        if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          SUITE: 'upgrade'
+          SUITE_LABEL: 'Upgrade compatibility'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPORT_FILE: '/tmp/rustfs-upgrade-report.md'
+          LOG_FILE: '/tmp/rustfs-upgrade.log'
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
+            exit 0
           fi
+          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
+          EXISTING="$(gh issue list -R rustfs/backlog --state all \
+            --search "in:title \"run ${GITHUB_RUN_ID}\"" \
+            --json number --jq '.[].number' || true)"
+          if [ -n "${EXISTING}" ]; then
+            echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
+            exit 0
+          fi
+          redact() {
+            sed -E \
+              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)[=: ]+)[^[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
+              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/^.*(password|secret|token)[=: ].*/[REDACTED SENSITIVE LINE]/Ig'
+          }
+          BODY_FILE="$(mktemp)"
+          {
+            echo "The **${SUITE_LABEL}** functional suite failed."
+            echo ""
+            echo "- Suite: \`${SUITE}\`"
+            echo "- Run: ${RUN_URL}"
+            echo "- Trigger: ${GITHUB_EVENT_NAME}"
+            echo "- Date: $(date -u +%Y-%m-%d)"
+            echo ""
+            echo "## Report (errors and symptoms)"
+            echo ""
+            if [ -s "${REPORT_FILE}" ]; then
+              redact < "${REPORT_FILE}"
+            elif [ -s "${LOG_FILE:-}" ]; then
+              echo "(report file missing; log tail below)"
+              echo ""
+              tail -n 200 "${LOG_FILE}" | redact
+            else
+              echo "(no report or log file was produced)"
+            fi
+          } | head -c 55000 > "${BODY_FILE}"
+          gh label create functional-test -R rustfs/backlog --color d73a4a 2>/dev/null || true
+          if ! gh issue create -R rustfs/backlog --title "${TITLE}" \
+              --body-file "${BODY_FILE}" --label functional-test; then
+            gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}"
+          fi
+          echo "filed backlog issue for suite ${SUITE}"
 
       - name: Upload report and logs
         if: always()
@@ -467,6 +385,24 @@ jobs:
               ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms /var/lib/rustfs/kms-backup
             '
           done
+
+      - name: "Continue functional chain (next: S3 compatibility)"
+        # Only chain-triggered runs forward to the next suite; standalone
+        # workflow_dispatch runs stop after their own cleanup.
+        if: ${{ always() && github.event_name == 'repository_dispatch' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
+            exit 1
+          fi
+          echo "Dispatching next functional suite: S3 compatibility"
+          gh api --method POST repos/rustfs/rustfs/dispatches \
+            -f event_type='rustfs-chain-s3' \
+            -F 'client_payload[from_suite]=upgrade'
 
       - name: Notify on failure
         if: failure()
