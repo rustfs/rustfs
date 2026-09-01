@@ -2501,6 +2501,7 @@ fn list_metadata_resolution_params(
     listing_quorum: usize,
     latest_object_quorum: usize,
     versioned: bool,
+    write_quorum_slack: usize,
 ) -> MetadataResolutionParams {
     let quorum = if versioned {
         listing_quorum
@@ -2511,6 +2512,7 @@ fn list_metadata_resolution_params(
         dir_quorum: quorum,
         obj_quorum: quorum,
         bucket,
+        write_quorum_slack,
         ..Default::default()
     };
 
@@ -2811,7 +2813,10 @@ fn cached_entry_needs_supplement(
 
     let mut selected_object_versions = 0;
     for version in cached.versions.iter() {
-        let required_quorum = version.write_quorum(resolver.obj_quorum).max(resolver.obj_quorum);
+        let required_quorum = version
+            .write_quorum(resolver.obj_quorum)
+            .saturating_sub(resolver.write_quorum_slack)
+            .max(resolver.obj_quorum);
         if version_requires_supplement(required_quorum, reader_disks, selected_object_versions, resolver.requested_versions) {
             return true;
         }
@@ -2962,7 +2967,10 @@ fn resolve_agreed_listing_entry(
     let mut needs_supplement = false;
 
     for (idx, version) in cached.versions.iter().enumerate() {
-        let required_quorum = version.write_quorum(resolver.obj_quorum).max(resolver.obj_quorum);
+        let required_quorum = version
+            .write_quorum(resolver.obj_quorum)
+            .saturating_sub(resolver.write_quorum_slack)
+            .max(resolver.obj_quorum);
         if reader_disks < required_quorum {
             needs_supplement |=
                 version_requires_supplement(required_quorum, reader_disks, selected_object_versions, resolver.requested_versions);
@@ -3016,21 +3024,51 @@ fn latest_listing_object_quorum(
     drive_count: usize,
     parity_count: usize,
     enforce_write_quorum: bool,
+    unreachable_disks: usize,
 ) -> usize {
-    latest_listing_required_object_quorum(listing_quorum, drive_count, parity_count, enforce_write_quorum)
+    latest_listing_required_object_quorum(listing_quorum, drive_count, parity_count, enforce_write_quorum, unreachable_disks)
 }
 
+/// Object quorum a listed "latest" version must reach among the drives the
+/// listing can actually consult.
+///
+/// An object legally committed at write quorum can have up to
+/// `unreachable_disks` of its metadata copies on drives that are offline for
+/// this listing, so the write-quorum requirement is relaxed by that amount.
+/// The result is floored at the erasure read quorum (data drives): below that
+/// the object could not be read back either, and a quorum-deleted object
+/// leaves at most `drive_count - write_quorum < read_quorum` stale copies, so
+/// the floor also keeps deleted objects from resurfacing.
+///
+/// Trade-off: while a drive is offline, a torn overwrite that reached only
+/// `write_quorum - 1` drives becomes indistinguishable from a committed write
+/// whose missing copy sits on the offline drive, so it can be listed as
+/// latest. GET at read quorum serves that same version in that state, so the
+/// listing stays consistent with reads instead of hiding readable objects.
 fn latest_listing_required_object_quorum(
     listing_quorum: usize,
     drive_count: usize,
     parity_count: usize,
     enforce_write_quorum: bool,
+    unreachable_disks: usize,
 ) -> usize {
     if !enforce_write_quorum {
         return listing_quorum;
     }
 
-    write_quorum_for_drive_count(drive_count, parity_count).max(listing_quorum)
+    let read_quorum = drive_count.saturating_sub(parity_count);
+    write_quorum_for_drive_count(drive_count, parity_count)
+        .saturating_sub(unreachable_disks)
+        .max(read_quorum)
+        .max(listing_quorum)
+}
+
+fn latest_listing_write_quorum_slack(enforce_write_quorum: bool, drive_count: usize, online_disks: usize) -> usize {
+    if !enforce_write_quorum {
+        return 0;
+    }
+
+    drive_count.saturating_sub(online_disks)
 }
 
 fn enforce_latest_listing_write_quorum(strict_latest: bool, ask_disks: &str) -> bool {
@@ -4322,6 +4360,9 @@ impl ECStore {
         for eset in self.pools.iter() {
             for set in eset.disk_set.iter() {
                 let (mut disks, infos, _) = set.get_online_disks_with_healing_and_info(true).await;
+                // Captured before any quorum-based filtering: only genuinely
+                // unreachable drives may relax the write-quorum requirement.
+                let online_disks = disks.len();
                 let opts = opts.clone();
 
                 let (sender, list_out_rx) = mpsc::channel::<MetaCacheEntry>(1);
@@ -4347,11 +4388,14 @@ impl ECStore {
                     let listing_quorum = listing_quorum_from_ask_disks(ask_disks);
                     let enforce_write_quorum = enforce_latest_listing_write_quorum(opts.latest_only, &opts.ask_disks);
                     let write_quorum_parity = set.default_parity_count;
+                    let write_quorum_slack =
+                        latest_listing_write_quorum_slack(enforce_write_quorum, set.set_drive_count, online_disks);
                     let required_obj_quorum = latest_listing_required_object_quorum(
                         listing_quorum,
                         set.set_drive_count,
                         write_quorum_parity,
                         enforce_write_quorum,
+                        write_quorum_slack,
                     );
                     ask_disks = expand_ask_disks_for_object_quorum(ask_disks, disks.len(), required_obj_quorum);
                     let fallback_disks = {
@@ -4373,11 +4417,17 @@ impl ECStore {
                         set.set_drive_count,
                         write_quorum_parity,
                         enforce_write_quorum,
+                        write_quorum_slack,
                     );
                     let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, obj_quorum, enforce_write_quorum);
 
-                    let resolver =
-                        list_metadata_resolution_params(bucket.to_owned(), listing_quorum, obj_quorum, !opts.latest_only);
+                    let resolver = list_metadata_resolution_params(
+                        bucket.to_owned(),
+                        listing_quorum,
+                        obj_quorum,
+                        !opts.latest_only,
+                        write_quorum_slack,
+                    );
                     let agreed_resolver = resolver.clone();
                     let partial_resolver = resolver.clone();
                     let reader_disks = disks.len();
@@ -5564,6 +5614,9 @@ impl Sets {
 
         for set in &self.disk_set {
             let (mut disks, infos, _) = set.get_online_disks_with_healing_and_info(true).await;
+            // Captured before any quorum-based filtering: only genuinely
+            // unreachable drives may relax the write-quorum requirement.
+            let online_disks = disks.len();
             let opts = opts.clone();
             let (sender, list_out_rx) = mpsc::channel::<MetaCacheEntry>(1);
             inputs.push(list_out_rx);
@@ -5589,11 +5642,14 @@ impl Sets {
                 let listing_quorum = listing_quorum_from_ask_disks(ask_disks);
                 let enforce_write_quorum = enforce_latest_listing_write_quorum(opts.latest_only, &opts.ask_disks);
                 let write_quorum_parity = set.default_parity_count;
+                let write_quorum_slack =
+                    latest_listing_write_quorum_slack(enforce_write_quorum, set.set_drive_count, online_disks);
                 let required_obj_quorum = latest_listing_required_object_quorum(
                     listing_quorum,
                     set.set_drive_count,
                     write_quorum_parity,
                     enforce_write_quorum,
+                    write_quorum_slack,
                 );
                 ask_disks = expand_ask_disks_for_object_quorum(ask_disks, disks.len(), required_obj_quorum);
                 let fallback_disks = if let Some(asked_disks) = positive_ask_disks(ask_disks)
@@ -5608,10 +5664,21 @@ impl Sets {
                 let fallback_disks = Arc::new(fallback_disks);
                 let claim_tracker = FallbackClaimTracker::default();
 
-                let obj_quorum =
-                    latest_listing_object_quorum(listing_quorum, set.set_drive_count, write_quorum_parity, enforce_write_quorum);
+                let obj_quorum = latest_listing_object_quorum(
+                    listing_quorum,
+                    set.set_drive_count,
+                    write_quorum_parity,
+                    enforce_write_quorum,
+                    write_quorum_slack,
+                );
                 let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, obj_quorum, enforce_write_quorum);
-                let resolver = list_metadata_resolution_params(bucket.to_owned(), listing_quorum, obj_quorum, !opts.latest_only);
+                let resolver = list_metadata_resolution_params(
+                    bucket.to_owned(),
+                    listing_quorum,
+                    obj_quorum,
+                    !opts.latest_only,
+                    write_quorum_slack,
+                );
                 let agreed_resolver = resolver.clone();
                 let partial_resolver = resolver.clone();
                 let reader_disks = disks.len();
@@ -6533,6 +6600,9 @@ impl SetDisks {
         let list_path_started = std::time::Instant::now();
 
         let (mut disks, infos, _) = self.get_online_disks_with_healing_and_info(true).await;
+        // Captured before any quorum-based filtering: only genuinely
+        // unreachable drives may relax the write-quorum requirement.
+        let online_disks = disks.len();
 
         let mut ask_disks = get_list_quorum(&opts.ask_disks, self.set_drive_count as i32);
         if ask_disks == -1 {
@@ -6556,11 +6626,13 @@ impl SetDisks {
 
         let enforce_write_quorum = enforce_latest_listing_write_quorum(!opts.versioned, &opts.ask_disks);
         let write_quorum_parity = self.default_parity_count;
+        let write_quorum_slack = latest_listing_write_quorum_slack(enforce_write_quorum, self.set_drive_count, online_disks);
         let required_obj_quorum = latest_listing_required_object_quorum(
             listing_quorum,
             self.set_drive_count,
             write_quorum_parity,
             enforce_write_quorum,
+            write_quorum_slack,
         );
         ask_disks = expand_ask_disks_for_object_quorum(ask_disks, disks.len(), required_obj_quorum);
         let mut fallback_disks = Vec::new();
@@ -6578,10 +6650,21 @@ impl SetDisks {
 
         let bucket = opts.bucket.clone();
         let base_dir = opts.base_dir.clone();
-        let latest_object_quorum =
-            latest_listing_object_quorum(listing_quorum, self.set_drive_count, write_quorum_parity, enforce_write_quorum);
+        let latest_object_quorum = latest_listing_object_quorum(
+            listing_quorum,
+            self.set_drive_count,
+            write_quorum_parity,
+            enforce_write_quorum,
+            write_quorum_slack,
+        );
         let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, latest_object_quorum, enforce_write_quorum);
-        let resolver = list_metadata_resolution_params(bucket.clone(), listing_quorum, latest_object_quorum, opts.versioned);
+        let resolver = list_metadata_resolution_params(
+            bucket.clone(),
+            listing_quorum,
+            latest_object_quorum,
+            opts.versioned,
+            write_quorum_slack,
+        );
         let agreed_resolver = resolver.clone();
         let partial_resolver = resolver.clone();
         let reader_disks = disks.len();
@@ -6593,6 +6676,7 @@ impl SetDisks {
             asked_disks = ask_disks,
             listing_quorum = listing_quorum,
             latest_object_quorum = latest_object_quorum,
+            write_quorum_slack = write_quorum_slack,
             raw_min_disks = raw_min_disks,
             fallback_disks = fallback_disks.len(),
             limit = opts.limit,
@@ -6840,10 +6924,11 @@ mod test {
         PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
         PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER, PERSISTENT_KEY_ONLY_INDEX_HEADER, PersistentKeyOnlyIndex,
         PersistentListMetadataObject, RUSTFS_META_BUCKET, VerifiedIndexCandidateStats, VersionMarker,
-        current_list_objects_mutation_sequence, encode_persistent_list_metadata_object, enforce_latest_listing_write_quorum,
-        expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects,
-        latest_listing_object_quorum, latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_marker_key,
-        list_merged_entry_channel, list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
+        cached_entry_needs_supplement, current_list_objects_mutation_sequence, encode_persistent_list_metadata_object,
+        enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum, fallback_entries_for_object, gather_results,
+        latest_listing_allow_agreed_objects, latest_listing_object_quorum, latest_listing_raw_min_disks,
+        latest_listing_required_object_quorum, latest_listing_write_quorum_slack, list_marker_key, list_merged_entry_channel,
+        list_metadata_resolution_params, list_objects_from_metadata_snapshot_candidates,
         list_objects_from_verified_index_candidates, list_objects_from_verified_index_candidates_with_optional_stats,
         list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
         list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
@@ -8990,7 +9075,7 @@ mod test {
 
     #[test]
     fn list_metadata_resolution_params_limits_plain_listing_to_latest_version() {
-        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 3, false);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 3, false, 0);
 
         assert_eq!(resolver.dir_quorum, 3);
         assert_eq!(resolver.obj_quorum, 3);
@@ -9000,7 +9085,7 @@ mod test {
 
     #[test]
     fn list_metadata_resolution_params_keeps_all_versions_for_version_listing() {
-        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, true);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, true, 0);
 
         assert_eq!(resolver.dir_quorum, 3);
         assert_eq!(resolver.obj_quorum, 3);
@@ -9010,22 +9095,22 @@ mod test {
 
     #[test]
     fn latest_listing_object_quorum_uses_write_quorum_for_strict_latest_listing() {
-        let required_quorum = latest_listing_required_object_quorum(2, 8, 4, true);
+        let required_quorum = latest_listing_required_object_quorum(2, 8, 4, true, 0);
         let ask_disks = expand_ask_disks_for_object_quorum(4, 8, required_quorum);
 
         assert_eq!(required_quorum, 5);
         assert_eq!(ask_disks, 5);
-        assert_eq!(latest_listing_object_quorum(2, 8, 4, true), 5);
+        assert_eq!(latest_listing_object_quorum(2, 8, 4, true, 0), 5);
     }
 
     #[test]
     fn latest_listing_object_quorum_calculates_low_parity_write_quorum() {
-        let required_quorum = latest_listing_required_object_quorum(2, 8, 1, true);
+        let required_quorum = latest_listing_required_object_quorum(2, 8, 1, true, 0);
         let ask_disks = expand_ask_disks_for_object_quorum(4, 8, required_quorum);
 
         assert_eq!(required_quorum, 7);
         assert_eq!(ask_disks, 7);
-        assert_eq!(latest_listing_object_quorum(2, 8, 1, true), 7);
+        assert_eq!(latest_listing_object_quorum(2, 8, 1, true, 0), 7);
     }
 
     #[test]
@@ -9034,21 +9119,92 @@ mod test {
         assert!(!enforce_latest_listing_write_quorum(true, "disk"));
         assert!(enforce_latest_listing_write_quorum(true, "optimal"));
         assert!(!enforce_latest_listing_write_quorum(false, "optimal"));
-        assert_eq!(latest_listing_required_object_quorum(1, 4, 2, false), 1);
-        assert_eq!(latest_listing_object_quorum(1, 4, 2, false), 1);
-        assert_eq!(latest_listing_required_object_quorum(2, 4, 2, false), 2);
-        assert_eq!(latest_listing_object_quorum(2, 4, 2, false), 2);
+        assert_eq!(latest_listing_required_object_quorum(1, 4, 2, false, 0), 1);
+        assert_eq!(latest_listing_object_quorum(1, 4, 2, false, 0), 1);
+        assert_eq!(latest_listing_required_object_quorum(2, 4, 2, false, 0), 2);
+        assert_eq!(latest_listing_object_quorum(2, 4, 2, false, 0), 2);
         assert_eq!(expand_ask_disks_for_object_quorum(2, 4, 2), 2);
     }
 
     #[test]
+    fn latest_listing_object_quorum_relaxes_write_quorum_by_unreachable_drives() {
+        // 4-drive set, EC 2+2: with one drive offline an object committed at
+        // write quorum 3 can only ever show 2 metadata copies to the listing.
+        let slack = latest_listing_write_quorum_slack(true, 4, 3);
+        assert_eq!(slack, 1);
+        assert_eq!(latest_listing_required_object_quorum(2, 4, 2, true, slack), 2);
+        assert_eq!(latest_listing_required_object_quorum(2, 4, 2, true, 0), 3);
+
+        // The relaxed quorum never drops below the erasure read quorum, so a
+        // quorum-deleted object (at most one stale copy) stays hidden even
+        // with half the set unreachable.
+        let slack = latest_listing_write_quorum_slack(true, 4, 2);
+        assert_eq!(slack, 2);
+        assert_eq!(latest_listing_required_object_quorum(1, 4, 2, true, slack), 2);
+
+        assert_eq!(latest_listing_write_quorum_slack(false, 4, 2), 0);
+    }
+
+    #[test]
+    fn latest_listing_resolves_degraded_object_when_a_set_drive_is_unreachable() {
+        let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let entry = test_object_meta_entry_with_erasure_versions("object", &[(mod_time, "etag", 2, 2)]);
+        let entries = || MetaCacheEntries(vec![Some(entry.clone()), Some(entry.clone()), None]);
+
+        let slack = latest_listing_write_quorum_slack(true, 4, 3);
+        let obj_quorum = latest_listing_object_quorum(2, 4, 2, true, slack);
+        assert_eq!(obj_quorum, 2);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, obj_quorum, false, slack);
+        let resolved = resolve_listing_entries(entries(), resolver, true)
+            .expect("object committed at write quorum should stay listable with one holder drive offline");
+        assert_eq!(resolved.name, "object");
+
+        // Without the unreachable-drive slack the same sample is dropped even
+        // though the object still satisfies read quorum for GET.
+        let strict_quorum = latest_listing_object_quorum(2, 4, 2, true, 0);
+        let strict_resolver = list_metadata_resolution_params("bucket".to_string(), 2, strict_quorum, false, 0);
+        assert!(resolve_listing_entries(entries(), strict_resolver, true).is_none());
+    }
+
+    #[test]
+    fn agreed_listing_entry_relaxes_write_quorum_by_unreachable_drives() {
+        let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let entry = test_object_meta_entry_with_erasure_versions("object", &[(mod_time, "etag", 2, 2)]);
+        let mut resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 1);
+
+        assert!(matches!(
+            resolve_agreed_listing_entry(entry.clone(), 2, resolver.clone(), true),
+            ListingEntryResolution::Resolved(_)
+        ));
+
+        resolver.write_quorum_slack = 0;
+        assert!(matches!(
+            resolve_agreed_listing_entry(entry, 2, resolver, true),
+            ListingEntryResolution::NeedsSupplement(_, _)
+        ));
+    }
+
+    #[test]
+    fn cached_entry_supplement_check_honors_write_quorum_slack() {
+        let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut entry = test_object_meta_entry_with_erasure_versions("object", &[(mod_time, "etag", 2, 2)]);
+        let cached = entry.xl_meta().expect("test entry should decode");
+        let mut resolver = list_metadata_resolution_params("bucket".to_string(), 2, 2, false, 1);
+
+        assert!(!cached_entry_needs_supplement(&cached, 2, &resolver, true));
+
+        resolver.write_quorum_slack = 0;
+        assert!(cached_entry_needs_supplement(&cached, 2, &resolver, true));
+    }
+
+    #[test]
     fn latest_listing_object_quorum_requires_write_quorum_when_degraded_cannot_satisfy_it() {
-        let required_quorum = latest_listing_required_object_quorum(2, 8, 4, true);
+        let required_quorum = latest_listing_required_object_quorum(2, 8, 4, true, 0);
         let ask_disks = expand_ask_disks_for_object_quorum(4, 4, required_quorum);
 
         assert_eq!(required_quorum, 5);
         assert_eq!(ask_disks, 4);
-        assert_eq!(latest_listing_object_quorum(2, 8, 4, true), 5);
+        assert_eq!(latest_listing_object_quorum(2, 8, 4, true, 0), 5);
     }
 
     #[tokio::test]
@@ -9063,7 +9219,7 @@ mod test {
             Some(deleted.clone()),
             Some(deleted.clone()),
         ]);
-        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 4, false);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 4, false, 0);
 
         assert_eq!(listing_entries_supplement_target(&entries, &resolver, true).as_deref(), Some("object"));
         assert_eq!(listing_entries_supplement_target(&entries, &resolver, false), None);
@@ -9128,7 +9284,7 @@ mod test {
         let delete_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
         let stale = test_object_meta_entry_with_erasure_versions("object", &[(object_mod_time, "object-etag", 4, 2)]);
         let deleted = test_object_with_delete_marker_meta_entry("object", object_mod_time, delete_mod_time);
-        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 4, false);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 4, false, 0);
         let entries = MetaCacheEntries(vec![
             Some(stale.clone()),
             Some(stale.clone()),
@@ -9229,7 +9385,7 @@ mod test {
             &[(old_mod_time, "old-etag", 4, 4), (new_mod_time, "new-etag", 7, 1)],
         );
         let fallback_old_entry = test_object_meta_entry_with_erasure_versions("object", &[(old_mod_time, "old-etag", 4, 4)]);
-        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, false);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, false, 0);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
 
@@ -9284,7 +9440,7 @@ mod test {
             "object",
             &[(old_mod_time, "old-etag", 4, 4), (new_mod_time, "new-etag", 7, 1)],
         );
-        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, false);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, false, 0);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
 
@@ -9328,7 +9484,7 @@ mod test {
         let new_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
         let entry = test_object_meta_entry_with_erasure_versions("object", &[(new_mod_time, "new-etag", 7, 1)]);
         let fallback_entry = entry.clone();
-        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, false);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, false, 0);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
 

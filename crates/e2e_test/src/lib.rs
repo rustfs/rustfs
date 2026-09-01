@@ -348,6 +348,11 @@ mod delete_regression_test;
 #[cfg(test)]
 mod listing_regression_test;
 
+// Cluster regression: objects committed at degraded write quorum must stay
+// listable while a different drive is offline (CI run 33478999853).
+#[cfg(test)]
+mod degraded_listing_availability_test;
+
 // P1 regression: bucket statistics accuracy (rustfs#5615, #5008, #5116, #5055, #3898, #1012)
 #[cfg(test)]
 mod bucket_stats_regression_test;
