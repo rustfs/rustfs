@@ -60,6 +60,12 @@ struct ScannerCycleResetRequest {
     mode: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScannerUsageStateResetRequest {
+    mode: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ScannerFreshnessStatus {
     state: &'static str,
@@ -234,6 +240,11 @@ pub fn register_scanner_route(r: &mut S3Router<AdminOperation>) -> std::io::Resu
         AdminOperation(&ScannerCycleStateResetHandler {}),
     )?;
     r.insert(
+        Method::POST,
+        format!("{ADMIN_PREFIX}/v3/scanner/usage-state/reset").as_str(),
+        AdminOperation(&ScannerUsageStateResetHandler {}),
+    )?;
+    r.insert(
         Method::GET,
         format!("{ADMIN_PREFIX}/v3/ilm/expiry/status").as_str(),
         AdminOperation(&IlmExpiryStatusHandler {}),
@@ -303,6 +314,8 @@ pub struct IlmExpiryStatusHandler {}
 
 pub struct ScannerCycleStateResetHandler {}
 
+pub struct ScannerUsageStateResetHandler {}
+
 #[async_trait::async_trait]
 impl Operation for ScannerCycleStateResetHandler {
     async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -329,6 +342,40 @@ impl Operation for ScannerCycleStateResetHandler {
         })
         .await?;
         json_response(br#"{"status":"reset","mode":"full-rescan"}"#.to_vec())
+    }
+}
+
+#[async_trait::async_trait]
+impl Operation for ScannerUsageStateResetHandler {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let _cred = validate_scanner_reset_request(&req).await?;
+        let body = req
+            .input
+            .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
+            .await
+            .map_err(|err| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid reset request body: {err}")))?;
+        let reset = serde_json::from_slice::<ScannerUsageStateResetRequest>(&body)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid reset request body: {err}")))?;
+        if reset.mode != "full-rebuild" {
+            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "reset mode must be full-rebuild"));
+        }
+        let context = app_context_from_req(&req)
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
+        let store = current_object_store_handle_for_context(Some(context.as_ref()))
+            .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "storage layer not initialized"))?;
+        let result = supervise_admin_mutation("scanner usage state reset", async move {
+            rustfs_scanner::scanner::reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store)
+                .await
+                .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, err.to_string()))
+        })
+        .await?;
+        let body = serde_json::to_vec(&result).map_err(|err| {
+            S3Error::with_message(
+                S3ErrorCode::InternalError,
+                format!("failed to encode scanner usage reset response: {err}"),
+            )
+        })?;
+        json_response(body)
     }
 }
 
@@ -420,6 +467,20 @@ mod tests {
             serde_json::from_str(r#"{"mode":"cursor"}"#).expect("mode validation belongs to the handler");
         assert_ne!(cursor.mode, "full-rescan");
         assert!(serde_json::from_str::<ScannerCycleResetRequest>(r#"{"mode":"full-rescan","cursor":"untrusted"}"#).is_err());
+    }
+
+    #[test]
+    fn admin_usage_reset_requires_full_rebuild_without_untrusted_fields() {
+        let full_rebuild: ScannerUsageStateResetRequest =
+            serde_json::from_str(r#"{"mode":"full-rebuild"}"#).expect("full rebuild must be accepted");
+        assert_eq!(full_rebuild.mode, "full-rebuild");
+        let cycle_mode: ScannerUsageStateResetRequest =
+            serde_json::from_str(r#"{"mode":"full-rescan"}"#).expect("mode validation belongs to the handler");
+        assert_ne!(cycle_mode.mode, "full-rebuild");
+        assert!(
+            serde_json::from_str::<ScannerUsageStateResetRequest>(r#"{"mode":"full-rebuild","delete_files":[".usage.v2.json"]}"#)
+                .is_err()
+        );
     }
 
     #[test]

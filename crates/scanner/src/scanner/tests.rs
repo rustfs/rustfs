@@ -4378,6 +4378,265 @@ async fn usage_bootstrap_does_not_overwrite_concurrent_replacement() {
 }
 
 #[tokio::test]
+#[serial]
+async fn scanner_usage_state_reset_publishes_fenced_bootstrap_marker() {
+    let (_temp_dir, store) = setup_scanner_cycle_store().await;
+    let cycle = CurrentCycle {
+        current: 41,
+        next: 42,
+        cycle_completed: vec![Utc::now()],
+        started: Utc::now(),
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        encode_scanner_cycle_state(&cycle, 7).expect("cycle state should encode"),
+    )
+    .await
+    .expect("cycle state should persist");
+
+    let usage_backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+    let legacy_backup_path = format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str());
+    for (path, epoch, cycle) in [
+        (usage_backup_path.as_str(), 6, 40),
+        (LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(), 5, 39),
+        (legacy_backup_path.as_str(), 4, 38),
+        (DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(), 8, 41),
+    ] {
+        let mut usage = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+        usage.scanner_epoch = Some(epoch);
+        usage.scanner_cycle = Some(cycle);
+        save_config(store.clone(), path, serde_json::to_vec(&usage).expect("usage slot should encode"))
+            .await
+            .expect("usage slot should persist");
+    }
+
+    let result = reset_scanner_usage_state_for_full_rebuild(CancellationToken::new(), store.clone())
+        .await
+        .expect("usage state reset should publish a fenced bootstrap marker");
+
+    assert_eq!(result.status, "reset");
+    assert_eq!(result.mode, "full-rebuild");
+    assert_eq!(result.usage_state, "bootstrap-pending");
+    assert_eq!(result.leader_epoch, 9);
+    assert_eq!(result.next_cycle, 42);
+    assert_eq!(result.reset_paths.len(), 5);
+
+    let cycle_state = read_config(store.clone(), DATA_USAGE_BLOOM_NAME_PATH.as_str())
+        .await
+        .expect("reset cycle state should remain");
+    let (reset_cycle, reset_epoch) = decode_scanner_cycle_state(&cycle_state).expect("reset cycle state should decode");
+    assert_eq!(reset_cycle.next, 42);
+    assert_eq!(reset_cycle.current, 0);
+    assert!(reset_cycle.cycle_completed.is_empty());
+    assert_eq!(reset_epoch, 9);
+
+    let usage = read_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("reset usage marker should remain");
+    let usage = serde_json::from_slice::<DataUsageInfo>(&usage).expect("reset usage marker should decode");
+    assert!(data_usage_info_is_bootstrap_pending(&usage));
+    assert!(!data_usage_info_has_persisted_baseline_identity(&usage));
+    assert_eq!(usage.scanner_epoch, Some(9));
+
+    for path in [
+        usage_backup_path.as_str(),
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        legacy_backup_path.as_str(),
+        DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+    ] {
+        assert!(
+            matches!(read_config(store.clone(), path).await, Err(EcstoreError::ConfigNotFound)),
+            "reset should remove stale usage slot {path}"
+        );
+    }
+
+    let (floor, state) = persisted_usage_floor_for_startup(store, false)
+        .await
+        .expect("reset marker should be resumable");
+    assert_eq!(floor.leader_epoch, 9);
+    assert_eq!(state, PersistedUsageFloorStartup::BootstrapPending);
+}
+
+#[tokio::test]
+async fn scanner_usage_state_reset_bootstrap_survives_stale_cleanup_slots_after_restart() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let mut marker = DataUsageInfo {
+        last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+        scanner_epoch: Some(9),
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_bootstrap_pending: true,
+        ..Default::default()
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&marker).expect("usage reset marker should encode"),
+    )
+    .await
+    .expect("usage reset marker should persist");
+    save_config(
+        store.clone(),
+        format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()).as_str(),
+        b"{not-json".to_vec(),
+    )
+    .await
+    .expect("stale malformed backup should persist");
+
+    marker.usage_snapshot_bootstrap_pending = false;
+    marker.usage_snapshot_complete = true;
+    marker.scanner_epoch = Some(8);
+    marker.scanner_cycle = Some(41);
+    for path in [
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+    ] {
+        save_config(
+            store.clone(),
+            &path,
+            serde_json::to_vec(&marker).expect("stale legacy usage should encode"),
+        )
+        .await
+        .expect("stale legacy usage should persist");
+    }
+
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), false)
+        .await
+        .expect("restart should resume reset bootstrap while stale cleanup slots remain");
+    assert_eq!(
+        floor,
+        PersistedUsageFloor {
+            next_cycle: 0,
+            leader_epoch: 9,
+        }
+    );
+    assert_eq!(state, PersistedUsageFloorStartup::BootstrapPending);
+    assert!(
+        persisted_usage_floor(store).await.is_err(),
+        "bootstrap marker must still not become an authoritative usage floor"
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_state_reset_bootstrap_survives_malformed_legacy_primary_after_restart() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let marker = DataUsageInfo {
+        last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+        scanner_epoch: Some(9),
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_bootstrap_pending: true,
+        ..Default::default()
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&marker).expect("usage reset marker should encode"),
+    )
+    .await
+    .expect("usage reset marker should persist");
+    save_config(store.clone(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(), b"{not-json".to_vec())
+        .await
+        .expect("stale malformed legacy primary should persist");
+
+    let (floor, state) = persisted_usage_floor_for_startup(store.clone(), false)
+        .await
+        .expect("restart should resume reset bootstrap when only stale malformed legacy primary remains");
+    assert_eq!(
+        floor,
+        PersistedUsageFloor {
+            next_cycle: 0,
+            leader_epoch: 9,
+        }
+    );
+    assert_eq!(state, PersistedUsageFloorStartup::BootstrapPending);
+    assert!(persisted_usage_floor(store).await.is_err());
+}
+
+#[tokio::test]
+async fn scanner_usage_state_reset_bootstrap_does_not_mask_newer_legacy_backup() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let marker = DataUsageInfo {
+        last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+        scanner_epoch: Some(9),
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_bootstrap_pending: true,
+        ..Default::default()
+    };
+    save_config(
+        store.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        serde_json::to_vec(&marker).expect("usage reset marker should encode"),
+    )
+    .await
+    .expect("usage reset marker should persist");
+    save_config(store.clone(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str(), b"{not-json".to_vec())
+        .await
+        .expect("malformed legacy primary should persist");
+
+    let mut newer_backup = complete_usage_with_bucket_count(Some(std::time::SystemTime::UNIX_EPOCH), 0);
+    newer_backup.scanner_epoch = Some(10);
+    newer_backup.scanner_cycle = Some(43);
+    save_config(
+        store.clone(),
+        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()).as_str(),
+        serde_json::to_vec(&newer_backup).expect("newer legacy backup should encode"),
+    )
+    .await
+    .expect("newer legacy backup should persist");
+
+    let err = persisted_usage_floor_for_startup(store, false)
+        .await
+        .expect_err("newer legacy backup must not be hidden by an older bootstrap marker");
+    assert!(
+        err.to_string()
+            .contains("scanner usage bootstrap conflicts with a persisted backup"),
+        "unexpected conflict error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_state_reset_slots_reject_primary_aba() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    store.objects.lock().await.insert(key.clone(), b"not-json".to_vec());
+    store.revisions.lock().await.insert(key.clone(), 1);
+    let slots = read_usage_state_reset_slots(store.clone())
+        .await
+        .expect("usage reset slots should be inspected");
+
+    store.objects.lock().await.insert(key.clone(), b"newer-json".to_vec());
+    store.revisions.lock().await.insert(key, 2);
+    let err = reset_scanner_usage_state_slots_for_full_rebuild(store, &slots, 0, 3)
+        .await
+        .expect_err("stale primary revision must not be overwritten");
+    assert!(
+        err.to_string()
+            .contains("scanner usage reset primary slot changed before bootstrap publish"),
+        "unexpected primary ABA error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn scanner_usage_state_reset_slots_defer_when_publication_epoch_moves() {
+    let store = Arc::new(MemoryConfigStore::default());
+    let key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+    store.objects.lock().await.insert(key, b"not-json".to_vec());
+    let slots = read_usage_state_reset_slots(store.clone())
+        .await
+        .expect("usage reset slots should be inspected");
+    store.publication_admission_blocked.store(true, Ordering::Release);
+
+    let err = reset_scanner_usage_state_slots_for_full_rebuild(store, &slots, 0, 3)
+        .await
+        .expect_err("movement admission loss must defer reset");
+    assert!(
+        err.to_string()
+            .contains("scanner usage reset deferred by a movement epoch change"),
+        "unexpected movement defer error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn leadership_claim_defers_on_corrupt_usage_baseline_without_bloom_write() {
     let store = Arc::new(MemoryConfigStore::default());
     let usage_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
