@@ -485,6 +485,19 @@ impl BucketTargetSys {
         mutex
     }
 
+    /// Snapshot the heartbeat-tracked health of `url`'s endpoint.
+    ///
+    /// Returns `None` when the heartbeat has never seen the endpoint. Unlike
+    /// [`Self::is_offline`] this deliberately does not call `init_hc`: a caller
+    /// that only reports metrics must not create health entries as a side
+    /// effect, or merely rendering a status page would mark an unknown peer
+    /// online.
+    pub async fn endpoint_health(&self, url: &Url) -> Option<EpHealth> {
+        let key = endpoint_health_key(url);
+        let health_map = self.h_mutex.read().await;
+        health_map.get(&key).cloned()
+    }
+
     pub async fn is_offline(&self, url: &Url) -> bool {
         let key = endpoint_health_key(url);
         {

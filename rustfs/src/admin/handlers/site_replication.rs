@@ -35,6 +35,7 @@ use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
 use crate::admin::storage_api::bucket::{
     AdminObjectLockConfigExt as _, AdminReplicationConfigExt as _, AdminVersioningConfigExt as _,
 };
+use crate::admin::storage_api::bucket_target_sys::BucketTargetSys;
 use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
@@ -87,6 +88,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use url::Url;
 use url::form_urlencoded;
 use uuid::Uuid;
 
@@ -2092,25 +2094,111 @@ fn filter_sr_info(mut info: SRInfo, opts: &SRStatusOptions) -> SRInfo {
     info
 }
 
-async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
+/// Resolve one peer's downtime and last-seen from the replication heartbeat.
+///
+/// The heartbeat already tracks every remote endpoint it replicates to
+/// (`EpHealth`, refreshed every `RUSTFS_REPL_HEALTH_CHECK_INTERVAL_MS`), so
+/// these come from real observations instead of being synthesized per request.
+/// `reachable` is the caller's live probe for this status call and wins over
+/// the heartbeat's cached flag, which can lag by up to one probe interval.
+///
+/// An endpoint the heartbeat has never seen (no replication target points at
+/// it yet) yields zero downtime rather than a fabricated outage.
+async fn peer_health_metric(endpoint: &str, reachable: bool) -> (i64, Option<OffsetDateTime>) {
+    let fallback = (0, reachable.then(OffsetDateTime::now_utc));
+
+    let Ok(url) = Url::parse(endpoint) else {
+        return fallback;
+    };
+    let Some(health) = BucketTargetSys::get().endpoint_health(&url).await else {
+        return fallback;
+    };
+
+    let total_downtime_ns = i64::try_from(health.offline_duration.as_nanos()).unwrap_or(i64::MAX);
+    let last_online = if reachable {
+        Some(OffsetDateTime::now_utc())
+    } else {
+        health.last_online
+    };
+
+    (total_downtime_ns, last_online)
+}
+
+/// Assemble one peer's metric entry from already-resolved inputs.
+///
+/// Split out of [`build_metrics_summary`] so the local/remote and
+/// reachable/unreachable matrix stays unit-testable without a live replication
+/// stats handle or a populated heartbeat map.
+fn peer_metric_entry(
+    deployment_id: &str,
+    endpoint: &str,
+    is_local: bool,
+    reachable: bool,
+    (total_downtime_ns, last_online): (i64, Option<OffsetDateTime>),
+    local_counters: (i64, i64),
+) -> SRMetric {
+    let (replica_size, replica_count) = local_counters;
+
+    SRMetric {
+        deployment_id: deployment_id.to_string(),
+        endpoint: endpoint.to_string(),
+        online: reachable,
+        total_downtime_ns,
+        last_online,
+        // Replication counters are node-local: they describe traffic this node
+        // handled, so they belong only on the local entry. Copying them onto
+        // remote entries would double-count them cluster-wide.
+        replicated_size: if is_local { replica_size } else { 0 },
+        replicated_count: if is_local { replica_count } else { 0 },
+        ..Default::default()
+    }
+}
+
+async fn build_metrics_summary(
+    local_peer: &PeerInfo,
+    peers: &BTreeMap<String, PeerInfo>,
+    reachable_peers: &HashSet<String>,
+) -> SRMetricsSummary {
     let Some(stats) = current_replication_stats_handle() else {
         return SRMetricsSummary::default();
     };
 
     let node = stats.site_metrics_snapshot().await;
     let mut metrics = BTreeMap::new();
-    metrics.insert(
-        local_peer.deployment_id.clone(),
-        SRMetric {
-            deployment_id: local_peer.deployment_id.clone(),
-            endpoint: local_peer.endpoint.clone(),
-            online: true,
-            replicated_size: node.replica_size,
-            replicated_count: node.replica_count,
-            last_online: Some(OffsetDateTime::now_utc()),
-            ..Default::default()
-        },
-    );
+
+    // Emit an entry for every peer, not just the local one. An operator reading
+    // this page needs to know whether the *remote* site is reachable; reporting
+    // only "I am online" made a peer outage invisible here, so a site could be
+    // down for minutes while the status page stayed green.
+    for (deployment_id, peer) in peers {
+        let is_local = deployment_id == &local_peer.deployment_id;
+        let reachable = is_local || reachable_peers.contains(deployment_id);
+        let health = peer_health_metric(&peer.endpoint, reachable).await;
+
+        metrics.insert(
+            deployment_id.clone(),
+            peer_metric_entry(
+                deployment_id,
+                &peer.endpoint,
+                is_local,
+                reachable,
+                health,
+                (node.replica_size, node.replica_count),
+            ),
+        );
+    }
+
+    // A peer map that somehow omits the local deployment must still report the
+    // local counters rather than silently dropping them.
+    metrics.entry(local_peer.deployment_id.clone()).or_insert_with(|| SRMetric {
+        deployment_id: local_peer.deployment_id.clone(),
+        endpoint: local_peer.endpoint.clone(),
+        online: true,
+        last_online: Some(OffsetDateTime::now_utc()),
+        replicated_size: node.replica_size,
+        replicated_count: node.replica_count,
+        ..Default::default()
+    });
 
     SRMetricsSummary {
         active_workers: WorkerStat {
@@ -2757,7 +2845,7 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
     }
 
     if metrics_requested {
-        status.metrics = build_metrics_summary(local_peer).await;
+        status.metrics = build_metrics_summary(local_peer, &state.peers, &reachable_peers).await;
     }
 
     if opts.peer_state {
@@ -7667,6 +7755,47 @@ impl Operation for SRRotateServiceAccountHandler {
 mod tests {
     use super::*;
     use crate::site_replication::identity::deployment_id_for_endpoint;
+
+    /// A peer the status probe could not reach must render as offline.
+    ///
+    /// Regression: `build_metrics_summary` used to hardcode `online: true` and
+    /// only ever emitted the local deployment, so a peer outage was invisible
+    /// on the status page — `Link: ● online` stayed green through a multi-minute
+    /// outage while replication was failing.
+    #[test]
+    fn peer_metric_entry_reports_unreachable_peer_as_offline() {
+        let heartbeat_last_online = OffsetDateTime::UNIX_EPOCH;
+        let entry = peer_metric_entry(
+            "remote-deployment",
+            "http://remote.example:9000",
+            false,
+            false,
+            (5_000_000_000, Some(heartbeat_last_online)),
+            (4096, 8),
+        );
+
+        assert!(!entry.online, "an unreachable peer must not be reported online");
+        assert_eq!(entry.total_downtime_ns, 5_000_000_000);
+        assert_eq!(
+            entry.last_online,
+            Some(heartbeat_last_online),
+            "an offline peer keeps the heartbeat's last-seen instead of being stamped 'now'"
+        );
+    }
+
+    /// Node-local replication counters must not be copied onto remote entries,
+    /// or a two-site cluster would double-count its own traffic.
+    #[test]
+    fn peer_metric_entry_keeps_replication_counters_on_the_local_entry() {
+        let local = peer_metric_entry("local", "http://local.example:9000", true, true, (0, None), (4096, 8));
+        let remote = peer_metric_entry("remote", "http://remote.example:9000", false, true, (0, None), (4096, 8));
+
+        assert_eq!(local.replicated_size, 4096);
+        assert_eq!(local.replicated_count, 8);
+        assert_eq!(remote.replicated_size, 0);
+        assert_eq!(remote.replicated_count, 0);
+        assert!(remote.online, "a reachable remote peer is still online");
+    }
 
     #[test]
     fn test_rotation_secret_candidates_try_the_installed_secret_before_the_new_one() {
