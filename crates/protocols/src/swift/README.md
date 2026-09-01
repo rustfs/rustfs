@@ -97,14 +97,23 @@ cargo build --features full
 
 ## Configuration
 
-Swift API uses Keystone for authentication. Configure the following environment variables:
+Swift API uses Keystone for authentication. The variables below are read by
+`crates/keystone/src/config.rs`; that file is the authoritative list.
 
 | Variable | Description |
 |----------|-------------|
-| `RUSTFS_KEYSTONE_URL` | Keystone authentication endpoint URL |
-| `RUSTFS_KEYSTONE_ADMIN_TENANT` | Admin tenant/project name |
-| `RUSTFS_KEYSTONE_ADMIN_USER` | Admin username |
-| `RUSTFS_KEYSTONE_ADMIN_PASSWORD` | Admin password |
+| `RUSTFS_KEYSTONE_ENABLE` | Set to `true` to enable Keystone authentication (default `false`; nothing else is read while disabled) |
+| `RUSTFS_KEYSTONE_AUTH_URL` | Keystone authentication endpoint URL (required once enabled) |
+| `RUSTFS_KEYSTONE_VERSION` | Keystone API version, `v3` or `v2.0` (default `v3`) |
+| `RUSTFS_KEYSTONE_ADMIN_USER` | Admin username (optional) |
+| `RUSTFS_KEYSTONE_ADMIN_PASSWORD` | Admin password (optional) |
+| `RUSTFS_KEYSTONE_ADMIN_PROJECT` | Admin project name (optional) |
+| `RUSTFS_KEYSTONE_ADMIN_DOMAIN` | Admin domain name (optional) |
+| `RUSTFS_KEYSTONE_VERIFY_SSL` | Verify the Keystone TLS certificate (default `true`) |
+| `RUSTFS_KEYSTONE_ENABLE_CACHE` / `RUSTFS_KEYSTONE_CACHE_SIZE` / `RUSTFS_KEYSTONE_CACHE_TTL` | Token cache toggle, entry count, and TTL in seconds (defaults `true`, `10000`, `300`) |
+| `RUSTFS_KEYSTONE_TENANT_PREFIX` | Prefix bucket names with the tenant hash (default `true`) |
+| `RUSTFS_KEYSTONE_IMPLICIT_TENANTS` | Allow implicit tenant creation (default `true`) |
+| `RUSTFS_KEYSTONE_TIMEOUT` | Keystone request timeout in seconds (default `30`) |
 
 ## API Endpoints
 
@@ -188,13 +197,15 @@ This ensures:
 
 ## Documentation
 
-See the `docs/` directory for detailed documentation:
+There is no separate Swift reference document in the repository. Use these
+sources instead:
 
-- `SWIFT_API.md` - Complete API reference
-- `TESTING_GUIDE.md` - Manual testing procedures
-- `COMPLETION_ANALYSIS.md` - Protocol coverage tracking
-- `COPY_IMPLEMENTATION.md` - Server-side copy documentation
-- `RANGE_REQUESTS.md` - Range request implementation details
+- Module-level `//!` comments in each `crates/protocols/src/swift/*.rs` file
+  describe the headers and metadata keys that feature reads
+- `crates/protocols/tests/swift_*.rs` and `rustfs/tests/swift_*_integration_test.rs`
+  show the expected request and response shapes
+- `docs/testing/ci-gates.md` describes the CI lane that builds and tests with
+  `--features swift`
 
 ## License
 
