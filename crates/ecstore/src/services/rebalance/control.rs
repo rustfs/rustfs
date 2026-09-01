@@ -1329,8 +1329,9 @@ mod tests {
     use super::*;
     use crate::config::com::delete_config;
     use crate::core::pools::{
-        POOL_META_NAME, PoolActivationDurableSaveBarrier, PoolActivationStartKind, PoolActivationStartProbe, PoolMetaWriteState,
-        persist_pool_meta_identity_for_startup,
+        DecommissionErasureLayout, DecommissionPoolCapacityInfo, POOL_META_NAME, PoolActivationDurableSaveBarrier,
+        PoolActivationStartKind, PoolActivationStartProbe, PoolMetaWriteState, persist_pool_meta_identity_for_startup,
+        set_decommission_capacity_info_overrides_for_test,
     };
     use crate::object_api::NamespaceLockFence;
     use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, hermetic_set_disks_isolated};
@@ -1751,26 +1752,15 @@ mod tests {
         ];
         set_rebalance_disk_stats_override_for_test(rebalance_store.id, disk_stats.clone());
         set_rebalance_disk_stats_override_for_test(decommission_store.id, disk_stats);
-        crate::core::pools::set_decommission_space_info_override_for_test(
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity_snapshot = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 100, 100),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 200, 200, 0),
+        ];
+        // Decommission start samples capacity before and inside its durable activation fence.
+        set_decommission_capacity_info_overrides_for_test(
             decommission_store.id,
-            vec![
-                (
-                    0,
-                    crate::core::pools::PoolSpaceInfo {
-                        free: 0,
-                        total: 100,
-                        used: 100,
-                    },
-                ),
-                (
-                    1,
-                    crate::core::pools::PoolSpaceInfo {
-                        free: 200,
-                        total: 200,
-                        used: 0,
-                    },
-                ),
-            ],
+            vec![capacity_snapshot.clone(), capacity_snapshot],
         );
         let (first_object, competing_object, competing_kind) = match paused_kind {
             PoolActivationStartKind::Rebalance => {
