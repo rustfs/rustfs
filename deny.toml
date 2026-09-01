@@ -36,8 +36,9 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Temporary tokio-tar fork pinned to the reviewed bounded extension parser
-    # change while astral-sh/tokio-tar#118 awaits an upstream release.
+    # Temporary tokio-tar fork pinned to the reviewed parser limits,
+    # cancellation safety, and error-fusing change while
+    # astral-sh/tokio-tar#118 awaits an upstream release.
     # owner: cxymds  review: 2026-10
     "https://github.com/cxymds/tokio-tar.git",
     # Official s3s repository. Temporarily pinned to the merged generic REST
