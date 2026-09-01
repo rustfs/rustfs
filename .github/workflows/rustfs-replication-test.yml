@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: RustFS Security Test
+name: RustFS Replication Test
 
 on:
   workflow_dispatch:
@@ -25,36 +25,24 @@ on:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
         type: string
-      topology:
-        description: 'Topology to run (all = SNSD, SNMD, MNMD)'
+      suite:
+        description: 'Suite to run (all = bucket REP-* then site SITE-*)'
         type: choice
         options:
           - all
-          - single-single
-          - single-multi
-          - multi-multi
+          - bucket
+          - site
         default: all
-      oidc_live:
-        description: 'Run the live Keycloak OIDC/SSO gate as part of the suite'
-        type: boolean
-        default: true
-      cleanup_before:
-        description: 'Reset the nodes before the test (DESTROYS existing data/config)'
-        type: boolean
-        default: true
-      cleanup_after:
-        description: 'Reset the nodes after the test (DESTROYS test data/config)'
-        type: boolean
-        default: true
   repository_dispatch:
-    # Chain handoff: dispatched when the pool expansion suite finishes.
-    types: [rustfs-chain-security]
+    # Chain handoff: dispatched when the security suite finishes. This is the
+    # last link of the functional chain.
+    types: [rustfs-chain-replication]
 
 permissions:
   contents: read
 
-# The security suite uses the same shared VMs as the other functional tests,
-# so it must serialize with them instead of running in parallel.
+# The replication suite uses the same shared VMs as the other functional
+# tests, so it must serialize with them instead of running in parallel.
 concurrency:
   group: rustfs-shared-functional-tests
   cancel-in-progress: false
@@ -72,8 +60,10 @@ env:
   PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
 
 jobs:
-  security-test:
+  replication-test:
     runs-on: smoke-testing
+    # A failed replication run must not break the chain or the workflow: the
+    # failure is reported to rustfs/backlog instead (see the issue step).
     continue-on-error: true
     timeout-minutes: 360
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
@@ -98,22 +88,15 @@ jobs:
           echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
           exit 1
 
-      - name: Checkout repository (for the OIDC live gate script)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          persist-credentials: false
-
       - name: Show environment
         run: |
           uname -a
           jq --version
           openssl version
-          aws --version || true
-          docker --version || true
-          df -h /data | tail -1
+          aws --version
+          df -h /data | tail -1 || true
 
       - name: Cleanup environment (before)
-        if: ${{ inputs.cleanup_before != 'false' || github.event_name != 'workflow_dispatch' }}
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -122,35 +105,31 @@ jobs:
             ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
               set -euo pipefail
               SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
-              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              ${SUDO} systemctl stop rustfs rustfs-rep2 2>/dev/null || true
               if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
                 ${SUDO} dpkg -P rustfs
               fi
               for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
-              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
+              ${SUDO} rm -rf /data/rustfs-rep2 /var/log/rustfs /var/log/rustfs-rep2 /var/lib/rustfs/kms
             '
           done
 
-      - name: Run security suite
+      - name: Run replication suite
         id: test
         continue-on-error: true
         env:
-          REPORT_FILE: /tmp/rustfs-security-report.md
-          RUSTFS_SECURITY_OIDC_LIVE_SCRIPT: ${{ github.workspace }}/scripts/test/oidc_keycloak_live.sh
+          LOG_FILE: /tmp/rustfs-replication.log
         run: |
           set -euo pipefail
-          chmod +x auto-testing/rustfs-security-test.sh
+          chmod +x auto-testing/rustfs-replication-test.sh
           PACKAGE_URL='${{ inputs.package_url }}'
           RUSTFS_VERSION='${{ inputs.rustfs_version }}'
-          TOPOLOGY='${{ inputs.topology }}'
-          ARGS=(-y)
-          if [ "${TOPOLOGY}" = "all" ] || [ -z "${TOPOLOGY}" ] || [ "${TOPOLOGY}" = "null" ]; then
-            ARGS+=(--all-topologies)
+          SUITE='${{ inputs.suite }}'
+          ARGS=(-y --log-file "${LOG_FILE}")
+          if [ "${SUITE}" = "all" ] || [ -z "${SUITE}" ] || [ "${SUITE}" = "null" ]; then
+            ARGS+=(--suite all)
           else
-            ARGS+=(--topology "${TOPOLOGY}")
-          fi
-          if [ "${{ inputs.oidc_live }}" = "true" ] || [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
-            ARGS+=(--oidc-live)
+            ARGS+=(--suite "${SUITE}")
           fi
           if [ -n "${PACKAGE_URL}" ]; then
             ARGS+=(--package-url "${PACKAGE_URL}")
@@ -159,30 +138,109 @@ jobs:
           else
             ARGS+=(--package-url "${RUSTFS_NIGHTLY_PACKAGE_URL}")
           fi
-          ./auto-testing/rustfs-security-test.sh "${ARGS[@]}"
+          ./auto-testing/rustfs-replication-test.sh "${ARGS[@]}"
 
       - name: Generate report
         if: always()
+        env:
+          LOG_FILE: /tmp/rustfs-replication.log
+          REPORT_FILE: /tmp/rustfs-replication-report.md
         run: |
           set -euo pipefail
-          if [ ! -f /tmp/rustfs-security-report.md ]; then
-            {
-              echo "# RustFS security test report"
-              echo ""
-              echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-              echo "- Trigger: ${{ github.event_name }}"
-              echo "- Test Step Outcome: failure (suite did not produce a report)"
-            } > /tmp/rustfs-security-report.md
+          PACKAGE_URL='${{ inputs.package_url }}'
+          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          if [ -n "${PACKAGE_URL}" ]; then
+            PACKAGE_SOURCE="${PACKAGE_URL}"
+          elif [ -n "${RUSTFS_VERSION}" ] && [ "${RUSTFS_VERSION}" != "null" ]; then
+            PACKAGE_SOURCE="version ${RUSTFS_VERSION}"
+          else
+            PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
-          cat /tmp/rustfs-security-report.md >> "${GITHUB_STEP_SUMMARY}"
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          RUSTFS_VERSION_INFO="N/A"
+          if [ "${#NODES[@]}" -gt 0 ]; then
+            DETECTED_VERSION="$(ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+              "${SSH_USER}@${NODES[0]}" 'rustfs --version' 2>/dev/null | tr -d '\r' | head -n 1 || true)"
+            if [ -n "${DETECTED_VERSION}" ]; then
+              RUSTFS_VERSION_INFO="${DETECTED_VERSION}"
+            fi
+          fi
+          CASE_TABLE="/tmp/rustfs-replication-cases.md"
+          python3 - "${LOG_FILE}" "${CASE_TABLE}" <<'PY'
+          import re
+          import sys
+
+          log_file, out_file = sys.argv[1], sys.argv[2]
+          ansi = re.compile(r'\x1b\[[0-9;]*m')
+          start_re = re.compile(r'^---\s+([A-Z0-9]+-[0-9]+)\s+(.+?)\s+---$')
+          done_re = re.compile(r'^\[(PASS|FAIL|UNSUPPORTED)\]\s+([A-Z0-9]+-[0-9]+)\b')
+
+          rows = []
+          index = {}
+          try:
+              with open(log_file, 'r', encoding='utf-8', errors='replace') as fh:
+                  for raw in fh:
+                      line = ansi.sub('', raw).strip()
+                      m = start_re.match(line)
+                      if m:
+                          case_id, name = m.group(1), m.group(2)
+                          if case_id not in index:
+                              index[case_id] = len(rows)
+                              rows.append([case_id, name, 'RUNNING'])
+                          continue
+                      m = done_re.match(line)
+                      if m:
+                          status, case_id = m.group(1), m.group(2)
+                          if case_id in index:
+                              rows[index[case_id]][2] = status
+                          else:
+                              rows.append([case_id, case_id, status])
+                              index[case_id] = len(rows) - 1
+          except FileNotFoundError:
+              rows = []
+
+          counts = {'PASS': 0, 'FAIL': 0, 'UNSUPPORTED': 0, 'RUNNING': 0}
+          for _, _, status in rows:
+              counts[status] = counts.get(status, 0) + 1
+
+          with open(out_file, 'w', encoding='utf-8') as out:
+              out.write('## Case Summary\n\n')
+              out.write(f"- Total: {len(rows)}\\n")
+              out.write(f"- PASS: {counts.get('PASS', 0)}\\n")
+              out.write(f"- FAIL: {counts.get('FAIL', 0)}\\n")
+              out.write(f"- UNSUPPORTED: {counts.get('UNSUPPORTED', 0)}\\n")
+              out.write('\\n')
+              out.write('| Case | Name | Status |\\n')
+              out.write('| --- | --- | --- |\\n')
+              for case_id, name, status in rows:
+                  out.write(f'| {case_id} | {name} | {status} |\\n')
+          PY
+          {
+            echo "# RustFS replication test report"
+            echo ""
+            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- RustFS Version: ${RUSTFS_VERSION_INFO}"
+            echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo ""
+            cat "${CASE_TABLE}" || true
+            echo ""
+            echo "## Log tail"
+            echo '```text'
+            tail -n 200 "${LOG_FILE}" || true
+            echo '```'
+          } | tee "${REPORT_FILE}"
+          cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload functional report to dashboard
         if: always()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
-          REPORT_FILE: /tmp/rustfs-security-report.md
-          SUITE: security
+          REPORT_FILE: /tmp/rustfs-replication-report.md
+          SUITE: replication
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -208,11 +266,11 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-          SUITE: 'security'
-          SUITE_LABEL: 'Security'
+          SUITE: 'replication'
+          SUITE_LABEL: 'Replication (bucket + site)'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPORT_FILE: '/tmp/rustfs-security-report.md'
-          LOG_FILE: ''
+          REPORT_FILE: '/tmp/rustfs-replication-report.md'
+          LOG_FILE: '/tmp/rustfs-replication.log'
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -266,15 +324,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: rustfs-security-test-${{ github.run_id }}
+          name: rustfs-replication-${{ github.run_id }}
           path: |
-            /tmp/rustfs-security-report.md
-            /tmp/rustfs-security.*/*
-          if-no-files-found: ignore
-          retention-days: 3
+            /tmp/rustfs-replication.log
+            /tmp/rustfs-replication-report.md
+          if-no-files-found: warn
 
       - name: Cleanup environment (after)
-        if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}
+        if: always()
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -283,36 +340,26 @@ jobs:
             ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
               set -euo pipefail
               SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
-              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              ${SUDO} systemctl stop rustfs rustfs-rep2 2>/dev/null || true
               if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
                 ${SUDO} dpkg -P rustfs
               fi
               for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
-              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
+              ${SUDO} rm -rf /data/rustfs-rep2 /var/log/rustfs /var/log/rustfs-rep2
             '
           done
 
-      - name: "Continue functional chain (next: Replication)"
-        # Only chain-triggered runs forward to the next suite; standalone
-        # workflow_dispatch runs stop after their own cleanup.
+      - name: Chain complete
+        # Replication is the last link of the functional chain: nothing to
+        # dispatch after it. This step just records that the chain finished.
         if: ${{ always() && github.event_name == 'repository_dispatch' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
         run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
-            exit 1
-          fi
-          echo "Dispatching next functional suite: Replication"
-          gh api --method POST repos/rustfs/rustfs/dispatches \
-            -f event_type='rustfs-chain-replication' \
-            -F 'client_payload[from_suite]=security'
+          echo "Functional chain complete: replication (final suite) finished."
+          echo "from_suite=security trigger=${{ github.event_name }} outcome=${{ steps.test.outcome }}"
 
       - name: Notify on failure
         if: failure()
         run: |
-          echo "RustFS security test failed"
-          echo "Package source: ${{ inputs.package_url || 'nightly (R2 latest)' }}"
-          echo "See the uploaded report and logs for details."
+          echo "RustFS replication suite failed"
+          echo "Package source: ${{ inputs.package_url || inputs.rustfs_version || 'nightly (R2 latest)' }}"
+          echo "See the uploaded report and log artifacts for details."
