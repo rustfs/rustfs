@@ -11,6 +11,10 @@ on:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
         type: string
+      package_sha256:
+        description: 'Optional SHA-256 for package_url; mismatch is an infrastructure failure.'
+        required: false
+        type: string
       rc_sha256:
         description: 'Optional SHA-256 for the preinstalled rc binary; mismatch is an infrastructure failure.'
         required: false
@@ -186,6 +190,7 @@ jobs:
         continue-on-error: true
         env:
           PACKAGE_URL_INPUT: ${{ inputs.package_url }}
+          PACKAGE_SHA256_INPUT: ${{ inputs.package_sha256 }}
           RUSTFS_VERSION_INPUT: ${{ inputs.rustfs_version }}
         run: |
           set -euo pipefail
@@ -193,6 +198,7 @@ jobs:
           chmod +x auto-testing/rustfs-tier-test.sh
           RC_BIN="${RUNNER_TEMP}/issue-2128-rc/rc"
           PACKAGE_URL="${PACKAGE_URL_INPUT}"
+          PACKAGE_SHA256="${PACKAGE_SHA256_INPUT}"
           RUSTFS_VERSION="${RUSTFS_VERSION_INPUT}"
           ARGS=(
             --all-topologies
@@ -203,6 +209,9 @@ jobs:
           )
           if [ -n "${RUSTFS_EXPECTED_RC_SHA256}" ]; then
             ARGS+=(--expected-rc-sha256 "${RUSTFS_EXPECTED_RC_SHA256}")
+          fi
+          if [ -n "${PACKAGE_SHA256}" ]; then
+            ARGS+=(--sha256 "${PACKAGE_SHA256}")
           fi
           if [ -n "${PACKAGE_URL}" ]; then
             ARGS+=(--package-url "${PACKAGE_URL}")
