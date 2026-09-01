@@ -93,6 +93,39 @@ jobs:
           echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
           exit 1
 
+      - name: Download exact rc candidate
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          repository: rustfs/rustfs-release-validation
+          run-id: '33465191972'
+          name: rc-under-test-33465191972-1
+          path: ${{ runner.temp }}/issue-2128-rc
+          github-token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+      - name: Verify exact rc candidate
+        env:
+          RC_BIN: ${{ runner.temp }}/issue-2128-rc/rc
+          RC_PROVENANCE: ${{ runner.temp }}/issue-2128-rc/rc-build.json
+          RC_EXPECTED_COMMIT: f6b9b509a60ef172a2b037d638c2cac46e762129
+          RC_EXPECTED_SHA256: 3d128d99f05403f4028c7c9ae24b03d66a3e98f2090e66cb7f9f45a9e11fdce1
+        run: |
+          set -euo pipefail
+          test -s "${RC_BIN}"
+          test -s "${RC_PROVENANCE}"
+          jq -e \
+            --arg commit "${RC_EXPECTED_COMMIT}" \
+            --arg digest "${RC_EXPECTED_SHA256}" \
+            '.repository == "rustfs/cli"
+             and .requestedCommit == $commit
+             and .resolvedCommit == $commit
+             and .binarySha256 == $digest
+             and .target == "x86_64-unknown-linux-gnu"' \
+            "${RC_PROVENANCE}" >/dev/null
+          actual_sha256="$(sha256sum -- "${RC_BIN}" | awk '{print $1}')"
+          test "${actual_sha256}" = "${RC_EXPECTED_SHA256}"
+          chmod 0555 "${RC_BIN}"
+          "${RC_BIN}" --version
+
       - name: Show environment
         run: |
           uname -a
@@ -158,7 +191,7 @@ jobs:
           set -euo pipefail
           LOG_FILE="${TIER_ARTIFACTS_DIR}/rustfs-tier.log"
           chmod +x auto-testing/rustfs-tier-test.sh
-          RC_BIN="$(command -v rc)"
+          RC_BIN="${RUNNER_TEMP}/issue-2128-rc/rc"
           PACKAGE_URL="${PACKAGE_URL_INPUT}"
           RUSTFS_VERSION="${RUSTFS_VERSION_INPUT}"
           ARGS=(
