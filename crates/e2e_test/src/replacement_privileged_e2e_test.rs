@@ -211,6 +211,69 @@ mod tests {
         }
     }
 
+    struct ZramBlockMount {
+        target: PathBuf,
+        device: String,
+        mounted: bool,
+    }
+
+    impl ZramBlockMount {
+        fn mount(target: &Path) -> Result<Self, Box<dyn Error + Send + Sync>> {
+            if !Path::new("/dev/zram-control").exists() {
+                run_command("modprobe", &["zram"])?;
+            }
+            let device = run_command_stdout("zramctl", &["--find", "--size", "256M"])?;
+            if device.is_empty() {
+                return Err("zramctl --find --size returned an empty device".into());
+            }
+
+            let mut mount = Self {
+                target: target.to_path_buf(),
+                device,
+                mounted: false,
+            };
+            let result = (|| {
+                run_command("mkfs.ext4", &["-F", &mount.device])?;
+                let target_arg = path_to_string(&mount.target, "zram replacement mount target")?;
+                run_command("mount", &[&mount.device, &target_arg])
+            })();
+            if let Err(error) = result {
+                let _ = mount.cleanup();
+                return Err(error);
+            }
+            mount.mounted = true;
+            Ok(mount)
+        }
+
+        fn cleanup(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+            let mut first_error: Option<Box<dyn Error + Send + Sync>> = None;
+            if self.mounted {
+                if let Err(error) = detach_mount(&self.target) {
+                    first_error.get_or_insert(error);
+                } else {
+                    self.mounted = false;
+                }
+            }
+            if !self.device.is_empty() {
+                if let Err(error) = run_command("zramctl", &["--reset", &self.device]) {
+                    first_error.get_or_insert(error);
+                } else {
+                    self.device.clear();
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for ZramBlockMount {
+        fn drop(&mut self) {
+            let _ = self.cleanup();
+        }
+    }
+
     fn checked_command_output(program: &str, args: &[&str]) -> Result<std::process::Output, Box<dyn Error + Send + Sync>> {
         let output = Command::new(program).args(args).output()?;
         if output.status.success() {
@@ -808,10 +871,10 @@ mod tests {
         let target_log_path = replacement_target_log_path(&cluster.temp_dir, parity)?;
         cluster.set_node_capture_log_path(TARGET_NODE, target_log_path.to_string_lossy())?;
         let target_disk = PathBuf::from(&cluster.nodes[TARGET_NODE].data_dirs[TARGET_DRIVE]);
-        // Each drive below is an independent tmpfs mount, so this privileged
-        // path must exercise the production distinct-device/readiness fences.
+        // The blank target uses a temporary zram block device, so the
+        // replacement readiness fence sees no root or sibling alias.
         cluster.extra_env.retain(|(key, _)| key != "RUSTFS_UNSAFE_BYPASS_DISK_CHECK");
-        let image_root = PathBuf::from(&cluster.temp_dir).join("replacement-faultable-images");
+        let image_root = PathBuf::from(&cluster.temp_dir).join("replacement-block-images");
         let mut target_mount = None;
         for (node_index, node) in cluster.nodes.iter().enumerate() {
             for (drive_index, drive) in node.data_dirs.iter().enumerate() {
@@ -860,7 +923,7 @@ mod tests {
 
         cluster.stop_node_gracefully(TARGET_NODE).await?;
         target_mount.cleanup()?;
-        mount_ns.mount_tmpfs(&target_disk, &format!("rustfs-e2e-p{parity}-replacement"))?;
+        let _replacement_mount = ZramBlockMount::mount(&target_disk)?;
         let missing_before_restart = incomplete_versions(&target_disk, &versions)?;
         assert_eq!(
             missing_before_restart.len(),

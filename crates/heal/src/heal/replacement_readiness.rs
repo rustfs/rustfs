@@ -14,9 +14,9 @@
 
 use std::{fs, path::Path};
 
-#[cfg(test)]
-use super::Endpoint;
-use super::{DiskStore, HealDiskExt as _, local_disk_map_read, resume::ReplacementTargetIdentity};
+use super::{
+    DiskOption, DiskStore, Endpoint, HealDiskExt as _, local_disk_map_read, new_disk, resume::ReplacementTargetIdentity,
+};
 
 pub(crate) async fn auto_replacement_target_ready(disk: &DiskStore, local_disks: &[DiskStore]) -> bool {
     auto_replacement_target_identity(disk, local_disks).await.is_some()
@@ -76,6 +76,27 @@ pub(crate) async fn auto_replacement_targets_ready(targets: &[String]) -> bool {
     auto_replacement_target_identities(targets).await.is_some()
 }
 
+async fn replacement_target_disk(target: &str, local_disks: &[DiskStore]) -> Option<DiskStore> {
+    if let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == target) {
+        return Some(disk.clone());
+    }
+
+    let endpoint = Endpoint::try_from(target).ok()?;
+    if !endpoint.is_local {
+        return None;
+    }
+
+    new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .ok()
+}
+
 pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Option<Vec<ReplacementTargetIdentity>> {
     let local_disk_map = local_disk_map_read().await;
     let local_disks = local_disk_map
@@ -88,8 +109,8 @@ pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Op
 
     let mut identities = Vec::with_capacity(targets.len());
     for target in targets {
-        let disk = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target)?;
-        identities.push(auto_replacement_target_identity(disk, &local_disks).await?);
+        let disk = replacement_target_disk(target, &local_disks).await?;
+        identities.push(auto_replacement_target_identity(&disk, &local_disks).await?);
     }
     identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     identities.dedup_by(|left, right| left.endpoint == right.endpoint);

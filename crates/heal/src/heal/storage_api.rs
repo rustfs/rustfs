@@ -24,7 +24,6 @@ pub(crate) use rustfs_ecstore::api::disk::{
     DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
     RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
 };
-#[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
 pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read as ecstore_local_disk_map_read;
@@ -43,7 +42,6 @@ pub(crate) mod owner {
         EcstoreStorageError, EcstoreStore, ecstore_load_admin_data_usage_from_backend_cached, ecstore_local_disk_map_read,
     };
 
-    #[cfg(test)]
     pub(crate) use super::{EcstoreDiskOption, ecstore_new_disk};
 }
 
