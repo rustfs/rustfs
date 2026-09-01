@@ -146,19 +146,18 @@ mod tests {
 
         let expected: HashSet<String> = (0..OBJECT_COUNT).map(object_key).collect();
         let deadline = Instant::now() + LISTING_DEADLINE;
-        let mut listed = HashSet::new();
-        loop {
-            match list_all_keys(&client).await {
-                Ok(keys) => listed = keys,
+        let listed = loop {
+            let listed = match list_all_keys(&client).await {
+                Ok(keys) => keys,
                 Err(error) if Instant::now() < deadline => {
                     info!("retrying degraded listing: {error}");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
                 Err(error) => return Err(error),
-            }
+            };
             if expected.is_subset(&listed) {
-                break;
+                break listed;
             }
             assert!(
                 Instant::now() < deadline,
@@ -167,7 +166,7 @@ mod tests {
                 expected.difference(&listed).collect::<Vec<_>>(),
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        };
         info!(listed = listed.len(), "degraded objects are listable while node 3 is offline");
 
         Ok(())
