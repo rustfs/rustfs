@@ -48,16 +48,33 @@ Unlike other storage systems, RustFS is released under the permissible Apache 2.
 - **Open Source**: Licensed under Apache 2.0, encouraging unrestricted community contributions and commercial usage.
 - **User-Friendly**: Designed with simplicity in mind for easy deployment and management.
 
-| Feature                 | Status       | Feature                  | Status           |
-| :---------------------- | :----------- | :----------------------- | :--------------- |
-| **S3 Core Features**    | ✅ Available | **Bitrot Protection**    | ✅ Available     |
-| **Upload / Download**   | ✅ Available | **Single Node Mode**     | ✅ Available     |
-| **Versioning**          | ✅ Available | **Bucket Replication**   | ✅ Available     |
-| **Logging**             | ✅ Available | **Lifecycle Management** | 🚧 Under Testing |
-| **Event Notifications** | ✅ Available | **Distributed Mode**     | 🚧 Under Testing |
-| **K8s Helm Charts**     | ✅ Available | **RustFS KMS**           | 🚧 Under Testing |
-| **Keystone Auth**       | ✅ Available | **Multi-Tenancy**        | ✅ Available     |
-| **Swift API**           | ✅ Available | **Swift Metadata Ops**   | 🚧 Partial       |
+Status legend: ✅ Available — shipped and covered by CI gates; 🧪 Preview — shipped behind an opt-in flag or with a bounded compatibility claim.
+
+| Feature                          | Status       | Feature                            | Status       |
+| :------------------------------- | :----------- | :--------------------------------- | :----------- |
+| **S3 Core Features**             | ✅ Available | **Distributed Mode**               | ✅ Available |
+| **Upload / Download**            | ✅ Available | **Single Node Mode**               | ✅ Available |
+| **Versioning**                   | ✅ Available | **Bitrot Protection**              | ✅ Available |
+| **Object Lock (WORM)**           | ✅ Available | **Healing & Scanner**              | ✅ Available |
+| **Server-Side Encryption**       | ✅ Available | **Pool Expansion / Decommission**  | ✅ Available |
+| **RustFS KMS**                   | ✅ Available | **Bucket Replication**             | ✅ Available |
+| **Lifecycle Management (ILM)**   | ✅ Available | **Site Replication**               | ✅ Available |
+| **ILM Tiering (Remote S3)**      | ✅ Available | **Bucket Quota**                   | ✅ Available |
+| **S3 Select**                    | ✅ Available | **Event Notifications**            | ✅ Available |
+| **S3 Tables (Iceberg REST)**     | 🧪 Preview   | **Audit Logging**                  | ✅ Available |
+| **IAM / Policies**               | ✅ Available | **Logging & Observability**        | ✅ Available |
+| **OIDC / SSO**                   | ✅ Available | **Web Console**                    | ✅ Available |
+| **Keystone Auth**                | ✅ Available | **K8s Helm Charts**                | ✅ Available |
+| **Swift API**                    | ✅ Available | **FTPS / WebDAV**                  | ✅ Available |
+| **Multi-Tenancy**                | ✅ Available | **SFTP**                           | ✅ Available |
+| **MinIO On-Disk Compatibility**  | 🧪 Preview   |                                    |              |
+
+Notes:
+
+- **RustFS KMS**: Vault (KV2 / Transit) and AWS KMS backends are supported for production. The `Local` and `Static` backends are for development and testing only. See [KMS backend security properties](docs/operations/kms-backend-security.md).
+- **Swift API / SFTP**: opt-in cargo features (`--features swift`, `--features sftp`, or `full`). FTPS and WebDAV are enabled in the default build.
+- **S3 Tables**: ships as an Iceberg REST Catalog with automated PyIceberg and DuckDB coverage; other engines and vendor profiles carry bounded claims listed in the [S3 Tables support matrix](docs/architecture/s3-tables-support-matrix.md).
+- **MinIO On-Disk Compatibility**: gated behind the `rio-v2` feature and not part of the default build. Objects MinIO encrypted are not readable by RustFS. See [MinIO file-format interoperability](docs/architecture/minio-file-format-compat.md).
 
 ## RustFS vs MinIO Performance
 
