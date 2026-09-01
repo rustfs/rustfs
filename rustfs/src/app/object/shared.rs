@@ -475,13 +475,25 @@ pub(super) fn expected_current_version_id(headers: &HeaderMap) -> S3Result<Optio
         .transpose()
 }
 
+pub(super) fn parse_expires_header(expires: Option<&str>) -> S3Result<Option<Timestamp>> {
+    expires
+        .map(|expires| {
+            Timestamp::parse(TimestampFormat::HttpDate, expires).map_err(|_| s3_error!(InvalidArgument, "Invalid Expires header"))
+        })
+        .transpose()
+}
+
+pub(super) fn format_expires_header(expires: &Timestamp) -> S3Result<String> {
+    let mut formatted = Vec::new();
+    expires
+        .format(TimestampFormat::HttpDate, &mut formatted)
+        .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
+    Ok(String::from_utf8_lossy(&formatted).into_owned())
+}
+
 pub(super) fn insert_expires_metadata(metadata: &mut HashMap<String, String>, expires: Option<&Timestamp>) -> S3Result<()> {
     if let Some(expires) = expires {
-        let mut formatted = Vec::new();
-        expires
-            .format(TimestampFormat::HttpDate, &mut formatted)
-            .map_err(|e| ApiError::from(StorageError::other(format!("Invalid expires timestamp: {e}"))))?;
-        metadata.insert("expires".to_string(), String::from_utf8_lossy(&formatted).into_owned());
+        metadata.insert("expires".to_string(), format_expires_header(expires)?);
     }
     Ok(())
 }
@@ -802,6 +814,22 @@ mod tests {
         assert_eq!(throttle.claim(IO_QUEUE_CONGESTION_WARN_INTERVAL_MS + 1), None);
     }
 
+    #[test]
+    fn parse_expires_header_accepts_http_date() {
+        let expires = parse_expires_header(Some("Wed, 21 Oct 2015 07:28:00 GMT"))
+            .expect("valid Expires header should parse")
+            .expect("header should be present");
+
+        assert_eq!(format_expires_header(&expires).unwrap(), "Wed, 21 Oct 2015 07:28:00 GMT");
+    }
+
+    #[test]
+    fn parse_expires_header_rejects_invalid_http_date() {
+        let err = parse_expires_header(Some("not-a-date")).expect_err("invalid Expires header should fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
     // classify_response_checksums is the single point that splits decrypted checksum
     // pairs into the five s3s-typed fields and the additional-algorithm `extra`
     // headers, replacing five copies of the loop. Lock its behaviour (#1252).
@@ -938,6 +966,7 @@ mod tests {
                     sse_algorithm: ServerSideEncryption::from(String::from(algorithm)),
                     kms_master_key_id: kms_key_id.map(|id| SSEKMSKeyId::from(id.to_string())),
                 }),
+                blocked_encryption_types: None,
                 bucket_key_enabled: None,
             }],
         }
