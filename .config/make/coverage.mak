@@ -23,4 +23,4 @@ coverage: core-deps ## Workspace line coverage (cargo-llvm-cov + nextest; slow, 
 	@mkdir -p target/llvm-cov
 	cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
 	cargo llvm-cov report --json --output-path target/llvm-cov/coverage.json
-	python3 scripts/coverage_per_crate.py target/llvm-cov/coverage.json
+	$(RUSTFS_PYTHON_BIN) scripts/coverage_per_crate.py target/llvm-cov/coverage.json

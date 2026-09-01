@@ -41,7 +41,7 @@ use crate::bucket::lifecycle::tier_free_version_recovery::{
     DEFAULT_FREE_VERSION_RECOVERY_LIMIT, FreeVersionRecoveryStats, recover_tier_free_versions_with_cancel,
 };
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
-use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent_with_manager_and_identity};
+use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_with_lease_idempotent};
 use crate::bucket::lifecycle::transition_transaction::run_transition_transaction_recovery_loop;
 use crate::bucket::object_lock::ObjectLockApi;
 use crate::bucket::versioning::VersioningApi as _;
@@ -50,7 +50,10 @@ use crate::disk::error::DiskError;
 use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
 use crate::error::Error;
 use crate::error::StorageError;
-use crate::error::{is_err_object_not_found, is_err_read_quorum, is_err_version_not_found, is_network_or_host_down};
+use crate::error::{
+    is_err_object_not_found, is_err_read_quorum, is_err_strict_volume_not_found, is_err_version_not_found,
+    is_network_or_host_down,
+};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::object_api::{ObjectEncryptionResolver, ReadPlan};
 use crate::services::tier::{
@@ -586,23 +589,215 @@ impl ExpiryOp for FreeVersionTask {
     }
 }
 
-async fn delete_free_version_remote_object(
+async fn acquire_free_version_tier_lease(
     oi: &ObjectInfo,
     tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
-) -> Result<(), std::io::Error> {
+) -> Result<(TierOperationLease, bool), std::io::Error> {
     let version_id_exact = validate_transition_remote_version(oi)?;
     let identity = tier_destination_id_from_metadata(&oi.user_defined)?
         .ok_or_else(|| std::io::Error::other("tier free-version has no durable backend identity"))?;
-    delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+    let lease =
+        TierConfigMgr::acquire_operation_lease_for_backend_identity(tier_config_mgr, &oi.transitioned_object.tier, identity)
+            .await
+            .map_err(std::io::Error::other)?;
+    Ok((lease, version_id_exact))
+}
+
+async fn delete_free_version_remote_object_with_lease(
+    oi: &ObjectInfo,
+    lease: &TierOperationLease,
+    version_id_exact: bool,
+) -> Result<(), std::io::Error> {
+    delete_object_from_remote_tier_with_lease_idempotent(
         &oi.transitioned_object.name,
         &oi.transitioned_object.version_id,
-        &oi.transitioned_object.tier,
-        identity,
-        tier_config_mgr,
+        lease,
         version_id_exact,
     )
     .await?;
     Ok(())
+}
+
+fn free_version_physical_topology_generation(api: &ECStore) -> String {
+    let mut hasher = Sha256::new();
+    for pool in &api.pools {
+        hasher.update(pool.pool_idx.to_be_bytes());
+        hasher.update(pool.disk_set.len().to_be_bytes());
+        for set in &pool.disk_set {
+            hasher.update(set.set_index.to_be_bytes());
+        }
+    }
+    rustfs_utils::crypto::hex(hasher.finalize().as_slice())
+}
+
+fn free_version_remote_tuple_matches(candidate: &ObjectInfo, expected: &ObjectInfo) -> std::io::Result<bool> {
+    if candidate.transitioned_object.tier != expected.transitioned_object.tier
+        || candidate.transitioned_object.name != expected.transitioned_object.name
+    {
+        return Ok(false);
+    }
+    let candidate_identity = tier_destination_id_from_metadata(&candidate.user_defined)?
+        .ok_or_else(|| std::io::Error::other("tier free-version is missing its backend identity"))?;
+    let expected_identity = tier_destination_id_from_metadata(&expected.user_defined)?
+        .ok_or_else(|| std::io::Error::other("tier free-version task is missing its backend identity"))?;
+    if candidate_identity != expected_identity {
+        return Ok(false);
+    }
+    if candidate.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+        || expected.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier free-version remote version state is unknown",
+        ));
+    }
+    Ok(candidate.transition_version_state == expected.transition_version_state
+        && candidate.transitioned_object.version_id == expected.transitioned_object.version_id)
+}
+
+async fn scan_exact_free_version_targets(
+    api: &ECStore,
+    oi: &ObjectInfo,
+    local_object: &str,
+) -> std::io::Result<Vec<(Arc<SetDisks>, FileInfo)>> {
+    let mut targets = Vec::new();
+    for pool in &api.pools {
+        for set in &pool.disk_set {
+            let versions = match set.load_file_info_versions_exact(&oi.bucket, &oi.name).await {
+                Ok(Some(versions)) => versions,
+                Ok(None) => continue,
+                Err(err) if is_err_strict_volume_not_found(&err) => continue,
+                Err(err) => return Err(std::io::Error::other(err)),
+            };
+            for version in versions.versions.iter().chain(versions.free_versions.iter()) {
+                let candidate = ObjectInfo::from_file_info(version, &oi.bucket, &oi.name, true);
+                if free_version_remote_tuple_matches(&candidate, oi)? {
+                    if candidate.transitioned_object.free_version {
+                        // Data movement can leave the same remote tuple in
+                        // several physical pools. Ordinary deletion assigns a
+                        // fresh local free-version UUID to each copy, but all
+                        // of those markers own the same idempotent remote
+                        // DELETE. Consume them together while holding every
+                        // physical object lock; treating their local UUIDs as
+                        // conflicting would strand cleanup forever.
+                        let mut actual = version.clone();
+                        actual.name = local_object.to_string();
+                        targets.push((Arc::clone(set), actual));
+                    } else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            "a live transitioned source still references the free-version remote tuple",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(targets)
+}
+
+fn free_version_cleanup_fences_current(
+    topology_generation: &str,
+    api: &ECStore,
+    bucket_guard: &rustfs_lock::NamespaceLockGuard,
+    object_guards: &[crate::store::ObjectLockDiagGuard],
+    lease: &TierOperationLease,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> bool {
+    !cancel.is_cancelled()
+        && tokio::time::Instant::now() < deadline
+        && !bucket_guard.is_lock_lost()
+        && object_guards.iter().all(|guard| !guard.is_lock_lost())
+        && lease.is_current_generation()
+        && free_version_physical_topology_generation(api) == topology_generation
+}
+
+async fn cleanup_free_version_exact(api: Arc<ECStore>, oi: &ObjectInfo, cancel: &CancellationToken) -> std::io::Result<bool> {
+    const FREE_VERSION_REMOTE_DEADLINE: StdDuration = StdDuration::from_secs(30);
+
+    let topology_generation = free_version_physical_topology_generation(&api);
+    let bucket_guard = api
+        .acquire_bucket_lifecycle_read_lock(&oi.bucket)
+        .await
+        .map_err(std::io::Error::other)?;
+    let (lease, version_id_exact) = acquire_free_version_tier_lease(oi, &api.tier_config_mgr()).await?;
+    let local_object = encode_dir_object(&oi.name);
+    let object_guards = api
+        .acquire_all_physical_object_write_locks("tier_free_version_cleanup", &oi.bucket, &local_object)
+        .await
+        .map_err(std::io::Error::other)?;
+    let targets = scan_exact_free_version_targets(&api, oi, &local_object).await?;
+    if targets.is_empty() {
+        return Ok(false);
+    }
+
+    let deadline = tokio::time::Instant::now() + FREE_VERSION_REMOTE_DEADLINE;
+    if !free_version_cleanup_fences_current(&topology_generation, &api, &bucket_guard, &object_guards, &lease, cancel, deadline) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier free-version cleanup fence is invalid before remote delete",
+        ));
+    }
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "tier free-version cleanup was cancelled"));
+        }
+        result = tokio::time::timeout_at(
+            deadline,
+            delete_free_version_remote_object_with_lease(oi, &lease, version_id_exact),
+        ) => {
+            result
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "tier free-version remote delete timed out"))??;
+        }
+    }
+    if !free_version_cleanup_fences_current(&topology_generation, &api, &bucket_guard, &object_guards, &lease, cancel, deadline) {
+        // Remote DELETE is idempotent, but a changed fence makes the local
+        // outcome ambiguous. Keep every marker for a fully fenced retry.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "tier free-version cleanup fence changed after remote delete",
+        ));
+    }
+
+    let mut first_error = None;
+    for (set, actual) in &targets {
+        let mut delete_request = FileInfo {
+            name: local_object.clone(),
+            version_id: actual.version_id,
+            ..Default::default()
+        };
+        delete_request.set_tier_free_version();
+        if let Err(err) = set
+            .delete_object_version(&oi.bucket, &local_object, &delete_request, false)
+            .await
+            && first_error.is_none()
+        {
+            first_error = Some(std::io::Error::other(err));
+        }
+    }
+    let remaining = scan_exact_free_version_targets(&api, oi, &local_object).await?;
+    if !remaining.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "tier free-version cleanup remained on at least one physical set",
+            )
+        }));
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok(true)
+}
+
+#[cfg(all(test, feature = "test-util"))]
+async fn delete_free_version_remote_object(
+    oi: &ObjectInfo,
+    tier_config_mgr: &Arc<RwLock<TierConfigMgr>>,
+) -> Result<(), std::io::Error> {
+    let (lease, version_id_exact) = acquire_free_version_tier_lease(oi, tier_config_mgr).await?;
+    delete_free_version_remote_object_with_lease(oi, &lease, version_id_exact).await
 }
 
 #[allow(
@@ -618,8 +813,11 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = T>,
 {
-    delete_free_version_remote_object(oi, tier_config_mgr).await?;
-    Ok(delete_local().await)
+    let (lease, version_id_exact) = acquire_free_version_tier_lease(oi, tier_config_mgr).await?;
+    delete_free_version_remote_object_with_lease(oi, &lease, version_id_exact).await?;
+    let result = delete_local().await;
+    drop(lease);
+    Ok(result)
 }
 
 struct NewerNoncurrentTask {
@@ -688,6 +886,10 @@ impl ExpiryState {
 
     pub fn pending_tasks(&self) -> usize {
         usize::try_from(self.stats.pending_tasks().max(0)).unwrap_or(usize::MAX)
+    }
+
+    pub fn active_tasks(&self) -> usize {
+        usize::try_from(self.stats.active_tasks().max(0)).unwrap_or(usize::MAX)
     }
 
     fn send_expiry_task(&self, wrkr: Sender<Option<ExpiryOpType>>, task: ExpiryOpType) -> bool {
@@ -826,7 +1028,7 @@ impl ExpiryState {
     }
 
     pub async fn resize_workers(n: usize, api: Arc<ECStore>) {
-        let expiry_state = runtime_sources::expiry_state_handle();
+        let expiry_state = api.ctx.expiry_state();
         if n == expiry_state.read().await.tasks_tx.len() || n < 1 {
             return;
         }
@@ -867,7 +1069,7 @@ impl ExpiryState {
         stats: Arc<ExpiryStats>,
         recovery_notify: Arc<Notify>,
     ) {
-        let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_else(|| {
+        let cancel_token = api.ctx.background_cancel_token().unwrap_or_else(|| {
             static FALLBACK: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
             FALLBACK.get_or_init(tokio_util::sync::CancellationToken::new).clone()
         });
@@ -968,119 +1170,33 @@ impl ExpiryState {
                     else if v.as_any().is::<FreeVersionTask>() {
                         let v = v.as_any().downcast_ref::<FreeVersionTask>().expect("FreeVersionTask downcast failed");
                         let oi = v.0.clone();
-                        if let Err(err) = delete_free_version_remote_object(&oi, &api.tier_config_mgr()).await {
-                            recovery_notify.notify_one();
-                            debug!(
-                                bucket = %oi.bucket,
-                                object = %oi.name,
-                                remote_object = %oi.transitioned_object.name,
-                                remote_version_id = %oi.transitioned_object.version_id,
-                                tier = %oi.transitioned_object.tier,
-                                error = ?err,
-                                event = EVENT_LIFECYCLE_WORKER_STATE,
-                                component = LOG_COMPONENT_ECSTORE,
-                                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                reason = "remote_tier_delete_failed",
-                                "Lifecycle worker skipped remote tier delete"
-                            );
-                            continue;
-                        }
-
-                        let local_object = encode_dir_object(&oi.name);
-                        let mut fi = FileInfo {
-                            name: local_object.clone(),
-                            version_id: oi.version_id,
-                            ..Default::default()
-                        };
-                        // This removes an existing internal cleanup marker. Keeping
-                        // `deleted` false makes duplicate tasks return not-found
-                        // instead of creating an ordinary delete marker.
-                        fi.set_tier_free_version();
-
-                        let mut deleted_locally = false;
-                        for pool in &api.pools {
-                            let set = pool.get_disks_by_key(&local_object);
-                            let ns_lock = match set.new_ns_lock(&oi.bucket, &local_object).await {
-                                Ok(lock) => lock,
-                                Err(err) => {
-                                    recovery_notify.notify_one();
-                                    debug!(
-                                        event = EVENT_LIFECYCLE_WORKER_STATE,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                        bucket = %oi.bucket,
-                                        object = %oi.name,
-                                        pool_index = pool.pool_idx,
-                                        set_index = set.set_index,
-                                        error = ?err,
-                                        reason = "local_free_version_lock_failed",
-                                        "Lifecycle worker failed to create local free-version cleanup lock"
-                                    );
-                                    continue;
-                                }
-                            };
-                            let _object_lock_guard =
-                                match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
-                                    Ok(guard) => guard,
-                                    Err(err) => {
-                                        recovery_notify.notify_one();
-                                        debug!(
-                                            event = EVENT_LIFECYCLE_WORKER_STATE,
-                                            component = LOG_COMPONENT_ECSTORE,
-                                            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                            bucket = %oi.bucket,
-                                            object = %oi.name,
-                                            pool_index = pool.pool_idx,
-                                            set_index = set.set_index,
-                                            error = ?err,
-                                            reason = "local_free_version_lock_failed",
-                                            "Lifecycle worker failed to acquire local free-version cleanup lock"
-                                        );
-                                        continue;
-                                    }
-                                };
-                            match set
-                                .delete_object_version(&oi.bucket, &local_object, &fi, false)
-                                .await
-                            {
-                                Ok(()) => {
-                                    deleted_locally = true;
-                                    break;
-                                }
-                                Err(err) if is_err_version_not_found(&err) || is_err_object_not_found(&err) => continue,
-                                Err(err) => {
-                                    recovery_notify.notify_one();
-                                    debug!(
-                                        event = EVENT_LIFECYCLE_WORKER_STATE,
-                                        component = LOG_COMPONENT_ECSTORE,
-                                        subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                                        bucket = %oi.bucket,
-                                        object = %oi.name,
-                                        remote_object = %oi.transitioned_object.name,
-                                        remote_version_id = %oi.transitioned_object.version_id,
-                                        tier = %oi.transitioned_object.tier,
-                                        error = ?err,
-                                        reason = "local_free_version_delete_failed",
-                                        "Lifecycle worker failed local free-version cleanup"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-
-                        if !deleted_locally {
-                            debug!(
+                        match cleanup_free_version_exact(api.clone(), &oi, &cancel_token).await {
+                            Ok(true) => {}
+                            Ok(false) => debug!(
                                 event = EVENT_LIFECYCLE_WORKER_STATE,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                                 bucket = %oi.bucket,
                                 object = %oi.name,
-                                remote_object = %oi.transitioned_object.name,
-                                remote_version_id = %oi.transitioned_object.version_id,
-                                tier = %oi.transitioned_object.tier,
                                 reason = "local_free_version_missing",
-                                "Lifecycle worker could not find transitioned free version locally"
-                            );
+                                "Lifecycle worker found that the exact free-version was already absent"
+                            ),
+                            Err(err) => {
+                                recovery_notify.notify_one();
+                                debug!(
+                                    event = EVENT_LIFECYCLE_WORKER_STATE,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                                    bucket = %oi.bucket,
+                                    object = %oi.name,
+                                    remote_object = %oi.transitioned_object.name,
+                                    remote_version_id = %oi.transitioned_object.version_id,
+                                    tier = %oi.transitioned_object.tier,
+                                    error = ?err,
+                                    reason = "free_version_exact_cleanup_deferred",
+                                    "Lifecycle worker retained the exact free-version for a fenced retry"
+                                );
+                            }
                         }
                     }
                     else {
@@ -1152,8 +1268,8 @@ fn set_recovered_free_version_enqueue_observer(
     RecoveredFreeVersionEnqueueObserverGuard
 }
 
-pub async fn enqueue_recovered_free_version(oi: ObjectInfo) -> bool {
-    let expiry_state = runtime_sources::expiry_state_handle();
+pub async fn enqueue_recovered_free_version(api: &ECStore, oi: ObjectInfo) -> bool {
+    let expiry_state = api.ctx.expiry_state();
     let queued = enqueue_recovered_free_version_with_state(&expiry_state, oi).await;
 
     #[cfg(test)]
@@ -2580,8 +2696,8 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>, started: &OnceLock<(
     }
 
     Some(tokio::spawn(async move {
-        let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_default();
-        let expiry_state = runtime_sources::expiry_state_handle();
+        let cancel_token = api.ctx.background_cancel_token().unwrap_or_default();
+        let expiry_state = api.ctx.expiry_state();
         run_tier_free_version_recovery_loop(
             cancel_token,
             expiry_state,
@@ -6229,9 +6345,18 @@ mod tests {
             rustfs_utils::crypto::hex(old_identity),
         );
         oi.user_defined = Arc::new(metadata.clone());
+        let lease_observed_during_local_delete = Arc::new(std::sync::atomic::AtomicBool::new(false));
         delete_free_version_remote_object_then(&oi, &manager, {
             let local_delete_calls = Arc::clone(&local_delete_calls);
+            let lease_observed_during_local_delete = Arc::clone(&lease_observed_during_local_delete);
+            let manager = manager.clone();
             move || async move {
+                assert_eq!(
+                    crate::services::tier::tier::TierConfigMgr::active_operation_lease_count(&manager, "WARM").await,
+                    1,
+                    "the identity-bound tier lease must span the exact local marker delete"
+                );
+                lease_observed_during_local_delete.store(true, Ordering::Relaxed);
                 local_delete_calls.fetch_add(1, Ordering::Relaxed);
             }
         })
@@ -6239,6 +6364,12 @@ mod tests {
         .expect("matching destination identity should allow idempotent remote cleanup");
         assert_eq!(old_backend.remove_count().await, 1);
         assert_eq!(local_delete_calls.load(Ordering::Relaxed), 1);
+        assert!(lease_observed_during_local_delete.load(Ordering::Relaxed));
+        assert_eq!(
+            crate::services::tier::tier::TierConfigMgr::active_operation_lease_count(&manager, "WARM").await,
+            0,
+            "the tier lease should be released after the local marker delete completes"
+        );
 
         let mut single_prefix_metadata = HashMap::new();
         single_prefix_metadata.insert(
@@ -6472,6 +6603,7 @@ mod tests {
         let state = ExpiryState::new();
         let mut state = state.write().await;
         let je = Jentry {
+            persisted_version: 0,
             obj_name: "remote/object".to_string(),
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
@@ -6480,6 +6612,7 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
 
         let err = state
@@ -6620,6 +6753,7 @@ mod tests {
         let state = ExpiryState::new_with_unconsumed_worker_channel(1);
         let mut state = state.write().await;
         let je = Jentry {
+            persisted_version: 0,
             obj_name: "remote/object".to_string(),
             version_id: "remote-version".to_string(),
             tier_name: "WARM".to_string(),
@@ -6628,6 +6762,7 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
 
         state
@@ -6759,7 +6894,7 @@ mod tests {
         };
 
         assert!(
-            super::enqueue_recovered_free_version(oi).await,
+            super::enqueue_recovered_free_version(&ecstore, oi).await,
             "the resized production worker queue should accept the task"
         );
         stop_tx.send(None).await.expect("worker stop signal should be delivered");
@@ -6875,12 +7010,12 @@ mod tests {
             .await
             .expect("free-version task should reach the worker");
         tokio::time::timeout(StdDuration::from_secs(30), async {
-            while remote_backend.remove_count().await == 0 {
+            while stats.active_tasks() == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("worker should complete remote cleanup before taking the local lock");
+        .expect("worker should mark the cleanup task active before the lock assertion");
         let completed_while_locked = tokio::time::timeout(StdDuration::from_millis(100), async {
             while stats.active_tasks() != 0 {
                 tokio::task::yield_now().await;
@@ -6889,7 +7024,12 @@ mod tests {
         .await;
         assert!(
             completed_while_locked.is_err(),
-            "local cleanup must wait while a competing object writer owns the namespace lock"
+            "the cleanup task must wait while a competing object writer owns the namespace lock"
+        );
+        assert_eq!(
+            remote_backend.remove_count().await,
+            0,
+            "the remote tuple must not be deleted before the all-physical namespace fence is acquired"
         );
         for disk_path in &disk_paths {
             assert!(
@@ -6900,6 +7040,13 @@ mod tests {
         }
 
         drop(object_lock_guard);
+        tokio::time::timeout(StdDuration::from_secs(30), async {
+            while remote_backend.remove_count().await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker should delete the remote tuple after acquiring the released namespace fence");
         tx.send(None).await.expect("worker stop signal should be delivered");
         worker.await.expect("free-version worker should stop cleanly");
 
@@ -6995,6 +7142,7 @@ mod tests {
             .next()
             .expect("seeded free version should be recoverable");
         let stale_version_id = oi.version_id.expect("free version should have a concrete UUID");
+        let ordinary_marker_mod_time = OffsetDateTime::now_utc();
 
         for disk_path in &disk_paths {
             let metadata_path = disk_path.join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
@@ -7017,7 +7165,7 @@ mod tests {
                     name: object.to_string(),
                     version_id: Some(stale_version_id),
                     deleted: true,
-                    mod_time: Some(OffsetDateTime::now_utc()),
+                    mod_time: Some(ordinary_marker_mod_time),
                     ..Default::default()
                 })
                 .expect("same-ID ordinary marker should replace the stale free version");
@@ -7030,6 +7178,13 @@ mod tests {
             .await
             .expect("same-ID ordinary marker metadata should be written");
         }
+
+        assert!(
+            !super::cleanup_free_version_exact(Arc::clone(&ecstore), &oi, &CancellationToken::new())
+                .await
+                .expect("a stale task whose local UUID now names an ordinary marker should be an idempotent no-op"),
+            "the stale free-version task must not report local cleanup"
+        );
 
         let state = ExpiryState::new();
         let (stats, recovery_notify) = {
@@ -11522,7 +11677,7 @@ mod tests {
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn journal_replay_rejects_unknown_version_state_before_backend_io() {
+    async fn journal_replay_quarantines_legacy_unknown_version_state_before_backend_io() {
         let (_disk_paths, ecstore) = setup_test_env().await;
         let (backend, _) = register_recovery_mock_tier(&ecstore).await;
         let identity = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
@@ -11530,6 +11685,7 @@ mod tests {
             .expect("mock tier lease should be available")
             .backend_identity();
         let je = Jentry {
+            persisted_version: 0,
             obj_name: "remote/object".to_string(),
             version_id: "legacy-version".to_string(),
             tier_name: "WARM".to_string(),
@@ -11538,25 +11694,28 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Unknown,
             state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
 
+        crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(ecstore.clone(), &je)
+            .await
+            .expect("legacy unknown journal should remain byte-compatible and persistable");
         let err = crate::bucket::lifecycle::tier_delete_journal::process_tier_delete_journal_entry(ecstore, &je)
             .await
-            .expect_err("unknown journal state must fail before backend IO");
+            .expect_err("legacy unknown journal must be quarantined before backend IO");
 
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
         assert_eq!(backend.remove_count().await, 0);
     }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
-    async fn journal_replay_deletes_confirmed_exact_provider_token() {
+    async fn rejected_upload_cleanup_retries_confirmed_exact_provider_token_without_legacy_journal() {
         let (_disk_paths, ecstore) = setup_test_env().await;
         let (backend, _) = register_recovery_mock_tier(&ecstore).await;
         let lease = TierConfigMgr::acquire_operation_lease(&ecstore.tier_config_mgr(), "WARM")
             .await
             .expect("mock tier lease should be available");
-        let identity = lease.backend_identity();
         backend
             .set_put_remote_version(Some("provider-version-token".to_string()))
             .await;
@@ -11570,34 +11729,30 @@ mod tests {
             .expect("confirmed remote candidate should be seeded");
         backend.set_remove_failure(true);
         backend.set_reject_non_empty_remote_versions(true);
-        let je = Jentry {
-            obj_name: "remote/object".to_string(),
-            version_id: "provider-version-token".to_string(),
-            tier_name: "WARM".to_string(),
-            backend_identity: Some(identity),
-            version_id_exact: true,
-            version_state: rustfs_filemeta::TransitionVersionState::Exact,
-            state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
-            source: None,
-        };
-
-        crate::set_disk::cleanup_rejected_transition_upload_durably(
+        let err = crate::set_disk::cleanup_rejected_transition_upload_durably(
             &lease,
-            &je.obj_name,
-            &je.version_id,
+            "remote/object",
+            "provider-version-token",
             true,
             Some(ecstore.clone()),
         )
         .await
-        .expect("failed immediate cleanup should remain durable in the journal");
-        assert!(backend.contains(&je.obj_name).await);
+        .expect_err("a failed immediate cleanup must remain owned by the caller's transition transaction");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(backend.contains("remote/object").await);
 
         backend.set_remove_failure(false);
-        crate::bucket::lifecycle::tier_delete_journal::process_tier_delete_journal_entry(ecstore, &je)
-            .await
-            .expect("identity-bound exact journal must retry confirmed candidate cleanup");
+        crate::set_disk::cleanup_rejected_transition_upload_durably(
+            &lease,
+            "remote/object",
+            "provider-version-token",
+            true,
+            Some(ecstore),
+        )
+        .await
+        .expect("the transaction retry must delete the same confirmed candidate");
 
-        assert!(!backend.contains(&je.obj_name).await);
+        assert!(!backend.contains("remote/object").await);
         assert_eq!(backend.exact_remove_count(), 2);
         assert_eq!(
             backend.remove_versions().await,
@@ -11760,11 +11915,14 @@ mod tests {
         };
         let mut recovery_rx = recovery_rx.lock().await;
         assert!(
-            super::enqueue_recovered_free_version(ObjectInfo {
-                bucket: "prefill".to_string(),
-                name: "prefill".to_string(),
-                ..Default::default()
-            })
+            super::enqueue_recovered_free_version(
+                &ecstore,
+                ObjectInfo {
+                    bucket: "prefill".to_string(),
+                    name: "prefill".to_string(),
+                    ..Default::default()
+                },
+            )
             .await,
             "the production recovery queue should accept its first task"
         );

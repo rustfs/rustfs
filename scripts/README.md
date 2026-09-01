@@ -57,6 +57,7 @@ their issue closes.
 | `test_build_rustfs_options.sh` | dev-tool | Shell test for rustfs build-option wiring | `make test` (script-tests) |
 | `test_entrypoint_credentials.sh` | dev-tool | Container entrypoint credential-handling test | `make test` (script-tests) |
 | `test_helm_chart_version.sh` | dev-tool | Test for `helm_chart_version.sh` | — |
+| `test_package_versions.sh` | ci-gate | Exact-output and fail-closed tests for DEB/RPM package version normalization | audit.yml `workflow-pin-report`; package.yml RPM build |
 | `windows-sftp-listener-smoke.sh` | dev-tool | Confirms `rustfs.exe --features sftp` binds an SFTP listener on Windows | — |
 
 ## Benchmark & performance harnesses
@@ -109,6 +110,7 @@ their issue closes.
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
 | `fuzz/` | ci-gate | Unified cargo-fuzz runner and helpers for the `fuzz/` sub-workspace | fuzz.yml; `fuzz/README.md` |
+| `release/` | ci-gate | Release creation and DEB/RPM version-normalization helpers | build.yml; package.yml |
 | `s3-tests/` | ci-gate | ceph/s3-tests compatibility harness (allow-lists, patches, report tooling) | ci.yml; e2e-s3tests.yml; `scripts/s3-tests/README.md` |
 | `security/` | ci-gate | Workflow-pin enforcement and release supply-chain asset generation | audit.yml; build.yml |
 | `table-catalog/` | dev-tool | S3-Tables / pyiceberg validation suite | `docs/architecture/s3-tables-support-matrix.md` |

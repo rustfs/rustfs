@@ -18,7 +18,8 @@ use crate::bucket::utils::is_meta_bucketname;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
-        DurableIlmRecordCheckpoint, ILM_META_PREFIX, LifecycleExpiryConfigs, ValidatedDurableIlmRecord,
+        DurableIlmRecordCheckpoint, ILM_META_PREFIX, LifecycleExpiryConfigs, TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE,
+        ValidatedDurableIlmRecord,
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
             LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule_for_data_movement, apply_expiry_rule_in,
@@ -26,6 +27,7 @@ use crate::bucket::{
         },
         classify_durable_ilm_record, get_expiry_configs,
         lifecycle::IlmAction,
+        tier_delete_journal::durable_ilm_v6_topology_generation,
         validate_durable_ilm_record,
     },
     metadata_sys,
@@ -49,6 +51,9 @@ use crate::error::{
 use crate::layout::endpoints::EndpointServerPools;
 use crate::object_api::{DecommissionCapacityOptions, GetObjectReader, ObjectOptions};
 use crate::runtime::sources as runtime_sources;
+use crate::services::notification_sys::{
+    acquire_tier_delete_journal_fleet_proof, tier_delete_journal_fleet_proof_matches, tier_delete_journal_topology_generation,
+};
 use crate::services::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::{
@@ -2384,10 +2389,12 @@ struct DecommissionDurableIlmReceipt {
     id: String,
     checkpoint: DurableIlmRecordCheckpoint,
     terminal_checkpoint: Option<DurableIlmRecordCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fleet_topology_generation: Option<String>,
 }
 
 impl DecommissionDurableIlmReceipt {
-    fn new(path: &str, record: &ValidatedDurableIlmRecord) -> Self {
+    fn new(path: &str, record: &ValidatedDurableIlmRecord, fleet_topology_generation: Option<String>) -> Self {
         Self {
             source_path: path.to_string(),
             namespace: record.namespace.to_string(),
@@ -2395,6 +2402,7 @@ impl DecommissionDurableIlmReceipt {
             id: record.id.clone(),
             checkpoint: record.checkpoint.clone(),
             terminal_checkpoint: None,
+            fleet_topology_generation,
         }
     }
 
@@ -2432,6 +2440,16 @@ impl DecommissionDurableIlmReceipt {
                     self.context()
                 ))
             })?;
+        }
+        if self
+            .fleet_topology_generation
+            .as_deref()
+            .is_some_and(|generation| !is_sha256_checksum(generation))
+        {
+            return Err(Error::other_with_context(
+                "receipt fleet topology generation is invalid",
+                format!("source path `{}` {}", self.source_path, self.context()),
+            ));
         }
         Ok(())
     }
@@ -2541,6 +2559,21 @@ fn merge_decommission_durable_ilm_receipts(
         id: existing.id.clone(),
         checkpoint,
         terminal_checkpoint,
+        fleet_topology_generation: match (
+            existing.fleet_topology_generation.as_ref(),
+            incoming.fleet_topology_generation.as_ref(),
+        ) {
+            (Some(existing_generation), Some(incoming_generation)) if existing_generation == incoming_generation => {
+                Some(existing_generation.clone())
+            }
+            (None, None) => None,
+            _ => {
+                return Err(Error::other_with_context(
+                    "durable ILM receipt fleet topology conflict",
+                    format!("source path `{}` {}", existing.source_path, existing.context()),
+                ));
+            }
+        },
     };
     merged.validate()?;
     Ok(merged)
@@ -7050,6 +7083,15 @@ pub(crate) struct DecommissionCapacityOwner {
     pub(crate) mutation_id: Option<uuid::Uuid>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecommissionDurableIlmCheckpointTarget {
+    pub(crate) source_pool_index: usize,
+    pub(crate) target_pool_index: usize,
+    pub(crate) capacity_owner: DecommissionCapacityOwner,
+    pub(crate) already_committed: bool,
+    pub(crate) target_etag: Option<String>,
+}
+
 impl DecommissionCapacityOwner {
     pub(crate) fn apply_to(self, opts: &mut ObjectOptions) {
         opts.src_pool_idx = self.source_pool_index;
@@ -7457,6 +7499,7 @@ impl DecommissionCapacityLockOrderBarrier {
         Self { state }
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) async fn wait_until_owner_paused(&self) {
         tokio::time::timeout(std::time::Duration::from_secs(30), self.state.owner_arrived.notified())
             .await
@@ -7469,6 +7512,7 @@ impl DecommissionCapacityLockOrderBarrier {
             .expect("external mutation should release capacity before waiting for the object namespace");
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) async fn wait_until_external_object_capacity_probe_acquired(&self) {
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -7478,6 +7522,7 @@ impl DecommissionCapacityLockOrderBarrier {
         .expect("external object mutation should acquire its no-active capacity probe");
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) async fn wait_until_external_object_commit_phase_started(&self) {
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -7502,24 +7547,29 @@ impl DecommissionCapacityLockOrderBarrier {
         .expect("external heal should attempt the target namespace lock after capacity admission");
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn release_owner(&self) {
         self.state.owner_release.notify_one();
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn pause_external_object_commit_phase(&self) {
         self.state.external_object_commit_phase_paused.store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn release_external_object_commit_phase(&self) {
         self.state.external_object_commit_phase_release.notify_one();
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn pause_external_object_capacity_probe(&self) {
         self.state
             .external_object_capacity_probe_paused
             .store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn release_external_object_capacity_probe(&self) {
         self.state.external_object_capacity_probe_release.notify_one();
     }
@@ -8018,6 +8068,19 @@ impl ECStore {
         write_state: &mut PoolMetaWriteState,
         operation: &str,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)> {
+        self.acquire_pool_meta_write_guard_with_lock_error(write_state, operation, activation_pool_meta_lock_error)
+            .await
+    }
+
+    async fn acquire_pool_meta_write_guard_with_lock_error<F>(
+        &self,
+        write_state: &mut PoolMetaWriteState,
+        operation: &str,
+        map_lock_error: F,
+    ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)>
+    where
+        F: FnOnce(rustfs_lock::LockError) -> Error,
+    {
         write_state.ensure_write_safe(operation)?;
         load_pool_meta_identity_observing(self.pools.clone(), write_state).await?;
         let pool = self.pools.first().cloned().ok_or_else(|| {
@@ -8031,7 +8094,7 @@ impl ECStore {
         let pool_meta_guard = pool_meta_lock
             .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(activation_pool_meta_lock_error)?;
+            .map_err(map_lock_error)?;
         let selection = load_pool_meta_replicas_observing(self.pools.clone(), true, write_state).await?;
         write_state.observe_replicas(selection.replica_state);
         write_state.ensure_write_safe(operation)?;
@@ -8085,6 +8148,27 @@ impl ECStore {
         let has_active_source = pool_meta_has_active_decommission(&snapshot);
         drop(save_guard);
         Ok((pool_meta_guard, has_active_source))
+    }
+
+    /// Fence healing of the pool metadata object itself without recursively
+    /// acquiring its namespace lock through the ordinary capacity probe. The
+    /// caller must retain the returned write guard through every admitted
+    /// repair; admission results preserve the input target order.
+    pub(crate) async fn acquire_pool_meta_object_heal_fence(
+        &self,
+        target_pool_indices: &[usize],
+    ) -> Result<(rustfs_lock::NamespaceLockGuard, Vec<Result<()>>)> {
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let (pool_meta_guard, snapshot) = self
+            .acquire_pool_meta_write_guard_with_lock_error(&mut save_guard, "pool metadata heal admission failed", Error::from)
+            .await?;
+        let admissions = target_pool_indices
+            .iter()
+            .copied()
+            .map(|target_pool_index| ensure_external_decommission_target_admission(&snapshot, target_pool_index, "heal"))
+            .collect();
+        drop(save_guard);
+        Ok((pool_meta_guard, admissions))
     }
 
     pub(crate) async fn acquire_decommission_capacity_release_fence_with_active_source(
@@ -8279,6 +8363,122 @@ impl ECStore {
     {
         self.run_decommission_capacity_mutation(target_pool_index, capacity_owner, expected_data_bytes, true, false, operation)
             .await
+    }
+
+    /// Finish the capacity transaction for an identity-preserving temporary
+    /// replacement whose target bytes are already durably present. This is
+    /// the crash-recovery half of `run_decommission_capacity_temporary_mutation`:
+    /// it never writes the target again and only resolves a pending intent
+    /// owned by the exact deterministic mutation id.
+    pub(crate) async fn reconcile_decommission_capacity_after_equivalent_temporary_target(
+        &self,
+        owner: DecommissionCapacityOwner,
+        target_pool_index: usize,
+        expected_data_bytes: usize,
+    ) -> Result<()> {
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let (pool_meta_guard, mut snapshot) = self
+            .acquire_pool_meta_write_guard(&mut save_guard, "decommission equivalent temporary target reconciliation failed")
+            .await?;
+        let source_pool_index = owner.source_pool_index;
+        let mutation_id = owner
+            .mutation_id
+            .ok_or_else(|| decommission_capacity_blocked_error("equivalent temporary target mutation identity is missing"))?;
+        let (target_layout, pending_physical_bytes, pending_mutation_id, already_reconciled) = {
+            let reservation = snapshot
+                .pools
+                .get(source_pool_index)
+                .and_then(|pool| pool.decommission.as_ref())
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .filter(|reservation| reservation.admits_cleanup_owner(owner))
+                .ok_or_else(|| decommission_capacity_blocked_error("equivalent temporary target owner is stale"))?;
+            let target = reservation
+                .targets
+                .iter()
+                .find(|target| target.pool_index == target_pool_index)
+                .ok_or_else(|| decommission_capacity_blocked_error("equivalent temporary target allocation is missing"))?;
+            (
+                target.layout,
+                target.pending_physical_bytes,
+                target.pending_mutation_id,
+                target
+                    .temporary_mutations
+                    .iter()
+                    .any(|mutation| mutation.mutation_id == mutation_id),
+            )
+        };
+        if pending_physical_bytes == 0 {
+            // Either the successful attempt already saved its progress, or a
+            // byte-neutral replacement had no inflight delta to record.
+            ensure_pool_meta_write_fence(&pool_meta_guard, "equivalent temporary target reconciliation fence failed")?;
+            return Ok(());
+        }
+        if pending_mutation_id != Some(mutation_id) {
+            return Err(decommission_capacity_blocked_error(
+                "equivalent temporary target pending intent belongs to another mutation",
+            ));
+        }
+        if already_reconciled {
+            return Err(decommission_capacity_blocked_error(
+                "equivalent temporary target has both pending and reconciled state",
+            ));
+        }
+        let expected_target_physical_bytes = capacity_target_physical_bytes(expected_data_bytes.max(1), target_layout)?;
+        if pending_physical_bytes < expected_target_physical_bytes {
+            return Err(decommission_capacity_blocked_error(
+                "equivalent temporary target pending capacity is smaller than the committed checkpoint",
+            ));
+        }
+        resolve_decommission_target_pending(
+            &mut snapshot,
+            source_pool_index,
+            target_pool_index,
+            expected_target_physical_bytes,
+            mutation_id,
+        )?;
+        // The replacement is byte-non-growing and its exact bytes were read
+        // before this call, so no new physical delta is inferred on replay.
+        // A prior successful progress save would have taken the idempotent
+        // pending==0 return above.
+        record_decommission_target_inflight(
+            &mut snapshot,
+            source_pool_index,
+            target_pool_index,
+            0,
+            mutation_id,
+            OffsetDateTime::now_utc(),
+        )?;
+        let outcome = snapshot
+            .save_no_lock_armed(
+                self.pools.clone(),
+                &mut save_guard,
+                pool_meta_guard.lock_lost_signal(),
+                &[source_pool_index],
+            )
+            .await?;
+        ensure_pool_meta_write_fence(&pool_meta_guard, "equivalent temporary target reconciliation save failed")?;
+        let persisted_info = outcome
+            .committed
+            .pools
+            .get(source_pool_index)
+            .and_then(|pool| pool.decommission.as_ref())
+            .cloned()
+            .ok_or_else(|| decommission_metadata_not_initialized_error("publish equivalent temporary target reconciliation"))?;
+        {
+            let mut pool_meta = self.pool_meta.write().await;
+            let pool_count = pool_meta.pools.len();
+            pool_meta.version = pool_meta.version.max(outcome.committed.version);
+            let info = pool_meta
+                .pools
+                .get_mut(source_pool_index)
+                .and_then(|pool| pool.decommission.as_mut())
+                .ok_or_else(|| invalid_decommission_pool_index_error(pool_count, source_pool_index))?;
+            info.capacity_reservation = persisted_info.capacity_reservation;
+            info.capacity_blocked_reason = persisted_info.capacity_blocked_reason;
+        }
+        ensure_pool_meta_write_fence(&pool_meta_guard, "equivalent temporary target reconciliation save failed")?;
+        outcome.disarm();
+        Ok(())
     }
 
     pub(crate) async fn has_decommission_capacity_temporary_mutation_state(
@@ -12813,6 +13013,7 @@ impl ECStore {
         let receipt_path = decommission_durable_ilm_receipt_path(run_token, path, source_record.id_kind, &source_record.id);
         let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
         let mut proof = None::<DecommissionDurableIlmReceipt>;
+        let mut nonterminal_receipt_found = false;
         for pool_idx in 0..self.pools.len() {
             if pool_idx == source_pool_idx {
                 continue;
@@ -12856,23 +13057,35 @@ impl ECStore {
                     receipt.context()
                 )));
             }
-            source_record
-                .checkpoint
-                .validate_successor(&receipt.checkpoint)
-                .map_err(|err| {
-                    Error::other(format!(
-                        "terminal durable ILM decommission receipt does not cover source at path `{path}` {}: {err}",
-                        source_record.context()
-                    ))
-                })?;
-            if receipt.terminal_checkpoint.is_some() {
+            if let Some(terminal_checkpoint) = receipt.terminal_checkpoint.as_ref() {
+                if !source_record.checkpoint.is_predecessor_of_terminal(terminal_checkpoint) {
+                    return Err(Error::other_with_context(
+                        "terminal durable ILM decommission receipt does not cover source",
+                        format!("path `{path}` {}", source_record.context()),
+                    ));
+                }
                 proof = Some(match proof {
                     Some(existing) => merge_decommission_durable_ilm_receipts(&existing, &receipt)?,
                     None => receipt,
                 });
+            } else {
+                source_record
+                    .checkpoint
+                    .validate_successor(&receipt.checkpoint)
+                    .map_err(|err| {
+                        Error::other_with_context(
+                            "durable ILM decommission receipt does not cover source",
+                            format!("path `{path}` {}: {err}", source_record.context()),
+                        )
+                    })?;
+                nonterminal_receipt_found = true;
             }
         }
-        Ok(proof)
+        // A terminal receipt on one target must not hide another target copy
+        // whose receipt was installed later and has not reached terminal yet.
+        // Returning no proof makes recovery advance every outstanding copy
+        // before source cleanup can treat the operation as complete.
+        if nonterminal_receipt_found { Ok(None) } else { Ok(proof) }
     }
 
     async fn verify_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<()> {
@@ -13016,6 +13229,7 @@ impl ECStore {
         pool_idx: usize,
         receipt_path: &str,
         record: &ValidatedDurableIlmRecord,
+        fleet_topology_generation: Option<&str>,
         terminal: bool,
     ) -> Result<bool> {
         let stage = if terminal { "terminal" } else { "progress" };
@@ -13051,6 +13265,12 @@ impl ECStore {
                 ))
             })?;
             Self::validate_decommission_durable_ilm_receipt_locator(receipt_path, &locator, &receipt)?;
+            if receipt.fleet_topology_generation.as_deref() != fleet_topology_generation {
+                return Err(Error::other_with_context(
+                    "durable ILM decommission receipt fleet topology mismatch",
+                    format!("path `{}` {}", receipt.source_path, receipt.context()),
+                ));
+            }
             receipt.checkpoint.validate_successor(&record.checkpoint).map_err(|err| {
                 Error::other(format!(
                     "{stage} durable ILM record generation mismatch at path `{}` {}: {err}",
@@ -13163,6 +13383,7 @@ impl ECStore {
         let stage = if terminal { "terminal" } else { "progress" };
         let record = validate_durable_ilm_record(path, data)
             .map_err(|err| Error::other(format!("{stage} durable ILM record is invalid at path `{path}`: {err}")))?;
+        let fleet_topology_generation = durable_ilm_v6_topology_generation(path, data)?;
         let active_source_pool_indices = active_runs.iter().map(|(pool_idx, _)| *pool_idx).collect::<Vec<_>>();
         let mut terminal_target_pool_indices = Vec::new();
         for (source_pool_idx, run_token) in active_runs {
@@ -13171,7 +13392,13 @@ impl ECStore {
             for pool_idx in 0..self.pools.len() {
                 if pool_idx != source_pool_idx {
                     let found = self
-                        .advance_durable_ilm_decommission_receipt(pool_idx, &receipt_path, &record, terminal)
+                        .advance_durable_ilm_decommission_receipt(
+                            pool_idx,
+                            &receipt_path,
+                            &record,
+                            fleet_topology_generation.as_deref(),
+                            terminal,
+                        )
                         .await?;
                     receipt_found |= found;
                     if terminal
@@ -13193,6 +13420,240 @@ impl ECStore {
         Ok(Some(terminal_target_pool_indices))
     }
 
+    /// Resolve the exact receipt-bearing target copies on which a v6 dispatch
+    /// manifest may advance while a decommission reservation is active.
+    ///
+    /// This is intentionally not a general capacity bypass. The target copy
+    /// must still be covered by the active source reservation and its durable
+    /// receipt, the ETag must be the caller's exact CAS generation, and the
+    /// replacement must be a byte-non-growing adjacent manifest checkpoint.
+    pub(crate) async fn decommission_durable_ilm_checkpoint_targets(
+        &self,
+        path: &str,
+        next_data: &[u8],
+        expected_etag: &str,
+    ) -> Result<Option<Vec<DecommissionDurableIlmCheckpointTarget>>> {
+        let active_runs = {
+            let pool_meta = self.pool_meta.read().await;
+            let mut active_runs = Vec::new();
+            for (source_pool_index, pool) in pool_meta.pools.iter().enumerate() {
+                let Some(info) = pool
+                    .decommission
+                    .as_ref()
+                    .filter(|info| info.has_decommission_state() && !info.complete)
+                else {
+                    continue;
+                };
+                let Some(start_time) = info.start_time else {
+                    continue;
+                };
+                let reservation = info.capacity_reservation.clone().ok_or_else(|| {
+                    decommission_capacity_blocked_error(format!(
+                        "active decommission source pool {source_pool_index} has no reservation for durable ILM checkpoint"
+                    ))
+                })?;
+                if !reservation.active() {
+                    return Err(decommission_capacity_blocked_error(format!(
+                        "active decommission source pool {source_pool_index} has a released reservation for durable ILM checkpoint"
+                    )));
+                }
+                active_runs.push((
+                    source_pool_index,
+                    decommission_durable_ilm_receipt_run_token(&pool.cmd_line, start_time),
+                    reservation,
+                ));
+            }
+            active_runs
+        };
+        if active_runs.is_empty() {
+            return Ok(None);
+        }
+
+        let next_record = validate_durable_ilm_record(path, next_data)?;
+        if next_record.namespace != TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE.name {
+            return Ok(None);
+        }
+        let next_fleet_topology_generation = durable_ilm_v6_topology_generation(path, next_data)?;
+
+        let mut targets = Vec::<DecommissionDurableIlmCheckpointTarget>::new();
+        let mut missing_source_receipts = 0usize;
+        let mut stale_target_etag_mismatch = false;
+        for (source_pool_index, run_token, reservation) in active_runs {
+            let receipt_path = decommission_durable_ilm_receipt_path(&run_token, path, next_record.id_kind, &next_record.id);
+            let mut source_receipt_found = false;
+            for allocation in &reservation.targets {
+                let receipt_data = match read_config_limited_preserve_empty(
+                    self.pools[allocation.pool_index].clone(),
+                    &receipt_path,
+                    DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE,
+                )
+                .await
+                {
+                    Ok(data) => data,
+                    Err(err)
+                        if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                            || is_err_object_not_found(&err)
+                            || is_err_version_not_found(&err) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+                let receipt = DecommissionDurableIlmReceipt::decode(&receipt_data)?;
+                let locator = parse_decommission_durable_ilm_receipt_path(&receipt_path)?;
+                Self::validate_decommission_durable_ilm_receipt_locator(&receipt_path, &locator, &receipt)?;
+                if receipt.source_path != path
+                    || receipt.namespace != next_record.namespace
+                    || receipt.id_kind != next_record.id_kind
+                    || receipt.id != next_record.id
+                {
+                    return Err(Error::other_with_context(
+                        "durable ILM checkpoint receipt identity does not authorize source",
+                        format!("path `{path}` {}", next_record.context()),
+                    ));
+                }
+                if receipt.fleet_topology_generation != next_fleet_topology_generation {
+                    return Err(Error::other_with_context(
+                        "durable ILM checkpoint receipt fleet topology does not authorize source",
+                        format!("path `{path}` {}", next_record.context()),
+                    ));
+                }
+                receipt
+                    .checkpoint
+                    .validate_successor(&next_record.checkpoint)
+                    .map_err(|err| {
+                        Error::other_with_context(
+                            "durable ILM checkpoint receipt is not a predecessor of the requested generation",
+                            format!(
+                                "target pool {}, path `{path}` {}; receipt checkpoint {:?}, requested checkpoint {:?}: {err}",
+                                allocation.pool_index,
+                                next_record.context(),
+                                receipt.checkpoint,
+                                next_record.checkpoint
+                            ),
+                        )
+                    })?;
+
+                let (target_data, metadata) = read_config_limited_preserve_empty_with_metadata(
+                    self.pools[allocation.pool_index].clone(),
+                    path,
+                    TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE.max_record_size,
+                )
+                .await?;
+                let target_record = validate_durable_ilm_record(path, &target_data)?;
+                if target_record.namespace != next_record.namespace
+                    || target_record.id_kind != next_record.id_kind
+                    || target_record.id != next_record.id
+                {
+                    return Err(Error::other_with_context(
+                        "durable ILM checkpoint target identity does not match source",
+                        format!("path `{path}` {}", next_record.context()),
+                    ));
+                }
+                let already_committed = target_data.as_slice() == next_data;
+                let target_etag = metadata.etag.filter(|etag| !etag.trim().is_empty()).ok_or_else(|| {
+                    Error::other_with_context("durable ILM checkpoint target is missing an ETag", format!("path `{path}`"))
+                })?;
+                if already_committed {
+                    receipt
+                        .checkpoint
+                        .validate_successor(&target_record.checkpoint)
+                        .map_err(|err| {
+                            Error::other_with_context(
+                                "durable ILM checkpoint receipt is not a predecessor of the committed target generation",
+                                format!("path `{path}` {}: {err}", next_record.context()),
+                            )
+                        })?;
+                } else {
+                    if target_record.checkpoint != receipt.checkpoint {
+                        return Err(Error::other_with_context(
+                            "durable ILM checkpoint target is not the receipt generation",
+                            format!("path `{path}` {}", next_record.context()),
+                        ));
+                    }
+                    target_record
+                        .checkpoint
+                        .validate_successor(&next_record.checkpoint)
+                        .map_err(|err| {
+                            Error::other_with_context(
+                                "durable ILM checkpoint target is not a predecessor of the requested generation",
+                                format!("path `{path}` {}: {err}", next_record.context()),
+                            )
+                        })?;
+                    if next_data.len() > target_data.len() {
+                        return Err(decommission_capacity_blocked_error(format!(
+                            "durable ILM checkpoint update at `{path}` grows from {} to {} bytes",
+                            target_data.len(),
+                            next_data.len()
+                        )));
+                    }
+                    stale_target_etag_mismatch |= target_etag != expected_etag;
+                }
+
+                source_receipt_found = true;
+                if let Some(existing) = targets
+                    .iter_mut()
+                    .find(|target| target.target_pool_index == allocation.pool_index)
+                {
+                    if existing.already_committed != already_committed {
+                        return Err(Error::other_with_context(
+                            "durable ILM checkpoint target state changed during authorization",
+                            format!("path `{path}`"),
+                        ));
+                    }
+                    continue;
+                }
+                let base_owner = DecommissionCapacityOwner {
+                    source_pool_index,
+                    operation_id: reservation.operation_id,
+                    generation: reservation.generation,
+                    owner_nonce: reservation.owner_nonce,
+                    mutation_id: None,
+                };
+                let mutation_id = decommission_capacity_mutation_id(
+                    base_owner,
+                    RUSTFS_META_BUCKET,
+                    path,
+                    Some(next_record.checkpoint.content_sha256()),
+                    false,
+                    None,
+                );
+                targets.push(DecommissionDurableIlmCheckpointTarget {
+                    source_pool_index,
+                    target_pool_index: allocation.pool_index,
+                    capacity_owner: base_owner.with_mutation_id(mutation_id),
+                    already_committed,
+                    target_etag: Some(target_etag),
+                });
+            }
+            if !source_receipt_found {
+                missing_source_receipts = missing_source_receipts.saturating_add(1);
+            }
+        }
+
+        if missing_source_receipts > 0 {
+            return Err(decommission_capacity_blocked_error(format!(
+                "durable ILM checkpoint at `{path}` is missing receipt coverage for {missing_source_receipts} active source(s)"
+            )));
+        }
+        if targets.is_empty() {
+            return Err(decommission_capacity_blocked_error(format!(
+                "durable ILM checkpoint at `{path}` has no receipt-bearing reservation target"
+            )));
+        }
+        if stale_target_etag_mismatch && !targets.iter().any(|target| target.already_committed) {
+            return Err(Error::PreconditionFailed);
+        }
+        // After a partial multi-target commit, an aggregate read may return
+        // the ETag of the already-advanced target while another authorized
+        // target still has the predecessor ETag. The exact committed bytes
+        // plus every target's receipt/checkpoint proof authorize repairing
+        // that predecessor with its own target-local CAS. Without an exact
+        // committed target, retain the caller-ETag requirement above.
+        targets.sort_unstable_by_key(|target| target.target_pool_index);
+        Ok(Some(targets))
+    }
+
     pub(crate) async fn record_durable_ilm_decommission_progress(&self, path: &str, data: &[u8]) -> Result<()> {
         self.advance_durable_ilm_decommission_receipts(path, data, false)
             .await
@@ -13212,6 +13673,66 @@ impl ECStore {
         data: &[u8],
     ) -> Result<Option<Vec<usize>>> {
         self.advance_durable_ilm_decommission_receipts(path, data, true).await
+    }
+
+    /// Return true only when `data` is the exact copy still owned by an active
+    /// decommission source and a target-side terminal receipt authorizes that
+    /// source's later verified cleanup. Lifecycle recovery may then regard the
+    /// logical record as terminal without deleting the source checkpoint.
+    pub(crate) async fn durable_ilm_terminal_receipt_covers_active_source(&self, path: &str, data: &[u8]) -> Result<bool> {
+        let namespace = classify_durable_ilm_record(path)?
+            .ok_or_else(|| Error::other_with_context("path is not a durable ILM record", format!("path `{path}`")))?;
+        let source_record = validate_durable_ilm_record(path, data)?;
+        let active_runs = {
+            let pool_meta = self.pool_meta.read().await;
+            pool_meta
+                .pools
+                .iter()
+                .enumerate()
+                .filter_map(|(source_pool_index, pool)| {
+                    pool.decommission
+                        .as_ref()
+                        .filter(|info| info.has_decommission_state() && !info.complete)
+                        .and_then(|info| info.start_time)
+                        .map(|start_time| {
+                            (source_pool_index, decommission_durable_ilm_receipt_run_token(&pool.cmd_line, start_time))
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut covered_active_source = false;
+        for (source_pool_index, run_token) in active_runs {
+            let source_data =
+                match read_config_limited_preserve_empty(self.pools[source_pool_index].clone(), path, namespace.max_record_size)
+                    .await
+                {
+                    Ok(source_data) => source_data,
+                    Err(err)
+                        if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                            || is_err_object_not_found(&err)
+                            || is_err_version_not_found(&err) =>
+                    {
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+            if source_data.as_slice() != data {
+                continue;
+            }
+            if self
+                .load_decommission_durable_ilm_terminal_receipt_for_run(source_pool_index, path, &source_record, &run_token)
+                .await?
+                .is_some()
+            {
+                covered_active_source = true;
+            } else {
+                // Every active source that still stores this exact generation
+                // needs complete terminal receipt coverage. One covered source
+                // cannot authorize lifecycle recovery to skip another.
+                return Ok(false);
+            }
+        }
+        Ok(covered_active_source)
     }
 
     async fn cleanup_decommission_durable_ilm_receipts(&self, source_pool_idx: usize) -> Result<()> {
@@ -13282,12 +13803,20 @@ impl ECStore {
             .map_err(|err| Error::other(format!("failed to read source durable ILM record at path `{path}`: {err}")))?;
         let source_record = validate_durable_ilm_record(path, &source)
             .map_err(|err| Error::other(format!("source durable ILM record is invalid at path `{path}`: {err}")))?;
+        let source_fleet_topology_generation = durable_ilm_v6_topology_generation(path, &source)?;
         let target = self
             .load_decommissioned_durable_ilm_target(source_pool_idx, path, namespace.max_record_size, &source_record.context())
             .await?;
         let manifest_receipt = if let Some((target_pool_idx, target)) = target {
             let target_record = validate_decommission_durable_ilm_copy(path, &source_record, &target)?;
-            let receipt = DecommissionDurableIlmReceipt::new(path, &target_record);
+            let target_fleet_topology_generation = durable_ilm_v6_topology_generation(path, &target)?;
+            if target_fleet_topology_generation != source_fleet_topology_generation {
+                return Err(Error::other_with_context(
+                    "target durable ILM fleet topology generation differs from source",
+                    format!("path `{path}` {}", source_record.context()),
+                ));
+            }
+            let receipt = DecommissionDurableIlmReceipt::new(path, &target_record, target_fleet_topology_generation);
             self.persist_decommission_durable_ilm_receipt_for_run(target_pool_idx, &receipt, run_token)
                 .await?;
             receipt
@@ -13301,8 +13830,33 @@ impl ECStore {
                     ))
                 })?
         };
+        if manifest_receipt.fleet_topology_generation != source_fleet_topology_generation {
+            return Err(Error::other_with_context(
+                "terminal durable ILM receipt fleet topology generation does not cover source",
+                format!("path `{path}` {}", source_record.context()),
+            ));
+        }
+        let fleet_proof = if let Some(expected_generation) = source_fleet_topology_generation.as_deref() {
+            let proof = acquire_tier_delete_journal_fleet_proof()
+                .ok_or_else(|| Error::other("tier delete journal v6 fleet capability is unavailable for source cleanup"))?;
+            if tier_delete_journal_topology_generation(&proof) != expected_generation
+                || !tier_delete_journal_fleet_proof_matches(&proof)
+            {
+                return Err(Error::other("tier delete journal v6 fleet generation changed before source cleanup"));
+            }
+            Some(proof)
+        } else {
+            None
+        };
         self.persist_decommission_durable_ilm_receipt_for_run(source_pool_idx, &manifest_receipt, run_token)
             .await?;
+
+        if fleet_proof
+            .as_ref()
+            .is_some_and(|proof| !tier_delete_journal_fleet_proof_matches(proof))
+        {
+            return Err(Error::other("tier delete journal v6 fleet proof changed before source cleanup"));
+        }
 
         let cleanup_result = data_movement::cleanup_source_entry_if_unchanged(
             source_set,
@@ -13320,7 +13874,16 @@ impl ECStore {
                 source_record.context()
             ))
         });
-        resolve_decommission_entry_cleanup_delete_result(cleanup_result, RUSTFS_META_BUCKET, path)
+        let cleanup_result = resolve_decommission_entry_cleanup_delete_result(cleanup_result, RUSTFS_META_BUCKET, path);
+        if fleet_proof
+            .as_ref()
+            .is_some_and(|proof| !tier_delete_journal_fleet_proof_matches(proof))
+        {
+            return Err(Error::other(
+                "tier delete journal v6 fleet proof changed during source cleanup; exact source outcome requires verification",
+            ));
+        }
+        cleanup_result
     }
 
     #[cfg(all(test, feature = "test-util"))]
@@ -13356,7 +13919,26 @@ impl ECStore {
         record: &ValidatedDurableIlmRecord,
         terminal: bool,
     ) -> Result<String> {
-        let mut receipt = DecommissionDurableIlmReceipt::new(source_path, record);
+        let fleet_topology_generation = match read_config_limited_preserve_empty(
+            self.pools[target_pool_idx].clone(),
+            source_path,
+            classify_durable_ilm_record(source_path)?
+                .ok_or_else(|| Error::other_with_context("path is not a durable ILM record", format!("path `{source_path}`")))?
+                .max_record_size,
+        )
+        .await
+        {
+            Ok(target_data) => durable_ilm_v6_topology_generation(source_path, &target_data)?,
+            Err(err)
+                if matches!(&err, Error::ConfigNotFound | Error::FileNotFound | Error::FileVersionNotFound)
+                    || is_err_object_not_found(&err)
+                    || is_err_version_not_found(&err) =>
+            {
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        let mut receipt = DecommissionDurableIlmReceipt::new(source_path, record, fleet_topology_generation);
         if terminal {
             receipt.terminal_checkpoint = Some(record.checkpoint.clone());
         }
@@ -17327,11 +17909,15 @@ mod pools_tests {
             content_sha256: "b".repeat(64),
             identity_sha256: "c".repeat(64),
             committed: false,
+            dispatch_identity_sha256: None,
+            state: None,
         };
         let terminal_checkpoint = DurableIlmRecordCheckpoint::TierDeleteJournal {
             content_sha256: "d".repeat(64),
             identity_sha256: "c".repeat(64),
             committed: true,
+            dispatch_identity_sha256: None,
+            state: None,
         };
         let incoming = DecommissionDurableIlmReceipt {
             source_path,
@@ -17340,6 +17926,7 @@ mod pools_tests {
             id: operation_id,
             checkpoint: checkpoint.clone(),
             terminal_checkpoint: None,
+            fleet_topology_generation: None,
         };
         let existing = DecommissionDurableIlmReceipt {
             terminal_checkpoint: Some(terminal_checkpoint.clone()),
@@ -17350,7 +17937,24 @@ mod pools_tests {
             .expect("retry receipt must merge with a terminal receipt");
 
         assert_eq!(merged.checkpoint, checkpoint);
-        assert_eq!(merged.terminal_checkpoint, Some(terminal_checkpoint));
+        assert_eq!(merged.terminal_checkpoint, Some(terminal_checkpoint.clone()));
+
+        let topology_bound = DecommissionDurableIlmReceipt {
+            fleet_topology_generation: Some("e".repeat(64)),
+            ..incoming
+        };
+        let mixed_error = merge_decommission_durable_ilm_receipts(&existing, &topology_bound)
+            .expect_err("a topology-bound v6 receipt must not mask an unbound receipt")
+            .to_string();
+        assert!(mixed_error.contains("fleet topology conflict"));
+
+        let topology_existing = DecommissionDurableIlmReceipt {
+            terminal_checkpoint: Some(terminal_checkpoint),
+            ..topology_bound.clone()
+        };
+        let topology_merged = merge_decommission_durable_ilm_receipts(&topology_existing, &topology_bound)
+            .expect("receipts bound to the same fleet topology should merge");
+        assert_eq!(topology_merged.fleet_topology_generation, Some("e".repeat(64)));
     }
 
     #[test]
@@ -17375,7 +17979,7 @@ mod pools_tests {
         assert!(job_bytes.len() > DECOMMISSION_DURABLE_ILM_RECEIPT_MAX_SIZE);
         let record = validate_durable_ilm_record(&path, &job_bytes).expect("large manual job should validate");
         let expected_checkpoint = record.checkpoint.clone();
-        let mut receipt = DecommissionDurableIlmReceipt::new(&path, &record);
+        let mut receipt = DecommissionDurableIlmReceipt::new(&path, &record, None);
         receipt.terminal_checkpoint = Some(record.checkpoint);
 
         let encoded = receipt.encode().expect("bounded progress proof should fit the receipt limit");

@@ -7092,6 +7092,9 @@ impl LocalDisk {
                                 .await?
                         {
                             meta.name.push_str(SLASH_SEPARATOR);
+                            // Conservative listings verify physical prefixes. Never-versioned
+                            // buckets use the bounded fast path and reclaim residue after an
+                            // exact recursive listing proves that prefix empty.
                             if opts.recursive
                                 || opts.incl_deleted
                                 || opts.skip_hidden_prefix_check
@@ -17619,7 +17622,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_scan_dir_nonrecursive_visible_prefix_probe_cost() {
+    async fn test_scan_dir_nonrecursive_fast_path_preserves_probe_bound() {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
 
@@ -17650,6 +17653,10 @@ mod test {
             .expect("visible object metadata should be written");
             expected_names.push(format!("{prefix}/"));
         }
+
+        fs::create_dir_all(bucket_dir.join("stale/nested/residue"))
+            .await
+            .expect("stale backing directory should be created");
 
         async fn scan_prefixes(disk: &LocalDisk, bucket: &str, skip_hidden_prefix_check: bool) -> (Vec<String>, usize) {
             let probe_count = Arc::new(AtomicUsize::new(0));
@@ -17693,8 +17700,11 @@ mod test {
         let (fast_path_names, fast_path_probes) = scan_prefixes(&disk, bucket, true).await;
 
         assert_eq!(conservative_names, expected_names);
-        assert_eq!(fast_path_names, expected_names);
-        assert_eq!(conservative_probes, PREFIX_COUNT * 3);
+        let mut expected_fast_path_names = expected_names.clone();
+        expected_fast_path_names.push("stale/".to_owned());
+        assert_eq!(fast_path_names, expected_fast_path_names);
+        let expected_probes = PREFIX_COUNT * 3 + 3;
+        assert_eq!(conservative_probes, expected_probes);
         assert_eq!(fast_path_probes, 0);
     }
 

@@ -23,6 +23,36 @@ use s3s::S3ErrorCode;
 pub type Error = StorageError;
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// Keeps high-cardinality diagnostic detail in the error source while making
+/// the rendered `io::Error` stable for quorum aggregation.
+#[derive(Debug)]
+struct StableIoContextError {
+    message: &'static str,
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+impl std::fmt::Display for StableIoContextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for StableIoContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+pub(crate) fn stable_io_error<E>(message: &'static str, source: E) -> std::io::Error
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    std::io::Error::other(StableIoContextError {
+        message,
+        source: source.into(),
+    })
+}
+
 /// Storage layer error type covering disk, volume, bucket, object, multipart,
 /// erasure-coding, and operational error conditions.
 ///
@@ -262,6 +292,13 @@ impl StorageError {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         StorageError::Io(std::io::Error::other(error))
+    }
+
+    pub(crate) fn other_with_context<E>(message: &'static str, source: E) -> Self
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        StorageError::Io(stable_io_error(message, source))
     }
 
     pub fn is_not_found(&self) -> bool {

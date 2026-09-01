@@ -134,7 +134,7 @@ pub(crate) async fn test_three_pool_stores_with_isolated_node_contexts(
     test_pool_stores_with_contexts(rebalance_meta, true, 3, 2).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) async fn test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(
     rebalance_meta: Option<RebalanceMeta>,
 ) -> (

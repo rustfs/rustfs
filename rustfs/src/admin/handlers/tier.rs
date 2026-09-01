@@ -130,9 +130,26 @@ fn tier_mutation_error(
     }
 }
 
-fn tier_backend_in_use_response(err: &AdminError) -> Option<S3Error> {
-    (err.code == ERR_TIER_BACKEND_IN_USE.code)
-        .then(|| S3Error::with_message(S3ErrorCode::Custom("TierNameBackendInUse".into()), "tier backend is not empty"))
+fn tier_backend_error_response(err: &AdminError) -> Option<S3Error> {
+    let (code, message, status_code) = if err.code == ERR_TIER_BACKEND_IN_USE.code {
+        (
+            "XMinioAdminTierBackendInUse",
+            "Specified remote tier is already in use",
+            StatusCode::CONFLICT,
+        )
+    } else if err.code == ERR_TIER_BACKEND_NOT_EMPTY.code {
+        (
+            "XMinioAdminTierBackendNotEmpty",
+            "Specified remote backend is not empty",
+            StatusCode::BAD_REQUEST,
+        )
+    } else {
+        return None;
+    };
+
+    let mut response = S3Error::with_message(S3ErrorCode::Custom(code.into()), message);
+    response.set_status_code(status_code);
+    Some(response)
 }
 
 fn clear_tier_error_response(err: &AdminError) -> S3Error {
@@ -370,11 +387,8 @@ impl Operation for AddTier {
                     S3ErrorCode::Custom("TierNameNotUppercase".into()),
                     "tier name must be uppercase",
                 ))
-            } else if err.code == ERR_TIER_BACKEND_IN_USE.code {
-                Err(S3Error::with_message(
-                    S3ErrorCode::Custom("TierNameBackendInUse!".into()),
-                    "tier backend is already in use",
-                ))
+            } else if let Some(response) = tier_backend_error_response(&err) {
+                Err(response)
             } else if err.code == ERR_TIER_CONNECT_ERR.code {
                 Err(S3Error::with_message(
                     S3ErrorCode::Custom("TierConnectError".into()),
@@ -589,12 +603,7 @@ impl Operation for RemoveTier {
             let err = tier_mutation_error(update_err, "remove_tier", "TierRemoveFailed")?;
             return if err.code == ERR_TIER_NOT_FOUND.code {
                 Err(S3Error::with_message(S3ErrorCode::Custom("TierNotFound".into()), "tier not found"))
-            } else if err.code == ERR_TIER_BACKEND_NOT_EMPTY.code {
-                Err(S3Error::with_message(
-                    S3ErrorCode::Custom("TierNameBackendInUse".into()),
-                    "tier backend is not empty",
-                ))
-            } else if let Some(response) = tier_backend_in_use_response(&err) {
+            } else if let Some(response) = tier_backend_error_response(&err) {
                 Err(response)
             } else {
                 warn!(
@@ -1038,6 +1047,42 @@ mod tests {
     }
 
     #[test]
+    fn tier_backend_errors_use_minio_wire_contract() {
+        let in_use = tier_backend_error_response(&ERR_TIER_BACKEND_IN_USE)
+            .expect("backend-in-use errors should have a compatible response");
+        assert_eq!(in_use.code(), &S3ErrorCode::Custom("XMinioAdminTierBackendInUse".into()));
+        assert_eq!(in_use.message(), Some("Specified remote tier is already in use"));
+        assert_eq!(in_use.status_code(), Some(StatusCode::CONFLICT));
+
+        let not_empty = tier_backend_error_response(&ERR_TIER_BACKEND_NOT_EMPTY)
+            .expect("backend-not-empty errors should have a compatible response");
+        assert_eq!(not_empty.code(), &S3ErrorCode::Custom("XMinioAdminTierBackendNotEmpty".into()));
+        assert_eq!(not_empty.message(), Some("Specified remote backend is not empty"));
+        assert_eq!(not_empty.status_code(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn tier_backend_error_response_canonicalizes_by_code_only() {
+        let lifecycle_reference = AdminError {
+            code: ERR_TIER_BACKEND_IN_USE.code.clone(),
+            message: "tier WARM is referenced by lifecycle configuration".to_string(),
+            status_code: StatusCode::IM_A_TEAPOT,
+        };
+        let response = tier_backend_error_response(&lifecycle_reference)
+            .expect("a lifecycle reference should retain the backend-in-use wire contract");
+        assert_eq!(response.code(), &S3ErrorCode::Custom("XMinioAdminTierBackendInUse".into()));
+        assert_eq!(response.message(), Some("Specified remote tier is already in use"));
+        assert_eq!(response.status_code(), Some(StatusCode::CONFLICT));
+
+        let unknown = AdminError {
+            code: "XRustFSAdminTierUnknown".to_string(),
+            message: "unknown tier failure".to_string(),
+            status_code: StatusCode::CONFLICT,
+        };
+        assert!(tier_backend_error_response(&unknown).is_none());
+    }
+
+    #[test]
     fn clear_preserves_legacy_backend_not_empty_error_code() {
         let response = clear_tier_error_response(&ERR_TIER_BACKEND_NOT_EMPTY);
         assert_eq!(response.code(), &S3ErrorCode::Custom("TierClearFailed".into()));
@@ -1055,8 +1100,7 @@ mod tests {
                 .is_some_and(|message| message.starts_with("tier clear failed."))
         );
 
-        assert!(tier_backend_in_use_response(&ERR_TIER_BACKEND_NOT_EMPTY).is_none());
-        assert!(tier_backend_in_use_response(&ERR_TIER_NOT_FOUND).is_none());
+        assert!(tier_backend_error_response(&ERR_TIER_NOT_FOUND).is_none());
     }
 
     #[test]

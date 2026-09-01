@@ -37,8 +37,9 @@ use crate::{
     runtime::instance::{InstanceContext, bootstrap_ctx},
     runtime::sources as runtime_sources,
     set_disk::{PreparedGetObjectMetadata, SetDisks},
-    store::init_format::{
-        check_format_erasure_values, load_format_erasure_all, save_format_file, select_format_erasure_in_quorum,
+    store::{
+        RemoteTuplePublicationFence,
+        init_format::{check_format_erasure_values, load_format_erasure_all, save_format_file, select_format_erasure_in_quorum},
     },
 };
 use futures::{
@@ -623,6 +624,19 @@ impl Sets {
     ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
         self.get_disks_by_key(object)
             .put_object_with_old_current_size(bucket, object, data, opts)
+            .await
+    }
+
+    pub(crate) async fn put_object_with_old_current_size_for_data_movement(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+        publication_fence: RemoteTuplePublicationFence,
+    ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        self.get_disks_by_key(object)
+            .put_object_with_old_current_size_for_data_movement(bucket, object, data, opts, publication_fence)
             .await
     }
 }

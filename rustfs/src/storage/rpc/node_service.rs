@@ -83,6 +83,9 @@ const TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE: i32 = 0;
 const TIER_MUTATION_PEER_STATE_PREPARED_WIRE: i32 = 1;
 const TIER_MUTATION_PEER_STATE_COMMITTED_WIRE: i32 = 2;
 const TIER_MUTATION_PEER_STATE_ABORTED_WIRE: i32 = 3;
+const TIER_MUTATION_FAILURE_CLASS_UNSPECIFIED_WIRE: i32 = 0;
+const TIER_MUTATION_FAILURE_CLASS_PRE_DISPATCH_REJECTED_WIRE: i32 = 1;
+const TIER_MUTATION_FAILURE_CLASS_AMBIGUOUS_WIRE: i32 = 2;
 
 fn signal_service_response(success: bool, error_info: Option<String>) -> Response<SignalServiceResponse> {
     Response::new(SignalServiceResponse {
@@ -178,7 +181,10 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
+// v3 additionally promises the v6 tier-delete dispatch-manifest policy. The
+// existing periodic topology probe carries both capabilities so normal object
+// operations do not add another peer RPC.
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 3;
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -723,9 +729,28 @@ impl TierMutationControlRpcService {
             .map_err(|_| Status::invalid_argument("tier mutation request length cannot be represented"))?;
         verify_tonic_canonical_body_digest(request, &body)
             .map_err(|err| Status::permission_denied(format!("tier mutation authentication failed: {err}")))?;
-        let store = self
-            .resolve_object_store()
-            .ok_or_else(|| Status::failed_precondition("tier mutation object store is not initialized"))?;
+        if !tier_mutation_protocol_version_is_supported(version) {
+            return Err(Status::failed_precondition(format!(
+                "unsupported tier mutation peer protocol version: {version}"
+            )));
+        }
+        let store = match self.resolve_object_store() {
+            Some(store) => store,
+            None if version == rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION => {
+                return tier_mutation_control_response(TierMutationControlResponseInput {
+                    version,
+                    phase,
+                    mutation_id,
+                    canonical_payload,
+                    success: false,
+                    state: TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE,
+                    applied: false,
+                    error_info: Some("tier mutation object store is not initialized".to_string()),
+                    failure_class: TIER_MUTATION_FAILURE_CLASS_PRE_DISPATCH_REJECTED_WIRE,
+                });
+            }
+            None => return Err(Status::failed_precondition("tier mutation object store is not initialized")),
+        };
 
         match tier_mutation_peer::handle_tier_mutation_peer_request(store, version, phase, mutation_id, canonical_payload).await {
             Ok(outcome) => tier_mutation_control_response(TierMutationControlResponseInput {
@@ -737,6 +762,7 @@ impl TierMutationControlRpcService {
                 state: tier_mutation_peer_state_to_proto_wire(outcome.state),
                 applied: outcome.applied,
                 error_info: None,
+                failure_class: TIER_MUTATION_FAILURE_CLASS_UNSPECIFIED_WIRE,
             }),
             Err(err) => tier_mutation_control_response(TierMutationControlResponseInput {
                 version,
@@ -746,7 +772,12 @@ impl TierMutationControlRpcService {
                 success: false,
                 state: TIER_MUTATION_PEER_STATE_UNSPECIFIED_WIRE,
                 applied: false,
-                error_info: Some(err.to_string()),
+                error_info: Some(bounded_tier_mutation_error_info(err.to_string())),
+                failure_class: if version == rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION {
+                    TIER_MUTATION_FAILURE_CLASS_AMBIGUOUS_WIRE
+                } else {
+                    TIER_MUTATION_FAILURE_CLASS_UNSPECIFIED_WIRE
+                },
             }),
         }
     }
@@ -811,15 +842,35 @@ fn parse_tier_mutation_id(mutation_id: &str) -> Result<Uuid, Status> {
     Ok(parsed)
 }
 
+fn tier_mutation_protocol_version_is_supported(version: u32) -> bool {
+    matches!(
+        version,
+        rustfs_protos::TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION | rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION
+    )
+}
+
+fn bounded_tier_mutation_error_info(mut error_info: String) -> String {
+    let limit = rustfs_protos::TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE;
+    if error_info.len() <= limit {
+        return error_info;
+    }
+    let mut boundary = limit;
+    while !error_info.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    error_info.truncate(boundary);
+    error_info
+}
+
 fn validate_tier_mutation_payload_size(phase: rustfs_protos::TierMutationRpcPhase, payload_len: usize) -> Result<(), Status> {
     let limit = match phase {
         rustfs_protos::TierMutationRpcPhase::Prepare => rustfs_protos::TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE,
         rustfs_protos::TierMutationRpcPhase::Commit => rustfs_protos::TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE,
         rustfs_protos::TierMutationRpcPhase::Abort => {
-            if payload_len != 0 {
-                return Err(Status::invalid_argument("tier mutation abort payload must be empty"));
+            if payload_len == 0 {
+                return Err(Status::invalid_argument("tier mutation abort payload is empty"));
             }
-            return Ok(());
+            rustfs_protos::TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE
         }
         _ => return Err(Status::invalid_argument("tier mutation rpc phase is unsupported")),
     };
@@ -838,6 +889,7 @@ struct TierMutationControlResponseInput<'a> {
     state: i32,
     applied: bool,
     error_info: Option<String>,
+    failure_class: i32,
 }
 
 fn tier_mutation_control_response(
@@ -853,6 +905,7 @@ fn tier_mutation_control_response(
             state: input.state,
             applied: input.applied,
             error_info: input.error_info.as_deref(),
+            failure_class: input.failure_class,
         })
         .map_err(|_| Status::internal("tier mutation response length cannot be represented"))?;
     let response_proof = sign_tonic_rpc_response_proof(&canonical_response)
@@ -863,6 +916,7 @@ fn tier_mutation_control_response(
         applied: input.applied,
         error_info: input.error_info,
         response_proof: response_proof.into(),
+        failure_class: input.failure_class,
     }))
 }
 
@@ -2469,10 +2523,10 @@ impl Node for NodeService {
 #[allow(unused_imports)]
 mod tests {
     use super::{
-        CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE, KMS_SIGNAL_SUBSYSTEM, MetricType, Node as _,
-        NodeService, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
-        SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
-        SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS, admit_heal_control_replay,
+        CROSS_POOL_FENCE_SUPPORTED_VERSION, CollectMetricsOpts, DiskStore, Error, HEAL_CONTROL_PAYLOAD_MAX_SIZE,
+        KMS_SIGNAL_SUBSYSTEM, MetricType, Node as _, NodeService, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+        SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_PUBLICATION_LEASE_TTL_MS,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS, admit_heal_control_replay,
         background_rebalance_start_error_message, execute_heal_control_envelope_with_manager,
         initialize_heal_topology_fingerprint, initialize_heal_topology_fingerprint_with_probe, legacy_scanner_activity_response,
         make_heal_control_server, make_heal_control_server_with_cache, make_server, make_server_for_context,
@@ -2514,9 +2568,9 @@ mod tests {
         RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerPublicationLeaseReleaseRequest,
         ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest,
         SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest,
-        StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationPeerState, TierMutationPrepareRequest,
-        UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-        WriteRequest,
+        StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass,
+        TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest,
+        VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -3286,6 +3340,7 @@ mod tests {
 
     #[tokio::test]
     async fn tier_mutation_control_requires_body_bound_auth_before_store_lookup() {
+        let _ = rustfs_credentials::set_global_rpc_secret("tier-mutation-control-auth-test-secret".to_string());
         let service = make_tier_mutation_control_server_for_context(None);
         let mutation_id = uuid::Uuid::new_v4();
         let unsigned = service
@@ -3317,8 +3372,26 @@ mod tests {
         let unavailable = service
             .prepare_tier_mutation(signed)
             .await
-            .expect_err("authenticated request still requires initialized object store");
-        assert_eq!(unavailable.code(), tonic::Code::FailedPrecondition);
+            .expect("authenticated v4 pre-dispatch rejection should be signed")
+            .into_inner();
+        assert!(!unavailable.success);
+        assert_eq!(unavailable.failure_class, TierMutationFailureClass::PreDispatchRejected as i32);
+        assert_eq!(unavailable.error_info.as_deref(), Some("tier mutation object store is not initialized"));
+        let canonical =
+            rustfs_protos::canonical_tier_mutation_rpc_response_body(rustfs_protos::TierMutationRpcResponseProofInput {
+                version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                phase: rustfs_protos::TierMutationRpcPhase::Prepare,
+                mutation_id,
+                canonical_payload: b"intent",
+                success: false,
+                state: TierMutationPeerState::Unspecified as i32,
+                applied: false,
+                error_info: Some("tier mutation object store is not initialized"),
+                failure_class: TierMutationFailureClass::PreDispatchRejected as i32,
+            })
+            .expect("small response should encode");
+        crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical, &unavailable.response_proof)
+            .expect("v4 pre-dispatch rejection must authenticate its failure class");
     }
 
     #[tokio::test]
@@ -3337,12 +3410,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier_mutation_control_rejects_old_protocol_version_before_store_lookup() {
+    async fn tier_mutation_control_rejects_unsupported_protocol_version_before_store_lookup() {
         let service = make_tier_mutation_control_server_for_context(None);
         let mutation_id = uuid::Uuid::new_v4();
         let payload = Bytes::from_static(b"intent");
+        let unsupported_version = rustfs_protos::TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION - 1;
         let mut request = Request::new(TierMutationPrepareRequest {
-            version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION - 1,
+            version: unsupported_version,
             mutation_id: mutation_id.to_string(),
             canonical_payload: payload,
         });
@@ -3361,6 +3435,38 @@ mod tests {
             .await
             .expect_err("old tier mutation protocol version must fail closed");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            error.message(),
+            format!("unsupported tier mutation peer protocol version: {}", unsupported_version)
+        );
+    }
+
+    #[tokio::test]
+    async fn tier_mutation_control_accepts_v3_before_store_lookup() {
+        let service = make_tier_mutation_control_server_for_context(None);
+        let mutation_id = uuid::Uuid::new_v4();
+        let payload = Bytes::from_static(b"intent");
+        let mut request = Request::new(TierMutationPrepareRequest {
+            version: rustfs_protos::TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION,
+            mutation_id: mutation_id.to_string(),
+            canonical_payload: payload,
+        });
+        let body = rustfs_protos::canonical_tier_mutation_rpc_body(
+            request.get_ref().version,
+            rustfs_protos::TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &request.get_ref().canonical_payload,
+        )
+        .expect("v3 request should encode");
+        set_tonic_canonical_body_digest(&mut request, &body).expect("digest metadata should encode");
+        mark_v2_authenticated(&mut request);
+
+        let error = service
+            .prepare_tier_mutation(request)
+            .await
+            .expect_err("accepted v3 request should reach the missing-store check");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.message(), "tier mutation object store is not initialized");
     }
 
     #[tokio::test]
@@ -3379,6 +3485,32 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
+    #[tokio::test]
+    async fn tier_mutation_control_rejects_invalid_abort_payload_before_auth_and_store_lookup() {
+        let service = make_tier_mutation_control_server_for_context(None);
+        let mutation_id = uuid::Uuid::new_v4();
+        let empty = service
+            .abort_tier_mutation(Request::new(TierMutationAbortRequest {
+                version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                mutation_id: mutation_id.to_string(),
+                canonical_payload: Bytes::new(),
+            }))
+            .await
+            .expect_err("empty abort must fail before digest construction");
+        assert_eq!(empty.code(), tonic::Code::InvalidArgument);
+
+        let oversized = Bytes::from(vec![0; rustfs_protos::TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE + 1]);
+        let error = service
+            .abort_tier_mutation(Request::new(TierMutationAbortRequest {
+                version: rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                mutation_id: mutation_id.to_string(),
+                canonical_payload: oversized,
+            }))
+            .await
+            .expect_err("oversized abort must fail before digest construction");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
     #[test]
     fn tier_mutation_peer_state_wire_constants_match_generated_proto() {
         assert_eq!(
@@ -3388,6 +3520,19 @@ mod tests {
         assert_eq!(super::TIER_MUTATION_PEER_STATE_PREPARED_WIRE, TierMutationPeerState::Prepared as i32);
         assert_eq!(super::TIER_MUTATION_PEER_STATE_COMMITTED_WIRE, TierMutationPeerState::Committed as i32);
         assert_eq!(super::TIER_MUTATION_PEER_STATE_ABORTED_WIRE, TierMutationPeerState::Aborted as i32);
+    }
+
+    #[test]
+    fn tier_mutation_error_info_bound_preserves_utf8_and_byte_limit() {
+        let ascii = "a".repeat(rustfs_protos::TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE + 1);
+        let bounded = super::bounded_tier_mutation_error_info(ascii);
+        assert_eq!(bounded.len(), rustfs_protos::TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE);
+
+        let unicode = "界".repeat(rustfs_protos::TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE);
+        let bounded = super::bounded_tier_mutation_error_info(unicode);
+        assert!(bounded.len() <= rustfs_protos::TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        assert!(bounded.chars().all(|character| character == '界'));
     }
 
     #[test]
@@ -3404,6 +3549,7 @@ mod tests {
             state: TierMutationPeerState::Unspecified as i32,
             applied: false,
             error_info: Some("store failed".to_string()),
+            failure_class: TierMutationFailureClass::Ambiguous as i32,
         })
         .expect("response proof should be signed")
         .into_inner();
@@ -3417,6 +3563,7 @@ mod tests {
                 state: TierMutationPeerState::Unspecified as i32,
                 applied: false,
                 error_info: Some("store failed"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
             })
             .expect("small mutation response should encode");
         crate::storage::storage_api::verify_tonic_rpc_response_proof(&canonical, &response.response_proof)
@@ -3432,6 +3579,7 @@ mod tests {
                 state: TierMutationPeerState::Unspecified as i32,
                 applied: false,
                 error_info: Some("store failed"),
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
             })
             .expect("small mutation response should encode");
         let error = crate::storage::storage_api::verify_tonic_rpc_response_proof(&tampered, &response.response_proof)
@@ -3599,7 +3747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_pool_fence_probe_authenticates_supported_v2_state() {
+    async fn cross_pool_fence_probe_authenticates_supported_v3_state() {
         let _ = rustfs_credentials::set_global_rpc_secret("cross-pool-fence-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
         assert!(
@@ -3664,7 +3812,7 @@ mod tests {
 
         assert!(response.success);
         assert_eq!(response.error_info, None);
-        assert_eq!(&response.result[..4], &2_u32.to_be_bytes());
+        assert_eq!(&response.result[..4], &CROSS_POOL_FENCE_SUPPORTED_VERSION.to_be_bytes());
         let (topology_member, process_epoch) = rustfs_protos::decode_remote_version_state_capability(&response.result[4..])
             .expect("capability identity should decode");
         assert_eq!(topology_member, "node-a:9000");

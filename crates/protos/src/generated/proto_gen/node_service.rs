@@ -1521,6 +1521,8 @@ pub struct TierMutationControlResponse {
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bytes = "bytes", tag = "5")]
     pub response_proof: ::prost::bytes::Bytes,
+    #[prost(enumeration = "TierMutationFailureClass", tag = "6")]
+    pub failure_class: i32,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetLiveEventsRequest {
@@ -1607,6 +1609,35 @@ impl TierMutationPeerState {
             "TIER_MUTATION_PEER_STATE_PREPARED" => Some(Self::Prepared),
             "TIER_MUTATION_PEER_STATE_COMMITTED" => Some(Self::Committed),
             "TIER_MUTATION_PEER_STATE_ABORTED" => Some(Self::Aborted),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TierMutationFailureClass {
+    Unspecified = 0,
+    PreDispatchRejected = 1,
+    Ambiguous = 2,
+}
+impl TierMutationFailureClass {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIER_MUTATION_FAILURE_CLASS_UNSPECIFIED",
+            Self::PreDispatchRejected => "TIER_MUTATION_FAILURE_CLASS_PRE_DISPATCH_REJECTED",
+            Self::Ambiguous => "TIER_MUTATION_FAILURE_CLASS_AMBIGUOUS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIER_MUTATION_FAILURE_CLASS_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIER_MUTATION_FAILURE_CLASS_PRE_DISPATCH_REJECTED" => Some(Self::PreDispatchRejected),
+            "TIER_MUTATION_FAILURE_CLASS_AMBIGUOUS" => Some(Self::Ambiguous),
             _ => None,
         }
     }

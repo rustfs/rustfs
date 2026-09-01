@@ -356,7 +356,7 @@ impl ECStore {
             };
             run_guard.ensure_held("rebalance version migration")?;
             let result = migrate_entry_version(
-                &RebalanceMigrationBackend::new(set.as_ref(), self.as_ref(), lock_lost_signal.clone()),
+                &RebalanceMigrationBackend::new(set.as_ref(), self.clone(), lock_lost_signal.clone()),
                 bucket.clone(),
                 pool_index,
                 version,
@@ -1478,6 +1478,7 @@ mod tests {
         let (_temp_dirs, store, _unused_store) =
             crate::services::rebalance::test_two_pool_stores(Some(active_rebalance_meta(REBALANCE_ID))).await;
         prepare_rebalance_test_volumes(store.as_ref()).await;
+        crate::services::tier::test_util::register_mock_tier(&store.tier_config_mgr(), "WARM").await;
         let source_set = store.pools[0].get_disks_by_key(object);
         let target_set = store.pools[1].get_disks_by_key(object);
         let version_id = uuid::Uuid::new_v4();
@@ -1520,14 +1521,17 @@ mod tests {
         let entry = metacache_entry_from_source(source_set.as_ref(), bucket, object).await;
         let run_signal_fence = RebalanceRunSignalTestFence::install(REBALANCE_ID);
         let barrier = TieredMetadataCommitBarrier::install(bucket, object);
-        let task = spawn_real_rebalance_entry(
+        let mut task = spawn_real_rebalance_entry(
             Arc::clone(&store),
             Arc::clone(&source_set),
             entry,
             REBALANCE_ID,
             Arc::new(RebalanceBucketConfigs::default()),
         );
-        barrier.wait_until_paused().await;
+        tokio::select! {
+            _ = barrier.wait_until_paused() => {}
+            result = &mut task => panic!("rebalance exited before the tiered commit barrier: {result:?}"),
+        }
         run_signal_fence.mark_lost();
         barrier.release();
         drop(barrier);

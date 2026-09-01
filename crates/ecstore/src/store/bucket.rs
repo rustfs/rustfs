@@ -29,6 +29,25 @@ use std::future::Future;
 
 const DELETED_BUCKETS_PREFIX: &str = ".deleted";
 const SCANNER_BUCKET_LIST_SET_CONCURRENCY: usize = 4;
+const EVENT_BUCKET_DELETE_BLOCKED: &str = "bucket_delete_blocked";
+
+fn record_bucket_delete_blocker(bucket: &str, kind: BucketDeleteBlockerKind, residue: &BucketMetadataLessResidue) {
+    metrics::counter!("rustfs_bucket_delete_blockers_total", "kind" => kind.as_str()).increment(1);
+    debug!(
+        event = EVENT_BUCKET_DELETE_BLOCKED,
+        component = "ecstore",
+        subsystem = "bucket",
+        bucket,
+        blocker = kind.as_str(),
+        files = residue.files,
+        uuid_data_dirs = residue.uuid_data_dirs,
+        entries_scanned = residue.entries_scanned,
+        diagnostic_bytes_read = residue.diagnostic_bytes_read,
+        diagnostic_truncated = residue.diagnostic_truncated,
+        sample = residue.sample.as_deref().unwrap_or("<none>"),
+        "Bucket deletion was blocked by durable local state"
+    );
+}
 
 fn scanner_bucket_list_set_concurrency(set_count: usize) -> usize {
     set_count.clamp(1, SCANNER_BUCKET_LIST_SET_CONCURRENCY)
@@ -156,6 +175,7 @@ where
 async fn bucket_delete_local_blocker(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
+    budget: &mut BucketDeleteDiagnosticBudget,
 ) -> Result<Option<StorageError>> {
     let local_disks = runtime_sources::local_disks_in(ctx).await;
     let mut residue = BucketMetadataLessResidue::default();
@@ -164,18 +184,30 @@ async fn bucket_delete_local_blocker(
         let Some(bucket_path) = disk.get_bucket_path_for_io_if_local(bucket) else {
             continue;
         };
-        let scan = scan_metadata_less_residue(&bucket_path?).await?;
+        let scan = scan_metadata_less_residue_with_budget(&bucket_path?, budget).await?;
         if scan.xlmeta_found {
+            record_bucket_delete_blocker(bucket, scan.xlmeta_blocker.unwrap_or(BucketDeleteBlockerKind::UnknownXlMeta), &scan);
             return Ok(Some(StorageError::BucketNotEmpty(bucket.to_string())));
         }
         residue.files = residue.files.saturating_add(scan.files);
         residue.uuid_data_dirs = residue.uuid_data_dirs.saturating_add(scan.uuid_data_dirs);
+        residue.entries_scanned = residue.entries_scanned.saturating_add(scan.entries_scanned);
+        residue.diagnostic_bytes_read = residue.diagnostic_bytes_read.saturating_add(scan.diagnostic_bytes_read);
         if residue.sample.is_none() {
-            residue.sample = scan.sample;
+            residue.sample = scan.sample.clone();
+        }
+        if scan.diagnostic_truncated {
+            residue.diagnostic_truncated = true;
+            record_bucket_delete_blocker(bucket, BucketDeleteBlockerKind::DiagnosticBudgetExceeded, &residue);
+            return Ok(Some(StorageError::BucketNotEmptyWithDetails {
+                bucket: bucket.to_string(),
+                details: residue.describe(),
+            }));
         }
     }
 
     if residue.has_residue_without_xlmeta() {
+        record_bucket_delete_blocker(bucket, BucketDeleteBlockerKind::OrphanDirectory, &residue);
         return Ok(Some(StorageError::BucketNotEmptyWithDetails {
             bucket: bucket.to_string(),
             details: residue.describe(),
@@ -783,12 +815,14 @@ impl ECStore {
                 }
             }
         };
+        let mut diagnostic_budget = None;
 
         if bucket_exists {
             validate_table_bucket_delete_guard(&self.ctx, bucket).await?;
 
             if !opts.force {
-                if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket).await? {
+                let budget = diagnostic_budget.get_or_insert_with(BucketDeleteDiagnosticBudget::new);
+                if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket, budget).await? {
                     return Err(blocker);
                 }
                 delete_opts.force_if_empty = true;
@@ -827,7 +861,12 @@ impl ECStore {
         {
             if delete_opts.force_if_empty
                 && matches!(&err, StorageError::BucketNotEmpty(_))
-                && let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket).await?
+                && let Some(blocker) = bucket_delete_local_blocker(
+                    &self.ctx,
+                    bucket,
+                    diagnostic_budget.get_or_insert_with(BucketDeleteDiagnosticBudget::new),
+                )
+                .await?
             {
                 return Err(blocker);
             }
@@ -856,15 +895,17 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        SCANNER_BUCKET_LIST_SET_CONCURRENCY, await_bucket_namespace_operation, bucket_delete_metadata_cleanup_prefixes,
-        bucket_deleted_marker_prefix, bucket_deleted_marker_volume, run_bucket_usage_cleanup, run_physical_bucket_deletion,
-        scan_metadata_less_residue, scanner_bucket_list_set_concurrency, should_override_created_from_metadata,
+        BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES, BucketDeleteBlockerKind,
+        BucketDeleteDiagnosticBudget, SCANNER_BUCKET_LIST_SET_CONCURRENCY, await_bucket_namespace_operation,
+        bucket_delete_metadata_cleanup_prefixes, bucket_deleted_marker_prefix, bucket_deleted_marker_volume,
+        run_bucket_usage_cleanup, run_physical_bucket_deletion, scan_metadata_less_residue,
+        scan_metadata_less_residue_with_budget, scanner_bucket_list_set_concurrency, should_override_created_from_metadata,
         validate_table_bucket_delete_allowed,
     };
     use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
     use crate::bucket::metadata_sys;
     use crate::cluster::rpc::peer_s3_client::install_delete_bucket_empty_scan_barrier;
-    use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+    use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE};
     use crate::error::StorageError;
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::runtime::instance::InstanceContext;
@@ -879,6 +920,7 @@ mod tests {
         layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
     };
     use rustfs_data_usage::{BucketUsageInfo, DATA_USAGE_OBJECT_NAME, DataUsageInfo};
+    use rustfs_filemeta::{FileInfo, FileMeta, TRANSITION_COMPLETE};
     use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use serial_test::serial;
     use std::path::{Path, PathBuf};
@@ -891,6 +933,88 @@ mod tests {
     use uuid::Uuid;
 
     static BUCKET_DELETE_TEST_ENV: OnceCell<(Vec<PathBuf>, Arc<ECStore>)> = OnceCell::const_new();
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_delete_diagnostic_budget_starts_with_first_scan_io_and_latches_once() {
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(8, Duration::from_millis(100));
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        let first_polled = Arc::new(AtomicBool::new(false));
+        let first_polled_for_io = first_polled.clone();
+        let first = budget
+            .run_io(async move {
+                first_polled_for_io.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(7_u8)
+            })
+            .await
+            .expect("the first diagnostic IO should succeed");
+        assert_eq!(first, Some(7));
+        assert!(first_polled.load(Ordering::SeqCst));
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let expired_polled = Arc::new(AtomicBool::new(false));
+        let expired_polled_for_io = expired_polled.clone();
+        let expired = budget
+            .run_io(async move {
+                expired_polled_for_io.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(9_u8)
+            })
+            .await
+            .expect("an expired diagnostic budget should not become an IO error");
+        assert_eq!(expired, None);
+        assert!(
+            !expired_polled.load(Ordering::SeqCst),
+            "the deadline must remain latched after the first scan IO"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_delete_diagnostic_budget_times_out_its_first_pending_io() {
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(8, Duration::from_millis(100));
+        let io_polled = Arc::new(AtomicBool::new(false));
+        let io_polled_for_future = io_polled.clone();
+
+        let result = budget
+            .run_io(std::future::poll_fn(move |_cx| {
+                io_polled_for_future.store(true, Ordering::SeqCst);
+                std::task::Poll::<std::io::Result<()>>::Pending
+            }))
+            .await
+            .expect("a diagnostic timeout should fail closed without an IO error");
+
+        assert_eq!(result, None);
+        assert!(
+            io_polled.load(Ordering::SeqCst),
+            "the first diagnostic IO must be polled before its timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_metadata_less_scans_still_detect_orphans_and_xlmeta() {
+        let root = tempfile::tempdir().expect("temporary delayed-scan roots should be created");
+        let orphan_root = root.path().join("orphan-root");
+        let xlmeta_root = root.path().join("xlmeta-root");
+        std::fs::create_dir_all(&orphan_root).expect("orphan root should be created");
+        std::fs::create_dir_all(&xlmeta_root).expect("xlmeta root should be created");
+        std::fs::write(orphan_root.join("orphan-part"), b"orphan").expect("orphan fixture should be written");
+        std::fs::write(xlmeta_root.join(STORAGE_FORMAT_FILE), b"invalid-xlmeta").expect("xl.meta fixture should be written");
+
+        let mut orphan_budget = BucketDeleteDiagnosticBudget::with_limits(16, Duration::from_secs(5));
+        let mut xlmeta_budget = BucketDeleteDiagnosticBudget::with_limits(16, Duration::from_secs(5));
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        let orphan = scan_metadata_less_residue_with_budget(&orphan_root, &mut orphan_budget)
+            .await
+            .expect("delayed orphan scan should complete");
+        assert!(orphan.has_residue_without_xlmeta());
+        assert!(!orphan.diagnostic_truncated);
+
+        let xlmeta = scan_metadata_less_residue_with_budget(&xlmeta_root, &mut xlmeta_budget)
+            .await
+            .expect("delayed xl.meta scan should complete");
+        assert!(xlmeta.xlmeta_found);
+        assert!(!xlmeta.diagnostic_truncated);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn bucket_namespace_operation_fails_closed_after_lease_expiry() {
@@ -1311,6 +1435,175 @@ mod tests {
         let sample = residue.sample.as_deref().expect("part sample should be recorded");
         assert!(sample.starts_with("object/"));
         assert!(sample.ends_with("/part.1"));
+    }
+
+    #[tokio::test]
+    async fn metadata_less_residue_scan_shares_one_entry_budget_across_roots() {
+        let root = tempfile::tempdir().expect("temporary diagnostic roots should be created");
+        let first_root = root.path().join("disk-a");
+        let second_root = root.path().join("disk-b");
+        tokio::fs::create_dir_all(&first_root)
+            .await
+            .expect("first diagnostic root should be created");
+        tokio::fs::create_dir_all(&second_root)
+            .await
+            .expect("second diagnostic root should be created");
+        for index in 0..3 {
+            std::fs::write(first_root.join(format!("first-{index}")), b"").expect("first-root fixture should be written");
+            std::fs::write(second_root.join(format!("second-{index}")), b"").expect("second-root fixture should be written");
+        }
+
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(4, Duration::from_secs(5));
+        let first = scan_metadata_less_residue_with_budget(&first_root, &mut budget)
+            .await
+            .expect("first root should fit the shared budget");
+        assert!(!first.diagnostic_truncated);
+        let second = scan_metadata_less_residue_with_budget(&second_root, &mut budget)
+            .await
+            .expect("second root should stop at the remaining shared budget");
+        assert!(second.diagnostic_truncated);
+        assert!(first.entries_scanned + second.entries_scanned <= 4);
+    }
+
+    #[tokio::test]
+    async fn metadata_less_residue_scan_honors_an_expired_request_deadline() {
+        let root = tempfile::tempdir().expect("temporary diagnostic root should be created");
+        std::fs::write(root.path().join("orphan"), b"").expect("deadline fixture should be written");
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(8, Duration::ZERO);
+
+        let scan = scan_metadata_less_residue_with_budget(root.path(), &mut budget)
+            .await
+            .expect("an expired diagnostic budget should fail closed without an IO error");
+
+        assert!(scan.diagnostic_truncated);
+        assert_eq!(scan.entries_scanned, 0);
+        assert_eq!(scan.diagnostic_bytes_read, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_less_residue_scan_stops_at_diagnostic_budget() {
+        let root = tempfile::tempdir().expect("temporary bucket root should be created");
+        let bucket_path = root.path().join("bucket");
+        tokio::fs::create_dir_all(&bucket_path)
+            .await
+            .expect("budget fixture directory should be created");
+        for index in 0..(BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES + 32) {
+            std::fs::write(bucket_path.join(format!("orphan-{index:05}")), b"").expect("budget fixture file should be created");
+        }
+
+        let residue = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("budgeted residue scan should fail closed without an IO error");
+        assert!(residue.diagnostic_truncated);
+        assert!(residue.has_residue_without_xlmeta());
+        assert!(!residue.xlmeta_found);
+        assert!(residue.entries_scanned <= BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES);
+        assert!(residue.files <= BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES);
+        assert_eq!(residue.diagnostic_bytes_read, 0);
+    }
+
+    #[tokio::test]
+    async fn bucket_residue_scan_distinguishes_visible_and_tier_free_xlmeta() {
+        let root = tempfile::tempdir().expect("temporary bucket root should be created");
+        let bucket_path = root.path().join("bucket");
+        let visible_path = bucket_path.join("visible").join(STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(visible_path.parent().expect("visible xl.meta should have a parent"))
+            .await
+            .expect("visible object directory should be created");
+        let mut visible = FileMeta::new();
+        visible
+            .add_version(FileInfo {
+                version_id: Some(Uuid::new_v4()),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("visible version should encode");
+        tokio::fs::write(&visible_path, visible.marshal_msg().expect("visible xl.meta should marshal"))
+            .await
+            .expect("visible xl.meta should be written");
+
+        let visible_scan = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("visible xl.meta scan should succeed");
+        assert_eq!(visible_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::VisibleVersion));
+
+        tokio::fs::remove_dir_all(bucket_path.join("visible"))
+            .await
+            .expect("visible fixture should be removed");
+        let free_path = bucket_path.join("free").join(STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(free_path.parent().expect("free xl.meta should have a parent"))
+            .await
+            .expect("free-version object directory should be created");
+        let source_version_id = Uuid::new_v4();
+        let mut free = FileMeta::new();
+        free.add_version(FileInfo {
+            version_id: Some(source_version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(Uuid::new_v4()),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned source should encode");
+        let mut delete = FileInfo {
+            version_id: Some(source_version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete.set_tier_free_version_id(&Uuid::new_v4().to_string());
+        free.delete_version(&delete)
+            .expect("transitioned source delete should create a free-version");
+        tokio::fs::write(&free_path, free.marshal_msg().expect("free-version xl.meta should marshal"))
+            .await
+            .expect("free-version xl.meta should be written");
+
+        let free_scan = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("free-version xl.meta scan should succeed");
+        assert_eq!(free_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::TierFreeVersion));
+
+        tokio::fs::remove_dir_all(bucket_path.join("free"))
+            .await
+            .expect("free-version fixture should be removed");
+
+        let exact_limit_path = bucket_path.join("exact-limit").join(STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(exact_limit_path.parent().expect("exact-limit xl.meta should have a parent"))
+            .await
+            .expect("exact-limit object directory should be created");
+        let exact_limit = tokio::fs::File::create(&exact_limit_path)
+            .await
+            .expect("exact-limit xl.meta should be created");
+        exact_limit
+            .set_len(BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES)
+            .await
+            .expect("exact-limit xl.meta should be extended without allocating its contents");
+        let exact_limit_scan = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("exact-limit xl.meta scan should remain fail closed");
+        assert_eq!(exact_limit_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::UnknownXlMeta));
+        assert_eq!(exact_limit_scan.diagnostic_bytes_read, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES);
+        tokio::fs::remove_dir_all(bucket_path.join("exact-limit"))
+            .await
+            .expect("exact-limit fixture should be removed");
+
+        let oversized_path = bucket_path.join("oversized").join(STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(oversized_path.parent().expect("oversized xl.meta should have a parent"))
+            .await
+            .expect("oversized object directory should be created");
+        let oversized = tokio::fs::File::create(&oversized_path)
+            .await
+            .expect("oversized xl.meta should be created");
+        oversized
+            .set_len(BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES + 1)
+            .await
+            .expect("oversized xl.meta should be extended without allocating its contents");
+        let oversized_scan = scan_metadata_less_residue(&bucket_path)
+            .await
+            .expect("oversized xl.meta scan should remain fail closed");
+        assert_eq!(oversized_scan.xlmeta_blocker, Some(BucketDeleteBlockerKind::UnknownXlMeta));
+        assert_eq!(oversized_scan.diagnostic_bytes_read, 0);
+        assert!(oversized_scan.diagnostic_bytes_read <= BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES);
     }
 
     #[tokio::test]

@@ -21,12 +21,12 @@
 2|crates/ecstore/src/bucket/replication/replication_target_boundary.rs
 3|crates/ecstore/src/cluster/rpc/http_auth.rs
 2|crates/ecstore/src/cluster/rpc/internode_data_transport.rs
-11|crates/ecstore/src/cluster/rpc/peer_rest_client.rs
+10|crates/ecstore/src/cluster/rpc/peer_rest_client.rs
 10|crates/ecstore/src/cluster/rpc/peer_s3_client.rs
 10|crates/ecstore/src/cluster/rpc/remote_disk.rs
 6|crates/ecstore/src/config/com.rs
 14|crates/ecstore/src/config/storageclass.rs
-183|crates/ecstore/src/core/pools.rs
+182|crates/ecstore/src/core/pools.rs
 8|crates/ecstore/src/data_movement/mod.rs
 2|crates/ecstore/src/data_usage/local_snapshot.rs
 12|crates/ecstore/src/data_usage/mod.rs
@@ -70,5 +70,5 @@
 12|crates/ecstore/src/store/init.rs
 2|crates/ecstore/src/store/init_format.rs
 3|crates/ecstore/src/store/multipart.rs
-8|crates/ecstore/src/store/object.rs
+7|crates/ecstore/src/store/object.rs
 5|crates/ecstore/src/store/rebalance/support.rs
