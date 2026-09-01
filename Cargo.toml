@@ -71,7 +71,7 @@ resolver = "3"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/rustfs/rustfs"
-rust-version = "1.97.1"
+rust-version = "1.98.0"
 version = "1.0.0-rc.5"
 homepage = "https://rustfs.com"
 description = "RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages worldwide. "
@@ -174,7 +174,7 @@ tonic = { version = "0.14.6" }
 tonic-prost = { version = "0.14.6" }
 tonic-prost-build = { version = "0.14.6" }
 tower = { version = "0.5.3" }
-tower-http = { version = "0.7.0" }
+tower-http = { version = "0.7.1" }
 
 # Serialization and Data Formats
 apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"] }
@@ -232,7 +232,7 @@ tokio-postgres-rustls = "0.14.0"
 # Utilities and Tools
 anyhow = "1.0.104"
 arc-swap = "1.9.2"
-# RUSTFS_COMPAT_TODO(tokio-tar-extension-limits): keep the fork pin until bounded extension parsing is released upstream. Remove after astral-sh/tokio-tar#118 is merged and a published tokio-tar release exposes the extension limits used here.
+# RUSTFS_COMPAT_TODO(tokio-tar-extension-limits): keep the fork pin until every parser hardening used by Snowball is released upstream. Remove after astral-sh/tokio-tar#118 is merged and a published release includes extension, physical-entry, and sparse limits, cancellation-safe sparse parsing, and error-fused entry streams.
 astral-tokio-tar = { git = "https://github.com/cxymds/tokio-tar.git", rev = "603756478b7668436e464519c77ccac22a99ba96" }
 atoi = "3.1.0"
 atomic_enum = "0.3.0"
@@ -283,7 +283,7 @@ mime_guess = "2.0.5"
 moka = { version = "0.12.16" }
 netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
-nvml-wrapper = "0.12.1"
+nvml-wrapper = "0.13.0"
 parking_lot = "0.12.5"
 path-absolutize = "4.0.1"
 percent-encoding = "2.3.2"
@@ -305,7 +305,7 @@ rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { git = "https://github.com/rustfs/s3s.git", rev = "9c4690d8e73fc8d184031a19b2c4539ebc77d180", version = "0.15.0", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s.git", rev = "28e9ebb23dd2fb7d667084f34121b4aa4807a5c6", version = "0.15.0", features = ["minio"] }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.3"
@@ -355,7 +355,7 @@ pyroscope = { version = "2.1.1" }
 # FTP and SFTP
 libunftp = { version = "0.23.0" }
 unftp-core = "0.1.0"
-suppaftp = { version = "10.0.2" }
+suppaftp = { version = "11.0.0" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
 russh = { version = "0.63.1" }
 russh-sftp = "2.4.0"

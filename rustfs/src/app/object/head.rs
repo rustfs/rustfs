@@ -311,7 +311,11 @@ impl DefaultObjectUsecase {
         let content_disposition = metadata_map.get("content-disposition").cloned();
         let content_language = metadata_map.get("content-language").cloned();
         let website_redirect_location = metadata_map.get(AMZ_WEBSITE_REDIRECT_LOCATION).cloned();
-        let expires = info.expires.map(Timestamp::from);
+        let expires = info
+            .expires
+            .map(Timestamp::from)
+            .map(|expires| format_expires_header(&expires))
+            .transpose()?;
 
         // Calculate tag count from user_tags already in ObjectInfo
         // This avoids an additional API call since user_tags is already populated by get_object_info

@@ -23,7 +23,7 @@
 //! - `InfoType`: Information type enum
 //! - `CommandResult`: Result of parsing command line arguments
 
-use crate::version::build;
+use crate::version::{self, build};
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use const_str::concat;
@@ -31,16 +31,7 @@ use rustfs_config::{DEFAULT_ADDRESS, DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_EN
 use std::path::PathBuf;
 // build module is re-exported from crate::build
 
-#[allow(clippy::const_is_empty)]
-pub(super) const SHORT_VERSION: &str = {
-    if !build::TAG.is_empty() {
-        build::TAG
-    } else if !build::SHORT_COMMIT.is_empty() {
-        concat!("@", build::SHORT_COMMIT)
-    } else {
-        build::PKG_VERSION
-    }
-};
+pub(super) const SHORT_VERSION: &str = version::DISPLAY_VERSION;
 
 pub(super) const LONG_VERSION: &str = concat!(
     concat!(SHORT_VERSION, "\n"),
@@ -495,8 +486,9 @@ pub fn default_server_opts() -> ServerOpts {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands, ConnectCommands, InspectCommands, preprocess_args_for_legacy};
-    use clap::Parser;
+    use crate::version;
     use clap::error::ErrorKind;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn preprocess_help_command_displays_top_level_help() {
@@ -509,6 +501,19 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn version_flags_use_display_version() {
+        let command = Cli::command();
+
+        let short = command.render_version();
+        assert!(short.contains(version::DISPLAY_VERSION));
+        assert!(!short.contains("build time"));
+
+        let long = command.render_long_version();
+        assert!(long.starts_with(&format!("rustfs {}\n", version::DISPLAY_VERSION)));
+        assert!(long.contains("build time"));
     }
 
     #[test]

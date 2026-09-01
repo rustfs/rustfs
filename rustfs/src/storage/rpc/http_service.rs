@@ -370,6 +370,18 @@ fn put_file_server_epoch_matches(query: &PutFileQuery) -> bool {
     query.put_file_server_epoch == Some(*PUT_FILE_CAPABILITY_SERVER_EPOCH)
 }
 
+fn put_file_server_epoch_accepted(query: &PutFileQuery, strict: bool) -> bool {
+    if put_file_server_epoch_matches(query) {
+        return true;
+    }
+    if strict {
+        return false;
+    }
+
+    // RUSTFS_COMPAT_TODO(put-file-auth-epoch-strict): accept signed, non-nil stale epochs because rc.2 peers can cache a server epoch before a rolling restart and cannot recover from the v1 409. Remove after the minimum supported RustFS peer version re-probes put_file capability after server-epoch conflicts and legacy put_file auth is no longer accepted.
+    query.put_file_server_epoch.is_some_and(|epoch| !epoch.is_nil())
+}
+
 impl<S> Service<Request<Incoming>> for InternodeRpcService<S>
 where
     S: Service<Request<Incoming>, Response = Response<Body>> + Clone + Send + 'static,
@@ -1346,7 +1358,7 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool) -> Response
     if require_auth && auth_nonce.is_none() {
         return response_with_status(StatusCode::FORBIDDEN, "invalid put_file auth: put_file auth required");
     }
-    if require_auth && !put_file_server_epoch_matches(&query) {
+    if require_auth && !put_file_server_epoch_accepted(&query, *PUT_FILE_AUTH_STRICT) {
         return response_with_status(StatusCode::CONFLICT, "put_file capability server epoch changed");
     }
     if let Some(nonce) = auth_nonce
@@ -1690,8 +1702,8 @@ mod tests {
         READ_FILE_STREAM_PATH, WALK_DIR_BODY_SHA256_QUERY, WALK_DIR_PATH, WalkDirQuery, append_walk_dir_completion,
         internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path, ns_scanner_response_body,
         ns_scanner_server_epoch_matches, put_body_size_mismatch, put_file_auth_nonce, put_file_capability_response,
-        put_file_server_epoch_matches, put_file_stage_error_message, put_file_target_lock, read_file_body_stream,
-        read_file_stream_buffer_size, remote_scanner_claim_rejection, response_with_disk_error,
+        put_file_server_epoch_accepted, put_file_server_epoch_matches, put_file_stage_error_message, put_file_target_lock,
+        read_file_body_stream, read_file_stream_buffer_size, remote_scanner_claim_rejection, response_with_disk_error,
         supports_walk_dir_stream_completion, validate_walk_dir_completion_request, verify_internode_rpc_signature,
         verify_ns_scanner_body_digest, verify_walk_dir_body_digest, walk_dir_response_body, write_authenticated_put_file,
         write_body_chunks_to_writer, write_put_file_body_chunks_to_writer,
@@ -1832,7 +1844,7 @@ mod tests {
 
         for (server_epoch, expected_status) in [
             (None, StatusCode::CONFLICT),
-            (Some(uuid::Uuid::new_v4()), StatusCode::CONFLICT),
+            (Some(uuid::Uuid::new_v4()), StatusCode::BAD_REQUEST),
             (Some(*super::PUT_FILE_CAPABILITY_SERVER_EPOCH), StatusCode::BAD_REQUEST),
         ] {
             let nonce = uuid::Uuid::new_v4();
@@ -2251,14 +2263,23 @@ mod tests {
 
         assert_eq!(put_file_auth_nonce(&query).expect("v1 auth should parse"), Some(nonce));
         assert!(put_file_server_epoch_matches(&query));
+        assert!(put_file_server_epoch_accepted(&query, false));
+        assert!(put_file_server_epoch_accepted(&query, true));
 
         let mut stale_epoch = query.clone();
         stale_epoch.put_file_server_epoch = Some(uuid::Uuid::new_v4());
         assert!(!put_file_server_epoch_matches(&stale_epoch));
+        assert!(put_file_server_epoch_accepted(&stale_epoch, false));
+        assert!(!put_file_server_epoch_accepted(&stale_epoch, true));
 
         let mut missing_epoch = query.clone();
         missing_epoch.put_file_server_epoch = None;
         assert!(!put_file_server_epoch_matches(&missing_epoch));
+        assert!(!put_file_server_epoch_accepted(&missing_epoch, false));
+
+        let mut nil_epoch = query.clone();
+        nil_epoch.put_file_server_epoch = Some(uuid::Uuid::nil());
+        assert!(!put_file_server_epoch_accepted(&nil_epoch, false));
 
         let mut append = query.clone();
         append.append = true;

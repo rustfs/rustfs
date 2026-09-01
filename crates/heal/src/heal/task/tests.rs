@@ -2429,6 +2429,37 @@ async fn erasure_set_format_slowdown_is_propagated() {
 }
 
 #[tokio::test]
+async fn erasure_set_retry_signal_remains_typed_across_task_boundary() {
+    let temp = TempDir::new().expect("temporary directory should be created");
+    let disk = make_resume_disk(&temp).await;
+    let storage = Arc::new(MockStorage {
+        heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::RetryableSlowDown)),
+        resume_disk: Mutex::new(Some(disk)),
+        ..Default::default()
+    });
+    let request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: vec!["bucket-a".to_string()],
+            set_disk_id: "pool_0_set_0".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Normal,
+    );
+    let task = HealTask::from_request(request, storage);
+
+    let error = task
+        .execute()
+        .await
+        .expect_err("an incomplete resumable pass must remain retryable");
+
+    assert!(
+        matches!(&error, Error::TransientSkip { message } if message.contains("retry scheduled")),
+        "the resumable retry signal must keep its typed identity: {error}"
+    );
+    assert!(error.is_recoverable_heal(), "the scheduler must accept the preserved retry signal");
+}
+
+#[tokio::test]
 async fn erasure_set_bucket_prepass_failure_stops_before_object_heal() {
     let temp = TempDir::new().expect("temporary directory should be created");
     let disk = make_resume_disk(&temp).await;

@@ -1013,7 +1013,7 @@ fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &He
         insert_string_header(&mut headers, http::header::LAST_MODIFIED, format_timestamp_http_date(last_modified)?)?;
     }
     if let Some(expires) = &output.expires {
-        insert_string_header(&mut headers, http::header::EXPIRES, format_timestamp_http_date(expires)?)?;
+        insert_string_header(&mut headers, http::header::EXPIRES, expires.clone())?;
     }
     if let Some(version_id) = &output.version_id {
         insert_string_header(&mut headers, HeaderName::from_static("x-amz-version-id"), version_id.clone())?;
