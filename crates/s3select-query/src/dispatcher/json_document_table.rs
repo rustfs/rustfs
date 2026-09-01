@@ -672,3 +672,613 @@ fn decoder_resource_error() -> DataFusionError {
 fn decoder_worker_error() -> DataFusionError {
     DataFusionError::Execution("JSON DOCUMENT decoder worker terminated unexpectedly".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::{
+        arrow::{array::Int64Array, datatypes::Schema},
+        object_store::memory::InMemory,
+        prelude::SessionContext,
+    };
+    use futures::TryStreamExt as _;
+
+    #[tokio::test]
+    async fn schema_prefix_is_replayed_without_reopening_the_object() {
+        let store = Arc::new(InMemory::new());
+        let path = Path::from("input.json");
+        store
+            .put(&path, Bytes::from_static(b"{\"id\":1}\n{\"id\":2}\n").into())
+            .await
+            .expect("put fixture");
+        let context = SessionContext::new();
+        let url = datafusion::execution::object_store::ObjectStoreUrl::parse("s3://bucket").expect("store URL");
+        context.register_object_store(url.as_ref(), store);
+        let provider = JsonDocumentTable::try_new(&context.state(), "bucket", "input.json")
+            .await
+            .expect("prepare streaming provider");
+        context.register_table("S3Object", provider).expect("register table");
+
+        let batches = context
+            .sql("SELECT id FROM S3Object ORDER BY id")
+            .await
+            .expect("plan query")
+            .collect()
+            .await
+            .expect("execute query");
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column")
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(values, vec![1, 2]);
+
+        let error = context
+            .sql("SELECT id FROM S3Object")
+            .await
+            .expect("plan second scan")
+            .collect()
+            .await
+            .expect_err("JSON DOCUMENT source must be consumed exactly once");
+        assert!(error.to_string().contains("consumed more than once"));
+    }
+
+    #[tokio::test]
+    async fn schema_prefix_fails_closed_at_its_byte_limit() {
+        const ROWS: usize = 6;
+        const PAYLOAD_BYTES: usize = 700 * 1024;
+        let rows = (0..ROWS)
+            .map(|id| {
+                Ok::<_, ObjectStoreError>(Bytes::from(format!("{{\"id\":{id},\"payload\":\"{}\"}}\n", "x".repeat(PAYLOAD_BYTES))))
+            })
+            .collect::<Vec<_>>();
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let error = prepare_source(stream::iter(rows).boxed(), memory_pool)
+            .await
+            .expect_err("an incomplete schema prefix must not silently drop later fields");
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_row_stream_produces_an_empty_query_result() {
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let (schema, source) = prepare_source(stream::empty().boxed(), memory_pool)
+            .await
+            .expect("prepare empty JSON DOCUMENT stream");
+        assert!(schema.fields().is_empty());
+
+        let provider = Arc::new(JsonDocumentTable {
+            schema,
+            source: Arc::new(Mutex::new(Some(source))),
+        });
+        let context = SessionContext::new();
+        context.register_table("S3Object", provider).expect("register empty table");
+        let batches = context
+            .sql("SELECT COUNT(*) FROM S3Object")
+            .await
+            .expect("plan empty query")
+            .collect()
+            .await
+            .expect("execute empty query");
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column")
+            .value(0);
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn object_row_with_an_empty_schema_is_counted() {
+        let input = stream::once(async { Ok::<_, ObjectStoreError>(Bytes::from_static(b"{}\n")) }).boxed();
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let (schema, source) = prepare_source(input, memory_pool)
+            .await
+            .expect("prepare empty-object JSON DOCUMENT stream");
+        assert!(schema.fields().is_empty());
+
+        let provider = Arc::new(JsonDocumentTable {
+            schema,
+            source: Arc::new(Mutex::new(Some(source))),
+        });
+        let context = SessionContext::new();
+        context.register_table("S3Object", provider).expect("register table");
+        let batches = context
+            .sql("SELECT COUNT(*) FROM S3Object")
+            .await
+            .expect("plan empty-object query")
+            .collect()
+            .await
+            .expect("execute empty-object query");
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count column")
+            .value(0);
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn limit_drops_a_stalled_tail_after_the_bounded_schema_prefix() {
+        const EXPECTED_SCHEMA_PREFIX_RECORDS: usize = 1000;
+        assert_eq!(SCHEMA_INFERENCE_MAX_RECORDS, EXPECTED_SCHEMA_PREFIX_RECORDS);
+        let rows = (0..EXPECTED_SCHEMA_PREFIX_RECORDS).map(|id| Ok(Bytes::from(format!("{{\"id\":{id}}}\n"))));
+        let input = stream::iter(rows).chain(stream::pending()).boxed();
+        let memory_pool = Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(16 * 1024 * 1024));
+        let (schema, source) = prepare_source(input, memory_pool.clone())
+            .await
+            .expect("prepare bounded schema prefix");
+        let provider = Arc::new(JsonDocumentTable {
+            schema,
+            source: Arc::new(Mutex::new(Some(source))),
+        });
+        let context = SessionContext::new();
+        context
+            .register_table("S3Object", provider)
+            .expect("register streaming table");
+
+        let batches = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            context
+                .sql("SELECT id FROM S3Object LIMIT 1")
+                .await
+                .expect("plan limited query")
+                .collect()
+                .await
+        })
+        .await
+        .expect("LIMIT should not wait for the unread object tail")
+        .expect("execute limited query");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(memory_pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn row_chunks_must_end_on_a_record_boundary() {
+        let chunks = stream::iter([
+            Ok::<_, ObjectStoreError>(Bytes::from_static(b"{\"id\":")),
+            Ok(Bytes::from_static(b"1}\n")),
+        ])
+        .boxed();
+        let mut input = JsonDocumentInput::new(chunks);
+
+        let error = input
+            .next_row()
+            .await
+            .expect_err("a producer must not split one JSON row across chunks");
+        assert!(error.to_string().contains("non-newline-terminated chunk"));
+    }
+
+    #[test]
+    fn schema_inference_has_no_fixed_field_count_limit() {
+        const FIELDS: usize = 4097;
+        let cancellation = AtomicBool::new(false);
+        let mut input = json_object_with_unique_keys(FIELDS);
+        input.push(b'\n');
+
+        let (schema, records, _) = infer_schema(&input, 1, &cancellation, SCHEMA_INFERENCE_MAX_SCHEMA_BYTES)
+            .expect("a protocol-valid wide object should be governed by memory, not a field-count constant");
+        assert_eq!(records, 1);
+        assert_eq!(schema.fields().len(), FIELDS);
+    }
+
+    #[tokio::test]
+    async fn schema_prefix_respects_the_query_memory_pool() {
+        let memory_pool = Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(1));
+        let input = stream::once(async { Ok::<_, ObjectStoreError>(Bytes::from_static(b"{\"id\":1}\n")) }).boxed();
+
+        let error = prepare_source(input, memory_pool.clone())
+            .await
+            .expect_err("schema prefix allocation must use the query memory pool");
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+        assert_eq!(memory_pool.reserved(), 0);
+    }
+
+    #[test]
+    fn schema_inference_cancellation_reaches_cpu_boundaries() {
+        let cancellation = Arc::new(AtomicBool::new(false));
+        drop(SchemaInferenceCancellation(Arc::clone(&cancellation)));
+        assert!(cancellation.load(Ordering::Acquire));
+
+        let error = infer_schema(b"{}\n", 1, cancellation.as_ref(), SCHEMA_INFERENCE_MAX_SCHEMA_BYTES)
+            .expect_err("schema inference must observe cancellation");
+        assert!(error.to_string().contains("schema inference canceled"));
+    }
+
+    #[test]
+    fn queued_schema_inference_retains_query_admission() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        runtime.block_on(async {
+            let (blocking_started_tx, blocking_started_rx) = tokio::sync::oneshot::channel();
+            let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocking_started_tx.send(());
+                release_blocking_rx.recv().expect("release blocking worker");
+            });
+            blocking_started_rx.await.expect("blocking worker should start");
+
+            let admission = Arc::new(tokio::sync::Semaphore::new(1));
+            let query_guard = Arc::new(
+                Arc::clone(&admission)
+                    .acquire_owned()
+                    .await
+                    .expect("query admission should be available"),
+            );
+            let input = stream::iter([Ok::<_, ObjectStoreError>(Bytes::from_static(b"{\"id\":1}\n"))])
+                .map(move |row| {
+                    let _query_guard = &query_guard;
+                    row
+                })
+                .boxed();
+            let memory_pool: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+            {
+                let inference = prepare_source(input, memory_pool);
+                futures::pin_mut!(inference);
+                assert!(futures::poll!(inference.as_mut()).is_pending());
+            }
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), Arc::clone(&admission).acquire_owned(),)
+                    .await
+                    .is_err(),
+                "queued schema inference must retain query admission through teardown"
+            );
+
+            release_blocking_tx.send(()).expect("release blocking worker");
+            blocker.await.expect("blocking worker should finish");
+            let recovered = tokio::time::timeout(std::time::Duration::from_secs(1), Arc::clone(&admission).acquire_owned())
+                .await
+                .expect("schema worker teardown should release query admission")
+                .expect("query admission should remain open");
+            drop(recovered);
+        });
+    }
+
+    #[tokio::test]
+    async fn projection_is_applied_before_json_value_decoding() {
+        let rows = stream::iter(
+            (0..SCHEMA_INFERENCE_MAX_RECORDS)
+                .map(|id| Ok::<_, ObjectStoreError>(Bytes::from(format!("{{\"id\":{id},\"payload\":\"ok\"}}\n")))),
+        )
+        .chain(stream::once(async {
+            Ok(Bytes::from_static(b"{\"id\":1000,\"payload\":{\"shape\":\"incompatible\"}}\n"))
+        }))
+        .boxed();
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let (schema, source) = prepare_source(rows, memory_pool).await.expect("prepare projection fixture");
+        let provider = Arc::new(JsonDocumentTable {
+            schema,
+            source: Arc::new(Mutex::new(Some(source))),
+        });
+        let context = SessionContext::new();
+        context.register_table("S3Object", provider).expect("register table");
+
+        let batches = context
+            .sql("SELECT id FROM S3Object")
+            .await
+            .expect("plan projected query")
+            .collect()
+            .await
+            .expect("unprojected type changes must not affect selected columns");
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column")
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(values.len(), SCHEMA_INFERENCE_MAX_RECORDS + 1);
+        assert_eq!(values.last(), Some(&1000));
+    }
+
+    #[tokio::test]
+    async fn filter_columns_remain_available_to_the_physical_filter() {
+        let rows = stream::iter([
+            Ok::<_, ObjectStoreError>(Bytes::from_static(b"{\"id\":1,\"payload\":\"keep\"}\n")),
+            Ok(Bytes::from_static(b"{\"id\":2,\"payload\":\"drop\"}\n")),
+        ])
+        .boxed();
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let (schema, source) = prepare_source(rows, memory_pool).await.expect("prepare filter fixture");
+        let provider = Arc::new(JsonDocumentTable {
+            schema,
+            source: Arc::new(Mutex::new(Some(source))),
+        });
+        let context = SessionContext::new();
+        context.register_table("S3Object", provider).expect("register table");
+
+        let batches = context
+            .sql("SELECT id FROM S3Object WHERE payload = 'keep'")
+            .await
+            .expect("plan filtered query")
+            .collect()
+            .await
+            .expect("execute filtered query");
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id column")
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(values, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn decoder_flushes_large_input_on_a_byte_boundary() {
+        use datafusion::arrow::datatypes::{DataType, Field};
+
+        const ROWS: usize = 10;
+        const PAYLOAD_BYTES: usize = 512 * 1024;
+        let rows = (0..ROWS)
+            .map(|id| {
+                Ok::<_, ObjectStoreError>(Bytes::from(format!("{{\"id\":{id},\"payload\":\"{}\"}}\n", "x".repeat(PAYLOAD_BYTES))))
+            })
+            .collect::<Vec<_>>();
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let source = JsonDocumentSource {
+            replay: None,
+            replay_reservation: 0,
+            input: JsonDocumentInput::new(stream::iter(rows).boxed()),
+            reservation: MemoryConsumer::new("byte-batch source").register(&memory_pool),
+            memory_pool,
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("payload", DataType::Utf8, true),
+        ]));
+        let batches = JsonDocumentBatchStream::try_new(schema, source, 1024)
+            .expect("build JSON decoder")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("decode large input");
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), ROWS);
+        assert!(batches.len() >= 2, "the decoder must not retain more than one byte-bounded batch");
+    }
+
+    #[tokio::test]
+    async fn decoder_flushes_before_a_large_row_exceeds_the_remaining_budget() {
+        use datafusion::arrow::datatypes::{DataType, Field};
+
+        let row = |total_bytes: usize| {
+            const PREFIX: &str = "{\"payload\":\"";
+            const SUFFIX: &str = "\"}\n";
+            let payload_bytes = total_bytes
+                .checked_sub(PREFIX.len() + SUFFIX.len())
+                .expect("row fixture must fit its JSON wrapper");
+            Bytes::from(format!("{PREFIX}{}{SUFFIX}", "x".repeat(payload_bytes)))
+        };
+        let rows = stream::iter([
+            Ok::<_, ObjectStoreError>(row(JSON_DECODE_BATCH_BYTES - JSON_DECODE_POLL_BYTES + 1)),
+            Ok(row(JSON_DECODE_BATCH_BYTES)),
+        ])
+        .boxed();
+        let memory_pool = Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(40 * 1024 * 1024));
+        let query_memory_pool: Arc<dyn MemoryPool> = memory_pool.clone();
+        let source = JsonDocumentSource {
+            replay: None,
+            replay_reservation: 0,
+            input: JsonDocumentInput::new(rows),
+            reservation: MemoryConsumer::new("large-row boundary source").register(&query_memory_pool),
+            memory_pool: query_memory_pool,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("payload", DataType::Utf8, true)]));
+
+        let batches = JsonDocumentBatchStream::try_new(schema, source, 1024)
+            .expect("build JSON decoder")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("a legal large row must start in a fresh byte-bounded batch");
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(memory_pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn decoder_yields_after_its_per_poll_byte_budget() {
+        const EXPECTED_POLL_BYTES: usize = 64 * 1024;
+        assert_eq!(JSON_DECODE_POLL_BYTES, EXPECTED_POLL_BYTES);
+        let row = Bytes::from(format!("{{\"payload\":\"{}\"}}\n", "x".repeat(256 * 1024)));
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+        let (schema, source) = prepare_source(stream::once(async move { Ok::<_, ObjectStoreError>(row) }).boxed(), memory_pool)
+            .await
+            .expect("prepare cooperative decoder fixture");
+        let mut decoder = JsonDocumentBatchStream::try_new(schema, source, 1024).expect("build JSON decoder");
+        let waker = futures::task::noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(
+            Pin::new(&mut decoder).poll_next(&mut context).is_pending(),
+            "one poll must not decode an entire large row"
+        );
+        let batches = decoder
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("finish decoding after cooperative yield");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    }
+
+    #[tokio::test]
+    async fn dense_nested_values_are_charged_before_arrow_allocation() {
+        use datafusion::arrow::datatypes::{DataType, Field};
+
+        let replay = Bytes::from(format!("{{\"values\":[{}0]}}\n", "0,".repeat(32 * 1024)));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "values",
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            true,
+        )]));
+        let (_, decoder_base_reservation) = json_decoder_layout(&schema, 1024).expect("calculate decoder reservation");
+        let pool_size = replay
+            .len()
+            .checked_mul(JSON_DECODE_MEMORY_MULTIPLIER - 1)
+            .and_then(|work| work.checked_add(replay.len()))
+            .and_then(|bytes| bytes.checked_add(decoder_base_reservation))
+            .and_then(|bytes| bytes.checked_sub(1))
+            .expect("decoder memory fixture should fit");
+        let memory_pool = Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size));
+        let query_memory_pool: Arc<dyn MemoryPool> = memory_pool.clone();
+        let reservation = MemoryConsumer::new("JSON decoder memory test").register(&query_memory_pool);
+        reservation
+            .try_resize(replay.len())
+            .expect("reserve the retained replay buffer");
+        let source = JsonDocumentSource {
+            replay_reservation: replay.len(),
+            replay: Some(replay),
+            input: JsonDocumentInput::new(stream::empty().boxed()),
+            reservation,
+            memory_pool: query_memory_pool,
+        };
+        let mut decoder = JsonDocumentBatchStream::try_new(schema, source, 1024).expect("build JSON decoder");
+
+        let error = decoder
+            .next()
+            .await
+            .expect("decoder must emit a memory error")
+            .expect_err("dense nested values must be charged before Arrow allocates their tape");
+        assert!(matches!(error, DataFusionError::ResourcesExhausted(_)));
+        drop(decoder);
+        assert_eq!(memory_pool.reserved(), 0);
+    }
+
+    #[test]
+    fn wide_schema_bounds_decoder_preallocation() {
+        use datafusion::arrow::datatypes::{DataType, Field};
+
+        const FIELDS: usize = 1000;
+        const REQUESTED_BATCH_SIZE: usize = 8192;
+        let schema = Arc::new(Schema::new(
+            (0..FIELDS)
+                .map(|index| Field::new(format!("field_{index}"), DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ));
+        let (batch_size, reservation) = json_decoder_layout(&schema, REQUESTED_BATCH_SIZE).expect("calculate decoder layout");
+
+        assert!(batch_size < REQUESTED_BATCH_SIZE);
+        assert!(reservation <= JSON_DECODER_TAPE_TARGET_BYTES + FIELDS * JSON_DECODER_PER_FIELD_METADATA_BYTES);
+        let memory_pool = Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(reservation));
+        let query_memory_pool: Arc<dyn MemoryPool> = memory_pool.clone();
+        let source = JsonDocumentSource {
+            replay: None,
+            replay_reservation: 0,
+            input: JsonDocumentInput::new(stream::empty().boxed()),
+            reservation: MemoryConsumer::new("wide schema source").register(&query_memory_pool),
+            memory_pool: query_memory_pool,
+        };
+        let decoder = JsonDocumentBatchStream::try_new(schema, source, REQUESTED_BATCH_SIZE)
+            .expect("bounded decoder should fit its registered reservation");
+        assert_eq!(decoder.batch_size, batch_size);
+        assert_eq!(memory_pool.reserved(), reservation);
+        drop(decoder);
+        assert_eq!(memory_pool.reserved(), 0);
+    }
+
+    #[test]
+    fn queued_decoder_flush_retains_upstream_query_admission() {
+        use datafusion::arrow::datatypes::{DataType, Field};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        runtime.block_on(async {
+            let (blocking_started_tx, blocking_started_rx) = tokio::sync::oneshot::channel();
+            let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocking_started_tx.send(());
+                release_blocking_rx.recv().expect("release blocking worker");
+            });
+            blocking_started_rx.await.expect("blocking worker should start");
+
+            let admission = Arc::new(tokio::sync::Semaphore::new(1));
+            let query_guard = Arc::new(
+                Arc::clone(&admission)
+                    .acquire_owned()
+                    .await
+                    .expect("query admission should be available"),
+            );
+            let input = stream::iter([Ok::<_, ObjectStoreError>(Bytes::from_static(b"{\"id\":1}\n"))])
+                .map(move |row| {
+                    let _query_guard = &query_guard;
+                    row
+                })
+                .boxed();
+            let memory_pool: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default());
+            let source = JsonDocumentSource {
+                replay: None,
+                replay_reservation: 0,
+                input: JsonDocumentInput::new(input),
+                reservation: MemoryConsumer::new("queued decoder source").register(&memory_pool),
+                memory_pool,
+            };
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+            {
+                let mut decoder = JsonDocumentBatchStream::try_new(schema, source, 1).expect("build JSON decoder");
+                let waker = futures::task::noop_waker();
+                let mut context = Context::from_waker(&waker);
+                assert!(Pin::new(&mut decoder).poll_next(&mut context).is_pending());
+            }
+
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), Arc::clone(&admission).acquire_owned(),)
+                    .await
+                    .is_err(),
+                "queued decoder teardown must retain upstream query admission"
+            );
+
+            release_blocking_tx.send(()).expect("release blocking worker");
+            blocker.await.expect("blocking worker should finish");
+            let recovered = tokio::time::timeout(std::time::Duration::from_secs(1), Arc::clone(&admission).acquire_owned())
+                .await
+                .expect("decoder teardown should release query admission")
+                .expect("query admission should remain open");
+            drop(recovered);
+        });
+    }
+
+    fn json_object_with_unique_keys(keys: usize) -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let mut object = String::from("{");
+        for index in 0..keys {
+            if index > 0 {
+                object.push(',');
+            }
+            write!(&mut object, "\"field_{index}\":0").expect("write key fixture");
+        }
+        object.push('}');
+        object.into_bytes()
+    }
+}

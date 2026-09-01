@@ -422,3 +422,73 @@ impl InferredObject {
         bytes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::json::reader::infer_json_schema as arrow_infer_json_schema;
+
+    const TEST_SCHEMA_LIMIT: usize = 4 * 1024 * 1024;
+
+    fn assert_matches_arrow(input: &[u8]) {
+        let records = input.iter().filter(|byte| **byte == b'\n').count();
+        let (expected, expected_records) = arrow_infer_json_schema(io::BufReader::new(input), Some(records))
+            .expect("Arrow should infer the compatibility fixture");
+        let (actual, actual_records, _) = infer_schema(input, records, &AtomicBool::new(false), TEST_SCHEMA_LIMIT)
+            .expect("streaming inference should accept the compatibility fixture");
+        assert_eq!(actual_records, expected_records);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn inference_matches_arrow_for_nested_and_coerced_types() {
+        assert_matches_arrow(
+            br#"{"a":1,"values":[1,2],"nested":{"enabled":true},"nullable":null}
+{"a":1.5,"values":3,"nested":{"name":"ok"},"nullable":"set"}
+"#,
+        );
+        assert_matches_arrow(
+            br#"{"matrix":[[1,2],[3]],"objects":[{"id":1},{"name":"two"}],"empty":[]}
+{"matrix":[[4.5]],"objects":[],"empty":[null]}
+"#,
+        );
+    }
+
+    #[test]
+    fn inference_matches_arrow_for_null_first_arrays_and_duplicate_keys() {
+        assert_matches_arrow(
+            br#"{"values":[null,1,2],"duplicate":1,"duplicate":"last"}
+"#,
+        );
+
+        let input = br#"{"values":[null,{"id":1}]}
+"#;
+        let records = 1;
+        assert!(arrow_infer_json_schema(io::BufReader::new(input.as_slice()), Some(records)).is_err());
+        assert!(infer_schema(input, records, &AtomicBool::new(false), TEST_SCHEMA_LIMIT).is_err());
+    }
+
+    #[test]
+    fn inference_checkpoints_observe_cancellation() {
+        let cancellation = AtomicBool::new(true);
+        let mut context = InferenceContext {
+            cancellation: &cancellation,
+            items_since_check: CANCELLATION_CHECK_ITEMS - 1,
+        };
+        let error = context
+            .checkpoint::<serde_json::Error>()
+            .expect_err("the item checkpoint must observe cancellation");
+        assert!(error.to_string().contains("schema inference canceled"));
+    }
+
+    #[test]
+    fn incompatible_types_preserve_arrow_json_error_classification() {
+        let error = infer_schema(b"{\"a\":{}}\n{\"a\":1}\n", 2, &AtomicBool::new(false), TEST_SCHEMA_LIMIT)
+            .expect_err("object and scalar fields must remain incompatible");
+
+        assert!(matches!(
+            error,
+            DataFusionError::ArrowError(source, None) if matches!(*source, ArrowError::JsonError(_))
+        ));
+    }
+}
