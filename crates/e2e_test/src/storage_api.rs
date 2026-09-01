@@ -15,7 +15,7 @@
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 #[cfg(test)]
-pub(crate) use rustfs_ecstore::api::disk::{VolumeInfo, WalkDirOptions};
+pub(crate) use rustfs_ecstore::api::disk::{RUSTFS_META_BUCKET, VolumeInfo, WalkDirOptions};
 pub(crate) use rustfs_ecstore::api::rpc::{AuthenticatedChannel, TonicInterceptor, node_service_time_out_client_no_auth};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::rpc::{
