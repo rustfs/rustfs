@@ -265,6 +265,7 @@ impl DefaultObjectUsecase {
                 ));
             }
         };
+        let expires_timestamp = parse_expires_header(expires.as_deref())?;
         let replacement_metadata = if replaces_metadata {
             validate_archive_content_encoding(&key, content_type.as_deref(), content_encoding.as_deref())?;
             let mut replacement_metadata = metadata.unwrap_or_default();
@@ -276,7 +277,7 @@ impl DefaultObjectUsecase {
                 content_encoding.as_deref(),
                 content_language.as_deref(),
                 content_type.as_deref(),
-                expires.as_ref(),
+                expires_timestamp.as_ref(),
                 website_redirect_location.as_deref(),
             )?;
             Some(replacement_metadata)
@@ -609,7 +610,7 @@ impl DefaultObjectUsecase {
             user_defined = replacement_metadata;
             src_info.content_type = content_type.clone();
             src_info.content_encoding = content_encoding.as_deref().and_then(normalize_content_encoding_for_storage);
-            src_info.expires = expires.map(OffsetDateTime::from);
+            src_info.expires = expires_timestamp.map(OffsetDateTime::from);
         } else if metadata_directive.is_some() || website_redirect_location.is_some() {
             user_defined.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_WEBSITE_REDIRECT_LOCATION));
             if let Some(website_redirect_location) = website_redirect_location {
@@ -923,6 +924,7 @@ mod tests {
                     sse_algorithm: ServerSideEncryption::from(String::from("garbage")),
                     kms_master_key_id: None,
                 }),
+                blocked_encryption_types: None,
                 bucket_key_enabled: None,
             }],
         };

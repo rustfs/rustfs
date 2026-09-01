@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn metadata_operation_matches_virtual_hosted_bucket_root() {
-        let host = MultiDomain::new(["example.com", "example.com:9000"]).expect("valid test host domain");
+        let host = MultiDomain::new(["example.com:9000"]).expect("valid test host domain");
         let mut headers = HeaderMap::new();
         headers.insert(HOST, "demo-bucket.example.com:9000".parse().expect("valid host header"));
 
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn metadata_operation_matches_unconfigured_host_fallbacks() {
-        let host = MultiDomain::new(["s3.example.com", "s3.example.com:9000"]).expect("valid test host domain");
+        let host = MultiDomain::new(["s3.example.com:9000"]).expect("valid test host domain");
 
         let mut path_style_headers = HeaderMap::new();
         path_style_headers.insert(HOST, "localhost:9000".parse().expect("valid host header"));

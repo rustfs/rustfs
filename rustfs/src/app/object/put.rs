@@ -829,12 +829,13 @@ pub(super) fn apply_put_request_metadata(
     content_encoding: Option<ContentEncoding>,
     content_language: Option<ContentLanguage>,
     content_type: Option<ContentType>,
-    expires: Option<Timestamp>,
+    expires: Option<String>,
     website_redirect_location: Option<WebsiteRedirectLocation>,
     tagging: Option<TaggingHeader>,
     storage_class: Option<StorageClass>,
 ) -> S3Result<()> {
     namespace_reserved_user_metadata(metadata);
+    let expires = parse_expires_header(expires.as_deref())?;
     apply_standard_object_metadata(
         metadata,
         cache_control.as_deref(),
@@ -2399,6 +2400,7 @@ mod tests {
                         sse_algorithm: ServerSideEncryption::from_static(algorithm),
                         kms_master_key_id: kms_key_id.map(|id| SSEKMSKeyId::from(id.to_string())),
                     }),
+                    blocked_encryption_types: None,
                     bucket_key_enabled: None,
                 }],
             };

@@ -4210,7 +4210,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5668,7 +5668,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6986,9 +6986,9 @@ checksum = "a3c00a0c9600379bd32f8972de90676a7672cba3bf4886986bc05902afc1e093"
 
 [[package]]
 name = "nvml-wrapper"
-version = "0.12.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f049ae562349fefb8e837eb15443da1e7c6dcbd8a11f52a228f92220c2e5c85e"
+checksum = "d164abbde0b3c03edb9edb9cb8d31a7f5b79015c692b7c771f6e0840e9106b9f"
 dependencies = [
  "bitflags 2.13.1",
  "libloading",
@@ -7000,9 +7000,9 @@ dependencies = [
 
 [[package]]
 name = "nvml-wrapper-sys"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b4d594420fcda43b1c2c4bd44d48974aa3c7a9ab2cbf10dc18e35265767bf0b"
+checksum = "5d2079f4c9b6d2170bfb71c6355734ead6c47da75c179847395c31f9f2f66ede"
 dependencies = [
  "libloading",
 ]
@@ -8610,7 +8610,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9512,7 +9512,7 @@ dependencies = [
  "tokio-util",
  "tonic",
  "tower",
- "tower-http 0.7.0",
+ "tower-http 0.7.1",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -10943,7 +10943,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11016,7 +11016,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11073,7 +11073,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.15.0"
-source = "git+https://github.com/rustfs/s3s.git?rev=9c4690d8e73fc8d184031a19b2c4539ebc77d180#9c4690d8e73fc8d184031a19b2c4539ebc77d180"
+source = "git+https://github.com/rustfs/s3s.git?rev=c8f575e3b8c7ec9962a722e197bb929efc12a07a#c8f575e3b8c7ec9962a722e197bb929efc12a07a"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -11104,6 +11104,7 @@ dependencies = [
  "pin-project-lite",
  "quick-xml",
  "regex",
+ "s3s-rfc2047",
  "s3s-sigv2",
  "s3s-sigv4",
  "serde",
@@ -11128,27 +11129,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "s3s-rfc2047"
+version = "0.16.0-alpha.1"
+source = "git+https://github.com/rustfs/s3s.git?rev=c8f575e3b8c7ec9962a722e197bb929efc12a07a#c8f575e3b8c7ec9962a722e197bb929efc12a07a"
+dependencies = [
+ "base64-simd",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "s3s-sigv2"
 version = "0.16.0-alpha.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=9c4690d8e73fc8d184031a19b2c4539ebc77d180#9c4690d8e73fc8d184031a19b2c4539ebc77d180"
+source = "git+https://github.com/rustfs/s3s.git?rev=c8f575e3b8c7ec9962a722e197bb929efc12a07a#c8f575e3b8c7ec9962a722e197bb929efc12a07a"
 dependencies = [
+ "base64-simd",
+ "hmac 0.13.0",
  "jiff",
+ "sha1 0.11.0",
+ "smallvec",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "s3s-sigv4"
 version = "0.16.0-alpha.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=9c4690d8e73fc8d184031a19b2c4539ebc77d180#9c4690d8e73fc8d184031a19b2c4539ebc77d180"
+source = "git+https://github.com/rustfs/s3s.git?rev=c8f575e3b8c7ec9962a722e197bb929efc12a07a#c8f575e3b8c7ec9962a722e197bb929efc12a07a"
 dependencies = [
  "arrayvec",
  "base64-simd",
  "hex-simd",
+ "hmac 0.13.0",
  "jiff",
  "nom 8.0.0",
  "serde",
+ "sha2 0.11.0",
  "smallvec",
+ "std-next",
  "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]
@@ -12040,9 +12058,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "suppaftp"
-version = "10.0.2"
+version = "11.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "821001051ea3d12a60fb790b8c7cb9a6f5f8698dcfdca4cd533a025fefb0b5b8"
+checksum = "46c5095831abc0d7944a2d50d6ec6abcd75b9d165d9377deb3e45798cae2343a"
 dependencies = [
  "async-trait",
  "chrono",
@@ -12233,10 +12251,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12729,9 +12747,9 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
+checksum = "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c"
 dependencies = [
  "async-compression",
  "bitflags 2.13.1",
@@ -13355,7 +13373,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
