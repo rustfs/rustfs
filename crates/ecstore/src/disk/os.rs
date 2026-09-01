@@ -298,6 +298,39 @@ pub(crate) mod windows_rename_test_hooks {
     }
 }
 
+/// Test-only hooks into the destination-parent walk of rename preparation.
+///
+/// The prune race lives between two syscalls inside
+/// [`mkdir_all_below_existing_base_std`], so only an injection at that exact
+/// point reproduces it deterministically. Hooks are keyed by the absolute path
+/// of the component just opened and queued per path: a retrying preparation
+/// visits the same component again, so a test models a pruner that keeps
+/// walking upward by queueing one hook per visit.
+#[cfg(all(test, unix))]
+pub(crate) mod prepare_rename_test_hooks {
+    use super::*;
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    static AFTER_COMPONENT_OPENED: LazyLock<Mutex<HashMap<PathBuf, VecDeque<Hook>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(crate) fn queue_after_component_opened(path: &Path, hook: impl FnOnce() + Send + 'static) {
+        AFTER_COMPONENT_OPENED
+            .lock()
+            .entry(path.to_path_buf())
+            .or_default()
+            .push_back(Box::new(hook));
+    }
+
+    pub(crate) fn run_after_component_opened(path: &Path) {
+        let hook = AFTER_COMPONENT_OPENED.lock().get_mut(path).and_then(VecDeque::pop_front);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
 /// Fsync a directory so recently created or renamed entries survive power loss.
 /// No-op on non-Unix platforms where directories cannot be opened for syncing.
 pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
@@ -1905,8 +1938,8 @@ pub(crate) async fn rename_all_with_prepared_source(
         let base_dir = base_dir.clone();
         move || {
             validate_prepared_rename_source(&prepared_source, &src_file_path)?;
-            let (preparation, attempt) = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
-            rename_prepared(&src_file_path, &dst_file_path, &preparation, attempt)
+            let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+            rename_prepared(&src_file_path, &dst_file_path, &preparation)
         }
     };
     let result = run_blocking_namespace_operation(lease, operation).await;
@@ -2008,8 +2041,8 @@ async fn reliable_rename_inner_with_lease(
         let dst_file_path = dst_file_path.clone();
         let base_dir = base_dir.clone();
         move || {
-            let (preparation, attempt) = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
-            rename_prepared(&src_file_path, &dst_file_path, &preparation, attempt)
+            let preparation = prepare_rename_with_retry(&src_file_path, &dst_file_path, &base_dir, &publication_root)?;
+            rename_prepared(&src_file_path, &dst_file_path, &preparation)
         }
     };
     let result = run_blocking_namespace_operation(lease, operation).await;
@@ -2233,12 +2266,13 @@ fn prepare_rename_with_retry(
     dst_file_path: &Path,
     base_dir: &Path,
     publication_root: &PublicationRoot,
-) -> io::Result<(RenamePreparation, usize)> {
+) -> io::Result<RenamePreparation> {
+    let prune_budget = prepare_prune_budget(dst_file_path, base_dir);
     let mut attempt = 0;
     loop {
         match prepare_rename(src_file_path, dst_file_path, base_dir, publication_root) {
-            Ok(preparation) => return Ok((preparation, attempt)),
-            Err(err) if should_retry_rename(&err, attempt) => {
+            Ok(preparation) => return Ok(preparation),
+            Err(err) if should_retry_prepare(&err, attempt, prune_budget) => {
                 attempt += 1;
             }
             Err(err) => return Err(err),
@@ -2252,23 +2286,26 @@ fn prepare_rename_with_retry(
     dst_file_path: &Path,
     base_dir: &Path,
     publication_root: &PublicationRoot,
-) -> io::Result<(RenamePreparation, usize)> {
+) -> io::Result<RenamePreparation> {
     let source_parent = src_file_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename source must have a parent directory"))?;
     let destination_parent = dst_file_path.parent();
-    let mut attempt = 0;
-    let prepare_destination_parent = |attempt: &mut usize| -> io::Result<Option<ExistingBaseDirectoryGuard>> {
+    let prune_budget = prepare_prune_budget(dst_file_path, base_dir);
+    // The destination walk and the source open below keep separate counters:
+    // exhausting one must not deny the other its own retry.
+    let prepare_destination_parent = || -> io::Result<Option<ExistingBaseDirectoryGuard>> {
+        let mut attempt = 0;
         loop {
             let result = destination_parent
                 .map(|parent| mkdir_all_below_existing_base_std(parent, base_dir, publication_root))
                 .transpose();
             match result {
                 Ok(parent_guard) => break Ok(parent_guard),
-                Err(err) if should_retry_rename(&err, *attempt) => {
+                Err(err) if should_retry_prepare(&err, attempt, prune_budget) => {
                     #[cfg(test)]
                     windows_rename_test_hooks::run_before_rename_retry(dst_file_path);
-                    *attempt += 1;
+                    attempt += 1;
                 }
                 Err(err) => break Err(err),
             }
@@ -2281,7 +2318,7 @@ fn prepare_rename_with_retry(
         None => false,
     };
     let (source_parent_guard, parent_guard, source_identity_anchor, expected_source_identity) = if same_parent {
-        let parent_guard = prepare_destination_parent(&mut attempt)?;
+        let parent_guard = prepare_destination_parent()?;
         let source_parent_guard = parent_guard
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must have a parent directory"))?
@@ -2293,16 +2330,17 @@ fn prepare_rename_with_retry(
         let source_parent_guard = lock_windows_directory_tree(source_parent, destination_parent, publication_root)?;
         let (source_identity_anchor, expected_source_identity) =
             open_windows_rename_source_identity(src_file_path, &source_parent_guard)?;
-        let parent_guard = prepare_destination_parent(&mut attempt)?;
+        let parent_guard = prepare_destination_parent()?;
         (source_parent_guard, parent_guard, source_identity_anchor, expected_source_identity)
     };
+    let mut source_attempt = 0;
     let source = loop {
         match open_windows_rename_source(src_file_path, &source_parent_guard) {
             Ok(source) => break source,
-            Err(err) if should_retry_rename(&err, attempt) => {
+            Err(err) if should_retry_rename(&err, source_attempt) => {
                 #[cfg(test)]
                 windows_rename_test_hooks::run_before_rename_retry(dst_file_path);
-                attempt += 1;
+                source_attempt += 1;
             }
             Err(err) => return Err(err),
         }
@@ -2315,14 +2353,11 @@ fn prepare_rename_with_retry(
     }
     drop(source_identity_anchor);
 
-    Ok((
-        RenamePreparation {
-            parent_guard,
-            _source_parent_guard: source_parent_guard,
-            source,
-        },
-        attempt,
-    ))
+    Ok(RenamePreparation {
+        parent_guard,
+        _source_parent_guard: source_parent_guard,
+        source,
+    })
 }
 
 #[cfg(not(windows))]
@@ -2339,24 +2374,22 @@ fn prepare_rename(
     Ok(RenamePreparation { parent_guard })
 }
 
-fn rename_prepared(
-    _src_file_path: &Path,
-    dst_file_path: &Path,
-    preparation: &RenamePreparation,
-    attempt: usize,
-) -> io::Result<()> {
+/// Publish a prepared rename. The retry budget starts fresh here: preparation
+/// keeps its own counter, so a chain rebuilt after a concurrent prune must not
+/// cost the rename its one retry.
+fn rename_prepared(_src_file_path: &Path, dst_file_path: &Path, preparation: &RenamePreparation) -> io::Result<()> {
     #[cfg(windows)]
     {
         let parent_guard = preparation
             .parent_guard
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must have a parent directory"))?;
-        rename_windows_prepared(dst_file_path, parent_guard, &preparation.source, attempt)
+        rename_windows_prepared(dst_file_path, parent_guard, &preparation.source, 0)
     }
 
     #[cfg(not(windows))]
     {
-        let mut attempt = attempt;
+        let mut attempt = 0;
         loop {
             let rename_result = rename_into_existing_parent(_src_file_path, dst_file_path, preparation.parent_guard.as_ref());
             match rename_result {
@@ -3756,6 +3789,8 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
         let mut parents = vec![open(base_dir, flags, Mode::empty()).map_err(io::Error::from)?];
 
+        #[cfg(test)]
+        let mut walked_path = base_dir.to_path_buf();
         for component in relative.components() {
             let Component::Normal(component) = component else {
                 continue;
@@ -3769,6 +3804,11 @@ pub(crate) fn mkdir_all_below_existing_base_std(
                 Err(err) => return Err(err.into()),
             }
             parents.push(openat(parent, component, flags, Mode::empty()).map_err(io::Error::from)?);
+            #[cfg(test)]
+            {
+                walked_path.push(component);
+                prepare_rename_test_hooks::run_after_component_opened(&walked_path);
+            }
         }
 
         Ok(parents)
@@ -3866,9 +3906,49 @@ fn warn_reliable_rename_failure(src_file_path: &Path, dst_file_path: &Path, base
 /// cleanup renames (e.g. `move_to_trash` on an already-removed tmp path) a
 /// pointless second syscall. This predicate is shared by the `rename_data`
 /// commit path via `rename_all`, so any relaxation here must keep genuine
-/// transient errors retryable.
+/// transient errors retryable. The *preparation* phase deliberately uses
+/// [`should_retry_prepare`] instead — see there for why `NotFound` is
+/// recoverable while the destination parent chain is still being built.
 fn should_retry_rename(err: &io::Error, attempt: usize) -> bool {
     attempt == 0 && err.kind() != io::ErrorKind::NotFound
+}
+
+/// How many times rename preparation may retry a `NotFound`.
+///
+/// A pruning walk (`LocalDisk::delete_file`) removes empty ancestors
+/// monotonically upward and stops at the volume root, so it can invalidate
+/// each component *below* the base at most once. One attempt per such
+/// component therefore outlasts a pruning walk, and concurrent walks only
+/// steal an attempt by making that same upward progress. A destination whose
+/// parent *is* the base gets a budget of zero, keeping `NotFound` immediately
+/// terminal for speculative cleanup renames.
+fn prepare_prune_budget(dst_file_path: &Path, base_dir: &Path) -> usize {
+    dst_file_path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(base_dir).ok())
+        .map(|relative| relative.components().count())
+        .unwrap_or(0)
+}
+
+/// Whether a failed rename *preparation* attempt (building the destination
+/// parent chain) should be retried.
+///
+/// Unlike [`should_retry_rename`], `NotFound` is recoverable here: a concurrent
+/// delete prunes now-empty parent directories, so it can unlink an intermediate
+/// destination component between this walk opening a directory and creating the
+/// next child inside it, which a handle-relative `mkdirat`/`openat` reports as
+/// `NotFound`. Each retry rebuilds the whole chain from the base directory,
+/// which no walk below it can remove; `prune_budget` bounds how far a pruner
+/// can push the walk back. A genuinely missing base directory fails identically
+/// on every attempt — the base is only ever opened, never created — so the
+/// missing-base contract holds at the cost of a few extra syscalls on an
+/// already-failing path.
+fn should_retry_prepare(err: &io::Error, attempt: usize, prune_budget: usize) -> bool {
+    if err.kind() == io::ErrorKind::NotFound {
+        attempt < prune_budget
+    } else {
+        attempt == 0
+    }
 }
 
 pub async fn reliable_mkdir_all(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> io::Result<()> {
@@ -4399,6 +4479,141 @@ mod tests {
         let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
         assert!(should_retry_rename(&denied, 0));
         assert!(!should_retry_rename(&denied, 1));
+    }
+
+    #[test]
+    fn prepare_retry_budget_covers_every_prunable_component() {
+        // A pruner can invalidate each component below the base once, so the
+        // budget must match the chain depth, not a fixed count.
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "pruned");
+        assert!(should_retry_prepare(&not_found, 0, 2));
+        assert!(should_retry_prepare(&not_found, 1, 2));
+        assert!(!should_retry_prepare(&not_found, 2, 2));
+    }
+
+    #[test]
+    fn prepare_retry_keeps_other_errors_at_a_single_retry() {
+        // Only a prune produces a recoverable NotFound; everything else keeps
+        // the historical single retry so persistent failures stay cheap.
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert!(should_retry_prepare(&denied, 0, 3));
+        assert!(!should_retry_prepare(&denied, 1, 3));
+    }
+
+    #[test]
+    fn prepare_retry_budget_is_zero_when_the_parent_is_the_base() {
+        // Speculative cleanup renames (move_to_trash) land directly in their
+        // base, so a NotFound there is a missing base: terminal, not a prune.
+        let base = Path::new("/vol");
+        assert_eq!(prepare_prune_budget(Path::new("/vol/entry"), base), 0);
+        assert_eq!(prepare_prune_budget(Path::new("/vol/data-movement/sha/id/xl.meta"), base), 3);
+        let not_found = io::Error::new(io::ErrorKind::NotFound, "missing base");
+        assert!(!should_retry_prepare(&not_found, 0, 0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_all_survives_concurrent_empty_parent_prune() {
+        // A multipart staging cleanup prunes the momentarily empty shared
+        // `data-movement/` prefix while a concurrent upload publishes its
+        // xl.meta below that same prefix. The writer's walk holds an fd to the
+        // pruned component, so its next handle-relative mkdirat fails
+        // NotFound; preparation must rebuild the chain and still publish.
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("multipart-volume");
+        let shared = base.join("data-movement");
+        std::fs::create_dir_all(&shared).expect("create shared prefix");
+        let src = temp_dir.path().join("staged.meta");
+        std::fs::write(&src, b"payload").expect("write staged meta");
+        let dst = shared.join("sha").join("upload-id").join("xl.meta");
+
+        let pruned = shared.clone();
+        prepare_rename_test_hooks::queue_after_component_opened(&shared, move || {
+            // The cleanup chain's empty-parent prune lands after the writer
+            // opened the shared component but before it creates its child.
+            std::fs::remove_dir(&pruned).expect("prune the empty shared prefix");
+        });
+
+        rename_all(&src, &dst, &base)
+            .await
+            .expect("a concurrently pruned intermediate directory must not fail the publish");
+
+        assert_eq!(std::fs::read(&dst).expect("read published meta"), b"payload");
+        assert!(!src.exists(), "publish must consume the staged source");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_all_survives_a_prune_walking_up_every_shared_component() {
+        // The multipart data-movement chain has TWO shared components below the
+        // volume (`data-movement/` and the per-object `<sha>/`), so one cleanup
+        // walk pruning upward can invalidate the writer twice: once at <sha>,
+        // then again at data-movement while the writer rebuilds. A budget that
+        // covers only a single component would still break write quorum here.
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("multipart-volume");
+        let movement = base.join("data-movement");
+        let sha = movement.join("sha");
+        std::fs::create_dir_all(&sha).expect("create shared chain");
+        let src = temp_dir.path().join("staged.meta");
+        std::fs::write(&src, b"payload").expect("write staged meta");
+        let dst = sha.join("upload-id").join("xl.meta");
+
+        // First visit of `data-movement` is the writer's initial walk, which the
+        // pruner has not reached yet; it prunes on the writer's rebuild.
+        prepare_rename_test_hooks::queue_after_component_opened(&movement, || {});
+        let pruned_sha = sha.clone();
+        prepare_rename_test_hooks::queue_after_component_opened(&sha, move || {
+            std::fs::remove_dir(&pruned_sha).expect("prune the empty per-object prefix");
+        });
+        let pruned_movement = movement.clone();
+        prepare_rename_test_hooks::queue_after_component_opened(&movement, move || {
+            std::fs::remove_dir(&pruned_movement).expect("prune the empty data-movement prefix");
+        });
+
+        rename_all(&src, &dst, &base)
+            .await
+            .expect("a prune walking up the whole shared chain must not fail the publish");
+
+        assert_eq!(std::fs::read(&dst).expect("read published meta"), b"payload");
+        assert!(!src.exists(), "publish must consume the staged source");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rename_all_rejects_a_symlink_swapped_in_between_prepare_attempts() {
+        // The retry must not become a traversal window: replacing the pruned
+        // component with a symlink out of the volume before the rebuilt walk
+        // reopens it must fail closed, exactly as a symlink staged before the
+        // first attempt does.
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("multipart-volume");
+        let shared = base.join("data-movement");
+        let outside = temp_dir.path().join("outside");
+        std::fs::create_dir_all(&shared).expect("create shared prefix");
+        std::fs::create_dir_all(&outside).expect("create outside target");
+        let src = temp_dir.path().join("staged.meta");
+        std::fs::write(&src, b"payload").expect("write staged meta");
+        let dst = shared.join("sha").join("upload-id").join("xl.meta");
+
+        let swapped = shared.clone();
+        let outside_target = outside.clone();
+        prepare_rename_test_hooks::queue_after_component_opened(&shared, move || {
+            std::fs::remove_dir(&swapped).expect("prune the shared prefix");
+            symlink(&outside_target, &swapped).expect("replace the pruned component with a symlink");
+        });
+
+        rename_all(&src, &dst, &base)
+            .await
+            .expect_err("a symlink swapped in between attempts must not be followed");
+
+        assert!(src.exists(), "rejected publish must preserve the staged source");
+        assert!(
+            !outside.join("sha").exists(),
+            "the rebuilt walk must not create or publish through the replacement symlink"
+        );
     }
 
     #[test]
