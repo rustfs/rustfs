@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Functional chain driver: runs the nine functional suites in a fixed order
-# (upgrade -> s3 -> kms -> tier -> storage -> heal -> pool -> security, with
-# performance on its own runner in parallel) and guarantees the chain keeps
-# moving even when individual suites fail.
+# Functional chain driver: runs the ten functional suites in a fixed order
+# (upgrade -> s3 -> kms -> tier -> storage -> heal -> pool -> security ->
+# replication, with performance on its own runner in parallel) and guarantees
+# the chain keeps moving even when individual suites fail.
 #
 # Each suite workflow can still be dispatched standalone (workflow_dispatch);
 # only chain-triggered runs forward to the next suite via repository_dispatch,
