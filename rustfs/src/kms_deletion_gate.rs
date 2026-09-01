@@ -184,6 +184,7 @@ mod tests {
                     sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
                     kms_master_key_id: key_id.map(str::to_string),
                 }),
+                blocked_encryption_types: None,
                 bucket_key_enabled: None,
             }],
         }
