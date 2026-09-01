@@ -3185,12 +3185,12 @@ impl ECStore {
     }
 
     /// Best-effort purge of an orphan directory prefix — an on-disk tree of empty
-    /// directories with no `xl.meta` anywhere (issue #4189). Orphan fragments can sit
+    /// directories or committed delete residue with no `xl.meta` anywhere. Orphan fragments can sit
     /// on any erasure set of any pool (they are left behind by whichever sets stored
     /// the now-deleted children), so every set is swept. Returns true when at least
     /// one set removed an orphan tree. Hard per-set failures are logged and skipped:
     /// the caller falls back to surfacing the original NotFound.
-    async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> bool {
+    pub(super) async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> bool {
         let prefix = decode_dir_object(object);
         let mut purged = false;
         for pool in self.pools.iter() {

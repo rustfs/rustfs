@@ -20,7 +20,9 @@ fn to_filemeta_err(err: Error) -> rustfs_filemeta::Error {
     err.narrow_to_filemeta().unwrap_or_else(rustfs_filemeta::Error::other)
 }
 
-use crate::bucket::metadata_sys::{get_versioning_config, has_authoritative_never_versioned_state};
+use crate::bucket::metadata_sys::{
+    get_versioning_config, has_authoritative_never_versioned_state, has_authoritative_never_versioned_state_in,
+};
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker};
@@ -312,6 +314,25 @@ async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
     has_authoritative_never_versioned_state(&options.bucket)
         .await
         .unwrap_or(false)
+}
+
+fn should_purge_empty_directory_listing(
+    prefix: &str,
+    marker: Option<&str>,
+    delimiter: Option<&str>,
+    max_keys: i32,
+    incl_deleted: bool,
+    result: &ListObjectsInfo,
+) -> bool {
+    !prefix.is_empty()
+        && prefix.ends_with(SLASH_SEPARATOR)
+        && marker.is_none()
+        && delimiter.is_none_or(str::is_empty)
+        && max_keys == 1
+        && !incl_deleted
+        && !result.is_truncated
+        && result.objects.is_empty()
+        && result.prefixes.is_empty()
 }
 
 const MARKER_TAG_VERSION: &str = "v2";
@@ -3788,6 +3809,19 @@ impl ECStore {
                 .list_objects_from_opt_in_key_only_provider(&opts, mode, max_keys, incl_deleted)
                 .await?
         {
+            if should_purge_empty_directory_listing(
+                prefix,
+                opts.marker.as_deref(),
+                delimiter.as_deref(),
+                max_keys,
+                incl_deleted,
+                &result,
+            ) && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
+                .await
+                .unwrap_or(false)
+            {
+                self.purge_orphan_dir_object(bucket, prefix).await;
+            }
             return Ok(result);
         }
 
@@ -3818,6 +3852,7 @@ impl ECStore {
         };
 
         let mut list_result = self
+            .clone()
             .list_path(&opts)
             .await
             .unwrap_or_else(|err| MetaCacheEntriesSortedResult {
@@ -3836,7 +3871,7 @@ impl ECStore {
         }
 
         if let Some(result) = list_result.entries.as_mut() {
-            result.forward_past(opts.marker);
+            result.forward_past(opts.marker.clone());
         }
 
         // contextCanceled
@@ -3864,12 +3899,26 @@ impl ECStore {
         );
         let _ = next_version_idmarker;
 
-        Ok(ListObjectsInfo {
+        let result = ListObjectsInfo {
             is_truncated,
             next_marker,
             objects,
             prefixes,
-        })
+        };
+        if should_purge_empty_directory_listing(
+            prefix,
+            opts.marker.as_deref(),
+            delimiter.as_deref(),
+            max_keys,
+            incl_deleted,
+            &result,
+        ) && has_authoritative_never_versioned_state_in(&self.ctx, bucket)
+            .await
+            .unwrap_or(false)
+        {
+            self.purge_orphan_dir_object(bucket, prefix).await;
+        }
+        Ok(result)
     }
 
     pub async fn inner_list_object_versions(
@@ -6834,8 +6883,8 @@ mod test {
         LIST_CURSOR_GENERATION_LIVE, LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY,
         LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY, ListIndexFallbackReason, ListIndexLifecycle, ListIndexLifecycleState,
         ListIndexSourceDecision, ListMetadataAuthority, ListMetadataIndexHealth, ListObjectsIndexProviderKind,
-        ListObjectsIndexProviderState, ListPathOptions, ListPathRawOptions, ListSourceMode, ListingEntryResolution,
-        ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalBackend,
+        ListObjectsIndexProviderState, ListObjectsInfo, ListPathOptions, ListPathRawOptions, ListSourceMode,
+        ListingEntryResolution, ListingSupplement, ListingSupplementOptions, MAX_OBJECT_LIST, NamespaceMutationJournalBackend,
         NamespaceMutationJournalSnapshot, NamespaceMutationJournalStatus, PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER,
         PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION,
         PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER, PERSISTENT_KEY_ONLY_INDEX_HEADER, PersistentKeyOnlyIndex,
@@ -6858,8 +6907,8 @@ mod test {
         persistent_key_only_index_health, persistent_key_only_index_matches_provider,
         reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
         resolve_listing_entries_with_supplement, scanner_namespace_mutation_generation, select_list_index_provider_source_mode,
-        select_list_index_source_mode, send_or_cancel, version_marker_for_entries, walk_result_from_set_errors,
-        write_namespace_mutation_journal_state, write_persistent_key_only_index_with_metadata,
+        select_list_index_source_mode, send_or_cancel, should_purge_empty_directory_listing, version_marker_for_entries,
+        walk_result_from_set_errors, write_namespace_mutation_journal_state, write_persistent_key_only_index_with_metadata,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
     use crate::disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
@@ -8706,6 +8755,80 @@ mod test {
 
         assert_eq!(observe_list_objects_mutations_with_store(None, "photos", 2).await, Some(5));
         assert_eq!(scanner_namespace_mutation_generation(), 2);
+    }
+
+    #[test]
+    fn empty_directory_listing_purge_requires_complete_exact_recursive_request() {
+        let empty = ListObjectsInfo::default();
+        assert!(should_purge_empty_directory_listing("ghost/", None, None, 1, false, &empty));
+        assert!(should_purge_empty_directory_listing("ghost/", None, Some(""), 1, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost", None, None, 1, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost/", Some("marker"), None, 1, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost/", None, Some("/"), 1, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 0, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 2, false, &empty));
+        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 1, true, &empty));
+
+        let mut live = ListObjectsInfo::default();
+        live.objects.push(ObjectInfo::default());
+        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 1, false, &live));
+
+        let truncated = ListObjectsInfo {
+            is_truncated: true,
+            ..Default::default()
+        };
+        assert!(!should_purge_empty_directory_listing("ghost/", None, None, 1, false, &truncated));
+    }
+
+    #[tokio::test]
+    async fn empty_recursive_listing_purges_committed_delete_residue() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "listing-purge-bucket";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        let data_dir = uuid::Uuid::new_v4();
+        let transaction = uuid::Uuid::new_v4();
+        for dir in &dirs {
+            let residue = dir
+                .path()
+                .join(bucket)
+                .join("ghost")
+                .join("nested")
+                .join("object")
+                .join(data_dir.to_string());
+            tokio::fs::create_dir_all(&residue)
+                .await
+                .expect("committed delete residue should be created");
+            tokio::fs::write(residue.join("part.1"), b"stale")
+                .await
+                .expect("stale part should be written");
+            tokio::fs::write(
+                residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                [],
+            )
+            .await
+            .expect("committed delete marker should be written");
+        }
+
+        let result = store
+            .list_objects_generic(bucket, "ghost/", None, None, 1, false)
+            .await
+            .expect("empty recursive listing should succeed");
+
+        assert!(result.objects.is_empty());
+        assert!(result.prefixes.is_empty());
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("ghost").exists(),
+                "the empty listing should reclaim its committed delete residue"
+            );
+        }
     }
 
     #[test]

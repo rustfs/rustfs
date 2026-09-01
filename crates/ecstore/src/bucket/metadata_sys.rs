@@ -1136,6 +1136,16 @@ pub(crate) async fn has_authoritative_never_versioned_state(bucket: &str) -> Res
     bucket_meta_sys.has_authoritative_never_versioned_state(bucket).await
 }
 
+pub(crate) async fn has_authoritative_never_versioned_state_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<bool> {
+    let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
+
+    bucket_meta_sys.has_authoritative_never_versioned_state(bucket).await
+}
+
 pub async fn get_website_config(bucket: &str) -> Result<(WebsiteConfiguration, OffsetDateTime)> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;

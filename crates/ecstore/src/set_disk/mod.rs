@@ -329,6 +329,7 @@ const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
 const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
 const EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED: &str = "set_disk_rename_tail_drain_failed";
 const EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY: &str = "set_disk_put_object_stage_summary";
+const EVENT_SET_DISK_ORPHAN_PURGE_SKIPPED: &str = "set_disk_orphan_purge_skipped";
 const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
 const ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
 const DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 64 * 1024 * 1024;
@@ -1638,10 +1639,13 @@ mod prepared_get_object_metadata_tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial(body_cache_hook)]
-    async fn non_inline_data_read_early_stop_does_not_add_inline_fanout_on_unequal_layout() {
-        let (_dirs, set_disks) = make_local_set_disks(6, 2).await;
+    fn non_inline_data_read_early_stop_does_not_add_inline_fanout_on_unequal_layout() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
         let bucket = "inline-read-plan-unequal";
         let object = object_with_initial_data_shards_for_geometry(bucket, "inline-object", 6, 2);
         let payload = b"inline quorum payload".repeat(256);
@@ -1650,55 +1654,65 @@ mod prepared_get_object_metadata_tests {
             ..Default::default()
         };
 
-        set_disks
-            .make_bucket(bucket, &MakeBucketOptions::default())
-            .await
-            .expect("bucket should be created");
-        let mut put_reader = PutObjReader::from_vec(payload.clone());
-        set_disks
-            .put_object(bucket, &object, &mut put_reader, &opts)
-            .await
-            .expect("inline object should be written");
-
-        let read_once = |enabled: bool| {
-            let set_disks = Arc::clone(&set_disks);
-            let bucket = bucket.to_string();
-            let object = object.clone();
-            let payload = payload.clone();
-            let opts = opts.clone();
-            async move {
-                temp_env::async_with_vars(
-                    [
-                        (
-                            "RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE",
-                            Some(if enabled { "true" } else { "false" }),
-                        ),
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
-                    ],
-                    async {
-                        let calls = disk_call_counters::observe(&object);
-                        let mut reader = set_disks
-                            .get_object_reader(&bucket, &object, None, HeaderMap::new(), &opts)
-                            .await
-                            .expect("inline GET reader should open");
-                        let mut restored = Vec::new();
-                        reader
-                            .stream
-                            .read_to_end(&mut restored)
-                            .await
-                            .expect("inline GET body should stream");
-                        assert_eq!(restored, payload);
-                        calls.total(disk_call_counters::KIND_READ_VERSION)
-                    },
-                )
+        let (_dirs, set_disks) = runtime.block_on(async {
+            let (dirs, set_disks) = make_local_set_disks(6, 2).await;
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
                 .await
-            }
-        };
+                .expect("bucket should be created");
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            set_disks
+                .put_object(bucket, &object, &mut put_reader, &opts)
+                .await
+                .expect("inline object should be written");
+            (dirs, set_disks)
+        });
 
-        let gate_off_calls = read_once(false).await;
-        let gate_on_calls = read_once(true).await;
-        assert_eq!(gate_on_calls, gate_off_calls, "inline gate must not add reserve fanout");
+        // disk_call_counters counts tasks that started running, so an
+        // early-stop abort races the single-pending inline hedge into a ±1
+        // count per read. The fanout lifecycle histogram records the
+        // scheduling decision itself and stays deterministic under load.
+        let recorder = CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                for enabled in [false, true] {
+                    temp_env::async_with_vars(
+                        [
+                            (
+                                "RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE",
+                                Some(if enabled { "true" } else { "false" }),
+                            ),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                        ],
+                        async {
+                            let mut reader = set_disks
+                                .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                                .await
+                                .expect("inline GET reader should open");
+                            let mut restored = Vec::new();
+                            reader
+                                .stream
+                                .read_to_end(&mut restored)
+                                .await
+                                .expect("inline GET body should stream");
+                            assert_eq!(restored, payload);
+                        },
+                    )
+                    .await;
+                }
+            })
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        let scheduled = recorder.histogram_values(
+            "rustfs_io_get_object_metadata_fanout_scheduled",
+            &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+        );
+        assert_eq!(scheduled.len(), 2, "each GET should run exactly one metadata fanout");
+        assert_eq!(scheduled[1], scheduled[0], "inline gate must not add reserve fanout");
     }
 
     #[test]
@@ -8773,6 +8787,111 @@ mod tests {
         assert!(purged, "orphan empty tree should be purged");
         assert!(!root.join("bucket").join("pfx").exists(), "prefix directory should be gone");
         assert!(root.join("bucket").exists(), "bucket volume should remain");
+    }
+
+    #[tokio::test]
+    async fn purge_orphan_dir_object_removes_committed_delete_residue() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let data_dir = Uuid::new_v4();
+        let transaction = Uuid::new_v4();
+        let residue = root
+            .join("bucket")
+            .join("pfx")
+            .join("nested")
+            .join("object")
+            .join(data_dir.to_string());
+        fs::create_dir_all(&residue)
+            .await
+            .expect("committed delete residue should be created");
+        fs::write(residue.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        fs::write(
+            residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+            [],
+        )
+        .await
+        .expect("committed delete marker should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("purge should succeed");
+
+        assert!(purged, "committed delete residue should be purgeable");
+        assert!(!root.join("bucket").join("pfx").exists(), "prefix directory should be gone");
+    }
+
+    #[tokio::test]
+    async fn purge_orphan_dir_object_preserves_uncommitted_data_residue() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let residue = root
+            .join("bucket")
+            .join("pfx")
+            .join("object")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&residue)
+            .await
+            .expect("uncommitted data residue should be created");
+        fs::write(residue.join("part.1"), b"possibly live")
+            .await
+            .expect("data part should be written");
+        fs::write(residue.join("delete-data.not-a-uuid"), [])
+            .await
+            .expect("malformed marker should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!purged, "data without a valid committed marker must be preserved");
+        assert!(residue.join("part.1").exists(), "possibly live data must remain");
+    }
+
+    #[tokio::test]
+    async fn purge_orphan_dir_object_preserves_nested_object_below_committed_residue() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let transaction = Uuid::new_v4();
+        let residue = root
+            .join("bucket")
+            .join("pfx")
+            .join("object")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&residue)
+            .await
+            .expect("committed data directory should be created");
+        fs::write(residue.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        fs::write(
+            residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+            [],
+        )
+        .await
+        .expect("committed delete marker should be written");
+        let nested_object = residue.join("nested");
+        fs::create_dir_all(&nested_object)
+            .await
+            .expect("nested object directory should be created");
+        fs::write(nested_object.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("nested object metadata should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!purged, "nested object metadata must veto committed-residue cleanup");
+        assert!(nested_object.join(STORAGE_FORMAT_FILE).exists(), "nested object metadata must remain");
+        assert!(residue.join("part.1").exists(), "committed residue must remain when cleanup is vetoed");
     }
 
     // issue #4189: a prefix that still anchors a real object must be left intact.
