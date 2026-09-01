@@ -14,8 +14,8 @@
 
 use super::*;
 use crate::core::pools::{
-    PoolMetaReplicaState, PoolMetaWriteState, load_pool_meta_identity_observing, local_decommission_queue_prefix,
-    persist_pool_meta_identity_for_startup, pool_meta_has_active_decommission,
+    PoolMetaBootstrapAuthority, PoolMetaReplicaState, PoolMetaWriteState, load_pool_meta_identity_observing,
+    local_decommission_queue_prefix, persist_pool_meta_identity_for_startup, pool_meta_has_active_decommission,
 };
 use crate::runtime::instance::InstanceContext;
 use crate::runtime::sources as runtime_sources;
@@ -173,7 +173,7 @@ async fn establish_pool_meta_bootstrap_identity_if_proven<S>(
 where
     S: EcstoreObjectIO,
 {
-    if elected_writer && write_state.fresh_bootstrap_proven() {
+    if elected_writer && write_state.bootstrap_identity_proven() {
         persist_pool_meta_identity_for_startup(pools, write_state, false).await?;
     }
     Ok(())
@@ -215,7 +215,7 @@ where
     }
     let mut committed = meta.clone();
     if should_write {
-        if write_state.fresh_bootstrap_proven() || write_state.identity_is_pending() {
+        if write_state.bootstrap_identity_proven() || write_state.identity_is_pending() {
             persist_pool_meta_identity_for_startup(pools.clone(), write_state, false)
                 .await
                 .map_err(|err| Error::other(format!("store init failed during prepare_pool_meta_identity: {err}")))?;
@@ -402,7 +402,7 @@ impl ECStore {
         preflight_startup_rpc_secret(&endpoint_pools)?;
 
         let mut deployment_id = None;
-        let mut fresh_bootstrap_proven = true;
+        let mut pool_meta_bootstrap_authority = None;
 
         // let (endpoint_pools, _) = EndpointServerPools::create_server_endpoints(address.as_str(), &layouts)?;
 
@@ -518,7 +518,12 @@ impl ECStore {
                     }
                 }
             }?;
-            fresh_bootstrap_proven &= loaded_format.fresh_bootstrap_proven;
+            pool_meta_bootstrap_authority = Some(pool_meta_bootstrap_authority.map_or(
+                loaded_format.pool_meta_bootstrap_authority,
+                |authority: PoolMetaBootstrapAuthority| {
+                    authority.combine_across_pools(loaded_format.pool_meta_bootstrap_authority)
+                },
+            ));
             let fm = loaded_format.format;
 
             // Format loading succeeded, enable health monitoring on all disks
@@ -559,6 +564,10 @@ impl ECStore {
         let peer_sys = S3PeerSys::new_with_instance_ctx(&endpoint_pools, instance_ctx.clone());
         let mut pool_meta = PoolMeta::new(&pools, &PoolMeta::default());
         pool_meta.dont_save = true;
+        let pool_meta_write_state = PoolMetaWriteState::for_startup_with_bootstrap_authority(
+            deployment_id,
+            pool_meta_bootstrap_authority.unwrap_or_default(),
+        );
 
         let decommission_cancelers = RwLock::new(vec![None; pools.len()]);
         let ec = Arc::new(ECStore {
@@ -570,7 +579,7 @@ impl ECStore {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(PoolMetaWriteState::for_startup(deployment_id, fresh_bootstrap_proven)),
+            pool_meta_save_gate: Mutex::new(pool_meta_write_state),
             decommission_capacity_entry_gate: Mutex::default(),
             // Adopt the caller's context (the process bootstrap one on the
             // legacy path) so startup writes (erasure type recorded before
@@ -791,6 +800,7 @@ mod tests {
         run_local_decommission_watchdog, save_validated_pool_meta_for_startup, should_auto_start_rebalance_after_init,
         should_defer_rebalance_auto_start, should_retry_format_load, wait_for_local_decommission_resume_delay,
     };
+    use crate::core::pools::PoolMetaBootstrapAuthority;
     #[cfg(feature = "test-util")]
     use crate::disk::DiskAPI;
     #[cfg(feature = "test-util")]
@@ -1149,6 +1159,65 @@ mod tests {
         write_state
             .ensure_write_safe("fresh bootstrap publication")
             .expect("successful startup publication must disarm the transaction guard");
+    }
+
+    #[tokio::test]
+    async fn test_legacy_adoption_pool_meta_bootstrap_reaches_v3_cas() {
+        let deployment_id = Uuid::new_v4();
+        let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let mut write_state =
+            PoolMetaWriteState::for_startup_with_bootstrap_authority(deployment_id, PoolMetaBootstrapAuthority::LegacyAdoption);
+
+        establish_pool_meta_bootstrap_identity_if_proven(vec![storage.clone()], &mut write_state, true)
+            .await
+            .expect("verified legacy adoption should persist a nonce-bound identity before loading pool metadata");
+        let (loaded, replica_state) = load_pool_meta_for_startup(vec![storage.clone()], &mut write_state)
+            .await
+            .expect("verified legacy adoption should authorize initially missing pool metadata");
+        assert!(loaded.pools.is_empty());
+
+        let committed = persist_pool_meta_for_startup_if_safe(
+            &init_test_pool_meta(None),
+            vec![storage.clone()],
+            replica_state,
+            &mut write_state,
+            true,
+            true,
+        )
+        .await
+        .expect("verified legacy adoption should publish initial pool metadata");
+        assert_eq!(committed.pools[0].cmd_line, "pool-0");
+
+        let objects = storage.objects.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(objects.contains_key(POOL_META_NAME));
+        let identity = objects
+            .get(POOL_META_IDENTITY_NAME)
+            .map(|(payload, _)| payload.clone())
+            .expect("legacy adoption should commit the bootstrap identity");
+        assert!(pool_meta_identity_initialized_for_test(&identity).expect("decode committed identity"));
+    }
+
+    #[tokio::test]
+    async fn test_non_elected_legacy_adoption_cannot_initialize_pool_meta() {
+        let storage = Arc::new(StartupPoolMetaStorage::new(Vec::new()));
+        let mut write_state =
+            PoolMetaWriteState::for_startup_with_bootstrap_authority(Uuid::new_v4(), PoolMetaBootstrapAuthority::LegacyAdoption);
+
+        establish_pool_meta_bootstrap_identity_if_proven(vec![storage.clone()], &mut write_state, false)
+            .await
+            .expect("a non-elected distributed node must not create legacy adoption authority");
+        let err = load_pool_meta_for_startup(vec![storage.clone()], &mut write_state)
+            .await
+            .expect_err("legacy adoption still requires the elected writer to create a durable identity");
+        assert!(err.to_string().contains("no durable bootstrap identity"));
+        assert!(
+            !storage
+                .objects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(POOL_META_NAME),
+            "classification must not create pool metadata on non-elected nodes"
+        );
     }
 
     #[tokio::test]

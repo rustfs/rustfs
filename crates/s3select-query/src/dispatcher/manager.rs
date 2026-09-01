@@ -61,7 +61,7 @@ use tokio::{
 };
 
 use crate::{
-    dispatcher::parquet_table::ParquetSelectTable,
+    dispatcher::{json_document_table::JsonDocumentTable, parquet_table::ParquetSelectTable},
     execution::factory::QueryExecutionFactoryRef,
     instance::{DEFAULT_MAX_CONCURRENT_QUERIES, DEFAULT_QUERY_TIMEOUT_SECS},
     metadata::{ContextProviderExtension, MetadataProvider, TableHandleProviderRef, base_table::BaseTableProvider},
@@ -181,7 +181,9 @@ impl QueryDispatcher for SimpleQueryDispatcher {
                 Ok(logical_plan)
             })
             .await?;
-        query_state_machine.query.input_metrics().reset();
+        if !is_json_document_input(&self.input) {
+            query_state_machine.query.input_metrics().reset();
+        }
         if !query_tracker.mark_planned(&self.query_execution_owner) {
             drop(logical_plan);
             return Err(self.query_tracker_error(&query_tracker));
@@ -415,6 +417,17 @@ impl SimpleQueryDispatcher {
             return Ok(metadata_provider);
         }
 
+        if is_json_document_input(&self.input) {
+            let provider = JsonDocumentTable::try_new(session.inner(), &self.input.bucket, &self.input.key).await?;
+            let current_session_table_provider = self.build_table_handle_provider()?;
+            return Ok(MetadataProvider::new(
+                provider,
+                current_session_table_provider,
+                self.func_manager.clone(),
+                session.clone(),
+            ));
+        }
+
         let path = format!("s3://{}/{}", self.input.bucket, self.input.key);
         let table_path = ListingTableUrl::parse(path)?;
         let compressed_input = self
@@ -542,19 +555,24 @@ impl SimpleQueryDispatcher {
     }
 }
 
+fn is_json_document_input(input: &SelectObjectContentInput) -> bool {
+    input
+        .request
+        .input_serialization
+        .json
+        .as_ref()
+        .and_then(|json| json.type_.as_ref())
+        .is_some_and(|json_type| json_type.as_str() == JSONType::DOCUMENT)
+}
+
 fn validate_json_source_path_input(input: &SelectObjectContentInput, source_path: &[JsonPathSegment]) -> QueryResult<()> {
     if source_path.is_empty() {
         return Ok(());
     }
-    let Some(json) = input.request.input_serialization.json.as_ref() else {
+    if input.request.input_serialization.json.is_none() {
         return Err(SelectError::DataSourcePathUnsupported.into());
-    };
-    if !source_path_requires_expansion(source_path)
-        || json
-            .type_
-            .as_ref()
-            .is_some_and(|json_type| json_type.as_str() == JSONType::DOCUMENT)
-    {
+    }
+    if !source_path_requires_expansion(source_path) || is_json_document_input(input) {
         return Ok(());
     }
     Err(SelectError::DataSourcePathUnsupported.into())
@@ -1801,6 +1819,63 @@ mod tests {
 
             assert_eq!(values, ["one", "two"]);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn json_document_schema_prefix_is_counted_once() {
+        const DOCUMENT: &[u8] = br#"["one","two"]"#;
+        let mut input = test_input();
+        input.bucket = "s3select-json-document-metrics".to_string();
+        input.key = "input.json".to_string();
+        input.request.expression = "SELECT _1 FROM S3Object[*]".to_string();
+        input.request.input_serialization = InputSerialization {
+            json: Some(JSONInput {
+                type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
+            }),
+            ..Default::default()
+        };
+        input.request.output_serialization = OutputSerialization {
+            json: Some(JSONOutput::default()),
+            ..Default::default()
+        };
+        let input = Arc::new(input);
+        let env = snapshot_test_env().await;
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, DOCUMENT.to_vec()).await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let state_machine = dispatcher
+            .build_query_state_machine(query)
+            .await
+            .expect("build tracked JSON DOCUMENT query");
+        let input_metrics = Arc::clone(state_machine.query.input_metrics());
+
+        let logical_plan = dispatcher
+            .build_logical_plan(Arc::clone(&state_machine))
+            .await
+            .expect("JSON DOCUMENT query should plan")
+            .expect("SELECT should produce a logical plan");
+        let expected_bytes = u64::try_from(DOCUMENT.len()).expect("fixture size should fit in u64");
+        assert_eq!(input_metrics.snapshot().bytes_scanned, expected_bytes);
+        assert_eq!(input_metrics.snapshot().bytes_processed, expected_bytes);
+
+        let values = collect_utf8_output(
+            dispatcher
+                .execute_logical_plan(logical_plan, state_machine)
+                .await
+                .expect("JSON DOCUMENT query should execute"),
+        )
+        .await;
+        assert_eq!(values, ["one", "two"]);
+        assert_eq!(input_metrics.snapshot().bytes_scanned, expected_bytes);
+        assert_eq!(input_metrics.snapshot().bytes_processed, expected_bytes);
     }
 
     #[tokio::test]

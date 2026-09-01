@@ -3235,16 +3235,17 @@ pub fn merge_file_meta_versions(
     requested_versions: usize,
     versions: &[Vec<FileMetaShallowVersion>],
 ) -> Vec<FileMetaShallowVersion> {
-    merge_file_meta_versions_inner(quorum, strict, requested_versions, false, versions)
+    merge_file_meta_versions_inner(quorum, strict, requested_versions, false, 0, versions)
 }
 
 pub(crate) fn merge_file_meta_versions_with_write_quorum(
     quorum: usize,
     strict: bool,
     requested_versions: usize,
+    write_quorum_slack: usize,
     versions: &[Vec<FileMetaShallowVersion>],
 ) -> Vec<FileMetaShallowVersion> {
-    merge_file_meta_versions_inner(quorum, strict, requested_versions, true, versions)
+    merge_file_meta_versions_inner(quorum, strict, requested_versions, true, write_quorum_slack, versions)
 }
 
 fn merge_file_meta_versions_inner(
@@ -3252,6 +3253,7 @@ fn merge_file_meta_versions_inner(
     mut strict: bool,
     requested_versions: usize,
     enforce_write_quorum: bool,
+    write_quorum_slack: usize,
     versions: &[Vec<FileMetaShallowVersion>],
 ) -> Vec<FileMetaShallowVersion> {
     if quorum == 0 {
@@ -3269,7 +3271,7 @@ fn merge_file_meta_versions_inner(
 
         let required_quorum = versions[0]
             .first()
-            .map(|version| version.write_quorum(quorum).max(quorum))
+            .map(|version| version.write_quorum(quorum).saturating_sub(write_quorum_slack).max(quorum))
             .unwrap_or(quorum);
         if versions.len() >= required_quorum {
             return versions[0].clone();
@@ -3283,7 +3285,7 @@ fn merge_file_meta_versions_inner(
 
     let required_quorum = |version: &FileMetaShallowVersion| {
         if enforce_write_quorum {
-            version.write_quorum(quorum).max(quorum)
+            version.write_quorum(quorum).saturating_sub(write_quorum_slack).max(quorum)
         } else {
             quorum
         }

@@ -14,6 +14,7 @@
 
 use crate::cluster::rpc::client::is_network_like_disk_error;
 use crate::config::storageclass;
+use crate::core::pools::PoolMetaBootstrapAuthority;
 use crate::disk::error_reduce::{count_errs, reduce_write_quorum_errs};
 use crate::disk::{self, DiskAPI};
 use crate::error::{Error, Result};
@@ -84,7 +85,7 @@ pub async fn connect_load_init_formats(
 
 pub(crate) struct LoadedFormat {
     pub(crate) format: FormatV3,
-    pub(crate) fresh_bootstrap_proven: bool,
+    pub(crate) pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority,
 }
 
 pub(crate) async fn connect_load_init_formats_with_instance_ctx(
@@ -133,7 +134,7 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
                 retain_format_quorum_members(instance_ctx, disks, &format, &quorum_members, set_drive_count).await?;
                 return Ok(LoadedFormat {
                     format: *format,
-                    fresh_bootstrap_proven: false,
+                    pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::LegacyAdoption,
                 });
             }
             Ok(LegacyFormatOutcome::Incompatible) => {
@@ -153,7 +154,7 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
             let fm = init_format_erasure(instance_ctx, disks, set_count, set_drive_count, deployment_id).await?;
             return Ok(LoadedFormat {
                 format: fm,
-                fresh_bootstrap_proven: true,
+                pool_meta_bootstrap_authority: PoolMetaBootstrapAuthority::Fresh,
             });
         }
     }
@@ -182,8 +183,27 @@ pub(crate) async fn connect_load_init_formats_with_instance_ctx(
 
     Ok(LoadedFormat {
         format: fm,
-        fresh_bootstrap_proven: false,
+        pool_meta_bootstrap_authority: verified_legacy_adoption_source(disks, &formats, set_count, set_drive_count).await?,
     })
+}
+
+async fn verified_legacy_adoption_source(
+    disks: &[Option<DiskStore>],
+    rustfs_formats: &[Option<FormatV3>],
+    set_count: usize,
+    set_drive_count: usize,
+) -> Result<PoolMetaBootstrapAuthority> {
+    match try_migrate_format(disks, rustfs_formats, set_count, set_drive_count).await {
+        Ok(LegacyFormatOutcome::Migrated { .. }) => Ok(PoolMetaBootstrapAuthority::LegacyAdoption),
+        Ok(LegacyFormatOutcome::None | LegacyFormatOutcome::Incompatible) => Ok(PoolMetaBootstrapAuthority::None),
+        Err(err) => {
+            debug!(
+                error = %err,
+                "legacy adoption proof skipped because legacy format verification failed"
+            );
+            Ok(PoolMetaBootstrapAuthority::None)
+        }
+    }
 }
 
 async fn retain_format_quorum_members(
@@ -1311,10 +1331,7 @@ mod tests {
         let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 3, None)
             .await
             .expect("fresh disks should receive a storage format");
-        assert!(
-            loaded.fresh_bootstrap_proven,
-            "every configured disk explicitly reporting unformatted should establish fresh topology proof"
-        );
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::Fresh);
         let format = loaded.format;
 
         let (formats, errors) = load_format_erasure_all(&disks, false).await;
@@ -1358,12 +1375,11 @@ mod tests {
 
         let mut expected = legacy;
         expected.erasure.this = Uuid::nil();
-        assert_eq!(
-            connect_load_init_formats(true, &mut disks, 1, 3, None)
-                .await
-                .expect("compatible legacy format should migrate"),
-            expected
-        );
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 3, None)
+            .await
+            .expect("compatible legacy format should migrate");
+        assert_eq!(loaded.format, expected);
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::LegacyAdoption);
         let (formats, errors) = load_format_erasure_all(&disks, false).await;
         assert!(
             errors.iter().all(Option::is_none),
@@ -1376,6 +1392,51 @@ mod tests {
                 "the migrated format must preserve each disk's physical slot"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn compatible_single_drive_legacy_format_marks_adoption_proof() {
+        let (_temp_dir, mut disks) = local_disks(1).await;
+        let legacy = FormatV3::new(1, 1);
+        write_legacy_majority(&disks, &legacy).await;
+
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 1, None)
+            .await
+            .expect("single-drive MinIO format should migrate");
+
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::LegacyAdoption);
+    }
+
+    #[tokio::test]
+    async fn existing_migrated_format_keeps_legacy_adoption_proof() {
+        let (_temp_dir, mut disks) = local_disks(1).await;
+        let legacy = FormatV3::new(1, 1);
+        write_legacy_majority(&disks, &legacy).await;
+
+        connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 1, None)
+            .await
+            .expect("first run should migrate the MinIO format");
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 1, None)
+            .await
+            .expect("retry after a partial adoption should reload the migrated RustFS format");
+
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::LegacyAdoption);
+    }
+
+    #[tokio::test]
+    async fn existing_rustfs_format_without_legacy_source_is_not_legacy_adoption() {
+        let (_temp_dir, mut disks) = local_disks(1).await;
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        save_format_file(&disks[0], &Some(format))
+            .await
+            .expect("existing RustFS format should be written");
+
+        let loaded = connect_load_init_formats_with_instance_ctx(&current_ctx(), true, &mut disks, 1, 1, None)
+            .await
+            .expect("existing RustFS format should load");
+
+        assert_eq!(loaded.pool_meta_bootstrap_authority, PoolMetaBootstrapAuthority::None);
     }
 
     #[tokio::test]

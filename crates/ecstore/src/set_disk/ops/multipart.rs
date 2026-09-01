@@ -5459,19 +5459,42 @@ mod tests {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
         let mut initial_reader = PutObjReader::from_vec(b"old multipart body".to_vec());
+        // A lock-owning PUT may quorum-ack before its rename tail drains, and
+        // cache priming refuses to publish while a straggler disk still reads
+        // as an error; keep the setup on the full-fanout commit path.
         set_disks
-            .put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
+            .put_object(
+                bucket,
+                object,
+                &mut initial_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("initial object should be written");
-        set_disks
-            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
-            .await
-            .expect("initial metadata should resolve");
-        let generation = set_disks
-            .get_object_metadata_cache_generation(bucket, object)
-            .expect("metadata cache generation should be active");
-        let retired_key = GetObjectMetadataCacheKey::new(bucket, object, generation);
-        assert!(set_disks.get_object_metadata_cache.get(&retired_key).await.is_some());
+        // The publish is also bounded by the cache TTL, so re-prime until the
+        // current generation is observably cached instead of asserting on a
+        // single read that a loaded host can stall past expiry.
+        let retired_key = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                set_disks
+                    .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+                    .await
+                    .expect("initial metadata should resolve");
+                let generation = set_disks
+                    .get_object_metadata_cache_generation(bucket, object)
+                    .expect("metadata cache generation should be active");
+                let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+                if set_disks.get_object_metadata_cache.get(&key).await.is_some() {
+                    return key;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("metadata priming should publish the current generation");
 
         let upload = set_disks
             .new_multipart_upload(bucket, object, &ObjectOptions::default())

@@ -2812,9 +2812,20 @@ mod heal_result_report_tests {
             }
 
             let mut reader = PutObjReader::from_vec(vec![0x5a; 1024 * 1024]);
-            set.put_object(&bucket, object, &mut reader, &ObjectOptions::default())
-                .await
-                .expect("source object should be written");
+            // This fixture reads and removes physical shards immediately after
+            // PUT. A lock-owning PUT may quorum-ack before its rename tail
+            // drains, so keep the setup on the full-fanout commit path.
+            set.put_object(
+                &bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should be written");
             let source = disks[2]
                 .read_version("", &bucket, object, "", &ReadOptions::default())
                 .await
@@ -3230,9 +3241,20 @@ mod heal_result_report_tests {
         }
 
         let mut reader = PutObjReader::from_vec(vec![0x5a; 1024 * 1024]);
-        set.put_object(bucket, object, &mut reader, &ObjectOptions::default())
-            .await
-            .expect("source object should be written");
+        // The target-evidence readback below asserts per-disk state right
+        // after PUT. A lock-owning PUT may quorum-ack before its rename tail
+        // drains, so keep the setup on the full-fanout commit path.
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("source object should be written");
         let source = disks[2]
             .read_version("", bucket, object, "", &ReadOptions::default())
             .await
@@ -3279,6 +3301,9 @@ mod heal_result_report_tests {
         .await
         .expect("versioned bucket should be created");
 
+        // The per-version target-evidence readback below asserts per-disk
+        // state right after PUT. A lock-owning PUT may quorum-ack before its
+        // rename tail drains, so keep the setup on the full-fanout commit path.
         let mut old_reader = PutObjReader::from_vec(vec![0x5a; 1024 * 1024]);
         let old_info = set
             .put_object(
@@ -3287,6 +3312,7 @@ mod heal_result_report_tests {
                 &mut old_reader,
                 &ObjectOptions {
                     versioned: true,
+                    no_lock: true,
                     ..Default::default()
                 },
             )
@@ -3304,6 +3330,7 @@ mod heal_result_report_tests {
                 &mut latest_reader,
                 &ObjectOptions {
                     versioned: true,
+                    no_lock: true,
                     ..Default::default()
                 },
             )
@@ -4325,9 +4352,20 @@ mod heal_result_report_tests {
 
         const PAYLOAD_SIZE: usize = 1024 * 1024;
         let mut initial_reader = PutObjReader::from_vec(vec![0x11; PAYLOAD_SIZE]);
-        set.put_object(bucket, object, &mut initial_reader, &ObjectOptions::default())
-            .await
-            .expect("initial object should be written");
+        // This fixture reads and removes physical shards immediately after
+        // PUT. A lock-owning PUT may quorum-ack before its rename tail drains,
+        // so keep the setup on the full-fanout commit path.
+        set.put_object(
+            bucket,
+            object,
+            &mut initial_reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("initial object should be written");
 
         let current = disks[2]
             .read_version("", bucket, object, "", &ReadOptions::default())
@@ -4415,11 +4453,12 @@ mod heal_result_report_tests {
                 // Give the heal something to rebuild on alternating rounds: remove a
                 // shard of the current data dir right before the race.
                 if round % 2 == 1 {
-                    let current = disks[2]
-                        .read_version("", bucket, object, "", &ReadOptions::default())
-                        .await
-                        .expect("current metadata should be readable");
-                    if let Some(data_dir) = current.data_dir {
+                    // The previous round's lock-owning PUT may still be
+                    // draining its rename tail on this disk; shard damage is
+                    // best-effort here, so skip injection when it lags.
+                    if let Ok(current) = disks[2].read_version("", bucket, object, "", &ReadOptions::default()).await
+                        && let Some(data_dir) = current.data_dir
+                    {
                         let shard = temp_dirs[3]
                             .path()
                             .join(bucket)

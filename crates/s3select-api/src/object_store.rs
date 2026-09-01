@@ -16,15 +16,11 @@ use crate::{
     PrepareSelectObjectSnapshotError, QueryError, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectError, SelectGetObjectReader,
     SelectInputMetrics, SelectObjectOptions, SelectObjectSnapshot, SelectObjectSnapshotReadError, SelectStorageError,
     SelectStore, SnapshotConsistencyError,
-    input_stream::{
-        CompressionFormat, MAX_SELECT_RECORD_BYTES, SELECT_DECODE_CHUNK_BYTES, SelectInputReader, compressed_input_reader,
-        compressed_input_stream, input_io_error, processed_bytes_limit,
-    },
-    metrics::SelectInputMetricsRecorder,
+    input_stream::{CompressionFormat, compressed_input_reader, compressed_input_stream, processed_bytes_limit},
     query::{
         ast::{JsonPathSegment, JsonSource},
         parser::RustFsDialect,
-        session::{QueryExecutionGuard, QueryExecutionTracker},
+        session::QueryExecutionTracker,
     },
     resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
     select_is_err_version_not_found,
@@ -33,8 +29,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use datafusion::{
-    common::{DataFusionError, runtime::SpawnedTask},
-    execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation, UnboundedMemoryPool},
+    execution::memory_pool::{MemoryPool, UnboundedMemoryPool},
     object_store::{
         Attributes, CopyOptions, Error as o_Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult,
         MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
@@ -51,7 +46,6 @@ use futures::pin_mut;
 use futures::{Stream, StreamExt, TryStreamExt, future::ready, stream};
 use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
-use parking_lot::Mutex;
 use rustfs_common::DEFAULT_DELIMITER;
 use s3s::header::{
     X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, X_AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
@@ -63,14 +57,18 @@ use s3s::{
 };
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, atomic::AtomicBool};
 use tokio::{io::AsyncReadExt, sync::OnceCell};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
 
 use crate::storage_api::object_store::HTTPRangeSpec;
+
+mod json_document;
+
+use json_document::{compressed_json_document_ndjson_stream, json_document_ndjson_stream};
 
 fn select_default_read_buffer_size_u64() -> u64 {
     u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)
@@ -85,29 +83,18 @@ fn compression_format(input: &InputSerialization) -> Result<Option<CompressionFo
     }
 }
 
-/// Maximum allowed object size for JSON DOCUMENT mode.
+/// Maximum decoded input accepted for JSON DOCUMENT mode.
 ///
-/// JSON DOCUMENT format requires loading the entire file into memory for DOM
-/// parsing, so memory consumption grows linearly with file size.  Objects
-/// larger than this threshold are rejected with an error rather than risking
-/// an OOM condition.
-///
-/// To process larger JSON files, convert the input to **JSON LINES** (NDJSON,
-/// `type = LINES`), which supports line-by-line streaming with no memory
-/// size limit.
-///
-/// Default: 128 MiB.  This matches the AWS S3 Select limit for JSON DOCUMENT
-/// inputs. The query memory pool also applies: RustFS reserves 64 times the
-/// input size for parsing and output. With the default 64 MiB query memory
-/// limit, JSON DOCUMENT inputs larger than 1 MiB are rejected; scalar source
-/// aliases reserve additional space for their maximum per-row expansion.
-/// Raise `RUSTFS_S3SELECT_MEMORY_LIMIT_BYTES` to process larger inputs, up to
-/// this hard cap.
+/// Root arrays are parsed incrementally, while a root object or scalar must fit
+/// in the query memory pool as one logical record. The hard cap also bounds
+/// compressed input after decompression.
 pub const MAX_JSON_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
-const JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER: usize = 64;
-const JSON_SCALAR_COLUMN_MEMORY_RESERVATION_MULTIPLIER: usize = 14;
-const JSON_CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
-const JSON_CANCELLATION_CHECK_KEYS: usize = 1024;
+#[cfg(test)]
+use json_document::{
+    JSON_CANCELLATION_CHECK_BYTES, JSON_CANCELLATION_CHECK_KEYS, escaped_json_object_with_size, flatten_json_document_to_ndjson,
+    json_key_eq_ignore_ascii_case_with_checkpoint, parse_json_document_to_lines, remove_json_source_key_with_checkpoint,
+    validate_json_document_size,
+};
 pub const INVALID_SCAN_RANGE_MESSAGE: &str =
     "The value of a parameter in ScanRange element is invalid. Check the service API documentation and try again.";
 const NORMALIZED_RECORD_DELIMITER: &[u8] = b"\r\n";
@@ -123,7 +110,7 @@ pub struct EcObjectStore {
     need_convert: bool,
     delimiter: String,
     /// True when the JSON input type is DOCUMENT (multi-line formatted JSON).
-    /// In that case the raw bytes are buffered and flattened to NDJSON before
+    /// In that case the input is incrementally framed into NDJSON rows before
     /// being handed to DataFusion's Arrow JSON reader.
     is_json_document: bool,
     /// JSON source path produced by the SQL compatibility analyzer.
@@ -912,19 +899,7 @@ impl ObjectStore for EcObjectStore {
                 GetResultPayload::Stream(stream.boxed())
             }
         } else if self.is_json_document {
-            // JSON DOCUMENT mode: gate on object size before doing any I/O.
-            //
-            // Small files (<= MAX_JSON_DOCUMENT_BYTES): build a lazy stream
-            // that defers all I/O and JSON parsing until DataFusion first
-            // polls it.  Parsing runs inside spawn_blocking so the async
-            // runtime thread is never blocked.
-            //
-            // Large files (> MAX_JSON_DOCUMENT_BYTES): return an error
-            // immediately.  JSON DOCUMENT relies on serde_json DOM parsing
-            // which must load the whole file into memory; rejecting oversized
-            // files upfront is safer than risking OOM.  Users should convert
-            // their data to JSON LINES (NDJSON) format for large files.
-            validate_json_document_size(original_size)?;
+            // Size validation is eager; input and row production remain lazy.
             let stream = json_document_ndjson_stream(
                 reader.stream,
                 original_size,
@@ -932,7 +907,7 @@ impl ObjectStore for EcObjectStore {
                 Arc::clone(&self.input_metrics),
                 Arc::clone(&self.memory_pool),
                 self.query_tracker.clone(),
-            );
+            )?;
             GetResultPayload::Stream(stream)
         } else if let Some((scan_range, read_start)) = scan_context {
             let delimiter = self.record_delimiter();
@@ -1271,660 +1246,6 @@ impl<S> ScanRangeState<S> {
     }
 }
 
-/// Build a lazy NDJSON stream from a JSON DOCUMENT reader.
-///
-/// `get_opts` calls this and returns immediately – no I/O is performed until
-/// DataFusion begins polling the returned stream.  The pipeline is:
-///
-/// 1. **Read** – the object bytes are read asynchronously from `stream` only
-///    when the returned stream is first polled.
-/// 2. **Parse** – JSON deserialization runs inside
-///    `tokio::task::spawn_blocking` so the async runtime is never blocked by
-///    CPU-bound work, even for very large documents.
-/// 3. **Yield** – each NDJSON line (one per array element, or one line for a
-///    scalar/object root) is yielded as a separate [`Bytes`] chunk, so
-///    DataFusion can pipeline row processing as lines arrive.
-fn json_document_ndjson_stream(
-    stream: SelectInputReader,
-    original_size: u64,
-    json_source: JsonSource,
-    input_metrics: Arc<SelectInputMetrics>,
-    memory_pool: Arc<dyn MemoryPool>,
-    query_tracker: Option<QueryExecutionTracker>,
-) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
-    json_document_ndjson_stream_with_parser(
-        stream,
-        JsonDocumentReadMode::Exact {
-            original_size,
-            input_metrics: input_metrics.recorder(),
-        },
-        json_source,
-        memory_pool,
-        query_tracker,
-        |all_bytes, json_source, cancellation| {
-            parse_json_document_to_lines_cancellable(&all_bytes, &json_source, cancellation.as_ref())
-        },
-    )
-}
-
-fn compressed_json_document_ndjson_stream(
-    stream: SelectInputReader,
-    json_source: JsonSource,
-    memory_pool: Arc<dyn MemoryPool>,
-    query_tracker: Option<QueryExecutionTracker>,
-) -> futures_core::stream::BoxStream<'static, Result<Bytes>> {
-    json_document_ndjson_stream_with_parser(
-        stream,
-        JsonDocumentReadMode::Bounded,
-        json_source,
-        memory_pool,
-        query_tracker,
-        |all_bytes, json_source, cancellation| {
-            parse_json_document_to_lines_cancellable(&all_bytes, &json_source, cancellation.as_ref())
-        },
-    )
-}
-
-enum JsonDocumentReadMode {
-    Exact {
-        original_size: u64,
-        input_metrics: SelectInputMetricsRecorder,
-    },
-    Bounded,
-}
-
-fn json_document_ndjson_stream_with_parser<P>(
-    stream: SelectInputReader,
-    read_mode: JsonDocumentReadMode,
-    json_source: JsonSource,
-    memory_pool: Arc<dyn MemoryPool>,
-    query_tracker: Option<QueryExecutionTracker>,
-    parser: P,
-) -> futures_core::stream::BoxStream<'static, Result<Bytes>>
-where
-    P: FnOnce(Vec<u8>, JsonSource, Arc<AtomicBool>) -> std::io::Result<Vec<Bytes>> + Send + 'static,
-{
-    AsyncTryStream::<Bytes, o_Error, _>::new(|mut y| async move {
-        let reservation = MemoryConsumer::new("S3 Select JSON document").register(&memory_pool);
-
-        // ── 1. Read phase (lazy: only runs when the stream is polled) ────
-        pin_mut!(stream);
-        let all_bytes = match read_mode {
-            JsonDocumentReadMode::Exact {
-                original_size,
-                input_metrics,
-            } => {
-                let buffer_capacity = usize::try_from(original_size).map_err(|_| o_Error::Generic {
-                    store: "EcObjectStore",
-                    source: Box::new(DataFusionError::ResourcesExhausted(format!(
-                        "JSON DOCUMENT input size {original_size} does not fit in memory"
-                    ))),
-                })?;
-                resize_json_document_reservation(&reservation, buffer_capacity, &json_source)?;
-                let mut all_bytes = Vec::with_capacity(buffer_capacity);
-                let read_result = stream.take(original_size).read_to_end(&mut all_bytes).await;
-                input_metrics.record_uncompressed(all_bytes.len());
-                read_result.map_err(input_io_error)?;
-                if all_bytes.len() != buffer_capacity {
-                    return Err(incomplete_object_stream_error(buffer_capacity - all_bytes.len()));
-                }
-                all_bytes
-            }
-            JsonDocumentReadMode::Bounded => {
-                let mut all_bytes = Vec::new();
-                let mut buffer = vec![0; SELECT_DECODE_CHUNK_BYTES];
-                loop {
-                    let read = stream.read(&mut buffer).await.map_err(input_io_error)?;
-                    if read == 0 {
-                        break;
-                    }
-                    let new_len = all_bytes.len().checked_add(read).ok_or_else(|| o_Error::Generic {
-                        store: "EcObjectStore",
-                        source: Box::new(json_document_memory_reservation_overflow(all_bytes.len())),
-                    })?;
-                    let new_len_u64 = u64::try_from(new_len).map_err(|_| o_Error::Generic {
-                        store: "EcObjectStore",
-                        source: Box::new(DataFusionError::ResourcesExhausted(format!(
-                            "JSON DOCUMENT input size {new_len} does not fit in the object size type"
-                        ))),
-                    })?;
-                    validate_json_document_size(new_len_u64)?;
-                    grow_json_document_buffer(&mut all_bytes, new_len, &reservation, &json_source)?;
-                    all_bytes.extend_from_slice(&buffer[..read]);
-                }
-                all_bytes
-            }
-        };
-
-        // ── 2. Parse phase (blocking thread pool, non-blocking runtime) ──
-        let queued_query_guard = match query_tracker.as_ref() {
-            Some(query_tracker) => Some(query_tracker.query_guard().ok_or_else(|| o_Error::Generic {
-                store: "EcObjectStore",
-                source: Box::new(json_document_parse_interrupted_error()),
-            })?),
-            None => None,
-        };
-        let task_resources = JsonDocumentTaskResources {
-            _reservation: reservation,
-            query_guard: queued_query_guard,
-        };
-        let pending_query_guard = PendingQueryExecutionGuard::new(query_tracker);
-        let task_query_guard = pending_query_guard.task_state();
-        let cancellation = Arc::new(AtomicBool::new(false));
-        let queued_task = Arc::new(Mutex::new(Some(JsonDocumentParseTask {
-            parser,
-            all_bytes,
-            json_source,
-            task_resources,
-        })));
-        let _cancel_on_drop = JsonDocumentCancellation::new(Arc::clone(&cancellation), Arc::clone(&queued_task));
-        let (lines, _task_resources) = SpawnedTask::spawn_blocking(move || {
-            let JsonDocumentParseTask {
-                parser,
-                all_bytes,
-                json_source,
-                mut task_resources,
-            } = queued_task.lock().take().ok_or_else(json_document_parse_interrupted_error)?;
-            let query_guard = PendingQueryExecutionGuard::start(&task_query_guard)?;
-            task_resources.query_guard = query_guard;
-            parser(all_bytes, json_source, cancellation).map(|lines| (lines, task_resources))
-        })
-        .await
-        .map_err(|e| o_Error::Generic {
-            store: "EcObjectStore",
-            source: e.to_string().into(),
-        })?
-        .map_err(|e| o_Error::Generic {
-            store: "EcObjectStore",
-            source: classify_json_document_parse_error(e),
-        })?;
-
-        // ── 3. Yield phase (one Bytes per NDJSON line) ───────────────────
-        for line in lines {
-            y.yield_ok(line).await;
-        }
-        Ok(())
-    })
-    .boxed()
-}
-
-fn grow_json_document_buffer(
-    buffer: &mut Vec<u8>,
-    required_len: usize,
-    reservation: &MemoryReservation,
-    json_source: &JsonSource,
-) -> Result<()> {
-    if required_len <= buffer.capacity() {
-        return Ok(());
-    }
-
-    let max_capacity = usize::try_from(MAX_JSON_DOCUMENT_BYTES).map_err(|_| o_Error::Generic {
-        store: "EcObjectStore",
-        source: Box::new(DataFusionError::ResourcesExhausted(
-            "JSON DOCUMENT size limit does not fit in memory".to_string(),
-        )),
-    })?;
-    let target_capacity = required_len
-        .checked_next_power_of_two()
-        .ok_or_else(|| o_Error::Generic {
-            store: "EcObjectStore",
-            source: Box::new(DataFusionError::ResourcesExhausted(format!(
-                "JSON DOCUMENT buffer capacity overflow at {required_len} bytes"
-            ))),
-        })?
-        .min(max_capacity);
-    if target_capacity < required_len {
-        return Err(o_Error::Generic {
-            store: "EcObjectStore",
-            source: Box::new(DataFusionError::ResourcesExhausted(format!(
-                "JSON DOCUMENT input size {required_len} exceeds the maximum buffer capacity"
-            ))),
-        });
-    }
-
-    resize_json_document_reservation(reservation, target_capacity, json_source)?;
-    buffer
-        .try_reserve_exact(target_capacity - buffer.len())
-        .map_err(|_| o_Error::Generic {
-            store: "EcObjectStore",
-            source: Box::new(DataFusionError::ResourcesExhausted(format!(
-                "JSON DOCUMENT input buffer allocation failed at {target_capacity} bytes"
-            ))),
-        })?;
-    resize_json_document_reservation(reservation, buffer.capacity(), json_source)
-}
-
-fn resize_json_document_reservation(reservation: &MemoryReservation, input_bytes: usize, json_source: &JsonSource) -> Result<()> {
-    let reservation_bytes =
-        json_document_memory_reservation_bytes(input_bytes, json_source).map_err(|source| o_Error::Generic {
-            store: "EcObjectStore",
-            source: Box::new(source),
-        })?;
-    reservation.try_resize(reservation_bytes).map_err(|source| o_Error::Generic {
-        store: "EcObjectStore",
-        source: Box::new(source),
-    })
-}
-
-struct JsonDocumentTaskResources {
-    // Struct fields drop in declaration order, so admission covers the reservation through teardown.
-    _reservation: MemoryReservation,
-    query_guard: Option<QueryExecutionGuard>,
-}
-
-struct JsonDocumentParseTask<P> {
-    parser: P,
-    all_bytes: Vec<u8>,
-    json_source: JsonSource,
-    task_resources: JsonDocumentTaskResources,
-}
-
-struct JsonDocumentCancellation<T> {
-    cancelled: Arc<AtomicBool>,
-    queued: Arc<Mutex<Option<T>>>,
-}
-
-impl<T> JsonDocumentCancellation<T> {
-    fn new(cancelled: Arc<AtomicBool>, queued: Arc<Mutex<Option<T>>>) -> Self {
-        Self { cancelled, queued }
-    }
-}
-
-impl<T> Drop for JsonDocumentCancellation<T> {
-    fn drop(&mut self) {
-        self.cancelled.store(true, std::sync::atomic::Ordering::Release);
-        let queued = self.queued.lock().take();
-        drop(queued);
-    }
-}
-
-struct CancellableJsonReader<'a> {
-    inner: std::io::Cursor<&'a [u8]>,
-    cancelled: &'a AtomicBool,
-}
-
-impl std::io::Read for CancellableJsonReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        ensure_json_parse_active(self.cancelled)?;
-        std::io::Read::read(&mut self.inner, buffer)
-    }
-}
-
-fn ensure_json_parse_active(cancelled: &AtomicBool) -> std::io::Result<()> {
-    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-        Err(std::io::Error::new(std::io::ErrorKind::Interrupted, SelectError::Canceled))
-    } else {
-        Ok(())
-    }
-}
-
-fn json_document_memory_reservation_bytes(input_bytes: usize, json_source: &JsonSource) -> datafusion::common::Result<usize> {
-    let base = input_bytes
-        .checked_mul(JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER)
-        .ok_or_else(|| json_document_memory_reservation_overflow(input_bytes))?;
-    let scalar_column = json_source.scalar_column().unwrap_or_default();
-    // A scalar row holds one key copy and its JSON encoding. One source byte
-    // can expand to six escaped bytes, and the serializer buffer can grow to
-    // twice its final length.
-    let scalar_column_per_row = scalar_column
-        .len()
-        .checked_mul(JSON_SCALAR_COLUMN_MEMORY_RESERVATION_MULTIPLIER)
-        .ok_or_else(|| json_document_memory_reservation_overflow(input_bytes))?;
-    let scalar_column_max = scalar_column_per_row
-        .checked_mul(input_bytes)
-        .ok_or_else(|| json_document_memory_reservation_overflow(input_bytes))?;
-    base.checked_add(scalar_column_max)
-        .ok_or_else(|| json_document_memory_reservation_overflow(input_bytes))
-}
-
-fn json_document_memory_reservation_overflow(input_bytes: usize) -> DataFusionError {
-    DataFusionError::ResourcesExhausted(format!("JSON DOCUMENT memory reservation overflow for {input_bytes} input bytes"))
-}
-
-fn classify_json_document_parse_error(error: std::io::Error) -> Box<dyn std::error::Error + Send + Sync> {
-    if let Some(select_error) = error.get_ref().and_then(|source| source.downcast_ref::<SelectError>()) {
-        Box::new(select_error.clone())
-    } else if error.kind() == std::io::ErrorKind::InvalidData {
-        Box::new(SelectError::JsonParsingError)
-    } else {
-        Box::new(error)
-    }
-}
-
-struct PendingQueryExecutionGuard {
-    state: Arc<Mutex<QueryExecutionGuardState>>,
-}
-
-enum QueryExecutionGuardState {
-    Pending(Option<QueryExecutionTracker>),
-    Started,
-    Cancelled,
-}
-
-impl PendingQueryExecutionGuard {
-    fn new(query_tracker: Option<QueryExecutionTracker>) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(QueryExecutionGuardState::Pending(query_tracker))),
-        }
-    }
-
-    fn task_state(&self) -> Arc<Mutex<QueryExecutionGuardState>> {
-        Arc::clone(&self.state)
-    }
-
-    fn start(state: &Mutex<QueryExecutionGuardState>) -> std::io::Result<Option<QueryExecutionGuard>> {
-        let mut state = state.lock();
-        match std::mem::replace(&mut *state, QueryExecutionGuardState::Started) {
-            QueryExecutionGuardState::Pending(None) => Ok(None),
-            QueryExecutionGuardState::Pending(Some(query_tracker)) => query_tracker
-                .query_guard()
-                .map(Some)
-                .ok_or_else(json_document_parse_interrupted_error),
-            QueryExecutionGuardState::Cancelled => {
-                *state = QueryExecutionGuardState::Cancelled;
-                Err(json_document_parse_interrupted_error())
-            }
-            QueryExecutionGuardState::Started => {
-                *state = QueryExecutionGuardState::Started;
-                Err(std::io::Error::other("JSON DOCUMENT parse started more than once"))
-            }
-        }
-    }
-}
-
-fn json_document_parse_interrupted_error() -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Interrupted, "JSON DOCUMENT parse was cancelled before it started")
-}
-
-impl Drop for PendingQueryExecutionGuard {
-    fn drop(&mut self) {
-        let query_guard = {
-            let mut state = self.state.lock();
-            match std::mem::replace(&mut *state, QueryExecutionGuardState::Cancelled) {
-                QueryExecutionGuardState::Pending(query_guard) => query_guard,
-                QueryExecutionGuardState::Started => {
-                    *state = QueryExecutionGuardState::Started;
-                    None
-                }
-                QueryExecutionGuardState::Cancelled => None,
-            }
-        };
-        drop(query_guard);
-    }
-}
-
-/// Parse a JSON DOCUMENT (a single JSON value, possibly multi-line) into a
-/// list of NDJSON lines – one [`Bytes`] per record.
-///
-/// `json_source` is produced from the SQL AST and expands nested source
-/// arrays before DataFusion infers the table schema.
-///
-/// - A JSON array → one line per element.
-/// - A JSON object or scalar root → one line.
-#[cfg(test)]
-fn parse_json_document_to_lines(bytes: &[u8], json_source: &JsonSource) -> std::io::Result<Vec<Bytes>> {
-    parse_json_document_to_lines_cancellable(bytes, json_source, &AtomicBool::new(false))
-}
-
-fn parse_json_document_to_lines_cancellable(
-    bytes: &[u8],
-    json_source: &JsonSource,
-    cancelled: &AtomicBool,
-) -> std::io::Result<Vec<Bytes>> {
-    let reader = std::io::BufReader::with_capacity(
-        JSON_CANCELLATION_CHECK_BYTES,
-        CancellableJsonReader {
-            inner: std::io::Cursor::new(bytes),
-            cancelled,
-        },
-    );
-    let root: serde_json::Value = match serde_json::from_reader(reader) {
-        Ok(root) => root,
-        Err(error) => {
-            ensure_json_parse_active(cancelled)?;
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
-        }
-    };
-    ensure_json_parse_active(cancelled)?;
-    let json_source_path = json_source.path();
-    let values = expand_json_source(root, json_source_path, cancelled)?;
-    // Preserve the two pre-path-AST forms that flattened arrays implicitly.
-    // Explicit indexes and wildcards already identify the intended records
-    // and must not flatten an array-valued result a second time.
-    let implicitly_expand_arrays = matches!(json_source_path, [] | [JsonPathSegment::Key { .. }]);
-    let scalar_column = json_source.scalar_column().unwrap_or_else(|| match json_source_path.last() {
-        Some(JsonPathSegment::Key { name, .. }) => name,
-        Some(JsonPathSegment::Index(_) | JsonPathSegment::ArrayWildcard | JsonPathSegment::ObjectWildcard) | None => "_1",
-    });
-    let mut lines: Vec<Bytes> = Vec::new();
-    for value in values {
-        ensure_json_parse_active(cancelled)?;
-        match value {
-            serde_json::Value::Array(array) if implicitly_expand_arrays => {
-                for item in array {
-                    ensure_json_parse_active(cancelled)?;
-                    lines.push(json_value_to_line_cancellable(item, scalar_column, cancelled)?);
-                }
-            }
-            other => lines.push(json_value_to_line_cancellable(other, scalar_column, cancelled)?),
-        }
-    }
-    Ok(lines)
-}
-
-fn expand_json_source(
-    root: serde_json::Value,
-    json_source_path: &[JsonPathSegment],
-    cancelled: &AtomicBool,
-) -> std::io::Result<Vec<serde_json::Value>> {
-    // S3Object[*] identifies the input record stream. JSON DOCUMENT already
-    // presents the root value as that stream, so the leading marker is not a
-    // lookup against the root object.
-    let (path, mut values) = match json_source_path.strip_prefix(&[JsonPathSegment::ArrayWildcard]) {
-        // Preserve RustFS's existing S3Object[*] root-array expansion while
-        // also allowing the AWS canonical S3Object[*][*] form.
-        Some(path) => match (root, path.first()) {
-            (root @ serde_json::Value::Array(_), Some(JsonPathSegment::ArrayWildcard | JsonPathSegment::Index(_))) => {
-                (path, vec![root])
-            }
-            (serde_json::Value::Array(array), _) => (path, array),
-            (root, _) => (path, vec![root]),
-        },
-        None => (json_source_path, vec![root]),
-    };
-
-    for segment in path {
-        ensure_json_parse_active(cancelled)?;
-        let mut expanded = Vec::new();
-        for value in values {
-            ensure_json_parse_active(cancelled)?;
-            match (segment, value) {
-                (JsonPathSegment::Key { name, quoted }, serde_json::Value::Object(mut object)) => {
-                    if let Some(value) = remove_json_source_key(&mut object, name, *quoted, cancelled)? {
-                        expanded.push(value);
-                    }
-                }
-                (JsonPathSegment::Index(index), serde_json::Value::Array(array)) => {
-                    if let Some(value) = array.into_iter().nth(*index) {
-                        expanded.push(value);
-                    }
-                }
-                (JsonPathSegment::ArrayWildcard, serde_json::Value::Array(mut array)) => {
-                    if expanded.is_empty() {
-                        expanded = array;
-                    } else {
-                        expanded.append(&mut array);
-                    }
-                }
-                (JsonPathSegment::ObjectWildcard, serde_json::Value::Object(object)) => {
-                    expanded.extend(object.into_values());
-                }
-                (JsonPathSegment::Key { .. }, _)
-                | (JsonPathSegment::Index(_), _)
-                | (JsonPathSegment::ArrayWildcard, _)
-                | (JsonPathSegment::ObjectWildcard, _) => {
-                    return Err(invalid_json_source_path("JSON source path segment does not match the input value"));
-                }
-            }
-        }
-        values = expanded;
-    }
-
-    Ok(values)
-}
-
-fn remove_json_source_key(
-    object: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    quoted: bool,
-    cancelled: &AtomicBool,
-) -> std::io::Result<Option<serde_json::Value>> {
-    let mut checkpoint = || ensure_json_parse_active(cancelled);
-    remove_json_source_key_with_checkpoint(object, name, quoted, &mut checkpoint)
-}
-
-fn remove_json_source_key_with_checkpoint(
-    object: &mut serde_json::Map<String, serde_json::Value>,
-    name: &str,
-    quoted: bool,
-    checkpoint: &mut impl FnMut() -> std::io::Result<()>,
-) -> std::io::Result<Option<serde_json::Value>> {
-    if quoted {
-        return Ok(object.remove(name));
-    }
-
-    let mut matched = None;
-    for (index, key) in object.keys().enumerate() {
-        if index % JSON_CANCELLATION_CHECK_KEYS == 0 {
-            checkpoint()?;
-        }
-        if json_key_eq_ignore_ascii_case_with_checkpoint(key, name, checkpoint)? {
-            if matched.is_some() {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::AmbiguousFieldName));
-            }
-            matched = Some(key.clone());
-        }
-    }
-    Ok(matched.and_then(|key| object.remove(&key)))
-}
-
-fn json_key_eq_ignore_ascii_case_with_checkpoint(
-    key: &str,
-    expected: &str,
-    checkpoint: &mut impl FnMut() -> std::io::Result<()>,
-) -> std::io::Result<bool> {
-    if key.len() != expected.len() {
-        return Ok(false);
-    }
-
-    for (key_chunk, expected_chunk) in key
-        .as_bytes()
-        .chunks(JSON_CANCELLATION_CHECK_BYTES)
-        .zip(expected.as_bytes().chunks(JSON_CANCELLATION_CHECK_BYTES))
-    {
-        checkpoint()?;
-        if !key_chunk.eq_ignore_ascii_case(expected_chunk) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-#[cfg(test)]
-fn json_value_to_line(value: serde_json::Value, scalar_column: &str) -> std::io::Result<Bytes> {
-    json_value_to_line_cancellable(value, scalar_column, &AtomicBool::new(false))
-}
-
-fn json_value_to_line_cancellable(
-    value: serde_json::Value,
-    scalar_column: &str,
-    cancelled: &AtomicBool,
-) -> std::io::Result<Bytes> {
-    let value = match value {
-        value @ serde_json::Value::Object(_) => value,
-        value => {
-            let mut row = serde_json::Map::new();
-            row.insert(scalar_column.to_string(), value);
-            serde_json::Value::Object(row)
-        }
-    };
-    let mut line = Vec::new();
-    let (serialize_result, limit_exceeded) = {
-        let mut writer = CancellableJsonWriter {
-            inner: &mut line,
-            cancelled,
-            bytes_since_check: 0,
-            limit_exceeded: false,
-        };
-        let serialize_result = serde_json::to_writer(&mut writer, &value);
-        (serialize_result, writer.limit_exceeded)
-    };
-    if limit_exceeded {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::OverMaxRecordSize));
-    }
-    if let Err(error) = serialize_result {
-        ensure_json_parse_active(cancelled)?;
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
-    }
-    ensure_json_parse_active(cancelled)?;
-    line.push(b'\n');
-    Ok(Bytes::from(line))
-}
-
-struct CancellableJsonWriter<'a> {
-    inner: &'a mut Vec<u8>,
-    cancelled: &'a AtomicBool,
-    bytes_since_check: usize,
-    limit_exceeded: bool,
-}
-
-impl std::io::Write for CancellableJsonWriter<'_> {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let Some(new_len) = self.inner.len().checked_add(buffer.len()) else {
-            self.limit_exceeded = true;
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::OverMaxRecordSize));
-        };
-        if new_len > MAX_SELECT_RECORD_BYTES {
-            self.limit_exceeded = true;
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::OverMaxRecordSize));
-        }
-        self.bytes_since_check = self.bytes_since_check.saturating_add(buffer.len());
-        if self.bytes_since_check >= JSON_CANCELLATION_CHECK_BYTES {
-            ensure_json_parse_active(self.cancelled)?;
-            self.bytes_since_check %= JSON_CANCELLATION_CHECK_BYTES;
-        }
-        self.inner.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        ensure_json_parse_active(self.cancelled)?;
-        self.bytes_since_check = 0;
-        Ok(())
-    }
-}
-
-fn invalid_json_source_path(message: &'static str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
-}
-
-/// Convert a JSON DOCUMENT to a single concatenated NDJSON [`Bytes`] blob.
-///
-/// This is a convenience wrapper around [`parse_json_document_to_lines`] used
-/// by the unit tests.  Production code uses `json_document_ndjson_stream`
-/// instead, which streams lines lazily without constructing this intermediate
-/// blob.
-#[cfg(test)]
-fn flatten_json_document_to_ndjson(bytes: &[u8], json_source_path: &[JsonPathSegment]) -> std::io::Result<Bytes> {
-    let lines = parse_json_document_to_lines(bytes, &JsonSource::from_path(json_source_path.to_vec()))?;
-    let total = lines.iter().map(|b| b.len()).sum();
-    let mut output = Vec::with_capacity(total);
-    for line in lines {
-        output.extend_from_slice(&line);
-    }
-    Ok(Bytes::from(output))
-}
-
 fn meter_uncompressed_input_stream<S, E>(
     stream: S,
     input_metrics: Arc<SelectInputMetrics>,
@@ -1965,21 +1286,6 @@ where
     })
 }
 
-fn validate_json_document_size(original_size: u64) -> Result<()> {
-    if original_size <= MAX_JSON_DOCUMENT_BYTES {
-        return Ok(());
-    }
-
-    Err(o_Error::Generic {
-        store: "EcObjectStore",
-        source: Box::new(DataFusionError::ResourcesExhausted(format!(
-            "JSON DOCUMENT object is {original_size} bytes, which exceeds the maximum allowed size of \
-             {MAX_JSON_DOCUMENT_BYTES} bytes ({} MiB). Convert the input to JSON LINES (NDJSON) to process large files.",
-            MAX_JSON_DOCUMENT_BYTES / (1024 * 1024)
-        ))),
-    })
-}
-
 fn incomplete_object_stream_error(remaining: impl std::fmt::Display) -> o_Error {
     o_Error::Generic {
         store: "EcObjectStore",
@@ -1993,14 +1299,13 @@ fn incomplete_object_stream_error(remaining: impl std::fmt::Display) -> o_Error 
 #[cfg(test)]
 mod test {
     use super::{
-        EcObjectStore, EcObjectStoreBuildError, JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER, JsonDocumentReadMode, OnceCell,
-        SELECT_DEFAULT_READ_BUFFER_SIZE, SelectObjectOptions, SelectObjectSnapshot, SelectScanRange, SnapshotConsistencyError,
-        bytes_stream, compressed_json_document_ndjson_stream, convert_csv_delimiter_stream, convert_field_delimiter_stream,
-        convert_record_delimiter_stream, find_delimiter, flatten_json_document_to_ndjson, grow_json_document_buffer,
-        http_range_spec_from_get_range, json_document_ndjson_stream, json_document_ndjson_stream_with_parser,
-        json_key_eq_ignore_ascii_case_with_checkpoint, legacy_json_source_from_input, map_storage_error,
-        meter_uncompressed_input_stream, remove_json_source_key_with_checkpoint, scan_range_from_bounds, scan_range_stream,
-        select_read_headers, snapshot_last_modified, validate_json_document_size,
+        EcObjectStore, EcObjectStoreBuildError, OnceCell, SELECT_DEFAULT_READ_BUFFER_SIZE, SelectObjectOptions,
+        SelectObjectSnapshot, SelectScanRange, SnapshotConsistencyError, bytes_stream, compressed_json_document_ndjson_stream,
+        convert_csv_delimiter_stream, convert_field_delimiter_stream, convert_record_delimiter_stream,
+        escaped_json_object_with_size, find_delimiter, flatten_json_document_to_ndjson, http_range_spec_from_get_range,
+        json_document_ndjson_stream, json_key_eq_ignore_ascii_case_with_checkpoint, legacy_json_source_from_input,
+        map_storage_error, meter_uncompressed_input_stream, remove_json_source_key_with_checkpoint, scan_range_from_bounds,
+        scan_range_stream, select_read_headers, snapshot_last_modified, validate_json_document_size,
     };
     use crate::input_stream::{CompressionFormat, MAX_SELECT_RECORD_BYTES, compressed_input_reader, encode_compressed_fixture};
     use crate::query::ast::{JsonPathSegment, JsonSource};
@@ -2011,7 +1316,7 @@ mod test {
     use bytes::Bytes;
     use datafusion::{
         common::DataFusionError,
-        execution::memory_pool::{GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation},
+        execution::memory_pool::{GreedyMemoryPool, MemoryLimit, MemoryPool, MemoryReservation},
         execution::{config::SessionConfig, context::SessionContext},
         object_store::{self, GetOptions, GetRange, GetResultPayload, ObjectStore as _, path::Path},
         physical_plan::ExecutionPlanProperties,
@@ -2036,6 +1341,8 @@ mod test {
     };
 
     use tokio::{io::AsyncReadExt, sync::Semaphore};
+
+    const JSON_DOCUMENT_TEST_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 
     #[derive(Debug)]
     struct AdmissionObservingMemoryPool {
@@ -3771,9 +3078,14 @@ mod test {
                 .expect("put JSON input metrics fixture");
             let snapshot = prepare_test_snapshot(BUCKET, object).await;
             let input_metrics = Arc::new(SelectInputMetrics::default());
+            let memory_limit = if json_type == JSONType::DOCUMENT {
+                JSON_DOCUMENT_TEST_MEMORY_BYTES
+            } else {
+                1024 * 1024
+            };
             let store = EcObjectStore::build_with_snapshot(
                 json_input(BUCKET, object, json_type),
-                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+                Arc::new(GreedyMemoryPool::new(memory_limit)),
                 None,
                 Arc::clone(&input_metrics),
                 snapshot,
@@ -3858,8 +3170,7 @@ mod test {
     #[tokio::test]
     async fn test_json_document_stream_respects_query_memory_pool() {
         let input = b"{}".to_vec();
-        let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
-        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(required - 1));
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
         let mut output = json_document_ndjson_stream(
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
@@ -3867,7 +3178,8 @@ mod test {
             Arc::new(SelectInputMetrics::default()),
             memory_pool,
             None,
-        );
+        )
+        .expect("build constrained JSON document stream");
 
         let err = output
             .next()
@@ -3903,7 +3215,7 @@ mod test {
             let output = compressed_json_document_ndjson_stream(
                 reader,
                 JsonSource::default(),
-                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+                Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES)),
                 None,
             )
             .try_collect::<Vec<_>>()
@@ -3937,16 +3249,16 @@ mod test {
         let mut output = compressed_json_document_ndjson_stream(
             reader,
             JsonSource::default(),
-            Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+            Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024)),
             None,
         );
-        let source = output
-            .next()
-            .await
-            .expect("decoder failure should produce one stream error")
-            .expect_err("compressed JSON DOCUMENT decoding must fail");
-        assert!(output.next().await.is_none());
-        QueryError::from(DataFusionError::ObjectStore(Box::new(source))).select_error()
+        while let Some(result) = output.next().await {
+            if let Err(source) = result {
+                assert!(output.next().await.is_none());
+                return QueryError::from(DataFusionError::ObjectStore(Box::new(source))).select_error();
+            }
+        }
+        panic!("compressed JSON DOCUMENT decoding must fail");
     }
 
     #[tokio::test]
@@ -3975,86 +3287,44 @@ mod test {
         }
     }
 
-    #[test]
-    fn compressed_json_document_buffer_grows_amortized_and_reserves_capacity() {
-        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
-        let reservation = MemoryConsumer::new("compressed JSON document test").register(&memory_pool);
-        let json_source = JsonSource::default();
-        let mut buffer = Vec::new();
-        let mut capacity_growths = 0;
+    #[tokio::test]
+    async fn json_document_input_record_limit_applies_after_decompression() {
+        let at_limit = escaped_json_object_with_size(MAX_SELECT_RECORD_BYTES);
+        let over_limit = escaped_json_object_with_size(MAX_SELECT_RECORD_BYTES + 1);
 
-        for _ in 0..1025 {
-            let old_capacity = buffer.capacity();
-            let required_len = buffer.len() + 1;
-            grow_json_document_buffer(&mut buffer, required_len, &reservation, &json_source)
-                .expect("bounded JSON buffer should grow");
-            if buffer.capacity() != old_capacity {
-                capacity_growths += 1;
-            }
-            buffer.push(0);
+        for format in [CompressionFormat::Gzip, CompressionFormat::Bzip2] {
+            let compressed = encode_compressed_fixture(format, &at_limit).await;
+            let compressed_len = u64::try_from(compressed.len()).expect("compressed fixture length should fit in u64");
+            let reader = compressed_input_reader(
+                Box::new(std::io::Cursor::new(compressed)),
+                compressed_len,
+                format,
+                Arc::new(SelectInputMetrics::default()),
+                u64::MAX,
+                None,
+            );
+            compressed_json_document_ndjson_stream(
+                reader,
+                JsonSource::default(),
+                Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024)),
+                None,
+            )
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("one-megabyte compressed input record should be accepted");
+
+            let compressed = encode_compressed_fixture(format, &over_limit).await;
             assert_eq!(
-                reservation.size(),
-                super::json_document_memory_reservation_bytes(buffer.capacity(), &json_source)
-                    .expect("test reservation should fit")
+                compressed_json_document_select_error(format, compressed, u64::MAX).await,
+                SelectError::OverMaxRecordSize
             );
         }
-
-        assert!(capacity_growths <= 12, "power-of-two growth should stay logarithmic");
-    }
-
-    #[tokio::test]
-    async fn scalar_alias_expansion_is_in_the_query_memory_reservation() {
-        let input = b"[0,0]".to_vec();
-        let alias = "alias".repeat(128);
-        let source = JsonSource::new(vec![JsonPathSegment::ArrayWildcard], Some(alias.clone()));
-        // Keep this threshold independent from the production helper so a
-        // smaller scalar-alias multiplier cannot make the test self-validate.
-        let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER + alias.len() * 14 * input.len();
-        assert!(required > input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER);
-        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(required - 1));
-        let mut output = json_document_ndjson_stream(
-            Box::new(std::io::Cursor::new(input.clone())),
-            input.len() as u64,
-            source,
-            Arc::new(SelectInputMetrics::default()),
-            memory_pool,
-            None,
-        );
-
-        let err = output
-            .next()
-            .await
-            .expect("memory error")
-            .expect_err("scalar alias expansion must be reserved before parsing");
-        let object_store::Error::Generic { source, .. } = err else {
-            panic!("expected generic object store error");
-        };
-        assert!(matches!(
-            source.downcast_ref::<DataFusionError>(),
-            Some(DataFusionError::ResourcesExhausted(_))
-        ));
-
-        let memory_pool = Arc::new(GreedyMemoryPool::new(required));
-        let output: Vec<Bytes> = json_document_ndjson_stream(
-            Box::new(std::io::Cursor::new(input.clone())),
-            input.len() as u64,
-            JsonSource::new(vec![JsonPathSegment::ArrayWildcard], Some(alias)),
-            Arc::new(SelectInputMetrics::default()),
-            memory_pool.clone(),
-            None,
-        )
-        .try_collect()
-        .await
-        .expect("scalar alias expansion should fit the exact reservation");
-        assert_eq!(output.len(), 2);
-        assert_eq!(memory_pool.reserved(), 0);
     }
 
     #[tokio::test]
     async fn test_json_document_stream_releases_memory_reservation() {
         let input = b"[1,2]".to_vec();
-        let required = input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER;
-        let memory_pool = Arc::new(GreedyMemoryPool::new(required));
+        let memory_pool = Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES));
         let input_metrics = Arc::new(SelectInputMetrics::default());
         let output: Vec<Bytes> = json_document_ndjson_stream(
             Box::new(std::io::Cursor::new(input.clone())),
@@ -4064,6 +3334,7 @@ mod test {
             memory_pool.clone(),
             None,
         )
+        .expect("build JSON document stream")
         .try_collect()
         .await
         .expect("JSON conversion should fit the pool");
@@ -4076,11 +3347,11 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_json_document_stream_rejects_early_eof() {
+    async fn test_json_document_stream_reports_early_eof_after_completed_rows() {
         let input = b"{}".to_vec();
         let input_len = u64::try_from(input.len()).expect("fixture length should fit in u64");
         let input_metrics = Arc::new(SelectInputMetrics::default());
-        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(4 * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES));
         let mut output = json_document_ndjson_stream(
             Box::new(std::io::Cursor::new(input)),
             4,
@@ -4088,7 +3359,15 @@ mod test {
             Arc::clone(&input_metrics),
             memory_pool,
             None,
-        );
+        )
+        .expect("build short JSON document stream");
+
+        let row = output
+            .next()
+            .await
+            .expect("completed row")
+            .expect("completed rows may precede a terminal stream error");
+        assert_eq!(row, Bytes::from_static(b"{}\n"));
 
         let err = output
             .next()
@@ -4109,8 +3388,7 @@ mod test {
     #[tokio::test]
     async fn malformed_json_document_stream_has_typed_select_error() {
         let input = b"{bad".to_vec();
-        let memory_pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+        let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES));
         let mut output = json_document_ndjson_stream(
             Box::new(std::io::Cursor::new(input.clone())),
             input.len() as u64,
@@ -4118,7 +3396,8 @@ mod test {
             Arc::new(SelectInputMetrics::default()),
             memory_pool,
             None,
-        );
+        )
+        .expect("build malformed JSON document stream");
 
         let source = output
             .next()
@@ -4128,34 +3407,6 @@ mod test {
         let error = QueryError::from(DataFusionError::ObjectStore(Box::new(source)));
 
         assert_eq!(error.select_error(), SelectError::JsonParsingError);
-        assert!(output.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn json_document_stream_preserves_typed_parser_error() {
-        let input = b"{}".to_vec();
-        let memory_pool: Arc<dyn MemoryPool> =
-            Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
-        let mut output = json_document_ndjson_stream_with_parser(
-            Box::new(std::io::Cursor::new(input.clone())),
-            JsonDocumentReadMode::Exact {
-                original_size: input.len() as u64,
-                input_metrics: SelectInputMetrics::default().recorder(),
-            },
-            JsonSource::default(),
-            memory_pool,
-            None,
-            |_, _, _| Err(std::io::Error::new(std::io::ErrorKind::InvalidData, SelectError::AmbiguousFieldName)),
-        );
-
-        let source = output
-            .next()
-            .await
-            .expect("typed parser failure should produce one stream error")
-            .expect_err("typed parser failure must fail the stream");
-        let error = QueryError::from(DataFusionError::ObjectStore(Box::new(source)));
-
-        assert_eq!(error.select_error(), SelectError::AmbiguousFieldName);
         assert!(output.next().await.is_none());
     }
 
@@ -4213,7 +3464,7 @@ mod test {
     }
 
     #[test]
-    fn test_json_document_cancelled_queued_parse_releases_before_dequeue() {
+    fn test_json_document_parser_does_not_use_tokio_blocking_pool() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .max_blocking_threads(1)
@@ -4243,10 +3494,8 @@ mod test {
                 30,
             );
             let input = b"{}".to_vec();
-            let (memory_pool, reservation_released) = AdmissionObservingMemoryPool::new(
-                input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER,
-                Arc::clone(&admission),
-            );
+            let (memory_pool, reservation_released) =
+                AdmissionObservingMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES, Arc::clone(&admission));
             let memory_pool = Arc::new(memory_pool);
             let query_memory_pool: Arc<dyn MemoryPool> = memory_pool.clone();
             let mut output = json_document_ndjson_stream(
@@ -4256,243 +3505,41 @@ mod test {
                 Arc::new(SelectInputMetrics::default()),
                 query_memory_pool,
                 Some(query_tracker),
-            );
+            )
+            .expect("build JSON document stream");
 
-            {
-                let next = output.next();
-                futures::pin_mut!(next);
-                assert!(futures::poll!(next.as_mut()).is_pending());
-            }
+            let row = tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+                .await
+                .expect("dedicated parser must not wait for Tokio's blocking pool")
+                .expect("JSON document should produce one row")
+                .expect("JSON document row should be valid");
+            assert_eq!(row, Bytes::from_static(b"{}\n"));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+                    .await
+                    .expect("parser should finish while the blocking pool is occupied")
+                    .is_none()
+            );
             drop(output);
 
+            tokio::pin!(reservation_released);
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(100), reservation_released)
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut reservation_released)
                     .await
-                    .expect("queued parse cancellation should release its memory immediately")
+                    .expect("completed parser should release memory")
                     .expect("memory reservation release observer should remain open"),
                 "query admission must cover the memory reservation through teardown"
             );
             assert_eq!(memory_pool.reserved(), 0);
             let recovered_permit =
-                tokio::time::timeout(std::time::Duration::from_millis(100), Arc::clone(&admission).acquire_owned())
+                tokio::time::timeout(std::time::Duration::from_secs(1), Arc::clone(&admission).acquire_owned())
                     .await
-                    .expect("queued parse cancellation should release admission before a worker is available")
-                    .expect("query admission should remain open");
-
-            release_blocking_tx.send(()).expect("release blocking worker");
-            blocker.await.expect("blocking worker should finish");
-            drop(recovered_permit);
-            assert_eq!(admission.available_permits(), 1);
-        });
-    }
-
-    #[test]
-    fn test_json_document_expired_queued_parse_does_not_start() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .expect("build test runtime");
-
-        runtime.block_on(async {
-            let (blocking_started_tx, blocking_started_rx) = tokio::sync::oneshot::channel();
-            let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                let _ = blocking_started_tx.send(());
-                release_blocking_rx.recv().expect("release blocking worker");
-            });
-            blocking_started_rx.await.expect("blocking worker should start");
-
-            let admission = Arc::new(Semaphore::new(1));
-            let permit = Arc::clone(&admission)
-                .acquire_owned()
-                .await
-                .expect("query permit should be available");
-            let owner = QueryExecutionOwner::new();
-            let query_tracker = QueryExecutionTracker::new(
-                &owner,
-                Arc::new(permit),
-                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-                30,
-            );
-            let input = b"{}".to_vec();
-            let memory_pool: Arc<dyn MemoryPool> =
-                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
-            let parser_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let parser_started_in_task = Arc::clone(&parser_started);
-            let mut output = json_document_ndjson_stream_with_parser(
-                Box::new(std::io::Cursor::new(input.clone())),
-                JsonDocumentReadMode::Exact {
-                    original_size: input.len() as u64,
-                    input_metrics: SelectInputMetrics::default().recorder(),
-                },
-                JsonSource::default(),
-                Arc::clone(&memory_pool),
-                Some(query_tracker.clone()),
-                move |_, _, _| {
-                    parser_started_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok(vec![Bytes::from_static(b"{}\n")])
-                },
-            );
-
-            {
-                let next = output.next();
-                futures::pin_mut!(next);
-                assert!(futures::poll!(next.as_mut()).is_pending());
-            }
-            query_tracker.expire(&owner);
-            assert_eq!(admission.available_permits(), 0);
-            assert!(memory_pool.reserved() > 0);
-            release_blocking_tx.send(()).expect("release blocking worker");
-            blocker.await.expect("blocking worker should finish");
-
-            let err = tokio::time::timeout(std::time::Duration::from_secs(5), output.next())
-                .await
-                .expect("queued parser should resume")
-                .expect("queued parser should return an error")
-                .expect_err("expired queued parser must not run");
-            let object_store::Error::Generic { source, .. } = err else {
-                panic!("expected generic object store error");
-            };
-            let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
-            assert_eq!(source.kind(), std::io::ErrorKind::Interrupted);
-            assert!(!parser_started.load(std::sync::atomic::Ordering::SeqCst));
-            assert_eq!(memory_pool.reserved(), 0);
-            assert_eq!(admission.available_permits(), 1);
-        });
-    }
-
-    #[test]
-    fn test_json_document_expired_before_enqueue_releases_resources_without_blocking() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .expect("build test runtime");
-
-        runtime.block_on(async {
-            let (blocking_started_tx, blocking_started_rx) = tokio::sync::oneshot::channel();
-            let (release_blocking_tx, release_blocking_rx) = std::sync::mpsc::channel();
-            let blocker = tokio::task::spawn_blocking(move || {
-                let _ = blocking_started_tx.send(());
-                release_blocking_rx.recv().expect("release blocking worker");
-            });
-            blocking_started_rx.await.expect("blocking worker should start");
-
-            let admission = Arc::new(Semaphore::new(1));
-            let permit = Arc::clone(&admission)
-                .acquire_owned()
-                .await
-                .expect("query permit should be available");
-            let owner = QueryExecutionOwner::new();
-            let query_tracker = QueryExecutionTracker::new(
-                &owner,
-                Arc::new(permit),
-                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-                30,
-            );
-            query_tracker.expire(&owner);
-
-            let input = b"{}".to_vec();
-            let memory_pool: Arc<dyn MemoryPool> =
-                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
-            let parser_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let parser_started_in_task = Arc::clone(&parser_started);
-            let mut output = json_document_ndjson_stream_with_parser(
-                Box::new(std::io::Cursor::new(input.clone())),
-                JsonDocumentReadMode::Exact {
-                    original_size: input.len() as u64,
-                    input_metrics: SelectInputMetrics::default().recorder(),
-                },
-                JsonSource::default(),
-                Arc::clone(&memory_pool),
-                Some(query_tracker),
-                move |_, _, _| {
-                    parser_started_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok(vec![Bytes::from_static(b"{}\n")])
-                },
-            );
-
-            let err = tokio::time::timeout(std::time::Duration::from_millis(100), output.next())
-                .await
-                .expect("expired parse must fail before entering the saturated blocking queue")
-                .expect("expired parse should return an error")
-                .expect_err("expired parse must not run");
-            let object_store::Error::Generic { source, .. } = err else {
-                panic!("expected generic object store error");
-            };
-            let source = source.downcast_ref::<std::io::Error>().expect("I/O error source");
-            assert_eq!(source.kind(), std::io::ErrorKind::Interrupted);
-            assert!(!parser_started.load(std::sync::atomic::Ordering::SeqCst));
-            assert_eq!(memory_pool.reserved(), 0);
-            assert_eq!(admission.available_permits(), 1);
-
-            release_blocking_tx.send(()).expect("release blocking worker");
-            blocker.await.expect("blocking worker should finish");
-        });
-    }
-
-    #[test]
-    fn test_json_document_started_parse_cancels_and_releases_query_guard() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .max_blocking_threads(1)
-            .enable_all()
-            .build()
-            .expect("build test runtime");
-
-        runtime.block_on(async {
-            let admission = Arc::new(Semaphore::new(1));
-            let permit = Arc::clone(&admission)
-                .acquire_owned()
-                .await
-                .expect("query permit should be available");
-            let query_guard: QueryExecutionGuard = Arc::new(permit);
-            let query_tracker = QueryExecutionTracker::new(
-                &QueryExecutionOwner::new(),
-                query_guard,
-                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-                30,
-            );
-            let input = b"{}".to_vec();
-            let memory_pool: Arc<dyn MemoryPool> =
-                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
-            let (parse_started_tx, parse_started_rx) = tokio::sync::oneshot::channel();
-            let mut output = json_document_ndjson_stream_with_parser(
-                Box::new(std::io::Cursor::new(input.clone())),
-                JsonDocumentReadMode::Exact {
-                    original_size: input.len() as u64,
-                    input_metrics: SelectInputMetrics::default().recorder(),
-                },
-                JsonSource::default(),
-                memory_pool,
-                Some(query_tracker),
-                move |_, _, cancellation| {
-                    let _ = parse_started_tx.send(());
-                    while !cancellation.load(std::sync::atomic::Ordering::Acquire) {
-                        std::thread::yield_now();
-                    }
-                    Err(std::io::Error::new(std::io::ErrorKind::Interrupted, SelectError::Canceled))
-                },
-            );
-
-            {
-                let next = output.next();
-                futures::pin_mut!(next);
-                assert!(futures::poll!(next.as_mut()).is_pending());
-            }
-            parse_started_rx.await.expect("JSON parser should start");
-            assert!(Arc::clone(&admission).try_acquire_owned().is_err());
-            drop(output);
-
-            let recovered_permit =
-                tokio::time::timeout(std::time::Duration::from_secs(5), Arc::clone(&admission).acquire_owned())
-                    .await
-                    .expect("cancelled JSON parse should release the query guard without an external unblock")
+                    .expect("completed parser should release query admission")
                     .expect("query admission should remain open");
             drop(recovered_permit);
+
+            release_blocking_tx.send(()).expect("release blocking worker");
+            blocker.await.expect("blocking worker should finish");
             assert_eq!(admission.available_permits(), 1);
         });
     }
@@ -4583,14 +3630,18 @@ mod test {
 
     #[test]
     fn json_document_logical_record_enforces_one_megabyte_limit() {
-        const OBJECT_OVERHEAD: usize = br#"{"v":""}"#.len();
+        const SCALAR_WRAPPER_BYTES: usize = br#"{"":0}"#.len();
+        let input = br#"{"v":0}"#;
+        let path = vec![source_key("v")];
 
-        let at_limit = serde_json::json!({"v": "x".repeat(MAX_SELECT_RECORD_BYTES - OBJECT_OVERHEAD)});
-        let line = super::json_value_to_line(at_limit, "_1").expect("one-megabyte logical record should be accepted");
-        assert_eq!(line.len(), MAX_SELECT_RECORD_BYTES + 1);
+        let alias = "a".repeat(MAX_SELECT_RECORD_BYTES - SCALAR_WRAPPER_BYTES);
+        let source = JsonSource::new(path.clone(), Some(alias));
+        let line = super::parse_json_document_to_lines(input, &source).expect("one-megabyte logical record should be accepted");
+        assert_eq!(line[0].len(), MAX_SELECT_RECORD_BYTES + 1);
 
-        let over_limit = serde_json::json!({"v": "x".repeat(MAX_SELECT_RECORD_BYTES + 1 - OBJECT_OVERHEAD)});
-        let error = super::json_value_to_line(over_limit, "_1").expect_err("oversized logical record must fail");
+        let alias = "a".repeat(MAX_SELECT_RECORD_BYTES + 1 - SCALAR_WRAPPER_BYTES);
+        let source = JsonSource::new(path.clone(), Some(alias));
+        let error = super::parse_json_document_to_lines(input, &source).expect_err("oversized logical record must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.get_ref().is_some_and(|source| {
             source
@@ -4598,8 +3649,10 @@ mod test {
                 .is_some_and(|error| error == &SelectError::OverMaxRecordSize)
         }));
 
-        let escaped = serde_json::json!({"v": "\0".repeat(MAX_SELECT_RECORD_BYTES / 6)});
-        let error = super::json_value_to_line(escaped, "_1").expect_err("escaped output must be bounded while it is serialized");
+        let escaped_alias = "\0".repeat(MAX_SELECT_RECORD_BYTES / 6);
+        let source = JsonSource::new(path, Some(escaped_alias));
+        let error = super::parse_json_document_to_lines(input, &source)
+            .expect_err("escaped output must be bounded while it is serialized");
         assert!(error.get_ref().is_some_and(|source| {
             source
                 .downcast_ref::<SelectError>()
@@ -4905,8 +3958,7 @@ mod test {
         ];
 
         for (case, input, path) in cases {
-            let memory_pool: Arc<dyn MemoryPool> =
-                Arc::new(GreedyMemoryPool::new(input.len() * JSON_DOCUMENT_MEMORY_RESERVATION_MULTIPLIER));
+            let memory_pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(JSON_DOCUMENT_TEST_MEMORY_BYTES));
             let mut output = json_document_ndjson_stream(
                 Box::new(std::io::Cursor::new(input.to_vec())),
                 input.len() as u64,
@@ -4914,7 +3966,8 @@ mod test {
                 Arc::new(SelectInputMetrics::default()),
                 memory_pool,
                 None,
-            );
+            )
+            .expect("build source-path JSON document stream");
             let source = output
                 .next()
                 .await
