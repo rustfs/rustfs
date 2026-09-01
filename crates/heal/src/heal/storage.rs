@@ -394,11 +394,6 @@ pub trait HealStorageAPI: Send + Sync {
         Err(Error::other("target-scoped replacement format is unsupported"))
     }
 
-    /// Recheck admitted replacement targets immediately before destructive work.
-    async fn replacement_targets_ready(&self, _targets: &[String]) -> Result<bool> {
-        Ok(false)
-    }
-
     /// Read target-specific physical evidence for one replacement version.
     ///
     /// This is only used by automatic replacement healing after the normal
@@ -1169,10 +1164,6 @@ impl HealStorageAPI for ECStoreHealStorage {
             .await
             .map(|(result, error)| (result, error.map(Error::Storage)))
             .map_err(Error::Storage)
-    }
-
-    async fn replacement_targets_ready(&self, targets: &[String]) -> Result<bool> {
-        Ok(super::replacement_readiness::auto_replacement_targets_ready(targets).await)
     }
 
     async fn replacement_targets_have_version(
