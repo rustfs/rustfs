@@ -326,13 +326,13 @@ fn invalid_gzip_header_error() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, CompressionFormat::Gzip.invalid_header_error())
 }
 
-struct BlockingChannelReader {
+pub(crate) struct BlockingChannelReader {
     receiver: mpsc::Receiver<io::Result<Bytes>>,
     current: Bytes,
 }
 
 impl BlockingChannelReader {
-    fn new(receiver: mpsc::Receiver<io::Result<Bytes>>) -> Self {
+    pub(crate) fn new(receiver: mpsc::Receiver<io::Result<Bytes>>) -> Self {
         Self {
             receiver,
             current: Bytes::new(),
@@ -639,7 +639,7 @@ fn error_chain_contains<T: StdError + 'static>(error: &(dyn StdError + 'static))
     find_error_source::<T>(error).is_some()
 }
 
-fn find_error_source<'a, T: StdError + 'static>(error: &'a (dyn StdError + 'static)) -> Option<&'a T> {
+pub(crate) fn find_error_source<'a, T: StdError + 'static>(error: &'a (dyn StdError + 'static)) -> Option<&'a T> {
     let mut current = Some(error);
     for _ in 0..MAX_ERROR_SOURCE_DEPTH {
         let Some(error) = current else {
