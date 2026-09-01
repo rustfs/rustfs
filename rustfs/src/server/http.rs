@@ -74,7 +74,7 @@ use s3s::{
 };
 use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -180,6 +180,7 @@ const EVENT_CONNECTION_CAP_STATE: &str = "connection_cap_state";
 const EVENT_HTTP_TRANSPORT_PARAMETERS: &str = "http_transport_parameters";
 const EVENT_HTTP_ACCEPT_LOOP_STATE: &str = "http_accept_loop_state";
 const EVENT_HTTP_CONNECTION_DRAIN: &str = "http_connection_drain";
+const EVENT_HTTP_EARLY_RESPONSE_BODY_DRAIN: &str = "http_early_response_body_drain";
 const EVENT_PEER_ADDR_UNAVAILABLE: &str = "peer_addr_unavailable";
 const EVENT_RPC_SIGNATURE_VERIFICATION_FAILED: &str = "rpc_signature_verification_failed";
 const EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED: &str = "grpc_trace_context_propagation_failed";
@@ -418,6 +419,20 @@ fn log_transport_failed(peer_addr: &str, error_kind: &str, error_message: &str) 
         result = "transport_error",
         "HTTP transport failed"
     );
+}
+
+fn format_peer_addr(real_ip: Option<IpAddr>, remote_addr: Option<SocketAddr>) -> String {
+    real_ip
+        .map(|addr| addr.to_string())
+        .or_else(|| remote_addr.map(|addr| addr.to_string()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn request_peer_addr<B>(request: &HttpRequest<B>) -> String {
+    format_peer_addr(
+        request.extensions().get::<ClientInfo>().map(|info| info.real_ip),
+        request.extensions().get::<RemoteAddr>().map(|addr| addr.0),
+    )
 }
 
 #[inline]
@@ -675,6 +690,69 @@ impl EarlyResponseBodyDrainResult {
     }
 }
 
+struct EarlyResponseBodyDrainContext {
+    real_ip: Option<IpAddr>,
+    remote_addr: Option<SocketAddr>,
+    method: Method,
+    uri: Uri,
+    status_code: u16,
+    idle_timeout: Duration,
+}
+
+impl EarlyResponseBodyDrainContext {
+    fn from_request<B>(request: &HttpRequest<B>, idle_timeout: Duration) -> Self {
+        Self {
+            real_ip: request.extensions().get::<ClientInfo>().map(|info| info.real_ip),
+            remote_addr: request.extensions().get::<RemoteAddr>().map(|addr| addr.0),
+            method: request.method().clone(),
+            uri: request.uri().clone(),
+            status_code: 0,
+            idle_timeout,
+        }
+    }
+
+    fn peer_addr(&self) -> String {
+        format_peer_addr(self.real_ip, self.remote_addr)
+    }
+}
+
+fn log_early_response_body_drain(result: EarlyResponseBodyDrainResult, context: &EarlyResponseBodyDrainContext) {
+    match result {
+        EarlyResponseBodyDrainResult::Completed => {}
+        EarlyResponseBodyDrainResult::BodyError => {
+            let peer_addr = context.peer_addr();
+            let uri = redact_sensitive_uri_query(&context.uri);
+            debug!(
+                event = EVENT_HTTP_EARLY_RESPONSE_BODY_DRAIN,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                result = result.as_str(),
+                peer_addr = %peer_addr,
+                method = %context.method,
+                uri = %uri,
+                status_code = context.status_code,
+                "HTTP early response body drain closed before EOF"
+            );
+        }
+        EarlyResponseBodyDrainResult::IdleTimeout => {
+            let peer_addr = context.peer_addr();
+            let uri = redact_sensitive_uri_query(&context.uri);
+            warn!(
+                event = EVENT_HTTP_EARLY_RESPONSE_BODY_DRAIN,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                result = result.as_str(),
+                peer_addr = %peer_addr,
+                method = %context.method,
+                uri = %uri,
+                status_code = context.status_code,
+                timeout_secs = context.idle_timeout.as_secs(),
+                "HTTP early response body drain timed out"
+            );
+        }
+    }
+}
+
 async fn drain_early_response_body<B>(mut body: B, idle_timeout: Duration) -> EarlyResponseBodyDrainResult
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
@@ -699,7 +777,7 @@ where
     }
 }
 
-fn spawn_early_response_body_drain<B>(body: B, idle_timeout: Duration)
+fn spawn_early_response_body_drain<B>(body: B, context: EarlyResponseBodyDrainContext)
 where
     B: http_body::Body<Data = Bytes> + Send + Unpin + 'static,
     B::Error: Send + 'static,
@@ -710,12 +788,13 @@ where
     )
     .increment(1);
     tokio::spawn(async move {
-        let result = drain_early_response_body(body, idle_timeout).await;
+        let result = drain_early_response_body(body, context.idle_timeout).await;
         counter!(
             METRIC_HTTP_SERVER_EARLY_RESPONSE_BODY_DRAINS_TOTAL,
             LABEL_HTTP_BODY_DRAIN_RESULT => result.as_str()
         )
         .increment(1);
+        log_early_response_body_drain(result, &context);
     });
 }
 
@@ -752,12 +831,12 @@ where
             return Box::pin(async move { <S as Service<HttpRequest<B>>>::call(&mut inner, req).await });
         }
 
+        let mut drain_context = EarlyResponseBodyDrainContext::from_request(&req, self.idle_timeout);
         let state = Arc::new(EarlyResponseBodyState::default());
         let guarded_req = req.map({
             let state = Arc::clone(&state);
             move |body| EarlyResponseBody::new(body, state)
         });
-        let idle_timeout = self.idle_timeout;
 
         Box::pin(async move {
             let result = <S as Service<HttpRequest<EarlyResponseBody<B>>>>::call(&mut inner, guarded_req).await;
@@ -768,7 +847,8 @@ where
             match result {
                 Ok(mut response) => {
                     response.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
-                    spawn_early_response_body_drain(abandoned, idle_timeout);
+                    drain_context.status_code = response.status().as_u16();
+                    spawn_early_response_body_drain(abandoned, drain_context);
                     Ok(response)
                 }
                 Err(err) => Err(err),
@@ -819,11 +899,7 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
         trace!("No trace context found in request headers, will create root span");
     }
 
-    let client_info = request.extensions().get::<ClientInfo>();
-    let peer_addr = client_info
-        .map(|info| info.real_ip.to_string())
-        .or_else(|| request.extensions().get::<RemoteAddr>().map(|addr| addr.0.to_string()))
-        .unwrap_or_else(|| "unknown".to_string());
+    let peer_addr = request_peer_addr(request);
 
     let span = tracing::info_span!("http-request",
         request_id = %request_id,
@@ -2492,6 +2568,7 @@ mod tests {
 
         assert_eq!(LABEL_HTTP_METHOD, "method");
         assert_eq!(LABEL_HTTP_STATUS_CLASS, "status_class");
+        assert_eq!(LABEL_HTTP_BODY_DRAIN_RESULT, "result");
     }
 
     #[test]
@@ -2849,6 +2926,12 @@ mod tests {
         let response_text = String::from_utf8_lossy(&response_bytes).to_ascii_lowercase();
         assert!(response_text.contains("http/1.1 503"));
         assert!(response_text.contains("connection: close"));
+        if expect_continue {
+            assert!(
+                !response_text.contains("100 continue"),
+                "early rejection must not invite the client to keep uploading"
+            );
+        }
         writer_task
             .await
             .expect("writer task")
