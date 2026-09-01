@@ -48,10 +48,10 @@ on:
         description: 'Reset the nodes after the test (DESTROYS test data/config)'
         type: boolean
         default: true
-  workflow_run:
-    # Run after the nightly build completes; the nightly deb is what the test installs.
-    workflows: ["Nightly GNU Build"]
-    types: [completed]
+  repository_dispatch:
+    # Chain entry: dispatched by rustfs-functional-chain.yml (runs on its own
+    # pf-testing runner, in parallel with the shared-VM chain).
+    types: [rustfs-chain-performance]
 
 permissions:
   contents: read
@@ -84,19 +84,33 @@ env:
 jobs:
   performance-test:
     runs-on: pf-testing
+    # Requirement: a failing benchmark must not fail the workflow;
+    # failures are filed to rustfs/backlog.
+    continue-on-error: true
     timeout-minutes: 900
     # Run on manual dispatch, or when the nightly build completed successfully.
     # Skipped when nightly failed.
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
-      - name: Checkout auto-testing scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          repository: rustfs/auto-testing
-          ref: main
-          path: auto-testing
-          persist-credentials: false
-          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+      # auto-testing is private: clone it with the dedicated PF token (not
+      # GITHUB_TOKEN) and retry transient GitHub/network failures.
+      - name: Checkout auto-testing scripts (with retry)
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf auto-testing
+          for attempt in 1 2 3 4 5; do
+            if gh repo clone rustfs/auto-testing auto-testing -- --depth 1 --quiet; then
+              echo "auto-testing cloned (attempt ${attempt})"
+              exit 0
+            fi
+            rm -rf auto-testing
+            echo "clone attempt ${attempt} failed; retrying in $((attempt * 15))s" >&2
+            sleep $((attempt * 15))
+          done
+          echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
+          exit 1
 
       - name: Show environment
         run: |
@@ -211,6 +225,65 @@ jobs:
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
             echo "created ${REPORT_PATH} in rustfs/dashboard"
           fi
+
+      - name: File failure issue in rustfs/backlog
+        if: ${{ always() && (failure() || steps.benchmark.outcome == 'failure' || steps.benchmark.outcome == 'cancelled') }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          SUITE: 'performance'
+          SUITE_LABEL: 'Performance'
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPORT_FILE: '/tmp/rustfs-perf-report.md'
+          LOG_FILE: '/tmp/rustfs-perf-test.log'
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping backlog issue"
+            exit 0
+          fi
+          TITLE="[functional][${SUITE}] ${SUITE_LABEL} suite failed (run ${GITHUB_RUN_ID})"
+          EXISTING="$(gh issue list -R rustfs/backlog --state all \
+            --search "in:title \"run ${GITHUB_RUN_ID}\"" \
+            --json number --jq '.[].number' || true)"
+          if [ -n "${EXISTING}" ]; then
+            echo "backlog issue already exists for run ${GITHUB_RUN_ID}; skipping"
+            exit 0
+          fi
+          redact() {
+            sed -E \
+              -e 's/(RUSTFS_(ACCESS_KEY|SECRET_KEY)[=: ]+)[^[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/(Authorization:).*/\1 [REDACTED]/Ig' \
+              -e 's/(X-Amz-Signature=)[^&[:space:]]+/\1[REDACTED]/Ig' \
+              -e 's/^.*(password|secret|token)[=: ].*/[REDACTED SENSITIVE LINE]/Ig'
+          }
+          BODY_FILE="$(mktemp)"
+          {
+            echo "The **${SUITE_LABEL}** functional suite failed."
+            echo ""
+            echo "- Suite: \`${SUITE}\`"
+            echo "- Run: ${RUN_URL}"
+            echo "- Trigger: ${GITHUB_EVENT_NAME}"
+            echo "- Date: $(date -u +%Y-%m-%d)"
+            echo ""
+            echo "## Report (errors and symptoms)"
+            echo ""
+            if [ -s "${REPORT_FILE}" ]; then
+              redact < "${REPORT_FILE}"
+            elif [ -s "${LOG_FILE:-}" ]; then
+              echo "(report file missing; log tail below)"
+              echo ""
+              tail -n 200 "${LOG_FILE}" | redact
+            else
+              echo "(no report or log file was produced)"
+            fi
+          } | head -c 55000 > "${BODY_FILE}"
+          gh label create functional-test -R rustfs/backlog --color d73a4a 2>/dev/null || true
+          if ! gh issue create -R rustfs/backlog --title "${TITLE}" \
+              --body-file "${BODY_FILE}" --label functional-test; then
+            gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}"
+          fi
+          echo "filed backlog issue for suite ${SUITE}"
 
       - name: Upload test logs & results
         if: always()

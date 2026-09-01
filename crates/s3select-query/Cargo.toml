@@ -51,6 +51,8 @@ derive_builder = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
 s3s = { workspace = true, features = ["minio"] }
+serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
 

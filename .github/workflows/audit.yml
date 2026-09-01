@@ -28,6 +28,7 @@ on:
       - 'scripts/test_package_versions.sh'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
+      - 'scripts/security/check_tier_artifact_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   pull_request:
     types: [ opened, synchronize, reopened, closed ]
@@ -43,6 +44,7 @@ on:
       - 'scripts/test_package_versions.sh'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
+      - 'scripts/security/check_tier_artifact_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
   schedule:
     # Daily, not weekly. This schedule exists to catch RustSec advisories
@@ -149,6 +151,9 @@ jobs:
 
       - name: Check performance A/B workflow trust boundary
         run: ./scripts/security/check_performance_ab_workflow.sh
+
+      - name: Check tier evidence workflow isolation
+        run: ./scripts/security/check_tier_artifact_workflow.sh
 
       - name: Check package version contract
         run: ./scripts/test_package_versions.sh

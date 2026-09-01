@@ -1,0 +1,74 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Functional chain driver: runs the nine functional suites in a fixed order
+# (upgrade -> s3 -> kms -> tier -> storage -> heal -> pool -> security, with
+# performance on its own runner in parallel) and guarantees the chain keeps
+# moving even when individual suites fail.
+#
+# Each suite workflow can still be dispatched standalone (workflow_dispatch);
+# only chain-triggered runs forward to the next suite via repository_dispatch,
+# so a standalone run never drags the rest of the chain behind it.
+#
+# Why not workflow_run chaining: GitHub does not guarantee delivery of
+# workflow_run events (they are fire-and-forget), and the head-SHA filter made
+# newly added suites (storage) unable to trigger at all. Explicit
+# repository_dispatch handoffs are verifiable and re-drivable.
+
+name: RustFS Functional Chain
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    # Entry point: start the chain after the nightly build completes. The
+    # build's own conclusion does not gate the chain; each suite reports its
+    # own result to rustfs/backlog and the dashboard.
+    workflows: ["Nightly GNU Build"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  start-chain:
+    name: Start functional chain (upgrade first)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'schedule') }}
+    steps:
+      - name: Dispatch first suite (upgrade)
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; cannot start the functional chain" >&2
+            exit 1
+          fi
+          gh api --method POST repos/rustfs/rustfs/dispatches \
+            -f event_type='rustfs-chain-upgrade' \
+            -F 'client_payload[from_suite]=nightly-build'
+
+      - name: Dispatch performance suite (parallel, own runner)
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch performance" >&2
+            exit 1
+          fi
+          gh api --method POST repos/rustfs/rustfs/dispatches \
+            -f event_type='rustfs-chain-performance' \
+            -F 'client_payload[from_suite]=nightly-build'

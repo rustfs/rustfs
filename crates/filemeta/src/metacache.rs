@@ -53,6 +53,12 @@ pub struct MetadataResolutionParams {
     pub requested_versions: usize,
     pub bucket: String,
     pub strict: bool,
+    /// Number of set drives that were unreachable when the listing snapshot was
+    /// taken. Write-quorum enforcement relaxes each version's required quorum by
+    /// this amount (never below `obj_quorum`): a version legally committed at
+    /// write quorum can have that many of its metadata copies on drives no
+    /// reader could consult, and must not be dropped for it.
+    pub write_quorum_slack: usize,
     pub candidates: Vec<Vec<FileMetaShallowVersion>>,
 }
 
@@ -416,6 +422,7 @@ impl MetaCacheEntries {
             requested_versions: 0,
             bucket: bucket.to_string(),
             strict: false,
+            write_quorum_slack: 0,
             candidates: Vec::new(),
         })
     }
@@ -693,7 +700,12 @@ impl MetaCacheEntries {
                     .cached
                     .as_ref()
                     .and_then(|cached| cached.versions.first())
-                    .map(|version| version.write_quorum(params.obj_quorum).max(params.obj_quorum))
+                    .map(|version| {
+                        version
+                            .write_quorum(params.obj_quorum)
+                            .saturating_sub(params.write_quorum_slack)
+                            .max(params.obj_quorum)
+                    })
                     .unwrap_or(params.obj_quorum)
             } else {
                 params.obj_quorum
@@ -720,6 +732,7 @@ impl MetaCacheEntries {
                 params.obj_quorum,
                 params.strict,
                 params.requested_versions,
+                params.write_quorum_slack,
                 &params.candidates,
             )
         } else {
@@ -2408,6 +2421,97 @@ mod tests {
         })
         .expect("previous committed metadata should resolve after rejecting legacy-header partial latest");
 
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(old_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+    }
+
+    #[test]
+    fn resolve_with_write_quorum_relaxes_requirement_by_unreachable_drives() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        // EC 2+2 version, write quorum 3 of 4: committed with one holder drive
+        // now offline, so only 2 of the 3 reachable drives carry the metadata.
+        let entry = metacache_entry_with_erasure(mod_time, "etag", 2, 2);
+        let entries = || MetaCacheEntries(vec![Some(entry.clone()), Some(entry.clone()), None]);
+
+        let resolved = entries()
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                obj_quorum: 2,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 1,
+                ..Default::default()
+            })
+            .expect("committed version should resolve when the missing copy sits on an unreachable drive");
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(mod_time));
+
+        // Without the slack the same sample is rejected outright.
+        let rejected = entries().resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 3,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        });
+        assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn resolve_with_write_quorum_slack_accepts_committed_latest_during_merge() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        // The newer EC 2+2 version committed at write quorum 3 of 4; one holder
+        // drive is offline, and a third reachable drive still carries only the
+        // previous version. The candidates disagree, so the merge path (not the
+        // all-agree branch) must honor the slack.
+        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 2, 2);
+        let new_and_old_entry =
+            metacache_entry_with_erasure_versions(&[(old_mod_time, "old-etag", 2, 2), (new_mod_time, "new-etag", 2, 2)]);
+
+        let resolved = MetaCacheEntries(vec![Some(new_and_old_entry.clone()), Some(new_and_old_entry), Some(old_entry)])
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                obj_quorum: 2,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 1,
+                ..Default::default()
+            })
+            .expect("committed latest should survive the merge when its missing copy is on an unreachable drive");
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(new_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("new-etag"));
+    }
+
+    #[test]
+    fn resolve_with_write_quorum_slack_keeps_partial_latest_hidden_during_merge() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        // The newer EC 2+2 version (write quorum 3) reached only ONE drive: even
+        // with one drive unreachable (slack 1) it cannot prove the relaxed
+        // quorum of 2, so the committed previous version must win the merge.
+        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 2, 2);
+        let new_and_old_entry =
+            metacache_entry_with_erasure_versions(&[(old_mod_time, "old-etag", 2, 2), (new_mod_time, "new-etag", 2, 2)]);
+
+        let resolved = MetaCacheEntries(vec![Some(new_and_old_entry), Some(old_entry.clone()), Some(old_entry)])
+            .resolve_with_write_quorum(MetadataResolutionParams {
+                obj_quorum: 2,
+                requested_versions: 1,
+                bucket: "bucket".to_string(),
+                strict: true,
+                write_quorum_slack: 1,
+                ..Default::default()
+            })
+            .expect("committed previous version should resolve after rejecting the partial latest");
         let info = resolved
             .to_fileinfo("bucket")
             .expect("resolved committed metadata should decode as file info");
