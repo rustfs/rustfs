@@ -94,7 +94,8 @@ pub(crate) const BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED: Duration = Duration::from
 
 #[derive(Debug)]
 pub(crate) struct BucketDeleteDiagnosticBudget {
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
+    max_elapsed: Duration,
     entries_remaining: usize,
 }
 
@@ -105,27 +106,38 @@ impl BucketDeleteDiagnosticBudget {
 
     fn with_limits(entries: usize, elapsed: Duration) -> Self {
         Self {
-            deadline: tokio::time::Instant::now() + elapsed,
+            deadline: None,
+            max_elapsed: elapsed,
             entries_remaining: entries,
         }
     }
 
+    fn deadline(&mut self) -> tokio::time::Instant {
+        let max_elapsed = self.max_elapsed;
+        *self.deadline.get_or_insert_with(|| tokio::time::Instant::now() + max_elapsed)
+    }
+
     fn claim_entry(&mut self) -> bool {
-        if self.entries_remaining == 0 || tokio::time::Instant::now() >= self.deadline {
+        if self.entries_remaining == 0 {
+            return false;
+        }
+        let deadline = self.deadline();
+        if tokio::time::Instant::now() >= deadline {
             return false;
         }
         self.entries_remaining -= 1;
         true
     }
 
-    async fn run_io<T, F>(&self, future: F) -> std::io::Result<Option<T>>
+    async fn run_io<T, F>(&mut self, future: F) -> std::io::Result<Option<T>>
     where
         F: std::future::Future<Output = std::io::Result<T>>,
     {
-        if tokio::time::Instant::now() >= self.deadline {
+        let deadline = self.deadline();
+        if tokio::time::Instant::now() >= deadline {
             return Ok(None);
         }
-        match tokio::time::timeout_at(self.deadline, future).await {
+        match tokio::time::timeout_at(deadline, future).await {
             Ok(result) => result.map(Some),
             Err(_) => Ok(None),
         }

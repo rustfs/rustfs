@@ -404,6 +404,8 @@ pub(crate) mod ecstore_admin {
 }
 
 pub(crate) mod ecstore_bucket {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::test_util::install_all_v6_fleet_capability_proof;
     pub(crate) use rustfs_ecstore::api::bucket::{
         bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, migration, object_lock, policy_sys,
         replication, tagging, target, utils,

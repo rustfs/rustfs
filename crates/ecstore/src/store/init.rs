@@ -380,6 +380,15 @@ impl ECStore {
         ctx: CancellationToken,
         instance_ctx: Arc<InstanceContext>,
     ) -> Result<Arc<Self>> {
+        Box::pin(Self::new_with_instance_ctx_inner(address, endpoint_pools, ctx, instance_ctx)).await
+    }
+
+    async fn new_with_instance_ctx_inner(
+        address: SocketAddr,
+        endpoint_pools: EndpointServerPools,
+        ctx: CancellationToken,
+        instance_ctx: Arc<InstanceContext>,
+    ) -> Result<Arc<Self>> {
         instance_ctx.bind_background_cancel_token(ctx.clone());
 
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
@@ -898,6 +907,22 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    #[test]
+    fn new_with_instance_ctx_future_remains_stack_bounded() {
+        let future = crate::store::ECStore::new_with_instance_ctx(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            EndpointServerPools(Vec::new()),
+            CancellationToken::new(),
+            Arc::new(crate::runtime::instance::InstanceContext::new()),
+        );
+        let future_size = std::mem::size_of_val(&future);
+
+        assert!(
+            future_size <= 4 * 1024,
+            "ECStore constructor future must remain stack-bounded; measured {future_size} bytes"
+        );
+    }
 
     fn startup_pool_meta_payload(meta: &PoolMeta) -> Vec<u8> {
         meta.encode_config_data_for_test().expect("pool metadata should encode")

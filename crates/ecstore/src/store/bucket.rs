@@ -935,6 +935,88 @@ mod tests {
     static BUCKET_DELETE_TEST_ENV: OnceCell<(Vec<PathBuf>, Arc<ECStore>)> = OnceCell::const_new();
 
     #[tokio::test(start_paused = true)]
+    async fn bucket_delete_diagnostic_budget_starts_with_first_scan_io_and_latches_once() {
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(8, Duration::from_millis(100));
+        tokio::time::advance(Duration::from_secs(10)).await;
+
+        let first_polled = Arc::new(AtomicBool::new(false));
+        let first_polled_for_io = first_polled.clone();
+        let first = budget
+            .run_io(async move {
+                first_polled_for_io.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(7_u8)
+            })
+            .await
+            .expect("the first diagnostic IO should succeed");
+        assert_eq!(first, Some(7));
+        assert!(first_polled.load(Ordering::SeqCst));
+
+        tokio::time::advance(Duration::from_millis(101)).await;
+        let expired_polled = Arc::new(AtomicBool::new(false));
+        let expired_polled_for_io = expired_polled.clone();
+        let expired = budget
+            .run_io(async move {
+                expired_polled_for_io.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(9_u8)
+            })
+            .await
+            .expect("an expired diagnostic budget should not become an IO error");
+        assert_eq!(expired, None);
+        assert!(
+            !expired_polled.load(Ordering::SeqCst),
+            "the deadline must remain latched after the first scan IO"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bucket_delete_diagnostic_budget_times_out_its_first_pending_io() {
+        let mut budget = BucketDeleteDiagnosticBudget::with_limits(8, Duration::from_millis(100));
+        let io_polled = Arc::new(AtomicBool::new(false));
+        let io_polled_for_future = io_polled.clone();
+
+        let result = budget
+            .run_io(std::future::poll_fn(move |_cx| {
+                io_polled_for_future.store(true, Ordering::SeqCst);
+                std::task::Poll::<std::io::Result<()>>::Pending
+            }))
+            .await
+            .expect("a diagnostic timeout should fail closed without an IO error");
+
+        assert_eq!(result, None);
+        assert!(
+            io_polled.load(Ordering::SeqCst),
+            "the first diagnostic IO must be polled before its timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_metadata_less_scans_still_detect_orphans_and_xlmeta() {
+        let root = tempfile::tempdir().expect("temporary delayed-scan roots should be created");
+        let orphan_root = root.path().join("orphan-root");
+        let xlmeta_root = root.path().join("xlmeta-root");
+        std::fs::create_dir_all(&orphan_root).expect("orphan root should be created");
+        std::fs::create_dir_all(&xlmeta_root).expect("xlmeta root should be created");
+        std::fs::write(orphan_root.join("orphan-part"), b"orphan").expect("orphan fixture should be written");
+        std::fs::write(xlmeta_root.join(STORAGE_FORMAT_FILE), b"invalid-xlmeta").expect("xl.meta fixture should be written");
+
+        let mut orphan_budget = BucketDeleteDiagnosticBudget::with_limits(16, Duration::from_secs(5));
+        let mut xlmeta_budget = BucketDeleteDiagnosticBudget::with_limits(16, Duration::from_secs(5));
+        tokio::time::advance(Duration::from_secs(60)).await;
+
+        let orphan = scan_metadata_less_residue_with_budget(&orphan_root, &mut orphan_budget)
+            .await
+            .expect("delayed orphan scan should complete");
+        assert!(orphan.has_residue_without_xlmeta());
+        assert!(!orphan.diagnostic_truncated);
+
+        let xlmeta = scan_metadata_less_residue_with_budget(&xlmeta_root, &mut xlmeta_budget)
+            .await
+            .expect("delayed xl.meta scan should complete");
+        assert!(xlmeta.xlmeta_found);
+        assert!(!xlmeta.diagnostic_truncated);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn bucket_namespace_operation_fails_closed_after_lease_expiry() {
         let ttl = Duration::from_millis(20);
         let lock = NamespaceLock::new("bucket-operation-test".to_string(), Arc::new(LocalClient::new()));

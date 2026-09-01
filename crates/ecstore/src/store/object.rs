@@ -116,6 +116,15 @@ async fn prepare_prefix_tier_delete_journal_entries(
     prefix: &str,
     opts: &ObjectOptions,
 ) -> Result<PreparedPrefixTierDelete> {
+    Box::pin(prepare_prefix_tier_delete_journal_entries_inner(api, bucket, prefix, opts)).await
+}
+
+async fn prepare_prefix_tier_delete_journal_entries_inner(
+    api: &Arc<ECStore>,
+    bucket: &str,
+    prefix: &str,
+    opts: &ObjectOptions,
+) -> Result<PreparedPrefixTierDelete> {
     let mut tier_references = std::collections::HashSet::<(String, Option<TierDestinationId>)>::new();
     let mut entries_by_name = std::collections::BTreeMap::new();
     let logical_prefix = decode_dir_object(prefix);
@@ -376,6 +385,64 @@ async fn delete_prefix_with_tier_delete_journal(
         // Recovery decides from physical proof; never abort the journals here.
         Err(err) => Err(err),
     }
+}
+
+async fn delete_recursive_prefix_with_tier_delete_journal(
+    store: &ECStore,
+    bucket: &str,
+    object: &str,
+    opts: &ObjectOptions,
+    tier_journal_api: Option<&Arc<ECStore>>,
+) -> Result<()> {
+    // Prefix deletes cover multiple object keys; an exact lock on the prefix
+    // string would not protect child objects.
+    if !is_meta_bucketname(bucket) {
+        let state = opts
+            .object_lock_config_snapshot
+            .as_deref()
+            .ok_or_else(|| Error::other("recursive delete is missing its Object Lock configuration snapshot"))?
+            .state();
+        ensure_recursive_force_delete_allowed_for_state(bucket, state)?;
+        let bypass_governance = opts
+            .object_lock_delete
+            .as_ref()
+            .is_some_and(|delete_opts| delete_opts.bypass_governance);
+        for pool in &store.pools {
+            for set in &pool.disk_set {
+                let mut marker = None;
+                let mut version_marker = None;
+                loop {
+                    let page = set
+                        .clone()
+                        .inner_list_object_versions_for_recursive_delete(
+                            bucket,
+                            object,
+                            marker.clone(),
+                            version_marker.clone(),
+                            RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE,
+                        )
+                        .await?;
+                    for object_info in &page.objects {
+                        if check_object_lock_for_deletion_with_state(state, object_info, bypass_governance)?.is_some() {
+                            return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object_info.name.clone()));
+                        }
+                    }
+                    if !page.is_truncated {
+                        break;
+                    }
+                    let next_marker = page
+                        .next_marker
+                        .ok_or_else(|| Error::other("recursive delete version scan did not return a continuation marker"))?;
+                    if marker.as_ref() == Some(&next_marker) && version_marker == page.next_version_idmarker {
+                        return Err(Error::other("recursive delete version scan did not advance"));
+                    }
+                    marker = Some(next_marker);
+                    version_marker = page.next_version_idmarker;
+                }
+            }
+        }
+    }
+    delete_prefix_with_tier_delete_journal(store, bucket, object, opts, tier_journal_api).await
 }
 
 /// A GET whose object identity has been resolved while its namespace read lock
@@ -3934,6 +4001,16 @@ impl ECStore {
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> Result<ObjectInfo> {
+        Box::pin(self.handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api)).await
+    }
+
+    async fn handle_delete_object_with_journal_inner(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+    ) -> Result<ObjectInfo> {
         check_del_obj_args(bucket, object)?;
 
         if opts.lifecycle_delete_all.is_some() && self.ctx.lock_manager().is_disabled() {
@@ -4002,55 +4079,7 @@ impl ECStore {
         pause_delete_after_object_lock_snapshot(bucket).await;
 
         if opts.delete_prefix && !opts.delete_prefix_object {
-            // Prefix deletes cover multiple object keys; an exact lock on the prefix string
-            // would not protect child objects.
-            if !is_meta_bucketname(bucket) {
-                let state = opts
-                    .object_lock_config_snapshot
-                    .as_deref()
-                    .ok_or_else(|| Error::other("recursive delete is missing its Object Lock configuration snapshot"))?
-                    .state();
-                ensure_recursive_force_delete_allowed_for_state(bucket, state)?;
-                let bypass_governance = opts
-                    .object_lock_delete
-                    .as_ref()
-                    .is_some_and(|delete_opts| delete_opts.bypass_governance);
-                for pool in &self.pools {
-                    for set in &pool.disk_set {
-                        let mut marker = None;
-                        let mut version_marker = None;
-                        loop {
-                            let page = set
-                                .clone()
-                                .inner_list_object_versions_for_recursive_delete(
-                                    bucket,
-                                    object,
-                                    marker.clone(),
-                                    version_marker.clone(),
-                                    RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE,
-                                )
-                                .await?;
-                            for object_info in &page.objects {
-                                if check_object_lock_for_deletion_with_state(state, object_info, bypass_governance)?.is_some() {
-                                    return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object_info.name.clone()));
-                                }
-                            }
-                            if !page.is_truncated {
-                                break;
-                            }
-                            let next_marker = page.next_marker.ok_or_else(|| {
-                                Error::other("recursive delete version scan did not return a continuation marker")
-                            })?;
-                            if marker.as_ref() == Some(&next_marker) && version_marker == page.next_version_idmarker {
-                                return Err(Error::other("recursive delete version scan did not advance"));
-                            }
-                            marker = Some(next_marker);
-                            version_marker = page.next_version_idmarker;
-                        }
-                    }
-                }
-            }
-            delete_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
+            delete_recursive_prefix_with_tier_delete_journal(self, bucket, object, &opts, tier_journal_api.as_ref()).await?;
             return Ok(ObjectInfo::default());
         }
 
@@ -7043,6 +7072,26 @@ mod tests {
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn delete_object_handler_futures_remain_stack_bounded() {
+        let store = new_read_lock_test_store().await;
+        let unified_future = store.handle_delete_object_with_journal("bucket", "object", ObjectOptions::default(), None);
+        let unified_future_size = std::mem::size_of_val(&unified_future);
+
+        assert!(
+            unified_future_size <= 4 * 1024,
+            "unified delete handler future must remain stack-bounded; measured {unified_future_size} bytes"
+        );
+        drop(unified_future);
+
+        let outer_future = store.handle_delete_object("bucket", "object", ObjectOptions::default());
+        let outer_future_size = std::mem::size_of_val(&outer_future);
+        assert!(
+            outer_future_size <= 16 * 1024,
+            "outer delete handler future must remain stack-bounded; measured {outer_future_size} bytes"
+        );
     }
 
     async fn new_prepared_reader_test_store(set_disks: &[Arc<SetDisks>]) -> ECStore {

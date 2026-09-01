@@ -99,6 +99,17 @@ pub mod bucket {
             pub use crate::bucket::lifecycle::tier_delete_journal::{
                 persist_tier_delete_journal_entry, record_tier_delete_journal_backend_identity,
             };
+
+            #[cfg(feature = "test-util")]
+            pub mod test_util {
+                /// Model a single-node, all-v6 fleet after its capability probe has completed.
+                ///
+                /// Call this only once while constructing an isolated test store, before any
+                /// tier-delete journal permit or background worker can be active.
+                pub fn install_all_v6_fleet_capability_proof() {
+                    crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
+                }
+            }
         }
 
         pub mod tier_last_day_stats {

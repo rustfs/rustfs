@@ -29,7 +29,7 @@ use super::storage_api::test::object_utils::to_s3s_etag;
 use super::storage_api::test::runtime::{MockWarmBackend, MockWarmOp, register_mock_tier as register_mock_tier_util};
 use super::storage_api::test::{
     ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
-    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
+    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, install_all_v6_fleet_capability_proof,
 };
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
@@ -78,6 +78,12 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     if let Some((paths, ecstore)) = GLOBAL_ENV.get() {
         return (paths.clone(), ecstore.clone());
     }
+
+    // Production startup installs this proof through the notification-system
+    // fleet probe. This isolated single-node harness constructs ECStore
+    // directly, so model that completed all-v6 probe before any journal permit
+    // or background expiry worker can exist.
+    install_all_v6_fleet_capability_proof();
 
     let test_base_dir = format!("/tmp/rustfs_app_lifecycle_test_{}", Uuid::new_v4());
     let temp_dir = PathBuf::from(&test_base_dir);

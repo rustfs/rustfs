@@ -2248,6 +2248,27 @@ pub(crate) async fn prepare_tier_delete_dispatch(
     fleet_proof: TierDeleteJournalFleetProofToken,
     bucket_fence: &crate::object_api::NamespaceLockFence,
 ) -> Result<PreparedTierDeleteDispatch> {
+    Box::pin(prepare_tier_delete_dispatch_inner(
+        api,
+        bucket,
+        bucket_incarnation,
+        prefix,
+        entries,
+        fleet_proof,
+        bucket_fence,
+    ))
+    .await
+}
+
+async fn prepare_tier_delete_dispatch_inner(
+    api: Arc<ECStore>,
+    bucket: &str,
+    bucket_incarnation: uuid::Uuid,
+    prefix: &str,
+    entries: Vec<Jentry>,
+    fleet_proof: TierDeleteJournalFleetProofToken,
+    bucket_fence: &crate::object_api::NamespaceLockFence,
+) -> Result<PreparedTierDeleteDispatch> {
     if bucket_incarnation.is_nil() || bucket_fence.is_lock_lost() || !tier_delete_journal_fleet_proof_matches(&fleet_proof) {
         return Err(Error::other("tier delete journal v6 fleet capability is unavailable"));
     }

@@ -401,7 +401,7 @@ fn stable_tier_delete_journal_topology_generation(topology_fingerprint: &str) ->
     rustfs_utils::crypto::hex(hasher.finalize().as_slice())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
     let topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY
         .get()
