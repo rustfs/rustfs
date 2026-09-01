@@ -186,6 +186,9 @@ preflight through journal prepare and physical deletion. Once physical deletion
 starts, any error is mutation-ambiguous: authorized/dispatched journals remain
 for recovery to commit owners only after all physical sets prove both the source
 and exact free-version identity absent; uncertain owners are retained.
+If a retry discovers a later transitioned source after the manifest reached
+`DispatchAuthorized`, it replays only the manifest's immutable predecessor set,
+completes that operation, and leaves the newcomer for a successor dispatch.
 Operators may retry after the legacy free-version worker has durably completed
 remote and local cleanup. Journal-less internal deletes and older nodes retain
 their established marker behavior.

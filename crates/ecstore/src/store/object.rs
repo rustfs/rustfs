@@ -17,11 +17,13 @@ use crate::bucket::lifecycle::{
     bucket_lifecycle_ops::eval_action_from_lifecycle,
     get_expiry_configs,
     tier_delete_journal::{
+        ActiveTierDeleteDispatch, EVENT_LIFECYCLE_TIER_DELETE_JOURNAL, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_LIFECYCLE,
         complete_tier_delete_dispatch, prepare_tier_delete_dispatch, record_tier_delete_journal_backend_identity,
-        tier_delete_journal_object_name,
+        tier_delete_journal_object_name, tier_delete_source_matches_dispatch_scope,
     },
     tier_sweeper::{
-        Jentry, attach_tier_delete_source, transitioned_delete_journal_entry_for_source, transitioned_force_delete_journal_entry,
+        Jentry, TierDeleteSourceIdentity, attach_tier_delete_source, transitioned_delete_journal_entry_for_source,
+        transitioned_force_delete_journal_entry,
     },
 };
 use crate::bucket::metadata_sys::{
@@ -35,7 +37,9 @@ use crate::bucket::replication::{DeleteReplicationConfigSnapshot, ReplicationObj
 use crate::bucket::versioning::VersioningApi;
 use crate::core::pools::{DecommissionCapacityOwner, ensure_decommission_capacity_mutation_id};
 use crate::disk::OldCurrentSize;
-use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot};
+use crate::object_api::{
+    NamespaceLockFence, ObjectLockConfigSnapshot, ScannerPublicationCommitScopeGuard, ScannerPublicationCommitState,
+};
 use crate::services::notification_sys::acquire_tier_delete_journal_fleet_proof;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
 use crate::set_disk::{
@@ -368,15 +372,23 @@ async fn delete_prefix_with_tier_delete_journal(
     // Keep every backend generation lease until the whole local operation has
     // either committed its journal set or returned an ambiguous mutation.
     let _tier_leases = _leases;
+    if active.predecessor_replay_required() {
+        replay_authorized_tier_delete_sources(store, bucket, object, &active, &operation_opts).await?;
+        complete_tier_delete_dispatch(Arc::clone(api), &active, bucket_fence).await?;
+        return Err(Error::other("authorized tier delete predecessor completed; retry the successor dispatch"));
+    }
     let result = store.delete_prefix(bucket, object, &operation_opts).await;
     match result {
         Ok(()) => {
             if let Err(err) = complete_tier_delete_dispatch(Arc::clone(api), &active, bucket_fence).await {
                 warn!(
+                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                     bucket,
                     prefix = object,
                     error = ?err,
-                    "prefix deletion committed locally; dispatched tier cleanup remains durable for recovery"
+                    "Prefix deletion committed with durable tier cleanup pending"
                 );
             }
             Ok(())
@@ -385,6 +397,104 @@ async fn delete_prefix_with_tier_delete_journal(
         // Recovery decides from physical proof; never abort the journals here.
         Err(err) => Err(err),
     }
+}
+
+async fn replay_authorized_tier_delete_sources(
+    store: &ECStore,
+    bucket: &str,
+    prefix: &str,
+    active: &ActiveTierDeleteDispatch,
+    opts: &ObjectOptions,
+) -> Result<()> {
+    let _publication_scope_guard = opts
+        .scanner_publication_commit_scope
+        .clone()
+        .map(ScannerPublicationCommitScopeGuard::new);
+    let publication_scope = opts.scanner_publication_commit_scope.as_ref();
+    let bucket_incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+    let bucket_fence = opts
+        .bucket_lifecycle_lock_fence
+        .as_ref()
+        .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
+    let authorization = active.authorization();
+    authorization.mark_mutation_started(bucket, bucket_incarnation, prefix)?;
+
+    let mut source_objects = std::collections::BTreeSet::new();
+    for entry in active.entries() {
+        let source = entry
+            .source
+            .as_ref()
+            .filter(|source| source.has_stable_identity())
+            .ok_or_else(|| Error::other("authorized tier delete predecessor has no stable source"))?;
+        if !tier_delete_source_matches_replay_scope(source, bucket, prefix, opts.delete_prefix_object) {
+            return Err(Error::other("authorized tier delete predecessor source escaped its prefix scope"));
+        }
+        source_objects.insert(source.object.clone());
+    }
+
+    let mut deleted = 0;
+    for object in source_objects {
+        if bucket_fence.is_lock_lost() {
+            return Err(Error::other("tier delete dispatch namespace fence was lost during predecessor replay"));
+        }
+        let encoded_object = encode_dir_object(&object);
+        let guards = if opts.delete_prefix_object {
+            store
+                .acquire_remaining_physical_object_write_locks("tier_delete_dispatch_predecessor_replay", bucket, &encoded_object)
+                .await?
+        } else {
+            store
+                .acquire_all_physical_object_write_locks("tier_delete_dispatch_predecessor_replay", bucket, &encoded_object)
+                .await?
+        };
+        authorization.ensure_current(bucket, bucket_incarnation, prefix)?;
+        if let Some(scope) = publication_scope {
+            if scope.state() == ScannerPublicationCommitState::Admitted {
+                scope
+                    .try_begin()
+                    .map_err(|_| Error::other("scanner publication predecessor replay scope cannot start"))?;
+            }
+            if !scope.can_commit() {
+                let _ = scope.mark_indeterminate();
+                return Err(StorageError::OperationCanceled);
+            }
+        }
+        let mut replay_opts = opts.clone();
+        replay_opts.no_lock = true;
+        replay_opts.delete_prefix = false;
+        replay_opts.delete_prefix_object = false;
+        for guard in &guards {
+            guard.add_namespace_lock_fence(&mut replay_opts);
+        }
+        for pool in &store.pools {
+            for set in &pool.disk_set {
+                authorization.ensure_current(bucket, bucket_incarnation, prefix)?;
+                deleted += set
+                    .replay_authorized_tier_delete_sources(bucket, &object, &authorization, &replay_opts)
+                    .await?;
+            }
+        }
+        if bucket_fence.is_lock_lost() || guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
+            return Err(Error::other("tier delete dispatch namespace fence was lost during predecessor replay"));
+        }
+    }
+    if let Some(scope) = publication_scope {
+        let _ = scope.mark_committed();
+    }
+    if deleted > 0 {
+        super::list_objects::observe_list_objects_mutation(store, bucket).await;
+    }
+    Ok(())
+}
+
+fn tier_delete_source_matches_replay_scope(
+    source: &TierDeleteSourceIdentity,
+    bucket: &str,
+    persisted_prefix: &str,
+    exact_object: bool,
+) -> bool {
+    tier_delete_source_matches_dispatch_scope(source, bucket, persisted_prefix)
+        && (!exact_object || source.object == decode_dir_object(persisted_prefix))
 }
 
 async fn delete_recursive_prefix_with_tier_delete_journal(
@@ -2978,12 +3088,39 @@ impl ECStore {
         bucket: &str,
         object: &str,
     ) -> Result<Vec<ObjectLockDiagGuard>> {
+        self.acquire_physical_object_write_locks(op, bucket, object, false).await
+    }
+
+    async fn acquire_remaining_physical_object_write_locks(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+    ) -> Result<Vec<ObjectLockDiagGuard>> {
+        self.acquire_physical_object_write_locks(op, bucket, object, true).await
+    }
+
+    async fn acquire_physical_object_write_locks(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        store_lock_already_held: bool,
+    ) -> Result<Vec<ObjectLockDiagGuard>> {
+        // Caller-held bucket lifecycle and tier-generation guards precede the
+        // fixed store domain, followed by every distinct physical set domain
+        // in stable `(pool_idx, set_idx)` order. Exact-object predecessor
+        // replay sets `store_lock_already_held` only while retaining that same
+        // fixed-domain write lock.
         if self.ctx.lock_manager().is_disabled() {
             return Err(Error::other("physical object mutation requires namespace locking"));
         }
         let diag_enabled = is_object_lock_diag_enabled();
         let distributed = self.ctx.is_dist_erasure().await;
-        let mut guards = vec![self.acquire_object_write_lock(op, bucket, object).await?];
+        let mut guards = Vec::new();
+        if !store_lock_already_held {
+            guards.push(self.acquire_object_write_lock(op, bucket, object).await?);
+        }
         let fixed_set = Arc::clone(&self.pools[0].disk_set[0]);
         let mut locked_sets = vec![fixed_set];
         for pool in &self.pools {
@@ -5055,6 +5192,27 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn predecessor_replay_scope_distinguishes_exact_object_from_recursive_prefix() {
+        let source = TierDeleteSourceIdentity {
+            bucket: "bucket".to_string(),
+            object: "directory/child".to_string(),
+            version_id: Some("version".to_string()),
+            versioned: true,
+            version_suspended: false,
+            data_dir: Some("data-dir".to_string()),
+            etag: Some("etag".to_string()),
+            mod_time: Some("mod-time".to_string()),
+        };
+        let persisted_prefix = encode_dir_object("directory/");
+
+        assert!(tier_delete_source_matches_replay_scope(&source, "bucket", &persisted_prefix, false,));
+        assert!(!tier_delete_source_matches_replay_scope(&source, "bucket", &persisted_prefix, true,));
+        let mut exact_source = source;
+        exact_source.object = "directory/".to_string();
+        assert!(tier_delete_source_matches_replay_scope(&exact_source, "bucket", &persisted_prefix, true,));
+    }
 
     struct WaitForLockLossReader {
         inner: Cursor<Vec<u8>>,

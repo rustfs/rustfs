@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{
         Arc, Mutex, OnceLock,
@@ -57,9 +57,9 @@ use crate::storage_api_contracts::{
 use crate::store::ECStore;
 use rustfs_filemeta::FileInfo;
 
-const LOG_COMPONENT_ECSTORE: &str = "ecstore";
-const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
-const EVENT_LIFECYCLE_TIER_DELETE_JOURNAL: &str = "lifecycle_tier_delete_journal";
+pub(crate) const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+pub(crate) const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+pub(crate) const EVENT_LIFECYCLE_TIER_DELETE_JOURNAL: &str = "lifecycle_tier_delete_journal";
 
 // Keep one background pass small enough that a slow remote tier cannot hold
 // the shared recovery worker for minutes. Subsequent passes resume from the
@@ -98,6 +98,15 @@ const MAX_TIER_DELETE_DISPATCH_JOURNALS: usize = 200_000;
 
 fn valid_tier_delete_topology_generation(generation: &str) -> bool {
     generation.len() == 64 && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn tier_delete_source_matches_dispatch_scope(
+    source: &TierDeleteSourceIdentity,
+    bucket: &str,
+    persisted_prefix: &str,
+) -> bool {
+    let logical_prefix = rustfs_utils::path::decode_dir_object(persisted_prefix);
+    source.bucket == bucket && !source.object.is_empty() && source.object.starts_with(&logical_prefix)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -306,7 +315,8 @@ struct TierDeleteDispatchAuthorizationInner {
     bucket_incarnation: uuid::Uuid,
     prefix: String,
     journal_set_sha256: String,
-    journal_names: BTreeSet<String>,
+    journal_entry_indexes: std::collections::BTreeMap<String, usize>,
+    entries: Arc<[Jentry]>,
     topology_generation: String,
     fleet_proof: TierDeleteJournalFleetProofToken,
     mutation_started: AtomicBool,
@@ -321,25 +331,29 @@ impl std::fmt::Debug for TierDeleteDispatchAuthorization {
         formatter
             .debug_struct("TierDeleteDispatchAuthorization")
             .field("operation_id", &self.0.operation_id)
-            .field("journal_count", &self.0.journal_names.len())
+            .field("journal_count", &self.0.journal_entry_indexes.len())
             .field("mutation_started", &self.mutation_started())
             .finish()
     }
 }
 
 impl TierDeleteDispatchAuthorization {
-    pub(crate) fn ensure_current(&self, bucket: &str, incarnation: uuid::Uuid, prefix: &str) -> Result<()> {
-        if self.0.bucket != bucket
-            || self.0.bucket_incarnation != incarnation
-            || self.0.prefix != prefix
-            || !tier_delete_journal_fleet_proof_matches(&self.0.fleet_proof)
+    fn ensure_fleet_proof_current(&self) -> Result<()> {
+        if !tier_delete_journal_fleet_proof_matches(&self.0.fleet_proof)
             || tier_delete_journal_topology_generation(&self.0.fleet_proof) != self.0.topology_generation
         {
+            return Err(Error::other("tier delete dispatch authorization fleet proof is stale"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_current(&self, bucket: &str, incarnation: uuid::Uuid, prefix: &str) -> Result<()> {
+        if self.0.bucket != bucket || self.0.bucket_incarnation != incarnation || self.0.prefix != prefix {
             return Err(Error::other(
                 "tier delete dispatch authorization is stale or belongs to another operation",
             ));
         }
-        Ok(())
+        self.ensure_fleet_proof_current()
     }
 
     pub(crate) fn mark_mutation_started(&self, bucket: &str, incarnation: uuid::Uuid, prefix: &str) -> Result<()> {
@@ -352,13 +366,18 @@ impl TierDeleteDispatchAuthorization {
         self.0.mutation_started.load(Ordering::Acquire)
     }
 
-    pub(crate) fn authorized_journal_name(&self, entry: &Jentry) -> Result<String> {
+    fn bound_journal_entry(&self, entry: &Jentry) -> Result<(String, Jentry)> {
+        // This method is called immediately before each authorized local
+        // source mutation. Re-check the fleet generation here because the
+        // caller may have waited for physical object locks after admission.
+        self.ensure_fleet_proof_current()?;
         let source = entry
             .source
             .as_ref()
             .filter(|source| source.has_stable_identity())
             .ok_or_else(|| Error::other("tier delete dispatch candidate has no stable source identity"))?;
-        if source.bucket != self.0.bucket || !source.object.starts_with(&self.0.prefix) || !entry.can_replace_tier_free_version()
+        if !tier_delete_source_matches_dispatch_scope(source, &self.0.bucket, &self.0.prefix)
+            || !entry.can_replace_tier_free_version()
         {
             return Err(Error::other("tier delete dispatch candidate is outside its authorized source scope"));
         }
@@ -371,8 +390,28 @@ impl TierDeleteDispatchAuthorization {
             journal_set_sha256: self.0.journal_set_sha256.clone(),
             topology_generation: self.0.topology_generation.clone(),
         });
-        let name = tier_delete_journal_object_name(&bound);
-        if !self.0.journal_names.contains(&name) {
+        Ok((tier_delete_journal_object_name(&bound), bound))
+    }
+
+    pub(crate) fn authorizes_journal_entry(&self, entry: &Jentry) -> Result<bool> {
+        let (name, bound) = self.bound_journal_entry(entry)?;
+        Ok(self
+            .0
+            .journal_entry_indexes
+            .get(&name)
+            .and_then(|index| self.0.entries.get(*index))
+            .is_some_and(|expected| same_tier_delete_authorization_identity(expected, &bound)))
+    }
+
+    pub(crate) fn authorized_journal_name(&self, entry: &Jentry) -> Result<String> {
+        let (name, bound) = self.bound_journal_entry(entry)?;
+        if !self
+            .0
+            .journal_entry_indexes
+            .get(&name)
+            .and_then(|index| self.0.entries.get(*index))
+            .is_some_and(|expected| same_tier_delete_authorization_identity(expected, &bound))
+        {
             return Err(Error::other("tier delete dispatch does not authorize this exact cleanup identity"));
         }
         Ok(name)
@@ -381,13 +420,15 @@ impl TierDeleteDispatchAuthorization {
 
 pub(crate) struct PreparedTierDeleteDispatch {
     permit: Option<DispatchedJournalPermit>,
+    predecessor_replay_required: bool,
 }
 
 pub(crate) struct ActiveTierDeleteDispatch {
     manifest: TierDeleteDispatchManifest,
     authorized_etag: String,
-    entries: Vec<Jentry>,
+    entries: Arc<[Jentry]>,
     authorization: TierDeleteDispatchAuthorization,
+    predecessor_replay_required: bool,
 }
 
 impl PreparedTierDeleteDispatch {
@@ -407,6 +448,15 @@ impl PreparedTierDeleteDispatch {
         {
             return Err(Error::other("tier delete dispatch permit validation failed"));
         }
+        let entries = Arc::<[Jentry]>::from(permit.entries);
+        let journal_entry_indexes = permit
+            .manifest
+            .journal_names
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, name)| (name, index))
+            .collect();
         let authorization = TierDeleteDispatchAuthorization(Arc::new(TierDeleteDispatchAuthorizationInner {
             manifest_object,
             operation_id: permit.manifest.operation_id,
@@ -414,7 +464,8 @@ impl PreparedTierDeleteDispatch {
             bucket_incarnation: permit.manifest.bucket_incarnation,
             prefix: permit.manifest.prefix.clone(),
             journal_set_sha256: permit.manifest.journal_set_sha256.clone(),
-            journal_names: permit.manifest.journal_names.iter().cloned().collect(),
+            journal_entry_indexes,
+            entries: Arc::clone(&entries),
             topology_generation: permit.manifest.topology_generation.clone(),
             fleet_proof: permit.fleet_proof,
             mutation_started: AtomicBool::new(false),
@@ -422,8 +473,9 @@ impl PreparedTierDeleteDispatch {
         Ok(ActiveTierDeleteDispatch {
             manifest: permit.manifest,
             authorized_etag: permit.authorized_etag,
-            entries: permit.entries,
+            entries,
             authorization,
+            predecessor_replay_required: self.predecessor_replay_required,
         })
     }
 }
@@ -431,6 +483,14 @@ impl PreparedTierDeleteDispatch {
 impl ActiveTierDeleteDispatch {
     pub(crate) fn authorization(&self) -> TierDeleteDispatchAuthorization {
         self.authorization.clone()
+    }
+
+    pub(crate) fn entries(&self) -> &[Jentry] {
+        &self.entries
+    }
+
+    pub(crate) fn predecessor_replay_required(&self) -> bool {
+        self.predecessor_replay_required
     }
 }
 
@@ -839,6 +899,7 @@ pub(crate) enum TierDeleteDispatchMemberReadTestStage {
     Validation,
     Authorized,
     Completed,
+    Completion,
 }
 
 #[cfg(all(test, feature = "test-util"))]
@@ -2236,6 +2297,7 @@ async fn authorized_dispatch_permit(
             entries,
             fleet_proof,
         }),
+        predecessor_replay_required: false,
     })
 }
 
@@ -2310,17 +2372,14 @@ async fn prepare_tier_delete_dispatch_inner(
                         break (existing, etag);
                     }
                     TierDeleteDispatchManifestState::DispatchAuthorized => {
-                        if desired_names
+                        let predecessor_replay_required = desired_names
                             .iter()
-                            .any(|name| !existing.journal_names.binary_search(name).is_ok())
-                        {
-                            return Err(Error::other(
-                                "authorized tier delete dispatch does not cover a newly discovered transitioned source",
-                            ));
-                        }
+                            .any(|name| existing.journal_names.binary_search(name).is_err());
                         ensure_dispatch_lock_current(bucket_fence, &operation_guard)?;
-                        return authorized_dispatch_permit(api, &manifest_name, fleet_proof, bucket_fence, &operation_guard)
-                            .await;
+                        let mut prepared =
+                            authorized_dispatch_permit(api, &manifest_name, fleet_proof, bucket_fence, &operation_guard).await?;
+                        prepared.predecessor_replay_required = predecessor_replay_required;
+                        return Ok(prepared);
                     }
                     TierDeleteDispatchManifestState::Completed => {
                         return Err(Error::other("a completed tier delete dispatch is still awaiting durable cleanup"));
@@ -2539,6 +2598,9 @@ async fn commit_dispatched_journal(
     fences_current: &impl Fn() -> bool,
 ) -> Result<Jentry> {
     let name = tier_delete_journal_object_name(expected);
+    #[cfg(all(test, feature = "test-util"))]
+    let _test_permit = tier_delete_dispatch_member_read_test_hook(TierDeleteDispatchMemberReadTestStage::Completion).await;
+    authorization.ensure_current(&manifest.bucket, manifest.bucket_incarnation, &manifest.prefix)?;
     for _ in 0..4 {
         authorization.ensure_current(&manifest.bucket, manifest.bucket_incarnation, &manifest.prefix)?;
         let (mut current, etag) = read_tier_delete_journal_with_etag(api.clone(), &name)
@@ -2604,16 +2666,50 @@ pub(crate) async fn complete_tier_delete_dispatch(
                 .is_ok()
     };
     ensure_durable_write_fence(&fences_current, "before tier delete dispatch completion")?;
-    let mut committed_entries = Vec::with_capacity(active.entries.len());
-    for entry in &active.entries {
-        active.authorization.ensure_current(
-            &active.manifest.bucket,
-            active.manifest.bucket_incarnation,
-            &active.manifest.prefix,
-        )?;
-        committed_entries
-            .push(commit_dispatched_journal(api.clone(), &active.manifest, entry, &active.authorization, &fences_current).await?);
+    let make_commit = |index: usize| {
+        let api = api.clone();
+        let active = active;
+        let fences_current = &fences_current;
+        async move {
+            active.authorization.ensure_current(
+                &active.manifest.bucket,
+                active.manifest.bucket_incarnation,
+                &active.manifest.prefix,
+            )?;
+            commit_dispatched_journal(api, &active.manifest, &active.entries[index], &active.authorization, fences_current)
+                .await
+                .map(|entry| (index, entry))
+        }
+    };
+    let mut next = 0;
+    let mut commits = futures::stream::FuturesUnordered::new();
+    while next < active.entries.len() && commits.len() < TIER_DELETE_DISPATCH_CAS_CONCURRENCY {
+        commits.push(make_commit(next));
+        next += 1;
     }
+    let mut committed_entries = vec![None; active.entries.len()];
+    let mut first_error = None;
+    while let Some(result) = commits.next().await {
+        match result {
+            Ok((index, entry)) => committed_entries[index] = Some(entry),
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+        // A failed member CAS leaves the Authorized manifest and every
+        // already-committed member recoverable. Stop admitting tail work, but
+        // drain the bounded in-flight set before releasing the operation lock.
+        if first_error.is_none() && next < active.entries.len() {
+            commits.push(make_commit(next));
+            next += 1;
+        }
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    let committed_entries = committed_entries
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| Error::other("tier delete dispatch completion omitted a journal"))?;
 
     active
         .authorization
@@ -2836,6 +2932,18 @@ fn same_tier_delete_journal_identity(left: &Jentry, right: &Jentry) -> bool {
         && left.version_state == right.version_state
         && left.source == right.source
         && left.dispatch == right.dispatch
+}
+
+fn same_tier_delete_authorization_identity(expected: &Jentry, candidate: &Jentry) -> bool {
+    let mut candidate = candidate.clone();
+    if let (Some(expected_source), Some(candidate_source)) = (expected.source.as_ref(), candidate.source.as_mut()) {
+        // Bucket versioning can change between the Authorized attempt and its
+        // replay. The persisted predecessor mode remains authoritative; every
+        // physical source, remote tuple, and dispatch field must still match.
+        candidate_source.versioned = expected_source.versioned;
+        candidate_source.version_suspended = expected_source.version_suspended;
+    }
+    same_tier_delete_journal_identity(expected, &candidate)
 }
 
 #[allow(
@@ -4482,7 +4590,8 @@ mod tests {
         TIER_DELETE_JOURNAL_EXACT_VERSION, TIER_DELETE_JOURNAL_LEGACY_PREFIX, TIER_DELETE_JOURNAL_SOLE_OWNER_VERSION,
         TIER_DELETE_JOURNAL_STATE_VERSION, TIER_DELETE_JOURNAL_TRANSACTION_VERSION, TIER_DELETE_JOURNAL_V6_PREFIX,
         await_tier_delete_journal_recovery, decode_tier_delete_journal_entry, encode_tier_delete_journal_entry,
-        object_info_references_tier_delete, record_tier_delete_journal_backend_identity, tier_delete_journal_object_name,
+        object_info_references_tier_delete, record_tier_delete_journal_backend_identity, same_tier_delete_authorization_identity,
+        same_tier_delete_journal_identity, tier_delete_journal_object_name, tier_delete_source_matches_dispatch_scope,
     };
     use crate::bucket::lifecycle::tier_sweeper::{
         Jentry, TierDeleteDispatchBinding, TierDeleteJournalState, TierDeleteSourceIdentity,
@@ -4560,6 +4669,41 @@ mod tests {
         replaced.obj_name = "remote/replaced".to_string();
 
         assert_ne!(tier_delete_journal_object_name(&replaced), original_name);
+    }
+
+    #[test]
+    fn dispatch_authorization_identity_normalizes_source_mode_name_collision() {
+        let original = bound_v6_journal_entry(TierDeleteJournalState::Dispatched);
+        let mut changed = original.clone();
+        let source = changed.source.as_mut().expect("bound journal should carry a source identity");
+        source.versioned = false;
+        source.version_suspended = true;
+
+        assert_eq!(tier_delete_journal_object_name(&original), tier_delete_journal_object_name(&changed));
+        assert!(!same_tier_delete_journal_identity(&original, &changed));
+        assert!(same_tier_delete_authorization_identity(&original, &changed));
+    }
+
+    #[test]
+    fn dispatch_scope_compares_persisted_directory_names_logically() {
+        let source = TierDeleteSourceIdentity {
+            bucket: "bucket".to_string(),
+            object: "directory/".to_string(),
+            version_id: Some("version".to_string()),
+            versioned: true,
+            version_suspended: false,
+            data_dir: Some("data-dir".to_string()),
+            etag: Some("etag".to_string()),
+            mod_time: Some("mod-time".to_string()),
+        };
+        let persisted_prefix = rustfs_utils::path::encode_dir_object("directory/");
+
+        assert!(tier_delete_source_matches_dispatch_scope(&source, "bucket", &persisted_prefix));
+        assert!(!tier_delete_source_matches_dispatch_scope(&source, "other-bucket", &persisted_prefix,));
+        assert!(!tier_delete_source_matches_dispatch_scope(&source, "bucket", "other/"));
+        let mut empty_source = source;
+        empty_source.object.clear();
+        assert!(!tier_delete_source_matches_dispatch_scope(&empty_source, "bucket", ""));
     }
 
     #[test]

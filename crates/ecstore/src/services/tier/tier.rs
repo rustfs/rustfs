@@ -3235,6 +3235,13 @@ impl TierConfigMgr {
             .any(|intent| intent.state != TierMutationIntentState::Prepared))
     }
 
+    fn terminal_mutation_cleanup_requires_retry(result: io::Result<bool>) -> bool {
+        // A failed durable-state read is Unknown, not proof that no terminal
+        // cleanup remains. Keep the bounded-backoff retry loop alive until a
+        // later authoritative read can classify the state.
+        result.unwrap_or(true)
+    }
+
     async fn acquire_tier_config_write_lock<S>(
         api: Arc<S>,
     ) -> std::result::Result<rustfs_lock::NamespaceLockGuard, TierConfigUpdateError>
@@ -5077,7 +5084,19 @@ impl TierConfigMgr {
         tier_name: &str,
         driver: WarmBackendImpl,
     ) -> std::result::Result<(), AdminError> {
-        self.replace_driver(tier_name, driver)
+        self.replace_driver(tier_name, driver)?;
+        if let Some(runtime) = registered_tier_driver_runtime(self)
+            && let Some(generation) = lock_unpoisoned(&runtime).generations.get(tier_name).cloned()
+        {
+            // Test drivers own their candidate inventory; do not reconstruct a
+            // real network reconciler from the placeholder test configuration.
+            generation.reconciler.set(None).map_err(|_| {
+                let mut err = ERR_TIER_INVALID_CONFIG.clone();
+                err.message = "Test tier candidate reconciler was already initialized".to_string();
+                err
+            })?;
+        }
+        Ok(())
     }
 
     fn revoke_driver(&mut self, tier_name: &str) -> Option<Arc<TierDriverGeneration>> {
@@ -5493,9 +5512,9 @@ impl TierConfigMgr {
                 Ok(()) => return,
                 Err(err) => {
                     let has_runtime_fence = Self::has_committed_mutation_block(handle).await;
-                    let has_cleanup = Self::has_retryable_terminal_mutation_cleanup(api.clone())
-                        .await
-                        .unwrap_or(false);
+                    let has_cleanup = Self::terminal_mutation_cleanup_requires_retry(
+                        Self::has_retryable_terminal_mutation_cleanup(api.clone()).await,
+                    );
                     if !has_runtime_fence && !has_cleanup {
                         warn!(
                             event = EVENT_TIER_CONFIG_REFRESH,
@@ -5538,9 +5557,9 @@ impl TierConfigMgr {
                     }
                     tokio::time::sleep(delay).await;
                     let has_runtime_fence = Self::has_committed_mutation_block(handle).await;
-                    let has_cleanup = Self::has_retryable_terminal_mutation_cleanup(api.clone())
-                        .await
-                        .unwrap_or(false);
+                    let has_cleanup = Self::terminal_mutation_cleanup_requires_retry(
+                        Self::has_retryable_terminal_mutation_cleanup(api.clone()).await,
+                    );
                     if !has_runtime_fence && !has_cleanup {
                         return;
                     }
@@ -14238,6 +14257,15 @@ mod tests {
         assert_eq!(tier_mutation_refresh_retry_delay(4), Duration::from_secs(16));
         assert_eq!(tier_mutation_refresh_retry_delay(5), TIER_MUTATION_REFRESH_RETRY_CAP);
         assert_eq!(tier_mutation_refresh_retry_delay(u32::MAX), TIER_MUTATION_REFRESH_RETRY_CAP);
+    }
+
+    #[test]
+    fn terminal_mutation_cleanup_read_failure_keeps_retry_armed() {
+        assert!(TierConfigMgr::terminal_mutation_cleanup_requires_retry(Ok(true)));
+        assert!(!TierConfigMgr::terminal_mutation_cleanup_requires_retry(Ok(false)));
+        assert!(TierConfigMgr::terminal_mutation_cleanup_requires_retry(Err(io::Error::other(
+            "injected durable cleanup read failure",
+        ))));
     }
 
     #[test]

@@ -94,6 +94,8 @@ const GET_MID_SIZE_STREAMING_MIN_SIZE: usize = 128 * 1024 + 1;
 // high-concurrency performance envelope; existing codec/legacy gates decide
 // which established reader handles the object.
 const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 512 * 1024;
+const EVENT_LIFECYCLE_TRANSITION_CLEANUP: &str = "lifecycle_transition_cleanup";
+const EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER: &str = "lifecycle_transitioned_delete_cleanup_owner";
 
 fn is_get_mid_size_streaming_enabled() -> bool {
     #[cfg(test)]
@@ -200,7 +202,7 @@ use super::super::capacity_scope_from_disks;
 #[cfg(all(test, feature = "test-util"))]
 use super::super::get_lock_acquire_timeout;
 use crate::bucket::lifecycle::{
-    tier_delete_journal::record_tier_delete_journal_backend_identity,
+    tier_delete_journal::{TierDeleteDispatchAuthorization, record_tier_delete_journal_backend_identity},
     tier_sweeper::{
         Jentry, RemoteTierDeleteOutcome, attach_tier_delete_source,
         delete_confirmed_transition_candidate_exact_with_lease_idempotent, delete_object_from_remote_tier_with_lease_idempotent,
@@ -270,7 +272,7 @@ use tokio_util::sync::CancellationToken;
 fn record_transitioned_delete_cleanup_owner(bucket: &str, object: &str, batch: bool) {
     metrics::counter!("rustfs_ilm_transitioned_delete_cleanup_owners_total", "owner" => "tier_free_version").increment(1);
     debug!(
-        event = "lifecycle_transitioned_delete_cleanup_owner",
+        event = EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER,
         component = LOG_COMPONENT_ECSTORE,
         subsystem = LOG_SUBSYSTEM_SET_DISK,
         bucket,
@@ -4944,12 +4946,15 @@ pub(crate) async fn cleanup_uncommitted_transition_upload(
 
 fn log_transition_upload_cleanup_failure(lease: &TierOperationLease, object: &str, cleanup_version: &str, err: &std::io::Error) {
     warn!(
+        event = EVENT_LIFECYCLE_TRANSITION_CLEANUP,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_SET_DISK,
         tier = lease.tier_name(),
         tier_generation = lease.generation(),
         object,
         remote_version = cleanup_version,
         error = ?err,
-        "failed to clean uncommitted transition upload"
+        "Transition upload cleanup failed"
     );
 }
 
@@ -5023,9 +5028,10 @@ impl TransitionUploadCleanup {
                 Ok(())
             }
             (None, Err(cleanup_error)) => Err(cleanup_error),
-            (Some(owner_error), Err(cleanup_error)) => Err(std::io::Error::other(format!(
-                "rejected transition upload cleanup failed after its transaction owner update failed: owner error: {owner_error}; cleanup error: {cleanup_error}"
-            ))),
+            (Some(owner_error), Err(cleanup_error)) => Err(crate::error::stable_io_error(
+                "rejected transition upload cleanup error followed a transaction owner update failure",
+                format!("owner error: {owner_error}; cleanup error: {cleanup_error}"),
+            )),
         }
     }
 
@@ -5046,11 +5052,14 @@ impl Drop for TransitionUploadCleanup {
             Ok(lease) => lease,
             Err(err) => {
                 warn!(
+                    event = EVENT_LIFECYCLE_TRANSITION_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
                     tier = self.lease.tier_name(),
                     tier_generation = self.lease.generation(),
                     object = self.object,
                     error = ?err,
-                    "unable to retain tier lease for cancelled transition cleanup"
+                    "Cancelled transition cleanup could not retain its tier lease"
                 );
                 return;
             }
@@ -5066,12 +5075,15 @@ impl Drop for TransitionUploadCleanup {
                         .await
                 {
                     warn!(
+                        event = EVENT_LIFECYCLE_TRANSITION_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
                         tier = lease.tier_name(),
                         tier_generation = lease.generation(),
                         object,
                         remote_version = cleanup_version,
                         error = ?err,
-                        "cancelled transition upload was neither deleted nor journaled"
+                        "Cancelled transition upload remains transaction-owned for recovery"
                     );
                 }
             });
@@ -5096,9 +5108,10 @@ async fn persist_rejected_transition_cleanup_owner(
         }
         TransitionTransactionState::Uploaded => {}
         state => {
-            return Err(Error::other(format!(
-                "transition transaction state {state:?} cannot own a rejected upload"
-            )));
+            return Err(Error::other_with_context(
+                "transition transaction state cannot own a rejected upload",
+                format!("state {state:?}"),
+            ));
         }
     }
     save_transition_transaction_if_available(api, transaction).await
@@ -6318,6 +6331,86 @@ mod transition_version_id_tests {
 }
 
 impl SetDisks {
+    pub(crate) async fn replay_authorized_tier_delete_sources(
+        &self,
+        bucket: &str,
+        object: &str,
+        authorization: &TierDeleteDispatchAuthorization,
+        opts: &ObjectOptions,
+    ) -> Result<usize> {
+        let versions = match self.load_file_info_versions_exact(bucket, object).await {
+            Ok(Some(versions)) => versions,
+            Ok(None) => return Ok(0),
+            Err(err) if crate::error::is_err_strict_volume_not_found(&err) => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let lock_state = opts
+            .object_lock_config_snapshot
+            .as_deref()
+            .ok_or_else(|| Error::other("authorized tier delete replay is missing its Object Lock snapshot"))?
+            .state();
+        let bypass_governance = opts
+            .object_lock_delete
+            .as_ref()
+            .is_some_and(|delete_opts| delete_opts.bypass_governance);
+        let encoded_object = rustfs_utils::path::encode_dir_object(object);
+        let mut deleted = 0;
+
+        for version in versions.versions {
+            let Some(candidate) = lifecycle_delete_all_tier_journal_entry(bucket, &encoded_object, &version, opts)? else {
+                continue;
+            };
+            if !authorization.authorizes_journal_entry(&candidate)? {
+                continue;
+            }
+            let object_info =
+                ObjectInfo::from_file_info(&version, bucket, &encoded_object, opts.versioned || opts.version_suspended);
+            if check_object_lock_for_deletion_with_state(lock_state, &object_info, bypass_governance)?.is_some() {
+                return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+            }
+            let replication_delete = if opts.lifecycle_delete_all.is_some() {
+                lifecycle_delete_all_replication_delete(bucket, &encoded_object, &version, opts)?
+            } else {
+                None
+            };
+            let mut delete_request = FileInfo {
+                name: encoded_object.clone(),
+                version_id: version.version_id,
+                replication_state_internal: replication_delete
+                    .as_ref()
+                    .map(|(state, _)| replication_state_to_filemeta(state)),
+                ..Default::default()
+            };
+            delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
+            delete_request.set_skip_tier_free_version();
+            ensure_delete_commit_locks_held(None, bucket, &encoded_object, opts)?;
+            authorization.authorized_journal_name(&candidate)?;
+            begin_scanner_publication_delete_mutation(opts.scanner_publication_commit_scope.as_ref())?;
+            self.delete_object_version(bucket, &encoded_object, &delete_request, false)
+                .await?;
+            if let Some((_, deleted_object)) = replication_delete {
+                ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
+            }
+            deleted += 1;
+        }
+
+        ensure_delete_commit_locks_held(None, bucket, &encoded_object, opts)?;
+        if let Some(remaining) = self.load_file_info_versions_exact(bucket, object).await? {
+            for version in remaining.versions {
+                let Some(candidate) = lifecycle_delete_all_tier_journal_entry(bucket, &encoded_object, &version, opts)? else {
+                    continue;
+                };
+                if authorization.authorizes_journal_entry(&candidate)? {
+                    return Err(Error::other("authorized tier delete source remained after exact replay"));
+                }
+            }
+        }
+        if deleted > 0 {
+            self.invalidate_get_object_metadata_cache(bucket, &encoded_object).await;
+        }
+        Ok(deleted)
+    }
+
     async fn update_object_tags_locked(
         &self,
         operation: &'static str,

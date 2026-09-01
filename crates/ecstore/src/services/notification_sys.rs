@@ -188,6 +188,10 @@ impl FleetCapabilityProofGeneration {
         self.accepting.store(false, Ordering::Release);
     }
 
+    fn is_accepting(&self) -> bool {
+        self.accepting.load(Ordering::Acquire)
+    }
+
     fn is_drained(&self) -> bool {
         self.active.load(Ordering::Acquire) == 0
     }
@@ -252,8 +256,7 @@ fn tier_delete_journal_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCap
     TIER_DELETE_JOURNAL_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
-fn revoke_fleet_capability_proof(slot: &std::sync::RwLock<FleetCapabilityProofState>) {
-    let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+fn revoke_fleet_capability_proof_state(state: &mut FleetCapabilityProofState) {
     if let Some(proof) = state.proof.take() {
         proof.generation.revoke();
         if !proof.generation.is_drained() {
@@ -267,6 +270,17 @@ fn revoke_fleet_capability_proof(slot: &std::sync::RwLock<FleetCapabilityProofSt
     {
         state.draining_generation = None;
     }
+}
+
+fn revoke_fleet_capability_proof(slot: &std::sync::RwLock<FleetCapabilityProofState>) {
+    let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    revoke_fleet_capability_proof_state(&mut state);
+}
+
+fn mark_fleet_capability_topology_conflict(slot: &std::sync::RwLock<FleetCapabilityProofState>) {
+    let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.topology_conflict = true;
+    revoke_fleet_capability_proof_state(&mut state);
 }
 
 fn publish_fleet_capability_probe_result(
@@ -373,9 +387,27 @@ fn acquire_tier_delete_journal_fleet_proof_from(
 }
 
 pub(crate) fn tier_delete_journal_fleet_proof_matches(proof: &TierDeleteJournalFleetProofToken) -> bool {
-    REMOTE_VERSION_STATE_PROBE_TOPOLOGY
-        .get()
-        .is_some_and(|topology| topology == &proof.token.topology_fingerprint)
+    let Some(expected_topology) = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get() else {
+        return false;
+    };
+    let state = tier_delete_journal_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    tier_delete_journal_fleet_proof_matches_at(&state, proof, expected_topology, Instant::now())
+}
+
+fn tier_delete_journal_fleet_proof_matches_at(
+    state: &FleetCapabilityProofState,
+    proof: &TierDeleteJournalFleetProofToken,
+    expected_topology: &str,
+    now: Instant,
+) -> bool {
+    proof._permit.generation.is_accepting()
+        && fleet_capability_proof_matches_at(state, &proof.token, expected_topology, now)
+        && state
+            .proof
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &proof._permit.generation))
 }
 
 pub(crate) fn tier_delete_journal_topology_generation(proof: &TierDeleteJournalFleetProofToken) -> String {
@@ -621,9 +653,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 cross_pool_fence_fleet_proof_slot(),
                 tier_delete_journal_fleet_proof_slot(),
             ] {
-                let mut state = slot.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.topology_conflict = true;
-                state.proof = None;
+                mark_fleet_capability_topology_conflict(slot);
             }
         }
         return;
@@ -2962,9 +2992,22 @@ mod tests {
         {
             let state = slot.read().expect("proof slot should not poison");
             assert!(
+                tier_delete_journal_fleet_proof_matches_at(&state, &admitted, "topology-a", now),
+                "a freshly admitted journal proof must remain current"
+            );
+            assert!(
                 acquire_tier_delete_journal_fleet_proof_from(&state, "topology-a", now + REMOTE_VERSION_STATE_PROOF_TTL,)
                     .is_none(),
                 "TTL expiry must stop new admission"
+            );
+            assert!(
+                !tier_delete_journal_fleet_proof_matches_at(
+                    &state,
+                    &admitted,
+                    "topology-a",
+                    now + REMOTE_VERSION_STATE_PROOF_TTL,
+                ),
+                "TTL expiry must also stop an admitted proof at its next durable fence"
             );
             assert!(!admitted._permit.generation.is_drained());
         }
@@ -2982,6 +3025,10 @@ mod tests {
             let state = slot.read().expect("proof slot should not poison");
             assert!(state.proof.is_none(), "new operations must remain closed while the predecessor drains");
             assert!(state.draining_generation.is_some());
+            assert!(
+                !tier_delete_journal_fleet_proof_matches_at(&state, &admitted, "topology-a", now + Duration::from_millis(1),),
+                "a restarted peer must revoke an admitted proof before its next durable fence"
+            );
         }
 
         drop(admitted);
@@ -2993,6 +3040,31 @@ mod tests {
         let state = slot.read().expect("proof slot should not poison");
         assert!(state.proof.is_some());
         assert!(state.draining_generation.is_none());
+    }
+
+    #[test]
+    fn tier_delete_journal_topology_conflict_revokes_admitted_generation() {
+        let slot = std::sync::RwLock::new(FleetCapabilityProofState::default());
+        let now = Instant::now();
+        let peers = BTreeMap::from([("peer-a".to_string(), Uuid::new_v4())]);
+        assert!(publish_fleet_capability_probe_result(&slot, "topology-a", Ok(peers), now).is_none());
+        let admitted = {
+            let state = slot.read().expect("proof slot should not poison");
+            acquire_tier_delete_journal_fleet_proof_from(&state, "topology-a", now)
+                .expect("a fresh proof should admit one journal operation")
+        };
+
+        mark_fleet_capability_topology_conflict(&slot);
+
+        let state = slot.read().expect("proof slot should not poison");
+        assert!(state.topology_conflict);
+        assert!(state.proof.is_none());
+        assert!(state.draining_generation.is_some());
+        assert!(!admitted._permit.generation.is_accepting());
+        assert!(
+            !tier_delete_journal_fleet_proof_matches_at(&state, &admitted, "topology-a", now),
+            "topology conflict must revoke an already admitted journal proof"
+        );
     }
 
     #[test]

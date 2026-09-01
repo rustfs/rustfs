@@ -75,6 +75,10 @@ pub mod bucket {
                 delete_transition_candidate_for_operator, finalize_missing_transition_transaction_for_operator,
                 inspect_transition_transaction_for_operator,
             };
+            #[cfg(feature = "test-util")]
+            pub use crate::bucket::lifecycle::transition_transaction::{
+                TransitionTransactionRecoveryStats, recover_transition_transaction_records,
+            };
         }
 
         pub mod evaluator {

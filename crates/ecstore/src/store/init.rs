@@ -808,11 +808,12 @@ mod tests {
             tier_delete_journal::{
                 DecommissionCheckpointTargetFailureHook, TIER_DELETE_DISPATCH_MANIFEST_PREFIX, TIER_DELETE_JOURNAL_PREFIX,
                 TierDeleteDispatchManifestState, TierDeleteDispatchMemberReadTestHook, TierDeleteDispatchMemberReadTestStage,
-                TierDeleteDispatchRollbackTestHook, encode_tier_delete_journal_entry, install_test_tier_delete_dispatch_fixture,
-                persist_tier_delete_journal_entry, recover_test_tier_delete_dispatch_manifest,
-                recover_test_tier_delete_dispatch_manifest_with_page_budget, recover_tier_delete_dispatch_manifests,
-                recover_tier_delete_journal_entries, test_tier_delete_dispatch_manifest_checkpoint,
-                test_tier_delete_dispatch_manifest_state, tier_delete_dispatch_manifest_operation_lock_held_for_test,
+                TierDeleteDispatchRollbackTestHook, complete_tier_delete_dispatch, encode_tier_delete_journal_entry,
+                install_test_tier_delete_dispatch_fixture, persist_tier_delete_journal_entry, prepare_tier_delete_dispatch,
+                recover_test_tier_delete_dispatch_manifest, recover_test_tier_delete_dispatch_manifest_with_page_budget,
+                recover_tier_delete_dispatch_manifests, recover_tier_delete_journal_entries,
+                test_tier_delete_dispatch_manifest_checkpoint, test_tier_delete_dispatch_manifest_state,
+                tier_delete_dispatch_manifest_operation_lock_held_for_test,
                 tier_delete_dispatch_manifest_recovery_count_for_test, tier_delete_dispatch_manifest_recovery_inflight_for_test,
                 tier_delete_journal_object_name,
             },
@@ -837,6 +838,7 @@ mod tests {
         data_movement::SourceCleanupDeleteBarrier,
         disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE},
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
+        services::notification_sys::acquire_tier_delete_journal_fleet_proof,
         services::tier::{
             test_util::{MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, register_mock_tier},
             tier::{
@@ -9119,6 +9121,115 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn dispatch_completion_cas_is_bounded_and_reaches_the_tail() {
+        const JOURNAL_COUNT: usize = 65;
+        const ADMITTED_COMMITS: usize = 32;
+
+        let temp_dir = tempfile::tempdir().expect("create dispatch completion concurrency store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-completion-concurrency", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-completion-concurrency-bucket";
+        let prefix = "archive/";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("dispatch completion concurrency bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("dispatch completion concurrency bucket incarnation should resolve");
+        let tier_name = "DISPATCH-COMPLETION-CONCURRENCY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        backend.set_remove_failure(true);
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("dispatch completion concurrency tier lease should resolve")
+            .backend_identity();
+        let entries = (0..JOURNAL_COUNT)
+            .map(|index| {
+                synthetic_v6_dispatch_entry(
+                    bucket,
+                    &format!("{prefix}{index:06}.bin"),
+                    tier_name,
+                    identity,
+                    &uuid::Uuid::new_v4().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            prefix,
+            entries
+                .iter()
+                .cloned()
+                .map(|entry| (entry, Some(TierDeleteJournalState::Dispatched)))
+                .collect(),
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("dispatch completion concurrency fixture should persist");
+
+        let lifecycle_guard = store
+            .acquire_bucket_lifecycle_write_lock(bucket)
+            .await
+            .expect("dispatch completion should acquire the bucket lifecycle fence");
+        let mut fence_opts = ObjectOptions::default();
+        fence_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let bucket_fence = fence_opts
+            .bucket_lifecycle_lock_fence
+            .clone()
+            .expect("dispatch completion should capture the bucket lifecycle fence");
+        let fleet_proof =
+            acquire_tier_delete_journal_fleet_proof().expect("dispatch completion concurrency fixture should have a fleet proof");
+        let prepared =
+            prepare_tier_delete_dispatch(store.clone(), bucket, incarnation, prefix, entries, fleet_proof, &bucket_fence)
+                .await
+                .expect("the existing Authorized dispatch should reload");
+        let active = prepared
+            .consume(bucket, incarnation, prefix)
+            .expect("the existing Authorized dispatch permit should be consumable");
+        active
+            .authorization()
+            .mark_mutation_started(bucket, incarnation, prefix)
+            .expect("the completion test should mark its synthetic local mutation");
+
+        let hook = TierDeleteDispatchMemberReadTestHook::install_pause(TierDeleteDispatchMemberReadTestStage::Completion);
+        let worker_store = store.clone();
+        let worker = tokio::spawn(async move { complete_tier_delete_dispatch(worker_store, &active, &bucket_fence).await });
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_read_pause_count(ADMITTED_COMMITS))
+            .await
+            .expect("the first completion CAS window should be admitted");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hook.entry_count(), ADMITTED_COMMITS, "completion must not admit an unbounded CAS tail");
+        assert_eq!(hook.in_flight(), ADMITTED_COMMITS);
+
+        hook.release_all_reads();
+        worker
+            .await
+            .expect("dispatch completion concurrency worker should join")
+            .expect("every bounded completion CAS should succeed");
+        assert_eq!(
+            hook.entry_count(),
+            JOURNAL_COUNT,
+            "completion must eventually admit the entire journal set"
+        );
+        assert_eq!(hook.in_flight(), 0);
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store.clone(), &manifest_name)
+                .await
+                .expect("completed concurrency manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::Completed)
+        );
+        drop(hook);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn dispatch_manifest_shutdown_stops_completed_missing_journal_tail_reads() {
         const JOURNAL_COUNT: usize = 65;
         const ADMITTED_READS: usize = 32;
@@ -10914,6 +11025,219 @@ mod tests {
         assert_eq!(tier_delete_journal_count(store).await, 0);
         assert_eq!(backend.object_count().await, 0);
         assert_eq!(backend.remove_versions().await.len(), objects.len());
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn authorized_prefix_retry_replays_predecessor_before_newcomer() {
+        let handle = std::thread::Builder::new()
+            .name("authorized-prefix-predecessor-replay-test".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("authorized predecessor replay test runtime should build");
+                runtime.block_on(authorized_prefix_retry_replays_predecessor_before_newcomer_case());
+            })
+            .expect("authorized predecessor replay test thread should spawn");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn authorized_prefix_retry_replays_predecessor_before_newcomer_case() {
+        let temp_dir = tempfile::tempdir().expect("create authorized predecessor replay store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "authorized-prefix-predecessor-replay", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "AUTHORIZED-PREFIX-REPLAY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("authorized replay tier lease should resolve");
+        let bucket = "authorized-prefix-predecessor-replay-bucket";
+        let prefix = "prefix/";
+        let predecessor = "prefix/predecessor.bin";
+        let newcomer = "prefix/newcomer.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("authorized replay bucket should be created");
+
+        let mut predecessor_reader = PutObjReader::from_vec(vec![b'p'; 1024 * 1024]);
+        let predecessor_source = store
+            .put_object(bucket, predecessor, &mut predecessor_reader, &ObjectOptions::default())
+            .await
+            .expect("predecessor source should be written");
+        store
+            .transition_object(
+                bucket,
+                predecessor,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: predecessor_source.etag.clone().expect("predecessor should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: predecessor_source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("predecessor should transition");
+        let predecessor_info = store
+            .get_object_info(bucket, predecessor, &ObjectOptions::default())
+            .await
+            .expect("transitioned predecessor should be readable");
+        let mut predecessor_entry =
+            transitioned_delete_journal_entry_for_source(None, false, false, bucket, predecessor, &predecessor_info)
+                .expect("transitioned predecessor should produce a dispatch journal");
+        predecessor_entry.backend_identity = Some(lease.backend_identity());
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("authorized replay bucket incarnation should resolve");
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            prefix,
+            vec![(predecessor_entry, Some(TierDeleteJournalState::Dispatched))],
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("authorized predecessor fixture should persist");
+
+        let mut newcomer_reader = PutObjReader::from_vec(vec![b'n'; 1024 * 1024]);
+        let newcomer_source = store
+            .put_object(bucket, newcomer, &mut newcomer_reader, &ObjectOptions::default())
+            .await
+            .expect("newcomer source should be written after authorization");
+        store
+            .transition_object(
+                bucket,
+                newcomer,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: newcomer_source.etag.clone().expect("newcomer should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: newcomer_source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("newcomer should transition");
+        backend.set_remove_failure(true);
+
+        let publication_epoch = store
+            .scanner_data_usage_publication_epoch()
+            .await
+            .expect("authorized replay should observe the current scanner publication epoch");
+        let publication_scope = store
+            .scanner_data_usage_publication_commit_scope(
+                publication_epoch,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                Vec::new(),
+            )
+            .await
+            .expect("authorized replay should acquire a scanner publication scope");
+
+        let retry = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                prefix,
+                ObjectOptions {
+                    delete_prefix: true,
+                    scanner_publication_commit_scope: Some(publication_scope.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the predecessor-only replay must request a successor retry");
+        assert!(
+            retry.to_string().contains("retry the successor dispatch"),
+            "unexpected predecessor replay result: {retry}"
+        );
+        assert_eq!(
+            publication_scope.state(),
+            crate::object_api::ScannerPublicationCommitState::Committed,
+            "an exact predecessor replay must report its local mutation as committed"
+        );
+        assert!(publication_scope.release_movement_permit().await);
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(predecessor)
+                .load_file_info_versions_exact(bucket, predecessor)
+                .await
+                .expect("predecessor metadata should remain readable")
+                .is_none(),
+            "the authorized predecessor must be removed exactly"
+        );
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(newcomer)
+                .load_file_info_versions_exact(bucket, newcomer)
+                .await
+                .expect("newcomer metadata should remain readable")
+                .is_some(),
+            "the predecessor authorization must not delete the newcomer"
+        );
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store.clone(), &manifest_name)
+                .await
+                .expect("completed predecessor manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::Completed)
+        );
+
+        backend.set_remove_failure(false);
+        let predecessor_journals = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("completed predecessor journal should recover");
+        assert_eq!(predecessor_journals.failed, 0);
+        assert!(predecessor_journals.scanned <= 1 && predecessor_journals.deleted <= 1);
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 1, "only the newcomer remote object should remain");
+        assert_eq!(backend.remove_versions().await.len(), 1);
+        let predecessor_manifest = recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+            .await
+            .expect("completed predecessor manifest should be collected");
+        assert_eq!(predecessor_manifest.failed, 0);
+        assert!(predecessor_manifest.deleted <= 1);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                prefix,
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a successor dispatch should delete the remaining newcomer");
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(newcomer)
+                .load_file_info_versions_exact(bucket, newcomer)
+                .await
+                .expect("newcomer metadata lookup should succeed after successor")
+                .is_none()
+        );
+        drive_tier_delete_dispatch_restart_to_convergence(store.clone()).await;
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.remove_versions().await.len(), 2);
     }
 
     #[cfg(feature = "test-util")]
