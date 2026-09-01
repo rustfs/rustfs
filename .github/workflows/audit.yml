@@ -24,6 +24,8 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/release/package_versions.sh'
+      - 'scripts/test_package_versions.sh'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
@@ -37,6 +39,8 @@ on:
       - '.github/actions/**'
       - '.github/workflows/**'
       - 'scripts/release/create_or_update_release.sh'
+      - 'scripts/release/package_versions.sh'
+      - 'scripts/test_package_versions.sh'
       - 'scripts/security/check_performance_ab_workflow.sh'
       - 'scripts/security/check_preview_release_workflow.sh'
       - 'scripts/security/check_workflow_pins.sh'
@@ -145,6 +149,9 @@ jobs:
 
       - name: Check performance A/B workflow trust boundary
         run: ./scripts/security/check_performance_ab_workflow.sh
+
+      - name: Check package version contract
+        run: ./scripts/test_package_versions.sh
 
   dependency-review:
     name: Dependency Review
