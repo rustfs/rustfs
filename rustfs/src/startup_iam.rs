@@ -321,6 +321,7 @@ fn initial_retry_interval() -> Duration {
 }
 
 // Sentinel marks "not yet initialized"; env var is read on first call.
+#[cfg(debug_assertions)]
 static TEST_REMAINING_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 fn should_fail_test_init_attempt() -> bool {

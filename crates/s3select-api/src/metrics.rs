@@ -87,7 +87,7 @@ impl SelectInputMetricsRecorder {
 
 fn saturating_add(counter: &AtomicU64, bytes: usize) {
     let increment = u64::try_from(bytes).unwrap_or(u64::MAX);
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(increment)));
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| Some(current.saturating_add(increment)));
 }
 
 #[cfg(test)]

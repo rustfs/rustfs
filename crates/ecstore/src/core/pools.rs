@@ -7411,50 +7411,14 @@ impl DecommissionPoolCapacityInfo {
             physical_used,
         }
     }
-
-    #[cfg(test)]
-    fn from_logical(pool_index: usize, space: PoolSpaceInfo) -> Self {
-        Self {
-            pool_index,
-            space,
-            layout: DecommissionErasureLayout { data: 1, parity: 0 },
-            physical_free: space.free,
-            physical_total: space.total,
-            physical_used: space.used,
-        }
-    }
 }
-
-#[cfg(test)]
-type DecommissionSpaceInfoOverrides = std::sync::Mutex<HashMap<uuid::Uuid, Vec<(usize, PoolSpaceInfo)>>>;
 
 #[cfg(test)]
 type DecommissionCapacityInfoOverrides =
     std::sync::Mutex<HashMap<uuid::Uuid, std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>>;
 
 #[cfg(test)]
-static DECOMMISSION_SPACE_INFO_OVERRIDES: std::sync::OnceLock<DecommissionSpaceInfoOverrides> = std::sync::OnceLock::new();
-
-#[cfg(test)]
 static DECOMMISSION_CAPACITY_INFO_OVERRIDES: std::sync::OnceLock<DecommissionCapacityInfoOverrides> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-pub(crate) fn set_decommission_space_info_override_for_test(store_id: uuid::Uuid, space_infos: Vec<(usize, PoolSpaceInfo)>) {
-    DECOMMISSION_SPACE_INFO_OVERRIDES
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-        .lock()
-        .expect("decommission space info override should not be poisoned")
-        .insert(store_id, space_infos);
-}
-
-#[cfg(test)]
-fn take_decommission_space_info_override_for_test(store_id: uuid::Uuid) -> Option<Vec<(usize, PoolSpaceInfo)>> {
-    DECOMMISSION_SPACE_INFO_OVERRIDES
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-        .lock()
-        .expect("decommission space info override should not be poisoned")
-        .remove(&store_id)
-}
 
 #[cfg(test)]
 pub(crate) fn set_decommission_capacity_info_overrides_for_test(
@@ -9320,14 +9284,6 @@ impl ECStore {
         #[cfg(test)]
         if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
             return Ok(capacity_infos);
-        }
-
-        #[cfg(test)]
-        if let Some(space_infos) = take_decommission_space_info_override_for_test(self.id) {
-            return Ok(space_infos
-                .into_iter()
-                .map(|(pool_index, space)| DecommissionPoolCapacityInfo::from_logical(pool_index, space))
-                .collect());
         }
 
         let mut capacity_infos = Vec::with_capacity(self.pools.len());
