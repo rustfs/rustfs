@@ -1699,6 +1699,51 @@ impl RustFSTestClusterEnvironment {
         process.wait()?;
         Ok(())
     }
+
+    /// Gracefully stop one cluster node and wait for its process to exit.
+    ///
+    /// This is intentionally separate from [`Self::stop_node`]: the latter is
+    /// a hard kill used by crash-recovery tests, while this path lets RustFS
+    /// complete its normal shutdown hooks before a test restarts the node.
+    pub async fn stop_node_gracefully(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.ensure_node_index(node_idx)?;
+
+        #[cfg(unix)]
+        {
+            let Some(process) = self.nodes[node_idx].process.as_ref() else {
+                return Ok(());
+            };
+            let pid = process.id().to_string();
+            let signal_status = Command::new("kill").args(["-TERM", &pid]).status()?;
+            if !signal_status.success() {
+                return Err(format!("failed to send SIGTERM to cluster node {node_idx} (pid {pid})").into());
+            }
+
+            let mut process = self.nodes[node_idx]
+                .process
+                .take()
+                .ok_or_else(|| format!("cluster node {node_idx} process disappeared while stopping"))?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(45);
+            loop {
+                if let Some(status) = process.try_wait()? {
+                    info!("Cluster node {} stopped gracefully with {}", node_idx, status);
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = process.kill();
+                    let _ = process.wait();
+                    return Err(format!("cluster node {node_idx} did not stop gracefully within 45 seconds").into());
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = node_idx;
+            Err("graceful cluster-node stop is only supported on Unix E2E hosts".into())
+        }
+    }
 }
 
 impl Drop for RustFSTestClusterEnvironment {

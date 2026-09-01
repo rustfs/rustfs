@@ -22,7 +22,7 @@
 use super::super::{
     Arc, DiskError, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, Endpoint, Error, FormatV3, HealChannelPriority, LockResult,
     NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks, StorageError, debug, disk, info, load_format_erasure,
-    send_heal_disk, warn,
+    send_heal_replacement_disk, warn,
 };
 use crate::disk::DiskAPI;
 use crate::disk::health_state::DriveMembershipSnapshot;
@@ -359,7 +359,7 @@ impl SetDisks {
                 if ep.is_local && e == DiskError::UnformattedDisk {
                     info!("renew_disk unformatteddisk will trigger heal_disk, {:?}", ep);
                     let set_disk_id = format!("pool_{}_set_{}", ep.pool_idx, ep.set_idx);
-                    let _ = send_heal_disk(set_disk_id, Some(HealChannelPriority::Normal)).await;
+                    let _ = send_heal_replacement_disk(set_disk_id, ep.to_string(), Some(HealChannelPriority::Normal)).await;
                 }
                 return;
             }

@@ -88,6 +88,8 @@ impl From<Priority> for HealChannelPriority {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartCommand {
     disk: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    heal_endpoints: Vec<String>,
     bucket: String,
     object_prefix: Option<String>,
     object_version_id: Option<String>,
@@ -113,6 +115,7 @@ impl TryFrom<HealChannelRequest> for StartCommand {
     fn try_from(request: HealChannelRequest) -> Result<Self, Self::Error> {
         Ok(Self {
             disk: request.disk,
+            heal_endpoints: request.heal_endpoints,
             bucket: request.bucket,
             object_prefix: request.object_prefix,
             object_version_id: request.object_version_id,
@@ -146,6 +149,7 @@ impl StartCommand {
         Ok(HealChannelRequest {
             id: request_id,
             disk: self.disk,
+            heal_endpoints: self.heal_endpoints,
             bucket: self.bucket,
             object_prefix: self.object_prefix,
             object_version_id: self.object_version_id,
@@ -632,6 +636,12 @@ mod tests {
         }
     }
 
+    fn replacement_test_request(request_id: String) -> HealChannelRequest {
+        let mut request = test_request(request_id);
+        request.heal_endpoints = vec!["http://node1:9000/drive2".to_string()];
+        request
+    }
+
     fn metadata(byte: u8, epoch: u64) -> RequestMetadata {
         RequestMetadata::new([byte; 16], 1_000, 2_000, epoch)
     }
@@ -639,7 +649,7 @@ mod tests {
     #[test]
     fn round_trips_all_commands_and_results() {
         let request_id = uuid::Uuid::new_v4().to_string();
-        let start = Envelope::start(test_request(request_id), metadata(1, 7)).unwrap();
+        let start = Envelope::start(replacement_test_request(request_id), metadata(1, 7)).unwrap();
         let query = Envelope::query(
             uuid::Uuid::new_v4().to_string(),
             metadata(2, 7),

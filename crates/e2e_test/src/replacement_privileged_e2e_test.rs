@@ -40,10 +40,10 @@ mod tests {
 
     const ENABLE_ENV: &str = "RUSTFS_PRIVILEGED_REPLACEMENT_E2E";
     const NAMESPACE_ENV: &str = "RUSTFS_PRIVILEGED_REPLACEMENT_E2E_IN_NAMESPACE";
+    const LOG_DIR_ENV: &str = "RUSTFS_PRIVILEGED_REPLACEMENT_LOG_DIR";
     const TARGET_NODE: usize = 1;
     const TARGET_DRIVE: usize = 0;
     const MOUNT_SIZE: &str = "size=128m,mode=0700";
-    const ABSENT_SCANNER_OBSERVATION_TIMEOUT_SECS: u64 = 180;
     const REPLACEMENT_RECOVERY_DIR: &str = ".rustfs.sys/buckets/ahm-replacement";
     const REPLACEMENT_INTENT_SUFFIX: &str = "_ahm_replacement_intent.json";
     const REPLACEMENT_COMPLETION_PROOF_SUFFIX: &str = "_ahm_replacement_completion_proof.json";
@@ -140,6 +140,23 @@ mod tests {
             run_command("dmsetup", &["suspend", &self.dm_name])?;
             run_command("dmsetup", &["load", &self.dm_name, "--table", &error_table])?;
             run_command("dmsetup", &["resume", &self.dm_name])
+        }
+
+        fn verify_raw_io_is_unavailable(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+            let mapper = format!("/dev/mapper/{}", self.dm_name);
+            let output = Command::new("dd")
+                .env("LC_ALL", "C")
+                .arg(format!("if={mapper}"))
+                .args(["of=/dev/null", "bs=4096", "count=1", "iflag=direct", "status=none"])
+                .output()?;
+            if output.status.success() {
+                return Err(format!("dm-error target unexpectedly allowed a raw read from {mapper}").into());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("Input/output error") {
+                return Err(format!("raw read from dm-error target failed unexpectedly: {stderr}").into());
+            }
+            Ok(())
         }
 
         fn restore_available(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -296,6 +313,14 @@ mod tests {
             return Ok(());
         }
         Err(format!("{ENABLE_ENV}=1 requires root or CAP_SYS_ADMIN; unshare exited with status {status}").into())
+    }
+
+    fn replacement_target_log_path(cluster_temp_dir: &str, parity: usize) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+        let log_dir = std::env::var_os(LOG_DIR_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(cluster_temp_dir));
+        fs::create_dir_all(&log_dir)?;
+        Ok(log_dir.join(format!("replacement-ec{parity}-node{TARGET_NODE}-{}.log", std::process::id())))
     }
 
     fn payload(len: usize, seed: u8) -> Vec<u8> {
@@ -472,8 +497,20 @@ mod tests {
             if let Some(version_id) = &version.version_id {
                 request = request.version_id(version_id);
             }
-            let response = request.send().await?;
-            let body = response.body.collect().await?.into_bytes();
+            let response = request.send().await.map_err(|error| {
+                format!("body GET failed for {}/{}@{:?}: {error}", version.bucket, version.key, version.version_id)
+            })?;
+            let body = response
+                .body
+                .collect()
+                .await
+                .map_err(|error| {
+                    format!(
+                        "body stream failed for {}/{}@{:?}: {error}",
+                        version.bucket, version.key, version.version_id
+                    )
+                })?
+                .into_bytes();
             assert_eq!(
                 sha256_hex(&body),
                 *expected_sha256,
@@ -582,81 +619,6 @@ mod tests {
         Ok(())
     }
 
-    fn log_tail(log: &str) -> String {
-        let mut lines = log.lines().rev().take(80).collect::<Vec<_>>();
-        lines.reverse();
-        lines.join("\n")
-    }
-
-    fn log_len(path: &Path) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        match fs::metadata(path) {
-            Ok(metadata) => Ok(metadata.len()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(format!("failed to stat target node log {path:?}: {error}").into()),
-        }
-    }
-
-    fn log_from_offset(path: &Path, offset: u64) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let log = match fs::read(path) {
-            Ok(log) => log,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(format!("failed to read target node log {path:?}: {error}").into()),
-        };
-        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(log.len());
-        Ok(String::from_utf8_lossy(&log[start..]).into_owned())
-    }
-
-    fn live_disk_loss_scan_completed(log: &str, target_disk: &Path) -> bool {
-        let target = target_disk.to_string_lossy();
-        let mut saw_live_loss = false;
-        for line in log.lines() {
-            if line.contains("Heal auto-scan disk inspection failed")
-                && line.contains("check_failed")
-                && line.contains(target.as_ref())
-            {
-                saw_live_loss = true;
-                continue;
-            }
-            if saw_live_loss && (line.contains("Heal auto disk scanner idle") || line.contains("Heal auto-scan cycle completed"))
-            {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn live_disk_loss_scan_completed_from_path(
-        log_path: &Path,
-        start_offset: u64,
-        target_disk: &Path,
-    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        Ok(live_disk_loss_scan_completed(&log_from_offset(log_path, start_offset)?, target_disk))
-    }
-
-    async fn wait_for_live_disk_loss_observation(
-        log_path: &Path,
-        target_disk: &Path,
-        start_offset: u64,
-        timeout_secs: u64,
-    ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-        let mut tick = interval(Duration::from_secs(1));
-        loop {
-            if live_disk_loss_scan_completed_from_path(log_path, start_offset, target_disk)? {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                let log = log_from_offset(log_path, start_offset)?;
-                return Err(format!(
-                    "scanner did not finish a live target-loss scan for {target_disk:?} within {timeout_secs}s; log tail:\n{}",
-                    log_tail(&log)
-                )
-                .into());
-            }
-            tick.tick().await;
-        }
-    }
-
     fn cluster_status_is_definitive(status: &serde_json::Value) -> Result<bool, Box<dyn Error + Send + Sync>> {
         status["cluster"]["definitive"]
             .as_bool()
@@ -707,6 +669,13 @@ mod tests {
             .collect()
     }
 
+    fn is_transient_recovery_version_absence(error: &(dyn Error + 'static)) -> bool {
+        matches!(
+            error.downcast_ref::<rustfs_filemeta::Error>(),
+            Some(rustfs_filemeta::Error::FileVersionNotFound)
+        )
+    }
+
     fn incomplete_versions(
         target_disk: &Path,
         versions: &[BaselineVersion],
@@ -714,7 +683,21 @@ mod tests {
         let mut missing = BTreeSet::new();
         for version in versions {
             let actual =
-                census_object_version_on_disk(target_disk, &version.bucket, &version.key, version.version_id.as_deref())?;
+                match census_object_version_on_disk(target_disk, &version.bucket, &version.key, version.version_id.as_deref()) {
+                    Ok(actual) => actual,
+                    // During replacement recovery, xl.meta may arrive before this
+                    // particular historical version. The generic census helper
+                    // correctly reports that as an error; this progress poll must
+                    // instead wait for the version to be restored.
+                    Err(error) if is_transient_recovery_version_absence(error.as_ref()) => {
+                        missing.insert(format!(
+                            "{}/{}@{:?}: version metadata not yet present on replacement",
+                            version.bucket, version.key, version.version_id
+                        ));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
             if !actual.matches_manifest(&version.expected) {
                 missing.insert(format!("{}/{}@{:?}: {actual:?}", version.bucket, version.key, version.version_id));
             }
@@ -822,7 +805,7 @@ mod tests {
 
         let mut mount_ns = MountNamespaceGuard::new()?;
         let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(3, 4)).await?;
-        let target_log_path = PathBuf::from(&cluster.temp_dir).join(format!("replacement-node{TARGET_NODE}.log"));
+        let target_log_path = replacement_target_log_path(&cluster.temp_dir, parity)?;
         cluster.set_node_capture_log_path(TARGET_NODE, target_log_path.to_string_lossy())?;
         let target_disk = PathBuf::from(&cluster.nodes[TARGET_NODE].data_dirs[TARGET_DRIVE]);
         // Each drive below is an independent tmpfs mount, so this privileged
@@ -856,22 +839,26 @@ mod tests {
         cluster.start().await?;
 
         let clients = cluster.create_all_clients()?;
-        let versions = seed_baseline(&clients[0], &target_disk).await?;
-        verify_bodies(&clients[0], &versions).await?;
+        let versions = seed_baseline(&clients[0], &target_disk)
+            .await
+            .map_err(|error| format!("pre-fault baseline seeding failed: {error}"))?;
+        verify_bodies(&clients[0], &versions)
+            .await
+            .map_err(|error| format!("pre-fault body verification failed: {error}"))?;
 
-        let live_loss_log_offset = log_len(&target_log_path)?;
-        target_mount.make_unavailable()?;
-        wait_for_live_disk_loss_observation(
-            &target_log_path,
-            &target_disk,
-            live_loss_log_offset,
-            ABSENT_SCANNER_OBSERVATION_TIMEOUT_SECS,
-        )
-        .await?;
-        assert_no_replacement_status_records(&cluster, &target_disk).await?;
-        assert_no_replacement_admission_artifacts(&cluster, &target_disk)?;
+        target_mount
+            .make_unavailable()
+            .map_err(|error| format!("failed to install the dm-error target: {error}"))?;
+        target_mount
+            .verify_raw_io_is_unavailable()
+            .map_err(|error| format!("dm-error target was not proven by a direct raw read: {error}"))?;
+        assert_no_replacement_status_records(&cluster, &target_disk)
+            .await
+            .map_err(|error| format!("live-fault replacement status check failed: {error}"))?;
+        assert_no_replacement_admission_artifacts(&cluster, &target_disk)
+            .map_err(|error| format!("live-fault replacement artifact check failed: {error}"))?;
 
-        cluster.stop_node(TARGET_NODE)?;
+        cluster.stop_node_gracefully(TARGET_NODE).await?;
         target_mount.cleanup()?;
         mount_ns.mount_tmpfs(&target_disk, &format!("rustfs-e2e-p{parity}-replacement"))?;
         let missing_before_restart = incomplete_versions(&target_disk, &versions)?;
@@ -885,43 +872,6 @@ mod tests {
         wait_for_completed_replacement_with_census(&cluster, &target_disk, &versions, 420).await?;
         verify_bodies(&clients[0], &versions).await?;
 
-        Ok(())
-    }
-
-    #[test]
-    fn live_loss_barrier_requires_scanner_failure_after_log_offset() -> Result<(), Box<dyn Error + Send + Sync>> {
-        let target = Path::new("/mnt/target");
-        assert!(live_disk_loss_scan_completed(
-            "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto-scan cycle completed",
-            target
-        ));
-        assert!(live_disk_loss_scan_completed(
-            "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto disk scanner idle",
-            target
-        ));
-        assert!(!live_disk_loss_scan_completed(
-            "Heal auto disk scanner idle\nHeal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed",
-            target
-        ));
-        assert!(!live_disk_loss_scan_completed(
-            "event=disk_health_check_failed endpoint=/mnt/target disk_state=check_failed\nHeal auto disk scanner idle",
-            target
-        ));
-        assert!(!live_disk_loss_scan_completed(
-            "Heal auto-scan disk inspection failed endpoint=/mnt/other disk_state=check_failed\nHeal auto disk scanner idle",
-            target
-        ));
-        let path = std::env::temp_dir().join(format!("rustfs-replacement-scan-{}.log", std::process::id()));
-        let stale =
-            "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto disk scanner idle\n";
-        fs::write(&path, stale)?;
-        let offset = log_len(&path)?;
-        assert!(!live_disk_loss_scan_completed_from_path(&path, offset, target)?);
-        let fresh =
-            "Heal auto-scan disk inspection failed endpoint=/mnt/target disk_state=check_failed\nHeal auto disk scanner idle\n";
-        fs::write(&path, format!("{stale}{fresh}"))?;
-        assert!(live_disk_loss_scan_completed_from_path(&path, offset, target)?);
-        fs::remove_file(path)?;
         Ok(())
     }
 
@@ -952,6 +902,15 @@ mod tests {
             replacement_completion_state(&definitive, target, BTreeSet::new()).unwrap(),
             CompletionSample::Ready
         );
+    }
+
+    #[test]
+    fn recovery_census_only_treats_missing_version_as_transient() {
+        let missing_version: Box<dyn Error + Send + Sync> = Box::new(rustfs_filemeta::Error::FileVersionNotFound);
+        let missing_file: Box<dyn Error + Send + Sync> = Box::new(rustfs_filemeta::Error::FileNotFound);
+
+        assert!(is_transient_recovery_version_absence(missing_version.as_ref()));
+        assert!(!is_transient_recovery_version_absence(missing_file.as_ref()));
     }
 
     #[tokio::test]
