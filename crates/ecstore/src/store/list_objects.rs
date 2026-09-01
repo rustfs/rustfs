@@ -2836,8 +2836,15 @@ fn listing_entries_supplement_target(
         return None;
     }
 
-    for entry in entries.0.iter().flatten() {
-        if entry.is_dir() {
+    for (idx, entry) in entries.0.iter().enumerate() {
+        let Some(entry) = entry.as_ref().filter(|entry| entry.is_object()) else {
+            continue;
+        };
+        if entries.0[..idx]
+            .iter()
+            .flatten()
+            .any(|previous| previous.name == entry.name && previous.is_object())
+        {
             continue;
         }
 
@@ -2850,6 +2857,15 @@ fn listing_entries_supplement_target(
                     .is_some_and(|candidate| candidate.name == entry.name && candidate.is_object())
             })
             .count();
+        let entries_disagree = entries.0.iter().flatten().any(|candidate| {
+            candidate.name == entry.name && candidate.is_object() && !entry.matches(Some(candidate), resolver.strict).1
+        });
+        // A split primary sample can fall back to an older version even when a
+        // newer version reaches write quorum only after the fallback disks join.
+        if entries_disagree {
+            return Some(entry.name.clone());
+        }
+
         let mut entry = entry.clone();
         if let Ok(cached) = entry.xl_meta()
             && cached_entry_needs_supplement(&cached, reader_disks, resolver, enforce_write_quorum)
@@ -6832,20 +6848,21 @@ mod test {
         list_objects_from_verified_index_candidates_with_stats, list_objects_index_mode_from_env,
         list_objects_index_provider_from_env, list_objects_index_provider_state_from_env,
         list_objects_metadata_fast_guardrails_from_env, list_objects_paginate, list_objects_quorum_from_env,
-        load_namespace_mutation_journal_state, load_persistent_key_only_index, max_keys_plus_one, merge_entry_channels,
-        namespace_mutation_journal_chaos_bucket_from_env, namespace_mutation_journal_chaos_config_from_env,
-        namespace_mutation_journal_chaos_enabled_from_env, namespace_mutation_journal_chaos_sequence_from_env,
-        namespace_mutation_journal_chaos_status_from_env, normalize_list_quorum, observe_list_objects_mutations_with_store,
-        parse_namespace_mutation_journal_state, parse_persistent_key_only_index, parse_persistent_list_metadata_object,
-        parse_version_marker, persist_observed_list_objects_mutation, persistent_key_only_index_has_complete_metadata_snapshot,
+        listing_entries_supplement_target, load_namespace_mutation_journal_state, load_persistent_key_only_index,
+        max_keys_plus_one, merge_entry_channels, namespace_mutation_journal_chaos_bucket_from_env,
+        namespace_mutation_journal_chaos_config_from_env, namespace_mutation_journal_chaos_enabled_from_env,
+        namespace_mutation_journal_chaos_sequence_from_env, namespace_mutation_journal_chaos_status_from_env,
+        normalize_list_quorum, observe_list_objects_mutations_with_store, parse_namespace_mutation_journal_state,
+        parse_persistent_key_only_index, parse_persistent_list_metadata_object, parse_version_marker,
+        persist_observed_list_objects_mutation, persistent_key_only_index_has_complete_metadata_snapshot,
         persistent_key_only_index_health, persistent_key_only_index_matches_provider,
         reset_list_objects_mutation_sequences_for_test, resolve_agreed_listing_entry, resolve_listing_entries,
-        scanner_namespace_mutation_generation, select_list_index_provider_source_mode, select_list_index_source_mode,
-        send_or_cancel, version_marker_for_entries, walk_result_from_set_errors, write_namespace_mutation_journal_state,
-        write_persistent_key_only_index_with_metadata,
+        resolve_listing_entries_with_supplement, scanner_namespace_mutation_generation, select_list_index_provider_source_mode,
+        select_list_index_source_mode, send_or_cancel, version_marker_for_entries, walk_result_from_set_errors,
+        write_namespace_mutation_journal_state, write_persistent_key_only_index_with_metadata,
     };
     use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
-    use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
+    use crate::disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, error::DiskError, new_disk};
     use crate::error::StorageError;
     use crate::object_api::ObjectInfo;
     use rustfs_filemeta::{
@@ -7164,6 +7181,32 @@ mod test {
             name: name.to_owned(),
             metadata,
             cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn test_object_with_delete_marker_meta_entry(
+        name: &str,
+        object_mod_time: time::OffsetDateTime,
+        delete_mod_time: time::OffsetDateTime,
+    ) -> MetaCacheEntry {
+        let mut object = test_object_meta_entry_with_erasure_versions(name, &[(object_mod_time, "object-etag", 4, 2)]);
+        let delete = test_delete_marker_meta_entry(name, delete_mod_time);
+        let mut metadata = object.cached.take().expect("test object metadata should be cached");
+        let delete_version = delete
+            .cached
+            .expect("test delete marker metadata should be cached")
+            .versions
+            .into_iter()
+            .next()
+            .expect("test delete marker should contain one version");
+        metadata.versions.insert(0, delete_version);
+        let encoded = metadata.marshal_msg().expect("test metadata should marshal");
+
+        MetaCacheEntry {
+            name: name.to_owned(),
+            metadata: encoded,
+            cached: Some(metadata),
             reusable: false,
         }
     }
@@ -9006,6 +9049,110 @@ mod test {
         assert_eq!(required_quorum, 5);
         assert_eq!(ask_disks, 4);
         assert_eq!(latest_listing_object_quorum(2, 8, 4, true), 5);
+    }
+
+    #[tokio::test]
+    async fn latest_listing_supplements_a_split_delete_marker_sample() {
+        let object_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let delete_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let stale = test_object_meta_entry_with_erasure_versions("object", &[(object_mod_time, "object-etag", 4, 2)]);
+        let deleted = test_object_with_delete_marker_meta_entry("object", object_mod_time, delete_mod_time);
+        let entries = MetaCacheEntries(vec![
+            Some(stale.clone()),
+            Some(stale.clone()),
+            Some(deleted.clone()),
+            Some(deleted.clone()),
+        ]);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 4, false);
+
+        assert_eq!(listing_entries_supplement_target(&entries, &resolver, true).as_deref(), Some("object"));
+        assert_eq!(listing_entries_supplement_target(&entries, &resolver, false), None);
+
+        let mut primary = resolve_listing_entries(MetaCacheEntries(entries.0.clone()), resolver.clone(), true)
+            .expect("the partial sample should fall back to the stale object version");
+        assert!(!primary.is_latest_delete_marker());
+
+        let mut fallback_disks = Vec::new();
+        let mut fallback_tempdirs = Vec::new();
+        for _ in 0..2 {
+            let tempdir = tempfile::tempdir().expect("fallback tempdir should be created");
+            let endpoint =
+                Endpoint::try_from(tempdir.path().to_str().expect("fallback path should be utf8")).expect("valid endpoint");
+            let disk = new_disk(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("fallback disk should be created");
+            disk.make_volume("bucket").await.expect("fallback bucket should be created");
+            disk.write_all(
+                "bucket",
+                &format!("object/{STORAGE_FORMAT_FILE}"),
+                bytes::Bytes::copy_from_slice(&deleted.metadata),
+            )
+            .await
+            .expect("fallback metadata should be written");
+            fallback_disks.push(disk);
+            fallback_tempdirs.push(tempdir);
+        }
+        let supplement = ListingSupplement::new(
+            ListingSupplementOptions {
+                bucket: "bucket".to_string(),
+                path: String::new(),
+                recursive: true,
+                incl_deleted: false,
+                skip_hidden_prefix_check: false,
+                filter_prefix: None,
+                forward_to: None,
+                per_disk_limit: 100,
+                skip_total_timeout: true,
+                walkdir_timeout: None,
+                walkdir_stall_timeout: None,
+            },
+            Arc::new(fallback_disks),
+            FallbackClaimTracker::default(),
+        );
+
+        let mut supplemented = resolve_listing_entries_with_supplement(entries, resolver, true, supplement)
+            .await
+            .expect("the supplemented sample should resolve the committed delete marker");
+        assert!(supplemented.is_latest_delete_marker());
+    }
+
+    #[test]
+    fn latest_listing_supplement_keeps_a_subquorum_delete_marker_hidden() {
+        let object_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let delete_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let stale = test_object_meta_entry_with_erasure_versions("object", &[(object_mod_time, "object-etag", 4, 2)]);
+        let deleted = test_object_with_delete_marker_meta_entry("object", object_mod_time, delete_mod_time);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 4, false);
+        let entries = MetaCacheEntries(vec![
+            Some(stale.clone()),
+            Some(stale.clone()),
+            Some(stale.clone()),
+            Some(deleted.clone()),
+        ]);
+
+        assert_eq!(listing_entries_supplement_target(&entries, &resolver, true).as_deref(), Some("object"));
+
+        let mut resolved = resolve_listing_entries(
+            MetaCacheEntries(vec![
+                Some(stale.clone()),
+                Some(stale.clone()),
+                Some(stale),
+                Some(deleted.clone()),
+                Some(deleted.clone()),
+                Some(deleted),
+            ]),
+            resolver,
+            true,
+        )
+        .expect("the previous object version should remain visible below delete-marker write quorum");
+
+        assert!(!resolved.is_latest_delete_marker());
     }
 
     #[tokio::test]
