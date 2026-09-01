@@ -4100,7 +4100,7 @@ impl PoolMetaBootstrapAuthority {
 }
 
 impl PoolMetaWriteState {
-    #[cfg(any(test, feature = "test-util"))]
+    #[cfg(test)]
     pub(crate) fn for_startup(cluster_id: uuid::Uuid, fresh_bootstrap_proven: bool) -> Self {
         let bootstrap_authority = if fresh_bootstrap_proven {
             PoolMetaBootstrapAuthority::Fresh
