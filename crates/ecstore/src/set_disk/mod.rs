@@ -329,6 +329,7 @@ const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
 const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
 const EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED: &str = "set_disk_rename_tail_drain_failed";
 const EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY: &str = "set_disk_put_object_stage_summary";
+const EVENT_SET_DISK_ORPHAN_PURGE_SKIPPED: &str = "set_disk_orphan_purge_skipped";
 const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
 const ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
 const DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 64 * 1024 * 1024;
@@ -8773,6 +8774,111 @@ mod tests {
         assert!(purged, "orphan empty tree should be purged");
         assert!(!root.join("bucket").join("pfx").exists(), "prefix directory should be gone");
         assert!(root.join("bucket").exists(), "bucket volume should remain");
+    }
+
+    #[tokio::test]
+    async fn purge_orphan_dir_object_removes_committed_delete_residue() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let data_dir = Uuid::new_v4();
+        let transaction = Uuid::new_v4();
+        let residue = root
+            .join("bucket")
+            .join("pfx")
+            .join("nested")
+            .join("object")
+            .join(data_dir.to_string());
+        fs::create_dir_all(&residue)
+            .await
+            .expect("committed delete residue should be created");
+        fs::write(residue.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        fs::write(
+            residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+            [],
+        )
+        .await
+        .expect("committed delete marker should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("purge should succeed");
+
+        assert!(purged, "committed delete residue should be purgeable");
+        assert!(!root.join("bucket").join("pfx").exists(), "prefix directory should be gone");
+    }
+
+    #[tokio::test]
+    async fn purge_orphan_dir_object_preserves_uncommitted_data_residue() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let residue = root
+            .join("bucket")
+            .join("pfx")
+            .join("object")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&residue)
+            .await
+            .expect("uncommitted data residue should be created");
+        fs::write(residue.join("part.1"), b"possibly live")
+            .await
+            .expect("data part should be written");
+        fs::write(residue.join("delete-data.not-a-uuid"), [])
+            .await
+            .expect("malformed marker should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!purged, "data without a valid committed marker must be preserved");
+        assert!(residue.join("part.1").exists(), "possibly live data must remain");
+    }
+
+    #[tokio::test]
+    async fn purge_orphan_dir_object_preserves_nested_object_below_committed_residue() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let transaction = Uuid::new_v4();
+        let residue = root
+            .join("bucket")
+            .join("pfx")
+            .join("object")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&residue)
+            .await
+            .expect("committed data directory should be created");
+        fs::write(residue.join("part.1"), b"stale")
+            .await
+            .expect("stale part should be written");
+        fs::write(
+            residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+            [],
+        )
+        .await
+        .expect("committed delete marker should be written");
+        let nested_object = residue.join("nested");
+        fs::create_dir_all(&nested_object)
+            .await
+            .expect("nested object directory should be created");
+        fs::write(nested_object.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("nested object metadata should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!purged, "nested object metadata must veto committed-residue cleanup");
+        assert!(nested_object.join(STORAGE_FORMAT_FILE).exists(), "nested object metadata must remain");
+        assert!(residue.join("part.1").exists(), "committed residue must remain when cleanup is vetoed");
     }
 
     // issue #4189: a prefix that still anchors a real object must be left intact.
