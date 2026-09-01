@@ -63,6 +63,14 @@ pin_project! {
     }
 }
 
+pin_project! {
+    struct ExtractArchiveDecoderReader<R> {
+        #[pin]
+        inner: R,
+        _permit: OwnedSemaphorePermit,
+    }
+}
+
 #[derive(Debug, Default)]
 struct ExtractArchiveUploadState {
     etag: Option<String>,
@@ -97,6 +105,21 @@ impl<R> ExtractArchiveEtagReader<R> {
             finished: false,
             state,
         }
+    }
+}
+
+impl<R> ExtractArchiveDecoderReader<R> {
+    fn new(inner: R, permit: OwnedSemaphorePermit) -> Self {
+        Self { inner, _permit: permit }
+    }
+}
+
+impl<R> AsyncRead for ExtractArchiveDecoderReader<R>
+where
+    R: AsyncRead,
+{
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        self.project().inner.poll_read(cx, buf)
     }
 }
 
@@ -508,6 +531,36 @@ fn try_acquire_extract_staging_permit(manager: &ConcurrencyManager, staging_weig
             "Snowball staging budget is exhausted, please reduce your request rate",
         )
     })
+}
+
+async fn build_admitted_extract_archive_decoder<R>(
+    manager: &ConcurrencyManager,
+    key: &str,
+    tracked_archive: R,
+) -> S3Result<ExtractArchiveDecoderReader<Box<dyn AsyncRead + Send + Unpin>>>
+where
+    R: AsyncRead + Send + Unpin + 'static,
+{
+    // Admission precedes stream inspection so saturation cannot allocate or
+    // drive another codec. The returned reader owns the permit through archive
+    // finalization and transport-length validation.
+    let permit = manager.try_acquire_snowball_archive_decoder().ok_or_else(|| {
+        object_s3_error(
+            S3ErrorCode::SlowDown,
+            "Snowball archive decoder limit reached, please reduce your request rate",
+        )
+    })?;
+    let (detected_archive_format, sniffed_archive) =
+        CompressionFormat::sniff(tracked_archive).await.map_err(|err| match err {
+            ZipError::InspectStream(source) => map_extract_archive_error(source),
+            _ => s3_error!(InvalidArgument, "Failed to detect archive compression"),
+        })?;
+    let archive_format = resolve_extract_archive_format(key, detected_archive_format);
+    let decoder = archive_format.get_decoder(sniffed_archive).map_err(|e| {
+        error!(error = ?e, "Archive decoder creation failed");
+        s3_error!(InvalidArgument, "get_decoder err")
+    })?;
+    Ok(ExtractArchiveDecoderReader::new(decoder, permit))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2067,16 +2120,7 @@ impl DefaultObjectUsecase {
         let extract_limits = put_object_extract_limits();
         let tracked_archive =
             ExtractArchiveEtagReader::new(archive_reader, expected_archive_length, archive_upload_state.clone());
-        let (detected_archive_format, sniffed_archive) =
-            CompressionFormat::sniff(tracked_archive).await.map_err(|err| match err {
-                ZipError::InspectStream(source) => map_extract_archive_error(source),
-                _ => s3_error!(InvalidArgument, "Failed to detect archive compression"),
-            })?;
-        let archive_format = resolve_extract_archive_format(&key, detected_archive_format);
-        let decoder = archive_format.get_decoder(sniffed_archive).map_err(|e| {
-            error!(error = ?e, "Archive decoder creation failed");
-            s3_error!(InvalidArgument, "get_decoder err")
-        })?;
+        let decoder = build_admitted_extract_archive_decoder(get_concurrency_manager(), &key, tracked_archive).await?;
         let decoder = ExtractDecodedLimitReader::new(decoder, extract_limits.max_decoded_size);
 
         let mut ar = build_put_object_extract_archive(decoder, extract_limits);
@@ -2621,6 +2665,9 @@ impl DefaultObjectUsecase {
             }
             state.etag.as_ref().map(|etag| to_s3s_etag(etag))
         };
+        // Keep decoder admission through body-complete validation, then release
+        // it before response checksum and completion bookkeeping.
+        drop(decoder);
         apply_trailing_checksums(
             input.checksum_algorithm.as_ref().map(|a| a.as_str()),
             &req.trailing_headers,
@@ -2691,6 +2738,120 @@ mod tests {
             user_agent: String::new(),
             wrote_any_entry: AtomicBool::new(false),
         })
+    }
+
+    #[tokio::test]
+    async fn snowball_archive_decoder_admission_is_global_and_lifetime_bound() {
+        struct PanicOnRead;
+        struct ErrorOnRead;
+
+        impl AsyncRead for PanicOnRead {
+            fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                panic!("a saturated decoder admission must not inspect the archive body")
+            }
+        }
+
+        impl AsyncRead for ErrorOnRead {
+            fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(std::io::Error::other("injected decoder source failure")))
+            }
+        }
+
+        let manager = ConcurrencyManager::new();
+        let clone = manager.clone();
+        let mut held = Vec::new();
+        while let Some(permit) = manager.try_acquire_snowball_archive_decoder() {
+            held.push(permit);
+        }
+        assert!(!held.is_empty(), "the global decoder gate must admit at least one archive");
+
+        let error = match build_admitted_extract_archive_decoder(&clone, "archive.tar", PanicOnRead).await {
+            Ok(_) => panic!("a saturated decoder gate must reject without constructing another decoder"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), &S3ErrorCode::SlowDown);
+
+        drop(
+            held.pop()
+                .expect("one decoder permit must be available for the lifetime test"),
+        );
+        let error = match build_admitted_extract_archive_decoder(&clone, "archive.tar", ErrorOnRead).await {
+            Ok(_) => panic!("archive inspection failure must remain an error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+        let released_after_error = clone
+            .try_acquire_snowball_archive_decoder()
+            .expect("archive inspection failure must release decoder capacity");
+        drop(released_after_error);
+
+        let mut builder = Builder::new(Vec::new());
+        let mut header = Header::new_gnu();
+        header.set_size(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "member.txt", &b""[..])
+            .await
+            .expect("decoder lifetime fixture should append its member");
+        let archive_bytes = builder.into_inner().await.expect("decoder lifetime fixture should finalize");
+        let expected_length = u64::try_from(archive_bytes.len()).expect("fixture length must fit u64");
+        let upload_state = Arc::new(Mutex::new(ExtractArchiveUploadState::default()));
+        let tracked_archive =
+            ExtractArchiveEtagReader::new(std::io::Cursor::new(archive_bytes), expected_length, upload_state.clone());
+        let decoder = build_admitted_extract_archive_decoder(&clone, "archive.tar", tracked_archive)
+            .await
+            .expect("released decoder capacity must be reusable");
+        assert!(
+            manager.try_acquire_snowball_archive_decoder().is_none(),
+            "the decoder reader must retain admission while it is active"
+        );
+
+        let extract_limits = put_object_extract_limits();
+        let decoder = ExtractDecodedLimitReader::new(decoder, extract_limits.max_decoded_size);
+        let mut archive = build_put_object_extract_archive(decoder, extract_limits);
+        let mut entries = archive.entries().expect("admitted archive entries should be readable");
+        let entry = entries
+            .next()
+            .await
+            .expect("admitted archive should contain its member")
+            .expect("admitted archive member should parse");
+        assert_eq!(entry.path_bytes().expect("archive member path should parse").as_ref(), b"member.txt");
+        drop(entry);
+        assert!(entries.next().await.is_none(), "admitted archive should contain one member");
+        drop(entries);
+        let mut decoder = match archive.into_inner() {
+            Ok(decoder) => decoder,
+            Err(_) => panic!("admitted archive should finalize"),
+        };
+        tokio::io::copy(&mut decoder, &mut tokio::io::sink())
+            .await
+            .expect("admitted archive should consume its remaining transport body");
+        assert!(
+            upload_state
+                .lock()
+                .expect("archive upload state lock must remain healthy")
+                .body_complete,
+            "transport-length validation must complete while decoder admission is held"
+        );
+        assert!(
+            manager.try_acquire_snowball_archive_decoder().is_none(),
+            "archive finalization and transport validation must retain decoder admission"
+        );
+        drop(decoder);
+        assert!(
+            clone.try_acquire_snowball_archive_decoder().is_some(),
+            "dropping the finalized decoder must release its global slot"
+        );
+
+        let cancelled =
+            build_admitted_extract_archive_decoder(&manager, "archive.tar", std::io::Cursor::new(b"cancelled".to_vec()))
+                .await
+                .expect("the decoder gate must remain reusable");
+        drop(cancelled);
+        assert!(
+            clone.try_acquire_snowball_archive_decoder().is_some(),
+            "dropping an unfinished decoder must release admission for cancellation"
+        );
     }
 
     #[test]

@@ -59,8 +59,9 @@ pub use mrf::{
     MrfV2Envelope, MrfV2Error, MrfV2Reader, MrfV2Readiness, decode_mrf_file, encode_mrf_file,
 };
 pub use multipart::{
-    ReplicationMultipartPartInput, ReplicationMultipartPartPlan, ReplicationMultipartPlanError, ReplicationMultipartRange,
-    replication_multipart_complete_actual_size, replication_multipart_part_plan,
+    REPLICATION_MAX_SINGLE_PUT_SIZE, ReplicationMultipartPartInput, ReplicationMultipartPartPlan, ReplicationMultipartPlanError,
+    ReplicationMultipartRange, replication_multipart_complete_actual_size, replication_multipart_part_plan,
+    replication_single_put_size_error,
 };
 pub use object::{
     ReplicationSourceObject, ReplicationTargetObject, SsecPassthroughCapability, SsecPassthroughGate, content_matches_by_etag,

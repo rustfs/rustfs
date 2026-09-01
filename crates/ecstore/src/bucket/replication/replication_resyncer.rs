@@ -32,8 +32,9 @@ use super::replication_object_decision_boundary::{
     MustReplicateOptions, ReplicationMultipartPartInput, delete_marker_purge_mrf_entry, delete_marker_purge_version_id,
     delete_replication_creates_marker, heal_uses_delete_replication_path, is_object_lock_denied_delete,
     is_retryable_delete_replication_head_error, is_version_delete_replication, replicate_delete_outcome, replication_etags_match,
-    replication_multipart_complete_actual_size, replication_multipart_part_plan, resync_existing_delete_replication_info,
-    should_retry_delete_marker_purge, single_part_replica_etag_mismatch, target_delete_version_id,
+    replication_multipart_complete_actual_size, replication_multipart_part_plan, replication_single_put_size_error,
+    resync_existing_delete_replication_info, should_retry_delete_marker_purge, single_part_replica_etag_mismatch,
+    target_delete_version_id,
 };
 use super::replication_queue_boundary::{DeletedObjectReplicationInfo, ReplicationQueueAdmission};
 use super::replication_resync_boundary::ResyncStatusType;
@@ -88,6 +89,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::time::Instant;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
@@ -118,6 +120,7 @@ const EVENT_DELETE_MARKER_PURGE_FAILED: &str = "replication_delete_marker_purge_
 const EVENT_DELETE_MARKER_PURGE_MRF: &str = "replication_delete_marker_purge_mrf";
 const METRIC_DELETE_MARKER_PURGE_TOTAL: &str = "rustfs_replication_delete_marker_purge_total";
 const EVENT_REPLICATION_VERSION_IDENTITY_DRIFT: &str = "replication_version_identity_drift";
+const EVENT_REPLICATION_OBJECT_FAILED: &str = "replication_object_failed";
 const EVENT_REPLICATION_PURGE_OBJECT_LOCK_DENIED: &str = "replication_purge_object_lock_denied";
 
 #[allow(
@@ -190,11 +193,19 @@ fn metadata_requires_existing_target(op_type: ReplicationType, object_info: &Obj
 
 const METRIC_VERSION_IDENTITY_DRIFT_TOTAL: &str = "rustfs_replication_version_identity_drift_total";
 
-/// Targets that already produced a version-identity-drift warning this
-/// process lifetime, by ARN. Deduping is advisory only (the metric still
-/// counts every drifting PUT), so a reconfigured target re-warning only
-/// after a restart is acceptable.
-static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<HashSet<String>>> = LazyLock::new(|| StdMutex::new(HashSet::new()));
+/// How long a target stays quiet after reporting version-identity drift.
+///
+/// This used to be a plain "once per ARN per process": one line ever, which on
+/// a long-lived server meant the single most important diagnostic for a
+/// non-converging generic S3 target scrolled away hours before anyone looked
+/// (rustfs#6822). Re-arming on an interval keeps the log bounded while leaving
+/// the condition discoverable in any recent window.
+const VERSION_IDENTITY_DRIFT_LOG_INTERVAL: TokioDuration = TokioDuration::from_secs(600);
+
+/// When each target last reported version-identity drift, by ARN. Throttling is
+/// advisory only — the metric still counts every drifting PUT.
+static VERSION_IDENTITY_WARNED_ARNS: LazyLock<StdMutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 /// Version purges the peer denied under object lock (#6850). A RustFS peer
 /// with the replicated-purge GOVERNANCE exemption
@@ -322,20 +333,39 @@ fn audit_target_version_identity(tgt_client: &TargetClient, source_version_id: &
         return;
     }
     counter!(METRIC_VERSION_IDENTITY_DRIFT_TOTAL).increment(1);
+    if !version_identity_drift_log_due(&tgt_client.arn, Instant::now()) {
+        return;
+    }
+    // `error`, not `warn`: the target silently refuses the addressing scheme
+    // every version-addressed delete and heal on it depends on, so replication
+    // to it can never converge. At `warn` this sat below `DEFAULT_LOG_LEVEL`
+    // and no default deployment ever saw the one line that explains why a
+    // purged version is still on the target (rustfs#6822).
+    error!(
+        event = EVENT_REPLICATION_VERSION_IDENTITY_DRIFT,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+        arn = %tgt_client.arn,
+        endpoint = %tgt_client.endpoint,
+        sent_version_id = %source_version_id,
+        assigned_version_id = assigned_version_id.unwrap_or("<none>"),
+        "Replication target does not adopt source version ids; version-addressed replication cannot converge (run ?replication-check for details)"
+    );
+}
+
+/// Whether this ARN's version-identity drift is due to be logged again at
+/// `now`, re-arming the throttle when it is. Split out from the audit so the
+/// interval policy is testable without a target client.
+fn version_identity_drift_log_due(arn: &str, now: Instant) -> bool {
     let mut warned = VERSION_IDENTITY_WARNED_ARNS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if warned.insert(tgt_client.arn.clone()) {
-        warn!(
-            event = EVENT_REPLICATION_VERSION_IDENTITY_DRIFT,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-            arn = %tgt_client.arn,
-            endpoint = %tgt_client.endpoint,
-            sent_version_id = %source_version_id,
-            assigned_version_id = assigned_version_id.unwrap_or("<none>"),
-            "Replication target does not adopt source version ids; version-addressed replication cannot converge (run ?replication-check for details)"
-        );
+    match warned.get(arn) {
+        Some(last) if now.duration_since(*last) < VERSION_IDENTITY_DRIFT_LOG_INTERVAL => false,
+        _ => {
+            warned.insert(arn.to_string(), now);
+            true
+        }
     }
 }
 
@@ -2050,10 +2080,13 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
         }
     }
 
+    let delete_version_id = dobj.delete_object.version_id.map(|v| v.to_string());
+    note_replication_terminal_failure(&bucket, &dobj.delete_object.object_name, delete_version_id.as_deref(), &rinfos);
+
     let mut drs = get_replication_state(
         &rinfos,
         &dobj.delete_object.replication_state.clone().unwrap_or_default(),
-        dobj.delete_object.version_id.map(|v| v.to_string()),
+        delete_version_id,
     );
     if replication_status != prev_status {
         drs.replication_timestamp = Some(OffsetDateTime::now_utc());
@@ -3023,8 +3056,11 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
         }
     }
 
+    let version_id = roi.version_id.map(|v| v.to_string());
+    note_replication_terminal_failure(&bucket, &object, version_id.as_deref(), &rinfos);
+
     let previous_state = roi.replication_state.clone().unwrap_or_default();
-    let merged_state = get_replication_state(&rinfos, &previous_state, roi.version_id.map(|v| v.to_string()));
+    let merged_state = get_replication_state(&rinfos, &previous_state, version_id);
     let replication_status = merged_state.composite_replication_status();
     let new_replication_internal = merged_state.replication_status_internal.clone();
     let mut object_info = roi.to_object_info();
@@ -3099,6 +3135,61 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
     }
 
     (merged_state, state_persisted)
+}
+
+/// Emit the operator-visible record of a replication attempt that ended FAILED.
+///
+/// Every per-branch failure log in this module is deliberately quieter than
+/// `error`: most of them sit on the replication hot path and fire once per
+/// object *per ARN*, so a target that stays unreachable would flood the log
+/// from inside the transfer loop. That left a hole customers fell into
+/// (rustfs#6825): `DEFAULT_LOG_LEVEL` is `error`, so on a stock deployment a
+/// failed object produced no line at all, and an operator staring at a replica
+/// that never arrived had nothing to correlate — the same trap already
+/// documented for the GET path in
+/// `crates/e2e_test/src/get_stream_failure_observability_test.rs`.
+///
+/// This is the one place that knows an object reached a *terminal* FAILED state
+/// for a target, so this is where the guaranteed-visible line belongs. It is
+/// bounded by the number of objects that actually fail rather than by attempts
+/// inside a transfer, and it carries the target's own error so a remote
+/// rejection is diagnosable without the operator first having to lower the
+/// global log level and reproduce.
+fn note_replication_terminal_failure(bucket: &str, object: &str, version_id: Option<&str>, rinfos: &ReplicatedInfos) {
+    for target in rinfos.targets.iter() {
+        if target.is_empty() {
+            continue;
+        }
+        let replication_failed = target.replication_status == ReplicationStatusType::Failed;
+        let purge_failed = target.version_purge_status == VersionPurgeStatusType::Failed;
+        if !replication_failed && !purge_failed {
+            continue;
+        }
+
+        error!(
+            event = EVENT_REPLICATION_OBJECT_FAILED,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+            bucket = %bucket,
+            object = %object,
+            version_id = version_id.unwrap_or("-"),
+            arn = %target.arn,
+            endpoint = %target.endpoint,
+            op_type = %target.op_type,
+            size = target.size,
+            replication_status = %target.replication_status.as_str(),
+            version_purge_status = %target.version_purge_status.as_str(),
+            // The target's error can carry a signed URL or an echoed auth
+            // header, so it goes through the same redaction as the persisted
+            // resync detail rather than straight into the log.
+            error = %target
+                .error
+                .as_deref()
+                .and_then(sanitize_resync_error_detail)
+                .unwrap_or_else(|| "<none>".to_string()),
+            "Replication failed for object"
+        );
+    }
 }
 
 fn unavailable_object_target_info(roi: &ReplicateObjectInfo, arn: &str) -> ReplicatedTargetInfo {
@@ -3399,6 +3490,33 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 return rinfo;
             }
         };
+
+        if let Some(reason) = replication_single_put_size_error(is_multipart, transfer_size) {
+            drop(gr);
+            rinfo.replication_status = ReplicationStatusType::Failed;
+            rinfo.error = Some(reason.clone());
+            warn!(
+                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                target_bucket = %tgt_client.bucket,
+                arn = %tgt_client.arn,
+                object = %object,
+                operation = "put_object",
+                transfer_size = transfer_size,
+                error = %reason,
+                "Replication target operation failed"
+            );
+            send_local_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: object_info,
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            return rinfo;
+        }
 
         if let Some(err) = if is_multipart {
             drop(gr);
@@ -4068,6 +4186,14 @@ async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
     ctx: ReplicateAllPayloadContext<'_, S>,
     mut gr: GetObjectReader,
 ) -> Option<std::io::Error> {
+    // Fail before streaming a body the target is required to reject: an S3
+    // PutObject caps at 5 GiB, and this route is chosen by the source object's
+    // storage shape rather than its size (rustfs#6825).
+    if let Some(reason) = replication_single_put_size_error(ctx.is_multipart, ctx.transfer_size) {
+        drop(gr);
+        return Some(std::io::Error::other(reason));
+    }
+
     if ctx.is_multipart {
         drop(gr);
         let result = replicate_object_with_multipart(MultipartReplicationContext {
@@ -5715,5 +5841,208 @@ mod tests {
         // produce noise.
         assert!(!retry_scheduled.load(Ordering::SeqCst));
         assert_eq!(result.unwrap_err().to_string(), "transfer failed");
+    }
+
+    /// A replication target's terminal outcome, as the operator sees it.
+    fn failed_target(arn: &str, error: &str) -> ReplicatedTargetInfo {
+        ReplicatedTargetInfo {
+            arn: arn.to_string(),
+            size: 6 * 1024 * 1024 * 1024,
+            op_type: ReplicationType::Object,
+            replication_status: ReplicationStatusType::Failed,
+            endpoint: "s3.wasabisys.com".to_string(),
+            error: Some(error.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Capture the log this module writes, filtered exactly the way a stock
+    /// deployment filters it.
+    fn logs_at_default_level(emit: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct CapturedLogs {
+            buffer: Arc<Mutex<Vec<u8>>>,
+        }
+        struct CapturedLogWriter {
+            buffer: Arc<Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for CapturedLogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.buffer
+                    .lock()
+                    .expect("captured logs mutex should not be poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CapturedLogs {
+            type Writer = CapturedLogWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CapturedLogWriter {
+                    buffer: Arc::clone(&self.buffer),
+                }
+            }
+        }
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry()
+            // Not a hand-picked level: this is the filter an operator who has
+            // changed nothing is actually running.
+            .with(EnvFilter::new(rustfs_config::DEFAULT_LOG_LEVEL))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .without_time(),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
+
+        emit();
+
+        let buffer = logs
+            .buffer
+            .lock()
+            .expect("captured logs mutex should not be poisoned")
+            .clone();
+        String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+    }
+
+    /// rustfs#6825: a 6 GiB object never reached the target and the server said
+    /// nothing an operator could act on, because every failure line in this
+    /// module sat below `DEFAULT_LOG_LEVEL`. The object key, the target, and
+    /// the target's own error have to survive the default filter.
+    #[test]
+    fn failed_replication_names_the_object_at_the_default_log_level() {
+        let rinfos = ReplicatedInfos {
+            replication_timestamp: Some(OffsetDateTime::now_utc()),
+            targets: vec![failed_target("arn:replication::wasabi", "put_object failed: EntityTooLarge")],
+        };
+
+        let logs = logs_at_default_level(|| {
+            note_replication_terminal_failure("photos", "backups/vm-image.qcow2", Some("v-9"), &rinfos);
+        });
+
+        assert!(logs.contains("backups/vm-image.qcow2"), "the failed object must be named: {logs}");
+        assert!(logs.contains("arn:replication::wasabi"), "the target must be named: {logs}");
+        assert!(logs.contains("EntityTooLarge"), "the target's own error must survive: {logs}");
+        assert!(logs.contains("v-9"), "the version must be named: {logs}");
+        assert!(logs.contains(EVENT_REPLICATION_OBJECT_FAILED), "the event must be structured: {logs}");
+    }
+
+    #[test]
+    fn successful_replication_stays_quiet_at_the_default_log_level() {
+        let rinfos = ReplicatedInfos {
+            replication_timestamp: Some(OffsetDateTime::now_utc()),
+            targets: vec![ReplicatedTargetInfo {
+                arn: "arn:replication::wasabi".to_string(),
+                replication_status: ReplicationStatusType::Completed,
+                ..Default::default()
+            }],
+        };
+
+        let logs = logs_at_default_level(|| {
+            note_replication_terminal_failure("photos", "backups/ok.bin", None, &rinfos);
+        });
+
+        assert!(logs.is_empty(), "a completed replication must not log an error: {logs}");
+    }
+
+    /// A failed version purge is the 6822 symptom (the version stays on the
+    /// target); it must be as visible as a failed transfer even though the
+    /// replication status itself is not FAILED.
+    #[test]
+    fn failed_version_purge_is_reported_at_the_default_log_level() {
+        let rinfos = ReplicatedInfos {
+            replication_timestamp: Some(OffsetDateTime::now_utc()),
+            targets: vec![ReplicatedTargetInfo {
+                arn: "arn:replication::wasabi".to_string(),
+                op_type: ReplicationType::Delete,
+                replication_status: ReplicationStatusType::Empty,
+                version_purge_status: VersionPurgeStatusType::Failed,
+                error: Some("remove_object failed: NoSuchVersion".to_string()),
+                ..Default::default()
+            }],
+        };
+
+        let logs = logs_at_default_level(|| {
+            note_replication_terminal_failure("photos", "backups/purged.bin", Some("v-1"), &rinfos);
+        });
+
+        assert!(logs.contains("backups/purged.bin"), "the purged object must be named: {logs}");
+        assert!(logs.contains("NoSuchVersion"), "the target's own error must survive: {logs}");
+    }
+
+    /// The target's error is echoed remote text and can carry a signed URL or
+    /// an auth header, so it goes through the persisted-detail redaction rather
+    /// than straight into the log.
+    #[test]
+    fn failed_replication_redacts_a_sensitive_target_error() {
+        let rinfos = ReplicatedInfos {
+            replication_timestamp: Some(OffsetDateTime::now_utc()),
+            targets: vec![failed_target(
+                "arn:replication::wasabi",
+                "put_object failed: rejected Authorization: Bearer super-secret",
+            )],
+        };
+
+        let logs = logs_at_default_level(|| {
+            note_replication_terminal_failure("photos", "backups/vm-image.qcow2", None, &rinfos);
+        });
+
+        assert!(logs.contains("backups/vm-image.qcow2"), "the object must still be named: {logs}");
+        assert!(!logs.contains("super-secret"), "the credential must not reach the log: {logs}");
+    }
+
+    /// An empty target slot carries no outcome; reporting it would invent a
+    /// failure for a target that was never attempted.
+    #[test]
+    fn empty_target_slots_are_not_reported_as_failures() {
+        let rinfos = ReplicatedInfos {
+            replication_timestamp: Some(OffsetDateTime::now_utc()),
+            targets: vec![ReplicatedTargetInfo::default()],
+        };
+
+        let logs = logs_at_default_level(|| {
+            note_replication_terminal_failure("photos", "backups/unattempted.bin", None, &rinfos);
+        });
+
+        assert!(logs.is_empty(), "an empty target slot must not be reported: {logs}");
+    }
+
+    #[test]
+    fn version_identity_drift_re_arms_after_the_throttle_interval() {
+        let arn = "arn:replication::drift-throttle-test";
+        let start = Instant::now();
+
+        assert!(version_identity_drift_log_due(arn, start), "first drift must be reported");
+        assert!(
+            !version_identity_drift_log_due(arn, start + VERSION_IDENTITY_DRIFT_LOG_INTERVAL / 2),
+            "a second drift inside the interval must stay throttled"
+        );
+        assert!(
+            version_identity_drift_log_due(arn, start + VERSION_IDENTITY_DRIFT_LOG_INTERVAL),
+            "drift must become visible again once the interval elapses, instead of \
+             going silent for the rest of the process lifetime"
+        );
+    }
+
+    #[test]
+    fn version_identity_drift_throttles_each_target_independently() {
+        let now = Instant::now();
+
+        assert!(version_identity_drift_log_due("arn:replication::drift-a", now));
+        assert!(
+            version_identity_drift_log_due("arn:replication::drift-b", now),
+            "one target's report must not silence another's"
+        );
     }
 }
