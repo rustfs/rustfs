@@ -35,6 +35,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
 const DERIVED_LARGE_PUT_ADMISSION_LIMIT_MAX: usize = 32;
+// Framed S2 alone can retain one encoded and one decoded block of roughly
+// 4 MiB each, while other codecs have their own larger windows. Four keeps
+// useful request parallelism without scaling codec memory and CPU with clients.
+const SNOWBALL_ARCHIVE_DECODER_LIMIT: usize = 4;
 pub(crate) const SNOWBALL_MEMBER_COMMIT_LIMIT: usize = 32;
 pub(crate) const SNOWBALL_STAGING_BYTES_LIMIT: usize = 4 * MI_B;
 
@@ -71,6 +75,8 @@ pub struct ConcurrencyManager {
     metrics_collector: Arc<MetricsCollector>,
     /// Foreground write admission policy, resolved once at startup.
     foreground_write_admission_policy: ForegroundWriteAdmissionPolicy,
+    /// Bounds active Snowball archive inspection and decoding across requests.
+    snowball_archive_decoder_semaphore: Arc<Semaphore>,
     /// Snowball members are internal PUTs, so they use a separate global gate
     /// from preparation through the independently owned post-commit tail.
     snowball_member_commit_semaphore: Arc<Semaphore>,
@@ -425,6 +431,7 @@ impl ConcurrencyManager {
             bandwidth_monitor,
             metrics_collector,
             foreground_write_admission_policy,
+            snowball_archive_decoder_semaphore: Arc::new(Semaphore::new(SNOWBALL_ARCHIVE_DECODER_LIMIT)),
             snowball_member_commit_semaphore: Arc::new(Semaphore::new(SNOWBALL_MEMBER_COMMIT_LIMIT)),
             snowball_staging_bytes_semaphore: Arc::new(Semaphore::new(SNOWBALL_STAGING_BYTES_LIMIT)),
         }
@@ -576,6 +583,11 @@ impl ConcurrencyManager {
         self.foreground_write_admission_policy
             .admit(ForegroundWriteAdmissionKind::PutObject, member_size)
             .await
+    }
+
+    /// Try to acquire one global Snowball archive decoder slot.
+    pub(crate) fn try_acquire_snowball_archive_decoder(&self) -> Option<OwnedSemaphorePermit> {
+        self.snowball_archive_decoder_semaphore.clone().try_acquire_owned().ok()
     }
 
     /// Acquire one global Snowball member lifecycle slot.
@@ -1095,8 +1107,8 @@ mod integration_tests {
     use super::super::io_schedule::{IoLoadLevel, IoPriority};
     use super::super::request_guard::GetObjectGuard;
     use super::{
-        ConcurrencyManager, ForegroundWriteAdmission, SNOWBALL_MEMBER_COMMIT_LIMIT, SNOWBALL_STAGING_BYTES_LIMIT,
-        derive_large_put_admission_limit,
+        ConcurrencyManager, ForegroundWriteAdmission, SNOWBALL_ARCHIVE_DECODER_LIMIT, SNOWBALL_MEMBER_COMMIT_LIMIT,
+        SNOWBALL_STAGING_BYTES_LIMIT, derive_large_put_admission_limit,
     };
     use crate::storage::storage_api::concurrency_consumer::PutObjectGuard;
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
@@ -1108,6 +1120,20 @@ mod integration_tests {
     fn test_snowball_gates_are_global_bounded_and_reusable() {
         let manager = ConcurrencyManager::new();
         let clone = manager.clone();
+
+        let decoder_permits = manager
+            .snowball_archive_decoder_semaphore
+            .clone()
+            .try_acquire_many_owned(
+                u32::try_from(SNOWBALL_ARCHIVE_DECODER_LIMIT).expect("Snowball decoder limit must fit into u32"),
+            )
+            .expect("the exact Snowball decoder limit must be available");
+        assert!(
+            clone.try_acquire_snowball_archive_decoder().is_none(),
+            "a cloned manager must share the global decoder gate"
+        );
+        drop(decoder_permits);
+        assert!(clone.try_acquire_snowball_archive_decoder().is_some());
 
         let commit_permits = manager
             .snowball_member_commit_semaphore
