@@ -93,16 +93,6 @@ impl HealTask {
             None
         };
 
-        if is_auto_replacement
-            && !self
-                .await_with_control(self.storage.replacement_targets_ready(&self.heal_endpoints))
-                .await?
-        {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Replacement target is no longer ready for automatic heal {set_disk_id}"),
-            });
-        }
-
         let replacement_resume_disk = if is_auto_replacement {
             Some(match replacement_resume_disk {
                 Some(disk) => disk,

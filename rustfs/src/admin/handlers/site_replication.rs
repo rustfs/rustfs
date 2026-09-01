@@ -35,6 +35,7 @@ use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
 use crate::admin::storage_api::bucket::{
     AdminObjectLockConfigExt as _, AdminReplicationConfigExt as _, AdminVersioningConfigExt as _,
 };
+use crate::admin::storage_api::bucket_target_sys::BucketTargetSys;
 use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
@@ -61,7 +62,7 @@ use rustfs_iam::sys::{
 };
 use rustfs_madmin::{
     BucketBandwidth, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric, LDAPConfigSettings, LDAPSettings,
-    OpenIDProviderSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus, ReplicateEditStatus,
+    OpenIDProviderSettings, OpenIDSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SR_IAM_ITEM_STS_ACC_LEGACY,
     SRBucketInfo, SRBucketMeta, SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem, SRIAMUser,
     SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation, SRPolicyMapping,
@@ -87,6 +88,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
+use url::Url;
 use url::form_urlencoded;
 use uuid::Uuid;
 
@@ -1079,6 +1081,62 @@ async fn add_preflight_infos(
     .collect()
 }
 
+/// The first field at which a peer's reported IDP settings diverge from the
+/// local ones, named so an operator can act on the rejection instead of
+/// re-deriving the comparison (rustfs#7003). Values are reported except for
+/// credential-derived leaves, which are named but never echoed.
+fn idp_settings_difference(local: &serde_json::Value, peer: &serde_json::Value) -> Option<String> {
+    // Only scalars are echoed: a nested object may carry credential-derived
+    // leaves whose own field name never reaches `path`.
+    fn scalar(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Object(_) | serde_json::Value::Array(_) => None,
+            other => Some(other.to_string()),
+        }
+    }
+
+    fn presence(value: &serde_json::Value) -> &'static str {
+        if value.is_null() { "absent" } else { "set" }
+    }
+
+    fn walk(path: &str, local: &serde_json::Value, peer: &serde_json::Value) -> Option<String> {
+        if local == peer {
+            return None;
+        }
+
+        if let (serde_json::Value::Object(local_fields), serde_json::Value::Object(peer_fields)) = (local, peer) {
+            let keys: BTreeSet<&String> = local_fields.keys().chain(peer_fields.keys()).collect();
+            for key in keys {
+                let child_path = if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                };
+                let difference = walk(
+                    &child_path,
+                    local_fields.get(key).unwrap_or(&serde_json::Value::Null),
+                    peer_fields.get(key).unwrap_or(&serde_json::Value::Null),
+                );
+                if difference.is_some() {
+                    return difference;
+                }
+            }
+        }
+
+        let field = if path.is_empty() { "<root>" } else { path };
+        if field.to_ascii_lowercase().contains("secret") {
+            return Some(format!("`{field}` differs (values redacted)"));
+        }
+        match (scalar(local), scalar(peer)) {
+            (Some(local), Some(peer)) => Some(format!("`{field}` differs (local `{local}`, peer `{peer}`)")),
+            _ => Some(format!("`{field}` differs (local {}, peer {})", presence(local), presence(peer))),
+        }
+    }
+
+    walk("", local, peer)
+}
+
 fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], local_peer: &PeerInfo) -> S3Result<()> {
     let mut deployment_ids = HashSet::new();
     let mut local_seen = false;
@@ -1121,8 +1179,12 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
         ));
     };
     for info in infos {
-        if &info.idp_settings != local_idp {
-            return Err(s3_error!(InvalidRequest, "IDP settings mismatch for site `{}`", info.endpoint));
+        if let Some(difference) = idp_settings_difference(local_idp, &info.idp_settings) {
+            return Err(s3_error!(
+                InvalidRequest,
+                "IDP settings mismatch for site `{}`: {difference}",
+                info.endpoint
+            ));
         }
     }
 
@@ -1916,36 +1978,64 @@ async fn bootstrap_existing_metadata_after_add(
     errors
 }
 
+/// The OpenID half of the IDP settings a site reports to its site-replication
+/// peers, built from the providers this site has configured (in
+/// `list_providers` order) and the site's own region.
+fn open_id_settings(providers: Vec<(String, OpenIDProviderSettings)>, region: String) -> OpenIDSettings {
+    // `region` qualifies the provider identities, not the site: a site
+    // without OpenID must report the empty settings in every region, or the
+    // peer comparison in `validate_add_preflight_topology` would reject two
+    // sites whose IDP configuration is identically absent (rustfs#7003).
+    if providers.is_empty() {
+        return OpenIDSettings::default();
+    }
+
+    let mut settings = OpenIDSettings {
+        enabled: true,
+        region,
+        ..Default::default()
+    };
+
+    for (provider_id, provider_settings) in providers {
+        let claim_provider_unset = settings.claim_provider.client_id.is_empty()
+            && settings.claim_provider.claim_name.is_empty()
+            && settings.claim_provider.role_policy.is_empty()
+            && settings.claim_provider.hashed_client_secret.is_empty();
+
+        if provider_id == "default" || claim_provider_unset {
+            settings.claim_provider = provider_settings;
+        } else {
+            settings.roles.insert(provider_id, provider_settings);
+        }
+    }
+
+    settings
+}
+
 fn local_idp_settings() -> IDPSettings {
     let mut settings = IDPSettings::default();
     if let Some(federation) = current_federated_identity_service() {
-        let providers = federation.list_providers();
-        settings.open_id.enabled = !providers.is_empty();
-        settings.open_id.region = current_region().map(|region| region.to_string()).unwrap_or_default();
-
-        for provider in providers {
-            let Some(config) = federation.get_provider_config(&provider.provider_id) else {
-                continue;
-            };
-            let provider_settings = OpenIDProviderSettings {
-                claim_name: config.claim_name.clone(),
-                claim_userinfo_enabled: false,
-                role_policy: config.role_policy.clone(),
-                client_id: config.client_id.clone(),
-                hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),
-            };
-
-            let claim_provider_unset = settings.open_id.claim_provider.client_id.is_empty()
-                && settings.open_id.claim_provider.claim_name.is_empty()
-                && settings.open_id.claim_provider.role_policy.is_empty()
-                && settings.open_id.claim_provider.hashed_client_secret.is_empty();
-
-            if provider.provider_id == "default" || claim_provider_unset {
-                settings.open_id.claim_provider = provider_settings.clone();
-            } else {
-                settings.open_id.roles.insert(provider.provider_id.clone(), provider_settings);
-            }
-        }
+        // A listed provider whose config cannot be resolved contributes
+        // nothing to the peer comparison, so it is dropped here rather than
+        // inside the settings builder.
+        let providers = federation
+            .list_providers()
+            .into_iter()
+            .filter_map(|provider| {
+                let config = federation.get_provider_config(&provider.provider_id)?;
+                Some((
+                    provider.provider_id.clone(),
+                    OpenIDProviderSettings {
+                        claim_name: config.claim_name.clone(),
+                        claim_userinfo_enabled: false,
+                        role_policy: config.role_policy.clone(),
+                        client_id: config.client_id.clone(),
+                        hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),
+                    },
+                ))
+            })
+            .collect();
+        settings.open_id = open_id_settings(providers, current_region().map(|region| region.to_string()).unwrap_or_default());
     }
 
     let (ldap, ldap_configs) = load_ldap_idp_settings();
@@ -2004,25 +2094,111 @@ fn filter_sr_info(mut info: SRInfo, opts: &SRStatusOptions) -> SRInfo {
     info
 }
 
-async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
+/// Resolve one peer's downtime and last-seen from the replication heartbeat.
+///
+/// The heartbeat already tracks every remote endpoint it replicates to
+/// (`EpHealth`, refreshed every `RUSTFS_REPL_HEALTH_CHECK_INTERVAL_MS`), so
+/// these come from real observations instead of being synthesized per request.
+/// `reachable` is the caller's live probe for this status call and wins over
+/// the heartbeat's cached flag, which can lag by up to one probe interval.
+///
+/// An endpoint the heartbeat has never seen (no replication target points at
+/// it yet) yields zero downtime rather than a fabricated outage.
+async fn peer_health_metric(endpoint: &str, reachable: bool) -> (i64, Option<OffsetDateTime>) {
+    let fallback = (0, reachable.then(OffsetDateTime::now_utc));
+
+    let Ok(url) = Url::parse(endpoint) else {
+        return fallback;
+    };
+    let Some(health) = BucketTargetSys::get().endpoint_health(&url).await else {
+        return fallback;
+    };
+
+    let total_downtime_ns = i64::try_from(health.offline_duration.as_nanos()).unwrap_or(i64::MAX);
+    let last_online = if reachable {
+        Some(OffsetDateTime::now_utc())
+    } else {
+        health.last_online
+    };
+
+    (total_downtime_ns, last_online)
+}
+
+/// Assemble one peer's metric entry from already-resolved inputs.
+///
+/// Split out of [`build_metrics_summary`] so the local/remote and
+/// reachable/unreachable matrix stays unit-testable without a live replication
+/// stats handle or a populated heartbeat map.
+fn peer_metric_entry(
+    deployment_id: &str,
+    endpoint: &str,
+    is_local: bool,
+    reachable: bool,
+    (total_downtime_ns, last_online): (i64, Option<OffsetDateTime>),
+    local_counters: (i64, i64),
+) -> SRMetric {
+    let (replica_size, replica_count) = local_counters;
+
+    SRMetric {
+        deployment_id: deployment_id.to_string(),
+        endpoint: endpoint.to_string(),
+        online: reachable,
+        total_downtime_ns,
+        last_online,
+        // Replication counters are node-local: they describe traffic this node
+        // handled, so they belong only on the local entry. Copying them onto
+        // remote entries would double-count them cluster-wide.
+        replicated_size: if is_local { replica_size } else { 0 },
+        replicated_count: if is_local { replica_count } else { 0 },
+        ..Default::default()
+    }
+}
+
+async fn build_metrics_summary(
+    local_peer: &PeerInfo,
+    peers: &BTreeMap<String, PeerInfo>,
+    reachable_peers: &HashSet<String>,
+) -> SRMetricsSummary {
     let Some(stats) = current_replication_stats_handle() else {
         return SRMetricsSummary::default();
     };
 
     let node = stats.site_metrics_snapshot().await;
     let mut metrics = BTreeMap::new();
-    metrics.insert(
-        local_peer.deployment_id.clone(),
-        SRMetric {
-            deployment_id: local_peer.deployment_id.clone(),
-            endpoint: local_peer.endpoint.clone(),
-            online: true,
-            replicated_size: node.replica_size,
-            replicated_count: node.replica_count,
-            last_online: Some(OffsetDateTime::now_utc()),
-            ..Default::default()
-        },
-    );
+
+    // Emit an entry for every peer, not just the local one. An operator reading
+    // this page needs to know whether the *remote* site is reachable; reporting
+    // only "I am online" made a peer outage invisible here, so a site could be
+    // down for minutes while the status page stayed green.
+    for (deployment_id, peer) in peers {
+        let is_local = deployment_id == &local_peer.deployment_id;
+        let reachable = is_local || reachable_peers.contains(deployment_id);
+        let health = peer_health_metric(&peer.endpoint, reachable).await;
+
+        metrics.insert(
+            deployment_id.clone(),
+            peer_metric_entry(
+                deployment_id,
+                &peer.endpoint,
+                is_local,
+                reachable,
+                health,
+                (node.replica_size, node.replica_count),
+            ),
+        );
+    }
+
+    // A peer map that somehow omits the local deployment must still report the
+    // local counters rather than silently dropping them.
+    metrics.entry(local_peer.deployment_id.clone()).or_insert_with(|| SRMetric {
+        deployment_id: local_peer.deployment_id.clone(),
+        endpoint: local_peer.endpoint.clone(),
+        online: true,
+        last_online: Some(OffsetDateTime::now_utc()),
+        replicated_size: node.replica_size,
+        replicated_count: node.replica_count,
+        ..Default::default()
+    });
 
     SRMetricsSummary {
         active_workers: WorkerStat {
@@ -2669,7 +2845,7 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
     }
 
     if metrics_requested {
-        status.metrics = build_metrics_summary(local_peer).await;
+        status.metrics = build_metrics_summary(local_peer, &state.peers, &reachable_peers).await;
     }
 
     if opts.peer_state {
@@ -7580,6 +7756,47 @@ mod tests {
     use super::*;
     use crate::site_replication::identity::deployment_id_for_endpoint;
 
+    /// A peer the status probe could not reach must render as offline.
+    ///
+    /// Regression: `build_metrics_summary` used to hardcode `online: true` and
+    /// only ever emitted the local deployment, so a peer outage was invisible
+    /// on the status page — `Link: ● online` stayed green through a multi-minute
+    /// outage while replication was failing.
+    #[test]
+    fn peer_metric_entry_reports_unreachable_peer_as_offline() {
+        let heartbeat_last_online = OffsetDateTime::UNIX_EPOCH;
+        let entry = peer_metric_entry(
+            "remote-deployment",
+            "http://remote.example:9000",
+            false,
+            false,
+            (5_000_000_000, Some(heartbeat_last_online)),
+            (4096, 8),
+        );
+
+        assert!(!entry.online, "an unreachable peer must not be reported online");
+        assert_eq!(entry.total_downtime_ns, 5_000_000_000);
+        assert_eq!(
+            entry.last_online,
+            Some(heartbeat_last_online),
+            "an offline peer keeps the heartbeat's last-seen instead of being stamped 'now'"
+        );
+    }
+
+    /// Node-local replication counters must not be copied onto remote entries,
+    /// or a two-site cluster would double-count its own traffic.
+    #[test]
+    fn peer_metric_entry_keeps_replication_counters_on_the_local_entry() {
+        let local = peer_metric_entry("local", "http://local.example:9000", true, true, (0, None), (4096, 8));
+        let remote = peer_metric_entry("remote", "http://remote.example:9000", false, true, (0, None), (4096, 8));
+
+        assert_eq!(local.replicated_size, 4096);
+        assert_eq!(local.replicated_count, 8);
+        assert_eq!(remote.replicated_size, 0);
+        assert_eq!(remote.replicated_count, 0);
+        assert!(remote.online, "a reachable remote peer is still online");
+    }
+
     #[test]
     fn test_rotation_secret_candidates_try_the_installed_secret_before_the_new_one() {
         let mut pending = PendingRotation {
@@ -9634,6 +9851,119 @@ mod tests {
         let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("missing local deployment should fail");
 
         assert!(err.to_string().contains("must include the local deployment"));
+    }
+
+    fn openid_provider(client_id: &str) -> OpenIDProviderSettings {
+        OpenIDProviderSettings {
+            claim_name: "groups".to_string(),
+            claim_userinfo_enabled: false,
+            role_policy: "readwrite".to_string(),
+            client_id: client_id.to_string(),
+            hashed_client_secret: "hashed".to_string(),
+        }
+    }
+
+    // rustfs#7003: the site region is per-site and must not reach the peer
+    // IDP comparison while OpenID is unconfigured, or two sites in different
+    // regions can never be paired even with an identical (empty) IDP config.
+    #[test]
+    fn test_open_id_settings_omits_region_without_providers() {
+        let settings = open_id_settings(Vec::new(), "eu-site-1".to_string());
+
+        assert!(!settings.enabled);
+        assert_eq!(settings.region, "");
+        assert!(settings.roles.is_empty());
+        assert_eq!(
+            serde_json::to_value(&settings).expect("serialize OpenID settings"),
+            serde_json::to_value(OpenIDSettings::default()).expect("serialize default OpenID settings"),
+            "a site without OpenID providers must report the same settings in every region"
+        );
+    }
+
+    #[test]
+    fn test_open_id_settings_keeps_region_with_providers() {
+        let settings = open_id_settings(vec![("default".to_string(), openid_provider("client-a"))], "eu-site-1".to_string());
+
+        assert!(settings.enabled);
+        assert_eq!(settings.region, "eu-site-1");
+        assert_eq!(settings.claim_provider.client_id, "client-a");
+    }
+
+    // A whole provider object present on one side only must not spill its
+    // credential-derived leaves into the rejection message.
+    #[test]
+    fn test_validate_add_preflight_topology_omits_nested_values_in_idp_diff() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        local.idp_settings = serde_json::json!({
+            "OpenID": {"Enabled": true, "ClaimProvider": {"ClientID": "client-a", "HashedClientSecret": "local-hash"}},
+        });
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        remote.idp_settings = serde_json::json!({"OpenID": {"Enabled": true}});
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("IDP mismatch should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("OpenID.ClaimProvider"), "{message}");
+        assert!(!message.contains("local-hash"), "{message}");
+    }
+
+    // rustfs#7003: a bare "IDP settings mismatch" leaves the operator with no
+    // way to tell which element diverged.
+    #[test]
+    fn test_validate_add_preflight_topology_reports_differing_idp_field() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        local.idp_settings = serde_json::json!({
+            "LDAP": {"IsLDAPEnabled": false},
+            "OpenID": {"Enabled": false, "Region": "eu-site-1"},
+        });
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        remote.idp_settings = serde_json::json!({
+            "LDAP": {"IsLDAPEnabled": false},
+            "OpenID": {"Enabled": false, "Region": "eu-site-2"},
+        });
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("IDP mismatch should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("OpenID.Region"), "{message}");
+        assert!(message.contains("eu-site-1"), "{message}");
+        assert!(message.contains("eu-site-2"), "{message}");
+    }
+
+    // Hashed client secrets are still credential-derived material: name the
+    // field that diverged, never its value.
+    #[test]
+    fn test_validate_add_preflight_topology_redacts_secret_values_in_idp_diff() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        local.idp_settings = serde_json::json!({
+            "OpenID": {"ClaimProvider": {"HashedClientSecret": "local-hash"}},
+        });
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        remote.idp_settings = serde_json::json!({
+            "OpenID": {"ClaimProvider": {"HashedClientSecret": "remote-hash"}},
+        });
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("IDP mismatch should fail");
+        let message = err.to_string();
+
+        assert!(message.contains("OpenID.ClaimProvider.HashedClientSecret"), "{message}");
+        assert!(!message.contains("local-hash"), "{message}");
+        assert!(!message.contains("remote-hash"), "{message}");
     }
 
     #[test]

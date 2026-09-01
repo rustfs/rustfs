@@ -127,7 +127,7 @@ use rustfs_filemeta::{
 };
 use rustfs_heal_contracts::heal_channel::{
     DriveState, HealAdmissionResult, HealChannelPriority, HealItemType, HealOpts, HealRequestSource, HealScanMode,
-    send_heal_disk, send_heal_request_with_admission,
+    send_heal_replacement_disk, send_heal_request_with_admission,
 };
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_enabled, record_object_lock_diag_hold_duration,

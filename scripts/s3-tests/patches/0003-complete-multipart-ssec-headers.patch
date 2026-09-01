@@ -1,0 +1,28 @@
+diff --git a/s3tests/functional/test_s3.py b/s3tests/functional/test_s3.py
+--- a/s3tests/functional/test_s3.py
++++ b/s3tests/functional/test_s3.py
+@@ -20631,13 +20631,6 @@ def _test_copy_part_enc(file_size, source_mode_key, dest_mode_key, source_sc=Non
+     })
+ 
+     if dest_mode_key == 'sse-c':
+-        # make sure api is verifying the SSE-C headers
+-        e = assert_raises(ClientError, client.complete_multipart_upload,
+-                          Bucket=dest_bucket_name, Key='testobj2',
+-                          UploadId=upload_id, MultipartUpload={'Parts': parts})
+-        status, _ = _get_status_and_error_code(e.response)
+-        assert status == 400
+-
+         # and the key would be the same as the one used in upload part
+         # use the source key to complete the upload
+         # this is not allowed, so we expect an error
+@@ -20649,6 +20642,10 @@ def _test_copy_part_enc(file_size, source_mode_key, dest_mode_key, source_sc=Non
+         status, _ = _get_status_and_error_code(e.response)
+         assert status == 400
+ 
++        # CompleteMultipartUpload does not require SSE-C headers. The upload
++        # metadata already identifies the key used for the uploaded parts.
++        complete_args = {}
++
+     # complete the multipart upload
+     response = client.complete_multipart_upload(
+         Bucket=dest_bucket_name,

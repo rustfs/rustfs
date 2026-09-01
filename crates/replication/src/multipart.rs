@@ -109,14 +109,48 @@ pub fn replication_multipart_complete_actual_size(user_defined: &HashMap<String,
     get_internal_metadata(user_defined, SUFFIX_ACTUAL_SIZE).unwrap_or_default()
 }
 
+/// Largest body S3 accepts on a single `PutObject`. Anything above this has to
+/// be uploaded as multipart; the limit is part of the S3 API, not a RustFS
+/// tunable, so every generic S3 target enforces it.
+pub const REPLICATION_MAX_SINGLE_PUT_SIZE: i64 = 5 * 1024 * 1024 * 1024;
+
+/// Reject a single-`PutObject` replication transfer the target can never accept.
+///
+/// Replication mirrors the object's *source-side storage shape*: an object
+/// written to the source with one `PutObject` replicates with one `PutObject`
+/// whatever its size, and a multipart object replays the source's own part
+/// layout. So a source object larger than [`REPLICATION_MAX_SINGLE_PUT_SIZE`]
+/// that was not written as multipart can never reach a generic S3 target — the
+/// remote rejects it with `EntityTooLarge`, but only after the whole body has
+/// been streamed to it (rustfs#6825).
+///
+/// Returning the failure up front turns an unbounded wasted transfer plus an
+/// opaque remote error into a stated, diagnosable limit. RustFS deliberately
+/// does not re-chunk such an object into multipart on the replication side:
+/// the target's part layout is the source's, and rewriting it would break the
+/// ETag/part identity that heal and delete convergence address.
+pub fn replication_single_put_size_error(is_multipart: bool, transfer_size: i64) -> Option<String> {
+    if is_multipart || transfer_size <= REPLICATION_MAX_SINGLE_PUT_SIZE {
+        return None;
+    }
+    Some(format!(
+        "object of {transfer_size} bytes was not written as multipart on the source and exceeds the \
+         {REPLICATION_MAX_SINGLE_PUT_SIZE} byte single-PutObject limit of an S3 target; \
+         re-upload it with multipart to make it replicable"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplicationMultipartPartInput, ReplicationMultipartPartPlan, ReplicationMultipartPlanError, ReplicationMultipartRange,
-        replication_multipart_complete_actual_size, replication_multipart_part_plan,
+        REPLICATION_MAX_SINGLE_PUT_SIZE, ReplicationMultipartPartInput, ReplicationMultipartPartPlan,
+        ReplicationMultipartPlanError, ReplicationMultipartRange, replication_multipart_complete_actual_size,
+        replication_multipart_part_plan, replication_single_put_size_error,
     };
     use crate::http::{SUFFIX_ACTUAL_SIZE, insert_internal_metadata};
     use std::collections::HashMap;
+
+    const MIB: i64 = 1024 * 1024;
 
     #[test]
     fn multipart_part_plan_builds_range_and_next_offset() {
@@ -218,5 +252,45 @@ mod tests {
 
         assert_eq!(replication_multipart_complete_actual_size(&user_defined), "123");
         assert!(replication_multipart_complete_actual_size(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn single_put_size_guard_admits_transfers_a_target_can_accept() {
+        for size in [
+            0,
+            1,
+            MIB,
+            REPLICATION_MAX_SINGLE_PUT_SIZE - 1,
+            REPLICATION_MAX_SINGLE_PUT_SIZE,
+        ] {
+            assert_eq!(
+                replication_single_put_size_error(false, size),
+                None,
+                "single PUT of {size} bytes is within the S3 limit and must not be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn single_put_size_guard_rejects_an_oversized_single_put() {
+        let size = REPLICATION_MAX_SINGLE_PUT_SIZE + 1;
+        let err = replication_single_put_size_error(false, size).expect("oversized single PUT must be rejected");
+
+        // The message is the operator's diagnosis: it has to name the actual
+        // size, the limit, and the reason the object is on this route at all.
+        assert!(err.contains(&size.to_string()), "message must name the object size: {err}");
+        assert!(
+            err.contains(&REPLICATION_MAX_SINGLE_PUT_SIZE.to_string()),
+            "message must name the limit: {err}"
+        );
+        assert!(err.contains("multipart"), "message must name the remedy: {err}");
+    }
+
+    #[test]
+    fn single_put_size_guard_never_rejects_the_multipart_route() {
+        // Multipart replays the source part layout, so object size alone says
+        // nothing about whether the target will accept it; the per-part limits
+        // are the target's to enforce.
+        assert_eq!(replication_single_put_size_error(true, REPLICATION_MAX_SINGLE_PUT_SIZE * 1024), None);
     }
 }

@@ -54,6 +54,18 @@ jobs:
     timeout-minutes: 420
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
     steps:
+      - name: Initialize run evidence directory
+        id: evidence
+        run: |
+          set -euo pipefail
+          umask 077
+          if ! mkdir -- "${TIER_ARTIFACTS_DIR}"; then
+            echo "refusing to reuse tier evidence path: ${TIER_ARTIFACTS_DIR}" >&2
+            exit 1
+          fi
+          test -d "${TIER_ARTIFACTS_DIR}"
+          test ! -L "${TIER_ARTIFACTS_DIR}"
+
       # auto-testing is private: clone it with the dedicated PF token (not
       # GITHUB_TOKEN) and retry transient GitHub/network failures.
       - name: Checkout auto-testing scripts (with retry)
@@ -133,11 +145,11 @@ jobs:
         id: test
         continue-on-error: true
         env:
-          LOG_FILE: /tmp/rustfs-tier.log
           PACKAGE_URL_INPUT: ${{ inputs.package_url }}
           RUSTFS_VERSION_INPUT: ${{ inputs.rustfs_version }}
         run: |
           set -euo pipefail
+          LOG_FILE="${TIER_ARTIFACTS_DIR}/rustfs-tier.log"
           chmod +x auto-testing/rustfs-tier-test.sh
           RC_BIN="$(command -v rc)"
           PACKAGE_URL="${PACKAGE_URL_INPUT}"
@@ -162,7 +174,7 @@ jobs:
           ./auto-testing/rustfs-tier-test.sh "${ARGS[@]}"
 
       - name: Inject diagnostic case failure
-        if: ${{ always() && inputs.force_case_failure }}
+        if: ${{ always() && steps.evidence.outcome == 'success' && inputs.force_case_failure }}
         run: |
           set -euo pipefail
           RESULT_FILE="${TIER_ARTIFACTS_DIR}/cases/single-single--TIER-101.json"
@@ -172,12 +184,8 @@ jobs:
           mv "${TMP_FILE}" "${RESULT_FILE}"
 
       - name: Generate report
-        if: always()
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         env:
-          LOG_FILE: /tmp/rustfs-tier.log
-          REPORT_FILE: /tmp/rustfs-tier-report.md
-          CASE_TABLE: /tmp/rustfs-tier-cases.md
-          GATE_RC_FILE: /tmp/rustfs-tier-gate.rc
           PACKAGE_URL_INPUT: ${{ inputs.package_url }}
           RUSTFS_VERSION_INPUT: ${{ inputs.rustfs_version }}
           TEST_OUTCOME: ${{ steps.test.outcome }}
@@ -185,6 +193,12 @@ jobs:
           TRIGGER_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          test -d "${TIER_ARTIFACTS_DIR}"
+          test ! -L "${TIER_ARTIFACTS_DIR}"
+          LOG_FILE="${TIER_ARTIFACTS_DIR}/rustfs-tier.log"
+          REPORT_FILE="${TIER_ARTIFACTS_DIR}/rustfs-tier-report.md"
+          CASE_TABLE="${TIER_ARTIFACTS_DIR}/rustfs-tier-cases.md"
+          GATE_RC_FILE="${TIER_ARTIFACTS_DIR}/rustfs-tier-gate.rc"
           PACKAGE_URL="${PACKAGE_URL_INPUT}"
           RUSTFS_VERSION="${RUSTFS_VERSION_INPUT}"
           if [ -n "${PACKAGE_URL}" ]; then
@@ -228,11 +242,11 @@ jobs:
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload functional report to dashboard
-        if: always()
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
-          REPORT_FILE: /tmp/rustfs-tier-report.md
+          REPORT_FILE: ${{ env.TIER_ARTIFACTS_DIR }}/rustfs-tier-report.md
           SUITE: tier
         run: |
           set -euo pipefail
@@ -254,16 +268,110 @@ jobs:
               | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
           fi
 
+      - name: Verify required tier evidence
+        id: evidence_verify
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for name in \
+            rustfs-tier.log \
+            rustfs-tier-report.md \
+            rustfs-tier-cases.md \
+            rustfs-tier-gate.rc \
+            provenance.json; do
+            if [ ! -s "${TIER_ARTIFACTS_DIR}/${name}" ]; then
+              echo "required tier evidence is missing or empty: ${name}" >&2
+              failed=1
+            fi
+          done
+          for name in cases logs; do
+            if [ ! -d "${TIER_ARTIFACTS_DIR}/${name}" ]; then
+              echo "required tier evidence directory is missing: ${name}" >&2
+              failed=1
+            fi
+          done
+          if ! find "${TIER_ARTIFACTS_DIR}/cases" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null | grep -q .; then
+            echo "no atomic tier case result was produced" >&2
+            failed=1
+          fi
+          [ "${failed}" -eq 0 ]
+
+      - name: Upload report and logs
+        if: ${{ always() && steps.evidence.outcome == 'success' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rustfs-tier-test-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TIER_ARTIFACTS_DIR }}/
+          if-no-files-found: error
+
+      - name: Cleanup environment (after)
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
+          sudo rm -f /tmp/rustfs-mosquitto.conf
+          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
+          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
+          for node in "${NODES[@]}"; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
+            '
+          done
+
+      - name: Enforce tier suite result
+        id: gate
+        if: always()
+        env:
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          GATE_RC_FILE: ${{ env.TIER_ARTIFACTS_DIR }}/rustfs-tier-gate.rc
+        run: |
+          set -euo pipefail
+          failed=0
+          if [ "${EVIDENCE_OUTCOME}" != "success" ]; then
+            echo "tier evidence directory initialization is ${EVIDENCE_OUTCOME}, expected success" >&2
+            failed=1
+          fi
+          if [ "${TEST_OUTCOME}" != "success" ]; then
+            echo "tier suite step outcome is ${TEST_OUTCOME}, expected success" >&2
+            failed=1
+          fi
+          if [ "${EVIDENCE_OUTCOME}" != "success" ]; then
+            echo "structured gate result is unavailable because evidence initialization failed" >&2
+          elif [ ! -s "${GATE_RC_FILE}" ]; then
+            echo "structured gate result is missing" >&2
+            failed=1
+          else
+            GATE_RC="$(tr -d '[:space:]' < "${GATE_RC_FILE}")"
+            if ! [[ "${GATE_RC}" =~ ^[0-9]+$ ]] || [ "${GATE_RC}" -ne 0 ]; then
+              echo "structured 56-case gate failed with exit ${GATE_RC:-invalid}" >&2
+              failed=1
+            fi
+          fi
+          [ "${failed}" -eq 0 ]
+
       - name: File failure issue in rustfs/backlog
-        if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled') }}
+        if: ${{ always() && (failure() || steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled' || steps.evidence_verify.outcome == 'failure' || steps.evidence_verify.outcome == 'cancelled' || steps.gate.outcome == 'failure' || steps.gate.outcome == 'cancelled') }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
           SUITE: 'tier'
           SUITE_LABEL: 'Tier'
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPORT_FILE: '/tmp/rustfs-tier-report.md'
-          LOG_FILE: '/tmp/rustfs-tier.log'
+          EVIDENCE_DIR: ${{ env.TIER_ARTIFACTS_DIR }}
+          EVIDENCE_OUTCOME: ${{ steps.evidence.outcome }}
+          VERIFY_OUTCOME: ${{ steps.evidence_verify.outcome }}
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+          REPORT_FILE: ${{ env.TIER_ARTIFACTS_DIR }}/rustfs-tier-report.md
+          LOG_FILE: ${{ env.TIER_ARTIFACTS_DIR }}/rustfs-tier.log
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
@@ -293,10 +401,17 @@ jobs:
             echo "- Run: ${RUN_URL}"
             echo "- Trigger: ${GITHUB_EVENT_NAME}"
             echo "- Date: $(date -u +%Y-%m-%d)"
+            echo "- Evidence initialization: ${EVIDENCE_OUTCOME}"
+            echo "- Evidence verification: ${VERIFY_OUTCOME}"
+            echo "- Final gate: ${GATE_OUTCOME}"
             echo ""
             echo "## Report (errors and symptoms)"
             echo ""
-            if [ -s "${REPORT_FILE}" ]; then
+            if [ "${EVIDENCE_OUTCOME}" != "success" ]; then
+              echo "(the run evidence directory was rejected; its contents were not read)"
+            elif [ ! -d "${EVIDENCE_DIR}" ] || [ -L "${EVIDENCE_DIR}" ]; then
+              echo "(the run evidence directory is missing or unsafe; its contents were not read)"
+            elif [ -s "${REPORT_FILE}" ]; then
               redact < "${REPORT_FILE}"
             elif [ -s "${LOG_FILE:-}" ]; then
               echo "(report file missing; log tail below)"
@@ -313,81 +428,54 @@ jobs:
           fi
           echo "filed backlog issue for suite ${SUITE}"
 
-      - name: Upload report and logs
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: rustfs-tier-test-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            /tmp/rustfs-tier.log
-            /tmp/rustfs-tier-report.md
-            /tmp/rustfs-tier-cases.md
-            /tmp/rustfs-tier-gate.rc
-            ${{ env.TIER_ARTIFACTS_DIR }}/
-          if-no-files-found: error
-
-      - name: Cleanup environment (after)
-        if: always()
-        run: |
-          set -euo pipefail
-          sudo docker rm -f rustfs-test-mqtt >/dev/null 2>&1 || true
-          sudo rm -f /tmp/rustfs-mosquitto.conf
-          read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
-          SSH_USER="${RUSTFS_SSH_USER:-azureuser}"
-          for node in "${NODES[@]}"; do
-            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "${SSH_USER}@${node}" '
-              set -euo pipefail
-              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
-              ${SUDO} systemctl stop rustfs 2>/dev/null || true
-              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
-                ${SUDO} dpkg -P rustfs
-              fi
-              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
-              ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
-            '
-          done
-
-      - name: Enforce tier suite result
-        if: always()
-        env:
-          TEST_OUTCOME: ${{ steps.test.outcome }}
-          GATE_RC_FILE: /tmp/rustfs-tier-gate.rc
-        run: |
-          set -euo pipefail
-          failed=0
-          if [ "${TEST_OUTCOME}" != "success" ]; then
-            echo "tier suite step outcome is ${TEST_OUTCOME}, expected success" >&2
-            failed=1
-          fi
-          if [ ! -s "${GATE_RC_FILE}" ]; then
-            echo "structured gate result is missing" >&2
-            failed=1
-          else
-            GATE_RC="$(tr -d '[:space:]' < "${GATE_RC_FILE}")"
-            if ! [[ "${GATE_RC}" =~ ^[0-9]+$ ]] || [ "${GATE_RC}" -ne 0 ]; then
-              echo "structured 56-case gate failed with exit ${GATE_RC:-invalid}" >&2
-              failed=1
-            fi
-          fi
-          [ "${failed}" -eq 0 ]
-
       - name: "Continue functional chain (next: Storage engine)"
         # Only chain-triggered runs forward to the next suite; standalone
-        # workflow_dispatch runs stop after their own cleanup.
+        # workflow_dispatch runs stop after their own cleanup. A failed
+        # handoff must never pass silently: it retries, then files an alert
+        # issue in rustfs/backlog so a stalled chain is visible.
         if: ${{ always() && github.event_name == 'repository_dispatch' }}
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
         run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
+          set -uo pipefail
+          if [ -z "${{GH_TOKEN:-}}" ]; then
             echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
             exit 1
           fi
-          echo "Dispatching next functional suite: Storage engine"
-          gh api --method POST repos/rustfs/rustfs/dispatches \
-            -f event_type='rustfs-chain-storage' \
-            -F 'client_payload[from_suite]=tier'
+          DISPATCHED=0
+          for attempt in 1 2 3; do
+            if gh api --method POST repos/rustfs/rustfs/dispatches \
+              -f event_type='rustfs-chain-storage' \
+              -F 'client_payload[from_suite]=tier'; then
+              echo "dispatched next suite Storage engine (attempt ${{attempt}})"
+              DISPATCHED=1
+              break
+            fi
+            echo "dispatch attempt ${{attempt}} failed; retrying in ${{attempt}}0s" >&2
+            sleep "${{attempt}}0"
+          done
+          if [ "${{DISPATCHED:-0}}" -ne 1 ]; then
+            echo "ERROR: functional chain stalled: could not dispatch Storage engine after 3 attempts" >&2
+            TITLE="[functional][chain] stalled after tier (run ${{GITHUB_RUN_ID}})"
+            BODY_FILE="$(mktemp)"
+            {
+              echo "The functional chain could not hand off from **tier** to **Storage engine** after 3 attempts."
+              echo ""
+              echo "- Failed suite job: ${{GITHUB_SERVER_URL}}/${{GITHUB_REPOSITORY}}/actions/runs/${{GITHUB_RUN_ID}}"
+              echo "- Expected next event: `rustfs-chain-storage`"
+              echo "- Likely cause: PF_TESTING_GH_TOKEN lacks contents:write on rustfs/rustfs, or the GitHub API was unavailable."
+              echo "- Recovery: re-dispatch manually with"
+              echo "  ```"
+              echo "  gh api --method POST repos/rustfs/rustfs/dispatches -f event_type='rustfs-chain-storage'"
+              echo "  ```"
+            } > "${{BODY_FILE}}"
+            gh issue create -R rustfs/backlog --title "${{TITLE}}" \
+              --body-file "${{BODY_FILE}}" --label functional-test \
+              || gh issue create -R rustfs/backlog --title "${{TITLE}}" --body-file "${{BODY_FILE}}" \
+              || echo "could not file the stall alert issue either; check the token" >&2
+            exit 1
+          fi
 
       - name: Notify on failure
         if: failure()

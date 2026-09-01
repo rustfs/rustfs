@@ -101,7 +101,7 @@ use rustfs_utils::CompressionAlgorithm;
 #[cfg(test)]
 use rustfs_utils::http::insert_header;
 use rustfs_utils::http::{
-    SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS,
+    SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS,
     SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_consistent_str, get_header,
     get_source_scheme,
     headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
@@ -653,7 +653,7 @@ impl DefaultMultipartUsecase {
                 content_size: 0,
                 principal: None,
             }
-            .validate_multipart_ssec(&multipart_info.user_defined)?;
+            .validate_complete_multipart_ssec(&multipart_info.user_defined)?;
         }
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
@@ -1022,6 +1022,9 @@ impl DefaultMultipartUsecase {
                 checksum_type,
                 ..Default::default()
             });
+        }
+        if effective_sse.is_some() && opts.want_checksum.is_some() {
+            insert_str(&mut opts.user_defined, SUFFIX_PLAINTEXT_CHECKSUM, "true".to_string());
         }
 
         let MultipartUploadResult {

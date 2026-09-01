@@ -2353,6 +2353,16 @@ impl ECStore {
         })
     }
 
+    pub(crate) fn is_equivalent_decommission_capacity_target(source: &ObjectInfo, target: &ObjectInfo) -> bool {
+        source.bucket == target.bucket
+            && source.name == decode_dir_object(&target.name)
+            && if source.delete_marker {
+                is_equivalent_data_movement_delete_marker(source, target)
+            } else {
+                crate::data_movement::is_equivalent_data_movement_object_identity(source, target, true, false)
+            }
+    }
+
     /// Captures Object Lock state once for a batch of PUTs to the same bucket.
     /// `handle_put_object` only reuses the token for the same store, bucket,
     /// bucket incarnation, and Object Lock configuration revision.
@@ -4440,7 +4450,9 @@ impl ECStore {
         }
 
         if should_delete_from_all_pools(&opts, errs.len()) {
-            let mut obj = self.delete_object_from_all_pools(bucket, object, &opts, errs).await?;
+            let mut obj = self
+                .delete_object_from_all_pools(bucket, object, &opts, &pinfo.object_info, errs)
+                .await?;
             obj.name = decode_dir_object(object);
             return Ok(obj);
         }
@@ -5821,6 +5833,36 @@ mod tests {
             !remote_tuple_publication_object_source_matches(&expected, &current),
             "publication revalidation must additionally bind the physical source generation"
         );
+    }
+
+    #[test]
+    fn exact_delete_capacity_target_requires_matching_namespace_and_object_identity() {
+        let source = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "directory/".to_string(),
+            version_id: Some(Uuid::from_u128(1)),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            size: 10,
+            etag: Some("source-etag".to_string()),
+            ..Default::default()
+        };
+        let target = ObjectInfo {
+            name: rustfs_utils::path::encode_dir_object(&source.name),
+            ..source.clone()
+        };
+        assert!(ECStore::is_equivalent_decommission_capacity_target(&source, &target));
+
+        let mismatched_identity = ObjectInfo {
+            etag: Some("different-etag".to_string()),
+            ..target.clone()
+        };
+        assert!(!ECStore::is_equivalent_decommission_capacity_target(&source, &mismatched_identity));
+
+        let wrong_bucket = ObjectInfo {
+            bucket: "other-bucket".to_string(),
+            ..target
+        };
+        assert!(!ECStore::is_equivalent_decommission_capacity_target(&source, &wrong_bucket));
     }
 
     #[tokio::test]

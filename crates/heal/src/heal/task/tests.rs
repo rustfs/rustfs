@@ -84,7 +84,7 @@ async fn automatic_replacement_uses_target_scoped_format() {
     let temp = TempDir::new().expect("temporary resume disk directory should be created");
     let disk = make_resume_disk(&temp).await;
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         resume_disk: Mutex::new(Some(disk)),
         ..Default::default()
     });
@@ -123,7 +123,7 @@ async fn automatic_replacement_uses_target_scoped_format() {
 #[tokio::test]
 async fn automatic_replacement_persists_intent_before_format() {
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         ..Default::default()
     });
     let mut request = HealRequest::new(
@@ -155,7 +155,7 @@ async fn automatic_replacement_persists_intent_before_format() {
 #[tokio::test]
 async fn recovered_replacement_never_uses_a_fresh_resume_disk() {
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         ..Default::default()
     });
     let mut request = HealRequest::new(
@@ -193,7 +193,7 @@ async fn automatic_replacement_rejects_a_new_identity_after_format() {
     let first_identity = replacement_identity("replacement-a", "device-a", "filesystem-a");
     let second_identity = replacement_identity("replacement-a", "device-b", "filesystem-b");
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         replacement_target_identity_sequences: Mutex::new(VecDeque::from([
             vec![first_identity.clone()],
             vec![first_identity.clone()],
@@ -259,7 +259,7 @@ async fn automatic_replacement_reuses_an_existing_non_target_resume_anchor() {
     .await
     .expect("existing intent should be stored on the non-target anchor");
     let storage = Arc::new(MockStorage {
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         replacement_resume_disk: Mutex::new(Some(anchor.clone())),
         ..Default::default()
     });
@@ -493,7 +493,7 @@ async fn verified_recovery_keeps_state_when_marker_clear_fails() {
 
     let storage = Arc::new(MockStorage {
         replacement_resume_disk: Mutex::new(Some(anchor.clone())),
-        replacement_targets_ready: Mutex::new(true),
+        replacement_target_identities_ready: Mutex::new(true),
         ..Default::default()
     });
     let mut request = HealRequest::new(
@@ -551,7 +551,7 @@ struct MockStorage {
     format_error: Mutex<Option<Error>>,
     global_format_calls: Mutex<u32>,
     replacement_format_calls: Mutex<Vec<(usize, usize, Vec<String>)>>,
-    replacement_targets_ready: Mutex<bool>,
+    replacement_target_identities_ready: Mutex<bool>,
     replacement_target_identity_sequences: Mutex<VecDeque<Vec<crate::heal::resume::ReplacementTargetIdentity>>>,
     listed_prefixes: Mutex<Vec<String>>,
     truncate_without_token: Mutex<bool>,
@@ -943,10 +943,6 @@ impl HealStorageAPI for MockStorage {
         ))
     }
 
-    async fn replacement_targets_ready(&self, _targets: &[String]) -> Result<bool> {
-        Ok(*self.replacement_targets_ready.lock().unwrap())
-    }
-
     async fn list_objects_for_heal_page(
         &self,
         bucket: &str,
@@ -1028,7 +1024,7 @@ impl HealStorageAPI for MockStorage {
         &self,
         targets: &[String],
     ) -> Result<Vec<crate::heal::resume::ReplacementTargetIdentity>> {
-        if !*self.replacement_targets_ready.lock().unwrap() {
+        if !*self.replacement_target_identities_ready.lock().unwrap() {
             return Err(Error::other("replacement target is not ready"));
         }
         if let Some(identities) = self.replacement_target_identity_sequences.lock().unwrap().pop_front() {
