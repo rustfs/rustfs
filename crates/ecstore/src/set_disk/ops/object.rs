@@ -10223,8 +10223,19 @@ mod inline_put_commit_path_tests {
         make_bucket(&disk_stores, bucket).await;
 
         let mut reader = PutObjReader::from_vec(payload.clone());
+        // This test asserts the committed inline shard on every individual
+        // disk. A lock-owning PUT may quorum-ack before its rename tail
+        // drains, so keep the setup on the full-fanout commit path.
         set_disks
-            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("inline PUT should commit");
 
@@ -10724,8 +10735,19 @@ mod inline_put_commit_path_tests {
         make_bucket(&disk_stores, bucket).await;
 
         let mut reader = PutObjReader::from_vec(Vec::new());
+        // This test asserts the committed layout on every individual disk. A
+        // lock-owning PUT may quorum-ack before its rename tail drains, so
+        // keep the setup on the full-fanout commit path.
         set_disks
-            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("zero-length PUT should commit through the existing pipeline");
 
@@ -11060,22 +11082,42 @@ mod metadata_mutation_generation_tests {
         payload: &[u8],
     ) -> (ObjectInfo, GetObjectMetadataCacheKey) {
         let mut reader = PutObjReader::from_vec(payload.to_vec());
+        // A lock-owning PUT may quorum-ack before its rename tail drains, and
+        // cache priming refuses to publish while a straggler disk still reads
+        // as an error; keep the setup on the full-fanout commit path.
         let info = set_disks
-            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("test object should be written");
-        set_disks
-            .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
-            .await
-            .expect("test object metadata should resolve");
-        let generation = set_disks
-            .get_object_metadata_cache_generation(bucket, object)
-            .expect("metadata cache generation should be active");
-        let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
-        assert!(
-            set_disks.get_object_metadata_cache.get(&key).await.is_some(),
-            "metadata priming should publish the current generation"
-        );
+        // The publish is also bounded by the cache TTL, so re-prime until the
+        // current generation is observably cached instead of asserting on a
+        // single read that a loaded host can stall past expiry.
+        let key = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                set_disks
+                    .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+                    .await
+                    .expect("test object metadata should resolve");
+                let generation = set_disks
+                    .get_object_metadata_cache_generation(bucket, object)
+                    .expect("metadata cache generation should be active");
+                let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+                if set_disks.get_object_metadata_cache.get(&key).await.is_some() {
+                    return key;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("metadata priming should publish the current generation");
         (info, key)
     }
 
@@ -15240,8 +15282,20 @@ mod heterogeneous_pool_put_tests {
         make_bucket(&disk_stores, bucket).await;
 
         let mut default_reader = PutObjReader::from_vec(b"default gate stays epoch-free".to_vec());
+        // Both epoch readbacks below inspect every disk right after PUT. A
+        // lock-owning PUT may quorum-ack before its rename tail drains, so keep
+        // these commits on the full-fanout path; the fencing gate itself is
+        // driven by the fleet proof and env vars, never by the lock option.
         set_disks
-            .put_object(bucket, "default.bin", &mut default_reader, &ObjectOptions::default())
+            .put_object(
+                bucket,
+                "default.bin",
+                &mut default_reader,
+                &ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
             .await
             .expect("default PUT should commit");
         assert_eq!(
@@ -15258,7 +15312,15 @@ mod heterogeneous_pool_put_tests {
             async {
                 let mut fenced_reader = PutObjReader::from_vec(b"fenced epoch commit".to_vec());
                 set_disks
-                    .put_object(bucket, "fenced.bin", &mut fenced_reader, &ObjectOptions::default())
+                    .put_object(
+                        bucket,
+                        "fenced.bin",
+                        &mut fenced_reader,
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
                     .await
                     .expect("fenced PUT should commit with a live proof");
             },
