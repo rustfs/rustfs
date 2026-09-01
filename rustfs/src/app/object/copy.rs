@@ -575,6 +575,7 @@ impl DefaultObjectUsecase {
         }
 
         strip_managed_encryption_metadata(&mut user_defined);
+        remove_str(&mut user_defined, SUFFIX_PLAINTEXT_CHECKSUM);
 
         let destination_storage_class = storage_class
             .as_ref()
@@ -665,6 +666,7 @@ impl DefaultObjectUsecase {
         // none is requested, carry the source object's stored checksum over unchanged — the copy
         // does not alter the plaintext, so re-hashing would be wasted work and would flatten a
         // multipart composite value.
+        let destination_has_checksum = requested_checksum_type.is_some() || src_checksum.is_some();
         match requested_checksum_type {
             Some(checksum_type) => {
                 reader.add_calculated_checksum(checksum_type).map_err(ApiError::from)?;
@@ -696,6 +698,9 @@ impl DefaultObjectUsecase {
             write_plan = write_plan.with_encryption(material.write_encryption(None));
 
             user_defined.extend(encryption_material_to_metadata(&material)?);
+            if destination_has_checksum {
+                insert_str(&mut user_defined, SUFFIX_PLAINTEXT_CHECKSUM, "true".to_string());
+            }
         }
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;

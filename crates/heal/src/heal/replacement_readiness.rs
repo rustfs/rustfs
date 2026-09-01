@@ -14,9 +14,9 @@
 
 use std::{fs, path::Path};
 
-#[cfg(test)]
-use super::Endpoint;
-use super::{DiskStore, HealDiskExt as _, local_disk_map_read, resume::ReplacementTargetIdentity};
+use super::{
+    DiskOption, DiskStore, Endpoint, HealDiskExt as _, local_disk_map_read, new_disk, resume::ReplacementTargetIdentity,
+};
 
 pub(crate) async fn auto_replacement_target_ready(disk: &DiskStore, local_disks: &[DiskStore]) -> bool {
     auto_replacement_target_identity(disk, local_disks).await.is_some()
@@ -72,8 +72,38 @@ pub(crate) async fn auto_replacement_target_identity(
     .flatten()
 }
 
-pub(crate) async fn auto_replacement_targets_ready(targets: &[String]) -> bool {
-    auto_replacement_target_identities(targets).await.is_some()
+fn local_replacement_endpoint(target: &str, local_grid_hosts: &[String]) -> Option<Endpoint> {
+    let mut endpoint = Endpoint::try_from(target).ok()?;
+    if endpoint.is_local {
+        return Some(endpoint);
+    }
+
+    let grid_host = endpoint.grid_host();
+    if grid_host.is_empty() || !local_grid_hosts.iter().any(|local_host| local_host == &grid_host) {
+        return None;
+    }
+
+    endpoint.is_local = true;
+    Some(endpoint)
+}
+
+async fn replacement_target_disk(target: &str, local_disks: &[DiskStore]) -> Option<DiskStore> {
+    if let Some(disk) = local_disks.iter().find(|disk| disk.endpoint().to_string() == target) {
+        return Some(disk.clone());
+    }
+
+    let local_grid_hosts = local_disks.iter().map(|disk| disk.endpoint().grid_host()).collect::<Vec<_>>();
+    let endpoint = local_replacement_endpoint(target, &local_grid_hosts)?;
+
+    new_disk(
+        &endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .ok()
 }
 
 pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Option<Vec<ReplacementTargetIdentity>> {
@@ -88,8 +118,8 @@ pub(crate) async fn auto_replacement_target_identities(targets: &[String]) -> Op
 
     let mut identities = Vec::with_capacity(targets.len());
     for target in targets {
-        let disk = local_disks.iter().find(|disk| disk.endpoint().to_string() == *target)?;
-        identities.push(auto_replacement_target_identity(disk, &local_disks).await?);
+        let disk = replacement_target_disk(target, &local_disks).await?;
+        identities.push(auto_replacement_target_identity(&disk, &local_disks).await?);
     }
     identities.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     identities.dedup_by(|left, right| left.endpoint == right.endpoint);
@@ -130,6 +160,29 @@ mod tests {
     use super::super::{DiskOption, new_disk};
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn local_replacement_endpoint_accepts_a_url_on_a_registered_local_grid_host() {
+        let local_grid_hosts = vec!["http://127.0.0.1:9000".to_owned()];
+        let endpoint = local_replacement_endpoint("http://127.0.0.1:9000/replacement", &local_grid_hosts)
+            .expect("matching local grid host should be accepted");
+
+        assert!(endpoint.is_local);
+    }
+
+    #[test]
+    fn local_replacement_endpoint_rejects_a_url_on_an_unregistered_grid_host() {
+        let local_grid_hosts = vec!["http://127.0.0.1:9000".to_owned()];
+
+        assert!(local_replacement_endpoint("http://127.0.0.1:9001/replacement", &local_grid_hosts).is_none());
+    }
+
+    #[test]
+    fn local_replacement_endpoint_keeps_a_local_path_local() {
+        let endpoint = local_replacement_endpoint("/replacement", &[]).expect("local path should be accepted");
+
+        assert!(endpoint.is_local);
+    }
 
     #[tokio::test]
     async fn runtime_environment_cannot_bypass_mount_admission() {

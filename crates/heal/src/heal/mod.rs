@@ -26,12 +26,10 @@ pub mod utils;
 
 use storage_api::owner::{
     ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_RUSTFS_META_BUCKET,
-    EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult,
-    EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations,
-    ecstore_local_disk_map_read,
+    EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskOption,
+    EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO,
+    ObjectOperations, ecstore_local_disk_map_read, ecstore_new_disk,
 };
-#[cfg(test)]
-use storage_api::owner::{EcstoreDiskOption, ecstore_new_disk};
 
 pub use erasure_healer::ErasureSetHealer;
 pub use manager::{HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
@@ -247,10 +245,8 @@ pub(crate) async fn local_disk_map_read() -> tokio::sync::OwnedRwLockReadGuard<L
     ecstore_local_disk_map_read().await
 }
 
-#[cfg(test)]
 pub(crate) type DiskOption = EcstoreDiskOption;
 
-#[cfg(test)]
 pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> DiskResult<DiskStore> {
     ecstore_new_disk(ep, opt).await
 }

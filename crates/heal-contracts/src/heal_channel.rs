@@ -347,6 +347,9 @@ pub struct HealChannelRequest {
     pub id: String,
     /// Disk ID for heal disk/erasure set task
     pub disk: Option<String>,
+    /// Exact endpoints of replacement disks for an automatic erasure-set
+    /// rebuild. An empty list retains the generic erasure-set heal behavior.
+    pub heal_endpoints: Vec<String>,
     /// Bucket name
     pub bucket: String,
     /// Object prefix (optional)
@@ -594,6 +597,7 @@ pub fn create_heal_request(
         timeout_seconds: None,
         source: HealRequestSource::Internal,
         disk: None,
+        heal_endpoints: Vec::new(),
     }
 }
 
@@ -634,12 +638,13 @@ pub fn create_heal_response(
     }
 }
 
-pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPriority>) -> Result<(), String> {
-    let req = HealChannelRequest {
+fn create_auto_heal_disk_request(set_disk_id: String, priority: Option<HealChannelPriority>) -> HealChannelRequest {
+    HealChannelRequest {
         id: Uuid::new_v4().to_string(),
         bucket: "".to_string(),
         object_prefix: None,
         disk: Some(set_disk_id),
+        heal_endpoints: Vec::new(),
         object_version_id: None,
         force_start: false,
         priority: priority.unwrap_or(HealChannelPriority::Low),
@@ -654,8 +659,71 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
         no_lock: None,
         timeout_seconds: None,
         source: HealRequestSource::AutoHeal,
-    };
-    send_heal_request(req).await
+    }
+}
+
+fn create_auto_replacement_disk_request(
+    pool_index: usize,
+    set_index: usize,
+    replacement_endpoint: String,
+    priority: Option<HealChannelPriority>,
+) -> HealChannelRequest {
+    let mut request = create_auto_heal_disk_request(format!("pool_{pool_index}_set_{set_index}"), priority);
+    request.heal_endpoints = vec![replacement_endpoint];
+    request.pool_index = Some(pool_index);
+    request.set_index = Some(set_index);
+    request
+}
+
+/// Submit the legacy generic erasure-set auto-heal request.
+pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPriority>) -> Result<(), String> {
+    send_heal_request(create_auto_heal_disk_request(set_disk_id, priority)).await
+}
+
+/// Submit an automatic replacement heal for one known disk endpoint.
+///
+/// The endpoint makes the request eligible for the durable replacement intent
+/// and completion-proof path in the heal task.
+pub async fn send_heal_replacement_disk(
+    pool_index: usize,
+    set_index: usize,
+    replacement_endpoint: String,
+    priority: Option<HealChannelPriority>,
+) -> Result<(), String> {
+    send_heal_request(create_auto_replacement_disk_request(
+        pool_index,
+        set_index,
+        replacement_endpoint,
+        priority,
+    ))
+    .await
+}
+
+#[cfg(test)]
+mod auto_heal_disk_request_tests {
+    use super::*;
+
+    #[test]
+    fn replacement_disk_request_carries_its_exact_endpoint() {
+        let request =
+            create_auto_replacement_disk_request(2, 3, "http://node2:9000/drive3".to_string(), Some(HealChannelPriority::Normal));
+
+        assert_eq!(request.disk.as_deref(), Some("pool_2_set_3"));
+        assert_eq!(request.heal_endpoints, ["http://node2:9000/drive3"]);
+        assert_eq!(request.pool_index, Some(2));
+        assert_eq!(request.set_index, Some(3));
+        assert_eq!(request.source, HealRequestSource::AutoHeal);
+    }
+
+    #[test]
+    fn legacy_auto_heal_disk_request_has_no_replacement_endpoint() {
+        let request = create_auto_heal_disk_request("pool_2_set_3".to_string(), None);
+
+        assert!(request.heal_endpoints.is_empty());
+        assert_eq!(request.pool_index, None);
+        assert_eq!(request.set_index, None);
+        assert_eq!(request.source, HealRequestSource::AutoHeal);
+    }
 }
 
 #[cfg(test)]

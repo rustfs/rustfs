@@ -22,7 +22,7 @@ mod tests {
     use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart};
+    use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, ServerSideEncryption};
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use md5::{Digest as Md5Digest, Md5};
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
@@ -258,6 +258,117 @@ mod tests {
             "HeadObject with ChecksumMode=ENABLED must return the stored base64 SHA256 (issue #4341)"
         );
         info!("PASSED: HeadObject returns stored SHA256 digest");
+    }
+
+    #[tokio::test]
+    async fn test_head_object_returns_sse_s3_checksum() {
+        init_logging();
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server_with_env(
+            vec![],
+            &[
+                ("RUSTFS_SSE_S3_MASTER_KEY", "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI="),
+                ("RUSTFS_CONSOLE_ENABLE", "false"),
+            ],
+        )
+        .await
+        .expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-sse-s3-checksum-head";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        let put = client
+            .put_object()
+            .bucket(bucket)
+            .key("encrypted.txt")
+            .body(ByteStream::from_static(b"encrypted checksum"))
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .expect("SSE-S3 PutObject with CRC32 failed");
+        let expected = put.checksum_crc32().expect("PutObject must return CRC32");
+
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key("encrypted.txt")
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("SSE-S3 HeadObject failed");
+
+        assert_eq!(head.checksum_crc32(), Some(expected));
+
+        client
+            .copy_object()
+            .bucket(bucket)
+            .key("encrypted-copy.txt")
+            .copy_source(format!("{bucket}/encrypted.txt"))
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .send()
+            .await
+            .expect("SSE-S3 CopyObject failed");
+        let copy_head = client
+            .head_object()
+            .bucket(bucket)
+            .key("encrypted-copy.txt")
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("SSE-S3 copied HeadObject failed");
+
+        assert_eq!(copy_head.checksum_crc32(), Some(expected));
+
+        let multipart_key = "encrypted-multipart.txt";
+        let create = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(multipart_key)
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .expect("SSE-S3 CreateMultipartUpload with CRC32 failed");
+        let upload_id = create.upload_id().expect("CreateMultipartUpload must return an upload ID");
+        let part = client
+            .upload_part()
+            .bucket(bucket)
+            .key(multipart_key)
+            .upload_id(upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"encrypted multipart checksum"))
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .expect("SSE-S3 UploadPart with CRC32 failed");
+        let completed_part = CompletedPart::builder()
+            .part_number(1)
+            .e_tag(part.e_tag().expect("UploadPart must return an ETag"))
+            .checksum_crc32(part.checksum_crc32().expect("UploadPart must return CRC32"))
+            .build();
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(multipart_key)
+            .upload_id(upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().parts(completed_part).build())
+            .send()
+            .await
+            .expect("SSE-S3 CompleteMultipartUpload with CRC32 failed");
+        let expected_multipart = complete.checksum_crc32().expect("CompleteMultipartUpload must return CRC32");
+        let multipart_head = client
+            .head_object()
+            .bucket(bucket)
+            .key(multipart_key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("SSE-S3 multipart HeadObject failed");
+
+        assert_eq!(multipart_head.checksum_crc32(), Some(expected_multipart));
     }
 
     /// Multipart upload with checksum: CreateMultipartUpload, UploadPart(s) with checksum_sha256, CompleteMultipartUpload; then GetObject verifies content.
