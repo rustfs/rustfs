@@ -196,7 +196,7 @@ mod decommission_lock_order_tests {
     use crate::bucket::lifecycle::lifecycle::TRANSITION_PENDING;
     use crate::core::pools::{
         DecommissionCapacityLockOrderBarrier, DecommissionCapacityOwner, DecommissionErasureLayout, DecommissionPoolCapacityInfo,
-        POOL_META_NAME, set_decommission_capacity_info_overrides_for_test,
+        POOL_META_NAME, decommission_capacity_mutation_id, set_decommission_capacity_info_overrides_for_test,
     };
     use crate::data_movement;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -3045,6 +3045,198 @@ mod decommission_lock_order_tests {
             reservation.consumed_target_physical_bytes > 0,
             "data-movement PUT should consume capacity only after its tail"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn exact_delete_reconciles_pending_capacity_before_removing_replicas() {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("exact-delete-capacity");
+        let object = "published-before-exact-delete.bin";
+        let body = vec![0x55; 64 * 1024];
+        let version_id = uuid::Uuid::new_v4().to_string();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the exact-delete reconciliation bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the exact-delete bucket incarnation");
+
+        let mut source_data = PutObjReader::from_vec(body.clone());
+        let source = store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut source_data,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.clone()),
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed the exact source version");
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let target_total = body.len().saturating_mul(4);
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, body.len(), body.len()),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 0, target_total, target_total),
+                DecommissionPoolCapacityInfo::for_test(2, layout, target_total, target_total, 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate the exact-delete capacity reservation");
+        let owner = decommission_capacity_owner(&*store.pool_meta.read().await);
+        let target_pool_index = store.pool_meta.read().await.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the exact-delete capacity reservation should exist")
+            .targets[0]
+            .pool_index;
+        assert_eq!(target_pool_index, 2);
+
+        let target_options = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id.clone()),
+            mod_time: source.mod_time,
+            preserve_etag: source.etag.clone(),
+            user_defined: (*source.user_defined).clone(),
+            data_movement: true,
+            src_pool_idx: 0,
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        let mut target_data = PutObjReader::from_vec(body.clone());
+        let target = store.pools[target_pool_index]
+            .put_object(&bucket, object, &mut target_data, &target_options)
+            .await
+            .expect("publish the target version before capacity progress");
+        assert_eq!(target.version_id, source.version_id);
+        assert_eq!(target.mod_time, source.mod_time);
+        assert_eq!(target.size, source.size);
+
+        let source_version_id = source.version_id.map(|version_id| version_id.to_string());
+        let mutation_id = decommission_capacity_mutation_id(
+            owner,
+            &source.bucket,
+            &source.name,
+            source_version_id.as_deref(),
+            source.delete_marker,
+            source.mod_time,
+        );
+        {
+            let mut pool_meta = store.pool_meta.write().await;
+            let source_pool = &mut pool_meta.pools[0];
+            let reservation = source_pool
+                .decommission
+                .as_mut()
+                .and_then(|info| info.capacity_reservation.as_mut())
+                .expect("the exact-delete capacity reservation should remain active");
+            let target = reservation
+                .targets
+                .iter_mut()
+                .find(|target| target.pool_index == target_pool_index)
+                .expect("the exact-delete target allocation should exist");
+            target.pending_physical_bytes = body.len();
+            target.pending_mutation_id = Some(mutation_id);
+            reservation.pending_target_physical_bytes = body.len();
+            source_pool.last_update = time::OffsetDateTime::now_utc();
+        }
+        store
+            .save_current_pool_meta_for_test(&[0])
+            .await
+            .expect("persist the simulated post-commit capacity intent");
+
+        let exact_delete_options = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id.clone()),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        store.pools[target_pool_index]
+            .delete_object(&bucket, object, exact_delete_options.clone())
+            .await
+            .expect("remove the target evidence before the fail-closed exact delete");
+        let delete_err = store
+            .delete_object(&bucket, object, exact_delete_options.clone())
+            .await
+            .expect_err("exact delete must fail while its pending target evidence is absent");
+        assert!(matches!(delete_err, crate::error::Error::DecommissionCapacityBlocked { .. }));
+        store.pools[0]
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version_id.clone()),
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a failed reconciliation must preserve the source evidence");
+        let mut failed = crate::core::pools::PoolMeta::default();
+        failed
+            .load_no_lock_from_replicas(store.pools.clone())
+            .await
+            .expect("the failed exact delete must preserve readable capacity metadata");
+        let failed_reservation = failed.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the failed exact delete reservation should remain present");
+        assert_eq!(failed_reservation.pending_target_physical_bytes, body.len());
+        assert_eq!(failed_reservation.consumed_target_physical_bytes, 0);
+
+        let mut replacement_target_data = PutObjReader::from_vec(body.clone());
+        store.pools[target_pool_index]
+            .put_object(&bucket, object, &mut replacement_target_data, &target_options)
+            .await
+            .expect("restore the equivalent target evidence for the exact-delete retry");
+
+        store
+            .delete_object(&bucket, object, exact_delete_options)
+            .await
+            .expect("the exact delete should reconcile capacity before removing replicas");
+
+        let mut persisted = crate::core::pools::PoolMeta::default();
+        persisted
+            .load_no_lock_from_replicas(store.pools.clone())
+            .await
+            .expect("the exact-delete reconciliation should remain durable");
+        let reservation = persisted.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("the reconciled reservation should remain present");
+        assert_eq!(reservation.pending_target_physical_bytes, 0);
+        assert_eq!(reservation.consumed_target_physical_bytes, body.len());
+        assert_eq!(reservation.committed_data_bytes, body.len());
+
+        for pool_index in [0, target_pool_index] {
+            let err = store.pools[pool_index]
+                .get_object_info(
+                    &bucket,
+                    object,
+                    &ObjectOptions {
+                        versioned: true,
+                        version_id: Some(version_id.clone()),
+                        no_lock: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("the exact version should be absent after reconciliation and delete");
+            assert!(crate::error::is_err_object_not_found(&err) || crate::error::is_err_version_not_found(&err));
+        }
     }
 
     #[tokio::test]
