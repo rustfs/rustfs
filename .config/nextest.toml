@@ -89,6 +89,29 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
 test-group = 'ecstore-serial-flaky'
 
+# Serialize the heal result-report tests. Every test in the module builds a
+# real-disk (TempDir-backed) hermetic erasure set and drives MiB-scale writes
+# plus deep-scan heal — the same load-sensitive cross-disk IO shape as the
+# crash_consistency scenarios above. Under a heavily parallel run a single
+# disk's IO can fail while write quorum still holds, which flips per-disk
+# readback and aggregate-outcome assertions nondeterministically (different
+# tests each round; all pass standalone). Preventive serialization only, no
+# retries. The matching ci-profile override is after [profile.ci].
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::heal::heal_result_report_tests::/)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the metadata-cache generation-retirement pair. Both carry
+# #[serial(metadata_cache_invalidation_probe)] — a no-op across nextest's
+# process boundary — and assert get_object_metadata_cache generation
+# semantics on a 4-disk hermetic set, the same load-sensitive shape that
+# forced the transition matrix tests into this group. Preventive
+# serialization only, no retries. The matching ci-profile override is after
+# [profile.ci].
+[[profile.default.overrides]]
+filter = 'package(rustfs-ecstore) & test(retires_cached_snapshot)'
+test-group = 'ecstore-serial-flaky'
+
 # The production-handler relocation regression builds an isolated 8-disk,
 # 2-pool store and commits a 72 MiB multipart object. Keep that cross-disk IO
 # from overlapping the ecstore commit fixtures above.
@@ -248,6 +271,20 @@ test-group = 'e2e-reliability'
 # no retries, just serialized 4-disk cross-disk-commit IO.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the heal result-report tests under the ci profile too (see the
+# matching default-profile override near the top). Not a quarantine: no
+# retries, just serialized real-disk heal IO.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::heal::heal_result_report_tests::/)'
+test-group = 'ecstore-serial-flaky'
+
+# Serialize the metadata-cache generation-retirement pair under the ci
+# profile too (see the matching default-profile override near the top). Not a
+# quarantine: no retries.
+[[profile.ci.overrides]]
+filter = 'package(rustfs-ecstore) & test(retires_cached_snapshot)'
 test-group = 'ecstore-serial-flaky'
 
 # Match the default-profile embedded test isolation without quarantining or
