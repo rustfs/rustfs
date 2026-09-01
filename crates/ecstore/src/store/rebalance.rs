@@ -939,8 +939,12 @@ impl ECStore {
         bucket: &str,
         object: &str,
         opts: &ObjectOptions,
+        exact: &ObjectInfo,
         errs: Vec<PoolErr>,
     ) -> Result<ObjectInfo> {
+        self.reconcile_decommission_capacity_before_exact_delete(bucket, object, opts, exact)
+            .await?;
+
         let mut results = Vec::with_capacity(errs.len());
 
         for pe in errs.iter() {

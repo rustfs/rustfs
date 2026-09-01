@@ -49,7 +49,7 @@ use crate::error::{
     is_err_version_not_found,
 };
 use crate::layout::endpoints::EndpointServerPools;
-use crate::object_api::{DecommissionCapacityOptions, GetObjectReader, ObjectOptions};
+use crate::object_api::{DecommissionCapacityOptions, GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::runtime::sources as runtime_sources;
 use crate::services::notification_sys::{
     acquire_tier_delete_journal_fleet_proof, tier_delete_journal_fleet_proof_matches, tier_delete_journal_topology_generation,
@@ -78,7 +78,9 @@ use rmp_serde::Serializer;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
 use rustfs_heal_contracts::heal_channel::HealOpts;
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
-use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
+use rustfs_utils::path::{
+    decode_dir_object, encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path,
+};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -7159,6 +7161,170 @@ pub(crate) fn decommission_capacity_mutation_id(
     uuid::Uuid::from_bytes(bytes)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExactDeleteCapacityReconciliation {
+    source_pool_index: usize,
+    target_pool_index: usize,
+    mutation_id: uuid::Uuid,
+    expected_data_bytes: usize,
+    expected_target_physical_bytes: usize,
+}
+
+fn plan_exact_delete_capacity_reconciliations(
+    meta: &PoolMeta,
+    object: &str,
+    exact: &ObjectInfo,
+) -> Result<Vec<ExactDeleteCapacityReconciliation>> {
+    let version_id = exact.version_id.map(|version_id| version_id.to_string());
+    let mut matches = Vec::new();
+
+    for (source_pool_index, pool) in meta.pools.iter().enumerate() {
+        let Some(reservation) = pool
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .filter(|reservation| reservation.active())
+        else {
+            continue;
+        };
+        let owner = DecommissionCapacityOwner {
+            source_pool_index,
+            operation_id: reservation.operation_id,
+            generation: reservation.generation,
+            owner_nonce: reservation.owner_nonce,
+            mutation_id: None,
+        };
+        let logical_mutation_id = decommission_capacity_mutation_id(
+            owner,
+            &exact.bucket,
+            &exact.name,
+            version_id.as_deref(),
+            exact.delete_marker,
+            exact.mod_time,
+        );
+        // Existing data-movement producers persist directory-key intents using
+        // either the logical name or its internal `__XLDIR__` representation.
+        // Accept both while retaining the exact persisted identity for CAS.
+        let internal_mutation_id = if object == exact.name {
+            logical_mutation_id
+        } else {
+            decommission_capacity_mutation_id(
+                owner,
+                &exact.bucket,
+                object,
+                version_id.as_deref(),
+                exact.delete_marker,
+                exact.mod_time,
+            )
+        };
+        let mut source_match = None;
+
+        for target in &reservation.targets {
+            if target.pending_physical_bytes == 0 {
+                continue;
+            }
+            let Some(pending_mutation_id) = target.pending_mutation_id else {
+                return Err(decommission_capacity_blocked_error(format!(
+                    "source pool {source_pool_index} target pool {} has pending capacity without an object identity",
+                    target.pool_index
+                )));
+            };
+            if pending_mutation_id != logical_mutation_id && pending_mutation_id != internal_mutation_id {
+                continue;
+            }
+            if source_match.is_some() {
+                return Err(decommission_capacity_blocked_error(format!(
+                    "source pool {source_pool_index} has the same exact-delete capacity intent on multiple targets"
+                )));
+            }
+            source_match = Some((target.pool_index, target.layout, target.pending_physical_bytes, pending_mutation_id));
+        }
+
+        let Some((target_pool_index, target_layout, pending_physical_bytes, mutation_id)) = source_match else {
+            continue;
+        };
+        if exact.version_id.is_none() && exact.mod_time.is_none() {
+            return Err(decommission_capacity_blocked_error(
+                "unversioned exact delete cannot identify pending capacity without a modification time",
+            ));
+        }
+        let expected_data_bytes = if exact.delete_marker {
+            0
+        } else {
+            usize::try_from(exact.size).map_err(|_| {
+                decommission_capacity_blocked_error("exact delete cannot reconcile a negative or overflowing object size")
+            })?
+        };
+        let expected_target_physical_bytes = capacity_target_physical_bytes(expected_data_bytes.max(1), target_layout)?;
+        if pending_physical_bytes != expected_target_physical_bytes {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {source_pool_index} target pool {target_pool_index} pending capacity does not match the exact object size"
+            )));
+        }
+        let remaining_target_physical_bytes = reservation
+            .targets
+            .iter()
+            .find(|target| target.pool_index == target_pool_index)
+            .map(|target| {
+                target.remaining_reserved_physical_bytes(reservation.temporary_copies)
+                    / 1usize.saturating_add(reservation.temporary_copies)
+            })
+            .unwrap_or_default();
+        let remaining_total_physical_bytes = reservation
+            .predicted_physical_bytes
+            .saturating_sub(reservation.consumed_target_physical_bytes);
+        let remaining_data_bytes = reservation
+            .source_data_equivalent_bytes
+            .saturating_sub(reservation.committed_data_bytes);
+        if expected_target_physical_bytes > remaining_target_physical_bytes
+            || expected_target_physical_bytes > remaining_total_physical_bytes
+            || expected_data_bytes > remaining_data_bytes
+        {
+            return Err(decommission_capacity_blocked_error(format!(
+                "source pool {source_pool_index} target pool {target_pool_index} lacks reservation capacity for the exact object"
+            )));
+        }
+        matches.push(ExactDeleteCapacityReconciliation {
+            source_pool_index,
+            target_pool_index,
+            mutation_id,
+            expected_data_bytes,
+            expected_target_physical_bytes,
+        });
+    }
+
+    Ok(matches)
+}
+
+fn ensure_exact_delete_capacity_namespace_fences(opts: &ObjectOptions, bucket: &str, object: &str) -> Result<()> {
+    let object_fence = opts.namespace_lock_fence.as_ref().ok_or_else(|| {
+        decommission_capacity_blocked_error("exact delete capacity reconciliation requires an object namespace fence")
+    })?;
+    if object_fence.is_lock_lost() {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "exact_delete_capacity_reconciliation",
+            bucket: bucket.to_string(),
+            object: decode_dir_object(object),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    if opts
+        .bucket_lifecycle_lock_fence
+        .as_ref()
+        .is_some_and(crate::object_api::NamespaceLockFence::is_lock_lost)
+    {
+        return Err(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "exact_delete_capacity_bucket_generation",
+            bucket: bucket.to_string(),
+            object: decode_dir_object(object),
+            required: 1,
+            achieved: 0,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_decommission_capacity_mutation_id(bucket: &str, object: &str, opts: &mut ObjectOptions) {
     if opts
         .decommission_capacity
@@ -8220,6 +8386,117 @@ impl ECStore {
     {
         self.run_decommission_capacity_mutation(target_pool_index, capacity_owner, expected_data_bytes, false, false, operation)
             .await
+    }
+
+    pub(crate) async fn reconcile_decommission_capacity_before_exact_delete(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        exact: &ObjectInfo,
+    ) -> Result<()> {
+        if exact.bucket != bucket || exact.name != decode_dir_object(object) {
+            return Err(decommission_capacity_blocked_error(
+                "exact delete object identity changed before capacity reconciliation",
+            ));
+        }
+
+        let reconciliations = {
+            let mut save_guard = self.pool_meta_save_gate.lock().await;
+            let (_read_guard, snapshot) = self
+                .acquire_pool_meta_read_guard(&mut save_guard, "exact delete capacity reconciliation failed")
+                .await?;
+            plan_exact_delete_capacity_reconciliations(&snapshot, object, exact)?
+        };
+        if reconciliations.is_empty() {
+            return Ok(());
+        }
+        ensure_exact_delete_capacity_namespace_fences(opts, bucket, object)?;
+
+        let target_lookup_options = ObjectOptions {
+            versioned: opts.versioned,
+            version_suspended: opts.version_suspended,
+            version_id: opts.version_id.clone(),
+            metadata_chg: opts.version_id.is_some(),
+            no_lock: true,
+            ..Default::default()
+        };
+        for reconciliation in &reconciliations {
+            let target_pool = self.pools.get(reconciliation.target_pool_index).ok_or_else(|| {
+                decommission_capacity_blocked_error(format!(
+                    "source pool {} exact-delete capacity target pool {} is out of range",
+                    reconciliation.source_pool_index, reconciliation.target_pool_index
+                ))
+            })?;
+            let target = target_pool
+                .get_object_info(bucket, object, &target_lookup_options)
+                .await
+                .map_err(|err| {
+                    decommission_capacity_blocked_error(format!(
+                        "source pool {} target pool {} exact object evidence could not be read: {err}",
+                        reconciliation.source_pool_index, reconciliation.target_pool_index
+                    ))
+                })?;
+            if !Self::is_equivalent_decommission_capacity_target(exact, &target) {
+                return Err(decommission_capacity_blocked_error(format!(
+                    "source pool {} target pool {} does not contain an equivalent exact object for its pending capacity intent",
+                    reconciliation.source_pool_index, reconciliation.target_pool_index
+                )));
+            }
+        }
+        ensure_exact_delete_capacity_namespace_fences(opts, bucket, object)?;
+
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let (write_guard, mut snapshot) = self
+            .acquire_pool_meta_write_guard(&mut save_guard, "exact delete capacity reconciliation failed")
+            .await?;
+        let current_reconciliations = plan_exact_delete_capacity_reconciliations(&snapshot, object, exact)?;
+        if current_reconciliations != reconciliations {
+            return Err(decommission_capacity_blocked_error(
+                "pending capacity changed while exact target evidence was being verified",
+            ));
+        }
+        ensure_exact_delete_capacity_namespace_fences(opts, bucket, object)?;
+
+        let now = OffsetDateTime::now_utc();
+        let mut source_pool_indices = Vec::with_capacity(current_reconciliations.len());
+        for reconciliation in current_reconciliations {
+            resolve_decommission_target_pending(
+                &mut snapshot,
+                reconciliation.source_pool_index,
+                reconciliation.target_pool_index,
+                reconciliation.expected_target_physical_bytes,
+                reconciliation.mutation_id,
+            )?;
+            record_decommission_target_consumption(
+                &mut snapshot,
+                reconciliation.source_pool_index,
+                reconciliation.target_pool_index,
+                DecommissionTargetConsumption {
+                    committed_data_bytes: reconciliation.expected_data_bytes,
+                    target_physical_bytes: reconciliation.expected_target_physical_bytes,
+                    observed_physical_bytes: 0,
+                },
+                reconciliation.mutation_id,
+                now,
+            )?;
+            source_pool_indices.push(reconciliation.source_pool_index);
+        }
+        source_pool_indices.sort_unstable();
+        source_pool_indices.dedup();
+        ensure_exact_delete_capacity_namespace_fences(opts, bucket, object)?;
+
+        let outcome = snapshot
+            .save_no_lock_armed(self.pools.clone(), &mut save_guard, write_guard.lock_lost_signal(), &source_pool_indices)
+            .await?;
+        ensure_pool_meta_write_fence(&write_guard, "exact delete capacity reconciliation save failed")?;
+        {
+            let mut pool_meta = self.pool_meta.write().await;
+            publish_pool_meta_updates(&mut pool_meta, &outcome.committed, &source_pool_indices);
+        }
+        ensure_pool_meta_write_fence(&write_guard, "exact delete capacity reconciliation save failed")?;
+        outcome.disarm();
+        Ok(())
     }
 
     pub(crate) async fn reconcile_decommission_capacity_after_equivalent_target(
@@ -17149,7 +17426,8 @@ mod pools_tests {
     use super::{
         DecommissionCapacityOwner, DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation,
         decommission_capacity_mutation_id, ensure_decommission_target_owner_admission,
-        ensure_external_decommission_target_admission, is_decommission_capacity_blocked_error,
+        ensure_exact_delete_capacity_namespace_fences, ensure_external_decommission_target_admission,
+        is_decommission_capacity_blocked_error, plan_exact_delete_capacity_reconciliations,
         record_decommission_target_consumption, reserve_decommission_target_pending, resolve_decommission_target_pending,
         set_decommission_capacity_info_overrides_for_test,
     };
@@ -17164,7 +17442,7 @@ mod pools_tests {
     use crate::disk::{STORAGE_FORMAT_FILE, endpoint::Endpoint};
     use crate::error::{Error, StorageError};
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
-    use crate::object_api::ObjectOptions;
+    use crate::object_api::{ObjectInfo, ObjectOptions};
     use crate::runtime::instance::InstanceContext;
     use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
@@ -21283,6 +21561,135 @@ mod pools_tests {
         let first = decommission_capacity_mutation_id(owner, "bucket", "object", Some("version"), false, None);
         let recovered = decommission_capacity_mutation_id(recovered_owner, "bucket", "object", Some("version"), false, None);
         assert_eq!(first, recovered, "a lease nonce rotation must not change the mutation identity");
+    }
+
+    #[test]
+    fn exact_delete_capacity_plan_requires_identity_and_exact_size() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(2);
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacity_infos = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0),
+        ];
+        let mut meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None), decommission_test_pool_status(1, None)],
+            ..Default::default()
+        };
+        meta.decommission(0, capacity_infos[0].space).unwrap();
+        reserve_decommission_start_target_capacity(&mut meta, &[0], &capacity_infos, uuid::Uuid::new_v4(), 1, now)
+            .expect("the exact-delete test reservation should fit");
+        let exact = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(uuid::Uuid::from_u128(7)),
+            mod_time: Some(now),
+            size: 10,
+            ..Default::default()
+        };
+        let owner = {
+            let reservation = meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("the exact-delete test reservation should exist");
+            DecommissionCapacityOwner {
+                source_pool_index: 0,
+                operation_id: reservation.operation_id,
+                generation: reservation.generation,
+                owner_nonce: reservation.owner_nonce,
+                mutation_id: None,
+            }
+        };
+        let version_id = exact.version_id.map(|version_id| version_id.to_string());
+        let mutation_id = decommission_capacity_mutation_id(
+            owner,
+            &exact.bucket,
+            &exact.name,
+            version_id.as_deref(),
+            exact.delete_marker,
+            exact.mod_time,
+        );
+        reserve_decommission_target_pending(&mut meta, 0, 1, 10, mutation_id, now + Duration::seconds(1))
+            .expect("the exact-delete test intent should be reserved");
+
+        let plan = plan_exact_delete_capacity_reconciliations(&meta, &exact.name, &exact)
+            .expect("the exact identity should match the pending intent");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].source_pool_index, 0);
+        assert_eq!(plan[0].target_pool_index, 1);
+        assert_eq!(plan[0].expected_data_bytes, 10);
+        assert_eq!(plan[0].expected_target_physical_bytes, 10);
+
+        let mismatched_size = ObjectInfo {
+            size: 9,
+            ..exact.clone()
+        };
+        let mismatched_size = plan_exact_delete_capacity_reconciliations(&meta, &mismatched_size.name, &mismatched_size)
+            .expect_err("a different exact size must not consume the pending intent");
+        assert!(mismatched_size.to_string().contains("does not match the exact object size"));
+
+        let directory_exact = ObjectInfo {
+            name: "directory/".to_string(),
+            ..exact.clone()
+        };
+        let internal_directory = rustfs_utils::path::encode_dir_object(&directory_exact.name);
+        let internal_directory_mutation_id = decommission_capacity_mutation_id(
+            owner,
+            &directory_exact.bucket,
+            &internal_directory,
+            version_id.as_deref(),
+            directory_exact.delete_marker,
+            directory_exact.mod_time,
+        );
+        meta.pools[0]
+            .decommission
+            .as_mut()
+            .and_then(|info| info.capacity_reservation.as_mut())
+            .expect("the exact-delete test reservation should exist")
+            .targets[0]
+            .pending_mutation_id = Some(internal_directory_mutation_id);
+        let directory_plan = plan_exact_delete_capacity_reconciliations(&meta, &internal_directory, &directory_exact)
+            .expect("an internally encoded directory intent should match its logical exact object");
+        assert_eq!(directory_plan[0].mutation_id, internal_directory_mutation_id);
+
+        let logical_directory_mutation_id = decommission_capacity_mutation_id(
+            owner,
+            &directory_exact.bucket,
+            &directory_exact.name,
+            version_id.as_deref(),
+            directory_exact.delete_marker,
+            directory_exact.mod_time,
+        );
+        meta.pools[0]
+            .decommission
+            .as_mut()
+            .and_then(|info| info.capacity_reservation.as_mut())
+            .expect("the exact-delete test reservation should exist")
+            .targets[0]
+            .pending_mutation_id = Some(logical_directory_mutation_id);
+        let directory_plan = plan_exact_delete_capacity_reconciliations(&meta, &internal_directory, &directory_exact)
+            .expect("a logical directory intent should match its internally encoded delete path");
+        assert_eq!(directory_plan[0].mutation_id, logical_directory_mutation_id);
+
+        meta.pools[0]
+            .decommission
+            .as_mut()
+            .and_then(|info| info.capacity_reservation.as_mut())
+            .expect("the exact-delete test reservation should exist")
+            .targets[0]
+            .pending_mutation_id = None;
+        let unidentified = plan_exact_delete_capacity_reconciliations(&meta, &exact.name, &exact)
+            .expect_err("an unidentified pending intent must fail closed");
+        assert!(unidentified.to_string().contains("without an object identity"));
+
+        let mut opts = ObjectOptions::default();
+        let unfenced = ensure_exact_delete_capacity_namespace_fences(&opts, &exact.bucket, &exact.name)
+            .expect_err("capacity reconciliation must reject a missing object namespace fence");
+        assert!(unfenced.to_string().contains("requires an object namespace fence"));
+        opts.ensure_namespace_lock_fence();
+        ensure_exact_delete_capacity_namespace_fences(&opts, &exact.bucket, &exact.name)
+            .expect("a live object namespace fence should admit capacity reconciliation");
     }
 
     #[test]
