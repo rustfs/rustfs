@@ -4075,23 +4075,54 @@ pub(crate) struct PoolMetaWriteState {
     expected_cluster_id: Option<uuid::Uuid>,
     cluster_epoch: Option<u64>,
     pool_meta_absent: bool,
-    fresh_bootstrap_proven: bool,
+    bootstrap_authority: PoolMetaBootstrapAuthority,
     identity_initialized: Option<bool>,
     identity_fresh_bootstrap_nonce: Option<uuid::Uuid>,
     identity_needs_repair: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PoolMetaBootstrapAuthority {
+    #[default]
+    None,
+    Fresh,
+    LegacyAdoption,
+}
+
+impl PoolMetaBootstrapAuthority {
+    pub(crate) fn combine_across_pools(self, other: Self) -> Self {
+        if self == other { self } else { Self::None }
+    }
+
+    fn is_proven(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 impl PoolMetaWriteState {
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn for_startup(cluster_id: uuid::Uuid, fresh_bootstrap_proven: bool) -> Self {
+        let bootstrap_authority = if fresh_bootstrap_proven {
+            PoolMetaBootstrapAuthority::Fresh
+        } else {
+            PoolMetaBootstrapAuthority::None
+        };
+        Self::for_startup_with_bootstrap_authority(cluster_id, bootstrap_authority)
+    }
+
+    pub(crate) fn for_startup_with_bootstrap_authority(
+        cluster_id: uuid::Uuid,
+        bootstrap_authority: PoolMetaBootstrapAuthority,
+    ) -> Self {
         Self {
             expected_cluster_id: Some(cluster_id),
-            fresh_bootstrap_proven,
+            bootstrap_authority,
             ..Default::default()
         }
     }
 
-    pub(crate) fn fresh_bootstrap_proven(&self) -> bool {
-        self.fresh_bootstrap_proven
+    pub(crate) fn bootstrap_identity_proven(&self) -> bool {
+        self.bootstrap_authority.is_proven()
     }
 
     pub(crate) fn identity_is_pending(&self) -> bool {
@@ -4113,7 +4144,7 @@ impl PoolMetaWriteState {
     #[cfg(any(test, feature = "test-util"))]
     fn for_test_bootstrap() -> Self {
         Self {
-            fresh_bootstrap_proven: true,
+            bootstrap_authority: PoolMetaBootstrapAuthority::Fresh,
             identity_initialized: Some(false),
             identity_fresh_bootstrap_nonce: Some(uuid::Uuid::new_v4()),
             ..Default::default()
@@ -4174,7 +4205,7 @@ impl PoolMetaWriteState {
         self.identity_fresh_bootstrap_nonce = selection.identity.and_then(|identity| identity.fresh_bootstrap_nonce);
         if let Some(identity) = selection.identity {
             if identity.initialized {
-                self.fresh_bootstrap_proven = false;
+                self.bootstrap_authority = PoolMetaBootstrapAuthority::None;
             }
             if let Some(metadata_epoch) = self.cluster_epoch
                 && metadata_epoch != identity.epoch
@@ -4198,11 +4229,11 @@ impl PoolMetaWriteState {
             return Ok(());
         }
         match self.identity_initialized {
-            Some(false) if self.fresh_bootstrap_proven && self.identity_fresh_bootstrap_nonce.is_some() => Ok(()),
+            Some(false) if self.bootstrap_identity_proven() && self.identity_fresh_bootstrap_nonce.is_some() => Ok(()),
             Some(false) => {
                 self.block_writes();
                 Err(Error::other(
-                    "pool metadata recovery required: pending cluster identity exists but this startup has no verified fresh-bootstrap proof",
+                    "pool metadata recovery required: pending cluster identity exists but this startup has no verified fresh-bootstrap proof or legacy-adoption proof",
                 ))
             }
             Some(true) => {
@@ -5184,10 +5215,10 @@ where
                 ..identity
             },
             Some(identity) => identity,
-            None if !initialized && !write_state.fresh_bootstrap_proven() => {
+            None if !initialized && !write_state.bootstrap_identity_proven() => {
                 write_state.block_writes();
                 return Err(Error::other(
-                    "pool metadata recovery required: cannot create a pending cluster identity without verified fresh-bootstrap proof",
+                    "pool metadata recovery required: cannot create a pending cluster identity without verified fresh-bootstrap proof or legacy-adoption proof",
                 ));
             }
             None => PersistedPoolMetaIdentity {
