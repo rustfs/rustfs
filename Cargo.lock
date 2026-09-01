@@ -10606,6 +10606,8 @@ dependencies = [
  "rustfs-s3select-api",
  "rustfs-test-utils",
  "s3s",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]
