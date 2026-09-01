@@ -83,6 +83,8 @@ worktrees/*
 
 # Local AI-agent review artifacts (omo evidence dumps)
 .omo/
+# Legacy per-tool skill dir; skills live in .agents/skills (shared by all agents)
+.mimocode/
 
 # insta scratch files; the accepted .snap files ARE the assertions and are committed
 *.snap.new
