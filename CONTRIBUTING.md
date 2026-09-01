@@ -62,7 +62,7 @@ make test
 # Fast pre-commit gate — see below for exactly what it runs
 make pre-commit
 
-# Full pre-PR gate (pre-commit gates + clippy + tests)
+# Optional full gate for broad cross-module changes (pre-commit + clippy + tests)
 make pre-pr
 ```
 
@@ -88,14 +88,16 @@ make pre-pr
 8. `quick-check` — `cargo check --workspace --exclude e2e_test`
 
 **`make pre-commit` does NOT run clippy and does NOT run any tests.**
-A green `make pre-commit` is not enough to open a pull request.
+It does not replace the scoped Clippy and test checks applicable to a change.
 
 `make pre-pr` is the **full** gate: it runs all of the guard checks above,
 then `clippy-check` (`cargo clippy --all-targets --all-features -- -D warnings`)
 and `test` (shell script tests, workspace tests excluding `e2e_test`, and doc
 tests). Complete the applicable multi-role adversarial review described in
-`AGENTS.md` before running `make pre-pr`; then run the gate before opening or
-updating a pull request. This is what CI enforces.
+`AGENTS.md` first. Do not run `make pre-pr` locally by default before opening or
+updating a pull request. Consider it only for a broad change that spans multiple
+modules and whose impact cannot be bounded by targeted checks; decide from the
+affected boundaries and risks. CI still runs its configured repository gates.
 
 ### 🔒 Git Pre-commit Hooks (optional)
 
@@ -114,8 +116,9 @@ Or manually:
 chmod +x .git/hooks/pre-commit
 ```
 
-With or without a hook, the expectation is the same: run `make pre-commit`
-before committing and `make pre-pr` before opening a pull request.
+With or without a hook, follow the verification tiers in `AGENTS.md`. Run the
+applicable scoped checks, and reserve `make pre-pr` for broad cross-module
+changes whose impact cannot be bounded by those checks.
 
 ### 📝 Formatting Configuration
 
@@ -154,7 +157,9 @@ Example output when formatting fails:
 3. **Run the fast gate**: `make pre-commit` (no clippy, no tests)
 4. **Commit your changes**: `git commit -m "your message"`
 5. **Complete the applicable multi-role adversarial review** for non-exempt changes (see `AGENTS.md`)
-6. **Run the full gate before opening/updating a PR**: `make pre-pr` (clippy + tests)
+6. **Run applicable scoped checks before opening/updating a PR**; consider
+   `make pre-pr` only for broad cross-module changes whose impact cannot be
+   bounded by targeted checks
 7. **Push to your branch**: `git push`
 
 ### 🛠️ IDE Integration
