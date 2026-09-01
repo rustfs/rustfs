@@ -1639,10 +1639,13 @@ mod prepared_get_object_metadata_tests {
         .await;
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial(body_cache_hook)]
-    async fn non_inline_data_read_early_stop_does_not_add_inline_fanout_on_unequal_layout() {
-        let (_dirs, set_disks) = make_local_set_disks(6, 2).await;
+    fn non_inline_data_read_early_stop_does_not_add_inline_fanout_on_unequal_layout() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime should build");
         let bucket = "inline-read-plan-unequal";
         let object = object_with_initial_data_shards_for_geometry(bucket, "inline-object", 6, 2);
         let payload = b"inline quorum payload".repeat(256);
@@ -1651,55 +1654,65 @@ mod prepared_get_object_metadata_tests {
             ..Default::default()
         };
 
-        set_disks
-            .make_bucket(bucket, &MakeBucketOptions::default())
-            .await
-            .expect("bucket should be created");
-        let mut put_reader = PutObjReader::from_vec(payload.clone());
-        set_disks
-            .put_object(bucket, &object, &mut put_reader, &opts)
-            .await
-            .expect("inline object should be written");
-
-        let read_once = |enabled: bool| {
-            let set_disks = Arc::clone(&set_disks);
-            let bucket = bucket.to_string();
-            let object = object.clone();
-            let payload = payload.clone();
-            let opts = opts.clone();
-            async move {
-                temp_env::async_with_vars(
-                    [
-                        (
-                            "RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE",
-                            Some(if enabled { "true" } else { "false" }),
-                        ),
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
-                    ],
-                    async {
-                        let calls = disk_call_counters::observe(&object);
-                        let mut reader = set_disks
-                            .get_object_reader(&bucket, &object, None, HeaderMap::new(), &opts)
-                            .await
-                            .expect("inline GET reader should open");
-                        let mut restored = Vec::new();
-                        reader
-                            .stream
-                            .read_to_end(&mut restored)
-                            .await
-                            .expect("inline GET body should stream");
-                        assert_eq!(restored, payload);
-                        calls.total(disk_call_counters::KIND_READ_VERSION)
-                    },
-                )
+        let (_dirs, set_disks) = runtime.block_on(async {
+            let (dirs, set_disks) = make_local_set_disks(6, 2).await;
+            set_disks
+                .make_bucket(bucket, &MakeBucketOptions::default())
                 .await
-            }
-        };
+                .expect("bucket should be created");
+            let mut put_reader = PutObjReader::from_vec(payload.clone());
+            set_disks
+                .put_object(bucket, &object, &mut put_reader, &opts)
+                .await
+                .expect("inline object should be written");
+            (dirs, set_disks)
+        });
 
-        let gate_off_calls = read_once(false).await;
-        let gate_on_calls = read_once(true).await;
-        assert_eq!(gate_on_calls, gate_off_calls, "inline gate must not add reserve fanout");
+        // disk_call_counters counts tasks that started running, so an
+        // early-stop abort races the single-pending inline hedge into a ±1
+        // count per read. The fanout lifecycle histogram records the
+        // scheduling decision itself and stays deterministic under load.
+        let recorder = CapturingRecorder::default();
+        let previous_gate = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                for enabled in [false, true] {
+                    temp_env::async_with_vars(
+                        [
+                            (
+                                "RUSTFS_GET_METADATA_TWO_PHASE_READ_PLAN_ENABLE",
+                                Some(if enabled { "true" } else { "false" }),
+                            ),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
+                            ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", Some("true")),
+                        ],
+                        async {
+                            let mut reader = set_disks
+                                .get_object_reader(bucket, &object, None, HeaderMap::new(), &opts)
+                                .await
+                                .expect("inline GET reader should open");
+                            let mut restored = Vec::new();
+                            reader
+                                .stream
+                                .read_to_end(&mut restored)
+                                .await
+                                .expect("inline GET body should stream");
+                            assert_eq!(restored, payload);
+                        },
+                    )
+                    .await;
+                }
+            })
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous_gate);
+
+        let scheduled = recorder.histogram_values(
+            "rustfs_io_get_object_metadata_fanout_scheduled",
+            &[("path", GET_OBJECT_PATH_LEGACY_DUPLEX)],
+        );
+        assert_eq!(scheduled.len(), 2, "each GET should run exactly one metadata fanout");
+        assert_eq!(scheduled[1], scheduled[0], "inline gate must not add reserve fanout");
     }
 
     #[test]
