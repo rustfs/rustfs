@@ -2668,7 +2668,6 @@ pub(crate) async fn complete_tier_delete_dispatch(
     ensure_durable_write_fence(&fences_current, "before tier delete dispatch completion")?;
     let make_commit = |index: usize| {
         let api = api.clone();
-        let active = active;
         let fences_current = &fences_current;
         async move {
             active.authorization.ensure_current(
