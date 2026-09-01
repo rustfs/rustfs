@@ -198,6 +198,22 @@ impl BucketDeleteBlockerKind {
             Self::DiagnosticBudgetExceeded => "diagnostic_budget_exceeded",
         }
     }
+
+    /// Whether the blocking residue is something the caller can still see and
+    /// remove through the S3 API.
+    ///
+    /// A live version or a tier free-version is ordinary: the bucket really is
+    /// not empty, the client can list and delete what is left, and the 409 it
+    /// receives is a complete answer.
+    ///
+    /// The remaining kinds are not. They are on-disk state that no S3 request
+    /// can reach: the caller has drained every version the API will show and
+    /// `DeleteBucket` still refuses, with no way to find out why. That is a
+    /// server-side integrity problem, and it is the reason this classification
+    /// exists — see [`bucket_delete_blocker_level`].
+    pub(crate) const fn is_client_visible(self) -> bool {
+        matches!(self, Self::VisibleVersion | Self::TierFreeVersion)
+    }
 }
 
 impl BucketMetadataLessResidue {

@@ -32,9 +32,44 @@ const SCANNER_BUCKET_LIST_SET_CONCURRENCY: usize = 4;
 const EVENT_BUCKET_DELETE_BLOCKED: &str = "bucket_delete_blocked";
 const EVENT_BUCKET_DELETE_ROLLBACK_FAILED: &str = "bucket_delete_rollback_failed";
 
+/// Record why `DeleteBucket` refused, and at a level that matches who can act
+/// on it.
+///
+/// `DeleteBucket` answers from a raw per-disk residue scan, not from a listing,
+/// so the server can refuse for a reason the client has no way to observe: the
+/// caller drained every version the S3 API will show and still gets
+/// `BucketNotEmpty`, with nothing to go on. This event is the only record of
+/// which residue blocked it and where — and it used to be emitted at `debug`,
+/// below both the `error` default log level and the `info` the CI s3-tests lane
+/// runs at, so in practice it was never written down. An intermittent
+/// `BucketNotEmpty` in that lane left a server log with no trace of the refusal
+/// at all, which is not a diagnosable state.
+///
+/// A blocker the client can still see and delete is ordinary — the 409 already
+/// says everything useful — so it stays at `warn`. Residue the client cannot
+/// reach through the API is a server-side integrity problem and is reported at
+/// `error`, which is what makes it survive a default deployment's filter.
 fn record_bucket_delete_blocker(bucket: &str, kind: BucketDeleteBlockerKind, residue: &BucketMetadataLessResidue) {
     metrics::counter!("rustfs_bucket_delete_blockers_total", "kind" => kind.as_str()).increment(1);
-    debug!(
+    if kind.is_client_visible() {
+        warn!(
+            event = EVENT_BUCKET_DELETE_BLOCKED,
+            component = "ecstore",
+            subsystem = "bucket",
+            bucket,
+            blocker = kind.as_str(),
+            files = residue.files,
+            uuid_data_dirs = residue.uuid_data_dirs,
+            entries_scanned = residue.entries_scanned,
+            diagnostic_bytes_read = residue.diagnostic_bytes_read,
+            diagnostic_truncated = residue.diagnostic_truncated,
+            sample = residue.sample.as_deref().unwrap_or("<none>"),
+            "Bucket deletion was blocked by durable local state"
+        );
+        return;
+    }
+
+    error!(
         event = EVENT_BUCKET_DELETE_BLOCKED,
         component = "ecstore",
         subsystem = "bucket",
@@ -46,7 +81,7 @@ fn record_bucket_delete_blocker(bucket: &str, kind: BucketDeleteBlockerKind, res
         diagnostic_bytes_read = residue.diagnostic_bytes_read,
         diagnostic_truncated = residue.diagnostic_truncated,
         sample = residue.sample.as_deref().unwrap_or("<none>"),
-        "Bucket deletion was blocked by durable local state"
+        "Bucket deletion was blocked by residue the client cannot reach through the S3 API"
     );
 }
 
@@ -1008,11 +1043,11 @@ impl ECStore {
 mod tests {
     use super::{
         BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED, BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES,
-        BucketDeleteBlockerKind, BucketDeleteDiagnosticBudget, SCANNER_BUCKET_LIST_SET_CONCURRENCY,
+        BucketDeleteBlockerKind, BucketDeleteDiagnosticBudget, BucketMetadataLessResidue, SCANNER_BUCKET_LIST_SET_CONCURRENCY,
         await_bucket_namespace_operation, bucket_delete_metadata_cleanup_prefixes, bucket_deleted_marker_prefix,
-        bucket_deleted_marker_volume, bucket_list_set_concurrency, run_bucket_usage_cleanup, run_physical_bucket_deletion,
-        scan_metadata_less_residue, scan_metadata_less_residue_with_budget, should_override_created_from_metadata,
-        validate_table_bucket_delete_allowed,
+        bucket_deleted_marker_volume, bucket_list_set_concurrency, record_bucket_delete_blocker, run_bucket_usage_cleanup,
+        run_physical_bucket_deletion, scan_metadata_less_residue, scan_metadata_less_residue_with_budget,
+        should_override_created_from_metadata, validate_table_bucket_delete_allowed,
     };
     use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
     use crate::bucket::metadata_sys;
@@ -2973,5 +3008,122 @@ mod tests {
         crate::config::com::save_config(ecstore, &usage_path, restored)
             .await
             .expect("usage fixture should be restored after the failure-path test");
+    }
+
+    /// Capture this module's log the way a stock deployment filters it.
+    fn bucket_logs_at_default_level(emit: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct CapturedLogs {
+            buffer: Arc<Mutex<Vec<u8>>>,
+        }
+        struct CapturedLogWriter {
+            buffer: Arc<Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for CapturedLogWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.buffer
+                    .lock()
+                    .expect("captured logs mutex should not be poisoned")
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CapturedLogs {
+            type Writer = CapturedLogWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CapturedLogWriter {
+                    buffer: Arc::clone(&self.buffer),
+                }
+            }
+        }
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new(rustfs_config::DEFAULT_LOG_LEVEL))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .without_time(),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
+
+        emit();
+
+        let buffer = logs
+            .buffer
+            .lock()
+            .expect("captured logs mutex should not be poisoned")
+            .clone();
+        String::from_utf8(buffer).expect("captured logs should be valid UTF-8")
+    }
+
+    fn residue_sample(sample: &str) -> BucketMetadataLessResidue {
+        BucketMetadataLessResidue {
+            files: 1,
+            entries_scanned: 3,
+            sample: Some(sample.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// `DeleteBucket` answers from a raw per-disk residue scan, so it can refuse
+    /// for a reason no S3 request can observe. When that happens the server's
+    /// own record of which residue blocked it must survive the default log
+    /// filter — otherwise a client that drained the bucket sees `BucketNotEmpty`
+    /// and the server log holds no trace of the refusal at all.
+    #[test]
+    fn unreachable_residue_is_reported_at_the_default_log_level() {
+        for kind in [
+            BucketDeleteBlockerKind::UnknownXlMeta,
+            BucketDeleteBlockerKind::OrphanDirectory,
+            BucketDeleteBlockerKind::DiagnosticBudgetExceeded,
+        ] {
+            let logs = bucket_logs_at_default_level(|| {
+                record_bucket_delete_blocker("drained-bucket", kind, &residue_sample("obj/8f2c/xl.meta"));
+            });
+
+            assert!(logs.contains("drained-bucket"), "the bucket must be named for {kind:?}: {logs}");
+            assert!(logs.contains(kind.as_str()), "the blocker kind must be named for {kind:?}: {logs}");
+            assert!(
+                logs.contains("obj/8f2c/xl.meta"),
+                "the residue sample is the only pointer to the leftover state for {kind:?}: {logs}"
+            );
+        }
+    }
+
+    /// A bucket that genuinely still holds a version is an ordinary 409: the
+    /// client can list and delete what is left, so this must not be reported as
+    /// a server-side fault.
+    #[test]
+    fn client_visible_blockers_stay_below_the_default_log_level() {
+        for kind in [
+            BucketDeleteBlockerKind::VisibleVersion,
+            BucketDeleteBlockerKind::TierFreeVersion,
+        ] {
+            let logs = bucket_logs_at_default_level(|| {
+                record_bucket_delete_blocker("still-full-bucket", kind, &residue_sample("obj/xl.meta"));
+            });
+
+            assert!(logs.is_empty(), "an ordinary non-empty bucket must not log an error for {kind:?}: {logs}");
+        }
+    }
+
+    #[test]
+    fn blocker_kinds_split_by_whether_the_client_can_reach_the_residue() {
+        assert!(BucketDeleteBlockerKind::VisibleVersion.is_client_visible());
+        assert!(BucketDeleteBlockerKind::TierFreeVersion.is_client_visible());
+        assert!(!BucketDeleteBlockerKind::UnknownXlMeta.is_client_visible());
+        assert!(!BucketDeleteBlockerKind::OrphanDirectory.is_client_visible());
+        assert!(!BucketDeleteBlockerKind::DiagnosticBudgetExceeded.is_client_visible());
     }
 }
