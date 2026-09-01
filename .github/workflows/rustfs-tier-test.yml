@@ -11,6 +11,15 @@ on:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
         type: string
+      rc_sha256:
+        description: 'Optional SHA-256 for the preinstalled rc binary; mismatch is an infrastructure failure.'
+        required: false
+        type: string
+      force_case_failure:
+        description: 'Diagnostic only: rewrite single-single/TIER-101 to FAIL after execution to verify artifact and final-gate behavior.'
+        required: false
+        default: false
+        type: boolean
   workflow_run:
     # Strict shared-environment order: run after KMS test completes.
     workflows: ["RustFS KMS Test"]
@@ -33,12 +42,13 @@ env:
   RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
   RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
   RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+  RUSTFS_EXPECTED_RC_SHA256: ${{ inputs.rc_sha256 || vars.RUSTFS_TIER_RC_SHA256 }}
   PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+  TIER_ARTIFACTS_DIR: /tmp/rustfs-tier-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   tier-test:
     runs-on: smoke-testing
-    continue-on-error: true
     timeout-minutes: 420
     if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_run' }}
     steps:
@@ -111,12 +121,24 @@ jobs:
         continue-on-error: true
         env:
           LOG_FILE: /tmp/rustfs-tier.log
+          PACKAGE_URL_INPUT: ${{ inputs.package_url }}
+          RUSTFS_VERSION_INPUT: ${{ inputs.rustfs_version }}
         run: |
           set -euo pipefail
           chmod +x auto-testing/rustfs-tier-test.sh
-          PACKAGE_URL='${{ inputs.package_url }}'
-          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
-          ARGS=(--all-topologies -y --log-file "${LOG_FILE}")
+          RC_BIN="$(command -v rc)"
+          PACKAGE_URL="${PACKAGE_URL_INPUT}"
+          RUSTFS_VERSION="${RUSTFS_VERSION_INPUT}"
+          ARGS=(
+            --all-topologies
+            -y
+            --log-file "${LOG_FILE}"
+            --rc-bin "${RC_BIN}"
+            --artifacts-dir "${TIER_ARTIFACTS_DIR}"
+          )
+          if [ -n "${RUSTFS_EXPECTED_RC_SHA256}" ]; then
+            ARGS+=(--expected-rc-sha256 "${RUSTFS_EXPECTED_RC_SHA256}")
+          fi
           if [ -n "${PACKAGE_URL}" ]; then
             ARGS+=(--package-url "${PACKAGE_URL}")
           elif [ -n "${RUSTFS_VERSION}" ]; then
@@ -126,15 +148,32 @@ jobs:
           fi
           ./auto-testing/rustfs-tier-test.sh "${ARGS[@]}"
 
+      - name: Inject diagnostic case failure
+        if: ${{ always() && inputs.force_case_failure }}
+        run: |
+          set -euo pipefail
+          RESULT_FILE="${TIER_ARTIFACTS_DIR}/cases/single-single--TIER-101.json"
+          test -s "${RESULT_FILE}"
+          TMP_FILE="$(mktemp "${TIER_ARTIFACTS_DIR}/cases/.forced.XXXXXX")"
+          jq '.status = "FAIL" | .case_rc = 97' "${RESULT_FILE}" > "${TMP_FILE}"
+          mv "${TMP_FILE}" "${RESULT_FILE}"
+
       - name: Generate report
         if: always()
         env:
           LOG_FILE: /tmp/rustfs-tier.log
           REPORT_FILE: /tmp/rustfs-tier-report.md
+          CASE_TABLE: /tmp/rustfs-tier-cases.md
+          GATE_RC_FILE: /tmp/rustfs-tier-gate.rc
+          PACKAGE_URL_INPUT: ${{ inputs.package_url }}
+          RUSTFS_VERSION_INPUT: ${{ inputs.rustfs_version }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TRIGGER_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          PACKAGE_URL='${{ inputs.package_url }}'
-          RUSTFS_VERSION='${{ inputs.rustfs_version }}'
+          PACKAGE_URL="${PACKAGE_URL_INPUT}"
+          RUSTFS_VERSION="${RUSTFS_VERSION_INPUT}"
           if [ -n "${PACKAGE_URL}" ]; then
             PACKAGE_SOURCE="${PACKAGE_URL}"
           elif [ -n "${RUSTFS_VERSION}" ]; then
@@ -142,65 +181,31 @@ jobs:
           else
             PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
-          CASE_TABLE="/tmp/rustfs-tier-cases.md"
-          python3 - "${LOG_FILE}" "${CASE_TABLE}" <<'PY'
-          import re
-          import sys
-
-          log_file, out_file = sys.argv[1], sys.argv[2]
-          ansi = re.compile(r'\x1b\[[0-9;]*m')
-          start_re = re.compile(r'^---\s+([A-Z]+-[0-9]+)\s+(.+?)\s+---$')
-          done_re = re.compile(r'^\[(PASS|FAIL|UNSUPPORTED)\]\s+([A-Z]+-[0-9]+)\b')
-
-          rows = []
-          index = {}
-          try:
-            with open(log_file, 'r', encoding='utf-8', errors='replace') as fh:
-              for raw in fh:
-                line = ansi.sub('', raw).strip()
-                m = start_re.match(line)
-                if m:
-                  case_id, name = m.group(1), m.group(2)
-                  if case_id not in index:
-                    index[case_id] = len(rows)
-                    rows.append([case_id, name, 'RUNNING'])
-                  continue
-                m = done_re.match(line)
-                if m:
-                  status, case_id = m.group(1), m.group(2)
-                  if case_id in index:
-                    rows[index[case_id]][2] = status
-                  else:
-                    rows.append([case_id, case_id, status])
-                    index[case_id] = len(rows) - 1
-          except FileNotFoundError:
-            rows = []
-
-          counts = {'PASS': 0, 'FAIL': 0, 'UNSUPPORTED': 0, 'RUNNING': 0}
-          for _, _, status in rows:
-            counts[status] = counts.get(status, 0) + 1
-
-          with open(out_file, 'w', encoding='utf-8') as out:
-            out.write('## Case Summary\n\n')
-            out.write(f"- Total: {len(rows)}\\n")
-            out.write(f"- PASS: {counts.get('PASS', 0)}\\n")
-            out.write(f"- FAIL: {counts.get('FAIL', 0)}\\n")
-            out.write(f"- UNSUPPORTED: {counts.get('UNSUPPORTED', 0)}\\n")
-            out.write('\\n')
-            out.write('| Case | Name | Status |\\n')
-            out.write('| --- | --- | --- |\\n')
-            for case_id, name, status in rows:
-              out.write(f'| {case_id} | {name} | {status} |\\n')
-          PY
+          set +e
+          python3 auto-testing/rustfs_tier_report.py \
+            --results-dir "${TIER_ARTIFACTS_DIR}/cases" \
+            --provenance "${TIER_ARTIFACTS_DIR}/provenance.json" \
+            --output "${CASE_TABLE}"
+          CASE_GATE_RC=$?
+          set -e
+          printf '%s\n' "${CASE_GATE_RC}" > "${GATE_RC_FILE}"
+          if [ ! -s "${CASE_TABLE}" ]; then
+            {
+              echo "## Case Summary"
+              echo ""
+              echo "Structured report generation failed before producing output (exit ${CASE_GATE_RC})."
+            } > "${CASE_TABLE}"
+          fi
           {
             echo "# RustFS tier test report"
             echo ""
-            echo "- Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Run: ${RUN_URL}"
+            echo "- Trigger: ${TRIGGER_NAME}"
             echo "- Package: ${PACKAGE_SOURCE}"
-            echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo "- Test Step Outcome: ${TEST_OUTCOME}"
+            echo "- Structured Gate Exit: ${CASE_GATE_RC}"
             echo ""
-            cat "${CASE_TABLE}" || true
+            cat "${CASE_TABLE}"
             echo ""
             echo "## Log tail"
             echo '```text'
@@ -340,11 +345,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: rustfs-tier-test-${{ github.run_id }}
+          name: rustfs-tier-test-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             /tmp/rustfs-tier.log
             /tmp/rustfs-tier-report.md
-          if-no-files-found: warn
+            /tmp/rustfs-tier-cases.md
+            /tmp/rustfs-tier-gate.rc
+            ${{ env.TIER_ARTIFACTS_DIR }}/
+          if-no-files-found: error
 
       - name: Cleanup environment (after)
         if: always()
@@ -366,6 +374,30 @@ jobs:
               ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
             '
           done
+
+      - name: Enforce tier suite result
+        if: always()
+        env:
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          GATE_RC_FILE: /tmp/rustfs-tier-gate.rc
+        run: |
+          set -euo pipefail
+          failed=0
+          if [ "${TEST_OUTCOME}" != "success" ]; then
+            echo "tier suite step outcome is ${TEST_OUTCOME}, expected success" >&2
+            failed=1
+          fi
+          if [ ! -s "${GATE_RC_FILE}" ]; then
+            echo "structured gate result is missing" >&2
+            failed=1
+          else
+            GATE_RC="$(tr -d '[:space:]' < "${GATE_RC_FILE}")"
+            if ! [[ "${GATE_RC}" =~ ^[0-9]+$ ]] || [ "${GATE_RC}" -ne 0 ]; then
+              echo "structured 56-case gate failed with exit ${GATE_RC:-invalid}" >&2
+              failed=1
+            fi
+          fi
+          [ "${failed}" -eq 0 ]
 
       - name: Notify on failure
         if: failure()

@@ -5039,9 +5039,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermit-abi"
-version = "0.5.2"
+version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "hex"
@@ -8036,9 +8036,9 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "ppmd-rust"
-version = "1.4.0"
+version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efca4c95a19a79d1c98f791f10aebd5c1363b473244630bb7dbde1dc98455a24"
+checksum = "9e9219bcb9d7aca6b2f63c83cf100cf78bcd619ac46e6ecbd0dd90869a39345d"
 
 [[package]]
 name = "ppv-lite86"
@@ -11073,7 +11073,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.15.0"
-source = "git+https://github.com/rustfs/s3s.git?rev=c8f575e3b8c7ec9962a722e197bb929efc12a07a#c8f575e3b8c7ec9962a722e197bb929efc12a07a"
+source = "git+https://github.com/rustfs/s3s.git?rev=28e9ebb23dd2fb7d667084f34121b4aa4807a5c6#28e9ebb23dd2fb7d667084f34121b4aa4807a5c6"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -11131,7 +11131,7 @@ dependencies = [
 [[package]]
 name = "s3s-rfc2047"
 version = "0.16.0-alpha.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=c8f575e3b8c7ec9962a722e197bb929efc12a07a#c8f575e3b8c7ec9962a722e197bb929efc12a07a"
+source = "git+https://github.com/rustfs/s3s.git?rev=28e9ebb23dd2fb7d667084f34121b4aa4807a5c6#28e9ebb23dd2fb7d667084f34121b4aa4807a5c6"
 dependencies = [
  "base64-simd",
  "thiserror 2.0.20",
@@ -11140,7 +11140,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv2"
 version = "0.16.0-alpha.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=c8f575e3b8c7ec9962a722e197bb929efc12a07a#c8f575e3b8c7ec9962a722e197bb929efc12a07a"
+source = "git+https://github.com/rustfs/s3s.git?rev=28e9ebb23dd2fb7d667084f34121b4aa4807a5c6#28e9ebb23dd2fb7d667084f34121b4aa4807a5c6"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -11153,7 +11153,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv4"
 version = "0.16.0-alpha.1"
-source = "git+https://github.com/rustfs/s3s.git?rev=c8f575e3b8c7ec9962a722e197bb929efc12a07a#c8f575e3b8c7ec9962a722e197bb929efc12a07a"
+source = "git+https://github.com/rustfs/s3s.git?rev=28e9ebb23dd2fb7d667084f34121b4aa4807a5c6#28e9ebb23dd2fb7d667084f34121b4aa4807a5c6"
 dependencies = [
  "arrayvec",
  "base64-simd",
