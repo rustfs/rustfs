@@ -9462,6 +9462,7 @@ dependencies = [
  "rustfs-io-metrics",
  "rustfs-keystone",
  "rustfs-kms",
+ "rustfs-license",
  "rustfs-lock",
  "rustfs-log-analyzer",
  "rustfs-madmin",
@@ -10062,6 +10063,13 @@ dependencies = [
  "uuid",
  "vaultrs",
  "zeroize",
+]
+
+[[package]]
+name = "rustfs-license"
+version = "1.0.0-rc.5"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]

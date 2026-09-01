@@ -29,6 +29,7 @@ members = [
     "crates/heal-contracts", # Heal request/response channel contracts
     "crates/iam", # Identity and Access Management
     "crates/keystone", # OpenStack Keystone integration
+    "crates/license", # License and entitlement provider contracts
     "crates/lifecycle", # Lifecycle rule evaluation contracts
     "crates/kms", # Key Management Service
     "crates/lock", # Distributed locking implementation
@@ -105,6 +106,7 @@ rustfs-ecstore = { path = "crates/ecstore", version = "1.0.0-rc.5" }
 rustfs-filemeta = { path = "crates/filemeta", version = "1.0.0-rc.5" }
 rustfs-iam = { path = "crates/iam", version = "1.0.0-rc.5" }
 rustfs-keystone = { path = "crates/keystone", version = "1.0.0-rc.5" }
+rustfs-license = { path = "crates/license", version = "1.0.0-rc.5" }
 rustfs-lifecycle = { path = "crates/lifecycle", version = "1.0.0-rc.5" }
 rustfs-kms = { path = "crates/kms", version = "1.0.0-rc.5" }
 rustfs-lock = { path = "crates/lock", version = "1.0.0-rc.5" }
