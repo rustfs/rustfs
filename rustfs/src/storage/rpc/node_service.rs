@@ -230,6 +230,11 @@ fn validate_admin_heal_control_start(request: &rustfs_heal_contracts::heal_chann
     if request.source != rustfs_heal_contracts::heal_channel::HealRequestSource::Admin {
         return Err(Status::permission_denied("heal control start source must be admin"));
     }
+    if !request.heal_endpoints.is_empty() {
+        return Err(Status::invalid_argument(
+            "admin heal control start cannot contain automatic replacement endpoints",
+        ));
+    }
     if request.pool_index.is_some() != request.set_index.is_some() {
         return Err(Status::invalid_argument("heal control start requires both pool and set"));
     }
@@ -2532,6 +2537,7 @@ mod tests {
         make_heal_control_server, make_heal_control_server_with_cache, make_server, make_server_for_context,
         make_tier_mutation_control_server_for_context, previous_scanner_activity_response, remove_heal_control_replay,
         scanner_activity_response_v7, start_decommission_failure_response, stop_rebalance_response,
+        validate_admin_heal_control_start,
     };
     use crate::storage::rpc::node_service::heal::heal_topology_fingerprint;
     use crate::storage::storage_api::rpc_consumer::node_service::{DiskError, HealBucketInfo};
@@ -2764,6 +2770,23 @@ mod tests {
         drop(second);
         let _third = admit_heal_control_replay(&mut cache, "request-3", &[3; 32], 400, 300).unwrap();
         assert!(!cache.contains_key("request-1"), "expired idle entries must be purged before admission");
+    }
+
+    #[test]
+    fn heal_control_admin_start_rejects_automatic_replacement_endpoints() {
+        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request(
+            String::new(),
+            None,
+            false,
+            Some(rustfs_heal_contracts::heal_channel::HealChannelPriority::High),
+        );
+        request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Admin;
+        request.recursive = Some(true);
+        request.heal_endpoints = vec!["/mnt/replacement".to_string()];
+
+        let err = validate_admin_heal_control_start(&request)
+            .expect_err("admin heal-control must not accept automatic replacement targets");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

@@ -646,10 +646,12 @@ impl HealChannelProcessor {
     /// Convert channel request to heal request
     fn convert_to_heal_request(&self, request: HealChannelRequest) -> Result<HealRequest> {
         let recursive = request.recursive.unwrap_or(false);
+        let mut inferred_set_scope = None;
         let heal_type = if let Some(disk_id) = &request.disk {
             let set_disk_id = utils::normalize_set_disk_id(disk_id).ok_or_else(|| Error::InvalidHealType {
                 heal_type: format!("erasure-set({disk_id})"),
             })?;
+            inferred_set_scope = utils::parse_set_disk_id(&set_disk_id).ok();
             HealType::ErasureSet {
                 buckets: vec![],
                 set_disk_id,
@@ -712,8 +714,8 @@ impl HealChannelProcessor {
             dry_run: request.dry_run.unwrap_or(false),
             no_lock,
             timeout: request.timeout_seconds.map(std::time::Duration::from_secs),
-            pool_index: request.pool_index,
-            set_index: request.set_index,
+            pool_index: request.pool_index.or_else(|| inferred_set_scope.map(|(pool, _)| pool)),
+            set_index: request.set_index.or_else(|| inferred_set_scope.map(|(_, set)| set)),
         };
 
         let mut heal_request = HealRequest::new(heal_type, options, priority);
@@ -1194,6 +1196,8 @@ mod tests {
         assert!(matches!(heal_request.heal_type, HealType::ErasureSet { .. }));
         assert_eq!(heal_request.priority, HealPriority::Urgent);
         assert_eq!(heal_request.heal_endpoints, ["http://node0:9000/drive1"]);
+        assert_eq!(heal_request.options.pool_index, Some(0));
+        assert_eq!(heal_request.options.set_index, Some(1));
     }
 
     #[tokio::test]
