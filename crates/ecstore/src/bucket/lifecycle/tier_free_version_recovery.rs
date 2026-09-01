@@ -172,7 +172,8 @@ pub(super) async fn recover_tier_free_versions_with_cancel(
         return Err(std::io::Error::other("free-version recovery limit must be greater than zero").into());
     }
 
-    let page = list_tier_free_versions(api, limit, bucket_marker.clone(), object_marker.clone(), cancel_token.clone()).await?;
+    let page =
+        list_tier_free_versions(api.clone(), limit, bucket_marker.clone(), object_marker.clone(), cancel_token.clone()).await?;
     let mut stats = FreeVersionRecoveryStats {
         scanned: 0,
         enqueued: 0,
@@ -190,7 +191,7 @@ pub(super) async fn recover_tier_free_versions_with_cancel(
             return Err(tier_free_version_recovery_cancelled());
         }
         retry_cursor.visit(&oi);
-        if !record_recovered_free_version_enqueue(&mut stats, enqueue_recovered_free_version(oi).await) {
+        if !record_recovered_free_version_enqueue(&mut stats, enqueue_recovered_free_version(&api, oi).await) {
             let (bucket_marker, object_marker) = retry_cursor.retry_markers();
             stats.truncated = true;
             stats.next_bucket_marker = bucket_marker;

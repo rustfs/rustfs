@@ -49,8 +49,8 @@ use rustfs_protos::proto_gen::node_service::{
     ScannerActivityRequest, ScannerActivityResponse, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
     ScannerPublicationLeaseResponse, ServerInfoRequest, SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest,
     StartProfilingRequest, StopRebalanceRequest, TierMutationAbortRequest, TierMutationCommitRequest,
-    TierMutationControlResponse, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
-    tier_mutation_control_service_client::TierMutationControlServiceClient,
+    TierMutationControlResponse, TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest,
+    node_service_client::NodeServiceClient, tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
 use rustfs_protos::{TierMutationRpcPhase, evict_failed_connection};
@@ -462,6 +462,31 @@ pub struct PeerTierMutationOutcome {
     pub applied: bool,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct TierMutationDefinitelyRejected {
+    message: String,
+}
+
+fn tier_mutation_definitely_rejected_error(message: String) -> Error {
+    Error::other(TierMutationDefinitelyRejected { message })
+}
+
+#[cfg(test)]
+pub(crate) fn test_tier_mutation_definitely_rejected_error(message: &str) -> Error {
+    tier_mutation_definitely_rejected_error(message.to_string())
+}
+
+pub(crate) fn tier_mutation_error_is_definitely_rejected(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Io(io_error)
+            if io_error
+                .get_ref()
+                .is_some_and(|source| source.downcast_ref::<TierMutationDefinitelyRejected>().is_some())
+    )
+}
+
 fn validate_tier_mutation_response_proof(
     version: u32,
     phase: TierMutationRpcPhase,
@@ -469,6 +494,16 @@ fn validate_tier_mutation_response_proof(
     canonical_payload: &[u8],
     response: &TierMutationControlResponse,
 ) -> Result<()> {
+    if response.response_proof.len() > rustfs_protos::TIER_MUTATION_RPC_MAX_RESPONSE_PROOF_SIZE {
+        return Err(Error::other("peer tier mutation response proof exceeds size limit"));
+    }
+    if response
+        .error_info
+        .as_ref()
+        .is_some_and(|error| error.len() > rustfs_protos::TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE)
+    {
+        return Err(Error::other("peer tier mutation error response exceeds size limit"));
+    }
     let canonical_response =
         rustfs_protos::canonical_tier_mutation_rpc_response_body(rustfs_protos::TierMutationRpcResponseProofInput {
             version,
@@ -479,6 +514,7 @@ fn validate_tier_mutation_response_proof(
             state: response.state,
             applied: response.applied,
             error_info: response.error_info.as_deref(),
+            failure_class: response.failure_class,
         })
         .map_err(|_| Error::other("tier mutation response length cannot be represented"))?;
     verify_tonic_rpc_response_proof(&canonical_response, &response.response_proof)
@@ -500,9 +536,9 @@ fn validate_tier_mutation_payload_len(phase: TierMutationRpcPhase, payload_len: 
         TierMutationRpcPhase::Commit => rustfs_protos::TIER_MUTATION_RPC_MAX_COMMIT_PAYLOAD_SIZE,
         TierMutationRpcPhase::Abort => {
             if payload_len == 0 {
-                return Ok(());
+                return Err(Error::other("tier mutation abort payload is empty"));
             }
-            return Err(Error::other("tier mutation abort payload must be empty"));
+            rustfs_protos::TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE
         }
         _ => return Err(Error::other("tier mutation rpc phase is unsupported")),
     };
@@ -521,8 +557,29 @@ fn tier_mutation_phase_label(phase: TierMutationRpcPhase) -> &'static str {
     }
 }
 
-fn tier_mutation_control_status_error(phase: TierMutationRpcPhase, status: tonic::Status) -> Error {
-    Error::other(format!("peer tier mutation {} RPC failed: {status}", tier_mutation_phase_label(phase)))
+fn tier_mutation_control_status_error(phase: TierMutationRpcPhase, requested_version: u32, status: tonic::Status) -> Error {
+    let message = format!("peer tier mutation {} RPC failed: {status}", tier_mutation_phase_label(phase));
+    let legacy_rejection = format!("unsupported tier mutation peer protocol version: {requested_version}");
+    // RUSTFS_COMPAT_TODO(backlog-2097-tier-mutation-v4-error-text): retain this exact v3-server rejection classifier for mixed-version peers. Remove after every supported peer returns the signed v4 failure class.
+    if requested_version == rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION
+        && status.code() == tonic::Code::FailedPrecondition
+        && status.message().as_bytes() == legacy_rejection.as_bytes()
+    {
+        return tier_mutation_definitely_rejected_error(message);
+    }
+    Error::other(message)
+}
+
+fn tier_mutation_failed_response_error(version: u32, failure_class: i32, error_info: Option<String>) -> Error {
+    let message = error_info.unwrap_or_else(|| "peer tier mutation failed without an error".to_string());
+    if version == rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION
+        && TierMutationFailureClass::try_from(failure_class).ok() == Some(TierMutationFailureClass::PreDispatchRejected)
+    {
+        return tier_mutation_definitely_rejected_error(message);
+    }
+    // Missing/zero, unknown, and explicit Ambiguous are deliberately the same
+    // fail-closed result: the coordinator must include this peer in Abort.
+    Error::other(message)
 }
 
 impl PeerRestClient {
@@ -1315,8 +1372,12 @@ impl PeerRestClient {
             .await
     }
 
-    pub async fn abort_tier_mutation(&self, mutation_id: Uuid) -> Result<PeerTierMutationOutcome> {
-        self.tier_mutation_control(TierMutationRpcPhase::Abort, mutation_id, Bytes::new())
+    pub async fn abort_tier_mutation(
+        &self,
+        mutation_id: Uuid,
+        canonical_prepare_payload: Bytes,
+    ) -> Result<PeerTierMutationOutcome> {
+        self.tier_mutation_control(TierMutationRpcPhase::Abort, mutation_id, canonical_prepare_payload)
             .await
     }
 
@@ -1350,7 +1411,7 @@ impl PeerRestClient {
                         client
                             .prepare_tier_mutation(request)
                             .await
-                            .map_err(|status| tier_mutation_control_status_error(phase, status))?
+                            .map_err(|status| tier_mutation_control_status_error(phase, version, status))?
                             .into_inner()
                     }
                     TierMutationRpcPhase::Commit => {
@@ -1363,7 +1424,7 @@ impl PeerRestClient {
                         client
                             .commit_tier_mutation(request)
                             .await
-                            .map_err(|status| tier_mutation_control_status_error(phase, status))?
+                            .map_err(|status| tier_mutation_control_status_error(phase, version, status))?
                             .into_inner()
                     }
                     TierMutationRpcPhase::Abort => {
@@ -1376,18 +1437,19 @@ impl PeerRestClient {
                         client
                             .abort_tier_mutation(request)
                             .await
-                            .map_err(|status| tier_mutation_control_status_error(phase, status))?
+                            .map_err(|status| tier_mutation_control_status_error(phase, version, status))?
                             .into_inner()
                     }
                     _ => return Err(Error::other("tier mutation rpc phase is unsupported")),
                 };
                 validate_tier_mutation_response_proof(version, phase, mutation_id, &canonical_payload, &response)?;
                 if !response.success {
-                    return Err(Error::other(
-                        response
-                            .error_info
-                            .unwrap_or_else(|| "peer tier mutation failed without an error".to_string()),
-                    ));
+                    return Err(tier_mutation_failed_response_error(version, response.failure_class, response.error_info));
+                }
+                if version == rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION
+                    && response.failure_class != TierMutationFailureClass::Unspecified as i32
+                {
+                    return Err(Error::other("successful peer tier mutation response carried a failure class"));
                 }
                 let state = decode_tier_mutation_peer_state(response.state)?;
                 Ok(PeerTierMutationOutcome {
@@ -3332,6 +3394,7 @@ mod tests {
         state: i32,
         applied: bool,
         error_info: Option<&'a str>,
+        failure_class: i32,
     }
 
     fn signed_tier_mutation_response(input: TierMutationResponseFixture<'_>) -> TierMutationControlResponse {
@@ -3345,6 +3408,7 @@ mod tests {
                 state: input.state,
                 applied: input.applied,
                 error_info: input.error_info,
+                failure_class: input.failure_class,
             })
             .expect("small tier mutation response should encode");
         let response_proof =
@@ -3355,6 +3419,7 @@ mod tests {
             applied: input.applied,
             error_info: input.error_info.map(str::to_string),
             response_proof: response_proof.into(),
+            failure_class: input.failure_class,
         }
     }
 
@@ -3372,6 +3437,7 @@ mod tests {
             state: TierMutationPeerState::Prepared as i32,
             applied: true,
             error_info: None,
+            failure_class: TierMutationFailureClass::Unspecified as i32,
         });
         validate_tier_mutation_response_proof(
             rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
@@ -3396,6 +3462,10 @@ mod tests {
                 applied: false,
                 ..response.clone()
             },
+            TierMutationControlResponse {
+                failure_class: TierMutationFailureClass::Ambiguous as i32,
+                ..response.clone()
+            },
         ] {
             let err = validate_tier_mutation_response_proof(
                 rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
@@ -3417,6 +3487,44 @@ mod tests {
         )
         .expect_err("response proof must bind request phase");
         assert!(err.to_string().contains("invalid tier mutation response proof"));
+    }
+
+    #[test]
+    fn tier_mutation_response_rejects_oversized_proof_and_error_before_verification() {
+        let mutation_id = Uuid::new_v4();
+        let payload = b"tier-mutation-prepare";
+        let oversized_proof = TierMutationControlResponse {
+            success: false,
+            state: TierMutationPeerState::Unspecified as i32,
+            applied: false,
+            error_info: None,
+            response_proof: vec![0; rustfs_protos::TIER_MUTATION_RPC_MAX_RESPONSE_PROOF_SIZE + 1].into(),
+            failure_class: TierMutationFailureClass::Ambiguous as i32,
+        };
+        let err = validate_tier_mutation_response_proof(
+            rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            payload,
+            &oversized_proof,
+        )
+        .expect_err("oversized proof must fail before cryptographic verification");
+        assert!(err.to_string().contains("response proof exceeds size limit"));
+
+        let oversized_error = TierMutationControlResponse {
+            response_proof: Bytes::new(),
+            error_info: Some("e".repeat(rustfs_protos::TIER_MUTATION_RPC_MAX_ERROR_INFO_SIZE + 1)),
+            ..oversized_proof
+        };
+        let err = validate_tier_mutation_response_proof(
+            rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            payload,
+            &oversized_error,
+        )
+        .expect_err("oversized error detail must fail before proof construction");
+        assert!(err.to_string().contains("error response exceeds size limit"));
     }
 
     #[test]
@@ -3463,8 +3571,17 @@ mod tests {
             )
             .is_err()
         );
-        validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 0).expect("empty abort payload should fit");
-        assert!(validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 1).is_err());
+        assert!(validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 0).is_err());
+        validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, 1).expect("non-empty abort payload should fit");
+        validate_tier_mutation_payload_len(TierMutationRpcPhase::Abort, rustfs_protos::TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE)
+            .expect("max abort payload should fit");
+        assert!(
+            validate_tier_mutation_payload_len(
+                TierMutationRpcPhase::Abort,
+                rustfs_protos::TIER_MUTATION_RPC_MAX_ABORT_PAYLOAD_SIZE + 1,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3479,7 +3596,7 @@ mod tests {
                 tonic::Status::deadline_exceeded("peer tier mutation control timed out"),
                 tonic::Status::unavailable("peer tier mutation control unavailable"),
             ] {
-                let err = tier_mutation_control_status_error(phase, status);
+                let err = tier_mutation_control_status_error(phase, rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION, status);
                 let rendered = err.to_string();
                 assert!(rendered.contains(&format!("peer tier mutation {label} RPC failed")), "{rendered}");
                 assert!(
@@ -3491,6 +3608,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn tier_mutation_v4_to_v3_rejection_classification_requires_exact_status_and_message() {
+        let version = rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION;
+        let exact = format!("unsupported tier mutation peer protocol version: {version}");
+        let rejected = tier_mutation_control_status_error(
+            TierMutationRpcPhase::Prepare,
+            version,
+            tonic::Status::failed_precondition(exact.clone()),
+        );
+        assert!(tier_mutation_error_is_definitely_rejected(&rejected));
+
+        for status in [
+            tonic::Status::failed_precondition(format!("{exact}.")),
+            tonic::Status::failed_precondition(format!("unsupported tier mutation peer protocol version: {}", version - 1)),
+            tonic::Status::invalid_argument(exact.clone()),
+            tonic::Status::unimplemented(exact),
+        ] {
+            let ambiguous = tier_mutation_control_status_error(TierMutationRpcPhase::Prepare, version, status);
+            assert!(
+                !tier_mutation_error_is_definitely_rejected(&ambiguous),
+                "near-text, wrong-code, and Unimplemented failures must remain ambiguous"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_mutation_v4_failure_class_is_typed_and_fails_closed() {
+        let version = rustfs_protos::TIER_MUTATION_RPC_PROTOCOL_VERSION;
+        let rejected = tier_mutation_failed_response_error(
+            version,
+            TierMutationFailureClass::PreDispatchRejected as i32,
+            Some("rejected".to_string()),
+        );
+        assert!(tier_mutation_error_is_definitely_rejected(&rejected));
+
+        for failure_class in [
+            TierMutationFailureClass::Unspecified as i32,
+            TierMutationFailureClass::Ambiguous as i32,
+            99,
+        ] {
+            let ambiguous = tier_mutation_failed_response_error(version, failure_class, None);
+            assert!(
+                !tier_mutation_error_is_definitely_rejected(&ambiguous),
+                "missing, unknown, and explicit ambiguous classes must trigger Abort fanout"
+            );
+        }
+
+        let v3_ignores_v4_class = tier_mutation_failed_response_error(
+            rustfs_protos::TIER_MUTATION_RPC_PREVIOUS_PROTOCOL_VERSION,
+            TierMutationFailureClass::PreDispatchRejected as i32,
+            Some("legacy failure".to_string()),
+        );
+        assert!(!tier_mutation_error_is_definitely_rejected(&v3_ignores_v4_class));
     }
 
     #[tokio::test]

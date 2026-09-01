@@ -846,6 +846,7 @@ impl ECStore {
             .await
     }
 
+    #[cfg(all(test, feature = "test-util"))]
     pub(crate) async fn complete_multipart_upload_for_data_movement(
         self: Arc<Self>,
         target: (usize, Option<&ObjectLockDiagGuard>),
@@ -854,6 +855,44 @@ impl ECStore {
         upload_id: &str,
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
+    ) -> Result<ObjectInfo> {
+        self.complete_multipart_upload_for_data_movement_inner(target, bucket, object, upload_id, uploaded_parts, opts, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn complete_multipart_upload_for_data_movement_with_publication_fence(
+        self: Arc<Self>,
+        target_pool_idx: usize,
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+        publication_fence: RemoteTuplePublicationFence,
+    ) -> Result<ObjectInfo> {
+        self.complete_multipart_upload_for_data_movement_inner(
+            (target_pool_idx, None),
+            bucket,
+            object,
+            upload_id,
+            uploaded_parts,
+            opts,
+            Some(publication_fence),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_multipart_upload_for_data_movement_inner(
+        self: Arc<Self>,
+        target: (usize, Option<&ObjectLockDiagGuard>),
+        bucket: &str,
+        object: &str,
+        upload_id: &str,
+        uploaded_parts: Vec<CompletePart>,
+        opts: &ObjectOptions,
+        publication_fence: Option<RemoteTuplePublicationFence>,
     ) -> Result<ObjectInfo> {
         let (target_pool_idx, mutation_fence) = target;
         check_complete_multipart_args(bucket, object, upload_id)?;
@@ -885,8 +924,36 @@ impl ECStore {
             snapshot.add_lock_fences(&mut opts);
             opts.object_lock_config_snapshot = Some(snapshot);
         }
-        self.apply_decommission_target_mutation_fence(target_pool_idx, object, &mut opts, mutation_fence)
+        let fixed_read_anchor = publication_fence
+            .as_ref()
+            .and_then(RemoteTuplePublicationFence::fixed_read_anchor_guard);
+        self.apply_decommission_target_mutation_fence(target_pool_idx, object, &mut opts, mutation_fence.or(fixed_read_anchor))
             .await;
+        // NewMultipart/UploadPart are staging only. Acquire and consume the
+        // non-cloneable publication capability immediately before Complete,
+        // then retain its guards until Complete has drained the commit path.
+        let publication_object = encode_dir_object(object);
+        let publication_guard = match publication_fence {
+            Some(publication_fence) => {
+                let guard = publication_fence
+                    .into_commit_guard(target_pool_idx, bucket, &publication_object)
+                    .await?;
+                guard.add_namespace_lock_fence(&mut opts);
+                opts.no_lock = true;
+                Some(guard)
+            }
+            None => {
+                if rustfs_utils::http::metadata_compat::contains_key_str(
+                    &opts.user_defined,
+                    rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
+                ) {
+                    return Err(Error::other(
+                        "data movement multipart completion cannot publish transition ownership without a publication capability",
+                    ));
+                }
+                None
+            }
+        };
         #[cfg(test)]
         pause_data_movement_multipart_before_selected_completion(bucket).await;
         let pool = self
@@ -911,6 +978,7 @@ impl ECStore {
                 },
             )
             .await;
+        drop(publication_guard);
         let result = enqueue_transition_after_write(result, LcEventSrc::S3CompleteMultipartUpload).await;
         if result.is_ok() {
             list_objects::observe_list_objects_mutation(self.as_ref(), bucket).await;

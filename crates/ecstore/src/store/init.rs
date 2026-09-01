@@ -380,6 +380,15 @@ impl ECStore {
         ctx: CancellationToken,
         instance_ctx: Arc<InstanceContext>,
     ) -> Result<Arc<Self>> {
+        Box::pin(Self::new_with_instance_ctx_inner(address, endpoint_pools, ctx, instance_ctx)).await
+    }
+
+    async fn new_with_instance_ctx_inner(
+        address: SocketAddr,
+        endpoint_pools: EndpointServerPools,
+        ctx: CancellationToken,
+        instance_ctx: Arc<InstanceContext>,
+    ) -> Result<Arc<Self>> {
         instance_ctx.bind_background_cancel_token(ctx.clone());
 
         // let layouts = DisksLayout::from_volumes(endpoints.as_slice())?;
@@ -788,7 +797,7 @@ mod tests {
     use crate::{
         bucket::lifecycle::{
             DurableIlmRecordCheckpoint, ILM_META_PREFIX, ValidatedDurableIlmRecord,
-            bucket_lifecycle_ops::{ManualTransitionRunOptions, recover_manual_transition_jobs_once},
+            bucket_lifecycle_ops::{ExpiryState, ManualTransitionRunOptions, recover_manual_transition_jobs_once},
             lifecycle::{TRANSITION_PENDING, TransitionOptions},
             manual_transition_job::{
                 ManualTransitionJobRecord, ManualTransitionScopeAdmission, ManualTransitionTaskRecord,
@@ -797,9 +806,18 @@ mod tests {
                 manual_transition_worker_result_object_name, manual_transition_worker_result_task_key,
             },
             tier_delete_journal::{
-                TIER_DELETE_JOURNAL_PREFIX, encode_tier_delete_journal_entry, persist_tier_delete_journal_entry,
-                recover_tier_delete_journal_entries, tier_delete_journal_object_name,
+                DecommissionCheckpointTargetFailureHook, TIER_DELETE_DISPATCH_MANIFEST_PREFIX, TIER_DELETE_JOURNAL_PREFIX,
+                TierDeleteDispatchManifestState, TierDeleteDispatchMemberReadTestHook, TierDeleteDispatchMemberReadTestStage,
+                TierDeleteDispatchRollbackTestHook, complete_tier_delete_dispatch, encode_tier_delete_journal_entry,
+                install_test_tier_delete_dispatch_fixture, persist_tier_delete_journal_entry, prepare_tier_delete_dispatch,
+                recover_test_tier_delete_dispatch_manifest, recover_test_tier_delete_dispatch_manifest_with_page_budget,
+                recover_tier_delete_dispatch_manifests, recover_tier_delete_journal_entries,
+                test_tier_delete_dispatch_manifest_checkpoint, test_tier_delete_dispatch_manifest_state,
+                tier_delete_dispatch_manifest_operation_lock_held_for_test,
+                tier_delete_dispatch_manifest_recovery_count_for_test, tier_delete_dispatch_manifest_recovery_inflight_for_test,
+                tier_delete_journal_object_name,
             },
+            tier_free_version_recovery::recover_tier_free_versions,
             tier_sweeper::{
                 Jentry, TierDeleteJournalState, TierDeleteSourceIdentity, transitioned_delete_journal_entry_for_source,
             },
@@ -820,9 +838,13 @@ mod tests {
         data_movement::SourceCleanupDeleteBarrier,
         disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET, STORAGE_FORMAT_FILE},
         runtime::{global::set_object_store_resolver, sources as runtime_sources},
+        services::notification_sys::acquire_tier_delete_journal_fleet_proof,
         services::tier::{
             test_util::{MockWarmBackend, MockWarmOp, TransitionCleanupStoreBarrier, register_mock_tier},
-            tier::{TIER_CONFIG_FILE, TierConfigMgr, tier_config_candidate_digest},
+            tier::{
+                ERR_TIER_BACKEND_IN_USE, ERR_TIER_INVALID_CONFIG, TIER_CONFIG_FILE, TierConfigMgr,
+                ensure_no_authoritative_tier_references_for_test, tier_config_candidate_digest,
+            },
             tier_config::{TierConfig, TierType, TierWasabi},
             tier_mutation_intent::{
                 TIER_MUTATION_INTENT_RECORD_PREFIX, TierMutationIntent, TierMutationIntentKind, TierMutationIntentState,
@@ -835,6 +857,8 @@ mod tests {
         },
         storage_api_contracts::list::ListOperations as _,
     };
+    #[cfg(feature = "test-util")]
+    use crate::{bucket::replication::ReplicationObjectBridge, storage_api_contracts::bucket::DeleteBucketOptions};
     use crate::{
         bucket::replication::{ReplicationState, ReplicationStatusType, replication_statuses_map},
         core::pools::{
@@ -861,7 +885,7 @@ mod tests {
     use rustfs_config::server_config::KVS;
     #[cfg(feature = "test-util")]
     use rustfs_filemeta::{FileInfo, FileMeta};
-    use rustfs_filemeta::{FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
+    use rustfs_filemeta::{FileInfoVersions, MetaCacheEntry};
     #[cfg(feature = "test-util")]
     use rustfs_protos::{TIER_MUTATION_RPC_PROTOCOL_VERSION, TierMutationRpcPhase};
     use rustfs_rio::{Checksum, ChecksumType};
@@ -885,6 +909,22 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    #[test]
+    fn new_with_instance_ctx_future_remains_stack_bounded() {
+        let future = crate::store::ECStore::new_with_instance_ctx(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            EndpointServerPools(Vec::new()),
+            CancellationToken::new(),
+            Arc::new(crate::runtime::instance::InstanceContext::new()),
+        );
+        let future_size = std::mem::size_of_val(&future);
+
+        assert!(
+            future_size <= 4 * 1024,
+            "ECStore constructor future must remain stack-bounded; measured {future_size} bytes"
+        );
+    }
 
     fn startup_pool_meta_payload(meta: &PoolMeta) -> Vec<u8> {
         meta.encode_config_data_for_test().expect("pool metadata should encode")
@@ -2020,6 +2060,7 @@ mod tests {
             });
         }
         let endpoint_pools = EndpointServerPools(pools);
+        crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
 
         let instance_ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         crate::store::init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
@@ -2048,6 +2089,375 @@ mod tests {
         set_decommission_capacity_info_overrides_for_test(store.id, (0..128).map(|_| snapshot.clone()).collect());
 
         (instance_ctx, store, shutdown)
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn cross_key_materialized_copy_does_not_publish_remote_tuple_ownership() {
+        let temp_dir = tempfile::tempdir().expect("create materialized-copy store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "copy-materialized", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("copy-materialized-{}", Uuid::new_v4());
+        let source_object = "source-restored.bin";
+        let target_object = "target-local.bin";
+        let payload = b"materialized copy must own only its new local bytes".to_vec();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("copy test bucket should be created");
+
+        let tier_name = "COPY-MATERIALIZED-TIER";
+        register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("mock tier generation should be available");
+        let backend_identity = lease.backend_identity();
+        drop(lease);
+
+        let mut source_metadata = HashMap::from([
+            ("content-type".to_string(), "application/octet-stream".to_string()),
+            (
+                "x-amz-restore".to_string(),
+                "ongoing-request=\"false\", expiry-date=\"2099-01-01T00:00:00Z\"".to_string(),
+            ),
+        ]);
+        for (suffix, value) in [
+            (
+                rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
+                crate::bucket::lifecycle::core::TRANSITION_COMPLETE.to_string(),
+            ),
+            (
+                rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME,
+                "remote/source-restored.bin".to_string(),
+            ),
+            (rustfs_utils::http::SUFFIX_TRANSITION_TIER, tier_name.to_string()),
+            (rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID, "remote-source-version".to_string()),
+            (
+                rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE,
+                rustfs_filemeta::TransitionVersionState::Exact.as_str().to_string(),
+            ),
+            (
+                rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                rustfs_utils::crypto::hex(backend_identity),
+            ),
+            (rustfs_utils::http::SUFFIX_TRANSITION_TRANSACTION_ID, Uuid::new_v4().to_string()),
+        ] {
+            rustfs_utils::http::metadata_compat::insert_str(&mut source_metadata, suffix, value);
+        }
+
+        let mut source_body = PutObjReader::from_vec(payload.clone());
+        store
+            .put_object(
+                &bucket,
+                source_object,
+                &mut source_body,
+                &ObjectOptions {
+                    user_defined: source_metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restored transitioned source should be written");
+
+        let source_opts = ObjectOptions::default();
+        let mut source_info = store
+            .get_object_info(&bucket, source_object, &source_opts)
+            .await
+            .expect("source metadata should be readable");
+        assert_eq!(
+            source_info.transitioned_object.status,
+            crate::bucket::lifecycle::core::TRANSITION_COMPLETE
+        );
+        assert_eq!(source_info.transitioned_object.tier, tier_name);
+        assert!(source_info.data_dir.is_some(), "restored source must retain local data");
+        source_info.put_object_reader = Some(PutObjReader::from_vec(payload.clone()));
+
+        let copied = store
+            .copy_object(
+                &bucket,
+                source_object,
+                &bucket,
+                target_object,
+                &mut source_info,
+                &source_opts,
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("cross-key materialized copy should succeed");
+        assert!(copied.transitioned_object.status.is_empty());
+        assert!(copied.transitioned_object.name.is_empty());
+        assert!(copied.transitioned_object.version_id.is_empty());
+        assert!(copied.transitioned_object.tier.is_empty());
+        assert!(!copied.transitioned_object.free_version);
+        for suffix in [
+            rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
+            rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME,
+            rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID,
+            rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE,
+            rustfs_utils::http::SUFFIX_TRANSITION_TIER,
+            rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::http::SUFFIX_TRANSITION_TRANSACTION_ID,
+        ] {
+            assert!(
+                !rustfs_utils::http::metadata_compat::contains_key_str(copied.user_defined.as_ref(), suffix),
+                "target retained protected source suffix {suffix}"
+            );
+        }
+        assert_eq!(
+            copied.user_defined.get("content-type").map(String::as_str),
+            Some("application/octet-stream")
+        );
+
+        let mut target_reader = store
+            .get_object_reader(&bucket, target_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("target object should be readable");
+        let mut target_body = Vec::new();
+        target_reader
+            .stream
+            .read_to_end(&mut target_body)
+            .await
+            .expect("target body should stream");
+        assert_eq!(target_body, payload);
+
+        let source_after = store
+            .get_object_info(&bucket, source_object, &source_opts)
+            .await
+            .expect("source metadata should remain readable after copy");
+        assert_eq!(
+            source_after.transitioned_object.status,
+            crate::bucket::lifecycle::core::TRANSITION_COMPLETE
+        );
+        assert_eq!(source_after.transitioned_object.tier, tier_name);
+        assert_eq!(source_after.transitioned_object.name, "remote/source-restored.bin");
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease() {
+        let temp_dir = tempfile::tempdir().expect("create multipart staging-fence store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "mpu-staging-publication", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("mpu-staging-publication-{}", Uuid::new_v4());
+        let object = "remote-owned.bin";
+        let payload = b"multipart part staging must not publish an object".to_vec();
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("multipart staging test bucket should be created");
+
+        let tier_name = "MPU-STAGING-TIER";
+        register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("mock tier generation should be available");
+        let backend_identity = lease.backend_identity();
+        drop(lease);
+
+        let mut source_metadata = HashMap::from([(
+            "x-amz-restore".to_string(),
+            "ongoing-request=\"false\", expiry-date=\"2099-01-01T00:00:00Z\"".to_string(),
+        )]);
+        for (suffix, value) in [
+            (
+                rustfs_utils::http::SUFFIX_TRANSITION_STATUS,
+                crate::bucket::lifecycle::core::TRANSITION_COMPLETE.to_string(),
+            ),
+            (rustfs_utils::http::SUFFIX_TRANSITIONED_OBJECTNAME, "remote/mpu.bin".to_string()),
+            (rustfs_utils::http::SUFFIX_TRANSITION_TIER, tier_name.to_string()),
+            (rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_ID, "remote-mpu-version".to_string()),
+            (
+                rustfs_utils::http::SUFFIX_TRANSITIONED_VERSION_STATE,
+                rustfs_filemeta::TransitionVersionState::Exact.as_str().to_string(),
+            ),
+            (
+                rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                rustfs_utils::crypto::hex(backend_identity),
+            ),
+        ] {
+            rustfs_utils::http::metadata_compat::insert_str(&mut source_metadata, suffix, value);
+        }
+        let mut source_body = PutObjReader::from_vec(payload.clone());
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut source_body,
+                &ObjectOptions {
+                    user_defined: source_metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("remote-owned source should be written to the source pool");
+        let source = store.pools[0]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("remote-owned source metadata should be readable");
+        let publication = store
+            .acquire_remote_tuple_publication_fence(&bucket, 0, &source, true)
+            .await
+            .expect("multipart migration should capture its publication capability");
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&ctx.tier_config_mgr(), tier_name).await,
+            0,
+            "capturing the commit-late capability must not pin the tier generation"
+        );
+
+        let bucket_incarnation_id = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("bucket incarnation should resolve");
+        mark_test_pool_decommissioning(&store, 0).await;
+        let capacity_owner = test_decommission_capacity_owner(store.as_ref(), 0)
+            .await
+            .with_mutation_id(Uuid::new_v4());
+        let mut upload_metadata = source.user_defined.as_ref().clone();
+        rustfs_utils::http::insert_str(
+            &mut upload_metadata,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            "mpu-staging-test".to_string(),
+        );
+        let mut staging_opts = ObjectOptions {
+            data_movement: true,
+            src_pool_idx: 0,
+            user_defined: upload_metadata,
+            expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+            ..Default::default()
+        };
+        capacity_owner.apply_to(&mut staging_opts);
+        let (upload, target_pool_idx, staged_incarnation_id) = store
+            .handle_new_multipart_upload_with_pool_idx(&bucket, object, &staging_opts, None)
+            .await
+            .expect("target multipart upload should be staged");
+        assert_eq!(target_pool_idx, 1, "the active pool must receive the staged upload");
+        assert_eq!(staged_incarnation_id, Some(bucket_incarnation_id));
+
+        let barrier = crate::set_disk::MultipartCommitBarrier::install(
+            &bucket,
+            object,
+            crate::set_disk::MultipartCommitPause::PutPartBeforeLockLost,
+        );
+        let part_store = Arc::clone(&store);
+        let part_bucket = bucket.clone();
+        let upload_id = upload.upload_id.clone();
+        let part_payload = payload.clone();
+        let part = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(part_payload);
+            let mut part_opts = ObjectOptions {
+                data_movement: true,
+                src_pool_idx: 0,
+                part_number: Some(1),
+                expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+                ..Default::default()
+            };
+            capacity_owner.apply_to(&mut part_opts);
+            part_store
+                .put_object_part_for_data_movement(1, &part_bucket, object, &upload_id, &mut reader, &part_opts)
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&ctx.tier_config_mgr(), tier_name).await,
+            0,
+            "UploadPart staging must not pin the tier generation"
+        );
+        let encoded = rustfs_utils::path::encode_dir_object(object);
+        let mut proof_opts = ObjectOptions::default();
+        let proof = tokio::time::timeout(
+            Duration::from_millis(250),
+            store.acquire_all_physical_object_read_locks("tier_delete_journal_recovery", &bucket, &encoded, &mut proof_opts),
+        )
+        .await
+        .expect("UploadPart staging must not hold any object publication write lock")
+        .expect("the all-physical recovery proof should acquire every object namespace");
+        let source_head = store.pools[0]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("source HEAD should remain available while the part commit is paused");
+        assert_eq!(source_head.etag, source.etag);
+        assert!(
+            store.pools[1]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "UploadPart staging must not publish target object metadata"
+        );
+        drop(proof);
+
+        barrier.release();
+        drop(barrier);
+        part.await
+            .expect("UploadPart staging task should join")
+            .expect("UploadPart staging should commit after the observation releases");
+        let mut abort_opts = ObjectOptions {
+            data_movement: true,
+            src_pool_idx: 0,
+            expected_bucket_incarnation_id: Some(bucket_incarnation_id),
+            ..Default::default()
+        };
+        capacity_owner.apply_to(&mut abort_opts);
+        store
+            .abort_multipart_upload_for_data_movement(1, &bucket, object, &upload.upload_id, &abort_opts)
+            .await
+            .expect("staged target upload should be removable without publishing");
+        drop(publication);
+        assert_eq!(TierConfigMgr::active_operation_lease_count(&ctx.tier_config_mgr(), tier_name).await, 0);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    struct OfflineTestDisks {
+        disks: Vec<crate::disk::DiskStore>,
+    }
+
+    #[cfg(feature = "test-util")]
+    impl Drop for OfflineTestDisks {
+        fn drop(&mut self) {
+            for disk in &self.disks {
+                disk.reset_health_for_store_init_retry();
+            }
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn force_set_disks_offline_for_test(set: &Arc<crate::set_disk::SetDisks>) -> OfflineTestDisks {
+        let disks = set
+            .disks
+            .read()
+            .await
+            .iter()
+            .map(|disk| disk.clone().expect("fault-injection set should start fully online"))
+            .collect::<Vec<_>>();
+        for disk in &disks {
+            disk.close().await.expect("fault injection should stop per-disk monitoring");
+            disk.force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+        }
+
+        // Sets has an independent endpoint monitor that renews missing slots.
+        // Keep each slot populated by the original, deliberately faulty handle
+        // and prove an explicit reconnect pass cannot heal this test fault.
+        set.connect_disks().await;
+        let current = set.disks.read().await.clone();
+        assert_eq!(current.len(), disks.len());
+        for (slot, expected) in current.iter().zip(&disks) {
+            let disk = slot.as_ref().expect("offline test slot must remain populated");
+            assert!(Arc::ptr_eq(disk, expected), "endpoint monitor must not replace an offline test handle");
+            assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            assert!(
+                disk.is_online().await,
+                "the valid disk identity must prevent endpoint renewal while the IO health gate remains offline"
+            );
+        }
+        OfflineTestDisks { disks }
     }
 
     fn active_rebalance_meta_for_pool(pool_count: usize, active_pool_idx: usize) -> RebalanceMeta {
@@ -2202,6 +2612,52 @@ mod tests {
             .save_current_pool_meta_for_decommission_start(&[pool_idx], Vec::new())
             .await
             .expect("test decommission capacity reservation should activate");
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn mark_test_pool_decommissioning_with_split_targets(store: &Arc<crate::store::ECStore>, pool_idx: usize) {
+        let layout = DecommissionErasureLayout { data: 2, parity: 2 };
+        let source_physical_bytes = 1024 * 1024 * 1024;
+        let capacity = store
+            .pools
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                if index == pool_idx {
+                    DecommissionPoolCapacityInfo::for_test(index, layout, 0, source_physical_bytes, source_physical_bytes)
+                } else {
+                    // The reservation peak is twice the predicted target size.
+                    // Give each target only half so the real allocator must
+                    // authorize both receipt-bearing pools.
+                    DecommissionPoolCapacityInfo::for_test(index, layout, source_physical_bytes, source_physical_bytes, 0)
+                }
+            })
+            .collect::<Vec<_>>();
+        set_decommission_capacity_info_overrides_for_test(store.id, (0..128).map(|_| capacity.clone()).collect());
+        store
+            .save_current_pool_meta_for_decommission_start(&[pool_idx], Vec::new())
+            .await
+            .expect("split-target decommission capacity reservation should activate");
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn test_decommission_capacity_owner(
+        store: &crate::store::ECStore,
+        source_pool_index: usize,
+    ) -> crate::core::pools::DecommissionCapacityOwner {
+        let pool_meta = store.pool_meta.read().await;
+        let reservation = pool_meta.pools[source_pool_index]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("test decommission capacity reservation should exist");
+        crate::core::pools::DecommissionCapacityOwner {
+            source_pool_index,
+            operation_id: reservation.operation_id,
+            generation: reservation.generation,
+            owner_nonce: reservation.owner_nonce,
+            mutation_id: None,
+        }
     }
 
     const DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER: &str = "delete_marker_copy";
@@ -2384,6 +2840,84 @@ mod tests {
             .complete_multipart_upload(bucket, object, &upload.upload_id, completed_parts, &ObjectOptions::default())
             .await
             .expect("complete decommission multipart source object");
+    }
+
+    struct DataMovementSourceSeed {
+        pool_idx: usize,
+        version_id: Option<Uuid>,
+        body: Vec<u8>,
+        multipart_split: Option<usize>,
+        mod_time: OffsetDateTime,
+        user_defined: HashMap<String, String>,
+    }
+
+    async fn seed_data_movement_source_reader(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        seed: DataMovementSourceSeed,
+    ) -> GetObjectReader {
+        let DataMovementSourceSeed {
+            pool_idx,
+            version_id,
+            body,
+            multipart_split,
+            mod_time,
+            user_defined,
+        } = seed;
+        let pool = &store.pools[pool_idx];
+        let write_opts = ObjectOptions {
+            versioned: version_id.is_some(),
+            version_id: version_id.map(|version_id| version_id.to_string()),
+            mod_time: Some(mod_time),
+            user_defined,
+            ..Default::default()
+        };
+        if let Some(split) = multipart_split {
+            assert!(split > 0 && split < body.len(), "multipart source split must create two non-empty parts");
+            let upload = pool
+                .new_multipart_upload(bucket, object, &write_opts)
+                .await
+                .expect("create physical data-movement source upload");
+            let mut completed_parts = Vec::with_capacity(2);
+            for (part_number, bytes) in [(1, &body[..split]), (2, &body[split..])] {
+                let mut reader = PutObjReader::from_vec(bytes.to_vec());
+                let part = pool
+                    .put_object_part(bucket, object, &upload.upload_id, part_number, &mut reader, &ObjectOptions::default())
+                    .await
+                    .expect("write physical data-movement source part");
+                completed_parts.push(crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                });
+            }
+            pool.clone()
+                .complete_multipart_upload(bucket, object, &upload.upload_id, completed_parts, &write_opts)
+                .await
+                .expect("complete physical data-movement source object");
+        } else {
+            let mut reader = PutObjReader::from_vec(body);
+            pool.put_object(bucket, object, &mut reader, &write_opts)
+                .await
+                .expect("write physical data-movement source object");
+        }
+
+        pool.get_object_reader(
+            bucket,
+            object,
+            None,
+            HeaderMap::new(),
+            &ObjectOptions {
+                versioned: version_id.is_some(),
+                version_id: version_id.map(|version_id| version_id.to_string()),
+                raw_data_movement_read: true,
+                include_part_checksums: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("read the physical data-movement source snapshot")
     }
 
     async fn assert_pool_object_present(pool: &Arc<crate::core::sets::Sets>, bucket: &str, object: &str) {
@@ -2896,7 +3430,7 @@ mod tests {
                         .make_bucket(&bucket, &MakeBucketOptions::default())
                         .await
                         .expect("create data movement bucket");
-                    let source_mod_time = OffsetDateTime::UNIX_EPOCH;
+                    let source_mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND;
                     let target_mod_time = source_mod_time + time::Duration::SECOND;
 
                     let object = "single-object";
@@ -2916,24 +3450,25 @@ mod tests {
                         .expect("write newer single-part target");
 
                     let source_body = b"stale migration body".to_vec();
+                    let source_reader = seed_data_movement_source_reader(
+                        &store,
+                        &bucket,
+                        object,
+                        DataMovementSourceSeed {
+                            pool_idx: 0,
+                            version_id: None,
+                            body: source_body,
+                            multipart_split: None,
+                            mod_time: source_mod_time,
+                            user_defined: HashMap::new(),
+                        },
+                    )
+                    .await;
                     crate::data_movement::migrate_object(
                         store.clone(),
                         0,
                         bucket.clone(),
-                        GetObjectReader {
-                            stream: Box::new(Cursor::new(source_body.clone())),
-                            object_info: ObjectInfo {
-                                bucket: bucket.clone(),
-                                name: object.to_string(),
-                                size: i64::try_from(source_body.len()).expect("single source size should fit i64"),
-                                actual_size: i64::try_from(source_body.len()).expect("single source size should fit i64"),
-                                etag: Some("0123456789abcdef0123456789abcdef".to_string()),
-                                mod_time: Some(source_mod_time),
-                                ..Default::default()
-                            },
-                            buffered_body: None,
-                            body_source: Default::default(),
-                        },
+                        source_reader,
                         None,
                         "test_data_movement",
                     )
@@ -2967,42 +3502,25 @@ mod tests {
                     let first_part_size = 5 * 1024 * 1024;
                     let mut multipart_source_body = vec![b'a'; first_part_size];
                     multipart_source_body.push(b'b');
-                    let multipart_source_size =
-                        i64::try_from(multipart_source_body.len()).expect("multipart source size should fit i64");
+                    let multipart_source_reader = seed_data_movement_source_reader(
+                        &store,
+                        &bucket,
+                        multipart_object,
+                        DataMovementSourceSeed {
+                            pool_idx: 0,
+                            version_id: None,
+                            body: multipart_source_body,
+                            multipart_split: Some(first_part_size),
+                            mod_time: source_mod_time,
+                            user_defined: HashMap::new(),
+                        },
+                    )
+                    .await;
                     crate::data_movement::migrate_object(
                         store.clone(),
                         0,
                         bucket.clone(),
-                        GetObjectReader {
-                            stream: Box::new(Cursor::new(multipart_source_body)),
-                            object_info: ObjectInfo {
-                                bucket: bucket.clone(),
-                                name: multipart_object.to_string(),
-                                size: multipart_source_size,
-                                actual_size: multipart_source_size,
-                                etag: Some("source-multipart-etag-2".to_string()),
-                                mod_time: Some(source_mod_time),
-                                parts: Arc::new(vec![
-                                    ObjectPartInfo {
-                                        number: 1,
-                                        size: first_part_size,
-                                        actual_size: i64::try_from(first_part_size).expect("first part size should fit i64"),
-                                        etag: "source-part-1".to_string(),
-                                        ..Default::default()
-                                    },
-                                    ObjectPartInfo {
-                                        number: 2,
-                                        size: 1,
-                                        actual_size: 1,
-                                        etag: "source-part-2".to_string(),
-                                        ..Default::default()
-                                    },
-                                ]),
-                                ..Default::default()
-                            },
-                            buffered_body: None,
-                            body_source: Default::default(),
-                        },
+                        multipart_source_reader,
                         None,
                         "test_data_movement",
                     )
@@ -3538,40 +4056,20 @@ mod tests {
                     let mut new_body = vec![b'c'; first_part_size];
                     new_body.push(b'd');
 
-                    let source_reader = |name: &str, body: Vec<u8>, mod_time, metadata: HashMap<String, String>| {
-                        let size = i64::try_from(body.len()).expect("source body size should fit i64");
-                        GetObjectReader {
-                            stream: Box::new(Cursor::new(body)),
-                            object_info: ObjectInfo {
-                                bucket: bucket.clone(),
-                                name: name.to_string(),
+                    let source_reader = |name: &'static str, body: Vec<u8>, mod_time, metadata: HashMap<String, String>| {
+                        seed_data_movement_source_reader(
+                            &store,
+                            &bucket,
+                            name,
+                            DataMovementSourceSeed {
+                                pool_idx: 0,
                                 version_id: Some(version_id),
-                                size,
-                                actual_size: size,
-                                etag: Some(format!("{name}-multipart-etag-2")),
-                                mod_time: Some(mod_time),
-                                user_defined: Arc::new(metadata),
-                                parts: Arc::new(vec![
-                                    ObjectPartInfo {
-                                        number: 1,
-                                        size: first_part_size,
-                                        actual_size: i64::try_from(first_part_size).expect("first part size should fit i64"),
-                                        etag: format!("{name}-part-1"),
-                                        ..Default::default()
-                                    },
-                                    ObjectPartInfo {
-                                        number: 2,
-                                        size: 1,
-                                        actual_size: 1,
-                                        etag: format!("{name}-part-2"),
-                                        ..Default::default()
-                                    },
-                                ]),
-                                ..Default::default()
+                                body,
+                                multipart_split: Some(first_part_size),
+                                mod_time,
+                                user_defined: metadata,
                             },
-                            buffered_body: None,
-                            body_source: Default::default(),
-                        }
+                        )
                     };
 
                     let replaceable = "replaceable.bin";
@@ -3584,7 +4082,8 @@ mod tests {
                             old_body.clone(),
                             old_time,
                             HashMap::from([("x-amz-meta-generation".to_string(), "old".to_string())]),
-                        ),
+                        )
+                        .await,
                         None,
                         "test_stale_target_seed",
                     )
@@ -3623,7 +4122,8 @@ mod tests {
                             new_body.clone(),
                             new_time,
                             HashMap::from([("x-amz-meta-generation".to_string(), "new".to_string())]),
-                        ),
+                        )
+                        .await,
                         None,
                         "test_stale_target_replace",
                     )
@@ -3688,7 +4188,7 @@ mod tests {
                         store.clone(),
                         0,
                         bucket.clone(),
-                        source_reader(client_target, new_body.clone(), new_time, HashMap::new()),
+                        source_reader(client_target, new_body.clone(), new_time, HashMap::new()).await,
                         None,
                         "test_client_target_reject",
                     )
@@ -3727,7 +4227,8 @@ mod tests {
                             old_body.clone(),
                             old_time,
                             HashMap::from([("x-amz-meta-generation".to_string(), "old".to_string())]),
-                        ),
+                        )
+                        .await,
                         None,
                         "test_acknowledged_target_seed",
                     )
@@ -3765,7 +4266,8 @@ mod tests {
                             new_body.clone(),
                             new_time,
                             HashMap::from([("x-amz-meta-generation".to_string(), "new".to_string())]),
-                        ),
+                        )
+                        .await,
                         None,
                         "test_acknowledged_target_reject",
                     )
@@ -3800,7 +4302,8 @@ mod tests {
                             old_body.clone(),
                             old_time,
                             HashMap::from([("x-amz-meta-generation".to_string(), "old".to_string())]),
-                        ),
+                        )
+                        .await,
                         None,
                         "test_metadata_acknowledged_target_seed",
                     )
@@ -3854,7 +4357,8 @@ mod tests {
                             new_body.clone(),
                             new_time,
                             HashMap::from([("x-amz-meta-generation".to_string(), "new".to_string())]),
-                        ),
+                        )
+                        .await,
                         None,
                         "test_metadata_acknowledged_target_reject",
                     )
@@ -3880,7 +4384,7 @@ mod tests {
                             store.clone(),
                             0,
                             bucket.clone(),
-                            source_reader(object, old_body.clone(), old_time, retained_metadata.clone()),
+                            source_reader(object, old_body.clone(), old_time, retained_metadata.clone()).await,
                             None,
                             "test_retained_target_seed",
                         )
@@ -3890,7 +4394,7 @@ mod tests {
                             store.clone(),
                             0,
                             bucket.clone(),
-                            source_reader(object, new_body.clone(), new_time, retained_metadata),
+                            source_reader(object, new_body.clone(), new_time, retained_metadata).await,
                             None,
                             "test_retained_target_replace",
                         )
@@ -4896,26 +5400,30 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
     async fn decommission_outer_fence_loss_blocks_multipart_commits() {
-        let temp_dir = tempfile::tempdir().expect("create decommission multipart fence-loss store dir");
-        let (_ctx, store, shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "decommission-multipart-fence-loss", &[4, 4]))
-                .await;
-        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
-
-        let bucket = format!("decom-mpu-fence-loss-{}", uuid::Uuid::new_v4());
-        store
-            .make_bucket(&bucket, &MakeBucketOptions::default())
-            .await
-            .expect("create decommission multipart fence-loss bucket");
-        for object in ["new-upload.bin", "complete.bin"] {
-            write_decommission_test_multipart_source(&store, 0, &bucket, object).await;
-        }
-        mark_test_pool_decommissioning(&store, 0).await;
-
         for (object, pause) in [
-            ("new-upload.bin", crate::set_disk::MultipartCommitPause::NewUploadBeforeLockLost),
             ("complete.bin", crate::set_disk::MultipartCommitPause::BeforeLockLost),
+            ("new-upload.bin", crate::set_disk::MultipartCommitPause::NewUploadBeforeLockLost),
         ] {
+            // Each injected commit failure intentionally leaves a capacity intent for
+            // reconciliation.  Isolate the scenarios so one failure cannot turn the
+            // next scenario into a capacity-recovery test before its barrier is hit.
+            let temp_dir = tempfile::tempdir().expect("create decommission multipart fence-loss store dir");
+            let (_ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store(
+                temp_dir.path(),
+                "decommission-multipart-fence-loss",
+                &[4, 4],
+            ))
+            .await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+            let bucket = format!("decom-mpu-fence-loss-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create decommission multipart fence-loss bucket");
+            write_decommission_test_multipart_source(&store, 0, &bucket, object).await;
+            mark_test_pool_decommissioning(&store, 0).await;
+
             let loss_hook = crate::store::object::DecommissionMutationFenceLossHook::install(
                 &bucket,
                 object,
@@ -4943,8 +5451,10 @@ mod tests {
             });
 
             tokio::select! {
-                () = barrier.wait_until_paused() => {}
-                result = &mut worker => panic!("decommission multipart worker exited before the commit barrier: {result:?}"),
+                _ = barrier.wait_until_paused() => {}
+                result = &mut worker => {
+                    panic!("decommission multipart worker finished before the requested {pause:?} commit barrier: {result:?}");
+                }
             }
             loss_hook.mark_lost();
             barrier.release();
@@ -4957,7 +5467,7 @@ mod tests {
             if let Some(commit_observation) = commit_observation {
                 assert!(
                     !commit_observation.committed(),
-                    "new multipart upload metadata must not commit after the outer fence is lost"
+                    "NewMultipart must reject a lost outer decommission/capacity fence even though it does not acquire the final remote-tuple publication fence"
                 );
             }
             assert_pool_object_absent(&store.pools[1], &bucket, object).await;
@@ -4980,9 +5490,9 @@ mod tests {
                 )
                 .await
                 .expect("same-mutation retry should recover the durable capacity intent");
-        }
 
-        shutdown.cancel();
+            shutdown.cancel();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6351,7 +6861,7 @@ mod tests {
     #[serial_test::serial(storage_class_env)]
     async fn tiered_data_movement_rejects_a_stale_source_snapshot_before_target_write() {
         let temp_dir = tempfile::tempdir().expect("create stale-source data movement store dir");
-        let (_ctx, store, _shutdown) =
+        let (ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "stale-tier-source", &[4, 4])).await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "stale-tier-source-bucket";
@@ -6360,6 +6870,7 @@ mod tests {
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
+        register_mock_tier(&ctx.tier_config_mgr(), "STALE-TIER").await;
         let incarnation = store
             .bucket_incarnation_id(bucket)
             .await
@@ -6598,8 +7109,10 @@ mod tests {
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("create multipart selected-target bucket");
+        let first_part_size = 5 * 1024 * 1024;
+        let mut source_body = vec![b'a'; first_part_size];
+        source_body.push(b'b');
         for (pool_idx, version_id, body, mod_time) in [
-            (0, source_version, b"source version".to_vec(), source_mod_time),
             (
                 1,
                 other_version,
@@ -6624,52 +7137,31 @@ mod tests {
                 .await
                 .expect("seed multipart data movement pool");
         }
+        let source_reader = seed_data_movement_source_reader(
+            &store,
+            &bucket,
+            object,
+            DataMovementSourceSeed {
+                pool_idx: 0,
+                version_id: Some(source_version),
+                body: source_body,
+                multipart_split: Some(first_part_size),
+                mod_time: source_mod_time,
+                user_defined: HashMap::new(),
+            },
+        )
+        .await;
         *store.rebalance_meta.write().await = Some(active_rebalance_meta_for_pool(store.pools.len(), 0));
 
-        let first_part_size = 5 * 1024 * 1024;
-        let mut source_body = vec![b'a'; first_part_size];
-        source_body.push(b'b');
-        let source_size = i64::try_from(source_body.len()).expect("multipart source size should fit i64");
         let completion_barrier = crate::store::multipart::DataMovementMultipartCompletionBarrier::install(&bucket);
         let migration_store = store.clone();
         let migration_bucket = bucket.clone();
         let migration = tokio::spawn(async move {
-            let object_bucket = migration_bucket.clone();
             crate::data_movement::migrate_object(
                 migration_store,
                 0,
                 migration_bucket,
-                GetObjectReader {
-                    stream: Box::new(Cursor::new(source_body)),
-                    object_info: ObjectInfo {
-                        bucket: object_bucket,
-                        name: object.to_string(),
-                        version_id: Some(source_version),
-                        size: source_size,
-                        actual_size: source_size,
-                        etag: Some("source-multipart-etag-2".to_string()),
-                        mod_time: Some(source_mod_time),
-                        parts: Arc::new(vec![
-                            ObjectPartInfo {
-                                number: 1,
-                                size: first_part_size,
-                                actual_size: i64::try_from(first_part_size).expect("first part size should fit i64"),
-                                etag: "source-part-1".to_string(),
-                                ..Default::default()
-                            },
-                            ObjectPartInfo {
-                                number: 2,
-                                size: 1,
-                                actual_size: 1,
-                                etag: "source-part-2".to_string(),
-                                ..Default::default()
-                            },
-                        ]),
-                        ..Default::default()
-                    },
-                    buffered_body: None,
-                    body_source: Default::default(),
-                },
+                source_reader,
                 None,
                 "test_multipart_selected_target",
             )
@@ -6789,6 +7281,7 @@ mod tests {
             .expect("tier lease should resolve")
             .backend_identity();
         let entry = Jentry {
+            persisted_version: 0,
             obj_name: "receipt-recovery-object".to_string(),
             version_id: "receipt-recovery-version".to_string(),
             tier_name: tier_name.to_string(),
@@ -6797,6 +7290,7 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
         let path = tier_delete_journal_object_name(&entry);
         let data = encode_tier_delete_journal_entry(&entry).expect("tier journal should encode");
@@ -6990,6 +7484,7 @@ mod tests {
             .expect("tier lease should resolve")
             .backend_identity();
         let entry = Jentry {
+            persisted_version: 0,
             obj_name: "multi-source-recovery-object".to_string(),
             version_id: "multi-source-recovery-version".to_string(),
             tier_name: tier_name.to_string(),
@@ -6998,6 +7493,7 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
         let path = tier_delete_journal_object_name(&entry);
         let data = encode_tier_delete_journal_entry(&entry).expect("tier journal should encode");
@@ -7116,6 +7612,8 @@ mod tests {
                             content_sha256: format!("{:064x}", index + RECEIPT_COUNT),
                             identity_sha256: "f".repeat(64),
                             committed: false,
+                            dispatch_identity_sha256: None,
+                            state: None,
                         },
                     };
                     store
@@ -7223,6 +7721,7 @@ mod tests {
             .expect("tier lease should resolve")
             .backend_identity();
         let tier_entry = Jentry {
+            persisted_version: 0,
             obj_name: "decommissioned-remote-object".to_string(),
             version_id: "decommissioned-remote-version".to_string(),
             tier_name: tier_name.to_string(),
@@ -7231,6 +7730,7 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
         let tier_path = tier_delete_journal_object_name(&tier_entry);
         let tier_bytes = encode_tier_delete_journal_entry(&tier_entry).expect("tier journal should encode");
@@ -7804,6 +8304,2002 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    async fn tier_delete_dispatch_manifest_count(store: Arc<crate::store::ECStore>) -> usize {
+        store
+            .list_objects_v2(
+                RUSTFS_META_BUCKET,
+                TIER_DELETE_DISPATCH_MANIFEST_PREFIX,
+                None,
+                None,
+                100,
+                false,
+                None,
+                false,
+            )
+            .await
+            .expect("tier delete dispatch manifests should be listable")
+            .objects
+            .len()
+    }
+
+    #[cfg(feature = "test-util")]
+    fn synthetic_v6_dispatch_entry(
+        bucket: &str,
+        object: &str,
+        tier_name: &str,
+        backend_identity: [u8; 32],
+        remote_version: &str,
+    ) -> Jentry {
+        Jentry {
+            persisted_version: 0,
+            obj_name: format!("remote/{object}"),
+            version_id: remote_version.to_string(),
+            tier_name: tier_name.to_string(),
+            backend_identity: Some(backend_identity),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Prepared,
+            source: Some(TierDeleteSourceIdentity {
+                bucket: bucket.to_string(),
+                object: object.to_string(),
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                versioned: true,
+                version_suspended: false,
+                data_dir: Some(uuid::Uuid::new_v4().to_string()),
+                etag: Some(format!("etag-{object}")),
+                mod_time: Some(OffsetDateTime::UNIX_EPOCH.to_string()),
+            }),
+            dispatch: None,
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn install_aborting_dispatch_fixture(
+        store: Arc<crate::store::ECStore>,
+        bucket: &str,
+        incarnation: uuid::Uuid,
+        prefix: &str,
+        tier_name: &str,
+        backend_identity: [u8; 32],
+        journal_count: usize,
+    ) -> (String, Vec<Jentry>) {
+        let entries = (0..journal_count)
+            .map(|index| {
+                (
+                    synthetic_v6_dispatch_entry(
+                        bucket,
+                        &format!("{prefix}{index:06}.bin"),
+                        tier_name,
+                        backend_identity,
+                        &uuid::Uuid::new_v4().to_string(),
+                    ),
+                    Some(TierDeleteJournalState::Prepared),
+                )
+            })
+            .collect();
+        install_test_tier_delete_dispatch_fixture(
+            store,
+            bucket,
+            incarnation,
+            prefix,
+            entries,
+            TierDeleteDispatchManifestState::Aborting,
+        )
+        .await
+        .expect("Aborting rollback fixture should persist")
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn drive_tier_delete_dispatch_restart_to_convergence(store: Arc<crate::store::ECStore>) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut stable_empty_observations = 0;
+            loop {
+                recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+                    .await
+                    .expect("restarted manifest recovery pass should finish");
+                recover_tier_delete_journal_entries(store.clone(), 100, None)
+                    .await
+                    .expect("restarted journal recovery pass should finish");
+                if tier_delete_journal_count(store.clone()).await == 0
+                    && tier_delete_dispatch_manifest_count(store.clone()).await == 0
+                    && tier_delete_dispatch_manifest_recovery_count_for_test(&store) == 0
+                {
+                    stable_empty_observations += 1;
+                    if stable_empty_observations == 10 {
+                        break;
+                    }
+                } else {
+                    stable_empty_observations = 0;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("same-disk restart recovery should converge without retained dispatch state");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_journal_rejects_unbound_new_prepare_without_persisting() {
+        let temp_dir = tempfile::tempdir().expect("create journal admission store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-journal-unbound-prepare", &[4])).await;
+        let entry = Jentry {
+            persisted_version: 0,
+            obj_name: "remote/object".to_string(),
+            version_id: uuid::Uuid::new_v4().to_string(),
+            tier_name: "COLD-A".to_string(),
+            backend_identity: Some([7; 32]),
+            version_id_exact: true,
+            version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            state: TierDeleteJournalState::Prepared,
+            source: Some(TierDeleteSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: Some(uuid::Uuid::new_v4().to_string()),
+                versioned: true,
+                version_suspended: false,
+                data_dir: Some(uuid::Uuid::new_v4().to_string()),
+                etag: Some("source-etag".to_string()),
+                mod_time: Some(OffsetDateTime::UNIX_EPOCH.to_string()),
+            }),
+            dispatch: None,
+        };
+        let error = persist_tier_delete_journal_entry(store.clone(), &entry)
+            .await
+            .expect_err("a new source-owning journal without a v6 manifest binding must fail closed");
+        assert!(error.to_string().contains("dispatch manifest binding"), "unexpected error: {error}");
+        assert_eq!(tier_delete_journal_count(store).await, 0, "rejected prepare must not write a journal");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_recovery_rolls_back_unapproved_crash_states_without_remote_io() {
+        let temp_dir = tempfile::tempdir().expect("create dispatch rollback store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-manifest-rollback", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-manifest-rollback-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("dispatch rollback bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("bucket incarnation should resolve");
+        let tier_name = "DISPATCH-ROLLBACK";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+
+        let preparing = [
+            ("preparing/a.bin", TierDeleteJournalState::Prepared),
+            ("preparing/b.bin", TierDeleteJournalState::Dispatched),
+        ]
+        .into_iter()
+        .map(|(object, state)| {
+            (
+                synthetic_v6_dispatch_entry(bucket, object, tier_name, identity, &uuid::Uuid::new_v4().to_string()),
+                Some(state),
+            )
+        })
+        .collect();
+        install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "preparing/",
+            preparing,
+            TierDeleteDispatchManifestState::Preparing,
+        )
+        .await
+        .expect("Preparing crash fixture should persist");
+
+        let aborting = [
+            ("aborting/missing.bin", None),
+            ("aborting/prepared.bin", Some(TierDeleteJournalState::Prepared)),
+            ("aborting/dispatched.bin", Some(TierDeleteJournalState::Dispatched)),
+        ]
+        .into_iter()
+        .map(|(object, state)| {
+            (
+                synthetic_v6_dispatch_entry(bucket, object, tier_name, identity, &uuid::Uuid::new_v4().to_string()),
+                state,
+            )
+        })
+        .collect();
+        install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "aborting/",
+            aborting,
+            TierDeleteDispatchManifestState::Aborting,
+        )
+        .await
+        .expect("Aborting crash fixture should persist");
+        install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "empty/",
+            Vec::new(),
+            TierDeleteDispatchManifestState::Completed,
+        )
+        .await
+        .expect("empty Completed crash fixture should persist");
+
+        let deleted = tokio::time::timeout(Duration::from_secs(30), async {
+            let mut deleted = 0;
+            loop {
+                let stats = recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+                    .await
+                    .expect("manifest recovery should reconcile negative-seal crash states");
+                deleted += stats.deleted;
+                if tier_delete_dispatch_manifest_count(store.clone()).await == 0 {
+                    break deleted;
+                }
+                // A different process-global test can briefly revoke the
+                // fleet proof. Recovery must fail closed for that pass and
+                // converge after the proof generation is republished.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("valid negative-seal crash states should eventually converge");
+        assert_eq!(deleted, 3);
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(store).await, 0);
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "rollback recovery must perform zero remote delete operations"
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_recovery_quarantines_impossible_committed_rollback_set() {
+        let temp_dir = tempfile::tempdir().expect("create dispatch quarantine store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-manifest-quarantine", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-manifest-quarantine-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("dispatch quarantine bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("bucket incarnation should resolve");
+        let tier_name = "DISPATCH-QUARANTINE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let entries = [TierDeleteJournalState::Prepared, TierDeleteJournalState::Committed]
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| {
+                (
+                    synthetic_v6_dispatch_entry(
+                        bucket,
+                        &format!("quarantine/{index}.bin"),
+                        tier_name,
+                        identity,
+                        &uuid::Uuid::new_v4().to_string(),
+                    ),
+                    Some(state),
+                )
+            })
+            .collect();
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "quarantine/",
+            entries,
+            TierDeleteDispatchManifestState::Aborting,
+        )
+        .await
+        .expect("impossible rollback fixture should persist");
+
+        let stats = recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+            .await
+            .expect("quarantined manifest scan should finish");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 0, 1));
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            2,
+            "validation must precede every deletion"
+        );
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 1);
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store, &manifest_name)
+                .await
+                .expect("quarantined manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::Aborting)
+        );
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_rollback_bounded_concurrency_reaches_tail_behind_slow_member() {
+        const JOURNAL_COUNT: usize = 65;
+
+        let temp_dir = tempfile::tempdir().expect("create bounded rollback store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "bounded-dispatch-rollback", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "bounded-dispatch-rollback-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bounded rollback bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("bounded rollback bucket incarnation should resolve");
+        let tier_name = "BOUNDED-DISPATCH-ROLLBACK";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("bounded rollback tier lease should resolve")
+            .backend_identity();
+        let (manifest_name, entries) =
+            install_aborting_dispatch_fixture(store.clone(), bucket, incarnation, "slow/", tier_name, identity, JOURNAL_COUNT)
+                .await;
+        let first_name = tier_delete_journal_object_name(entries.first().expect("slow rollback fixture should not be empty"));
+        let last_name = tier_delete_journal_object_name(entries.last().expect("slow rollback fixture should not be empty"));
+        let hook = TierDeleteDispatchRollbackTestHook::install_slow_delete(&first_name, &last_name);
+        let worker_store = store.clone();
+        let worker_manifest = manifest_name.clone();
+        let worker =
+            tokio::spawn(async move { recover_test_tier_delete_dispatch_manifest(worker_store, &worker_manifest).await });
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_delete_paused())
+            .await
+            .expect("the first rollback member should reach the slow hook");
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_delete_observed())
+            .await
+            .expect("a member beyond the first two concurrency windows should remain reachable");
+        assert!(
+            (2..=32).contains(&hook.max_in_flight()),
+            "rollback delete concurrency must make progress without exceeding its bound; observed {}",
+            hook.max_in_flight()
+        );
+        hook.release_delete();
+        worker
+            .await
+            .expect("bounded rollback recovery task should join")
+            .expect("bounded rollback recovery should converge after the slow member releases");
+        drop(hook);
+
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+        assert_eq!(backend.remove_count().await, 0, "rollback must not call the remote tier");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_page_timeout_detaches_one_deduplicated_worker_until_convergence() {
+        let temp_dir = tempfile::tempdir().expect("create detached rollback store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "detached-dispatch-rollback", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "detached-dispatch-rollback-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("detached rollback bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("detached rollback bucket incarnation should resolve");
+        let tier_name = "DETACHED-DISPATCH-ROLLBACK";
+        let _backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("detached rollback tier lease should resolve")
+            .backend_identity();
+        let (manifest_name, entries) =
+            install_aborting_dispatch_fixture(store.clone(), bucket, incarnation, "detached/", tier_name, identity, 1).await;
+        let journal_name = tier_delete_journal_object_name(&entries[0]);
+        let hook = TierDeleteDispatchRollbackTestHook::install_slow_delete(&journal_name, &journal_name);
+
+        assert!(
+            recover_test_tier_delete_dispatch_manifest_with_page_budget(
+                store.clone(),
+                &manifest_name,
+                Duration::from_millis(10),
+            )
+            .await,
+            "the synthetic page budget must elapse while the manifest worker continues"
+        );
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_delete_paused())
+            .await
+            .expect("the detached manifest worker should continue into its delete phase");
+        assert!(
+            tier_delete_dispatch_manifest_recovery_inflight_for_test(&store, &manifest_name),
+            "the detached worker must retain its per-store/object deduplication guard"
+        );
+        assert!(
+            !recover_test_tier_delete_dispatch_manifest_with_page_budget(store.clone(), &manifest_name, Duration::from_secs(30),)
+                .await,
+            "a duplicate page observation should be retained without queuing another worker"
+        );
+
+        hook.release_delete();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let manifest_gone = matches!(com::read_config(store.clone(), &manifest_name).await, Err(Error::ConfigNotFound));
+                if manifest_gone && !tier_delete_dispatch_manifest_recovery_inflight_for_test(&store, &manifest_name) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the detached manifest worker should release its guard after convergence");
+        drop(hook);
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_detached_workers_are_store_bounded_and_shutdown_cancellable() {
+        const MANIFEST_COUNT: usize = 6;
+        const WORKER_LIMIT: usize = 4;
+
+        let temp_dir = tempfile::tempdir().expect("create bounded detached rollback store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "bounded-detached-dispatch-rollback", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "BOUNDED-DETACHED-DISPATCH-ROLLBACK";
+        let _backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("bounded detached rollback tier lease should resolve")
+            .backend_identity();
+        let mut manifest_names = Vec::with_capacity(MANIFEST_COUNT);
+        for index in 0..MANIFEST_COUNT {
+            let bucket = format!("bounded-detached-dispatch-rollback-{index}");
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bounded detached rollback bucket should be created");
+            let incarnation = store
+                .bucket_incarnation_id(&bucket)
+                .await
+                .expect("bounded detached rollback bucket incarnation should resolve");
+            let (manifest_name, _) = install_aborting_dispatch_fixture(
+                store.clone(),
+                &bucket,
+                incarnation,
+                &format!("detached-{index}/"),
+                tier_name,
+                identity,
+                1,
+            )
+            .await;
+            manifest_names.push(manifest_name);
+        }
+        let hook = TierDeleteDispatchRollbackTestHook::install_pause_all_deletes();
+
+        let first_pass = futures::stream::iter(manifest_names.iter().cloned().map(|manifest_name| {
+            let store = store.clone();
+            async move {
+                recover_test_tier_delete_dispatch_manifest_with_page_budget(store, &manifest_name, Duration::from_millis(10))
+                    .await
+            }
+        }))
+        .buffer_unordered(MANIFEST_COUNT)
+        .collect::<Vec<_>>()
+        .await;
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_delete_pause_count(WORKER_LIMIT))
+            .await
+            .expect("every admitted detached worker should pause before its first mutation");
+        assert_eq!(
+            first_pass.into_iter().filter(|timed_out| *timed_out).count(),
+            WORKER_LIMIT,
+            "only the per-store worker budget may detach"
+        );
+        assert_eq!(
+            tier_delete_dispatch_manifest_recovery_count_for_test(&store),
+            WORKER_LIMIT,
+            "detached workers must remain bounded per store"
+        );
+
+        let repeated_pass = futures::stream::iter(manifest_names.iter().cloned().map(|manifest_name| {
+            let store = store.clone();
+            async move {
+                recover_test_tier_delete_dispatch_manifest_with_page_budget(store, &manifest_name, Duration::from_secs(30)).await
+            }
+        }))
+        .buffer_unordered(MANIFEST_COUNT)
+        .collect::<Vec<_>>()
+        .await;
+        assert!(
+            repeated_pass.into_iter().all(|timed_out| !timed_out),
+            "duplicates and over-budget manifests must be retained without a waiter queue"
+        );
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), WORKER_LIMIT);
+
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            tier_delete_dispatch_manifest_recovery_count_for_test(&store),
+            WORKER_LIMIT,
+            "shutdown must not drop a bounded batch before its admitted work drains"
+        );
+        assert_eq!(tier_delete_journal_count(store.clone()).await, MANIFEST_COUNT);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, MANIFEST_COUNT);
+        hook.release_all_deletes();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while tier_delete_dispatch_manifest_recovery_count_for_test(&store) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown should cancel every detached worker and release its registry permit");
+        assert_eq!(tier_delete_journal_count(store.clone()).await, MANIFEST_COUNT);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, MANIFEST_COUNT);
+        drop(hook);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            MANIFEST_COUNT,
+            "releasing the old hook after shutdown must not resume a cancelled mutation"
+        );
+        assert_eq!(
+            tier_delete_dispatch_manifest_recovery_count_for_test(&store),
+            0,
+            "the shutdown store must leave no registry permits behind"
+        );
+        drop(store);
+        drop(ctx);
+
+        let (_restarted_ctx, restarted_store, restarted_shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "bounded-detached-dispatch-rollback-restart",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(restarted_store.clone(), Vec::new()).await;
+        assert!(!restarted_shutdown.is_cancelled(), "the restarted store needs a fresh shutdown token");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let active = tier_delete_dispatch_manifest_recovery_count_for_test(&restarted_store);
+                let manifests = tier_delete_dispatch_manifest_count(restarted_store.clone()).await;
+                if active > 0 || manifests < MANIFEST_COUNT {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the restarted store should start a fresh manifest recovery");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while tier_delete_dispatch_manifest_recovery_count_for_test(&restarted_store) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the restarted store recovery should release every worker permit");
+        if tier_delete_dispatch_manifest_count(restarted_store.clone()).await != 0 {
+            let stats = recover_tier_delete_dispatch_manifests(restarted_store.clone(), 100, None)
+                .await
+                .expect("the restarted store should retry any conservatively retained manifest");
+            assert_eq!(stats.failed, 0, "the restarted recovery must not quarantine a valid manifest");
+        }
+        assert_eq!(tier_delete_journal_count(restarted_store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(restarted_store).await, 0);
+        restarted_shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_shutdown_stops_aborting_validation_tail_reads() {
+        const JOURNAL_COUNT: usize = 65;
+        const ADMITTED_READS: usize = 32;
+
+        let temp_dir = tempfile::tempdir().expect("create validation-read shutdown store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-validation-read-shutdown", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-validation-read-shutdown-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("validation-read shutdown bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("validation-read shutdown bucket incarnation should resolve");
+        let tier_name = "VALIDATION-READ-SHUTDOWN";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("validation-read shutdown tier lease should resolve")
+            .backend_identity();
+        let (manifest_name, _) =
+            install_aborting_dispatch_fixture(store.clone(), bucket, incarnation, "archive/", tier_name, identity, JOURNAL_COUNT)
+                .await;
+        let hook = TierDeleteDispatchMemberReadTestHook::install_pause(TierDeleteDispatchMemberReadTestStage::Validation);
+        let worker_store = store.clone();
+        let worker_manifest = manifest_name.clone();
+        let worker = tokio::spawn(async move {
+            recover_test_tier_delete_dispatch_manifest_with_page_budget(worker_store, &worker_manifest, Duration::from_secs(30))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_read_pause_count(ADMITTED_READS))
+            .await
+            .expect("the first validation read window should be admitted");
+        assert_eq!(hook.entry_count(), ADMITTED_READS);
+        assert_eq!(hook.in_flight(), ADMITTED_READS);
+
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hook.entry_count(), ADMITTED_READS, "shutdown must not admit validation tail reads");
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 1);
+        assert!(tier_delete_dispatch_manifest_operation_lock_held_for_test(store.clone(), &manifest_name).await);
+        assert!(crate::services::notification_sys::tier_delete_journal_fleet_proof_has_inflight_for_test());
+        assert_eq!(tier_delete_journal_count(store.clone()).await, JOURNAL_COUNT);
+        assert_eq!(backend.remove_count().await, 0);
+
+        hook.release_all_reads();
+        assert!(
+            !worker.await.expect("validation-read shutdown worker should join"),
+            "cooperative shutdown should retain an unvalidated rollback"
+        );
+        assert_eq!(hook.entry_count(), ADMITTED_READS);
+        assert_eq!(hook.in_flight(), 0);
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 0);
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            JOURNAL_COUNT,
+            "no rollback DELETE may start"
+        );
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store.clone(), &manifest_name)
+                .await
+                .expect("retained Aborting manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::Aborting)
+        );
+        drop(hook);
+        drop(store);
+        drop(ctx);
+
+        let (_restarted_ctx, restarted_store, restarted_shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "dispatch-validation-read-shutdown-restart",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(restarted_store.clone(), Vec::new()).await;
+        drive_tier_delete_dispatch_restart_to_convergence(restarted_store.clone()).await;
+        restarted_shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_shutdown_stops_authorized_tail_reads_before_receipt_or_cas() {
+        const JOURNAL_COUNT: usize = 65;
+        const ADMITTED_READS: usize = 32;
+
+        let temp_dir = tempfile::tempdir().expect("create authorized-read shutdown store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-authorized-read-shutdown", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-authorized-read-shutdown-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("authorized-read shutdown bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("authorized-read shutdown bucket incarnation should resolve");
+        let tier_name = "AUTHORIZED-READ-SHUTDOWN";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("authorized-read shutdown tier lease should resolve")
+            .backend_identity();
+        let entries = (0..JOURNAL_COUNT)
+            .map(|index| {
+                (
+                    synthetic_v6_dispatch_entry(
+                        bucket,
+                        &format!("archive/{index:06}.bin"),
+                        tier_name,
+                        identity,
+                        &uuid::Uuid::new_v4().to_string(),
+                    ),
+                    Some(TierDeleteJournalState::Committed),
+                )
+            })
+            .collect();
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "archive/",
+            entries,
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("authorized-read shutdown fixture should persist");
+        let tier_config = ctx
+            .tier_config_mgr()
+            .read()
+            .await
+            .tiers
+            .get(tier_name)
+            .cloned()
+            .expect("authorized-read tier config should remain available for restart");
+        let hook = TierDeleteDispatchMemberReadTestHook::install_pause(TierDeleteDispatchMemberReadTestStage::Authorized);
+        let worker_store = store.clone();
+        let worker_manifest = manifest_name.clone();
+        let worker = tokio::spawn(async move {
+            recover_test_tier_delete_dispatch_manifest_with_page_budget(worker_store, &worker_manifest, Duration::from_secs(30))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_read_pause_count(ADMITTED_READS))
+            .await
+            .expect("the first authorized read window should be admitted");
+
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hook.entry_count(), ADMITTED_READS, "shutdown must not admit authorized tail reads");
+        assert_eq!(hook.in_flight(), ADMITTED_READS);
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 1);
+        assert!(tier_delete_dispatch_manifest_operation_lock_held_for_test(store.clone(), &manifest_name).await);
+        assert!(crate::services::notification_sys::tier_delete_journal_fleet_proof_has_inflight_for_test());
+
+        hook.release_all_reads();
+        assert!(
+            !worker.await.expect("authorized-read shutdown worker should join"),
+            "cooperative shutdown should retain an unscanned authorized manifest"
+        );
+        assert_eq!(hook.entry_count(), ADMITTED_READS);
+        assert_eq!(hook.in_flight(), 0);
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 0);
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store.clone(), &manifest_name)
+                .await
+                .expect("retained Authorized manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::DispatchAuthorized),
+            "cancellation before member reads must prevent the Completed CAS"
+        );
+        assert_eq!(
+            hook.authorized_progress_count(),
+            0,
+            "cancellation before member reads must not attempt a decommission progress receipt"
+        );
+        assert_eq!(backend.remove_count().await, 0);
+        drop(hook);
+        drop(store);
+        drop(ctx);
+
+        let (restarted_ctx, restarted_store, restarted_shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "dispatch-authorized-read-shutdown-restart",
+            &[4],
+        ))
+        .await;
+        {
+            let tier_config_mgr = restarted_ctx.tier_config_mgr();
+            let mut manager = tier_config_mgr.write().await;
+            manager.tiers.insert(tier_name.to_string(), tier_config);
+            manager
+                .install_test_driver(tier_name, Box::new(backend.clone()))
+                .expect("the exact authorized-read tier driver should reinstall after restart");
+        }
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(restarted_store.clone(), Vec::new()).await;
+        drive_tier_delete_dispatch_restart_to_convergence(restarted_store.clone()).await;
+        assert_eq!(backend.remove_count().await, JOURNAL_COUNT);
+        restarted_shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_completion_cas_is_bounded_and_reaches_the_tail() {
+        const JOURNAL_COUNT: usize = 65;
+        const ADMITTED_COMMITS: usize = 32;
+
+        let temp_dir = tempfile::tempdir().expect("create dispatch completion concurrency store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-completion-concurrency", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-completion-concurrency-bucket";
+        let prefix = "archive/";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("dispatch completion concurrency bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("dispatch completion concurrency bucket incarnation should resolve");
+        let tier_name = "DISPATCH-COMPLETION-CONCURRENCY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        backend.set_remove_failure(true);
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("dispatch completion concurrency tier lease should resolve")
+            .backend_identity();
+        let entries = (0..JOURNAL_COUNT)
+            .map(|index| {
+                synthetic_v6_dispatch_entry(
+                    bucket,
+                    &format!("{prefix}{index:06}.bin"),
+                    tier_name,
+                    identity,
+                    &uuid::Uuid::new_v4().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            prefix,
+            entries
+                .iter()
+                .cloned()
+                .map(|entry| (entry, Some(TierDeleteJournalState::Dispatched)))
+                .collect(),
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("dispatch completion concurrency fixture should persist");
+
+        let lifecycle_guard = store
+            .acquire_bucket_lifecycle_write_lock(bucket)
+            .await
+            .expect("dispatch completion should acquire the bucket lifecycle fence");
+        let mut fence_opts = ObjectOptions::default();
+        fence_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let bucket_fence = fence_opts
+            .bucket_lifecycle_lock_fence
+            .clone()
+            .expect("dispatch completion should capture the bucket lifecycle fence");
+        let fleet_proof =
+            acquire_tier_delete_journal_fleet_proof().expect("dispatch completion concurrency fixture should have a fleet proof");
+        let prepared =
+            prepare_tier_delete_dispatch(store.clone(), bucket, incarnation, prefix, entries, fleet_proof, &bucket_fence)
+                .await
+                .expect("the existing Authorized dispatch should reload");
+        let active = prepared
+            .consume(bucket, incarnation, prefix)
+            .expect("the existing Authorized dispatch permit should be consumable");
+        active
+            .authorization()
+            .mark_mutation_started(bucket, incarnation, prefix)
+            .expect("the completion test should mark its synthetic local mutation");
+
+        let hook = TierDeleteDispatchMemberReadTestHook::install_pause(TierDeleteDispatchMemberReadTestStage::Completion);
+        let worker_store = store.clone();
+        let worker = tokio::spawn(async move { complete_tier_delete_dispatch(worker_store, &active, &bucket_fence).await });
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_read_pause_count(ADMITTED_COMMITS))
+            .await
+            .expect("the first completion CAS window should be admitted");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hook.entry_count(), ADMITTED_COMMITS, "completion must not admit an unbounded CAS tail");
+        assert_eq!(hook.in_flight(), ADMITTED_COMMITS);
+
+        hook.release_all_reads();
+        worker
+            .await
+            .expect("dispatch completion concurrency worker should join")
+            .expect("every bounded completion CAS should succeed");
+        assert_eq!(
+            hook.entry_count(),
+            JOURNAL_COUNT,
+            "completion must eventually admit the entire journal set"
+        );
+        assert_eq!(hook.in_flight(), 0);
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store.clone(), &manifest_name)
+                .await
+                .expect("completed concurrency manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::Completed)
+        );
+        drop(hook);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_shutdown_stops_completed_missing_journal_tail_reads() {
+        const JOURNAL_COUNT: usize = 65;
+        const ADMITTED_READS: usize = 32;
+
+        let temp_dir = tempfile::tempdir().expect("create completed-read shutdown store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-completed-read-shutdown", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-completed-read-shutdown-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("completed-read shutdown bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("completed-read shutdown bucket incarnation should resolve");
+        let tier_name = "COMPLETED-READ-SHUTDOWN";
+        let _backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("completed-read shutdown tier lease should resolve")
+            .backend_identity();
+        let entries = (0..JOURNAL_COUNT)
+            .map(|index| {
+                (
+                    synthetic_v6_dispatch_entry(
+                        bucket,
+                        &format!("archive/{index:06}.bin"),
+                        tier_name,
+                        identity,
+                        &uuid::Uuid::new_v4().to_string(),
+                    ),
+                    None,
+                )
+            })
+            .collect();
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "archive/",
+            entries,
+            TierDeleteDispatchManifestState::Completed,
+        )
+        .await
+        .expect("completed-read shutdown fixture should persist");
+        let hook = TierDeleteDispatchMemberReadTestHook::install_pause(TierDeleteDispatchMemberReadTestStage::Completed);
+        let worker_store = store.clone();
+        let worker_manifest = manifest_name.clone();
+        let worker = tokio::spawn(async move {
+            recover_test_tier_delete_dispatch_manifest_with_page_budget(worker_store, &worker_manifest, Duration::from_secs(30))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_read_pause_count(ADMITTED_READS))
+            .await
+            .expect("the first Completed read window should be admitted");
+
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hook.entry_count(), ADMITTED_READS, "shutdown must not admit later Completed chunks");
+        assert_eq!(hook.in_flight(), ADMITTED_READS);
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 1);
+        assert!(tier_delete_dispatch_manifest_operation_lock_held_for_test(store.clone(), &manifest_name).await);
+        assert!(crate::services::notification_sys::tier_delete_journal_fleet_proof_has_inflight_for_test());
+
+        hook.release_all_reads();
+        assert!(
+            !worker.await.expect("completed-read shutdown worker should join"),
+            "cooperative shutdown should retain a partially scanned Completed manifest"
+        );
+        assert_eq!(hook.entry_count(), ADMITTED_READS);
+        assert_eq!(hook.in_flight(), 0);
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 0);
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(
+            tier_delete_dispatch_manifest_count(store.clone()).await,
+            1,
+            "manifest DELETE must not run"
+        );
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store.clone(), &manifest_name)
+                .await
+                .expect("retained Completed manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::Completed)
+        );
+        drop(hook);
+        drop(store);
+        drop(ctx);
+
+        let (_restarted_ctx, restarted_store, restarted_shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "dispatch-completed-read-shutdown-restart",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(restarted_store.clone(), Vec::new()).await;
+        drive_tier_delete_dispatch_restart_to_convergence(restarted_store.clone()).await;
+        restarted_shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_shutdown_drains_preparing_cas_before_releasing_fences() {
+        let temp_dir = tempfile::tempdir().expect("create preparing CAS shutdown store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-preparing-cas-shutdown", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-preparing-cas-shutdown-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("preparing CAS shutdown bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("preparing CAS shutdown bucket incarnation should resolve");
+        let entry = synthetic_v6_dispatch_entry(
+            bucket,
+            "archive/preparing-cas.bin",
+            "PREPARING-CAS-SHUTDOWN",
+            [31; 32],
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "archive/",
+            vec![(entry, Some(TierDeleteJournalState::Prepared))],
+            TierDeleteDispatchManifestState::Preparing,
+        )
+        .await
+        .expect("preparing CAS shutdown fixture should persist");
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &manifest_name,
+            crate::set_disk::PutObjectCommitPause::BeforeQuotaRename,
+        );
+        let worker_store = store.clone();
+        let worker_manifest = manifest_name.clone();
+        let worker = tokio::spawn(async move {
+            recover_test_tier_delete_dispatch_manifest_with_page_budget(worker_store, &worker_manifest, Duration::from_secs(30))
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            tier_delete_dispatch_manifest_recovery_count_for_test(&store),
+            1,
+            "a paused CAS must retain its registry permit after shutdown"
+        );
+        assert!(
+            tier_delete_dispatch_manifest_operation_lock_held_for_test(store.clone(), &manifest_name).await,
+            "a paused CAS must retain its manifest operation lock after shutdown"
+        );
+        assert!(
+            crate::services::notification_sys::tier_delete_journal_fleet_proof_has_inflight_for_test(),
+            "a paused CAS must retain its fleet-proof generation permit"
+        );
+
+        barrier.release();
+        assert!(
+            !worker.await.expect("preparing CAS shutdown worker should join"),
+            "cooperative shutdown should retain the partially advanced manifest"
+        );
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 0);
+        assert!(
+            !tier_delete_dispatch_manifest_operation_lock_held_for_test(store.clone(), &manifest_name).await,
+            "the operation lock may release only after the admitted CAS drains"
+        );
+        assert!(
+            com::read_config(store.clone(), &manifest_name).await.is_ok(),
+            "shutdown must retain the durable manifest for restart replay"
+        );
+        drop(barrier);
+        drop(store);
+        drop(ctx);
+
+        let (_restarted_ctx, restarted_store, restarted_shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "dispatch-preparing-cas-shutdown-restart",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(restarted_store.clone(), Vec::new()).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut stable_empty_observations = 0;
+            loop {
+                if tier_delete_journal_count(restarted_store.clone()).await == 0
+                    && tier_delete_dispatch_manifest_count(restarted_store.clone()).await == 0
+                    && tier_delete_dispatch_manifest_recovery_count_for_test(&restarted_store) == 0
+                {
+                    stable_empty_observations += 1;
+                    if stable_empty_observations == 10 {
+                        break;
+                    }
+                } else {
+                    stable_empty_observations = 0;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the restarted background recovery should replay the drained Preparing CAS");
+        assert_eq!(tier_delete_journal_count(restarted_store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(restarted_store).await, 0);
+        restarted_shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_shutdown_drains_admitted_delete_batch_without_tail_admission() {
+        const JOURNAL_COUNT: usize = 65;
+        const ADMITTED_BATCH: usize = 32;
+
+        let temp_dir = tempfile::tempdir().expect("create delete-batch shutdown store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-delete-batch-shutdown", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-delete-batch-shutdown-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("delete-batch shutdown bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("delete-batch shutdown bucket incarnation should resolve");
+        let (manifest_name, entries) = install_aborting_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "archive/",
+            "DELETE-BATCH-SHUTDOWN",
+            [32; 32],
+            JOURNAL_COUNT,
+        )
+        .await;
+        let mut journal_names = entries.iter().map(tier_delete_journal_object_name).collect::<Vec<_>>();
+        journal_names.sort();
+        let published_delete_name = journal_names[0].clone();
+        let hook = TierDeleteDispatchRollbackTestHook::install_pause_all_except_delete(&published_delete_name);
+        let barrier =
+            crate::set_disk::DeleteObjectCommitBarrier::install_after_publish(RUSTFS_META_BUCKET, &published_delete_name);
+        let worker_store = store.clone();
+        let worker_manifest = manifest_name.clone();
+        let worker = tokio::spawn(async move {
+            recover_test_tier_delete_dispatch_manifest_with_page_budget(worker_store, &worker_manifest, Duration::from_secs(30))
+                .await
+        });
+        barrier.wait_until_paused().await;
+        tokio::time::timeout(Duration::from_secs(30), hook.wait_until_delete_pause_count(ADMITTED_BATCH - 1))
+            .await
+            .expect("the rest of the bounded delete batch should pause before mutation");
+        assert_eq!(hook.delete_entry_count(), ADMITTED_BATCH);
+
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 1);
+        assert!(
+            tier_delete_dispatch_manifest_operation_lock_held_for_test(store.clone(), &manifest_name).await,
+            "the partially published DELETE must retain its operation lock"
+        );
+        assert!(
+            crate::services::notification_sys::tier_delete_journal_fleet_proof_has_inflight_for_test(),
+            "the partially published DELETE must retain its fleet-proof permit"
+        );
+        assert_eq!(
+            hook.delete_entry_count(),
+            ADMITTED_BATCH,
+            "shutdown must stop admitting the tail behind the bounded batch"
+        );
+
+        barrier.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            tier_delete_dispatch_manifest_recovery_count_for_test(&store),
+            1,
+            "the worker must retain its guards until every admitted sibling drains"
+        );
+        hook.release_all_deletes();
+        assert!(
+            !worker.await.expect("delete-batch shutdown worker should join"),
+            "cooperative shutdown should retain the partial rollback for restart"
+        );
+        assert_eq!(hook.delete_entry_count(), ADMITTED_BATCH);
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 0);
+        assert!(
+            tier_delete_journal_count(store.clone()).await >= JOURNAL_COUNT - 1,
+            "only the already-published DELETE may commit before restart"
+        );
+        drop(barrier);
+        drop(hook);
+        drop(store);
+        drop(ctx);
+
+        let (_restarted_ctx, restarted_store, restarted_shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-delete-batch-shutdown-restart", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(restarted_store.clone(), Vec::new()).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut stable_empty_observations = 0;
+            loop {
+                if tier_delete_journal_count(restarted_store.clone()).await == 0
+                    && tier_delete_dispatch_manifest_count(restarted_store.clone()).await == 0
+                    && tier_delete_dispatch_manifest_recovery_count_for_test(&restarted_store) == 0
+                {
+                    stable_empty_observations += 1;
+                    if stable_empty_observations == 10 {
+                        break;
+                    }
+                } else {
+                    stable_empty_observations = 0;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the restarted background recovery should replay the partially drained delete batch");
+        assert_eq!(tier_delete_journal_count(restarted_store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(restarted_store).await, 0);
+        restarted_shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatch_manifest_rollback_retries_delete_and_confirmation_failures() {
+        const JOURNAL_COUNT: usize = 40;
+
+        let temp_dir = tempfile::tempdir().expect("create rollback retry store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "dispatch-rollback-retry", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "dispatch-rollback-retry-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("rollback retry bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("rollback retry bucket incarnation should resolve");
+        let tier_name = "DISPATCH-ROLLBACK-RETRY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("rollback retry tier lease should resolve")
+            .backend_identity();
+
+        let (delete_manifest, delete_entries) = install_aborting_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "delete-failure/",
+            tier_name,
+            identity,
+            JOURNAL_COUNT,
+        )
+        .await;
+        let delete_failure_name = tier_delete_journal_object_name(&delete_entries[10]);
+        let delete_hook = TierDeleteDispatchRollbackTestHook::install_delete_failure(&delete_failure_name);
+        let delete_error = recover_test_tier_delete_dispatch_manifest(store.clone(), &delete_manifest)
+            .await
+            .expect_err("an injected member delete failure must retain the manifest")
+            .to_string();
+        assert!(delete_error.contains("injected tier delete dispatch rollback delete failure"));
+        assert!(
+            tier_delete_journal_count(store.clone()).await > 0,
+            "the failed member and all work not admitted after the first error must remain retryable"
+        );
+        drop(delete_hook);
+        recover_test_tier_delete_dispatch_manifest(store.clone(), &delete_manifest)
+            .await
+            .expect("the delete-stage retry should converge");
+
+        let (confirmation_manifest, confirmation_entries) = install_aborting_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "confirmation-failure/",
+            tier_name,
+            identity,
+            JOURNAL_COUNT,
+        )
+        .await;
+        let confirmation_failure_name = tier_delete_journal_object_name(&confirmation_entries[10]);
+        let confirmation_hook = TierDeleteDispatchRollbackTestHook::install_confirmation_failure(&confirmation_failure_name);
+        let confirmation_error = recover_test_tier_delete_dispatch_manifest(store.clone(), &confirmation_manifest)
+            .await
+            .expect_err("an injected confirmation failure must retain the manifest")
+            .to_string();
+        assert!(confirmation_error.contains("injected tier delete dispatch rollback confirmation failure"));
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            0,
+            "confirmation failure occurs only after the bounded delete phase drains"
+        );
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 1);
+        drop(confirmation_hook);
+        recover_test_tier_delete_dispatch_manifest(store.clone(), &confirmation_manifest)
+            .await
+            .expect("the confirmation-stage retry should converge over missing members");
+
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+        assert_eq!(backend.remove_count().await, 0, "rollback retries must never call the remote tier");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn v6_decommission_checkpoint_no_lock_put_rejects_lost_publication_fence() {
+        let temp_dir = tempfile::tempdir().expect("create v6 checkpoint fence-loss store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "v6-checkpoint-fence-loss", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "v6-checkpoint-fence-loss-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("checkpoint fence-loss bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("checkpoint fence-loss bucket incarnation should resolve");
+        let entry = synthetic_v6_dispatch_entry(
+            bucket,
+            "archive/fence-loss.bin",
+            "FENCE-LOSS-TIER",
+            [18; 32],
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        let (manifest_name, entries) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "archive/",
+            vec![(entry, Some(TierDeleteJournalState::Prepared))],
+            TierDeleteDispatchManifestState::Preparing,
+        )
+        .await
+        .expect("checkpoint fence-loss fixture should persist");
+        let journal_name = tier_delete_journal_object_name(&entries[0]);
+        let manifest_data = com::read_config(store.clone(), &manifest_name)
+            .await
+            .expect("checkpoint fence-loss manifest should be readable");
+        let journal_data = com::read_config(store.clone(), &journal_name)
+            .await
+            .expect("checkpoint fence-loss journal should be readable");
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &manifest_name, manifest_data.clone())
+                .await
+                .expect("manifest copy should persist in each checkpoint fence-loss pool");
+            com::save_config(pool.clone(), &journal_name, journal_data.clone())
+                .await
+                .expect("journal copy should persist in each checkpoint fence-loss pool");
+        }
+        mark_test_pool_decommissioning(&store, 0).await;
+        for (path, data) in [
+            (&manifest_name, manifest_data.as_slice()),
+            (&journal_name, journal_data.as_slice()),
+        ] {
+            let record = validate_durable_ilm_record(path, data).expect("checkpoint fence-loss v6 record should validate");
+            store
+                .persist_decommission_durable_ilm_receipt_for_test(0, 1, path, &record, false)
+                .await
+                .expect("checkpoint fence-loss receipt should persist");
+        }
+
+        let loss_hook = crate::store::object::DecommissionMutationFenceLossHook::install(
+            RUSTFS_META_BUCKET,
+            &manifest_name,
+            crate::store::object::DecommissionMutationFenceTestPhase::Migration,
+        );
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &manifest_name,
+            crate::set_disk::PutObjectCommitPause::BeforeQuotaRename,
+        );
+        let worker_store = store.clone();
+        let worker_manifest = manifest_name.clone();
+        let worker =
+            tokio::spawn(async move { recover_test_tier_delete_dispatch_manifest(worker_store, &worker_manifest).await });
+        barrier.wait_until_paused().await;
+        loss_hook.mark_lost();
+        barrier.release();
+        drop(barrier);
+        let error = worker
+            .await
+            .expect("checkpoint fence-loss recovery task should join")
+            .expect_err("lost publication fence must reject the no-lock checkpoint PUT")
+            .to_string();
+        assert!(
+            error.contains("lock") || error.contains("fence"),
+            "unexpected checkpoint fence-loss error: {error}"
+        );
+        assert_eq!(
+            com::read_config(store.pools[1].clone(), &manifest_name)
+                .await
+                .expect("fenced target manifest should remain readable"),
+            manifest_data,
+            "the target checkpoint must not commit after its publication fence is lost"
+        );
+
+        drop(loss_hook);
+        recover_test_tier_delete_dispatch_manifest(store.clone(), &manifest_name)
+            .await
+            .expect("checkpoint recovery should converge after a fresh fence is acquired");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn v6_decommission_checkpoint_partial_target_failure_retries_without_advancing_receipts() {
+        let temp_dir = tempfile::tempdir().expect("create v6 partial checkpoint store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "v6-partial-checkpoint", &[4, 4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "v6-partial-checkpoint-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("partial checkpoint bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("partial checkpoint bucket incarnation should resolve");
+        let entry = synthetic_v6_dispatch_entry(
+            bucket,
+            "archive/partial.bin",
+            "PARTIAL-CHECKPOINT-TIER",
+            [19; 32],
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        let (manifest_name, entries) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "archive/",
+            vec![(entry, Some(TierDeleteJournalState::Prepared))],
+            TierDeleteDispatchManifestState::Preparing,
+        )
+        .await
+        .expect("partial checkpoint fixture should persist");
+        let journal_name = tier_delete_journal_object_name(&entries[0]);
+        let manifest_data = com::read_config(store.clone(), &manifest_name)
+            .await
+            .expect("partial checkpoint manifest should be readable");
+        let journal_data = com::read_config(store.clone(), &journal_name)
+            .await
+            .expect("partial checkpoint journal should be readable");
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &manifest_name, manifest_data.clone())
+                .await
+                .expect("manifest copy should persist in each partial checkpoint pool");
+            com::save_config(pool.clone(), &journal_name, journal_data.clone())
+                .await
+                .expect("journal copy should persist in each partial checkpoint pool");
+        }
+        mark_test_pool_decommissioning_with_split_targets(&store, 0).await;
+        for target_pool_index in [1, 2] {
+            for (path, data) in [
+                (&manifest_name, manifest_data.as_slice()),
+                (&journal_name, journal_data.as_slice()),
+            ] {
+                let record = validate_durable_ilm_record(path, data).expect("partial checkpoint v6 record should validate");
+                store
+                    .persist_decommission_durable_ilm_receipt_for_test(0, target_pool_index, path, &record, false)
+                    .await
+                    .expect("partial checkpoint receipt should persist on each target");
+            }
+        }
+        let (aborting_data, preparing_etag) = test_tier_delete_dispatch_manifest_checkpoint(
+            store.clone(),
+            &manifest_name,
+            TierDeleteDispatchManifestState::Aborting,
+        )
+        .await
+        .expect("partial checkpoint Aborting generation should encode");
+        let targets = store
+            .decommission_durable_ilm_checkpoint_targets(&manifest_name, &aborting_data, &preparing_etag)
+            .await
+            .expect("partial checkpoint targets should resolve")
+            .expect("the active decommission should own the partial checkpoint");
+        assert_eq!(
+            targets.iter().map(|target| target.target_pool_index).collect::<Vec<_>>(),
+            vec![1, 2],
+            "the capacity reservation must exercise two independently confirmed targets"
+        );
+
+        let failure_hook = DecommissionCheckpointTargetFailureHook::install(2);
+        let error = recover_test_tier_delete_dispatch_manifest(store.clone(), &manifest_name)
+            .await
+            .expect_err("the injected second-target failure must reject the checkpoint");
+        assert!(
+            error.to_string().contains("injected decommission checkpoint target failure"),
+            "unexpected partial checkpoint error: {error}"
+        );
+        let mut diagnostic = &error as &(dyn std::error::Error + 'static);
+        let mut target_context_found = false;
+        while let Some(source) = diagnostic.source() {
+            if source.to_string().contains("target pool 2") {
+                target_context_found = true;
+                break;
+            }
+            diagnostic = source;
+        }
+        assert!(
+            target_context_found,
+            "the stable checkpoint error must retain the failed target in its diagnostic source chain: {error:?}"
+        );
+        assert_eq!(
+            com::read_config(store.pools[1].clone(), &manifest_name)
+                .await
+                .expect("first target checkpoint should be readable"),
+            aborting_data,
+            "the first target should model a committed checkpoint before the later failure"
+        );
+        assert_eq!(
+            com::read_config(store.pools[2].clone(), &manifest_name)
+                .await
+                .expect("second target checkpoint should be readable"),
+            manifest_data,
+            "the failed second target must retain the prior generation"
+        );
+        let retry_targets = store
+            .decommission_durable_ilm_checkpoint_targets(&manifest_name, &aborting_data, &preparing_etag)
+            .await
+            .expect("unadvanced receipts must still authorize the exact partial checkpoint retry")
+            .expect("the partial checkpoint retry should remain decommission-owned");
+        assert!(retry_targets[0].already_committed);
+        assert!(!retry_targets[1].already_committed);
+
+        drop(failure_hook);
+        recover_test_tier_delete_dispatch_manifest(store.clone(), &manifest_name)
+            .await
+            .expect("the partial checkpoint should converge after the target recovers");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn v6_decommission_checkpoint_shutdown_drains_target_put_and_replays_capacity() {
+        let temp_dir = tempfile::tempdir().expect("create checkpoint shutdown store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "v6-checkpoint-shutdown", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "v6-checkpoint-shutdown-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("checkpoint shutdown bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("checkpoint shutdown bucket incarnation should resolve");
+        let entry = synthetic_v6_dispatch_entry(
+            bucket,
+            "archive/checkpoint-shutdown.bin",
+            "CHECKPOINT-SHUTDOWN",
+            [33; 32],
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        let (manifest_name, entries) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "archive/",
+            vec![(entry, Some(TierDeleteJournalState::Prepared))],
+            TierDeleteDispatchManifestState::Preparing,
+        )
+        .await
+        .expect("checkpoint shutdown fixture should persist");
+        let journal_name = tier_delete_journal_object_name(&entries[0]);
+        let manifest_data = com::read_config(store.clone(), &manifest_name)
+            .await
+            .expect("checkpoint shutdown manifest should be readable");
+        let journal_data = com::read_config(store.clone(), &journal_name)
+            .await
+            .expect("checkpoint shutdown journal should be readable");
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &manifest_name, manifest_data.clone())
+                .await
+                .expect("manifest copy should persist in each checkpoint shutdown pool");
+            com::save_config(pool.clone(), &journal_name, journal_data.clone())
+                .await
+                .expect("journal copy should persist in each checkpoint shutdown pool");
+        }
+        mark_test_pool_decommissioning(&store, 0).await;
+        for (path, data) in [
+            (&manifest_name, manifest_data.as_slice()),
+            (&journal_name, journal_data.as_slice()),
+        ] {
+            let record = validate_durable_ilm_record(path, data).expect("checkpoint shutdown v6 record should validate");
+            store
+                .persist_decommission_durable_ilm_receipt_for_test(0, 1, path, &record, false)
+                .await
+                .expect("checkpoint shutdown receipt should persist");
+        }
+        let (aborting_data, preparing_etag) = test_tier_delete_dispatch_manifest_checkpoint(
+            store.clone(),
+            &manifest_name,
+            TierDeleteDispatchManifestState::Aborting,
+        )
+        .await
+        .expect("checkpoint shutdown Aborting generation should encode");
+        let targets = store
+            .decommission_durable_ilm_checkpoint_targets(&manifest_name, &aborting_data, &preparing_etag)
+            .await
+            .expect("checkpoint shutdown target should resolve")
+            .expect("the active decommission should own the checkpoint target");
+        assert_eq!(targets.len(), 1);
+        let target = targets[0].clone();
+        let barrier = crate::set_disk::PutObjectCommitBarrier::install(
+            RUSTFS_META_BUCKET,
+            &manifest_name,
+            crate::set_disk::PutObjectCommitPause::BeforeQuotaRename,
+        );
+        let worker_store = store.clone();
+        let worker_manifest = manifest_name.clone();
+        let worker = tokio::spawn(async move {
+            recover_test_tier_delete_dispatch_manifest_with_page_budget(worker_store, &worker_manifest, Duration::from_secs(30))
+                .await
+        });
+        barrier.wait_until_paused().await;
+        assert!(
+            store
+                .has_decommission_capacity_temporary_mutation_state(target.target_pool_index, target.capacity_owner)
+                .await,
+            "the target PUT must persist its capacity intent before commit"
+        );
+
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 1);
+        assert!(
+            tier_delete_dispatch_manifest_operation_lock_held_for_test(store.clone(), &manifest_name).await,
+            "the target checkpoint PUT must retain its operation lock after shutdown"
+        );
+        assert!(
+            crate::services::notification_sys::tier_delete_journal_fleet_proof_has_inflight_for_test(),
+            "the target checkpoint PUT must retain its fleet-proof permit after shutdown"
+        );
+
+        barrier.release();
+        assert!(
+            !worker.await.expect("checkpoint shutdown worker should join"),
+            "cooperative shutdown should retain the partially committed checkpoint"
+        );
+        assert_eq!(tier_delete_dispatch_manifest_recovery_count_for_test(&store), 0);
+        assert_eq!(
+            com::read_config(store.pools[target.target_pool_index].clone(), &manifest_name)
+                .await
+                .expect("the committed target checkpoint should be readable"),
+            aborting_data,
+            "the admitted target PUT must finish before its fences release"
+        );
+        assert!(
+            !store
+                .has_decommission_capacity_temporary_mutation_state(target.target_pool_index, target.capacity_owner)
+                .await,
+            "the admitted target PUT must drain its capacity transaction before releasing the recovery fences"
+        );
+        drop(barrier);
+        let mut reloaded_pool_meta = PoolMeta::default();
+        reloaded_pool_meta
+            .load(store.pools[0].clone(), store.pools.clone())
+            .await
+            .expect("checkpoint shutdown pool metadata should reload from disk");
+        *store.pool_meta.write().await = reloaded_pool_meta;
+        recover_test_tier_delete_dispatch_manifest(store.clone(), &manifest_name)
+            .await
+            .expect("a fresh recovery attempt should replay the committed checkpoint and receipt");
+        assert!(
+            !store
+                .has_decommission_capacity_temporary_mutation_state(target.target_pool_index, target.capacity_owner)
+                .await,
+            "durable replay must reconcile the exact capacity transaction"
+        );
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("checkpoint shutdown receipts should be listable"),
+            2,
+            "durable replay must advance both the manifest and journal receipts"
+        );
+        drop(ctx);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn v6_dispatch_recovery_advances_decommission_receipts_and_cleans_target_copies() {
+        let temp_dir = tempfile::tempdir().expect("create v6 decommission receipt store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "v6-dispatch-decommission-receipts", &[4, 4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "v6-dispatch-decommission-receipts-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("receipt bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("receipt bucket incarnation should resolve");
+        let entry = synthetic_v6_dispatch_entry(
+            bucket,
+            "archive/receipt.bin",
+            "RECEIPT-TIER",
+            [17; 32],
+            &uuid::Uuid::new_v4().to_string(),
+        );
+        let (manifest_name, entries) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "archive/",
+            vec![(entry, Some(TierDeleteJournalState::Prepared))],
+            TierDeleteDispatchManifestState::Preparing,
+        )
+        .await
+        .expect("Preparing v6 fixture should persist");
+        let journal_name = tier_delete_journal_object_name(&entries[0]);
+        let manifest_data = com::read_config(store.clone(), &manifest_name)
+            .await
+            .expect("manifest fixture should be readable");
+        let journal_data = com::read_config(store.clone(), &journal_name)
+            .await
+            .expect("journal fixture should be readable");
+
+        // Model an in-flight decommission after both records have been copied
+        // to its target pool but before their state machines advance.
+        for pool in &store.pools {
+            com::save_config(pool.clone(), &manifest_name, manifest_data.clone())
+                .await
+                .expect("manifest copy should persist in each pool");
+            com::save_config(pool.clone(), &journal_name, journal_data.clone())
+                .await
+                .expect("journal copy should persist in each pool");
+        }
+        // Exercise the same durable capacity reservation and identity that a
+        // real decommission start installs. A hand-written active flag makes
+        // every target mutation look external and masks whether recovery is
+        // correctly charged to the decommission owner.
+        mark_test_pool_decommissioning(&store, 0).await;
+
+        let missing_receipt_error = recover_test_tier_delete_dispatch_manifest(store.clone(), &manifest_name)
+            .await
+            .expect_err("an active decommission without receipt coverage must block v6 checkpoint mutation")
+            .to_string();
+        assert!(
+            missing_receipt_error.contains("missing receipt coverage"),
+            "unexpected missing-receipt error: {missing_receipt_error}"
+        );
+        assert_eq!(
+            com::read_config(store.pools[1].clone(), &manifest_name)
+                .await
+                .expect("blocked checkpoint must retain the target manifest generation"),
+            manifest_data,
+            "missing receipt coverage must fail before mutating a target copy"
+        );
+
+        for (path, data) in [
+            (&manifest_name, manifest_data.as_slice()),
+            (&journal_name, journal_data.as_slice()),
+        ] {
+            let record = validate_durable_ilm_record(path, data).expect("v6 durable record should validate");
+            store
+                .persist_decommission_durable_ilm_receipt_for_test(0, 1, path, &record, false)
+                .await
+                .expect("initial decommission receipt should persist");
+        }
+
+        // Model a crash after the target checkpoint PUT committed but before
+        // its temporary-capacity intent was resolved. Recovery must recognize
+        // the exact target bytes and finish that same deterministic intent
+        // instead of treating the checkpoint as an uncharged success.
+        let (aborting_data, preparing_etag) = test_tier_delete_dispatch_manifest_checkpoint(
+            store.clone(),
+            &manifest_name,
+            TierDeleteDispatchManifestState::Aborting,
+        )
+        .await
+        .expect("the Aborting checkpoint should encode");
+        let checkpoint_targets = store
+            .decommission_durable_ilm_checkpoint_targets(&manifest_name, &aborting_data, &preparing_etag)
+            .await
+            .expect("receipt-bearing checkpoint targets should resolve")
+            .expect("an active decommission should own the checkpoint");
+        assert_eq!(checkpoint_targets.len(), 1);
+        let checkpoint_target = checkpoint_targets
+            .into_iter()
+            .next()
+            .expect("one checkpoint target should exist");
+        let checkpoint_owner = checkpoint_target.capacity_owner;
+        let target_pool_index = checkpoint_target.target_pool_index;
+        let injected_write_error = store
+            .run_decommission_capacity_temporary_mutation_with_capacity_lease(
+                target_pool_index,
+                Some(checkpoint_owner),
+                Some(aborting_data.len()),
+                |_| {
+                    let target_pool = store.pools[target_pool_index].clone();
+                    let manifest_name = manifest_name.clone();
+                    let aborting_data = aborting_data.clone();
+                    async move {
+                        com::save_config(target_pool, &manifest_name, aborting_data)
+                            .await
+                            .expect("the injected target checkpoint should commit");
+                        Err::<(), Error>(Error::other("injected crash after checkpoint target commit"))
+                    }
+                },
+            )
+            .await
+            .expect_err("the injected post-commit crash should leave a pending capacity intent")
+            .to_string();
+        assert!(injected_write_error.contains("injected crash after checkpoint target commit"));
+        assert!(
+            store
+                .has_decommission_capacity_temporary_mutation_state(target_pool_index, checkpoint_owner)
+                .await,
+            "the committed target must retain its exact unresolved capacity intent"
+        );
+
+        recover_test_tier_delete_dispatch_manifest(store.clone(), &manifest_name)
+            .await
+            .expect("Preparing rollback should advance receipts and finish terminal cleanup");
+        assert!(
+            !store
+                .has_decommission_capacity_temporary_mutation_state(target_pool_index, checkpoint_owner)
+                .await,
+            "already-committed checkpoint recovery must resolve the pending capacity intent"
+        );
+        let stats = recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+            .await
+            .expect("the terminal source checkpoint should remain non-actionable");
+        assert_eq!((stats.scanned, stats.deleted, stats.retained, stats.failed), (1, 0, 1, 0));
+        assert_eq!(
+            store
+                .decommission_durable_ilm_receipt_count_for_test(0)
+                .await
+                .expect("v6 terminal receipts should be listable"),
+            2
+        );
+
+        {
+            let _proof_guard = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
+            let proof_error = store
+                .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(
+                    0,
+                    store.pools[0].get_disks_by_key(&manifest_name),
+                    &manifest_name,
+                )
+                .await
+                .expect_err("revoked v6 fleet proof must block final source cleanup")
+                .to_string();
+            assert!(
+                proof_error.contains("fleet capability is unavailable"),
+                "unexpected revoked-proof cleanup error: {proof_error}"
+            );
+            assert!(
+                com::read_config(store.pools[0].clone(), &manifest_name).await.is_ok(),
+                "revoked fleet proof must retain the last source manifest copy"
+            );
+        }
+
+        for path in [&manifest_name, &journal_name] {
+            store
+                .verify_and_cleanup_decommissioned_durable_ilm_record_for_test(0, store.pools[0].get_disks_by_key(path), path)
+                .await
+                .expect("terminal receipt should authorize verified source cleanup");
+        }
+        let stats = recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+            .await
+            .expect("verified source cleanup should remove the last manifest copy");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (0, 0, 0));
+        for path in [&manifest_name, &journal_name] {
+            for pool in &store.pools {
+                assert!(
+                    matches!(com::read_config(pool.clone(), path).await, Err(Error::ConfigNotFound)),
+                    "terminal receipt cleanup must remove `{path}` from every staged pool"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn authorized_all_committed_manifest_recovers_after_last_commit_crash() {
+        let temp_dir = tempfile::tempdir().expect("create authorized manifest recovery store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "authorized-manifest-last-commit", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "authorized-manifest-last-commit-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("authorized recovery bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("bucket incarnation should resolve");
+        let tier_name = "AUTHORIZED-LAST-COMMIT";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve");
+        let mut entries = Vec::new();
+        for index in 0..2 {
+            let remote_version = uuid::Uuid::new_v4().to_string();
+            let entry = synthetic_v6_dispatch_entry(
+                bucket,
+                &format!("archive/{index}.bin"),
+                tier_name,
+                lease.backend_identity(),
+                &remote_version,
+            );
+            backend.set_put_remote_version(Some(remote_version)).await;
+            lease
+                .put(&entry.obj_name, ReaderImpl::Body(bytes::Bytes::from_static(b"remote candidate")), 16)
+                .await
+                .expect("remote candidate should be seeded");
+            entries.push((entry, Some(TierDeleteJournalState::Committed)));
+        }
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            "archive/",
+            entries,
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("last-commit crash fixture should persist");
+
+        let manifest_stats = recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+            .await
+            .expect("all-Committed Authorized manifest should advance");
+        assert_eq!((manifest_stats.scanned, manifest_stats.advanced, manifest_stats.failed), (1, 1, 0));
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store.clone(), &manifest_name)
+                .await
+                .expect("advanced manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::Completed)
+        );
+        let journal_stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("Completed journal set should recover remote candidates");
+        assert_eq!((journal_stats.scanned, journal_stats.deleted, journal_stats.failed), (2, 2, 0));
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 1);
+        let gc_stats = recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+            .await
+            .expect("manifest coordinator should remove the empty Completed manifest");
+        assert_eq!((gc_stats.scanned, gc_stats.deleted, gc_stats.failed), (1, 1, 0));
+        assert_eq!(tier_delete_dispatch_manifest_count(store).await, 0);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.remove_versions().await.len(), 2);
+    }
+
+    #[cfg(feature = "test-util")]
     async fn transition_transaction_record_count(store: Arc<crate::store::ECStore>) -> usize {
         store
             .list_objects_v2(
@@ -7871,6 +10367,2500 @@ mod tests {
         })
         .await
         .expect("tier delete journal recovery should complete");
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn wait_for_tier_free_version_recovery(
+        store: Arc<crate::store::ECStore>,
+        backend: &MockWarmBackend,
+        expected_removes: usize,
+    ) {
+        ExpiryState::resize_workers(1, store.clone()).await;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let stats = recover_tier_free_versions(store.clone(), 100, None, None)
+                    .await
+                    .expect("tier free-version recovery scan should succeed");
+                if backend.remove_versions().await.len() >= expected_removes && stats.enqueued == 0 && stats.failed == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("tier free-version recovery should complete");
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn wait_for_expiry_workers_idle(store: &crate::store::ECStore) {
+        let expiry_state = store.ctx.expiry_state();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let idle = {
+                    let state = expiry_state.read().await;
+                    state.pending_tasks() == 0 && state.active_tasks() == 0
+                };
+                if idle {
+                    // Recheck after a scheduler turn so the tiny hand-off
+                    // between dequeue and active-task accounting cannot make
+                    // the test observe a false idle state.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let state = expiry_state.read().await;
+                    if state.pending_tasks() == 0 && state.active_tasks() == 0 {
+                        return;
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        })
+        .await
+        .expect("lifecycle expiry workers should become idle");
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn run_transitioned_delete_free_version_owner_case(
+        store_name: &str,
+        tier_name: &str,
+        bucket: &str,
+        object: &str,
+        restore_before_delete: bool,
+    ) {
+        let temp_dir = tempfile::tempdir().expect("create transitioned delete store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), store_name, &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("source bucket should be created");
+        let mut reader = PutObjReader::from_vec(vec![b'd'; 1024 * 1024]);
+        let original = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: original.etag.clone().expect("source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source transition should commit");
+        assert_eq!(backend.object_count().await, 1, "transition should create one remote object");
+        if restore_before_delete {
+            store
+                .clone()
+                .restore_transitioned_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            restore_request: s3s::dto::RestoreRequest {
+                                days: Some(1),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("restore should complete before transitioned delete");
+            let restored = store
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("restored transitioned source should remain readable");
+            assert!(
+                restored.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+                "restore completion metadata must be present before the delete regression"
+            );
+        }
+
+        backend.set_remove_failure(true);
+        store
+            .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
+            .await
+            .expect("transitioned source delete should commit");
+
+        let local_versions = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("post-delete metadata should remain decodable");
+        let local_versions = local_versions.expect("ordinary delete must leave a durable free-version cleanup owner");
+        assert_eq!(
+            local_versions
+                .versions
+                .iter()
+                .chain(local_versions.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            1,
+            "ordinary delete must leave exactly one hidden free-version owner"
+        );
+        assert_eq!(
+            local_versions
+                .versions
+                .iter()
+                .filter(|version| !version.tier_free_version())
+                .count(),
+            0,
+            "ordinary delete must remove the visible transitioned source"
+        );
+        let listed = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("source versions should be listable");
+        assert!(listed.objects.is_empty(), "source must have no visible versions after delete");
+
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            0,
+            "ordinary delete must not create a journal"
+        );
+
+        backend.set_remove_failure(false);
+        ExpiryState::resize_workers(1, store.clone()).await;
+        let recovered = recover_tier_free_versions(store.clone(), 100, None, None)
+            .await
+            .expect("free-version recovery should scan the hidden owner");
+        assert_eq!((recovered.enqueued, recovered.failed), (1, 0));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let metadata_absent = store.pools[0]
+                    .get_disks_by_key(object)
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("free-version cleanup metadata should remain readable")
+                    .is_none();
+                if metadata_absent && backend.remove_versions().await.len() == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("free-version recovery should delete the remote and exact local owner");
+        assert_eq!(backend.object_count().await, 0, "free-version recovery should remove the remote object");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("ordinary bucket delete should succeed after the last transitioned object");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transitioned_delete_uses_free_version_as_cleanup_owner() {
+        run_transitioned_delete_free_version_owner_case(
+            "transitioned-delete-journal-owner",
+            "DELETEOWNER",
+            "transitioned-delete-journal-owner-bucket",
+            "transition/archive.bin",
+            false,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn restored_transitioned_delete_uses_free_version_as_cleanup_owner() {
+        run_transitioned_delete_free_version_owner_case(
+            "restored-transitioned-delete-journal-owner",
+            "RESTOREDELETEOWNER",
+            "restored-transitioned-delete-journal-owner-bucket",
+            "transition/archive.bin",
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn force_tier_remove_blocks_on_physical_free_version_hidden_by_other_pool() {
+        let temp_dir = tempfile::tempdir().expect("create tier reference store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-free-reference-proof", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "FREE-PROOF";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("test tier identity should resolve")
+            .backend_identity();
+        let bucket = "tier-free-reference-proof-bucket";
+        let object = "archive.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("source bucket should be created");
+        let mut reader = PutObjReader::from_vec(vec![b'f'; 1024 * 1024]);
+        let original = store.pools[0]
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        store.pools[0]
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: original.etag.clone().expect("source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source transition should commit");
+        backend.set_remove_failure(true);
+        store.pools[0]
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    tier_delete_journal_api: Some(store.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("journal-less compatibility delete should retain a free-version");
+
+        let exact = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("free-version metadata should remain decodable")
+            .expect("free-version metadata should remain on disk");
+        assert_eq!(
+            exact
+                .versions
+                .iter()
+                .chain(exact.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            1,
+            "fixture must contain one real serialized hidden free-version"
+        );
+
+        let mut hot_reader = PutObjReader::from_vec(vec![b'h'; 1024 * 1024]);
+        store.pools[1]
+            .put_object(
+                bucket,
+                object,
+                &mut hot_reader,
+                &ObjectOptions {
+                    mod_time: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("second pool hot source should be written");
+        let merged = store
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("merged lookup should return the second-pool hot source");
+        assert!(
+            merged.transitioned_object.status.is_empty() && !merged.transitioned_object.free_version,
+            "the ordinary second-pool source must hide the first-pool free-version from merged lookup"
+        );
+
+        let err = ensure_no_authoritative_tier_references_for_test(store, tier_name, backend_identity, true)
+            .await
+            .expect_err("force tier removal must not bypass a physical free-version cleanup obligation");
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_reference_proof_fails_closed_when_physical_bucket_topology_is_incomplete() {
+        let temp_dir = tempfile::tempdir().expect("create incomplete tier reference store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-reference-incomplete-topology", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "INCOMPLETE-PROOF";
+        register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("test tier identity should resolve")
+            .backend_identity();
+        store.pools[0].disk_set[0].disks.write().await[0] = None;
+
+        let err = ensure_no_authoritative_tier_references_for_test(store, tier_name, backend_identity, true)
+            .await
+            .expect_err("an incomplete physical bucket enumeration must block tier mutation");
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert!(
+            err.message.contains("complete set quorum"),
+            "unexpected reference proof error: {}",
+            err.message
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn copy_test_xlmeta_between_pools(
+        root: &std::path::Path,
+        source_pool: usize,
+        target_pool: usize,
+        bucket: &str,
+        object: &str,
+    ) {
+        for disk_index in 0..4 {
+            let source = root.join(format!("pool{source_pool}/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+            let target = root.join(format!("pool{target_pool}/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+            tokio::fs::create_dir_all(target.parent().expect("target xl.meta should have a parent"))
+                .await
+                .expect("target object directory should be created");
+            tokio::fs::copy(&source, &target)
+                .await
+                .expect("xl.meta should copy exactly between pools");
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn rewrite_transitioned_xlmeta_as_legacy_unknown(
+        root: &std::path::Path,
+        pool_index: usize,
+        bucket: &str,
+        object: &str,
+    ) {
+        for disk_index in 0..4 {
+            let metadata_path =
+                root.join(format!("pool{pool_index}/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+            let encoded = tokio::fs::read(&metadata_path)
+                .await
+                .expect("transitioned xl.meta should be readable");
+            let mut metadata = FileMeta::load(&encoded).expect("transitioned xl.meta should decode");
+            let mut found = false;
+            for shallow in &mut metadata.versions {
+                let mut version = shallow
+                    .parse_version_meta()
+                    .expect("transitioned version record should decode");
+                let Some(object_meta) = version.object.as_mut() else {
+                    continue;
+                };
+                if rustfs_utils::http::metadata_compat::get_bytes(
+                    &object_meta.meta_sys,
+                    rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_STATUS,
+                )
+                .as_deref()
+                    != Some(rustfs_filemeta::TRANSITION_COMPLETE.as_bytes())
+                {
+                    continue;
+                }
+                found = true;
+                for suffix in [
+                    rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                    rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+                    rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_ID,
+                ] {
+                    rustfs_utils::http::metadata_compat::remove_bytes(&mut object_meta.meta_sys, suffix);
+                }
+                *shallow = rustfs_filemeta::FileMetaShallowVersion::try_from(version)
+                    .expect("legacy transitioned version should re-encode");
+            }
+            assert!(found, "transitioned source should exist in serialized xl.meta");
+            tokio::fs::write(&metadata_path, metadata.marshal_msg().expect("legacy transitioned xl.meta should encode"))
+                .await
+                .expect("legacy transitioned xl.meta should persist");
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn legacy_unknown_transition_delete_falls_back_for_single_batch_and_blocks_prefix() {
+        let temp_dir = tempfile::tempdir().expect("create legacy transitioned delete store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "legacy-unknown-transitioned-delete", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "LEGACY-UNKNOWN-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "legacy-unknown-transitioned-delete-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("legacy source bucket should be created");
+
+        for (index, object) in ["single.bin", "batch.bin", "prefix/legacy.bin"].into_iter().enumerate() {
+            let mut reader = PutObjReader::from_vec(vec![b'l' + index as u8; 1024 * 1024]);
+            let source = store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("legacy source should be written");
+            store
+                .transition_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.to_string(),
+                            etag: source.etag.clone().expect("legacy source should have an etag"),
+                            ..Default::default()
+                        },
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("legacy source should transition");
+            rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 0, bucket, object).await;
+            let legacy = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("legacy source metadata should remain decodable")
+                .expect("legacy source should remain on disk")
+                .versions
+                .into_iter()
+                .find(|version| version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE)
+                .expect("legacy transitioned source should remain visible before delete");
+            assert_eq!(legacy.transition_version_state, rustfs_filemeta::TransitionVersionState::Unknown);
+            assert_eq!(
+                crate::services::tier::tier::tier_destination_id_from_metadata(&legacy.metadata)
+                    .expect("legacy metadata identity lookup should not fail"),
+                None
+            );
+        }
+
+        backend.set_remove_failure(true);
+        store
+            .delete_object_with_tier_delete_journal(bucket, "single.bin", ObjectOptions::default())
+            .await
+            .expect("legacy single delete should retain its free-version fallback");
+        let free_version_prefix_error = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "single.bin",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("recursive prefix delete must not discard an existing hidden cleanup owner");
+        assert!(
+            free_version_prefix_error
+                .to_string()
+                .contains("tier free-version cleanup obligation"),
+            "unexpected hidden-owner prefix failure: {free_version_prefix_error}"
+        );
+        let (_deleted, errors) = store
+            .delete_objects_with_tier_delete_journal(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: "batch.bin".to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "legacy batch delete should succeed: {errors:?}");
+        let prefix_error = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "prefix/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("legacy recursive prefix delete must fail closed before physical removal");
+        assert!(
+            prefix_error.to_string().contains("legacy Unknown"),
+            "unexpected prefix failure: {prefix_error}"
+        );
+
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            0,
+            "legacy cleanup must not create an unsafe journal"
+        );
+        assert_eq!(
+            backend.object_count().await,
+            3,
+            "failed free-version cleanup must retain all remote objects"
+        );
+        for object in ["single.bin", "batch.bin"] {
+            let exact = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("legacy post-delete metadata should decode")
+                .expect("legacy cleanup owner should remain on disk");
+            assert_eq!(
+                exact
+                    .versions
+                    .iter()
+                    .chain(exact.free_versions.iter())
+                    .filter(|version| version.tier_free_version())
+                    .count(),
+                1,
+                "legacy {object} must retain exactly one hidden cleanup owner"
+            );
+            assert_eq!(
+                exact.versions.iter().filter(|version| !version.tier_free_version()).count(),
+                0,
+                "legacy {object} must have no visible source after delete"
+            );
+        }
+        let retained_prefix = store.pools[0]
+            .get_disks_by_key("prefix/legacy.bin")
+            .load_file_info_versions_exact(bucket, "prefix/legacy.bin")
+            .await
+            .expect("rejected prefix metadata should decode")
+            .expect("rejected prefix delete must retain its source");
+        assert_eq!(
+            retained_prefix
+                .versions
+                .iter()
+                .filter(|version| !version.tier_free_version())
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn stable_transitioned_recursive_prefix_delete_uses_journal_owners() {
+        let temp_dir = tempfile::tempdir().expect("create stable transitioned prefix-delete store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "stable-transitioned-prefix-delete", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "STABLE-PREFIX-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "stable-transitioned-prefix-delete-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("stable prefix source bucket should be created");
+
+        let objects = ["prefix/first.bin", "prefix/second.bin"];
+        for (index, object) in objects.into_iter().enumerate() {
+            let mut reader = PutObjReader::from_vec(vec![b'a' + index as u8; 1024 * 1024]);
+            let source = store
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("stable prefix source should be written");
+            store
+                .transition_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.to_string(),
+                            etag: source.etag.clone().expect("stable prefix source should have an etag"),
+                            ..Default::default()
+                        },
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("stable prefix source should transition");
+        }
+        assert_eq!(backend.object_count().await, objects.len());
+        backend.set_remove_failure(true);
+
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "prefix/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stable recursive prefix delete should use journal ownership");
+
+        assert_eq!(tier_delete_journal_count(store.clone()).await, objects.len());
+        assert_eq!(backend.object_count().await, objects.len());
+        for object in objects {
+            assert!(
+                store.pools[0]
+                    .get_disks_by_key(object)
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("stable prefix metadata lookup should succeed")
+                    .is_none(),
+                "stable recursive delete must leave neither a visible source nor a free-version for {object}"
+            );
+        }
+
+        backend.set_remove_failure(false);
+        let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("stable prefix journals should recover");
+        assert_eq!(stats.failed, 0);
+        assert!(stats.scanned <= objects.len() && stats.deleted <= objects.len());
+        assert_eq!(tier_delete_journal_count(store).await, 0);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.remove_versions().await.len(), objects.len());
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn authorized_prefix_retry_replays_predecessor_before_newcomer() {
+        let handle = std::thread::Builder::new()
+            .name("authorized-prefix-predecessor-replay-test".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("authorized predecessor replay test runtime should build");
+                runtime.block_on(authorized_prefix_retry_replays_predecessor_before_newcomer_case());
+            })
+            .expect("authorized predecessor replay test thread should spawn");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn authorized_prefix_retry_replays_predecessor_before_newcomer_case() {
+        let temp_dir = tempfile::tempdir().expect("create authorized predecessor replay store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "authorized-prefix-predecessor-replay", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "AUTHORIZED-PREFIX-REPLAY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("authorized replay tier lease should resolve");
+        let bucket = "authorized-prefix-predecessor-replay-bucket";
+        let prefix = "prefix/";
+        let predecessor = "prefix/predecessor.bin";
+        let newcomer = "prefix/newcomer.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("authorized replay bucket should be created");
+
+        let mut predecessor_reader = PutObjReader::from_vec(vec![b'p'; 1024 * 1024]);
+        let predecessor_source = store
+            .put_object(bucket, predecessor, &mut predecessor_reader, &ObjectOptions::default())
+            .await
+            .expect("predecessor source should be written");
+        store
+            .transition_object(
+                bucket,
+                predecessor,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: predecessor_source.etag.clone().expect("predecessor should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: predecessor_source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("predecessor should transition");
+        let predecessor_info = store
+            .get_object_info(bucket, predecessor, &ObjectOptions::default())
+            .await
+            .expect("transitioned predecessor should be readable");
+        let mut predecessor_entry =
+            transitioned_delete_journal_entry_for_source(None, false, false, bucket, predecessor, &predecessor_info)
+                .expect("transitioned predecessor should produce a dispatch journal");
+        predecessor_entry.backend_identity = Some(lease.backend_identity());
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("authorized replay bucket incarnation should resolve");
+        let (manifest_name, _) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            prefix,
+            vec![(predecessor_entry, Some(TierDeleteJournalState::Dispatched))],
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("authorized predecessor fixture should persist");
+
+        let mut newcomer_reader = PutObjReader::from_vec(vec![b'n'; 1024 * 1024]);
+        let newcomer_source = store
+            .put_object(bucket, newcomer, &mut newcomer_reader, &ObjectOptions::default())
+            .await
+            .expect("newcomer source should be written after authorization");
+        store
+            .transition_object(
+                bucket,
+                newcomer,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: newcomer_source.etag.clone().expect("newcomer should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: newcomer_source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("newcomer should transition");
+        backend.set_remove_failure(true);
+
+        let publication_epoch = store
+            .scanner_data_usage_publication_epoch()
+            .await
+            .expect("authorized replay should observe the current scanner publication epoch");
+        let publication_scope = store
+            .scanner_data_usage_publication_commit_scope(
+                publication_epoch,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                Vec::new(),
+            )
+            .await
+            .expect("authorized replay should acquire a scanner publication scope");
+
+        let retry = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                prefix,
+                ObjectOptions {
+                    delete_prefix: true,
+                    scanner_publication_commit_scope: Some(publication_scope.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the predecessor-only replay must request a successor retry");
+        assert!(
+            retry.to_string().contains("retry the successor dispatch"),
+            "unexpected predecessor replay result: {retry}"
+        );
+        assert_eq!(
+            publication_scope.state(),
+            crate::object_api::ScannerPublicationCommitState::Committed,
+            "an exact predecessor replay must report its local mutation as committed"
+        );
+        assert!(publication_scope.release_movement_permit().await);
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(predecessor)
+                .load_file_info_versions_exact(bucket, predecessor)
+                .await
+                .expect("predecessor metadata should remain readable")
+                .is_none(),
+            "the authorized predecessor must be removed exactly"
+        );
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(newcomer)
+                .load_file_info_versions_exact(bucket, newcomer)
+                .await
+                .expect("newcomer metadata should remain readable")
+                .is_some(),
+            "the predecessor authorization must not delete the newcomer"
+        );
+        assert_eq!(
+            test_tier_delete_dispatch_manifest_state(store.clone(), &manifest_name)
+                .await
+                .expect("completed predecessor manifest should remain readable"),
+            Some(TierDeleteDispatchManifestState::Completed)
+        );
+
+        backend.set_remove_failure(false);
+        let predecessor_journals = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("completed predecessor journal should recover");
+        assert_eq!(predecessor_journals.failed, 0);
+        assert!(predecessor_journals.scanned <= 1 && predecessor_journals.deleted <= 1);
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 1, "only the newcomer remote object should remain");
+        assert_eq!(backend.remove_versions().await.len(), 1);
+        let predecessor_manifest = recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+            .await
+            .expect("completed predecessor manifest should be collected");
+        assert_eq!(predecessor_manifest.failed, 0);
+        assert!(predecessor_manifest.deleted <= 1);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                prefix,
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a successor dispatch should delete the remaining newcomer");
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(newcomer)
+                .load_file_info_versions_exact(bucket, newcomer)
+                .await
+                .expect("newcomer metadata lookup should succeed after successor")
+                .is_none()
+        );
+        drive_tier_delete_dispatch_restart_to_convergence(store.clone()).await;
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.remove_versions().await.len(), 2);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multi_pool_same_tuple_recursive_prefix_uses_one_journal_owner() {
+        let temp_dir = tempfile::tempdir().expect("create shared-tuple prefix-delete store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "multi-pool-shared-tuple-prefix-delete",
+            &[4, 4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "SHARED-PREFIX-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "multi-pool-shared-tuple-prefix-delete-bucket";
+        let object = "prefix/shared.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("shared-tuple prefix bucket should be created");
+        let mut reader = PutObjReader::from_vec(vec![b's'; 1024 * 1024]);
+        let source = store.pools[0]
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("shared-tuple prefix source should be written");
+        store.pools[0]
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: source.etag.clone().expect("shared-tuple prefix source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("shared-tuple prefix source should transition");
+        copy_test_xlmeta_between_pools(temp_dir.path(), 0, 1, bucket, object).await;
+        assert_eq!(backend.object_count().await, 1);
+        backend.set_remove_failure(true);
+
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "prefix/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("shared-tuple recursive prefix delete should commit");
+
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 1);
+        for pool_idx in 0..2 {
+            assert!(
+                store.pools[pool_idx]
+                    .get_disks_by_key(object)
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("shared-tuple post-delete metadata should decode")
+                    .is_none(),
+                "pool {pool_idx} must be physically empty"
+            );
+        }
+        backend.set_remove_failure(false);
+        ctx.wake_tier_delete_journal_recovery();
+        wait_for_tier_delete_journal_recovery(store.clone(), &backend, 1).await;
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.remove_versions().await.len(), 1);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multi_pool_recursive_prefix_rejects_legacy_or_hidden_merge_loser_before_delete() {
+        let temp_dir = tempfile::tempdir().expect("create merge-loser prefix-delete store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "multi-pool-merge-loser-prefix-delete",
+            &[4, 4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "MERGE-LOSER-PREFIX-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "multi-pool-merge-loser-prefix-delete-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("merge-loser prefix bucket should be created");
+
+        for (object, byte) in [("legacy/item.bin", b'l'), ("hidden/item.bin", b'h')] {
+            let mut reader = PutObjReader::from_vec(vec![byte; 1024 * 1024]);
+            let source = store.pools[0]
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("merge-loser source should be written");
+            store.pools[0]
+                .transition_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.to_string(),
+                            etag: source.etag.clone().expect("merge-loser source should have an etag"),
+                            ..Default::default()
+                        },
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("merge-loser source should transition");
+            copy_test_xlmeta_between_pools(temp_dir.path(), 0, 1, bucket, object).await;
+        }
+        rewrite_transitioned_xlmeta_as_legacy_unknown(temp_dir.path(), 1, bucket, "legacy/item.bin").await;
+        backend.set_remove_failure(true);
+        store.pools[1]
+            .delete_object(bucket, "hidden/item.bin", ObjectOptions::default())
+            .await
+            .expect("second-pool source delete should retain a hidden free-version");
+
+        let legacy_error = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "legacy/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a legacy merge loser must reject recursive deletion");
+        assert!(legacy_error.to_string().contains("legacy Unknown"), "unexpected error: {legacy_error}");
+        let hidden_error = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "hidden/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a hidden free-version merge loser must reject recursive deletion");
+        assert!(
+            hidden_error.to_string().contains("free-version cleanup obligation"),
+            "unexpected error: {hidden_error}"
+        );
+
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 2);
+        assert_eq!(backend.remove_count().await, 0);
+        for object in ["legacy/item.bin", "hidden/item.bin"] {
+            let pool0 = store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("winner metadata should decode")
+                .expect("winner source must remain before destructive deletion");
+            assert_eq!(pool0.versions.iter().filter(|version| !version.tier_free_version()).count(), 1);
+        }
+        let hidden_pool1 = store.pools[1]
+            .get_disks_by_key("hidden/item.bin")
+            .load_file_info_versions_exact(bucket, "hidden/item.bin")
+            .await
+            .expect("hidden loser metadata should decode")
+            .expect("hidden loser cleanup owner must remain");
+        assert_eq!(
+            hidden_pool1
+                .versions
+                .iter()
+                .chain(hidden_pool1.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn recursive_prefix_partial_pool_failure_keeps_prepared_cleanup_owners() {
+        let temp_dir = tempfile::tempdir().expect("create partial prefix-delete store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "partial-pool-prefix-delete", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "PARTIAL-PREFIX-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "partial-pool-prefix-delete-bucket";
+        let object = "prefix/item.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("partial prefix bucket should be created");
+        for (pool_idx, byte) in [(0, b'a'), (1, b'b')] {
+            let mut reader = PutObjReader::from_vec(vec![byte; 1024 * 1024]);
+            let source = store.pools[pool_idx]
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("pool-local prefix source should be written");
+            store.pools[pool_idx]
+                .transition_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.to_string(),
+                            etag: source.etag.clone().expect("pool-local source should have an etag"),
+                            ..Default::default()
+                        },
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("pool-local prefix source should transition");
+        }
+        assert_eq!(backend.object_count().await, 2);
+        backend.set_remove_failure(true);
+
+        let barrier = crate::store::object::PrefixDeleteAfterJournalPrepareBarrier::install(bucket, "prefix/");
+        let delete_store = store.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_object_with_tier_delete_journal(
+                    bucket,
+                    "prefix/",
+                    ObjectOptions {
+                        delete_prefix: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_paused())
+            .await
+            .expect("prefix delete should pause after every journal is Prepared");
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 2);
+
+        let failed_set = store.pools[1].get_disks_by_key(object);
+        let offline_disks = force_set_disks_offline_for_test(&failed_set).await;
+        barrier.release();
+        let error = delete
+            .await
+            .expect("partial prefix delete task should join")
+            .expect_err("an offline second pool must fail the recursive prefix delete");
+        assert!(
+            matches!(
+                error,
+                StorageError::InsufficientWriteQuorum(_, _) | StorageError::InsufficientReadQuorum(_, _)
+            ),
+            "unexpected error: {error:?}"
+        );
+        drop(offline_disks);
+        drop(barrier);
+
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            2,
+            "an ambiguous partial mutation must retain every Dispatched owner"
+        );
+        let first_pool_state = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("first-pool metadata should remain decodable after an ambiguous failure");
+        if let Some(first_pool_state) = first_pool_state {
+            assert_eq!(
+                first_pool_state
+                    .versions
+                    .iter()
+                    .filter(|version| !version.tier_free_version())
+                    .count(),
+                1,
+                "a retained first-pool source must remain a visible source, not an unjournaled fallback owner"
+            );
+        }
+        assert!(
+            store.pools[1]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("failed-pool metadata should decode")
+                .is_some(),
+            "the failed pool should retain its live source"
+        );
+
+        let _ = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("Dispatched owners should reconcile after the failed pool returns");
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            2,
+            "recovery must never abort or delete a Dispatched journal while any source is still live"
+        );
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "prefix/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retry should delete the remaining pool source");
+        backend.set_remove_failure(false);
+        for _ in 0..3 {
+            let _ = recover_tier_delete_journal_entries(store.clone(), 100, None)
+                .await
+                .expect("remaining pool journals should settle after backend recovery");
+            if tier_delete_journal_count(store.clone()).await == 0 {
+                break;
+            }
+        }
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.remove_versions().await.len(), 2);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn recursive_prefix_partial_set_failure_keeps_prepared_cleanup_owners() {
+        let temp_dir = tempfile::tempdir().expect("create partial-set prefix-delete store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "partial-set-prefix-delete",
+            &[(2, 4)],
+            CancellationToken::new(),
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "PARTIAL-SET-PREFIX-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "partial-set-prefix-delete-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("partial-set prefix bucket should be created");
+
+        let objects = (0..2)
+            .map(|target_set| {
+                (0..512)
+                    .map(|index| format!("prefix/set-{target_set}-{index}.bin"))
+                    .find(|candidate| store.pools[0].get_disks_by_key(candidate).set_index == target_set)
+                    .expect("a deterministic key should map to each test set")
+            })
+            .collect::<Vec<_>>();
+        for (index, object) in objects.iter().enumerate() {
+            let mut reader = PutObjReader::from_vec(vec![b'0' + index as u8; 1024 * 1024]);
+            let source = store.pools[0]
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("set-local prefix source should be written");
+            store.pools[0]
+                .transition_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.to_string(),
+                            etag: source.etag.clone().expect("set-local source should have an etag"),
+                            ..Default::default()
+                        },
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("set-local prefix source should transition");
+        }
+        assert_eq!(backend.object_count().await, 2);
+        backend.set_remove_failure(true);
+
+        let barrier = crate::store::object::PrefixDeleteAfterJournalPrepareBarrier::install(bucket, "prefix/");
+        let delete_store = store.clone();
+        let delete = tokio::spawn(async move {
+            delete_store
+                .delete_object_with_tier_delete_journal(
+                    bucket,
+                    "prefix/",
+                    ObjectOptions {
+                        delete_prefix: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_paused())
+            .await
+            .expect("set-scoped prefix delete should pause after journal Prepare");
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 2);
+
+        let failed_set = store.pools[0].disk_set[1].clone();
+        let offline_disks = force_set_disks_offline_for_test(&failed_set).await;
+        barrier.release();
+        let error = delete
+            .await
+            .expect("partial-set prefix delete task should join")
+            .expect_err("an offline second set must fail recursive prefix deletion");
+        assert!(
+            matches!(
+                error,
+                StorageError::InsufficientWriteQuorum(_, _) | StorageError::InsufficientReadQuorum(_, _)
+            ),
+            "unexpected error: {error:?}"
+        );
+        drop(offline_disks);
+        drop(barrier);
+
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 2);
+        let first_set_state = store.pools[0]
+            .get_disks_by_key(&objects[0])
+            .load_file_info_versions_exact(bucket, &objects[0])
+            .await
+            .expect("first-set metadata should remain decodable after an ambiguous failure");
+        if let Some(first_set_state) = first_set_state {
+            assert_eq!(
+                first_set_state
+                    .versions
+                    .iter()
+                    .filter(|version| !version.tier_free_version())
+                    .count(),
+                1,
+                "a retained first-set source must remain visible under its Dispatched journal"
+            );
+        }
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(&objects[1])
+                .load_file_info_versions_exact(bucket, &objects[1])
+                .await
+                .expect("failed-set metadata should decode")
+                .is_some()
+        );
+
+        let _ = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("set-scoped Dispatched owners should reconcile");
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            2,
+            "recovery must retain the complete Authorized dispatch until every source is absent"
+        );
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                "prefix/",
+                ObjectOptions {
+                    delete_prefix: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("set-scoped retry should delete the remaining source");
+        backend.set_remove_failure(false);
+        for _ in 0..3 {
+            let _ = recover_tier_delete_journal_entries(store.clone(), 100, None)
+                .await
+                .expect("remaining set journals should settle after backend recovery");
+            if tier_delete_journal_count(store.clone()).await == 0 {
+                break;
+            }
+        }
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.remove_versions().await.len(), 2);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn versioned_explicit_transition_delete_preserves_other_version_then_allows_bucket_delete() {
+        let temp_dir = tempfile::tempdir().expect("create versioned transitioned delete store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "versioned-transitioned-delete-owner", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "VERSIONED-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "versioned-transitioned-delete-owner-bucket";
+        let object = "archive.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("versioned source bucket should be created");
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be enabled");
+
+        let mut first_reader = PutObjReader::from_vec(vec![b'1'; 1024 * 1024]);
+        let first = store
+            .put_object(
+                bucket,
+                object,
+                &mut first_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first version should be written");
+        let first_version = first.version_id.expect("versioned PUT should return an identity");
+        store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(first_version.to_string()),
+                    versioned: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: first.etag.clone().expect("first version should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: first.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first version should transition");
+        let mut second_reader = PutObjReader::from_vec(vec![b'2'; 1024 * 1024]);
+        let second = store
+            .put_object(
+                bucket,
+                object,
+                &mut second_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("second version should be written");
+        let second_version = second.version_id.expect("second PUT should return an identity");
+
+        backend.set_remove_failure(true);
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                object,
+                ObjectOptions {
+                    version_id: Some(first_version.to_string()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("explicit transitioned version delete should commit");
+        store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(second_version.to_string()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the unrelated second version must remain readable");
+        let exact = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("remaining version metadata should decode")
+            .expect("the second version should remain");
+        assert_eq!(
+            exact
+                .versions
+                .iter()
+                .chain(exact.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            1,
+            "ordinary exact-version delete must leave one hidden free-version owner"
+        );
+        assert!(
+            exact
+                .versions
+                .iter()
+                .any(|version| version.version_id == Some(second_version)),
+            "the explicit delete must not remove the other version"
+        );
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            0,
+            "ordinary exact-version delete must not create a journal"
+        );
+        backend.set_remove_failure(false);
+        wait_for_tier_free_version_recovery(store.clone(), &backend, 1).await;
+        let exact = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("post-cleanup metadata should decode")
+            .expect("the unrelated second version should remain after cleanup");
+        assert_eq!(
+            exact
+                .versions
+                .iter()
+                .chain(exact.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            0,
+            "free-version recovery must remove only its exact owner"
+        );
+        assert!(
+            exact
+                .versions
+                .iter()
+                .any(|version| version.version_id == Some(second_version)),
+            "free-version recovery must preserve the unrelated version"
+        );
+
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                object,
+                ObjectOptions {
+                    version_id: Some(second_version.to_string()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("last ordinary version should be removed");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("bucket delete should succeed after the last version is removed");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn suspended_null_transition_delete_uses_free_version_as_sole_owner() {
+        let temp_dir = tempfile::tempdir().expect("create suspended transitioned delete store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "suspended-transitioned-delete-owner", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "SUSPENDED-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "suspended-transitioned-delete-owner-bucket";
+        let object = "archive.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("suspended source bucket should be created");
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be suspended");
+
+        let mut reader = PutObjReader::from_vec(vec![b's'; 1024 * 1024]);
+        let source = store
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("suspended null source should be written");
+        let null_version = source.version_id.expect("suspended source should expose the null identity");
+        assert!(null_version.is_nil(), "suspended source identity must be null");
+        store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(null_version.to_string()),
+                    version_suspended: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: source.etag.clone().expect("suspended source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("suspended null source should transition");
+
+        backend.set_remove_failure(true);
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                object,
+                ObjectOptions {
+                    version_id: Some(null_version.to_string()),
+                    version_suspended: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("explicit null transitioned version delete should commit");
+        let exact = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("post-delete null metadata should decode")
+            .expect("ordinary null-version delete must retain a cleanup owner");
+        assert_eq!(
+            exact
+                .versions
+                .iter()
+                .chain(exact.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            1,
+            "ordinary null-version delete must retain exactly one hidden free-version owner"
+        );
+        assert_eq!(
+            exact.versions.iter().filter(|version| !version.tier_free_version()).count(),
+            0,
+            "ordinary null-version delete must remove the visible source"
+        );
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        backend.set_remove_failure(false);
+        wait_for_tier_free_version_recovery(store.clone(), &backend, 1).await;
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("suspended bucket should be empty after exact null-version cleanup");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn versioned_delete_marker_keeps_transitioned_source_and_remote_object() {
+        let temp_dir = tempfile::tempdir().expect("create versioned delete-marker store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transitioned-delete-marker", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "DELETE-MARKER";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "transitioned-delete-marker-bucket";
+        let object = "archive.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("versioned source bucket should be created");
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be enabled");
+
+        let mut reader = PutObjReader::from_vec(vec![b'm'; 1024 * 1024]);
+        let source = store
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned source should be written");
+        let source_version = source.version_id.expect("versioned source should have an identity");
+        store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(source_version.to_string()),
+                    versioned: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: source.etag.clone().expect("versioned source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned source should transition");
+
+        let marker = store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned DELETE without versionId should create a marker");
+        assert!(marker.delete_marker);
+        let marker_version = marker.version_id.expect("delete marker should have an identity");
+        assert_eq!(backend.object_count().await, 1, "delete-marker creation must retain the remote object");
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            0,
+            "delete-marker creation must not schedule cleanup"
+        );
+        let exact = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("versioned delete-marker metadata should decode")
+            .expect("source and delete marker should remain on disk");
+        assert!(
+            exact.versions.iter().any(|version| {
+                version.version_id == Some(source_version) && version.transition_status == rustfs_filemeta::TRANSITION_COMPLETE
+            }),
+            "the transitioned source must remain behind the delete marker"
+        );
+        assert_eq!(
+            exact
+                .versions
+                .iter()
+                .chain(exact.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            0,
+            "delete-marker creation must not create a cleanup free-version"
+        );
+
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                object,
+                ObjectOptions {
+                    version_id: Some(marker_version.to_string()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("delete marker should be removable by exact identity");
+        store
+            .delete_object_with_tier_delete_journal(
+                bucket,
+                object,
+                ObjectOptions {
+                    version_id: Some(source_version.to_string()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("transitioned source should be removable by exact identity");
+        wait_for_tier_free_version_recovery(store.clone(), &backend, 1).await;
+        if let Some(exact) = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("post-recovery version metadata should decode")
+        {
+            assert!(
+                exact
+                    .versions
+                    .iter()
+                    .chain(exact.free_versions.iter())
+                    .all(|version| !version.tier_free_version()),
+                "free-version recovery must remove the all-physical cleanup owner"
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("versioned source bucket should be empty after explicit cleanup");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn batch_transitioned_delete_uses_free_version_per_item() {
+        let temp_dir = tempfile::tempdir().expect("create batch transitioned delete store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "batch-transitioned-delete-owner", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "BATCH-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "batch-transitioned-delete-owner-bucket";
+        let transitioned = "transitioned.bin";
+        let ordinary = "ordinary.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("batch source bucket should be created");
+        let mut transitioned_reader = PutObjReader::from_vec(vec![b't'; 1024 * 1024]);
+        let transitioned_source = store
+            .put_object(bucket, transitioned, &mut transitioned_reader, &ObjectOptions::default())
+            .await
+            .expect("transitioned batch source should be written");
+        store
+            .transition_object(
+                bucket,
+                transitioned,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: transitioned_source
+                            .etag
+                            .clone()
+                            .expect("transitioned batch source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: transitioned_source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("batch source transition should commit");
+        let mut ordinary_reader = PutObjReader::from_vec(vec![b'o'; 1024 * 1024]);
+        store
+            .put_object(bucket, ordinary, &mut ordinary_reader, &ObjectOptions::default())
+            .await
+            .expect("ordinary batch source should be written");
+
+        backend.set_remove_failure(true);
+        let (_deleted, errors) = store
+            .delete_objects_with_tier_delete_journal(
+                bucket,
+                vec![
+                    ObjectToDelete {
+                        object_name: transitioned.to_string(),
+                        ..Default::default()
+                    },
+                    ObjectToDelete {
+                        object_name: ordinary.to_string(),
+                        ..Default::default()
+                    },
+                    ObjectToDelete {
+                        object_name: "missing.bin".to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "S3 batch delete should be idempotent: {errors:?}");
+        let transitioned_versions = store.pools[0]
+            .get_disks_by_key(transitioned)
+            .load_file_info_versions_exact(bucket, transitioned)
+            .await
+            .expect("transitioned batch metadata should remain decodable")
+            .expect("transitioned batch item must retain a cleanup owner");
+        assert_eq!(
+            transitioned_versions
+                .versions
+                .iter()
+                .chain(transitioned_versions.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            1,
+            "transitioned batch item must retain exactly one hidden free-version owner"
+        );
+        assert_eq!(
+            transitioned_versions
+                .versions
+                .iter()
+                .filter(|version| !version.tier_free_version())
+                .count(),
+            0,
+            "transitioned batch item must have no visible source"
+        );
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(ordinary)
+                .load_file_info_versions_exact(bucket, ordinary)
+                .await
+                .expect("ordinary batch metadata should remain decodable")
+                .is_none(),
+            "ordinary batch item should have no local metadata"
+        );
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            0,
+            "ordinary batch delete must not create a tier-delete journal"
+        );
+        assert_eq!(backend.object_count().await, 1, "failed remote cleanup must retain its object");
+
+        backend.set_remove_failure(false);
+        wait_for_tier_free_version_recovery(store.clone(), &backend, 1).await;
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(transitioned)
+                .load_file_info_versions_exact(bucket, transitioned)
+                .await
+                .expect("cleaned batch metadata should remain decodable")
+                .is_none(),
+            "free-version recovery must remove the exact cleanup owner"
+        );
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("batch source bucket should be physically empty");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transitioned_delete_free_version_replays_after_store_restart() {
+        let temp_dir = tempfile::tempdir().expect("create restarted free-version store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transitioned-delete-restart-before", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "DELETE-RESTART";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let tier_config = ctx
+            .tier_config_mgr()
+            .read()
+            .await
+            .tiers
+            .get(tier_name)
+            .expect("mock tier config should exist")
+            .clone_with_credentials();
+        let bucket = "transitioned-delete-restart-bucket";
+        let object = "archive.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("restart source bucket should be created");
+        let mut reader = PutObjReader::from_vec(vec![b'r'; 1024 * 1024]);
+        let original = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("restart source object should be written");
+        store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: original.etag.clone().expect("restart source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("restart source transition should commit");
+        backend.set_remove_failure(true);
+        store
+            .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
+            .await
+            .expect("local source delete should commit while remote cleanup is retryable");
+        let retained = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("post-delete local metadata should decode")
+            .expect("ordinary delete must retain a free-version across restart");
+        assert_eq!(
+            retained
+                .versions
+                .iter()
+                .chain(retained.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            1,
+            "ordinary delete must retain exactly one free-version across restart"
+        );
+        assert_eq!(
+            retained
+                .versions
+                .iter()
+                .filter(|version| !version.tier_free_version())
+                .count(),
+            0,
+            "ordinary delete must remove the visible source before restart"
+        );
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 1);
+
+        shutdown.cancel();
+        drop(store);
+        drop(ctx);
+        let (restarted_ctx, restarted_store, restarted_shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transitioned-delete-restart-after", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(restarted_store.clone(), Vec::new()).await;
+        {
+            let restarted_tier_config_mgr = restarted_ctx.tier_config_mgr();
+            let mut manager = restarted_tier_config_mgr.write().await;
+            manager.tiers.insert(tier_name.to_string(), tier_config);
+            manager
+                .install_test_driver(tier_name, Box::new(backend.clone()))
+                .expect("restarted store should bind the original tier destination");
+        }
+        backend.set_remove_failure(false);
+        wait_for_tier_free_version_recovery(restarted_store.clone(), &backend, 1).await;
+        assert_eq!(tier_delete_journal_count(restarted_store.clone()).await, 0);
+        assert_eq!(backend.object_count().await, 0);
+        assert!(
+            restarted_store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("restarted cleanup metadata should decode")
+                .is_none(),
+            "restarted recovery must remove the exact free-version owner"
+        );
+        restarted_store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("source bucket should be empty after restarted free-version recovery");
+        restarted_shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transitioned_delete_local_quorum_failure_rolls_back_without_cleanup_owner() {
+        let temp_dir = tempfile::tempdir().expect("create failed local delete store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transitioned-delete-local-failure", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "DELETE-LOCAL-FAIL";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "transitioned-delete-local-failure-bucket";
+        let object = "archive.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("failed-delete source bucket should be created");
+        let mut reader = PutObjReader::from_vec(vec![b'q'; 1024 * 1024]);
+        let source = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("failed-delete source should be written");
+        store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: source.etag.clone().expect("failed-delete source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed-delete source should transition");
+
+        let set = store.pools[0].get_disks_by_key(object);
+        let saved_disk = {
+            let mut disks = set.disks.write().await;
+            let first = disks[0].as_ref().expect("first disk should be online");
+            crate::disk::local::set_delete_version_fail_after_commit(first.path().as_path(), object);
+            disks[1].take().expect("second disk should be online before fault injection")
+        };
+        let err = store
+            .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
+            .await
+            .expect_err("one post-commit error plus one offline disk must miss delete quorum");
+        assert!(matches!(err, StorageError::Io(_)), "unexpected local delete failure: {err:?}");
+        assert!(
+            err.to_string()
+                .contains("Storage resources are insufficient for the write operation"),
+            "the caller must observe the wrapped quorum failure: {err}"
+        );
+        set.disks.write().await[1] = Some(saved_disk);
+
+        let retained = store
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("failed local delete must roll back the transitioned source");
+        assert_eq!(retained.transitioned_object.status, rustfs_filemeta::TRANSITION_COMPLETE);
+        let retained_versions = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("rolled-back metadata should decode")
+            .expect("rolled-back source should remain on disk");
+        assert_eq!(
+            retained_versions
+                .versions
+                .iter()
+                .chain(retained_versions.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            0,
+            "failed local quorum must not create a cleanup owner"
+        );
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            0,
+            "ordinary delete must not create a journal, including on rollback"
+        );
+        assert_eq!(backend.object_count().await, 1, "failed local commit must retain the remote object");
+        assert_eq!(backend.remove_count().await, 0, "failed local commit must not dispatch remote cleanup");
+
+        backend.set_remove_failure(true);
+        store
+            .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
+            .await
+            .expect("retry after disk recovery should commit");
+        let cleanup_owner = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("retry metadata should decode")
+            .expect("successful retry must leave a free-version owner");
+        assert_eq!(
+            cleanup_owner
+                .versions
+                .iter()
+                .chain(cleanup_owner.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            1,
+            "successful retry must leave exactly one free-version owner"
+        );
+        assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
+        backend.set_remove_failure(false);
+        wait_for_tier_free_version_recovery(store.clone(), &backend, 1).await;
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("retry should leave the source bucket empty");
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn run_multi_pool_same_remote_tuple_delete_case(batch: bool) {
+        let temp_dir = tempfile::tempdir().expect("create shared-tuple multi-pool store dir");
+        let case = if batch { "batch" } else { "single" };
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            &format!("multi-pool-same-tuple-{case}"),
+            &[4, 4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = if batch { "SAME-TUPLE-BATCH" } else { "SAME-TUPLE-SINGLE" };
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = format!("multi-pool-same-tuple-{case}-bucket");
+        let object = "archive.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("shared-tuple bucket should be created");
+        let mut reader = PutObjReader::from_vec(vec![b's'; 1024 * 1024]);
+        let source = store.pools[0]
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("first pool source should be written");
+        store.pools[0]
+            .transition_object(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: source.etag.clone().expect("shared source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("first pool source should transition");
+        let first = store.pools[0]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("first pool transitioned source should be readable");
+
+        // Model the exact metadata duplication produced by data movement:
+        // both pools refer to the same remote object/version/backend and carry
+        // the same stable source identity.
+        for disk_index in 0..4 {
+            let source_meta = temp_dir
+                .path()
+                .join(format!("pool0/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+            let target_meta = temp_dir
+                .path()
+                .join(format!("pool1/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+            tokio::fs::create_dir_all(target_meta.parent().expect("target xl.meta should have a parent"))
+                .await
+                .expect("second pool object directory should be created");
+            tokio::fs::copy(&source_meta, &target_meta)
+                .await
+                .expect("transitioned xl.meta should copy exactly to the second pool");
+        }
+        let second = store.pools[1]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("copied second-pool source should be readable");
+        assert_eq!(
+            (first.transitioned_object.name.clone(), first.transitioned_object.version_id.clone()),
+            (second.transitioned_object.name.clone(), second.transitioned_object.version_id.clone())
+        );
+        assert_eq!(backend.object_count().await, 1);
+
+        let mut delete_opts = ObjectOptions {
+            tier_delete_journal_api: Some(store.clone()),
+            ..Default::default()
+        };
+        if batch {
+            delete_opts.delete_replication_config_snapshot = Some(Arc::new(
+                ReplicationObjectBridge::delete_request_config_in(&store.ctx, &bucket)
+                    .await
+                    .expect("batch delete replication snapshot should load"),
+            ));
+            let (_deleted, errors, _accounting) = store.pools[0]
+                .delete_objects_with_accounting(
+                    &bucket,
+                    vec![ObjectToDelete {
+                        object_name: object.to_string(),
+                        ..Default::default()
+                    }],
+                    delete_opts.clone(),
+                )
+                .await;
+            assert!(errors.iter().all(Option::is_none), "first pool batch delete should commit: {errors:?}");
+        } else {
+            store.pools[0]
+                .delete_object(&bucket, object, delete_opts.clone())
+                .await
+                .expect("first pool single delete should commit");
+        }
+
+        let first_pool_versions = store.pools[0]
+            .get_disks_by_key(object)
+            .load_file_info_versions_exact(&bucket, object)
+            .await
+            .expect("first-pool metadata should decode")
+            .expect("first pool must retain a free-version owner");
+        assert_eq!(
+            first_pool_versions
+                .versions
+                .iter()
+                .chain(first_pool_versions.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            1,
+            "first pool must retain exactly one free-version owner"
+        );
+        assert_eq!(
+            first_pool_versions
+                .versions
+                .iter()
+                .filter(|version| !version.tier_free_version())
+                .count(),
+            0,
+            "first pool must remove its visible source"
+        );
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            0,
+            "ordinary pool-local delete must not create a journal"
+        );
+
+        ExpiryState::resize_workers(1, store.clone()).await;
+        let first_recovery = recover_tier_free_versions(store.clone(), 100, None, None)
+            .await
+            .expect("first-pool free-version should be recoverable");
+        assert_eq!(
+            (first_recovery.enqueued, first_recovery.failed),
+            (0, 0),
+            "the live second-pool source is the merged walk winner, so its hidden loser must not dispatch cleanup"
+        );
+        wait_for_expiry_workers_idle(&store).await;
+        assert_eq!(backend.remove_count().await, 0, "live second-pool source must gate remote DELETE");
+        assert_eq!(backend.object_count().await, 1, "live source must retain its remote body");
+        assert!(
+            store.pools[0]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("blocked cleanup metadata should decode")
+                .is_some(),
+            "blocked cleanup must retain the first-pool free-version"
+        );
+        let surviving = store.pools[1]
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("second-pool source must remain GET-addressable");
+        assert_eq!(surviving.transitioned_object.name, first.transitioned_object.name);
+
+        backend.set_remove_failure(true);
+        if batch {
+            let (_deleted, errors, _accounting) = store.pools[1]
+                .delete_objects_with_accounting(
+                    &bucket,
+                    vec![ObjectToDelete {
+                        object_name: object.to_string(),
+                        ..Default::default()
+                    }],
+                    delete_opts,
+                )
+                .await;
+            assert!(errors.iter().all(Option::is_none), "second pool batch retry should commit: {errors:?}");
+        } else {
+            store.pools[1]
+                .delete_object(&bucket, object, delete_opts)
+                .await
+                .expect("second pool single retry should commit");
+        }
+        wait_for_expiry_workers_idle(&store).await;
+        let mut free_version_ids = Vec::new();
+        for pool_idx in 0..2 {
+            let retained = store.pools[pool_idx]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(&bucket, object)
+                .await
+                .expect("shared-tuple free-version metadata should decode")
+                .expect("remote failure must retain every shared-tuple cleanup owner");
+            let owners = retained
+                .versions
+                .iter()
+                .chain(retained.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .collect::<Vec<_>>();
+            assert_eq!(owners.len(), 1, "pool {pool_idx} must retain one free-version owner");
+            free_version_ids.push(owners[0].version_id);
+        }
+        assert_ne!(
+            free_version_ids[0], free_version_ids[1],
+            "ordinary pool-local deletes must model distinct local free-version identities"
+        );
+
+        backend.set_remove_failure(false);
+        wait_for_tier_free_version_recovery(store.clone(), &backend, 1).await;
+        assert_eq!(backend.remove_count().await, 1, "shared remote tuple should be deleted exactly once");
+        for pool_idx in 0..2 {
+            assert!(
+                store.pools[pool_idx]
+                    .get_disks_by_key(object)
+                    .load_file_info_versions_exact(&bucket, object)
+                    .await
+                    .expect("post-delete metadata should decode")
+                    .is_none(),
+                "pool {pool_idx} must not retain source or free-version metadata"
+            );
+        }
+        store
+            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("shared-tuple bucket should be physically empty");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multi_pool_same_remote_tuple_single_delete_waits_for_all_sources() {
+        run_multi_pool_same_remote_tuple_delete_case(false).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multi_pool_same_remote_tuple_batch_delete_waits_for_all_sources() {
+        run_multi_pool_same_remote_tuple_delete_case(true).await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn multi_pool_transitioned_delete_persists_one_free_version_per_remote_tuple() {
+        let temp_dir = tempfile::tempdir().expect("create multi-pool transitioned delete store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "multi-pool-transitioned-delete-owner",
+            &[4, 4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "MULTIPOOL-DELETE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "multi-pool-transitioned-delete-owner-bucket";
+        let object = "archive.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("multi-pool source bucket should be created");
+
+        let mut remote_tuples = Vec::new();
+        for pool_idx in 0..2 {
+            let mut reader = PutObjReader::from_vec(vec![b'a' + pool_idx as u8; 1024 * 1024]);
+            let source = store.pools[pool_idx]
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        mod_time: Some(OffsetDateTime::now_utc() + time::Duration::seconds(pool_idx as i64)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("pool-local source should be written");
+            store.pools[pool_idx]
+                .transition_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.to_string(),
+                            etag: source.etag.clone().expect("pool-local source should have an etag"),
+                            ..Default::default()
+                        },
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("pool-local source should transition");
+            let transitioned = store.pools[pool_idx]
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("pool-local transitioned source should be readable");
+            remote_tuples.push((
+                transitioned.transitioned_object.name.clone(),
+                transitioned.transitioned_object.version_id.clone(),
+            ));
+        }
+        assert_ne!(remote_tuples[0], remote_tuples[1], "fixture must use distinct remote cleanup tuples");
+        assert_eq!(backend.object_count().await, 2);
+
+        backend.set_remove_failure(true);
+        store
+            .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
+            .await
+            .expect("store-level delete should remove both pool copies");
+        for pool_idx in 0..2 {
+            let retained = store.pools[pool_idx]
+                .get_disks_by_key(object)
+                .load_file_info_versions_exact(bucket, object)
+                .await
+                .expect("pool-local post-delete metadata should decode")
+                .expect("each pool-specific remote tuple must retain a cleanup owner");
+            assert_eq!(
+                retained
+                    .versions
+                    .iter()
+                    .chain(retained.free_versions.iter())
+                    .filter(|version| version.tier_free_version())
+                    .count(),
+                1,
+                "pool {pool_idx} must retain exactly one free-version owner"
+            );
+            assert_eq!(
+                retained
+                    .versions
+                    .iter()
+                    .filter(|version| !version.tier_free_version())
+                    .count(),
+                0,
+                "pool {pool_idx} must not retain a visible source"
+            );
+        }
+        assert_eq!(
+            tier_delete_journal_count(store.clone()).await,
+            0,
+            "ordinary multi-pool delete must not create tier-delete journals"
+        );
+        assert_eq!(backend.object_count().await, 2, "failed remote cleanup must retain both remote objects");
+
+        backend.set_remove_failure(false);
+        wait_for_tier_free_version_recovery(store.clone(), &backend, 2).await;
+        let mut removed = backend.remove_versions().await;
+        removed.sort();
+        remote_tuples.sort();
+        assert_eq!(removed, remote_tuples, "recovery must use each pool's exact remote tuple");
+        for pool_idx in 0..2 {
+            assert!(
+                store.pools[pool_idx]
+                    .get_disks_by_key(object)
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("post-recovery pool metadata should decode")
+                    .is_none(),
+                "pool {pool_idx} must not retain source or free-version metadata"
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("multi-pool source bucket should be physically empty");
     }
 
     // Phase 5 follow-up (backlog#1052): building a real store through the
@@ -9202,26 +14192,15 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn tier_delete_journal_recovery_spawns_for_each_store() {
+    async fn v4_tier_delete_journal_recovery_is_exact_and_store_scoped() {
         let temp_a = tempfile::tempdir().expect("create temp store dir a");
         let temp_b = tempfile::tempdir().expect("create temp store dir b");
-        let (ctx_a, store_a, shutdown_a) =
+        let (ctx_a, store_a, _shutdown_a) =
             without_storage_class_env(build_isolated_test_store(temp_a.path(), "tier-journal-recovery-a", &[4])).await;
-        let (ctx_b, store_b, shutdown_b) =
+        let (ctx_b, store_b, _shutdown_b) =
             without_storage_class_env(build_isolated_test_store(temp_b.path(), "tier-journal-recovery-b", &[4])).await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store_a.clone(), Vec::new()).await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store_b.clone(), Vec::new()).await;
-
-        assert!(
-            !ctx_a.mark_tier_delete_journal_recovery_started(store_a.id),
-            "store A should have claimed its production recovery worker"
-        );
-        assert!(
-            !ctx_b.mark_tier_delete_journal_recovery_started(store_b.id),
-            "store B should have claimed its production recovery worker"
-        );
-        assert!(!shutdown_a.is_cancelled());
-        assert!(!shutdown_b.is_cancelled());
 
         let tier_a = "JOURNAL-A";
         let tier_b = "JOURNAL-B";
@@ -9236,6 +14215,7 @@ mod tests {
             .expect("store B tier lease should resolve")
             .backend_identity();
         let entry_a = Jentry {
+            persisted_version: 0,
             obj_name: "remote-a".to_string(),
             version_id: "version-a".to_string(),
             tier_name: tier_a.to_string(),
@@ -9244,8 +14224,10 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
         let entry_b = Jentry {
+            persisted_version: 0,
             obj_name: "remote-b".to_string(),
             version_id: "version-b".to_string(),
             tier_name: tier_b.to_string(),
@@ -9254,68 +14236,238 @@ mod tests {
             version_state: rustfs_filemeta::TransitionVersionState::Exact,
             state: crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::Committed,
             source: None,
+            dispatch: None,
         };
-        let remove_a = backend_a.arm_failing_remove_barrier().await;
         persist_tier_delete_journal_entry(store_a.clone(), &entry_a)
             .await
-            .expect("store A journal should persist");
+            .expect("store A v4 compatibility fixture should persist");
         persist_tier_delete_journal_entry(store_b.clone(), &entry_b)
             .await
-            .expect("store B journal should persist");
-
-        ctx_a.wake_tier_delete_journal_recovery();
-        ctx_b.wake_tier_delete_journal_recovery();
-        remove_a.wait_until_paused().await;
-        wait_for_tier_delete_journal_recovery(store_b.clone(), &backend_b, 1).await;
-
-        shutdown_a.cancel();
-        remove_a.wait_until_operation_dropped().await;
-        assert!(
-            ctx_a
-                .background_cancel_token()
-                .expect("store A shutdown token should be bound")
-                .is_cancelled()
-        );
-        assert!(
-            !ctx_b
-                .background_cancel_token()
-                .expect("store B shutdown token should be bound")
-                .is_cancelled(),
-            "cancelling store A must not stop store B"
-        );
-        assert_eq!(tier_delete_journal_count(store_a.clone()).await, 1);
-
+            .expect("store B v4 compatibility fixture should persist");
+        let entry_a_v3 = Jentry {
+            obj_name: "remote-a-v3".to_string(),
+            version_id: "version-a-v3".to_string(),
+            ..entry_a.clone()
+        };
+        let mut raw_v3: serde_json::Value = serde_json::from_slice(
+            &encode_tier_delete_journal_entry(&entry_a_v3).expect("store A v3 fixture should encode from the v4 shape"),
+        )
+        .expect("store A v3 fixture should be JSON");
+        raw_v3["version"] = serde_json::json!(3);
+        raw_v3
+            .as_object_mut()
+            .expect("store A v3 fixture should be an object")
+            .remove("version_state");
+        let path_a_v3 = tier_delete_journal_object_name(&entry_a_v3);
+        com::save_config(
+            store_a.clone(),
+            &path_a_v3,
+            serde_json::to_vec(&raw_v3).expect("store A raw v3 fixture should encode"),
+        )
+        .await
+        .expect("store A raw v3 compatibility fixture should persist");
+        let path_a = tier_delete_journal_object_name(&entry_a);
+        let path_b = tier_delete_journal_object_name(&entry_b);
         let recovered_a = recover_tier_delete_journal_entries(store_a.clone(), 100, None)
             .await
-            .expect("the cancelled store A worker must leave its journal recoverable");
-        assert_eq!((recovered_a.scanned, recovered_a.deleted, recovered_a.failed), (1, 1, 0));
-        assert_eq!(backend_a.remove_versions().await, vec![("remote-a".to_string(), "version-a".to_string())]);
-
-        let second_entry_b = Jentry {
-            obj_name: "remote-b-2".to_string(),
-            version_id: "version-b-2".to_string(),
-            ..entry_b
-        };
-        persist_tier_delete_journal_entry(store_b.clone(), &second_entry_b)
+            .expect("store A recovery scan should finish");
+        let recovered_b = recover_tier_delete_journal_entries(store_b.clone(), 100, None)
             .await
-            .expect("store B second journal should persist");
-        ctx_b.wake_tier_delete_journal_recovery();
-        wait_for_tier_delete_journal_recovery(store_b.clone(), &backend_b, 2).await;
+            .expect("store B recovery scan should finish");
+        assert_eq!((recovered_a.scanned, recovered_a.deleted, recovered_a.failed), (2, 2, 0));
+        assert_eq!((recovered_b.scanned, recovered_b.deleted, recovered_b.failed), (1, 1, 0));
+        let mut removed_a = backend_a.remove_versions().await;
+        removed_a.sort();
         assert_eq!(
-            backend_b.remove_versions().await,
+            removed_a,
             vec![
-                ("remote-b".to_string(), "version-b".to_string()),
-                ("remote-b-2".to_string(), "version-b-2".to_string()),
+                ("remote-a".to_string(), "version-a".to_string()),
+                ("remote-a-v3".to_string(), "version-a-v3".to_string()),
             ]
         );
-
-        shutdown_b.cancel();
+        assert_eq!(backend_b.remove_versions().await, vec![("remote-b".to_string(), "version-b".to_string())]);
+        assert!(matches!(com::read_config(store_a.clone(), &path_a).await, Err(Error::ConfigNotFound)));
+        assert!(matches!(com::read_config(store_a.clone(), &path_a_v3).await, Err(Error::ConfigNotFound)));
+        assert!(matches!(com::read_config(store_b.clone(), &path_b).await, Err(Error::ConfigNotFound)));
+        assert_eq!(tier_delete_journal_count(store_a).await, 0);
+        assert_eq!(tier_delete_journal_count(store_b).await, 0);
     }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn prepared_tier_delete_recovery_finds_directory_source_on_encoded_set() {
+    async fn v5_tier_delete_recovery_retains_live_sources_and_aborts_only_prepared() {
+        let temp_dir = tempfile::tempdir().expect("create v5 live-source store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "v5-live-source-recovery", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "V5-LIVE-SOURCE";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("v5 live-source tier lease should resolve")
+            .backend_identity();
+        let bucket = "v5-live-source-recovery-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("v5 live-source bucket should be created");
+
+        let mut paths = Vec::new();
+        for (index, state) in [
+            TierDeleteJournalState::Prepared,
+            TierDeleteJournalState::Dispatched,
+            TierDeleteJournalState::Committed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let object = format!("live-{index}.bin");
+            let remote_version = uuid::Uuid::new_v4().to_string();
+            backend.set_put_remote_version(Some(remote_version)).await;
+            let mut reader = PutObjReader::from_vec(format!("v5 live source {index}").into_bytes());
+            let source = store
+                .put_object(bucket, &object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("v5 live source should be written");
+            store
+                .transition_object(
+                    bucket,
+                    &object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.to_string(),
+                            etag: source.etag.clone().expect("v5 live source should have an ETag"),
+                            ..Default::default()
+                        },
+                        version_id: source.version_id.map(|version| version.to_string()),
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("v5 live source should transition");
+            let transitioned = store
+                .get_object_info(
+                    bucket,
+                    &object,
+                    &ObjectOptions {
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("v5 transitioned source should be readable");
+            let mut entry = transitioned_delete_journal_entry_for_source(None, false, false, bucket, &object, &transitioned)
+                .expect("v5 transitioned source should produce a stable journal identity");
+            entry.persisted_version = 5;
+            entry.backend_identity = Some(backend_identity);
+            entry.state = state;
+            entry.dispatch = None;
+            let path = tier_delete_journal_object_name(&entry);
+            com::save_config(
+                store.clone(),
+                &path,
+                encode_tier_delete_journal_entry(&entry).expect("raw v5 live-source journal should encode"),
+            )
+            .await
+            .expect("raw v5 live-source journal should persist");
+            paths.push((state, path));
+        }
+
+        let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("v5 live-source recovery should finish");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (3, 1, 2));
+        assert_eq!(backend.remove_count().await, 0, "a live source must block every remote DELETE");
+        for (state, path) in paths {
+            let observed = com::read_config(store.clone(), &path).await;
+            if state == TierDeleteJournalState::Prepared {
+                assert!(matches!(observed, Err(Error::ConfigNotFound)), "Prepared v5 evidence should abort");
+            } else {
+                assert!(observed.is_ok(), "{state:?} v5 evidence must remain while its exact source exists");
+            }
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn v5_tier_delete_recovery_replays_all_crash_states_without_sources() {
+        let temp_dir = tempfile::tempdir().expect("create v5 crash-replay store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "v5-crash-replay", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "V5-CRASH-REPLAY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let lease = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("v5 crash-replay tier lease should resolve");
+        let backend_identity = lease.backend_identity();
+        let bucket = "v5-crash-replay-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("v5 crash-replay bucket should be created");
+
+        for (index, state, seed_remote) in [
+            (0, TierDeleteJournalState::Prepared, true),
+            (1, TierDeleteJournalState::Dispatched, true),
+            (2, TierDeleteJournalState::Committed, true),
+            // Models a restart after exact remote DELETE succeeded but before
+            // the local Committed journal was removed.
+            (3, TierDeleteJournalState::Committed, false),
+        ] {
+            let remote_version = uuid::Uuid::new_v4().to_string();
+            let mut entry = synthetic_v6_dispatch_entry(
+                bucket,
+                &format!("missing-{index}.bin"),
+                tier_name,
+                backend_identity,
+                &remote_version,
+            );
+            entry.persisted_version = 5;
+            entry.state = state;
+            entry.dispatch = None;
+            if seed_remote {
+                backend.set_put_remote_version(Some(remote_version)).await;
+                let body = bytes::Bytes::from(format!("v5 remote candidate {index}"));
+                lease
+                    .put(
+                        &entry.obj_name,
+                        ReaderImpl::Body(body.clone()),
+                        i64::try_from(body.len()).expect("v5 candidate length should fit i64"),
+                    )
+                    .await
+                    .expect("v5 remote candidate should be seeded");
+            }
+            let path = tier_delete_journal_object_name(&entry);
+            com::save_config(
+                store.clone(),
+                &path,
+                encode_tier_delete_journal_entry(&entry).expect("raw v5 crash journal should encode"),
+            )
+            .await
+            .expect("raw v5 crash journal should persist");
+        }
+
+        let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
+            .await
+            .expect("v5 crash-state recovery should finish");
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (4, 4, 0));
+        assert_eq!(tier_delete_journal_count(store).await, 0);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.exact_remove_count(), 4, "every v5 state must use exact-version cleanup");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn dispatched_tier_delete_recovery_finds_directory_source_on_encoded_set() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
         let shutdown = CancellationToken::new();
         let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
@@ -9386,16 +14538,27 @@ mod tests {
         let mut entry = transitioned_delete_journal_entry_for_source(None, false, false, bucket, &object, &committed)
             .expect("transitioned source should produce a prepared journal entry");
         entry.backend_identity = Some(backend_identity);
-        persist_tier_delete_journal_entry(store.clone(), &entry)
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
             .await
-            .expect("prepared journal should persist");
+            .expect("bucket incarnation should resolve");
+        install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            &object,
+            vec![(entry, Some(TierDeleteJournalState::Dispatched))],
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("authorized dispatched journal should persist");
 
         let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
             .await
             .expect("prepared recovery should complete");
 
-        assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 1, 0));
-        assert_eq!(tier_delete_journal_count(store).await, 0);
+        assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 0, 1));
+        assert_eq!(tier_delete_journal_count(store).await, 1);
         assert_eq!(backend.remove_count().await, 0);
         assert_eq!(backend.object_count().await, 1, "live directory source must retain its remote object");
     }
@@ -9403,7 +14566,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn prepared_tier_delete_recovery_checks_later_pool_then_commits_after_source_removal() {
+    async fn dispatched_tier_delete_recovery_checks_later_pool_then_commits_after_source_removal() {
         let temp_dir = tempfile::tempdir().expect("create cross-pool recovery store dir");
         let (ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "prepared-cross-pool-recovery", &[4, 4])).await;
@@ -9449,20 +14612,31 @@ mod tests {
         let mut entry = transitioned_delete_journal_entry_for_source(None, false, false, bucket, object, &committed)
             .expect("transitioned source should produce a prepared journal");
         entry.backend_identity = Some(backend_identity);
-        persist_tier_delete_journal_entry(store.clone(), &entry)
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
             .await
-            .expect("prepared journal should persist");
+            .expect("bucket incarnation should resolve");
+        install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            object,
+            vec![(entry, Some(TierDeleteJournalState::Dispatched))],
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("authorized dispatched journal should persist");
 
         let retained = recover_tier_delete_journal_entries(store.clone(), 100, None)
             .await
             .expect("recovery should scan the later pool");
-        assert_eq!((retained.scanned, retained.deleted, retained.failed), (1, 1, 0));
+        assert_eq!((retained.scanned, retained.deleted, retained.failed), (1, 0, 1));
         assert_eq!(backend.remove_count().await, 0);
         assert_eq!(backend.object_count().await, 1);
         assert_eq!(
             tier_delete_journal_count(store.clone()).await,
-            0,
-            "live source should abort its prepared journal"
+            1,
+            "an authorized journal must remain while its live source is durable"
         );
 
         store.pools[1]
@@ -9472,18 +14646,26 @@ mod tests {
                 ObjectOptions {
                     version_id: committed.version_id.map(|version| version.to_string()),
                     expiration: crate::storage_api_contracts::lifecycle::ExpirationOptions { expire: true },
+                    skip_free_version: true,
                     ..Default::default()
                 },
             )
             .await
             .expect("source version should be removed before recovery retry");
-        persist_tier_delete_journal_entry(store.clone(), &entry)
+        let committed_stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
             .await
-            .expect("prepared journal should persist for the absent source");
+            .expect("journal recovery should commit an absent stable source");
+        assert_eq!((committed_stats.scanned, committed_stats.deleted, committed_stats.failed), (1, 0, 1));
+        assert_eq!(backend.remove_count().await, 0);
+
+        let manifest_stats = recover_tier_delete_dispatch_manifests(store.clone(), 100, None)
+            .await
+            .expect("manifest recovery should authorize committed remote cleanup");
+        assert_eq!((manifest_stats.advanced, manifest_stats.failed), (1, 0));
 
         let deleted = recover_tier_delete_journal_entries(store.clone(), 100, None)
             .await
-            .expect("recovery should commit an absent stable source");
+            .expect("completed journal should delete the exact remote version");
         assert_eq!((deleted.scanned, deleted.deleted, deleted.failed), (1, 1, 0));
         assert_eq!(tier_delete_journal_count(store).await, 0);
         assert_eq!(backend.remove_count().await, 1);
@@ -9493,7 +14675,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn prepared_tier_delete_recovery_retains_journal_on_source_metadata_error() {
+    async fn dispatched_tier_delete_recovery_retains_journal_on_source_metadata_error() {
         let temp_dir = tempfile::tempdir().expect("create metadata-error recovery store dir");
         let (ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "prepared-metadata-error-recovery", &[4])).await;
@@ -9539,9 +14721,20 @@ mod tests {
         let mut entry = transitioned_delete_journal_entry_for_source(None, false, false, bucket, object, &committed)
             .expect("transitioned source should produce a prepared journal");
         entry.backend_identity = Some(backend_identity);
-        persist_tier_delete_journal_entry(store.clone(), &entry)
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
             .await
-            .expect("prepared journal should persist");
+            .expect("bucket incarnation should resolve");
+        install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            bucket,
+            incarnation,
+            object,
+            vec![(entry, Some(TierDeleteJournalState::Dispatched))],
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("authorized dispatched journal should persist");
 
         for disk_index in 0..4 {
             let metadata_path = temp_dir
@@ -9557,7 +14750,7 @@ mod tests {
             .expect("recovery scan should complete despite the entry failure");
 
         assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 0, 1));
-        assert_eq!(tier_delete_journal_count(store).await, 1, "journal must remain prepared for retry");
+        assert_eq!(tier_delete_journal_count(store).await, 1, "journal must remain dispatched for retry");
         assert_eq!(backend.remove_count().await, 0, "unreadable source metadata must block remote deletion");
         assert_eq!(backend.object_count().await, 1, "remote source must remain intact");
     }
@@ -9582,6 +14775,7 @@ mod tests {
             .await
             .expect("remote body should be seeded");
         let entry = Jentry {
+            persisted_version: 0,
             obj_name: "remote/original".to_string(),
             version_id: remote_version,
             tier_name: tier_name.to_string(),
@@ -9599,11 +14793,19 @@ mod tests {
                 etag: Some("etag".to_string()),
                 mod_time: Some(OffsetDateTime::UNIX_EPOCH.to_string()),
             }),
+            dispatch: None,
         };
-        persist_tier_delete_journal_entry(store.clone(), &entry)
-            .await
-            .expect("prepared journal should persist");
-        let journal_name = tier_delete_journal_object_name(&entry);
+        let (_manifest_name, bound) = install_test_tier_delete_dispatch_fixture(
+            store.clone(),
+            "absent-source-bucket",
+            uuid::Uuid::new_v4(),
+            "absent-source-object",
+            vec![(entry, Some(TierDeleteJournalState::Dispatched))],
+            TierDeleteDispatchManifestState::DispatchAuthorized,
+        )
+        .await
+        .expect("authorized dispatched journal should persist");
+        let journal_name = tier_delete_journal_object_name(&bound[0]);
         let data = com::read_config(store.clone(), &journal_name)
             .await
             .expect("prepared journal should be readable");
@@ -9630,7 +14832,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[test]
     #[serial_test::serial(storage_class_env)]
-    fn transitioned_history_expiry_journals_real_source_without_free_version() {
+    fn transitioned_history_expiry_uses_journal_or_legacy_free_version() {
         std::thread::Builder::new()
             .name("transitioned-delete-all-test".to_string())
             .stack_size(32 * 1024 * 1024)
@@ -9654,14 +14856,16 @@ mod tests {
                         .make_bucket(bucket, &MakeBucketOptions::default())
                         .await
                         .expect("bucket should be created");
-                    crate::bucket::metadata_sys::update(
+                    crate::bucket::metadata_sys::update_in(
+                        &ctx,
                         bucket,
                         BUCKET_VERSIONING_CONFIG,
                         b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
                     )
                     .await
                     .expect("bucket versioning should be enabled");
-                    crate::bucket::metadata_sys::update(
+                    crate::bucket::metadata_sys::update_in(
+                        &ctx,
                         bucket,
                         BUCKET_LIFECYCLE_CONFIG,
                         br#"<LifecycleConfiguration>
@@ -9726,8 +14930,8 @@ mod tests {
                         .await
                         .expect("historical version should transition");
                     assert_eq!(backend.object_count().await, 1);
-                    let transitioned_remote_versions = backend.put_versions().await;
-                    assert_eq!(transitioned_remote_versions.len(), 1);
+                    assert_eq!(backend.put_versions().await.len(), 1);
+                    backend.set_remove_failure(true);
 
                     let incarnation = store
                         .bucket_incarnation_id_from_disk(bucket)
@@ -9764,60 +14968,101 @@ mod tests {
                         rule_id: "delete-all-versions".to_string(),
                         ..Default::default()
                     };
-                    let rejected = crate::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
-                        store.clone(),
-                        &current,
-                        &lifecycle_event,
-                        &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
-                        incarnation,
-                    )
-                    .await;
-                    assert!(!rejected, "legacy unknown transition identity must fail before local mutation");
+                    let legacy_applied =
+                        crate::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                            store.clone(),
+                            &current,
+                            &lifecycle_event,
+                            &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                            incarnation,
+                        )
+                        .await;
+                    assert!(legacy_applied, "legacy Unknown transition metadata should use the free-version fallback");
                     assert_eq!(tier_delete_journal_count(store.clone()).await, 0);
                     assert_eq!(backend.remove_count().await, 0);
                     let retained = store.pools[0].disk_set[0]
                         .load_file_info_versions_exact(bucket, object)
                         .await
-                        .expect("rejected delete-all metadata should remain readable")
-                        .expect("rejected delete-all should retain both versions");
+                        .expect("fallback delete-all metadata should remain readable")
+                        .expect("fallback delete-all should retain a hidden cleanup owner");
                     assert_eq!(
                         retained
                             .versions
                             .iter()
                             .filter(|version| !version.tier_free_version())
                             .count(),
-                        2
+                        0
                     );
+                    assert_eq!(
+                        retained.versions.iter().filter(|version| version.tier_free_version()).count(),
+                        1,
+                        "legacy cleanup must retain exactly one hidden free-version"
+                    );
+                    assert_eq!(backend.object_count().await, 1, "legacy remote cleanup must remain pending");
 
-                    for disk_index in 0..4 {
-                        let metadata_path = temp_dir
-                            .path()
-                            .join(format!("pool0/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
-                        let encoded = tokio::fs::read(&metadata_path)
-                            .await
-                            .expect("unknown transition metadata should be readable");
-                        let mut metadata = FileMeta::load(&encoded).expect("unknown transition metadata should decode");
-                        let mut transitioned = metadata
-                            .get_all_file_info_versions(bucket, object, true)
-                            .expect("unknown transition versions should decode")
-                            .versions
-                            .into_iter()
-                            .find(|version| version.version_id == history.version_id)
-                            .expect("unknown transitioned history should exist");
-                        transitioned.transition_version_state = rustfs_filemeta::TransitionVersionState::Exact;
-                        metadata
-                            .add_version(transitioned)
-                            .expect("exact state should replace the transitioned version");
-                        tokio::fs::write(
-                            &metadata_path,
-                            metadata.marshal_msg().expect("exact transition metadata should encode"),
+                    // Use a distinct tier/backend so the legacy worker can be
+                    // held in a deterministic remote-failure state while the
+                    // exact journal path independently proves convergence.
+                    let exact_tier_name = "DELETEALLTRANSITIONEDEXACT";
+                    let exact_backend = register_mock_tier(&ctx.tier_config_mgr(), exact_tier_name).await;
+                    let exact_object = "exact-object";
+                    let mut exact_history_reader = PutObjReader::from_vec(b"exact transitioned history".to_vec());
+                    let exact_history = store
+                        .put_object(
+                            bucket,
+                            exact_object,
+                            &mut exact_history_reader,
+                            &ObjectOptions {
+                                versioned: true,
+                                mod_time: Some(old_time - time::Duration::hours(1)),
+                                ..Default::default()
+                            },
                         )
                         .await
-                        .expect("exact transition metadata should be written");
-                    }
+                        .expect("second historical version should be written");
+                    let mut exact_current_reader = PutObjReader::from_vec(b"exact current version".to_vec());
+                    let exact_current = store
+                        .put_object(
+                            bucket,
+                            exact_object,
+                            &mut exact_current_reader,
+                            &ObjectOptions {
+                                versioned: true,
+                                mod_time: Some(old_time),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("second current version should be written");
+                    store
+                        .transition_object(
+                            bucket,
+                            exact_object,
+                            &ObjectOptions {
+                                versioned: true,
+                                version_id: exact_history.version_id.map(|version_id| version_id.to_string()),
+                                transition: TransitionOptions {
+                                    status: TRANSITION_PENDING.to_string(),
+                                    tier: exact_tier_name.to_string(),
+                                    etag: exact_history.etag.clone().expect("second history should have an ETag"),
+                                    ..Default::default()
+                                },
+                                mod_time: exact_history.mod_time,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("second historical version should transition exactly");
+                    let exact_remote_version = exact_backend
+                        .put_versions()
+                        .await
+                        .last()
+                        .cloned()
+                        .expect("second transition should publish a remote version");
+                    exact_backend.set_remove_failure(true);
                     let applied = crate::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
                         store.clone(),
-                        &current,
+                        &exact_current,
                         &lifecycle_event,
                         &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
                         incarnation,
@@ -9825,22 +15070,52 @@ mod tests {
                     .await;
 
                     assert!(applied, "delete-all should remove current and transitioned history");
+                    assert!(
+                        store.pools[0].disk_set[0]
+                            .load_file_info_versions_exact(bucket, exact_object)
+                            .await
+                            .expect("exact journal-owned metadata lookup should succeed")
+                            .is_none(),
+                        "exact journal ownership must remove the source key without leaving a free-version"
+                    );
                     let versions = store.pools[0].disk_set[0]
                         .load_file_info_versions_exact(bucket, object)
                         .await
-                        .expect("remaining exact metadata should be readable");
-                    assert!(versions.is_none(), "delete-all must not leave a tier free-version");
+                        .expect("remaining fallback metadata should be readable")
+                        .expect("the prior legacy cleanup owner should remain");
+                    assert_eq!(
+                        versions
+                            .versions
+                            .iter()
+                            .filter(|version| !version.tier_free_version())
+                            .count(),
+                        0,
+                        "exact delete-all must remove every visible version"
+                    );
+                    assert_eq!(
+                        versions.versions.iter().filter(|version| version.tier_free_version()).count(),
+                        1,
+                        "the exact v6 journal must not add another free-version"
+                    );
                     assert_eq!(tier_delete_journal_count(store.clone()).await, 1);
-                    assert_eq!(backend.object_count().await, 1, "remote deletion must remain journal-driven");
+                    assert_eq!(backend.object_count().await, 1, "legacy remote cleanup must remain pending");
+                    assert_eq!(exact_backend.object_count().await, 1, "exact remote cleanup must remain journal-owned");
 
+                    exact_backend.set_remove_failure(false);
                     let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
                         .await
                         .expect("committed journal should recover");
-                    assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 1, 0));
+                    assert_eq!(stats.failed, 0);
+                    assert!(stats.scanned <= 1 && stats.deleted <= 1);
                     assert_eq!(tier_delete_journal_count(store).await, 0);
-                    assert_eq!(backend.object_count().await, 0);
-                    assert_eq!(backend.exact_remove_count(), 1);
-                    assert_eq!(backend.remove_versions().await, transitioned_remote_versions);
+                    assert_eq!(
+                        backend.object_count().await,
+                        1,
+                        "journal recovery must leave the legacy free-version remote"
+                    );
+                    assert_eq!(exact_backend.object_count().await, 0);
+                    assert!(exact_backend.exact_remove_count() >= 1);
+                    assert_eq!(exact_backend.remove_versions().await, vec![exact_remote_version]);
                 });
             })
             .expect("test thread should spawn")
@@ -9851,7 +15126,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn prepared_tier_delete_recovery_requires_namespace_locking() {
+    async fn dispatched_tier_delete_recovery_requires_namespace_locking() {
         temp_env::async_with_vars([("RUSTFS_LOCK_ENABLED", Some("false"))], async {
             let temp_dir = tempfile::tempdir().expect("create lock-disabled store dir");
             let (ctx, store, _shutdown) =
@@ -9867,6 +15142,7 @@ mod tests {
                 .expect("tier lease should resolve")
                 .backend_identity();
             let entry = Jentry {
+                persisted_version: 0,
                 obj_name: "remote/lock-disabled".to_string(),
                 version_id: uuid::Uuid::new_v4().to_string(),
                 tier_name: tier_name.to_string(),
@@ -9884,17 +15160,25 @@ mod tests {
                     etag: Some("etag".to_string()),
                     mod_time: Some(OffsetDateTime::UNIX_EPOCH.to_string()),
                 }),
+                dispatch: None,
             };
-            persist_tier_delete_journal_entry(store.clone(), &entry)
-                .await
-                .expect("prepared journal should persist");
+            install_test_tier_delete_dispatch_fixture(
+                store.clone(),
+                "absent-source-bucket",
+                uuid::Uuid::new_v4(),
+                "absent-source-object",
+                vec![(entry, Some(TierDeleteJournalState::Dispatched))],
+                TierDeleteDispatchManifestState::DispatchAuthorized,
+            )
+            .await
+            .expect("authorized dispatched journal should persist");
 
             let stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
                 .await
                 .expect("recovery scan should complete");
 
             assert_eq!((stats.scanned, stats.deleted, stats.failed), (1, 0, 1));
-            assert_eq!(tier_delete_journal_count(store).await, 1, "journal must remain prepared for retry");
+            assert_eq!(tier_delete_journal_count(store).await, 1, "journal must remain dispatched for retry");
             assert_eq!(backend.remove_count().await, 0, "lock-disabled recovery must not delete remotely");
         })
         .await;
@@ -10201,14 +15485,252 @@ mod tests {
                 old_backend_identity: Some([1; 32]),
                 new_backend_identity: Some([2; 32]),
             }],
-            expires_at_unix_nanos: 1_780_000_000_000_000_000,
+            expires_at_unix_nanos: i64::MAX,
         }
     }
 
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently() {
+    async fn tier_mutation_abort_tombstone_rejects_delayed_prepare() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-abort-tombstone", &[4])).await;
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+        store
+            .tier_config_mgr()
+            .read()
+            .await
+            .save_tiering_config(store.clone())
+            .await
+            .expect("base tier config should persist");
+        let config_info = store
+            .get_object_info(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", com::CONFIG_PREFIX, TIER_CONFIG_FILE),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("base tier config metadata should load");
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [7; 32]);
+        intent.old_config_etag = config_info.etag;
+        intent.expires_at_unix_nanos =
+            i64::try_from((OffsetDateTime::now_utc() + time::Duration::hours(1)).unix_timestamp_nanos())
+                .expect("future tombstone expiry should fit i64");
+        let payload = intent.encode().expect("prepare identity should encode");
+
+        let mismatch_id = uuid::Uuid::new_v4();
+        let mut mismatch = intent.clone();
+        mismatch.mutation_id = mismatch_id;
+        mismatch.old_config_etag = Some("not-the-current-config-etag".to_string());
+        let mismatch_error = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Abort,
+            mismatch_id,
+            &mismatch.encode().expect("proof-mismatch Abort should encode"),
+        )
+        .await
+        .expect_err("a missing-record Abort with the wrong config proof must fail closed");
+        assert!(matches!(mismatch_error, TierMutationPeerError::AbortProofMismatch));
+        assert!(matches!(
+            load_tier_mutation_intent_record(store.clone(), mismatch_id).await,
+            Err(Error::ConfigNotFound)
+        ));
+
+        let aborted = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Abort,
+            mutation_id,
+            &payload,
+        )
+        .await
+        .expect("missing-record abort should persist a tombstone");
+        assert!(aborted.applied);
+        assert_eq!(aborted.state, TierMutationPeerState::Aborted);
+        let tombstone = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("abort tombstone should be durable");
+        assert_eq!(tombstone.state, TierMutationIntentState::Aborted);
+        assert!(tombstone.same_identity_as(&intent));
+
+        let manager = store.tier_config_mgr();
+        TierConfigMgr::reload_handle(&manager, store.clone())
+            .await
+            .expect("reload should retain an unexpired abort tombstone");
+        let tombstone_after_reload = load_tier_mutation_intent_record(store.clone(), mutation_id)
+            .await
+            .expect("reload must not clean an unexpired abort tombstone");
+        assert_eq!(tombstone_after_reload.state, TierMutationIntentState::Aborted);
+        assert!(tombstone_after_reload.same_identity_as(&intent));
+
+        register_mock_tier(&store.tier_config_mgr(), "COLD-B").await;
+        store
+            .tier_config_mgr()
+            .read()
+            .await
+            .save_tiering_config(store.clone())
+            .await
+            .expect("later config change should persist before idempotent Abort replay");
+        let retried_abort = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Abort,
+            mutation_id,
+            &payload,
+        )
+        .await
+        .expect("terminal Abort retry must not depend on the mutable current config proof");
+        assert!(!retried_abort.applied);
+        assert_eq!(retried_abort.state, TierMutationPeerState::Aborted);
+
+        let delayed = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &payload,
+        )
+        .await
+        .expect("delayed matching prepare should converge on the tombstone");
+        assert!(!delayed.applied);
+        assert_eq!(delayed.state, TierMutationPeerState::Aborted);
+        TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+            .await
+            .expect("delayed prepare must not reinstall the runtime block");
+
+        let mut conflicting = intent.clone();
+        conflicting.candidate_digest = [8; 32];
+        let conflict = handle_tier_mutation_peer_request(
+            store,
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &conflicting.encode().expect("conflicting prepare should encode"),
+        )
+        .await
+        .expect_err("different identity must not reuse an abort tombstone");
+        assert!(matches!(conflict, TierMutationPeerError::ConflictingIntent));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_expired_prepare_cannot_recreate_a_cleaned_tombstone() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-expired-replay", &[4])).await;
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [11; 32]);
+        intent.expires_at_unix_nanos =
+            i64::try_from((OffsetDateTime::now_utc() - time::Duration::seconds(1)).unix_timestamp_nanos())
+                .expect("expired timestamp should fit i64");
+        let payload = intent.encode().expect("expired signed Prepare should still encode");
+
+        let error = handle_tier_mutation_peer_request(
+            store.clone(),
+            TIER_MUTATION_RPC_PROTOCOL_VERSION,
+            TierMutationRpcPhase::Prepare,
+            mutation_id,
+            &payload,
+        )
+        .await
+        .expect_err("a missing-record expired Prepare must fail closed");
+        assert!(matches!(error, TierMutationPeerError::ExpiredIntent));
+        assert!(matches!(
+            load_tier_mutation_intent_record(store.clone(), mutation_id).await,
+            Err(Error::ConfigNotFound)
+        ));
+        TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+            .await
+            .expect("expired replay must not install a peer-only runtime fence");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_mutation_peer_prepare_waits_for_inflight_reference_lease() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-peer-drain", &[4])).await;
+        register_mock_tier(&store.tier_config_mgr(), "COLD-A").await;
+        let old_lease = TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+            .await
+            .expect("old tier operation lease should be available");
+        let mutation_id = uuid::Uuid::new_v4();
+        let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-A", [9; 32]);
+        intent.affected_targets[0].old_backend_identity = Some(old_lease.backend_identity());
+        let payload = intent.encode().expect("prepare intent should encode");
+        let prepare_store = store.clone();
+        let prepare = tokio::spawn(async move {
+            handle_tier_mutation_peer_request(
+                prepare_store,
+                TIER_MUTATION_RPC_PROTOCOL_VERSION,
+                TierMutationRpcPhase::Prepare,
+                mutation_id,
+                &payload,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-A")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer Prepare should install its runtime block");
+        assert!(
+            !prepare.is_finished(),
+            "peer Prepare must not acknowledge while a pre-existing reference creator still holds a lease"
+        );
+
+        drop(old_lease);
+        let outcome = prepare
+            .await
+            .expect("peer Prepare task should join")
+            .expect("peer Prepare should finish after the lease drains");
+        assert_eq!(outcome.state, TierMutationPeerState::Prepared);
+        TierConfigMgr::clear_prepared_mutation_intent_block(&store.tier_config_mgr(), mutation_id)
+            .await
+            .expect("test should clear the prepared runtime block");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn tier_mutation_peer_handler_applies_prepare_commit_and_abort_idempotently() {
+        // This end-to-end state-machine scenario intentionally keeps many
+        // durable fixtures live at once. Give its debug future the same
+        // dedicated stack used by the other large ecstore scenarios so the
+        // assertions run under the default test command without RUST_MIN_STACK.
+        std::thread::Builder::new()
+            .name("tier-mutation-peer-handler-test".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("tier mutation peer handler test runtime should build");
+                runtime.block_on(tier_mutation_peer_handler_case());
+            })
+            .expect("tier mutation peer handler test thread should spawn")
+            .join()
+            .expect("tier mutation peer handler test thread should complete");
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn tier_mutation_peer_handler_case() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-peer-handler", &[4])).await;
@@ -10324,7 +15846,7 @@ mod tests {
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
             TierMutationRpcPhase::Abort,
             bad_digest_id,
-            b"",
+            &bad_digest_intent.encode().expect("bad digest abort identity should encode"),
         )
         .await
         .expect("the negative digest proof fixture should clean up through abort");
@@ -10506,48 +16028,27 @@ mod tests {
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
             TierMutationRpcPhase::Abort,
             abort_id,
-            b"",
+            &abort_prepare_payload,
         )
         .await
         .expect("abort should advance the prepared peer intent");
         assert!(aborted.applied);
         assert_eq!(aborted.state, TierMutationPeerState::Aborted);
-        let aborted_blocked = match TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B").await {
-            Ok(_) => panic!("aborted peer mutation must remain blocked until local recovery cleans it up"),
-            Err(err) => err,
-        };
-        assert!(aborted_blocked.message.contains("being replaced"), "{aborted_blocked}");
+        TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B")
+            .await
+            .expect("durable abort must clear the peer runtime fence immediately");
 
         let retried_abort = handle_tier_mutation_peer_request(
             store.clone(),
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
             TierMutationRpcPhase::Abort,
             abort_id,
-            b"",
+            &abort_prepare_payload,
         )
         .await
         .expect("same abort retry should be idempotent before recovery cleanup");
         assert!(!retried_abort.applied);
         assert_eq!(retried_abort.state, TierMutationPeerState::Aborted);
-
-        let refresh_store = store.clone();
-        let refresh_manager = store.tier_config_mgr();
-        let refresh_worker = tokio::spawn(async move {
-            TierConfigMgr::refresh_tier_config_handle_with(refresh_manager, refresh_store).await;
-        });
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(lease) = TierConfigMgr::acquire_operation_lease(&store.tier_config_mgr(), "COLD-B").await {
-                    drop(lease);
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("abort notification should drive cleanup before clearing the prepared fence");
-        refresh_worker.abort();
-        let _ = refresh_worker.await;
     }
 
     #[cfg(feature = "test-util")]
@@ -10584,12 +16085,13 @@ mod tests {
         let mutation_id = uuid::Uuid::new_v4();
         let mut intent = tier_mutation_peer_test_intent(mutation_id, "COLD-B", candidate_digest);
         intent.old_config_etag = Some(base_etag.clone());
+        let prepare_payload = intent.encode().expect("late abort prepare intent should encode");
         handle_tier_mutation_peer_request(
             store.clone(),
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
             TierMutationRpcPhase::Prepare,
             mutation_id,
-            &intent.encode().expect("late abort prepare intent should encode"),
+            &prepare_payload,
         )
         .await
         .expect("prepare should install the runtime fence");
@@ -10619,7 +16121,7 @@ mod tests {
             TIER_MUTATION_RPC_PROTOCOL_VERSION,
             TierMutationRpcPhase::Abort,
             mutation_id,
-            b"",
+            &prepare_payload,
         )
         .await
         .expect_err("an abort after the candidate config commit must fail closed");
@@ -10859,7 +16361,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn cancelled_transition_cleanup_journals_to_its_own_instance_store() {
+    async fn cancelled_transition_cleanup_recovers_from_its_own_instance_transaction() {
         struct ResolverReset(Arc<std::sync::Mutex<Option<std::sync::Weak<crate::store::ECStore>>>>);
 
         impl Drop for ResolverReset {
@@ -10911,7 +16413,7 @@ mod tests {
         );
 
         let tier_name = "CROSSCTXA";
-        let backend = register_mock_tier(&ctx_a.tier_config_mgr(), tier_name).await;
+        let backend = register_transition_reconcile_test_tier(&ctx_a.tier_config_mgr(), tier_name).await;
         backend.set_put_remote_version(Some(uuid::Uuid::new_v4().to_string())).await;
         backend.reject_next_non_empty_remote_version_validation();
         let remove_barrier = backend.arm_failing_remove_barrier().await;
@@ -10953,23 +16455,37 @@ mod tests {
         );
 
         remove_barrier.wait_until_paused().await;
+        let transaction_counts = (
+            transition_transaction_record_count(store_a.clone()).await,
+            transition_transaction_record_count(store_b.clone()).await,
+        );
+        assert_eq!(
+            transaction_counts,
+            (1, 0),
+            "the transition transaction must remain only on store A even while the process resolver points at store B"
+        );
         let journal_counts = (
             tier_delete_journal_count(store_a.clone()).await,
             tier_delete_journal_count(store_b.clone()).await,
         );
         assert_eq!(
             journal_counts,
-            (1, 0),
-            "the journal must land only on store A even while the process resolver points at store B"
+            (0, 0),
+            "rejected transition uploads must not create a tier-delete journal"
         );
         assert_eq!(backend.object_count().await, 1, "failed cleanup should retain the remote candidate");
         remove_barrier.release();
         remove_barrier.wait_until_operation_dropped().await;
 
-        let recovered = recover_tier_delete_journal_entries(store_a.clone(), 100, None)
+        let recovered = recover_transition_transaction_records(store_a.clone(), 100, None)
             .await
-            .expect("store A should recover its own cancelled-transition journal");
-        assert_eq!((recovered.scanned, recovered.deleted, recovered.failed), (1, 1, 0));
+            .expect("store A should recover its own cancelled-transition transaction");
+        assert_eq!(
+            (recovered.scanned, recovered.recovered, recovered.retained, recovered.failed),
+            (1, 1, 0, 0)
+        );
+        assert_eq!(transition_transaction_record_count(store_a.clone()).await, 0);
+        assert_eq!(transition_transaction_record_count(store_b.clone()).await, 0);
         assert_eq!(tier_delete_journal_count(store_a.clone()).await, 0);
         assert_eq!(tier_delete_journal_count(store_b.clone()).await, 0);
         assert_eq!(

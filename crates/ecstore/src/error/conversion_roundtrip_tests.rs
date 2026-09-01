@@ -278,3 +278,17 @@ fn reduce_errs_buckets_identical_other_messages_together() {
     assert_eq!(count, 3);
     assert_eq!(err, Some(DiskError::other("can not get client")));
 }
+
+#[test]
+fn stable_io_context_buckets_by_cause_and_preserves_diagnostic_source() {
+    let first = StorageError::other_with_context("tier mutation intent changed", "mutation-a");
+    let second = StorageError::other_with_context("tier mutation intent changed", "mutation-b");
+
+    assert_eq!(first, second, "diagnostic identity must not split quorum buckets");
+    let StorageError::Io(io_error) = first else {
+        panic!("stable context must remain an io error");
+    };
+    assert_eq!(io_error.to_string(), "tier mutation intent changed");
+    let context = io_error.get_ref().expect("stable context must remain downcastable");
+    assert_eq!(context.source().expect("diagnostic source must be retained").to_string(), "mutation-a");
+}

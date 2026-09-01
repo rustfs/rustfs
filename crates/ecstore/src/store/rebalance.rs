@@ -309,6 +309,17 @@ impl ECStore {
     }
 
     pub(super) async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+        let dispatch_scope = if opts.tier_delete_journal_api.is_some() {
+            let incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+            let authorization = opts
+                .tier_delete_dispatch_authorization
+                .as_ref()
+                .ok_or_else(|| Error::other("prefix mutation is missing its dispatched-journal authorization"))?;
+            authorization.ensure_current(bucket, incarnation, object)?;
+            Some((authorization, incarnation))
+        } else {
+            None
+        };
         if opts.lifecycle_delete_all.is_some() {
             let mut preflight_opts = opts.clone();
             preflight_opts
@@ -317,6 +328,9 @@ impl ECStore {
                 .ok_or(StorageError::PreconditionFailed)?
                 .phase = crate::object_api::LifecycleDeleteAllPhase::Preflight;
             for pool in &self.pools {
+                if let Some((authorization, incarnation)) = dispatch_scope {
+                    authorization.ensure_current(bucket, incarnation, object)?;
+                }
                 #[cfg(test)]
                 lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::Preflight, pool.pool_idx)?;
                 pool.delete_object(bucket, object, preflight_opts.clone()).await?;
@@ -326,6 +340,9 @@ impl ECStore {
                 .ok_or(StorageError::PreconditionFailed)?
                 .lock()
                 .mark_mutation_started();
+            if let Some((authorization, incarnation)) = dispatch_scope {
+                authorization.mark_mutation_started(bucket, incarnation, object)?;
+            }
             let mut non_trigger_opts = opts.clone();
             non_trigger_opts
                 .lifecycle_delete_all
@@ -333,6 +350,9 @@ impl ECStore {
                 .ok_or(StorageError::PreconditionFailed)?
                 .phase = crate::object_api::LifecycleDeleteAllPhase::History;
             for pool in &self.pools {
+                if let Some((authorization, incarnation)) = dispatch_scope {
+                    authorization.ensure_current(bucket, incarnation, object)?;
+                }
                 #[cfg(test)]
                 lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::History, pool.pool_idx)?;
                 let mut pool_opts = non_trigger_opts.clone();
@@ -348,6 +368,9 @@ impl ECStore {
                 .phase = crate::object_api::LifecycleDeleteAllPhase::FinalPreflight;
             let mut trigger_pools = Vec::new();
             for (pool_index, pool) in self.pools.iter().enumerate() {
+                if let Some((authorization, incarnation)) = dispatch_scope {
+                    authorization.ensure_current(bucket, incarnation, object)?;
+                }
                 #[cfg(test)]
                 lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::FinalPreflight, pool.pool_idx)?;
                 let result = pool.delete_object(bucket, object, final_preflight_opts.clone()).await?;
@@ -366,6 +389,9 @@ impl ECStore {
                 .ok_or(StorageError::PreconditionFailed)?
                 .phase = crate::object_api::LifecycleDeleteAllPhase::Trigger;
             for pool_index in trigger_pools {
+                if let Some((authorization, incarnation)) = dispatch_scope {
+                    authorization.ensure_current(bucket, incarnation, object)?;
+                }
                 #[cfg(test)]
                 lifecycle_delete_all_test_failure(crate::object_api::LifecycleDeleteAllPhase::Trigger, pool_index)?;
                 let mut pool_opts = trigger_opts.clone();
@@ -378,7 +404,13 @@ impl ECStore {
         let mut first_error = None;
         let mut first_volume_error = None;
         let mut has_success = false;
+        if let Some((authorization, incarnation)) = dispatch_scope {
+            authorization.mark_mutation_started(bucket, incarnation, object)?;
+        }
         for pool in &self.pools {
+            if let Some((authorization, incarnation)) = dispatch_scope {
+                authorization.ensure_current(bucket, incarnation, object)?;
+            }
             let mut opts = opts.clone();
             opts.delete_prefix = true;
             match pool.delete_object(bucket, object, opts).await {

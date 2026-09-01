@@ -101,14 +101,14 @@ pub(crate) trait MigrationBackend: Send + Sync {
 
 pub(crate) struct RebalanceMigrationBackend<'a> {
     source: &'a SetDisks,
-    store: &'a ECStore,
+    store: std::sync::Arc<ECStore>,
     lock_lost_signal: Option<std::sync::Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
 }
 
 impl<'a> RebalanceMigrationBackend<'a> {
     pub(crate) fn new(
         source: &'a SetDisks,
-        store: &'a ECStore,
+        store: std::sync::Arc<ECStore>,
         lock_lost_signal: Option<std::sync::Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
     ) -> Self {
         Self {

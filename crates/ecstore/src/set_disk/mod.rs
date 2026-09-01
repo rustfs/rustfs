@@ -859,7 +859,9 @@ static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod core;
 #[cfg(test)]
-pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, disk_call_counters, rename_fanout_barrier};
+pub(crate) use core::io_primitives::disk_call_counters;
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
 mod ctx;
 mod metadata;
 mod ops;
@@ -872,7 +874,7 @@ pub(crate) use ops::multipart::NewMultipartUploadCommitObservation;
 pub use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
 #[cfg(test)]
 pub(crate) use ops::object::DeleteObjectCommitBarrier;
-#[cfg(feature = "test-util")]
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
 pub(crate) use ops::object::body_cache_plaintext_len;
 #[cfg(all(test, feature = "test-util"))]

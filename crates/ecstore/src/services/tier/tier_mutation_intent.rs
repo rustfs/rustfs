@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use rustfs_utils::crypto::{hex_sha256, is_sha256_checksum};
 use serde::{Deserialize, Serialize};
@@ -32,8 +32,33 @@ pub(crate) const TIER_MUTATION_INTENT_SCHEMA: &str = "rustfs-tier-mutation-inten
 pub(crate) const MAX_TIER_MUTATION_INTENT_SIZE: usize = rustfs_protos::TIER_MUTATION_RPC_MAX_PREPARE_PAYLOAD_SIZE;
 pub(crate) const TIER_MUTATION_INTENT_RECORD_PREFIX: &str = "tier/mutation-intents/records";
 pub(crate) const TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX: &str = "tier/mutation-intents/coordinators";
+pub(crate) const TIER_MUTATION_MUTEX_SHARDS: usize = 64;
 const TIER_MUTATION_INTENT_ADVANCE_CAS_ATTEMPTS: usize = 3;
 pub(crate) type TierMutationDigest = [u8; 32];
+
+static TIER_MUTATION_MUTEXES: LazyLock<[tokio::sync::Mutex<()>; TIER_MUTATION_MUTEX_SHARDS]> =
+    LazyLock::new(|| std::array::from_fn(|_| tokio::sync::Mutex::new(())));
+
+/// Serializes every local phase and recovery action for one mutation id while
+/// retaining bounded parallelism for unrelated mutations.
+pub(crate) async fn acquire_tier_mutation_mutex(mutation_id: Uuid) -> tokio::sync::MutexGuard<'static, ()> {
+    TIER_MUTATION_MUTEXES[tier_mutation_mutex_shard_index(mutation_id)]
+        .lock()
+        .await
+}
+
+fn tier_mutation_mutex_shard_index(mutation_id: Uuid) -> usize {
+    let raw = mutation_id.as_u128();
+    let mut mixed = (raw as u64) ^ ((raw >> 64) as u64);
+    // MurmurHash3's 64-bit finalizer gives stable diffusion without allocating
+    // or relying on RandomState, whose seed differs between processes.
+    mixed ^= mixed >> 33;
+    mixed = mixed.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    mixed ^= mixed >> 33;
+    mixed = mixed.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    mixed ^= mixed >> 33;
+    (mixed as usize) & (TIER_MUTATION_MUTEX_SHARDS - 1)
+}
 
 pub(crate) type Result<T> = std::result::Result<T, TierMutationIntentError>;
 
@@ -265,6 +290,30 @@ impl TierMutationIntent {
             && self.expires_at_unix_nanos == other.expires_at_unix_nanos
     }
 
+    /// Reconstruct the exact Prepared record that originally produced this
+    /// intent. Abort RPCs are identity-bound to that payload; serializing an
+    /// Aborted terminal record would both violate the wire contract and use a
+    /// different revision if a missing peer has to persist a tombstone.
+    pub(crate) fn original_prepared(&self) -> Result<Self> {
+        if self.state == TierMutationIntentState::Prepared {
+            self.validate()?;
+            return Ok(self.clone());
+        }
+        let mut prepared = self.clone();
+        prepared.revision =
+            prepared
+                .revision
+                .checked_sub(1)
+                .filter(|revision| *revision != 0)
+                .ok_or(TierMutationIntentError::Corrupt(
+                    "terminal intent cannot reconstruct its prepared revision",
+                ))?;
+        prepared.state = TierMutationIntentState::Prepared;
+        prepared.committed_config_etag = None;
+        prepared.validate()?;
+        Ok(prepared)
+    }
+
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         self.validate()?;
         let intent_bytes = serde_json::to_vec(self)?;
@@ -439,6 +488,16 @@ where
     load_tier_mutation_intent_record_with_etag_at_prefix(api, TIER_MUTATION_INTENT_RECORD_PREFIX, mutation_id).await
 }
 
+pub(crate) async fn load_tier_coordinator_mutation_intent_record_with_etag<S>(
+    api: Arc<S>,
+    mutation_id: Uuid,
+) -> EcstoreResult<(TierMutationIntent, String)>
+where
+    S: EcstoreObjectIO,
+{
+    load_tier_mutation_intent_record_with_etag_at_prefix(api, TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX, mutation_id).await
+}
+
 async fn load_tier_mutation_intent_record_with_etag_at_prefix<S>(
     api: Arc<S>,
     prefix: &str,
@@ -507,6 +566,7 @@ where
     .await
 }
 
+#[cfg(test)]
 pub(crate) async fn delete_tier_mutation_intent_record<S>(api: Arc<S>, mutation_id: Uuid) -> EcstoreResult<()>
 where
     S: EcstoreObjectOperations,
@@ -514,13 +574,36 @@ where
     delete_tier_mutation_intent_record_with_prefix(api, TIER_MUTATION_INTENT_RECORD_PREFIX, mutation_id).await
 }
 
-pub(crate) async fn delete_tier_coordinator_mutation_intent_record<S>(api: Arc<S>, mutation_id: Uuid) -> EcstoreResult<()>
+pub(crate) async fn delete_tier_mutation_intent_record_if_current<S>(
+    api: Arc<S>,
+    mutation_id: Uuid,
+    current_etag: &str,
+) -> EcstoreResult<()>
 where
     S: EcstoreObjectOperations,
 {
-    delete_tier_mutation_intent_record_with_prefix(api, TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX, mutation_id).await
+    delete_tier_mutation_intent_record_if_current_with_prefix(api, TIER_MUTATION_INTENT_RECORD_PREFIX, mutation_id, current_etag)
+        .await
 }
 
+pub(crate) async fn delete_tier_coordinator_mutation_intent_record_if_current<S>(
+    api: Arc<S>,
+    mutation_id: Uuid,
+    current_etag: &str,
+) -> EcstoreResult<()>
+where
+    S: EcstoreObjectOperations,
+{
+    delete_tier_mutation_intent_record_if_current_with_prefix(
+        api,
+        TIER_COORDINATOR_MUTATION_INTENT_RECORD_PREFIX,
+        mutation_id,
+        current_etag,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn delete_tier_mutation_intent_record_with_prefix<S>(api: Arc<S>, prefix: &str, mutation_id: Uuid) -> EcstoreResult<()>
 where
     S: EcstoreObjectOperations,
@@ -529,6 +612,40 @@ where
         tier_mutation_intent_record_object_name_with_prefix(prefix, mutation_id).map_err(tier_mutation_intent_store_error)?;
     match com::delete_config(api, &object).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+async fn delete_tier_mutation_intent_record_if_current_with_prefix<S>(
+    api: Arc<S>,
+    prefix: &str,
+    mutation_id: Uuid,
+    current_etag: &str,
+) -> EcstoreResult<()>
+where
+    S: EcstoreObjectOperations,
+{
+    if current_etag.trim().is_empty() {
+        return Err(Error::other("tier mutation intent current ETag is empty"));
+    }
+    let object =
+        tier_mutation_intent_record_object_name_with_prefix(prefix, mutation_id).map_err(tier_mutation_intent_store_error)?;
+    match api
+        .delete_object(
+            RUSTFS_META_BUCKET,
+            &object,
+            ObjectOptions {
+                http_preconditions: Some(HTTPPreconditions {
+                    if_match: Some(current_etag.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) if err == Error::FileNotFound || matches!(err, Error::ObjectNotFound(_, _)) => Err(Error::ConfigNotFound),
         Err(err) => Err(err),
     }
 }
@@ -713,6 +830,7 @@ fn digest_is_empty(digest: &TierMutationDigest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const OLD_IDENTITY: TierDestinationId = [1; 32];
     const NEW_IDENTITY: TierDestinationId = [2; 32];
@@ -734,6 +852,61 @@ mod tests {
             }],
             expires_at_unix_nanos: 1_780_000_000_000_000_000,
         }
+    }
+
+    #[test]
+    fn mutation_mutex_uses_exactly_64_stable_shards() {
+        assert_eq!(TIER_MUTATION_MUTEX_SHARDS, 64);
+        assert_eq!(TIER_MUTATION_MUTEXES.len(), TIER_MUTATION_MUTEX_SHARDS);
+
+        let mutation_id = Uuid::parse_str("36e2220e-9ad2-495b-b3bc-c4d2caf70a31").expect("fixture uuid should parse");
+        let shard = tier_mutation_mutex_shard_index(mutation_id);
+        assert!(shard < TIER_MUTATION_MUTEX_SHARDS);
+        assert_eq!(shard, tier_mutation_mutex_shard_index(mutation_id));
+    }
+
+    #[tokio::test]
+    async fn mutation_mutex_serializes_the_same_id() {
+        let mutation_id = Uuid::new_v4();
+        let first = acquire_tier_mutation_mutex(mutation_id).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).expect("test receiver should remain alive");
+            let _second = acquire_tier_mutation_mutex(mutation_id).await;
+            acquired_tx.send(()).expect("test receiver should remain alive");
+        });
+        started_rx.await.expect("waiter should start");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut acquired_rx)
+                .await
+                .is_err(),
+            "the same mutation id must not enter concurrently"
+        );
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), &mut acquired_rx)
+            .await
+            .expect("waiter should acquire after release")
+            .expect("waiter should report acquisition");
+        waiter.await.expect("waiter task should finish");
+    }
+
+    #[tokio::test]
+    async fn mutation_mutex_allows_different_shards_to_progress() {
+        let first_id = Uuid::new_v4();
+        let first_shard = tier_mutation_mutex_shard_index(first_id);
+        let second_id = (0..1024)
+            .map(|_| Uuid::new_v4())
+            .find(|candidate| tier_mutation_mutex_shard_index(*candidate) != first_shard)
+            .expect("a distinct shard should be easy to find");
+        let first = acquire_tier_mutation_mutex(first_id).await;
+
+        let _second = tokio::time::timeout(Duration::from_secs(1), acquire_tier_mutation_mutex(second_id))
+            .await
+            .expect("a different shard must not wait for the first mutation");
+        drop(first);
     }
 
     #[test]
@@ -870,6 +1043,37 @@ mod tests {
                 from: TierMutationIntentState::Aborted,
                 to: TierMutationIntentState::Committed,
             })
+        ));
+    }
+
+    #[test]
+    fn terminal_intent_reconstructs_original_prepared_abort_payload() {
+        for terminal in [TierMutationIntentState::Aborted, TierMutationIntentState::Committed] {
+            let original = prepared_intent();
+            let mut intent = original.clone();
+            let committed_etag = (terminal == TierMutationIntentState::Committed).then(|| "new-etag".to_string());
+            intent
+                .advance(terminal, committed_etag)
+                .expect("terminal transition should succeed");
+
+            let reconstructed = intent
+                .original_prepared()
+                .expect("terminal record should recover prepared payload");
+            assert_eq!(reconstructed, original);
+            assert!(intent.same_identity_as(&reconstructed));
+        }
+    }
+
+    #[test]
+    fn terminal_intent_with_initial_revision_fails_prepared_reconstruction() {
+        let mut corrupt = prepared_intent();
+        corrupt.state = TierMutationIntentState::Aborted;
+
+        assert!(matches!(
+            corrupt.original_prepared(),
+            Err(TierMutationIntentError::Corrupt(
+                "terminal intent cannot reconstruct its prepared revision"
+            ))
         ));
     }
 

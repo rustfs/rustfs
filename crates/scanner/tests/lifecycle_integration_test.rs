@@ -46,7 +46,7 @@ use storage_api::lifecycle::{
     STORAGE_FORMAT_FILE, TRANSITION_PENDING, TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
     enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
     get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
-    is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_tier_delete_journal_entries,
+    is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_transition_transaction_records,
     register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
 };
 
@@ -562,6 +562,29 @@ where
     }
 }
 
+// Deep transition futures can overflow libtest's default stack before their
+// first assertion, so the serial ILM cases use one dedicated test thread.
+fn run_large_stack_async_test<F, Fut>(thread_name: &'static str, test_fn: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("large-stack scanner test runtime should build");
+            runtime.block_on(test_fn());
+        })
+        .expect("large-stack scanner test thread should spawn");
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 mod serial_tests {
     use super::*;
 
@@ -737,10 +760,17 @@ mod serial_tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[test]
     #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
-    async fn rejected_transition_candidate_is_recovered_from_persisted_delete_journal() {
+    fn rejected_transition_candidate_is_recovered_from_persisted_transaction() {
+        run_large_stack_async_test(
+            "scanner-rejected-transition-transaction",
+            rejected_transition_candidate_is_recovered_from_persisted_transaction_case,
+        );
+    }
+
+    async fn rejected_transition_candidate_is_recovered_from_persisted_transaction_case() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
@@ -790,21 +820,20 @@ mod serial_tests {
             "no cleanup path may delete the candidate while remove failures are enabled"
         );
 
-        let retained = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+        let retained = recover_transition_transaction_records(ecstore.clone(), 100, None)
             .await
-            .expect("tier delete journal recovery should scan the persisted candidate");
-        assert_eq!(retained.scanned, 1);
-        assert_eq!(retained.deleted, 0);
-        assert_eq!(retained.failed, 1);
+            .expect("transition transaction recovery should scan the persisted candidate");
+        assert_eq!((retained.scanned, retained.recovered, retained.retained, retained.failed), (1, 0, 0, 1));
         assert_eq!(backend.object_count().await, 1, "failed recovery must retain the remote candidate");
 
         backend.set_remove_failure(false);
-        let recovered = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+        let recovered = recover_transition_transaction_records(ecstore.clone(), 100, None)
             .await
-            .expect("tier delete journal recovery should delete the retained candidate");
-        assert_eq!(recovered.scanned, 1);
-        assert_eq!(recovered.deleted, 1);
-        assert_eq!(recovered.failed, 0);
+            .expect("transition transaction recovery should delete the retained candidate");
+        assert_eq!(
+            (recovered.scanned, recovered.recovered, recovered.retained, recovered.failed),
+            (1, 1, 0, 0)
+        );
         let removed_versions = backend.remove_versions().await;
         assert!(!removed_versions.is_empty(), "recovery must issue at least one successful delete");
         assert!(
@@ -813,10 +842,10 @@ mod serial_tests {
         );
         assert_eq!(backend.object_count().await, 0, "recovery should remove the rejected remote candidate");
 
-        let empty = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+        let empty = recover_transition_transaction_records(ecstore.clone(), 100, None)
             .await
-            .expect("a removed tier delete journal entry should no longer be listed");
-        assert_eq!(empty.scanned, 0, "successful recovery must remove the persisted journal entry");
+            .expect("a removed transition transaction should no longer be listed");
+        assert_eq!(empty.scanned, 0, "successful recovery must remove the persisted transaction");
         assert_eq!(
             read_object_fully(&ecstore, bucket_name.as_str(), object_name).await,
             payload,
@@ -824,10 +853,17 @@ mod serial_tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[test]
     #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
-    async fn cancelled_before_cleanup_store_resolution_persists_journal() {
+    fn cancelled_before_cleanup_store_resolution_persists_transaction() {
+        run_large_stack_async_test(
+            "scanner-cancelled-transition-transaction",
+            cancelled_before_cleanup_store_resolution_persists_transaction_case,
+        );
+    }
+
+    async fn cancelled_before_cleanup_store_resolution_persists_transaction_case() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&tier_name).await;
@@ -876,9 +912,9 @@ mod serial_tests {
 
         let retained = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let recovery = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                let recovery = recover_transition_transaction_records(ecstore.clone(), 100, None)
                     .await
-                    .expect("the cancelled transition journal should be readable");
+                    .expect("the cancelled transition transaction should be readable");
                 if recovery.scanned > 0 {
                     break recovery;
                 }
@@ -887,29 +923,36 @@ mod serial_tests {
         })
         .await
         .expect("Drop should persist the rejected candidate through the saved instance context");
-        assert_eq!((retained.scanned, retained.deleted, retained.failed), (1, 0, 1));
+        assert_eq!((retained.scanned, retained.recovered, retained.retained, retained.failed), (1, 0, 0, 1));
         tokio::time::timeout(Duration::from_secs(5), async {
             while backend.exact_remove_count() < 2 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("Drop cleanup and failed journal recovery must both preserve the exact version constraint");
+        .expect("Drop cleanup and failed transaction recovery must both preserve the exact version constraint");
         let failed_exact_attempts = backend.exact_remove_count();
+        assert_eq!(
+            failed_exact_attempts, 2,
+            "the cancelled task and the first failed recovery must each preserve the exact delete constraint"
+        );
         assert_eq!(backend.object_count().await, 1);
         assert!(backend.remove_versions().await.is_empty());
 
         backend.set_remove_failure(false);
-        let recovered = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+        let recovered = recover_transition_transaction_records(ecstore.clone(), 100, None)
             .await
             .expect("recovery should delete the candidate retained by the cancelled transition");
-        assert_eq!((recovered.scanned, recovered.deleted, recovered.failed), (1, 1, 0));
+        assert_eq!(
+            (recovered.scanned, recovered.recovered, recovered.retained, recovered.failed),
+            (1, 1, 0, 0)
+        );
         assert_eq!(backend.remove_versions().await, backend.put_versions().await);
         assert_eq!(backend.exact_remove_count(), failed_exact_attempts + 1);
         assert_eq!(backend.object_count().await, 0);
-        let empty = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+        let empty = recover_transition_transaction_records(ecstore.clone(), 100, None)
             .await
-            .expect("successful recovery should remove the cancellation journal");
+            .expect("successful recovery should remove the cancellation transaction");
         assert_eq!(empty.scanned, 0);
         assert_eq!(
             read_object_fully(&ecstore, bucket_name.as_str(), object_name).await,
@@ -918,10 +961,14 @@ mod serial_tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[test]
     #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
-    async fn rejected_transition_cleanup_durability_matrix() {
+    fn rejected_transition_cleanup_durability_matrix() {
+        run_large_stack_async_test("scanner-transition-cleanup-matrix", rejected_transition_cleanup_durability_matrix_case);
+    }
+
+    async fn rejected_transition_cleanup_durability_matrix_case() {
         #[derive(Clone, Copy)]
         enum CleanupCase {
             Persisted,
@@ -1010,44 +1057,67 @@ mod serial_tests {
                 CleanupCase::Persisted | CleanupCase::DeleteFallback => {
                     assert_eq!(backend.remove_versions().await, backend.put_versions().await);
                     assert_eq!(backend.object_count().await, 0, "cleanup must remove the exact candidate");
-                    let recovery = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                    let recovery = recover_transition_transaction_records(ecstore.clone(), 100, None)
                         .await
-                        .expect("successful cleanup must not retain a journal entry");
-                    assert_eq!(recovery.scanned, 0);
+                        .expect("successful cleanup must leave no failed transition transaction");
+                    assert_eq!(recovery.failed, 0);
+                    assert_eq!(recovery.retained, 0);
+                    assert_eq!(recovery.recovered, recovery.scanned);
+                    let empty = recover_transition_transaction_records(ecstore.clone(), 100, None)
+                        .await
+                        .expect("successful reconciliation must remove every transition transaction");
+                    assert_eq!(empty.scanned, 0);
                 }
                 CleanupCase::RetryPersisted => {
                     assert!(
                         !err.to_string().contains("journal retry error"),
-                        "a successful journal retry must preserve the original version-constraint error"
+                        "the transaction path must not surface the removed journal fallback error"
                     );
                     assert_eq!(backend.object_count().await, 1);
-                    let retained = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                    let retained = recover_transition_transaction_records(ecstore.clone(), 100, None)
                         .await
-                        .expect("the retried journal should be recoverable");
-                    assert_eq!((retained.scanned, retained.deleted, retained.failed), (1, 0, 1));
+                        .expect("the retained transaction should be recoverable");
+                    assert_eq!((retained.scanned, retained.recovered, retained.retained, retained.failed), (1, 0, 0, 1));
                     backend.set_remove_failure(false);
-                    let recovered = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                    let recovered = recover_transition_transaction_records(ecstore.clone(), 100, None)
                         .await
-                        .expect("recovery should delete the exact retried candidate");
-                    assert_eq!((recovered.scanned, recovered.deleted, recovered.failed), (1, 1, 0));
+                        .expect("recovery should delete the exact transaction candidate");
+                    assert_eq!(
+                        (recovered.scanned, recovered.recovered, recovered.retained, recovered.failed),
+                        (1, 1, 0, 0)
+                    );
                     assert_eq!(backend.remove_versions().await, backend.put_versions().await);
                     assert_eq!(backend.object_count().await, 0);
-                    let empty = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                    let empty = recover_transition_transaction_records(ecstore.clone(), 100, None)
                         .await
-                        .expect("successful recovery must remove the retried journal");
+                        .expect("successful recovery must remove the retained transaction");
                     assert_eq!(empty.scanned, 0);
                 }
                 CleanupCase::FullyFailed => {
                     let message = err.to_string();
-                    assert!(message.contains("initial journal error"), "{message}");
                     assert!(message.contains("cleanup error"), "{message}");
-                    assert!(message.contains("journal retry error"), "{message}");
                     assert_eq!(backend.object_count().await, 1, "both failed safeguards must leave the candidate visible");
                     assert!(backend.remove_versions().await.is_empty());
-                    let recovery = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                    let retained = recover_transition_transaction_records(ecstore.clone(), 100, None)
                         .await
-                        .expect("failed journal writes must not create partial recovery entries");
-                    assert_eq!(recovery.scanned, 0);
+                        .expect("the pre-upload transaction must retain ownership after cleanup failure");
+                    assert_eq!(retained.scanned, 1, "the failed cleanup must keep one durable transaction owner");
+                    assert_eq!(retained.recovered, 0);
+                    assert_eq!(retained.retained + retained.failed, 1);
+                    backend.set_remove_failure(false);
+                    let recovered = recover_transition_transaction_records(ecstore.clone(), 100, None)
+                        .await
+                        .expect("recovery should delete the candidate after the backend becomes available");
+                    assert_eq!(
+                        (recovered.scanned, recovered.recovered, recovered.retained, recovered.failed),
+                        (1, 1, 0, 0)
+                    );
+                    assert_eq!(backend.remove_versions().await, backend.put_versions().await);
+                    assert_eq!(backend.object_count().await, 0);
+                    let empty = recover_transition_transaction_records(ecstore.clone(), 100, None)
+                        .await
+                        .expect("successful recovery must remove the failed cleanup transaction");
+                    assert_eq!(empty.scanned, 0);
                 }
             }
             assert_eq!(
@@ -1062,20 +1132,7 @@ mod serial_tests {
     #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     fn test_transition_and_restore_flows() {
-        std::thread::Builder::new()
-            .name("scanner-transition-restore-flows".to_string())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("transition and restore test runtime should build");
-
-                runtime.block_on(test_transition_and_restore_flows_inner());
-            })
-            .expect("transition and restore test thread should spawn")
-            .join()
-            .expect("transition and restore test thread should finish");
+        run_large_stack_async_test("scanner-transition-restore-flows", test_transition_and_restore_flows_inner);
     }
 
     async fn test_transition_and_restore_flows_inner() {

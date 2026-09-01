@@ -33,6 +33,7 @@ const MANUAL_TRANSITION_CURSOR_MARKER_PROOF_MAX_SIZE: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DurableIlmRecordKind {
     TierDeleteJournal,
+    TierDeleteDispatchManifest,
     TransitionTransaction,
     ManualTransitionJob,
     ManualTransitionScope,
@@ -53,6 +54,18 @@ pub(crate) const TIER_DELETE_JOURNAL_NAMESPACE: DurableIlmNamespace = DurableIlm
     prefix: "ilm/tier-delete-journal/",
     max_record_size: 64 * 1024,
     kind: DurableIlmRecordKind::TierDeleteJournal,
+};
+pub(crate) const TIER_DELETE_JOURNAL_V6_NAMESPACE: DurableIlmNamespace = DurableIlmNamespace {
+    name: "tier-delete-journal-v6",
+    prefix: "ilm/tier-delete-journal-v6/",
+    max_record_size: 64 * 1024,
+    kind: DurableIlmRecordKind::TierDeleteJournal,
+};
+pub(crate) const TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE: DurableIlmNamespace = DurableIlmNamespace {
+    name: "tier-delete-dispatch-manifest",
+    prefix: tier_delete_journal::TIER_DELETE_DISPATCH_MANIFEST_PREFIX,
+    max_record_size: tier_delete_journal::MAX_TIER_DELETE_DISPATCH_MANIFEST_SIZE,
+    kind: DurableIlmRecordKind::TierDeleteDispatchManifest,
 };
 pub(crate) const TRANSITION_TRANSACTION_NAMESPACE: DurableIlmNamespace = DurableIlmNamespace {
     name: "transition-transaction",
@@ -85,8 +98,10 @@ pub(crate) const MANUAL_TRANSITION_WORKER_RESULT_NAMESPACE: DurableIlmNamespace 
     kind: DurableIlmRecordKind::ManualTransitionWorkerResult,
 };
 
-pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 6] = [
+pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 8] = [
     TIER_DELETE_JOURNAL_NAMESPACE,
+    TIER_DELETE_JOURNAL_V6_NAMESPACE,
+    TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE,
     TRANSITION_TRANSACTION_NAMESPACE,
     MANUAL_TRANSITION_JOB_NAMESPACE,
     MANUAL_TRANSITION_SCOPE_NAMESPACE,
@@ -157,6 +172,15 @@ pub(crate) enum DurableIlmRecordCheckpoint {
         content_sha256: String,
         identity_sha256: String,
         committed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dispatch_identity_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<super::tier_sweeper::TierDeleteJournalState>,
+    },
+    TierDeleteDispatchManifest {
+        content_sha256: String,
+        identity_sha256: String,
+        state: tier_delete_journal::TierDeleteDispatchManifestState,
     },
     TransitionTransaction {
         content_sha256: String,
@@ -195,6 +219,7 @@ impl DurableIlmRecordCheckpoint {
     pub(crate) fn content_sha256(&self) -> &str {
         match self {
             Self::TierDeleteJournal { content_sha256, .. }
+            | Self::TierDeleteDispatchManifest { content_sha256, .. }
             | Self::TransitionTransaction { content_sha256, .. }
             | Self::ManualTransitionJob { content_sha256, .. }
             | Self::ManualTransitionScope { content_sha256, .. }
@@ -228,6 +253,19 @@ impl DurableIlmRecordCheckpoint {
     }
 
     pub(crate) fn validate_successor(&self, next: &Self) -> Result<()> {
+        for checkpoint in [self, next] {
+            if let Self::TierDeleteJournal {
+                committed,
+                dispatch_identity_sha256,
+                state,
+                ..
+            } = checkpoint
+                && (state.is_some() != dispatch_identity_sha256.is_some()
+                    || state.is_some_and(|state| *committed != (state == super::tier_sweeper::TierDeleteJournalState::Committed)))
+            {
+                return Err(Error::other("durable ILM tier delete journal checkpoint is invalid"));
+            }
+        }
         if self == next {
             if let Self::ManualTransitionJob {
                 progress,
@@ -244,18 +282,64 @@ impl DurableIlmRecordCheckpoint {
         let valid = match (self, next) {
             (
                 Self::TierDeleteJournal {
+                    content_sha256: previous_content,
                     identity_sha256: previous_identity,
                     committed: previous_committed,
+                    dispatch_identity_sha256: previous_dispatch_identity,
+                    state: previous_state,
                     ..
                 },
                 Self::TierDeleteJournal {
+                    content_sha256: next_content,
                     identity_sha256: next_identity,
                     committed: next_committed,
+                    dispatch_identity_sha256: next_dispatch_identity,
+                    state: next_state,
                     ..
                 },
             ) => {
+                use super::tier_sweeper::TierDeleteJournalState::{Committed, Dispatched, Prepared};
+
+                let dispatch_identity_is_monotonic = match (previous_dispatch_identity, next_dispatch_identity) {
+                    (Some(previous), Some(next)) => previous == next,
+                    (None, None) => true,
+                    // Old receipts did not record the v6 dispatch binding. A
+                    // byte-identical observation may adopt the stronger proof,
+                    // but an in-flight mutation must fail closed instead of
+                    // guessing which operation owned the journal.
+                    (None, Some(_)) => previous_content == next_content,
+                    (Some(_), None) => false,
+                };
+                let state_is_monotonic = match (previous_state, next_state) {
+                    (Some(previous), Some(next)) => {
+                        previous == next || matches!((previous, next), (Prepared, Dispatched) | (Dispatched, Committed))
+                    }
+                    (None, None) => previous_committed == next_committed || (!previous_committed && *next_committed),
+                    (None, Some(_)) => previous_content == next_content,
+                    (Some(_), None) => false,
+                };
+                previous_identity == next_identity && dispatch_identity_is_monotonic && state_is_monotonic
+            }
+            (
+                Self::TierDeleteDispatchManifest {
+                    identity_sha256: previous_identity,
+                    state: previous_state,
+                    ..
+                },
+                Self::TierDeleteDispatchManifest {
+                    identity_sha256: next_identity,
+                    state: next_state,
+                    ..
+                },
+            ) => {
+                use tier_delete_journal::TierDeleteDispatchManifestState::{
+                    Aborted, Aborting, Completed, DispatchAuthorized, Preparing,
+                };
                 previous_identity == next_identity
-                    && (previous_committed == next_committed || (!previous_committed && *next_committed))
+                    && matches!(
+                        (previous_state, next_state),
+                        (Preparing, DispatchAuthorized | Aborting) | (Aborting, Aborted) | (DispatchAuthorized, Completed)
+                    )
             }
             (
                 Self::TransitionTransaction {
@@ -349,6 +433,49 @@ impl DurableIlmRecordCheckpoint {
             Ok(())
         } else {
             Err(Error::other("durable ILM record generation is not a monotonic successor"))
+        }
+    }
+
+    /// Whether `self` is an older generation of the same immutable record
+    /// that can reach `terminal` through one or more valid state transitions.
+    /// This is deliberately broader than `validate_successor`, which remains
+    /// adjacent-only for receipt advancement. Terminal cleanup uses this only
+    /// after the exact terminal ETag and terminal receipt were committed, to
+    /// purge older object versions exposed by that deletion.
+    pub(crate) fn is_predecessor_of_terminal(&self, terminal: &Self) -> bool {
+        if self == terminal || self.validate_successor(terminal).is_ok() {
+            return true;
+        }
+        match (self, terminal) {
+            (
+                Self::TierDeleteJournal {
+                    identity_sha256: previous_identity,
+                    dispatch_identity_sha256: previous_dispatch,
+                    state: Some(super::tier_sweeper::TierDeleteJournalState::Prepared),
+                    ..
+                },
+                Self::TierDeleteJournal {
+                    identity_sha256: terminal_identity,
+                    dispatch_identity_sha256: terminal_dispatch,
+                    state: Some(super::tier_sweeper::TierDeleteJournalState::Committed),
+                    ..
+                },
+            ) => previous_identity == terminal_identity && previous_dispatch == terminal_dispatch,
+            (
+                Self::TierDeleteDispatchManifest {
+                    identity_sha256: previous_identity,
+                    state: tier_delete_journal::TierDeleteDispatchManifestState::Preparing,
+                    ..
+                },
+                Self::TierDeleteDispatchManifest {
+                    identity_sha256: terminal_identity,
+                    state:
+                        tier_delete_journal::TierDeleteDispatchManifestState::Aborted
+                        | tier_delete_journal::TierDeleteDispatchManifestState::Completed,
+                    ..
+                },
+            ) => previous_identity == terminal_identity,
+            _ => false,
         }
     }
 }
@@ -750,10 +877,19 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
             if tier_delete_journal::tier_delete_journal_object_name(&entry) != path {
                 return Err(Error::other("tier delete journal content does not match its path"));
             }
-            let operation_id = path
+            let legacy_operation_id = path
                 .strip_prefix(namespace.prefix)
                 .and_then(|suffix| suffix.strip_suffix(".json"))
                 .ok_or_else(|| Error::other("tier delete journal path is invalid"))?;
+            // Legacy v1-v5 paths already expose a 64-hex operation id and
+            // must remain receipt-compatible. V6 uses an operation-scoped
+            // nested path, so derive a fixed, path-unique receipt id instead
+            // of embedding slashes in the receipt locator.
+            let operation_id = if entry.persisted_version == 6 {
+                hex_sha256(path.as_bytes(), ToOwned::to_owned)
+            } else {
+                legacy_operation_id.to_string()
+            };
             let identity_sha256 = checkpoint_hash(&(
                 &entry.obj_name,
                 &entry.version_id,
@@ -763,13 +899,29 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
                 entry.version_state,
                 &entry.source,
             ))?;
+            let dispatch_identity_sha256 = entry.dispatch.as_ref().map(checkpoint_hash).transpose()?;
             (
                 "operation_id",
-                operation_id.to_string(),
+                operation_id,
                 DurableIlmRecordCheckpoint::TierDeleteJournal {
                     content_sha256,
                     identity_sha256,
                     committed: entry.state == super::tier_sweeper::TierDeleteJournalState::Committed,
+                    dispatch_identity_sha256,
+                    state: (entry.persisted_version == 6).then_some(entry.state),
+                },
+            )
+        }
+        DurableIlmRecordKind::TierDeleteDispatchManifest => {
+            let (operation_id, identity_sha256, state) =
+                tier_delete_journal::validate_tier_delete_dispatch_manifest_record(path, data)?;
+            (
+                "operation_id",
+                hex_sha256(operation_id.as_bytes(), ToOwned::to_owned),
+                DurableIlmRecordCheckpoint::TierDeleteDispatchManifest {
+                    content_sha256,
+                    identity_sha256,
+                    state,
                 },
             )
         }
@@ -954,6 +1106,87 @@ mod tests {
                 assert!(!path_is_in_namespace(other.prefix, namespace));
             }
         }
+    }
+
+    #[test]
+    fn tier_delete_dispatch_manifest_namespace_validates_monotonic_branches() {
+        use tier_delete_journal::TierDeleteDispatchManifestState::{Aborted, Aborting, Completed, DispatchAuthorized, Preparing};
+
+        let operation_id = Uuid::new_v4();
+        let checkpoint = |state| {
+            let (path, data) = tier_delete_journal::test_tier_delete_dispatch_manifest_record(operation_id, state);
+            let namespace = classify_durable_ilm_record(&path)
+                .expect("dispatch manifest namespace should classify")
+                .expect("dispatch manifest should be durable");
+            assert_eq!(namespace, &TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE);
+            validate_durable_ilm_record(&path, &data)
+                .expect("dispatch manifest should validate")
+                .checkpoint
+        };
+
+        let preparing = checkpoint(Preparing);
+        let authorized = checkpoint(DispatchAuthorized);
+        let completed = checkpoint(Completed);
+        let aborting = checkpoint(Aborting);
+        let aborted = checkpoint(Aborted);
+
+        preparing
+            .validate_successor(&authorized)
+            .expect("Preparing may become DispatchAuthorized");
+        authorized
+            .validate_successor(&completed)
+            .expect("DispatchAuthorized may become Completed");
+        preparing.validate_successor(&aborting).expect("Preparing may enter rollback");
+        aborting.validate_successor(&aborted).expect("Aborting may become Aborted");
+        assert!(authorized.validate_successor(&aborting).is_err());
+        assert!(completed.validate_successor(&authorized).is_err());
+        assert!(aborted.validate_successor(&preparing).is_err());
+    }
+
+    #[test]
+    fn tier_delete_journal_checkpoint_binds_dispatch_and_full_state_monotonically() {
+        use crate::bucket::lifecycle::tier_sweeper::TierDeleteJournalState::{Committed, Dispatched, Prepared};
+
+        let checkpoint = |content: &str, dispatch: Option<&str>, state| DurableIlmRecordCheckpoint::TierDeleteJournal {
+            content_sha256: content.repeat(64),
+            identity_sha256: "i".repeat(64),
+            committed: state == Some(Committed),
+            dispatch_identity_sha256: dispatch.map(|value| value.repeat(64)),
+            state,
+        };
+        let prepared = checkpoint("a", Some("d"), Some(Prepared));
+        let dispatched = checkpoint("b", Some("d"), Some(Dispatched));
+        let committed = checkpoint("c", Some("d"), Some(Committed));
+        prepared
+            .validate_successor(&dispatched)
+            .expect("Prepared may advance to Dispatched");
+        dispatched
+            .validate_successor(&committed)
+            .expect("Dispatched may advance to Committed");
+        assert!(prepared.validate_successor(&committed).is_err());
+        assert!(dispatched.validate_successor(&prepared).is_err());
+
+        let rebound = checkpoint("b", Some("e"), Some(Dispatched));
+        assert!(dispatched.validate_successor(&rebound).is_err());
+
+        let legacy: DurableIlmRecordCheckpoint = serde_json::from_value(serde_json::json!({
+            "kind": "tier_delete_journal",
+            "content_sha256": "a".repeat(64),
+            "identity_sha256": "i".repeat(64),
+            "committed": false
+        }))
+        .expect("legacy tier-delete checkpoint should remain decodable");
+        legacy
+            .validate_successor(&prepared)
+            .expect("byte-identical legacy receipt may adopt the stronger v6 proof");
+        let changed_legacy = DurableIlmRecordCheckpoint::TierDeleteJournal {
+            content_sha256: "z".repeat(64),
+            identity_sha256: "i".repeat(64),
+            committed: false,
+            dispatch_identity_sha256: None,
+            state: None,
+        };
+        assert!(changed_legacy.validate_successor(&prepared).is_err());
     }
 
     #[test]

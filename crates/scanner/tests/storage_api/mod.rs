@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use rustfs_ecstore::api::bucket::lifecycle::tier_delete_journal::recover_tier_delete_journal_entries;
+pub(crate) use rustfs_ecstore::api::bucket::lifecycle::transition_transaction::recover_transition_transaction_records;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::{
     bucket_lifecycle_audit::LcEventSrc,
     bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, expire_transitioned_object, init_background_expiry},
@@ -50,7 +50,7 @@ pub(crate) mod lifecycle {
         TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
         enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
         get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
-        is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_tier_delete_journal_entries,
+        is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_transition_transaction_records,
         register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
     };
 }
