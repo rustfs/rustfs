@@ -8018,6 +8018,19 @@ impl ECStore {
         write_state: &mut PoolMetaWriteState,
         operation: &str,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)> {
+        self.acquire_pool_meta_write_guard_with_lock_error(write_state, operation, activation_pool_meta_lock_error)
+            .await
+    }
+
+    async fn acquire_pool_meta_write_guard_with_lock_error<F>(
+        &self,
+        write_state: &mut PoolMetaWriteState,
+        operation: &str,
+        map_lock_error: F,
+    ) -> Result<(rustfs_lock::NamespaceLockGuard, PoolMeta)>
+    where
+        F: FnOnce(rustfs_lock::LockError) -> Error,
+    {
         write_state.ensure_write_safe(operation)?;
         load_pool_meta_identity_observing(self.pools.clone(), write_state).await?;
         let pool = self.pools.first().cloned().ok_or_else(|| {
@@ -8031,7 +8044,7 @@ impl ECStore {
         let pool_meta_guard = pool_meta_lock
             .get_write_lock(get_lock_acquire_timeout())
             .await
-            .map_err(activation_pool_meta_lock_error)?;
+            .map_err(map_lock_error)?;
         let selection = load_pool_meta_replicas_observing(self.pools.clone(), true, write_state).await?;
         write_state.observe_replicas(selection.replica_state);
         write_state.ensure_write_safe(operation)?;
@@ -8085,6 +8098,27 @@ impl ECStore {
         let has_active_source = pool_meta_has_active_decommission(&snapshot);
         drop(save_guard);
         Ok((pool_meta_guard, has_active_source))
+    }
+
+    /// Fence healing of the pool metadata object itself without recursively
+    /// acquiring its namespace lock through the ordinary capacity probe. The
+    /// caller must retain the returned write guard through every admitted
+    /// repair; admission results preserve the input target order.
+    pub(crate) async fn acquire_pool_meta_object_heal_fence(
+        &self,
+        target_pool_indices: &[usize],
+    ) -> Result<(rustfs_lock::NamespaceLockGuard, Vec<Result<()>>)> {
+        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let (pool_meta_guard, snapshot) = self
+            .acquire_pool_meta_write_guard_with_lock_error(&mut save_guard, "pool metadata heal admission failed", Error::from)
+            .await?;
+        let admissions = target_pool_indices
+            .iter()
+            .copied()
+            .map(|target_pool_index| ensure_external_decommission_target_admission(&snapshot, target_pool_index, "heal"))
+            .collect();
+        drop(save_guard);
+        Ok((pool_meta_guard, admissions))
     }
 
     pub(crate) async fn acquire_decommission_capacity_release_fence_with_active_source(
