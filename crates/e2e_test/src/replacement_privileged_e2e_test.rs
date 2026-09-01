@@ -218,7 +218,7 @@ mod tests {
     }
 
     impl ZramBlockMount {
-        fn mount(target: &Path) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        fn reserve(target: &Path) -> Result<Self, Box<dyn Error + Send + Sync>> {
             if !Path::new("/dev/zram-control").exists() {
                 run_command("modprobe", &["zram"])?;
             }
@@ -227,22 +227,25 @@ mod tests {
                 return Err("zramctl --find --size returned an empty device".into());
             }
 
-            let mut mount = Self {
+            Ok(Self {
                 target: target.to_path_buf(),
                 device,
                 mounted: false,
-            };
+            })
+        }
+
+        fn mount_target(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
             let result = (|| {
-                run_command("mkfs.ext4", &["-F", &mount.device])?;
-                let target_arg = path_to_string(&mount.target, "zram replacement mount target")?;
-                run_command("mount", &[&mount.device, &target_arg])
+                run_command("mkfs.ext4", &["-F", &self.device])?;
+                let target_arg = path_to_string(&self.target, "zram replacement mount target")?;
+                run_command("mount", &[&self.device, &target_arg])
             })();
             if let Err(error) = result {
-                let _ = mount.cleanup();
+                let _ = self.cleanup();
                 return Err(error);
             }
-            mount.mounted = true;
-            Ok(mount)
+            self.mounted = true;
+            Ok(())
         }
 
         fn cleanup(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -378,12 +381,16 @@ mod tests {
         Err(format!("{ENABLE_ENV}=1 requires root or CAP_SYS_ADMIN; unshare exited with status {status}").into())
     }
 
-    fn replacement_target_log_path(cluster_temp_dir: &str, parity: usize) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    fn replacement_node_log_path(
+        cluster_temp_dir: &str,
+        parity: usize,
+        node_index: usize,
+    ) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
         let log_dir = std::env::var_os(LOG_DIR_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(cluster_temp_dir));
         fs::create_dir_all(&log_dir)?;
-        Ok(log_dir.join(format!("replacement-ec{parity}-node{TARGET_NODE}-{}.log", std::process::id())))
+        Ok(log_dir.join(format!("replacement-ec{parity}-node{node_index}-{}.log", std::process::id())))
     }
 
     fn payload(len: usize, seed: u8) -> Vec<u8> {
@@ -868,8 +875,10 @@ mod tests {
 
         let mut mount_ns = MountNamespaceGuard::new()?;
         let mut cluster = RustFSTestClusterEnvironment::with_topology(ClusterTopology::single_pool_multidrive(3, 4)).await?;
-        let target_log_path = replacement_target_log_path(&cluster.temp_dir, parity)?;
-        cluster.set_node_capture_log_path(TARGET_NODE, target_log_path.to_string_lossy())?;
+        for node_index in 0..cluster.nodes.len() {
+            let node_log_path = replacement_node_log_path(&cluster.temp_dir, parity, node_index)?;
+            cluster.set_node_capture_log_path(node_index, node_log_path.to_string_lossy())?;
+        }
         let target_disk = PathBuf::from(&cluster.nodes[TARGET_NODE].data_dirs[TARGET_DRIVE]);
         // The blank target uses a temporary zram block device, so the
         // replacement readiness fence sees no root or sibling alias.
@@ -891,6 +900,7 @@ mod tests {
             }
         }
         let mut target_mount = target_mount.ok_or("target drive was not mounted with the faultable block fixture")?;
+        let mut replacement_mount = ZramBlockMount::reserve(&target_disk)?;
 
         cluster.set_env("RUSTFS_HEAL_ENABLED", "true");
         cluster.set_env("RUSTFS_SCANNER_ENABLED", "true");
@@ -898,7 +908,9 @@ mod tests {
         cluster.set_env("RUSTFS_SCANNER_CYCLE", "1");
         cluster.set_env("RUSTFS_SCANNER_START_DELAY_SECS", "0");
         cluster.set_env("RUSTFS_STORAGE_CLASS_STANDARD", format!("EC:{parity}"));
-        cluster.set_node_env(TARGET_NODE, "RUST_LOG", "rustfs=info,rustfs::heal::manager=debug,rustfs_notify=debug")?;
+        for node_index in 0..cluster.nodes.len() {
+            cluster.set_node_env(node_index, "RUST_LOG", "rustfs=info,rustfs::heal::manager=debug,rustfs_notify=debug")?;
+        }
         cluster.start().await?;
 
         let clients = cluster.create_all_clients()?;
@@ -923,7 +935,7 @@ mod tests {
 
         cluster.stop_node_gracefully(TARGET_NODE).await?;
         target_mount.cleanup()?;
-        let _replacement_mount = ZramBlockMount::mount(&target_disk)?;
+        replacement_mount.mount_target()?;
         let missing_before_restart = incomplete_versions(&target_disk, &versions)?;
         assert_eq!(
             missing_before_restart.len(),
@@ -932,8 +944,25 @@ mod tests {
         );
         cluster.start_node(TARGET_NODE).await?;
 
-        wait_for_completed_replacement_with_census(&cluster, &target_disk, &versions, 420).await?;
-        verify_bodies(&clients[0], &versions).await?;
+        let recovery_result = async {
+            wait_for_completed_replacement_with_census(&cluster, &target_disk, &versions, 420).await?;
+            verify_bodies(&clients[0], &versions).await
+        }
+        .await;
+        let stop_result = cluster.stop_node_gracefully(TARGET_NODE).await;
+        let replacement_cleanup_result = replacement_mount.cleanup();
+
+        if let Err(error) = recovery_result {
+            if let Err(stop_error) = stop_result {
+                info!(%stop_error, "replacement target stop failed while preserving recovery failure");
+            }
+            if let Err(cleanup_error) = replacement_cleanup_result {
+                info!(%cleanup_error, "replacement zram cleanup failed while preserving recovery failure");
+            }
+            return Err(error);
+        }
+        stop_result?;
+        replacement_cleanup_result?;
 
         Ok(())
     }

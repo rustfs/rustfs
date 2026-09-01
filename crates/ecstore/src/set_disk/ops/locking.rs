@@ -24,10 +24,8 @@ use super::super::{
     NamespaceLock, NamespaceLockWrapper, ObjectKey, Result, SetDisks, StorageError, debug, disk, info, load_format_erasure,
     send_heal_replacement_disk, warn,
 };
-use crate::disk::DiskAPI;
 use crate::disk::health_state::DriveMembershipSnapshot;
-#[cfg(test)]
-use crate::disk::new_disk;
+use crate::disk::{DiskAPI, new_disk};
 use crate::runtime::sources as runtime_sources;
 use rand::prelude::SliceRandom;
 #[cfg(test)]
@@ -356,11 +354,35 @@ impl SetDisks {
             Ok(res) => res,
             Err(e) => {
                 warn!("renew_disk: connect_endpoint err {:?}", &e);
-                if ep.is_local && e == DiskError::UnformattedDisk {
-                    info!("renew_disk unformatteddisk will trigger heal_disk, {:?}", ep);
-                    let set_disk_id = format!("pool_{}_set_{}", ep.pool_idx, ep.set_idx);
-                    let _ = send_heal_replacement_disk(set_disk_id, ep.to_string(), Some(HealChannelPriority::Normal)).await;
+                if !matches!(e, DiskError::UnformattedDisk | DiskError::Io(_)) {
+                    return;
                 }
+
+                let attached = match self.attach_unformatted_replacement_disk(ep).await {
+                    Ok(attached) => attached,
+                    Err(err) => {
+                        warn!(endpoint = %ep, error = ?err, "renew_disk: unformatted replacement probe failed");
+                        return;
+                    }
+                };
+                if !attached {
+                    return;
+                }
+
+                info!("renew_disk attached unformatted replacement and will trigger heal_disk, {:?}", ep);
+                let set_disk_id = format!("pool_{}_set_{}", ep.pool_idx, ep.set_idx);
+                let (Ok(pool_index), Ok(set_index)) = (usize::try_from(ep.pool_idx), usize::try_from(ep.set_idx)) else {
+                    warn!("renew_disk: replacement target has invalid pool or set index, {:?}", ep);
+                    return;
+                };
+                let _ = send_heal_replacement_disk(
+                    set_disk_id,
+                    ep.to_string(),
+                    pool_index,
+                    set_index,
+                    Some(HealChannelPriority::Normal),
+                )
+                .await;
                 return;
             }
         };
@@ -410,6 +432,60 @@ impl SetDisks {
 
         let mut disk_lock = self.disks.write().await;
         disk_lock[disk_idx] = Some(new_disk);
+    }
+
+    /// Attach a replacement target only after proving that the exact local slot
+    /// is present and unformatted. A health-checked reconnect may reject a
+    /// blank target before it reaches the format-heal path; that target still
+    /// has to be visible in this set for the formatter to claim it safely.
+    async fn attach_unformatted_replacement_disk(&self, ep: &Endpoint) -> disk::error::Result<bool> {
+        if !ep.is_local
+            || usize::try_from(ep.pool_idx).ok() != Some(self.pool_index)
+            || usize::try_from(ep.set_idx).ok() != Some(self.set_index)
+        {
+            return Ok(false);
+        }
+
+        let Some(disk_idx) = self.set_endpoints.iter().position(|candidate| candidate == ep) else {
+            return Ok(false);
+        };
+
+        let replacement = new_disk(
+            ep,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await?;
+        match load_format_erasure(&replacement, false).await {
+            Err(DiskError::UnformattedDisk) => {}
+            Ok(_) => return Ok(false),
+            Err(err) => return Err(err),
+        }
+
+        {
+            let mut disks = self.disks.write().await;
+            if disks[disk_idx].as_ref().is_some_and(|existing| existing.endpoint() != *ep) {
+                warn!(endpoint = %ep, disk_idx, "renew_disk rejected unformatted replacement for an occupied foreign slot");
+                return Ok(false);
+            }
+            disks[disk_idx] = Some(replacement.clone());
+        }
+
+        let local_disk_map = runtime_sources::local_disk_map_handle();
+        local_disk_map
+            .write()
+            .await
+            .insert(replacement.endpoint().to_string(), Some(replacement.clone()));
+
+        if runtime_sources::setup_is_dist_erasure().await {
+            let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
+            let mut local_set_drives = local_disk_set_drives.write().await;
+            local_set_drives[self.pool_index][self.set_index][disk_idx] = Some(replacement);
+        }
+
+        Ok(true)
     }
 
     pub(in crate::set_disk) fn find_disk_index(&self, fm: &FormatV3) -> Result<(usize, usize)> {
@@ -776,6 +852,75 @@ mod tests {
             "disk reconnect must preserve the local drive metrics tracker epoch"
         );
 
+        drop(temp_dirs);
+    }
+
+    #[tokio::test]
+    async fn renew_disk_attaches_only_a_verified_local_unformatted_replacement() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count - 1 {
+            let (temp_dir, endpoint, disk) = make_formatted_local_disk(disk_idx, &format).await;
+            temp_dirs.push(temp_dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let replacement_dir = tempfile::tempdir().expect("replacement tempdir should be created");
+        let mut replacement_endpoint =
+            Endpoint::try_from(replacement_dir.path().to_str().expect("replacement path should be utf8"))
+                .expect("replacement endpoint should parse");
+        replacement_endpoint.set_pool_index(0);
+        replacement_endpoint.set_set_index(0);
+        replacement_endpoint.set_disk_index(disk_count - 1);
+        temp_dirs.push(replacement_dir);
+        endpoints.push(replacement_endpoint.clone());
+        disks.push(None);
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        assert!(
+            set_disks
+                .attach_unformatted_replacement_disk(&replacement_endpoint)
+                .await
+                .expect("a blank local replacement should be admitted")
+        );
+
+        let attached = set_disks.get_disks_internal().await;
+        let replacement = attached[disk_count - 1]
+            .as_ref()
+            .expect("the verified replacement must occupy its exact set slot");
+        assert_eq!(replacement.endpoint(), replacement_endpoint);
+        assert!(
+            !replacement.health_check_enabled_for_test(),
+            "the blank replacement must not start health checks before it receives a format"
+        );
+        assert_eq!(
+            load_format_erasure(replacement, false).await.unwrap_err(),
+            DiskError::UnformattedDisk,
+            "only a still-unformatted replacement may be attached by the fallback"
+        );
+
+        runtime_sources::local_disk_map_handle()
+            .write()
+            .await
+            .remove(&replacement_endpoint.to_string());
+        drop(set_disks);
         drop(temp_dirs);
     }
 

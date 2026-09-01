@@ -642,6 +642,8 @@ fn create_auto_heal_disk_request(
     set_disk_id: String,
     heal_endpoints: Vec<String>,
     priority: Option<HealChannelPriority>,
+    pool_index: Option<usize>,
+    set_index: Option<usize>,
 ) -> HealChannelRequest {
     HealChannelRequest {
         id: Uuid::new_v4().to_string(),
@@ -652,8 +654,8 @@ fn create_auto_heal_disk_request(
         object_version_id: None,
         force_start: false,
         priority: priority.unwrap_or(HealChannelPriority::Low),
-        pool_index: None,
-        set_index: None,
+        pool_index,
+        set_index,
         scan_mode: None,
         remove_corrupted: None,
         recreate_missing: None,
@@ -668,7 +670,7 @@ fn create_auto_heal_disk_request(
 
 /// Submit the legacy generic erasure-set auto-heal request.
 pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPriority>) -> Result<(), String> {
-    send_heal_request(create_auto_heal_disk_request(set_disk_id, Vec::new(), priority)).await
+    send_heal_request(create_auto_heal_disk_request(set_disk_id, Vec::new(), priority, None, None)).await
 }
 
 /// Submit an automatic replacement heal for one known disk endpoint.
@@ -678,9 +680,18 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
 pub async fn send_heal_replacement_disk(
     set_disk_id: String,
     replacement_endpoint: String,
+    pool_index: usize,
+    set_index: usize,
     priority: Option<HealChannelPriority>,
 ) -> Result<(), String> {
-    send_heal_request(create_auto_heal_disk_request(set_disk_id, vec![replacement_endpoint], priority)).await
+    send_heal_request(create_auto_heal_disk_request(
+        set_disk_id,
+        vec![replacement_endpoint],
+        priority,
+        Some(pool_index),
+        Some(set_index),
+    ))
+    .await
 }
 
 #[cfg(test)]
@@ -693,18 +704,24 @@ mod auto_heal_disk_request_tests {
             "pool_2_set_3".to_string(),
             vec!["http://node2:9000/drive3".to_string()],
             Some(HealChannelPriority::Normal),
+            Some(2),
+            Some(3),
         );
 
         assert_eq!(request.disk.as_deref(), Some("pool_2_set_3"));
         assert_eq!(request.heal_endpoints, ["http://node2:9000/drive3"]);
+        assert_eq!(request.pool_index, Some(2));
+        assert_eq!(request.set_index, Some(3));
         assert_eq!(request.source, HealRequestSource::AutoHeal);
     }
 
     #[test]
     fn legacy_auto_heal_disk_request_has_no_replacement_endpoint() {
-        let request = create_auto_heal_disk_request("pool_2_set_3".to_string(), Vec::new(), None);
+        let request = create_auto_heal_disk_request("pool_2_set_3".to_string(), Vec::new(), None, None, None);
 
         assert!(request.heal_endpoints.is_empty());
+        assert_eq!(request.pool_index, None);
+        assert_eq!(request.set_index, None);
         assert_eq!(request.source, HealRequestSource::AutoHeal);
     }
 }
