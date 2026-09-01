@@ -29,6 +29,8 @@ const USAGE_FLOOR_LOAD_FAILED: &str = "usage_floor_load_failed";
 const LEGACY_EMPTY_USAGE_FLOOR_RECOVERY: &str = "legacy_empty_usage_floor";
 const CACHE_CYCLE_AHEAD: &str = "cache_cycle_ahead";
 
+const SCANNER_USAGE_STATE_RESET_MODE_FULL_REBUILD: &str = "full-rebuild";
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ScannerCycleRecoveryStatus {
     /// The immutable primary object whose revision is being guarded.
@@ -48,6 +50,23 @@ pub struct ScannerCycleRecoveryStatus {
     /// Whether the scanner may retry this state automatically.
     pub retryable: bool,
     pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ScannerUsageStateResetResult {
+    pub status: String,
+    pub mode: String,
+    pub usage_state: String,
+    pub leader_epoch: u64,
+    pub next_cycle: u64,
+    pub reset_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ScannerUsageStateResetSlot {
+    path: String,
+    data: Option<Vec<u8>>,
+    revision: DataUsageCacheRevision,
 }
 
 static SCANNER_CYCLE_RECOVERY_STATUS: LazyLock<RwLock<ScannerCycleRecoveryStatus>> = LazyLock::new(|| {
@@ -1288,6 +1307,292 @@ pub async fn reset_scanner_cycle_recovery(ctx: CancellationToken, storeapi: Arc<
     Ok(())
 }
 
+fn scanner_usage_state_reset_paths() -> Vec<String> {
+    vec![
+        DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+        format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
+        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
+        DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str().to_string(),
+    ]
+}
+
+pub(super) async fn read_usage_state_reset_slots(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> Result<Vec<ScannerUsageStateResetSlot>, ScannerError> {
+    let mut slots = Vec::new();
+    for path in scanner_usage_state_reset_paths() {
+        let (data, revision) = read_config_with_revision(storeapi.clone(), &path)
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to inspect scanner usage reset slot {path}: {err}")))?;
+        slots.push(ScannerUsageStateResetSlot { path, data, revision });
+    }
+    Ok(slots)
+}
+
+fn usage_state_reset_floor(slots: &[ScannerUsageStateResetSlot]) -> Result<PersistedUsageFloor, ScannerError> {
+    let mut floor = PersistedUsageFloor::default();
+    for slot in slots {
+        let Some(data) = slot.data.as_deref() else {
+            continue;
+        };
+        let Ok(usage) = serde_json::from_slice::<DataUsageInfo>(data) else {
+            continue;
+        };
+        update_persisted_usage_floor(&mut floor, &usage, &slot.path)?;
+    }
+    Ok(floor)
+}
+
+async fn read_cycle_state_for_usage_reset(
+    storeapi: Arc<ECStore>,
+) -> Result<(CurrentCycle, u64, DataUsageCacheRevision), ScannerError> {
+    let mut reader = match storeapi
+        .get_object_reader(
+            RUSTFS_META_BUCKET,
+            DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+            None,
+            http::HeaderMap::new(),
+            &ScannerObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(reader) => reader,
+        Err(
+            EcstoreError::FileNotFound
+            | EcstoreError::VolumeNotFound
+            | EcstoreError::ObjectNotFound(_, _)
+            | EcstoreError::BucketNotFound(_)
+            | EcstoreError::ConfigNotFound,
+        ) => return Ok((CurrentCycle::default(), 0, DataUsageCacheRevision::Missing)),
+        Err(err) => return Err(ScannerError::Other(format!("failed to inspect scanner cycle state: {err}"))),
+    };
+    if reader.object_info.is_dir || reader.object_info.size < 0 {
+        return Err(ScannerError::Other(
+            "scanner usage reset requires a regular scanner cycle state object".to_string(),
+        ));
+    }
+    let revision = reader
+        .object_info
+        .etag
+        .as_ref()
+        .filter(|etag| !etag.is_empty())
+        .cloned()
+        .map(DataUsageCacheRevision::Etag)
+        .ok_or_else(|| ScannerError::Other("scanner cycle state has no revision".to_string()))?;
+    let data = read_cycle_state_body(&mut reader)
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to read scanner cycle state for usage reset: {err}")))?;
+    let (cycle, leader_epoch) = decode_scanner_cycle_state(&data).map_err(|err| {
+        ScannerError::Other(format!(
+            "scanner usage reset requires a valid scanner cycle state; reset scanner cycle state first: {err}"
+        ))
+    })?;
+    Ok((cycle, leader_epoch, revision))
+}
+
+async fn delete_usage_state_reset_slot(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    slot: &ScannerUsageStateResetSlot,
+    expected_epoch: u64,
+) -> Result<bool, ScannerError> {
+    if matches!(slot.revision, DataUsageCacheRevision::Missing) {
+        return Ok(false);
+    }
+    let delete_result = delete_config_with_publication_admission_for_epoch(
+        storeapi.clone(),
+        RUSTFS_META_BUCKET,
+        &slot.path,
+        ScannerObjectOptions {
+            delete_prefix: false,
+            http_preconditions: Some(slot.revision.preconditions()),
+            ..Default::default()
+        },
+        expected_epoch,
+    )
+    .await;
+    match delete_result {
+        Ok(_) => Ok(true),
+        Err(EcstoreError::FileNotFound | EcstoreError::ConfigNotFound | EcstoreError::ObjectNotFound(_, _)) => Ok(false),
+        Err(EcstoreError::PreconditionFailed) => Err(ScannerError::Other(format!(
+            "scanner usage reset slot changed while deleting {}",
+            slot.path
+        ))),
+        Err(err) if scanner_publication_epoch_changed(&err) => {
+            Err(ScannerError::Other("scanner usage reset deferred by a movement epoch change".to_string()))
+        }
+        Err(err) => Err(ScannerError::Other(format!(
+            "failed to delete scanner usage reset slot {}: {err}",
+            slot.path
+        ))),
+    }
+}
+
+pub(super) async fn reset_scanner_usage_state_slots_for_full_rebuild(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+    slots: &[ScannerUsageStateResetSlot],
+    expected_epoch: u64,
+    leader_epoch: u64,
+) -> Result<Vec<String>, ScannerError> {
+    let mut reset_paths = Vec::new();
+    let primary = slots
+        .iter()
+        .find(|slot| slot.path == DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .ok_or_else(|| ScannerError::Other("scanner usage reset primary slot was not inspected".to_string()))?;
+    let marker = DataUsageInfo {
+        last_update: Some(std::time::SystemTime::now()),
+        scanner_epoch: Some(leader_epoch),
+        usage_snapshot_converged: Some(false),
+        usage_snapshot_bootstrap_pending: true,
+        ..Default::default()
+    };
+    let data = serde_json::to_vec(&marker)
+        .map_err(|err| ScannerError::Other(format!("failed to encode scanner usage reset bootstrap marker: {err}")))?;
+    let save_result = save_config_with_publication_admission_for_epoch(
+        storeapi.clone(),
+        DATA_USAGE_OBJ_NAME_PATH.as_str(),
+        data.clone(),
+        primary.revision.preconditions(),
+        expected_epoch,
+    )
+    .await;
+    if save_result
+        .as_ref()
+        .ok()
+        .and_then(|info| info.etag.as_deref())
+        .is_some_and(|etag| !etag.is_empty())
+    {
+        reset_paths.push(DATA_USAGE_OBJ_NAME_PATH.as_str().to_string());
+    } else {
+        let (persisted, revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+            .await
+            .map_err(|err| ScannerError::Other(format!("failed to reconcile scanner usage reset bootstrap marker: {err}")))?;
+        if persisted.as_deref() != Some(data.as_slice()) || !matches!(revision, DataUsageCacheRevision::Etag(_)) {
+            return Err(ScannerError::Other(match save_result {
+                Ok(_) => "scanner usage reset bootstrap returned no ETag and could not be confirmed".to_string(),
+                Err(err) if scanner_publication_epoch_changed(&err) => {
+                    "scanner usage reset deferred by a movement epoch change".to_string()
+                }
+                Err(EcstoreError::PreconditionFailed) => {
+                    "scanner usage reset primary slot changed before bootstrap publish".to_string()
+                }
+                Err(err) => format!("failed to persist scanner usage reset bootstrap: {err}"),
+            }));
+        }
+        reset_paths.push(DATA_USAGE_OBJ_NAME_PATH.as_str().to_string());
+    }
+
+    for slot in slots.iter().filter(|slot| slot.path != DATA_USAGE_OBJ_NAME_PATH.as_str()) {
+        if delete_usage_state_reset_slot(storeapi.clone(), slot, expected_epoch).await? {
+            reset_paths.push(slot.path.clone());
+        }
+    }
+    invalidate_admin_data_usage_snapshot_cache().await;
+    invalidate_data_usage_snapshot_cache().await;
+    Ok(reset_paths)
+}
+
+pub async fn reset_scanner_usage_state_for_full_rebuild(
+    ctx: CancellationToken,
+    storeapi: Arc<ECStore>,
+) -> Result<ScannerUsageStateResetResult, ScannerError> {
+    let lock = storeapi
+        .new_ns_lock(RUSTFS_META_BUCKET, "leader.lock")
+        .await
+        .map_err(|err| ScannerError::Other(format!("failed to acquire scanner leader lock: {err}")))?;
+    let guard = lock
+        .get_write_lock_quiet(Duration::from_secs(5))
+        .await
+        .map_err(|err| ScannerError::Other(format!("scanner leader lock is busy: {err}")))?;
+    if guard.is_lock_lost() {
+        return Err(ScannerError::Other("scanner leader lock was lost before usage reset".to_string()));
+    }
+    if ctx.is_cancelled() {
+        return Err(ScannerError::Other("scanner usage reset was cancelled".to_string()));
+    }
+
+    let Some(reset_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+        return Err(ScannerError::Other("scanner usage reset is blocked by data movement".to_string()));
+    };
+    let (cycle, cycle_epoch, cycle_revision) = read_cycle_state_for_usage_reset(storeapi.clone()).await?;
+    let slots = read_usage_state_reset_slots(storeapi.clone()).await?;
+    let usage_floor = usage_state_reset_floor(&slots)?;
+    let leader_epoch = cycle_epoch
+        .max(usage_floor.leader_epoch)
+        .checked_add(1)
+        .filter(|epoch| *epoch < u64::MAX)
+        .ok_or_else(|| ScannerError::Other("scanner leader epoch is exhausted".to_string()))?;
+    let rebuilt_cycle = CurrentCycle {
+        next: cycle.next.max(usage_floor.next_cycle),
+        ..Default::default()
+    };
+    let cycle_data = encode_scanner_cycle_state(&rebuilt_cycle, leader_epoch)
+        .map_err(|err| ScannerError::Other(format!("failed to encode scanner cycle state for usage reset: {err}")))?;
+
+    if guard.is_lock_lost() {
+        return Err(ScannerError::Other(
+            "scanner leader lock was lost before fencing usage reset cycle state".to_string(),
+        ));
+    }
+    save_config_with_publication_admission_for_epoch(
+        storeapi.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        cycle_data,
+        cycle_revision.preconditions(),
+        reset_epoch,
+    )
+    .await
+    .map_err(|err| {
+        if scanner_publication_epoch_changed(&err) {
+            ScannerError::Other("scanner usage reset deferred by a movement epoch change".to_string())
+        } else {
+            ScannerError::Other(format!("failed to fence scanner cycle state for usage reset: {err}"))
+        }
+    })?;
+
+    if guard.is_lock_lost() {
+        return Err(ScannerError::Other(
+            "scanner leader lock was lost before publishing usage reset marker".to_string(),
+        ));
+    }
+    let reset_paths =
+        reset_scanner_usage_state_slots_for_full_rebuild(storeapi.clone(), &slots, reset_epoch, leader_epoch).await?;
+    if guard.is_lock_lost() {
+        return Err(ScannerError::Other(
+            "scanner leader lock was lost after publishing usage reset marker".to_string(),
+        ));
+    }
+
+    clear_scanner_usage_floor_failure();
+    clear_legacy_empty_usage_floor_recovery_status();
+    set_scanner_cycle_recovery_status(recovery_status("healthy", None, false));
+    super::notify_scanner_cycle_recovery_wake();
+    info!(
+        target: "rustfs::scanner",
+        event = EVENT_SCANNER_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_RUNTIME,
+        state = "usage_state_reset",
+        mode = SCANNER_USAGE_STATE_RESET_MODE_FULL_REBUILD,
+        leader_epoch,
+        next_cycle = rebuilt_cycle.next,
+        reset_paths = reset_paths.len(),
+        "Scanner usage state reset was published"
+    );
+
+    Ok(ScannerUsageStateResetResult {
+        status: "reset".to_string(),
+        mode: SCANNER_USAGE_STATE_RESET_MODE_FULL_REBUILD.to_string(),
+        usage_state: "bootstrap-pending".to_string(),
+        leader_epoch,
+        next_cycle: rebuilt_cycle.next,
+        reset_paths,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ScannerCycleStateError {
     #[error("failed to encode scanner cycle state: {0}")]
@@ -1681,6 +1986,97 @@ pub(super) async fn persisted_usage_floor(
     Ok(floor)
 }
 
+fn usage_epoch(usage: &DataUsageInfo) -> u64 {
+    usage.scanner_epoch.unwrap_or_default()
+}
+
+fn usage_is_older_than_bootstrap(usage: &DataUsageInfo, bootstrap_epoch: Option<u64>) -> bool {
+    bootstrap_epoch.is_some_and(|epoch| usage_epoch(usage) < epoch)
+}
+
+fn decode_usage_floor_slot(data: &[u8], path: &str) -> Result<DataUsageInfo, ScannerError> {
+    serde_json::from_slice::<DataUsageInfo>(data)
+        .map_err(|err| ScannerError::Other(format!("failed to decode scanner usage floor from {path}: {err}")))
+}
+
+fn update_persisted_usage_floor(floor: &mut PersistedUsageFloor, usage: &DataUsageInfo, path: &str) -> Result<(), ScannerError> {
+    floor.leader_epoch = floor.leader_epoch.max(usage_epoch(usage));
+    if let Some(completed_cycle) = usage.scanner_cycle {
+        let next_cycle = completed_cycle
+            .checked_add(1)
+            .filter(|next| *next < u64::MAX)
+            .ok_or_else(|| ScannerError::Other(format!("persisted scanner usage cycle is exhausted in {path}")))?;
+        floor.next_cycle = floor.next_cycle.max(next_cycle);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BootstrapBackupAction {
+    Resume,
+    StopV2Pair,
+}
+
+struct BootstrapBackupSlot<'a> {
+    data: &'a [u8],
+    usage: &'a DataUsageInfo,
+    backup_path: &'a str,
+    primary_path: &'a str,
+    bootstrap_epoch: Option<u64>,
+    recovered_bootstrap: bool,
+    recovered_primary_companion_epoch: Option<u64>,
+}
+
+struct BootstrapBackupResolution<'a> {
+    floor: &'a mut PersistedUsageFloor,
+    unrecoverable_baseline_path: &'a mut Option<String>,
+}
+
+fn resolve_bootstrap_backup_slot(
+    slot: BootstrapBackupSlot<'_>,
+    resolution: BootstrapBackupResolution<'_>,
+) -> Result<BootstrapBackupAction, ScannerError> {
+    if usage_is_older_than_bootstrap(slot.usage, slot.bootstrap_epoch) {
+        return Ok(BootstrapBackupAction::Resume);
+    }
+    if let Some(primary_epoch) = slot.recovered_primary_companion_epoch {
+        if data_usage_info_has_persisted_baseline_identity(slot.usage) {
+            let backup_epoch = usage_epoch(slot.usage);
+            if backup_epoch >= primary_epoch {
+                update_persisted_usage_floor(resolution.floor, slot.usage, slot.backup_path)?;
+            }
+        } else if let Some(epoch) = legacy_empty_usage_fence_epoch(slot.data, slot.usage) {
+            if let Some(epoch) = epoch {
+                resolution.floor.leader_epoch = resolution.floor.leader_epoch.max(epoch);
+            }
+        } else {
+            resolution
+                .unrecoverable_baseline_path
+                .get_or_insert_with(|| slot.backup_path.to_string());
+        }
+        return Ok(BootstrapBackupAction::Resume);
+    }
+    let compatible_empty_fence = legacy_empty_usage_fence_epoch(slot.data, slot.usage).is_some_and(|epoch| {
+        epoch.is_none_or(|epoch| slot.bootstrap_epoch.is_some_and(|bootstrap_epoch| epoch <= bootstrap_epoch))
+    });
+    if compatible_empty_fence {
+        return Ok(BootstrapBackupAction::Resume);
+    }
+    if slot.recovered_bootstrap && data_usage_info_has_persisted_baseline_identity(slot.usage) {
+        let epoch = usage_epoch(slot.usage);
+        if epoch >= resolution.floor.leader_epoch {
+            update_persisted_usage_floor(resolution.floor, slot.usage, slot.backup_path)?;
+            if slot.primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str() {
+                return Ok(BootstrapBackupAction::StopV2Pair);
+            }
+            return Ok(BootstrapBackupAction::Resume);
+        }
+    }
+    Err(ScannerError::Other(
+        "scanner usage bootstrap conflicts with a persisted backup".to_string(),
+    ))
+}
+
 pub(super) async fn persisted_usage_floor_for_startup(
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     allow_missing_for_bootstrap: bool,
@@ -1704,17 +2100,6 @@ pub(super) async fn persisted_usage_floor_for_startup(
     let mut unrecoverable_baseline_path: Option<String> = None;
     let mut stale_authoritative_path: Option<String> = None;
     let mut legacy_empty_primary: Option<LegacyEmptyUsageFloorPrimary> = None;
-    let update_floor = |floor: &mut PersistedUsageFloor, usage: &DataUsageInfo, path: &str| -> Result<(), ScannerError> {
-        floor.leader_epoch = floor.leader_epoch.max(usage.scanner_epoch.unwrap_or_default());
-        if let Some(completed_cycle) = usage.scanner_cycle {
-            let next_cycle = completed_cycle
-                .checked_add(1)
-                .filter(|next| *next < u64::MAX)
-                .ok_or_else(|| ScannerError::Other(format!("persisted scanner usage cycle is exhausted in {path}")))?;
-            floor.next_cycle = floor.next_cycle.max(next_cycle);
-        }
-        Ok(())
-    };
     for primary_path in [DATA_USAGE_OBJ_NAME_PATH.as_str(), LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()] {
         let backup_path = format!("{primary_path}.bkp");
         let is_v2_path = primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str();
@@ -1722,60 +2107,82 @@ pub(super) async fn persisted_usage_floor_for_startup(
         let mut primary_read_error = None;
         let primary_epoch = match read_config_with_revision(storeapi.clone(), primary_path).await {
             Ok((Some(data), revision)) => {
-                let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
-                    ScannerError::Other(format!("failed to decode scanner usage floor from {primary_path}: {err}"))
-                })?;
-                if data_usage_info_is_bootstrap_pending(&usage) && primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str() {
-                    if bootstrap_pending {
-                        return Err(ScannerError::Other("multiple scanner usage bootstrap markers were found".to_string()));
-                    }
-                    bootstrap_pending = true;
-                    bootstrap_epoch = usage.scanner_epoch;
-                    if let Some((marker, _)) = recovery_marker.as_ref() {
-                        if usage.scanner_epoch.is_none_or(|epoch| epoch < marker.leader_epoch) {
-                            return Err(ScannerError::Other(
-                                "scanner usage bootstrap is older than its recovery marker".to_string(),
-                            ));
-                        }
-                        recovered_bootstrap = true;
-                    }
-                    update_floor(&mut floor, &usage, primary_path)?;
-                    None
-                } else if !data_usage_info_has_persisted_baseline_identity(&usage) {
-                    invalid_baseline_path.get_or_insert_with(|| primary_path.to_string());
-                    invalid_baseline_epoch = invalid_baseline_epoch.max(usage.scanner_epoch);
-                    match legacy_empty_usage_fence_epoch(&data, &usage) {
-                        Some(Some(epoch)) if is_v2_path => {
-                            legacy_empty_primary = Some(LegacyEmptyUsageFloorPrimary { revision, epoch });
-                        }
-                        Some(_) => {}
-                        None => {
-                            unrecoverable_baseline_path.get_or_insert_with(|| primary_path.to_string());
-                        }
-                    }
-                    None
-                } else {
-                    let epoch = usage.scanner_epoch.unwrap_or_default();
-                    if recovered_bootstrap && !is_v2_path {
-                        if epoch < floor.leader_epoch {
-                            unrecoverable_baseline_path.get_or_insert_with(|| primary_path.to_string());
-                        } else {
-                            update_floor(&mut floor, &usage, primary_path)?;
-                            recovered_primary_companion_epoch = Some(epoch);
-                        }
+                let usage = match decode_usage_floor_slot(&data, primary_path) {
+                    Ok(usage) => Some(usage),
+                    Err(err) if bootstrap_pending && !is_v2_path => {
+                        warn!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            state = "usage_reset_cleanup_deferred",
+                            path = %primary_path,
+                            error = %err,
+                            "Scanner usage reset ignored a stale legacy usage primary after bootstrap marker"
+                        );
                         None
-                    // A legacy snapshot may be structurally valid but older
-                    // than an incomplete v2 snapshot left by a newer leader.
-                    // Do not let that candidate regress the startup floor.
-                    } else if invalid_baseline_epoch.is_some_and(|fenced_epoch| epoch < fenced_epoch)
-                        && (!is_v2_path || recovery_marker.is_some())
-                    {
-                        stale_authoritative_path.get_or_insert_with(|| primary_path.to_string());
+                    }
+                    Err(err) => {
+                        return Err(err);
+                    }
+                };
+                if let Some(usage) = usage {
+                    if data_usage_info_is_bootstrap_pending(&usage) && primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str() {
+                        if bootstrap_pending {
+                            return Err(ScannerError::Other("multiple scanner usage bootstrap markers were found".to_string()));
+                        }
+                        bootstrap_pending = true;
+                        bootstrap_epoch = usage.scanner_epoch;
+                        if let Some((marker, _)) = recovery_marker.as_ref() {
+                            if usage.scanner_epoch.is_none_or(|epoch| epoch < marker.leader_epoch) {
+                                return Err(ScannerError::Other(
+                                    "scanner usage bootstrap is older than its recovery marker".to_string(),
+                                ));
+                            }
+                            recovered_bootstrap = true;
+                        }
+                        update_persisted_usage_floor(&mut floor, &usage, primary_path)?;
+                        None
+                    } else if bootstrap_pending && !is_v2_path && usage_is_older_than_bootstrap(&usage, bootstrap_epoch) {
+                        None
+                    } else if !data_usage_info_has_persisted_baseline_identity(&usage) {
+                        invalid_baseline_path.get_or_insert_with(|| primary_path.to_string());
+                        invalid_baseline_epoch = invalid_baseline_epoch.max(usage.scanner_epoch);
+                        match legacy_empty_usage_fence_epoch(&data, &usage) {
+                            Some(Some(epoch)) if is_v2_path => {
+                                legacy_empty_primary = Some(LegacyEmptyUsageFloorPrimary { revision, epoch });
+                            }
+                            Some(_) => {}
+                            None => {
+                                unrecoverable_baseline_path.get_or_insert_with(|| primary_path.to_string());
+                            }
+                        }
                         None
                     } else {
-                        update_floor(&mut floor, &usage, primary_path)?;
-                        Some(epoch)
+                        let epoch = usage_epoch(&usage);
+                        if recovered_bootstrap && !is_v2_path {
+                            if epoch < floor.leader_epoch {
+                                unrecoverable_baseline_path.get_or_insert_with(|| primary_path.to_string());
+                            } else {
+                                update_persisted_usage_floor(&mut floor, &usage, primary_path)?;
+                                recovered_primary_companion_epoch = Some(epoch);
+                            }
+                            None
+                        // A legacy snapshot may be structurally valid but older
+                        // than an incomplete v2 snapshot left by a newer leader.
+                        // Do not let that candidate regress the startup floor.
+                        } else if invalid_baseline_epoch.is_some_and(|fenced_epoch| epoch < fenced_epoch)
+                            && (!is_v2_path || recovery_marker.is_some())
+                        {
+                            stale_authoritative_path.get_or_insert_with(|| primary_path.to_string());
+                            None
+                        } else {
+                            update_persisted_usage_floor(&mut floor, &usage, primary_path)?;
+                            Some(epoch)
+                        }
                     }
+                } else {
+                    None
                 }
             }
             Ok((None, _)) => None,
@@ -1794,44 +2201,44 @@ pub(super) async fn persisted_usage_floor_for_startup(
         let mut any_found = primary_epoch.is_some();
         match read_config_with_revision(storeapi.clone(), &backup_path).await {
             Ok((Some(data), _)) => {
-                let usage = serde_json::from_slice::<DataUsageInfo>(&data).map_err(|err| {
-                    ScannerError::Other(format!("failed to decode scanner usage floor from {backup_path}: {err}"))
-                })?;
+                let usage = match decode_usage_floor_slot(&data, &backup_path) {
+                    Ok(usage) => usage,
+                    Err(err) if bootstrap_pending => {
+                        warn!(
+                            target: "rustfs::scanner",
+                            event = EVENT_SCANNER_PERSIST_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_RUNTIME,
+                            state = "usage_reset_cleanup_deferred",
+                            path = %backup_path,
+                            error = %err,
+                            "Scanner usage reset ignored a stale usage backup after bootstrap marker"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err);
+                    }
+                };
                 if bootstrap_pending {
-                    if let Some(primary_epoch) = recovered_primary_companion_epoch {
-                        if data_usage_info_has_persisted_baseline_identity(&usage) {
-                            let backup_epoch = usage.scanner_epoch.unwrap_or_default();
-                            if backup_epoch >= primary_epoch {
-                                update_floor(&mut floor, &usage, &backup_path)?;
-                            }
-                        } else if let Some(epoch) = legacy_empty_usage_fence_epoch(&data, &usage) {
-                            if let Some(epoch) = epoch {
-                                floor.leader_epoch = floor.leader_epoch.max(epoch);
-                            }
-                        } else {
-                            unrecoverable_baseline_path.get_or_insert_with(|| backup_path.clone());
-                        }
-                        continue;
+                    match resolve_bootstrap_backup_slot(
+                        BootstrapBackupSlot {
+                            data: &data,
+                            usage: &usage,
+                            backup_path: &backup_path,
+                            primary_path,
+                            bootstrap_epoch,
+                            recovered_bootstrap,
+                            recovered_primary_companion_epoch,
+                        },
+                        BootstrapBackupResolution {
+                            floor: &mut floor,
+                            unrecoverable_baseline_path: &mut unrecoverable_baseline_path,
+                        },
+                    )? {
+                        BootstrapBackupAction::Resume => continue,
+                        BootstrapBackupAction::StopV2Pair => break,
                     }
-                    let compatible_empty_fence = legacy_empty_usage_fence_epoch(&data, &usage).is_some_and(|epoch| {
-                        epoch.is_none_or(|epoch| bootstrap_epoch.is_some_and(|bootstrap_epoch| epoch <= bootstrap_epoch))
-                    });
-                    if compatible_empty_fence {
-                        continue;
-                    }
-                    if recovered_bootstrap && data_usage_info_has_persisted_baseline_identity(&usage) {
-                        let epoch = usage.scanner_epoch.unwrap_or_default();
-                        if epoch >= floor.leader_epoch {
-                            update_floor(&mut floor, &usage, &backup_path)?;
-                            if primary_path == DATA_USAGE_OBJ_NAME_PATH.as_str() {
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                    return Err(ScannerError::Other(
-                        "scanner usage bootstrap conflicts with a persisted backup".to_string(),
-                    ));
                 }
                 if !data_usage_info_has_persisted_baseline_identity(&usage) {
                     invalid_baseline_path.get_or_insert_with(|| backup_path.clone());
@@ -1843,14 +2250,14 @@ pub(super) async fn persisted_usage_floor_for_startup(
                     // missing-state bootstrap.  Continue to a legacy pair in
                     // case it contains a complete, fenced snapshot.
                 } else {
-                    let backup_epoch = usage.scanner_epoch.unwrap_or_default();
+                    let backup_epoch = usage_epoch(&usage);
                     // A backup write from an older leader may complete after the
                     // primary epoch has been fenced. It must not advance the startup
                     // floor unless its epoch is at least as new as the primary.
                     if primary_epoch.is_none_or(|epoch| backup_epoch >= epoch)
                         && invalid_baseline_epoch.is_none_or(|epoch| backup_epoch >= epoch)
                     {
-                        update_floor(&mut floor, &usage, &backup_path)?;
+                        update_persisted_usage_floor(&mut floor, &usage, &backup_path)?;
                         any_found = true;
                     } else {
                         stale_authoritative_path.get_or_insert_with(|| backup_path.clone());

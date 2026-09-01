@@ -187,6 +187,57 @@ catch_up_estimate.discovered_expiry_items
 catch_up_estimate.discovered_transition_items
 ```
 
+## Usage State Reset
+
+The supported break-glass route for rebuilding scanner usage state is:
+
+```text
+POST /v3/scanner/usage-state/reset
+{"mode":"full-rebuild"}
+```
+
+The request must be authenticated with an admin identity that has
+`ConfigUpdateAdminAction`. Use it only after confirming the scanner status shows
+a usage-floor load failure, a conflicting persisted usage floor, or an operator
+decision to discard the durable usage baseline and rebuild it from a full
+scanner pass.
+
+The reset does not delete metadata files from disk by hand and does not publish
+an authoritative zero-usage snapshot. It holds the scanner leader lock, fences
+the operation with the storage-owned publication epoch, CAS-publishes a v2
+`bootstrap-pending` marker in the primary usage slot, then clears stale backup,
+legacy, and observed usage slots by object revision. The next scanner
+leadership claim binds that marker to a fresh epoch and the next complete
+scanner cycle replaces it with authoritative usage.
+
+The JSON response is machine-readable:
+
+```json
+{
+  "status": "reset",
+  "mode": "full-rebuild",
+  "usage_state": "bootstrap-pending",
+  "leader_epoch": 9,
+  "next_cycle": 42,
+  "reset_paths": [
+    "buckets/.usage.v2.json",
+    "buckets/.usage.v2.json.bkp",
+    "buckets/.usage.json",
+    "buckets/.usage.json.bkp",
+    "buckets/.usage.observed.json"
+  ]
+}
+```
+
+If the response is an error mentioning data movement, wait for decommission or
+rebalance to leave the scanner metadata path and retry. If it reports that the
+scanner cycle state is invalid, run the cycle-state recovery reset first:
+
+```text
+POST /v3/scanner/cycle-state/reset
+{"mode":"full-rescan"}
+```
+
 ## Data Movement Pauses
 
 RustFS currently uses a `global_pause` policy while pool decommission or
