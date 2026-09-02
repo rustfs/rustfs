@@ -116,27 +116,38 @@ pub const REPLICATION_MAX_SINGLE_PUT_SIZE: i64 = 5 * 1024 * 1024 * 1024;
 
 /// Reject a single-`PutObject` replication transfer the target can never accept.
 ///
-/// Replication mirrors the object's *source-side storage shape*: an object
-/// written to the source with one `PutObject` replicates with one `PutObject`
-/// whatever its size, and a multipart object replays the source's own part
-/// layout. So a source object larger than [`REPLICATION_MAX_SINGLE_PUT_SIZE`]
-/// that was not written as multipart can never reach a generic S3 target — the
-/// remote rejects it with `EntityTooLarge`, but only after the whole body has
-/// been streamed to it (rustfs#6825).
+/// Replication mirrors the object's *source-side storage shape*, which is
+/// read from the ETag: a multipart upload carries a `-<part count>` suffix,
+/// a single `PutObject` does not. A single-`PutObject` object replicates with
+/// one `PutObject` whatever its size, and a multipart object replays the
+/// source's own part layout. So a source object larger than
+/// [`REPLICATION_MAX_SINGLE_PUT_SIZE`] whose ETag has no part-count suffix can
+/// never reach a generic S3 target — the remote rejects it with
+/// `EntityTooLarge`, but only after the whole body has been streamed to it
+/// (rustfs#6825).
 ///
 /// Returning the failure up front turns an unbounded wasted transfer plus an
-/// opaque remote error into a stated, diagnosable limit. RustFS deliberately
-/// does not re-chunk such an object into multipart on the replication side:
-/// the target's part layout is the source's, and rewriting it would break the
-/// ETag/part identity that heal and delete convergence address.
-pub fn replication_single_put_size_error(is_multipart: bool, transfer_size: i64) -> Option<String> {
+/// opaque remote error into a stated, diagnosable limit. The message quotes
+/// the ETag the decision was made from rather than asserting a conclusion
+/// about how the object was uploaded: an operator reading the line can check
+/// the evidence against the object's own listing, and a transport-selection
+/// bug upstream of this guard shows up as a visible contradiction instead of
+/// as advice to re-upload an object that was already multipart.
+///
+/// RustFS deliberately does not re-chunk such an object into multipart on the
+/// replication side: the target's part layout is the source's, and rewriting
+/// it would break the ETag/part identity that heal and delete convergence
+/// address.
+pub fn replication_single_put_size_error(is_multipart: bool, transfer_size: i64, etag: Option<&str>) -> Option<String> {
     if is_multipart || transfer_size <= REPLICATION_MAX_SINGLE_PUT_SIZE {
         return None;
     }
+    let etag = etag.filter(|value| !value.is_empty()).unwrap_or("<none>");
     Some(format!(
-        "object of {transfer_size} bytes was not written as multipart on the source and exceeds the \
-         {REPLICATION_MAX_SINGLE_PUT_SIZE} byte single-PutObject limit of an S3 target; \
-         re-upload it with multipart to make it replicable"
+        "object of {transfer_size} bytes exceeds the {REPLICATION_MAX_SINGLE_PUT_SIZE} byte single-PutObject limit \
+         of an S3 target; its ETag {etag} has no part-count suffix, so replication uses a single PutObject and \
+         does not re-chunk; if the object is in fact multipart this is a transport-selection defect, otherwise \
+         re-upload it as a multipart upload to make it replicable"
     ))
 }
 
@@ -264,7 +275,7 @@ mod tests {
             REPLICATION_MAX_SINGLE_PUT_SIZE,
         ] {
             assert_eq!(
-                replication_single_put_size_error(false, size),
+                replication_single_put_size_error(false, size, Some("0123456789abcdef0123456789abcdef")),
                 None,
                 "single PUT of {size} bytes is within the S3 limit and must not be rejected"
             );
@@ -274,10 +285,11 @@ mod tests {
     #[test]
     fn single_put_size_guard_rejects_an_oversized_single_put() {
         let size = REPLICATION_MAX_SINGLE_PUT_SIZE + 1;
-        let err = replication_single_put_size_error(false, size).expect("oversized single PUT must be rejected");
+        let etag = "0123456789abcdef0123456789abcdef";
+        let err = replication_single_put_size_error(false, size, Some(etag)).expect("oversized single PUT must be rejected");
 
         // The message is the operator's diagnosis: it has to name the actual
-        // size, the limit, and the reason the object is on this route at all.
+        // size, the limit, and the remedy.
         assert!(err.contains(&size.to_string()), "message must name the object size: {err}");
         assert!(
             err.contains(&REPLICATION_MAX_SINGLE_PUT_SIZE.to_string()),
@@ -287,10 +299,50 @@ mod tests {
     }
 
     #[test]
+    fn single_put_size_guard_quotes_the_etag_it_decided_from() {
+        // rustfs#6825, second report: a 768-part object was misrouted to the
+        // single-PUT path and this guard told the operator it "was not written
+        // as multipart" and to re-upload it. The message must carry the
+        // evidence the decision came from, so a misroute reads as a visible
+        // contradiction against the object's own listing, not as advice.
+        let etag = "767e7a8379c0f62c39e0ceeea0e13de9";
+        let err = replication_single_put_size_error(false, REPLICATION_MAX_SINGLE_PUT_SIZE + 1, Some(etag))
+            .expect("oversized single PUT must be rejected");
+
+        assert!(err.contains(etag), "message must quote the ETag: {err}");
+        assert!(
+            err.contains("part-count suffix"),
+            "message must say what about the ETag was read, not assert an upload method: {err}"
+        );
+        assert!(
+            !err.contains("was not written as multipart"),
+            "message must not assert how the object was uploaded: {err}"
+        );
+        assert!(
+            err.contains("transport-selection defect"),
+            "message must tell the operator what a contradiction with the listing means: {err}"
+        );
+
+        let missing = replication_single_put_size_error(false, REPLICATION_MAX_SINGLE_PUT_SIZE + 1, None)
+            .expect("oversized single PUT must be rejected");
+        assert!(missing.contains("<none>"), "a missing ETag must be stated, not hidden: {missing}");
+        let empty = replication_single_put_size_error(false, REPLICATION_MAX_SINGLE_PUT_SIZE + 1, Some(""))
+            .expect("oversized single PUT must be rejected");
+        assert!(empty.contains("<none>"), "an empty ETag must be stated, not hidden: {empty}");
+    }
+
+    #[test]
     fn single_put_size_guard_never_rejects_the_multipart_route() {
         // Multipart replays the source part layout, so object size alone says
         // nothing about whether the target will accept it; the per-part limits
         // are the target's to enforce.
-        assert_eq!(replication_single_put_size_error(true, REPLICATION_MAX_SINGLE_PUT_SIZE * 1024), None);
+        assert_eq!(
+            replication_single_put_size_error(
+                true,
+                REPLICATION_MAX_SINGLE_PUT_SIZE * 1024,
+                Some("0123456789abcdef0123456789abcdef-768")
+            ),
+            None
+        );
     }
 }

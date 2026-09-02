@@ -3491,7 +3491,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
-        if let Some(reason) = replication_single_put_size_error(is_multipart, transfer_size) {
+        if let Some(reason) = replication_single_put_size_error(is_multipart, transfer_size, object_info.etag.as_deref()) {
             drop(gr);
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(reason.clone());
@@ -4189,7 +4189,8 @@ async fn replicate_all_payload_to_target<S: ReplicationObjectIO>(
     // Fail before streaming a body the target is required to reject: an S3
     // PutObject caps at 5 GiB, and this route is chosen by the source object's
     // storage shape rather than its size (rustfs#6825).
-    if let Some(reason) = replication_single_put_size_error(ctx.is_multipart, ctx.transfer_size) {
+    if let Some(reason) = replication_single_put_size_error(ctx.is_multipart, ctx.transfer_size, ctx.object_info.etag.as_deref())
+    {
         drop(gr);
         return Some(std::io::Error::other(reason));
     }
