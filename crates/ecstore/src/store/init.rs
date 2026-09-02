@@ -10266,6 +10266,29 @@ mod tests {
             .expect("the active decommission should own the checkpoint target");
         assert_eq!(targets.len(), 1);
         let target = targets[0].clone();
+        let consumed_before_checkpoint = store.pool_meta.read().await.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("checkpoint shutdown capacity reservation should exist")
+            .consumed_target_physical_bytes;
+        let precommit_error = store
+            .run_decommission_capacity_non_growing_replacement_with_capacity_lease(
+                target.target_pool_index,
+                Some(target.capacity_owner),
+                Some(aborting_data.len()),
+                |_| async { Err::<(), Error>(Error::other("injected checkpoint failure before commit")) },
+            )
+            .await
+            .expect_err("the first checkpoint attempt should fail before writing its target")
+            .to_string();
+        assert!(precommit_error.contains("injected checkpoint failure before commit"));
+        assert!(
+            store
+                .has_decommission_capacity_temporary_mutation_state(target.target_pool_index, target.capacity_owner)
+                .await,
+            "a failed checkpoint attempt must retain exact retry state"
+        );
         let barrier = crate::set_disk::PutObjectCommitBarrier::install(
             RUSTFS_META_BUCKET,
             &manifest_name,
@@ -10316,6 +10339,27 @@ mod tests {
                 .await,
             "the admitted target PUT must drain its capacity transaction before releasing the recovery fences"
         );
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("checkpoint shutdown capacity reservation should remain active");
+            let capacity_target = reservation
+                .targets
+                .iter()
+                .find(|candidate| candidate.pool_index == target.target_pool_index)
+                .expect("checkpoint shutdown capacity target should remain allocated");
+            assert_eq!(
+                reservation.consumed_target_physical_bytes, consumed_before_checkpoint,
+                "a non-growing checkpoint replacement must not consume durable migration capacity"
+            );
+            assert_eq!(reservation.pending_target_physical_bytes, 0);
+            assert_eq!(reservation.inflight_target_physical_bytes, 0);
+            assert_eq!(capacity_target.pending_physical_bytes, 0);
+            assert!(capacity_target.temporary_mutations.is_empty());
+        }
         drop(barrier);
         let mut reloaded_pool_meta = PoolMeta::default();
         reloaded_pool_meta
