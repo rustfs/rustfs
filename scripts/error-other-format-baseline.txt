@@ -5,7 +5,6 @@
 # scripts/check_error_other_format_ratchet.sh --update-baseline. A PR that
 # raises a count or adds a file is introducing a new quorum-bucketing hazard
 # and must carry an explicit exemption rationale in its description.
-2|crates/ecstore/src/bucket/bucket_target_sys.rs
 4|crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs
 3|crates/ecstore/src/bucket/lifecycle/durable_namespace.rs
 2|crates/ecstore/src/bucket/lifecycle/metadata_boundary.rs
