@@ -21,7 +21,7 @@ use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{load_bucket_metadata_parse, load_bucket_metadata_parse_with_presence};
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::RUSTFS_META_BUCKET;
-use crate::error::{Error, Result, is_err_bucket_not_found};
+use crate::error::{Error, Result, is_err_bucket_not_found, is_err_strict_volume_not_found};
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
@@ -659,13 +659,12 @@ async fn acquire_config_write_guard_for_incarnation(
             async {
                 match metadata_sys
                     .api
-                    .peer_sys
-                    .get_bucket_info(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                    .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                     .await
                 {
                     Ok(_) => Ok(()),
-                    Err(crate::disk::error::Error::VolumeNotFound) => Err(Error::BucketNotFound(bucket.to_string())),
-                    Err(err) => Err(err.into()),
+                    Err(err) if is_err_strict_volume_not_found(&err) => Err(Error::BucketNotFound(bucket.to_string())),
+                    Err(err) => Err(err),
                 }
             },
         ),
@@ -1274,7 +1273,6 @@ pub struct BucketMetadataSys {
     /// name floods while avoiding repeated namespace and erasure reads.
     missing_buckets: moka::future::Cache<String, ()>,
     api: Arc<ECStore>,
-    initialized: Arc<RwLock<bool>>,
 }
 
 impl BucketMetadataSys {
@@ -1303,7 +1301,6 @@ impl BucketMetadataSys {
                 .time_to_live(MISSING_BUCKET_TTL)
                 .build(),
             api,
-            initialized: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -1364,13 +1361,12 @@ impl BucketMetadataSys {
         await_bucket_namespace_operation(Some(namespace_guard), bucket, operation, async {
             match self
                 .api
-                .peer_sys
-                .get_bucket_info(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                 .await
             {
                 Ok(_) => Ok(true),
-                Err(crate::disk::error::Error::VolumeNotFound) => Ok(false),
-                Err(err) => Err(err.into()),
+                Err(Error::VolumeNotFound) => Ok(false),
+                Err(err) => Err(err),
             }
         })
         .await
@@ -1380,9 +1376,15 @@ impl BucketMetadataSys {
         let _ = self.init_internal(buckets).await;
     }
     async fn init_internal(&self, buckets: Vec<String>) -> Result<()> {
-        let count = runtime_sources::endpoint_erasure_set_count()
-            .map(|count| count * 10)
-            .ok_or_else(|| Error::other("endpoint pools not initialized"))?;
+        let count = self
+            .api
+            .pools
+            .iter()
+            .map(|pool| pool.disk_set.len())
+            .sum::<usize>()
+            .checked_mul(10)
+            .filter(|count| *count != 0)
+            .ok_or_else(|| Error::other("bucket metadata store has no erasure sets"))?;
 
         let mut failed_buckets: HashSet<String> = HashSet::new();
         let mut buckets = buckets.as_slice();
@@ -1399,9 +1401,6 @@ impl BucketMetadataSys {
 
             buckets = &buckets[count..]
         }
-
-        let mut initialized = self.initialized.write().await;
-        *initialized = true;
 
         Ok(())
     }
@@ -1479,14 +1478,6 @@ impl BucketMetadataSys {
         expected: Option<&Arc<BucketMetadata>>,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
-        await_bucket_namespace_operation(
-            Some(namespace_guard),
-            bucket,
-            "bucket metadata heal",
-            self.api.heal_bucket(bucket, &HealOpts::default()),
-        )
-        .await?;
-
         if !self
             .bucket_exists(bucket, namespace_guard, "bucket metadata existence check")
             .await?
@@ -1505,6 +1496,20 @@ impl BucketMetadataSys {
             }
             return Ok(());
         }
+
+        await_bucket_namespace_operation(
+            Some(namespace_guard),
+            bucket,
+            "bucket metadata heal",
+            self.api.heal_bucket(
+                bucket,
+                &HealOpts {
+                    recreate: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await?;
 
         let (bm, persisted) = await_bucket_namespace_operation(
             Some(namespace_guard),
@@ -1887,23 +1892,13 @@ impl BucketMetadataSys {
                     "lazy metadata IO must start while the bucket namespace read lock is held"
                 );
             }
-            let (bm, persisted) = match await_bucket_namespace_operation(
+            let (bm, persisted) = await_bucket_namespace_operation(
                 Some(&guard),
                 bucket,
                 "lazy bucket metadata load",
                 Box::pin(load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true)),
             )
-            .await
-            {
-                Ok(res) => res,
-                Err(err) => {
-                    return if *self.initialized.read().await {
-                        Err(Error::other("errBucketMetadataNotInitialized"))
-                    } else {
-                        Err(err)
-                    };
-                }
-            };
+            .await?;
 
             let bm = Arc::new(bm);
 
@@ -1914,11 +1909,9 @@ impl BucketMetadataSys {
                     "lazy bucket metadata existence check",
                     Box::pin(async {
                         self.api
-                            .peer_sys
-                            .get_bucket_info(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                            .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                             .await
                             .map(|_| ())
-                            .map_err(Into::into)
                     }),
                 )
                 .await?;
@@ -2197,10 +2190,8 @@ impl BucketMetadataSys {
             "legacy bucket metadata existence check",
             async {
                 self.api
-                    .peer_sys
-                    .get_bucket_info(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                    .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                     .await
-                    .map_err(crate::error::StorageError::from)
             },
         )
         .await
@@ -2302,10 +2293,8 @@ impl BucketMetadataSys {
             "bucket metadata snapshot existence check",
             async {
                 self.api
-                    .peer_sys
-                    .get_bucket_info(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                    .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                     .await
-                    .map_err(crate::error::StorageError::from)
             },
         )
         .await

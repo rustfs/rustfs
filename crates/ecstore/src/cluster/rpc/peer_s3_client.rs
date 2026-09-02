@@ -190,7 +190,7 @@ fn install_heal_bucket_pre_mutation_barrier() -> Arc<DeleteBucketEmptyScanBarrie
 }
 
 #[cfg(test)]
-async fn pause_after_delete_bucket_empty_scan() {
+pub(crate) async fn pause_after_delete_bucket_empty_scan() {
     let barrier = DELETE_BUCKET_EMPTY_SCAN_BARRIER
         .lock()
         .expect("empty scan barrier lock should not be poisoned")
