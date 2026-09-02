@@ -12,7 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! On-demand migration (ODM): serve and back-fill objects from an external
-//! S3-compatible source bucket.
+//! On-Demand Migration (ODM): a bucket can name an external S3-compatible
+//! source bucket; GET misses are served from that source and backfilled
+//! locally. This module owns the bucket-level configuration model
+//! (`on-demand-migration.json` in the bucket metadata file); the runtime is
+//! layered on top of it by later tasks (rustfs/backlog#2147).
 
+pub mod config;
 pub mod source_client;
+
+pub use config::{
+    ConfigPublishHook, FilterConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK, ON_DEMAND_MIGRATION_CONFIG_VERSION,
+    OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy, SourceConfig,
+    SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
+};
