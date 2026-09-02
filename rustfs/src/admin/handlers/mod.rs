@@ -49,6 +49,7 @@ mod notify_runtime_access;
 pub mod object_data_cache;
 pub mod object_zip_download;
 pub mod oidc;
+pub mod on_demand_migration;
 pub mod plugins_catalog;
 pub mod plugins_instances;
 pub mod policies;
@@ -129,6 +130,10 @@ mod tests {
         let _list_extension_instances = extensions::ListExtensionInstancesHandler {};
         let _get_plugin_catalog = plugins_catalog::GetPluginCatalogHandler {};
         let _create_object_zip_download = object_zip_download::CreateObjectZipDownloadHandler {};
+        let _set_on_demand_migration = on_demand_migration::SetBucketOnDemandMigrationHandler {};
+        let _get_on_demand_migration = on_demand_migration::GetBucketOnDemandMigrationHandler {};
+        let _delete_on_demand_migration = on_demand_migration::DeleteBucketOnDemandMigrationHandler {};
+        let _on_demand_migration_status = on_demand_migration::GetBucketOnDemandMigrationStatusHandler {};
         let _list_plugin_instances = plugins_instances::ListPluginInstancesHandler {};
         let _get_plugin_instance = plugins_instances::GetPluginInstanceHandler {};
         let _put_plugin_instance = plugins_instances::PutPluginInstanceHandler {};

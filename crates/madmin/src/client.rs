@@ -412,7 +412,7 @@ impl AdminClient {
         self.execute(request).await
     }
 
-    fn url_for(&self, path: &str, query: &[(&str, String)]) -> Result<reqwest::Url, AdminClientError> {
+    pub(crate) fn url_for(&self, path: &str, query: &[(&str, String)]) -> Result<reqwest::Url, AdminClientError> {
         let mut url = self
             .endpoint
             .join(&format!("{}{}", self.api_prefix.trim_end_matches('/'), path))
@@ -430,7 +430,7 @@ impl AdminClient {
     /// then hand the signed headers to the HTTP client. The signature covers
     /// method, path, query, and an unsigned-payload marker — the same shape
     /// RustFS itself sends for peer admin calls.
-    async fn sign_and_build(
+    pub(crate) async fn sign_and_build(
         &self,
         method: Method,
         url: reqwest::Url,
@@ -479,7 +479,7 @@ impl AdminClient {
         Ok(request)
     }
 
-    async fn execute<T: for<'de> Deserialize<'de>>(&self, request: reqwest::Request) -> Result<T, AdminClientError> {
+    pub(crate) async fn execute<T: for<'de> Deserialize<'de>>(&self, request: reqwest::Request) -> Result<T, AdminClientError> {
         let response = self.http.execute(request).await?;
         let status = response.status();
         let bytes = response.bytes().await?;
@@ -492,6 +492,20 @@ impl AdminClient {
         serde_json::from_slice(&bytes).map_err(|err| AdminClientError::Decode {
             message: err.to_string(),
         })
+    }
+
+    /// Execute a request whose success answer carries no body (`204`).
+    pub(crate) async fn execute_no_content(&self, request: reqwest::Request) -> Result<(), AdminClientError> {
+        let response = self.http.execute(request).await?;
+        let status = response.status();
+        if !status.is_success() {
+            let bytes = response.bytes().await?;
+            return Err(AdminClientError::HttpStatus {
+                status: status.as_u16(),
+                body: String::from_utf8_lossy(&bytes).into_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -518,7 +532,7 @@ fn heal_path(bucket: Option<&str>, prefix: Option<&str>) -> String {
 
 /// Encode a single path segment (slashes are content, not separators, inside
 /// bucket/prefix path params).
-fn percent_encode_path_segment(segment: &str) -> String {
+pub(crate) fn percent_encode_path_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         match byte {
@@ -535,8 +549,8 @@ mod tests {
         AdminClient, AdminClientError, BackgroundHealStatus, HealOpts, HealScanMode, HealStartSuccess, HealTaskStatus,
         ScannerStatus, heal_path, percent_encode_path_segment,
     };
+    use crate::test_support::TestServer;
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
 
     #[test]
     fn heal_paths_cover_root_bucket_and_prefix() {
@@ -733,135 +747,5 @@ mod tests {
         let server = TestServer::spawn("not json", 200).await;
         let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
         assert!(matches!(client.scanner_status().await.unwrap_err(), AdminClientError::Decode { .. }));
-    }
-
-    /// One recorded request, parsed off the wire with the minimum needed for
-    /// assertions: method, path, query, headers, body.
-    #[derive(Debug, Clone)]
-    struct RecordedRequest {
-        method: String,
-        path: String,
-        query: String,
-        headers: Vec<(String, String)>,
-        body: String,
-    }
-
-    impl RecordedRequest {
-        fn header(&self, name: &str) -> Option<String> {
-            self.headers
-                .iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.clone())
-        }
-    }
-
-    /// Minimal HTTP/1.1 server: one canned response per connection, every
-    /// request recorded behind an `Arc<Mutex>`. Deliberately dependency-free —
-    /// the assertions only need the raw request bytes.
-    struct TestServer {
-        addr: std::net::SocketAddr,
-        requests: Arc<Mutex<Vec<RecordedRequest>>>,
-    }
-
-    impl TestServer {
-        async fn spawn(response_body: &'static str, status: u16) -> Self {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind ephemeral port");
-            let addr = listener.local_addr().expect("local addr");
-            let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
-
-            let recorded = requests.clone();
-            tokio::spawn(async move {
-                let reason = if status == 200 { "OK" } else { "Forbidden" };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
-                    response_body.len()
-                );
-                // Each request is a fresh connection (connection: close); a
-                // bounded loop serves every call a test makes while letting
-                // the task exit instead of lingering for the whole process.
-                for _ in 0..16 {
-                    let Ok((mut stream, _)) = listener.accept().await else {
-                        break;
-                    };
-                    let mut buffer = Vec::with_capacity(2048);
-                    let mut chunk = [0u8; 2048];
-                    // Read headers plus content-length body, or stop on close.
-                    loop {
-                        if let Some(end) = find_header_end(&buffer) {
-                            let content_length = extract_content_length(&buffer[..end]);
-                            if buffer.len() >= end + content_length {
-                                break;
-                            }
-                        }
-                        let n = match stream.read(&mut chunk).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => n,
-                        };
-                        buffer.extend_from_slice(&chunk[..n]);
-                        if buffer.len() > 64 * 1024 {
-                            break;
-                        }
-                    }
-                    if let Some(request) = parse_request(&buffer) {
-                        recorded.lock().expect("recorded lock").push(request);
-                    }
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                }
-            });
-
-            Self { addr, requests }
-        }
-
-        fn recorded(&self) -> RecordedRequest {
-            self.requests
-                .lock()
-                .expect("recorded lock")
-                .last()
-                .cloned()
-                .expect("the client call must have produced one recorded request")
-        }
-    }
-
-    fn find_header_end(buffer: &[u8]) -> Option<usize> {
-        buffer.windows(4).position(|window| window == b"\r\n\r\n").map(|pos| pos + 4)
-    }
-
-    fn extract_content_length(headers: &[u8]) -> usize {
-        let text = String::from_utf8_lossy(headers).to_ascii_lowercase();
-        text.lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0)
-    }
-
-    fn parse_request(raw: &[u8]) -> Option<RecordedRequest> {
-        let end = find_header_end(raw)?;
-        let head = String::from_utf8_lossy(&raw[..end]);
-        let body = String::from_utf8_lossy(&raw[end..]).into_owned();
-        let mut lines = head.lines();
-        let request_line = lines.next()?;
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next()?.to_string();
-        let target = parts.next()?.to_string();
-        let (path, query) = match target.split_once('?') {
-            Some((path, query)) => (path.to_string(), query.to_string()),
-            None => (target, String::new()),
-        };
-        let headers = lines
-            .filter_map(|line| line.split_once(':'))
-            .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
-            .collect();
-        Some(RecordedRequest {
-            method,
-            path,
-            query,
-            headers,
-            body,
-        })
     }
 }

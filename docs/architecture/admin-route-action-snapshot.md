@@ -25,3 +25,14 @@ Router-level credential checks (`S3Router::check_access`) are bypassed only for:
 - console assets (`/favicon.ico`, `/rustfs/console...`), only while the console is enabled.
 
 Every other admin route requires credentials at the router and a precise `AdminAction` or `S3Action` check in the handler (metrics routes, for example, authorize `GetMetricsAction`). The MinIO alias contract is specified in [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md).
+
+## Gated Bucket Feature Routes
+
+Some bucket-scoped routes add gates after the `AdminAction` check. The gates are enforced in the handler, so they are invisible to the route matrix and listed here instead.
+
+| Route | Actions | Extra gates after authorization |
+|---|---|---|
+| `PUT`/`DELETE /rustfs/admin/v3/on-demand-migration/{bucket}` (`?dry-run=true` validates and probes without saving) | `SetBucketOnDemandMigrationAction` (`admin:SetBucketOnDemandMigration`) | bucket must exist (`NoSuchBucket`); `PUT` also requires the `RUSTFS_ON_DEMAND_MIGRATION_ENABLED` module switch (`OnDemandMigrationDisabled`, 400) and the server license (`license_check()`, same mapping as object zip downloads); the source must answer HEAD + a one-key list (`OnDemandMigrationSourceUnreachable`, 400). Handler: `rustfs/src/admin/handlers/on_demand_migration.rs` |
+| `GET /rustfs/admin/v3/on-demand-migration/{bucket}` and `GET .../{bucket}/status` | `GetBucketOnDemandMigrationAction` (`admin:GetBucketOnDemandMigration`) | bucket must exist; reads work while the module switch is off so operators can inspect a disabled deployment; `GET` answers `NoSuchConfiguration` (404) when nothing is configured |
+
+Responses on these routes carry the redacted configuration (`secret_key` and `session_token` replaced by `REDACTED`); the wire shape is pinned by the fixtures under `crates/madmin/fixtures/on_demand_migration/`, shared by the server handler tests and the `rustfs-madmin` client tests.

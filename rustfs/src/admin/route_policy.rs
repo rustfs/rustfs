@@ -38,6 +38,7 @@ const EXPORT_BUCKET_METADATA: AdminActionRef = AdminActionRef::new("ExportBucket
 const EXPORT_IAM: AdminActionRef = AdminActionRef::new("ExportIAMAction");
 const FORCE_UNLOCK: AdminActionRef = AdminActionRef::new("ForceUnlockAdminAction");
 const GET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("GetBucketTargetAction");
+const GET_BUCKET_ON_DEMAND_MIGRATION: AdminActionRef = AdminActionRef::new("GetBucketOnDemandMigrationAction");
 const GET_GROUP: AdminActionRef = AdminActionRef::new("GetGroupAdminAction");
 const GET_USER: AdminActionRef = AdminActionRef::new("GetUserAdminAction");
 const GET_METRICS: AdminActionRef = AdminActionRef::new("GetMetricsAction");
@@ -88,6 +89,7 @@ const SERVER_INFO: AdminActionRef = AdminActionRef::new("ServerInfoAdminAction")
 const SERVER_UPDATE: AdminActionRef = AdminActionRef::new("ServerUpdateAdminAction");
 const SET_BUCKET_QUOTA: AdminActionRef = AdminActionRef::new("SetBucketQuotaAdminAction");
 const SET_BUCKET_TARGET: AdminActionRef = AdminActionRef::new("SetBucketTargetAction");
+const SET_BUCKET_ON_DEMAND_MIGRATION: AdminActionRef = AdminActionRef::new("SetBucketOnDemandMigrationAction");
 const SET_TABLE: AdminActionRef = AdminActionRef::new("SetTableAction");
 const SET_TABLE_BUCKET: AdminActionRef = AdminActionRef::new("SetTableBucketAction");
 const SET_TABLE_LIFECYCLE: AdminActionRef = AdminActionRef::new("SetTableLifecycleAction");
@@ -389,6 +391,30 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         "/rustfs/admin/v3/bucket-durability/{bucket}",
         CONFIG_UPDATE,
         RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}",
+        SET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}",
+        GET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}",
+        SET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}/status",
+        GET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Get,
@@ -2161,6 +2187,37 @@ mod tests {
     #[test]
     fn route_policy_maps_metrics_to_explicit_admin_action() {
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/metrics", GET_METRICS);
+    }
+
+    #[test]
+    fn route_policy_splits_on_demand_migration_into_set_and_get_actions() {
+        assert_action(
+            HttpMethod::Put,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_action(
+            HttpMethod::Delete,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}",
+            GET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}/status",
+            GET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        // Reads never require the write action, and the routes are not bucket-target routes.
+        assert_not_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_not_action(HttpMethod::Put, "/rustfs/admin/v3/on-demand-migration/{bucket}", SET_BUCKET_TARGET);
     }
 
     #[test]
