@@ -128,6 +128,7 @@ const DECOMMISSION_CAPACITY_RELEASE_FAILED: &str = "failed";
 const DECOMMISSION_CAPACITY_RELEASE_COMPLETED: &str = "completed";
 pub(crate) const DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX: &str = "decommission/capacity-target";
 const DECOMMISSION_CAPACITY_TARGET_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const DECOMMISSION_CAPACITY_TARGET_GATE_BUSY: &str = "target capacity mutation gate is busy";
 const METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL: &str = "rustfs_decommission_capacity_conflicts_total";
 const METRIC_DECOMMISSION_CAPACITY_PREDICTED_BYTES: &str = "rustfs_decommission_capacity_predicted_physical_bytes";
 const METRIC_DECOMMISSION_CAPACITY_RESERVED_BYTES: &str = "rustfs_decommission_capacity_reserved_physical_bytes";
@@ -948,11 +949,35 @@ fn is_decommission_capacity_blocked_error(err: &Error) -> bool {
 fn is_decommission_capacity_intent_conflict(err: &Error) -> bool {
     if let Error::DecommissionCapacityBlocked { message } = err {
         return message.contains("unresolved target capacity intent")
-            || message.contains("pending capacity intent belongs to another mutation")
-            || message.contains("target capacity mutation gate is busy");
+            || message.contains("pending capacity intent belongs to another mutation");
     }
     data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_intent_conflict)
         || err.to_string().contains("unresolved target capacity intent")
+}
+
+fn is_decommission_capacity_target_gate_busy(err: &Error) -> bool {
+    if let Error::DecommissionCapacityBlocked { message } = err
+        && message.contains(DECOMMISSION_CAPACITY_TARGET_GATE_BUSY)
+    {
+        return true;
+    }
+    data_movement::data_movement_stage_source(err).is_some_and(is_decommission_capacity_target_gate_busy)
+        || err.to_string().contains(DECOMMISSION_CAPACITY_TARGET_GATE_BUSY)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecommissionCapacityRetryKind {
+    TargetGateBusy,
+    IntentConflict,
+}
+
+fn decommission_capacity_retry_kind(err: &Error, intent_conflict_attempt: usize) -> Option<DecommissionCapacityRetryKind> {
+    if is_decommission_capacity_target_gate_busy(err) {
+        return Some(DecommissionCapacityRetryKind::TargetGateBusy);
+    }
+    (intent_conflict_attempt < DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS
+        && is_decommission_capacity_intent_conflict(err))
+    .then_some(DecommissionCapacityRetryKind::IntentConflict)
 }
 
 fn ensure_decommission_capacity_target_fence(
@@ -8426,9 +8451,11 @@ impl ECStore {
             .await
         {
             Ok(guard) => Ok(guard),
-            Err(rustfs_lock::LockError::Timeout { .. } | rustfs_lock::LockError::AlreadyLocked { .. }) => Err(
-                decommission_capacity_blocked_error(format!("target pool {target_pool_index} capacity mutation gate is busy")),
-            ),
+            Err(rustfs_lock::LockError::Timeout { .. } | rustfs_lock::LockError::AlreadyLocked { .. }) => {
+                Err(decommission_capacity_blocked_error(format!(
+                    "target pool {target_pool_index} {DECOMMISSION_CAPACITY_TARGET_GATE_BUSY}"
+                )))
+            }
             Err(rustfs_lock::LockError::QuorumNotReached { required, achieved }) => Err(Error::NamespaceLockQuorumUnavailable {
                 mode: "write",
                 bucket: RUSTFS_META_BUCKET.to_string(),
@@ -11079,6 +11106,7 @@ impl ECStore {
         for entry_attempt in 1..=DECOMMISSION_ENTRY_MAX_ATTEMPTS {
             let attempt_result = {
                 let mut conflict_attempt = 0;
+                let mut target_busy_attempt: usize = 0;
                 loop {
                     let result = self
                         .decommission_entry_attempt(
@@ -11097,18 +11125,28 @@ impl ECStore {
                             &mut counted_versions,
                         )
                         .await;
-                    if result.as_ref().is_err_and(is_decommission_capacity_intent_conflict)
-                        && conflict_attempt < DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS
-                    {
-                        conflict_attempt += 1;
-                        let retry_delay =
-                            decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, conflict_attempt);
-                        if wait_decommission_retry_backoff(&rx, retry_delay).await {
-                            decommission_cancel_signal_result(rx.is_cancelled())?;
+                    let retry = result
+                        .as_ref()
+                        .err()
+                        .and_then(|err| decommission_capacity_retry_kind(err, conflict_attempt));
+                    let retry_attempt = match retry {
+                        Some(DecommissionCapacityRetryKind::TargetGateBusy) => {
+                            // Expected same-target contention must remain
+                            // cancellable but cannot become a permanent entry
+                            // failure merely because another object is large.
+                            target_busy_attempt = target_busy_attempt.saturating_add(1);
+                            target_busy_attempt.min(DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS)
                         }
-                        continue;
+                        Some(DecommissionCapacityRetryKind::IntentConflict) => {
+                            conflict_attempt += 1;
+                            conflict_attempt
+                        }
+                        None => break result,
+                    };
+                    let retry_delay = decommission_retry_backoff_delay(DECOMMISSION_SOURCE_CLEANUP_RETRY_DELAY, retry_attempt);
+                    if wait_decommission_retry_backoff(&rx, retry_delay).await {
+                        decommission_cancel_signal_result(rx.is_cancelled())?;
                     }
-                    break result;
                 }
             };
             match attempt_result {
@@ -15335,6 +15373,11 @@ mod tests {
             .await
             .expect_err("a second mutation on the same target must wait behind its target gate");
         assert!(is_decommission_capacity_blocked_error(&blocked));
+        assert_eq!(
+            decommission_capacity_retry_kind(&blocked, DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS),
+            Some(DecommissionCapacityRetryKind::TargetGateBusy),
+            "expected same-target serialization must remain retryable after the intent-conflict budget"
+        );
 
         let cancel_store = Arc::clone(&store);
         let mut cancel = tokio::spawn(async move { cancel_store.decommission_cancel(0).await });
@@ -16711,6 +16754,15 @@ mod tests {
         );
 
         assert!(is_decommission_capacity_intent_conflict(&err));
+        assert_eq!(
+            decommission_capacity_retry_kind(&err, DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS - 1),
+            Some(DecommissionCapacityRetryKind::IntentConflict)
+        );
+        assert_eq!(
+            decommission_capacity_retry_kind(&err, DECOMMISSION_CAPACITY_INTENT_CONFLICT_MAX_ATTEMPTS),
+            None,
+            "a durable intent conflict must retain its bounded recovery policy"
+        );
     }
 
     #[test]
