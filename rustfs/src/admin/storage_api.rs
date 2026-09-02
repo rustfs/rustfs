@@ -20,8 +20,8 @@ use time::OffsetDateTime;
 
 mod ecstore_bucket {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::{
-        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, object_lock, quota, replication, target,
-        utils, versioning, versioning_sys,
+        bandwidth, bucket_target_sys, durability, lifecycle, metadata, metadata_sys, object_lock, on_demand_migration, quota,
+        remote_s3_client, replication, target, utils, versioning, versioning_sys,
     };
 }
 
@@ -269,6 +269,7 @@ pub(crate) mod metadata {
     pub(crate) const BUCKET_TARGETS_FILE: &str = super::ecstore_bucket::metadata::BUCKET_TARGETS_FILE;
     pub(crate) const BUCKET_VERSIONING_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
     pub(crate) const BUCKET_DURABILITY_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_DURABILITY_CONFIG;
+    pub(crate) const BUCKET_ON_DEMAND_MIGRATION_CONFIG: &str = super::ecstore_bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
     pub(crate) const OBJECT_LOCK_CONFIG: &str = super::ecstore_bucket::metadata::OBJECT_LOCK_CONFIG;
 
     pub(crate) type BucketMetadata = super::ecstore_bucket::metadata::BucketMetadata;
@@ -280,6 +281,29 @@ pub(crate) mod metadata {
 
 pub(crate) mod durability {
     pub(crate) type BucketDurabilityConfig = super::ecstore_bucket::durability::BucketDurabilityConfig;
+}
+
+pub(crate) mod on_demand_migration {
+    pub(crate) type OnDemandMigrationConfig = super::ecstore_bucket::on_demand_migration::OnDemandMigrationConfig;
+    pub(crate) type OnDemandMigrationConfigError = super::ecstore_bucket::on_demand_migration::OnDemandMigrationConfigError;
+    pub(crate) type PathStyle = super::ecstore_bucket::on_demand_migration::PathStyle;
+    pub(crate) type Provider = super::ecstore_bucket::on_demand_migration::Provider;
+    pub(crate) type ValidationContext<'a> = super::ecstore_bucket::on_demand_migration::ValidationContext<'a>;
+
+    pub(crate) mod source_client {
+        pub(crate) type SourceClient = super::super::ecstore_bucket::on_demand_migration::source_client::SourceClient;
+        pub(crate) type SourceClientSpec = super::super::ecstore_bucket::on_demand_migration::source_client::SourceClientSpec;
+        pub(crate) type SourceError = super::super::ecstore_bucket::on_demand_migration::source_client::SourceError;
+        pub(crate) type SourceProbe = super::super::ecstore_bucket::on_demand_migration::source_client::SourceProbe;
+        pub(crate) type SourceProvider = super::super::ecstore_bucket::on_demand_migration::source_client::SourceProvider;
+        pub(crate) type SourceTimeouts = super::super::ecstore_bucket::on_demand_migration::source_client::SourceTimeouts;
+    }
+}
+
+pub(crate) mod remote_s3_client {
+    pub(crate) type PathStyle = super::ecstore_bucket::remote_s3_client::PathStyle;
+    pub(crate) type RemoteCredentials = super::ecstore_bucket::remote_s3_client::RemoteCredentials;
+    pub(crate) type RemoteS3ClientError = super::ecstore_bucket::remote_s3_client::RemoteS3ClientError;
 }
 
 pub(crate) mod metadata_sys {
@@ -415,6 +439,12 @@ pub(crate) mod metadata_sys {
         bucket: &str,
     ) -> Result<(Option<super::durability::BucketDurabilityConfig>, OffsetDateTime)> {
         super::ecstore_bucket::metadata_sys::get_durability_config(bucket).await
+    }
+
+    pub(crate) async fn get_on_demand_migration_config(
+        bucket: &str,
+    ) -> Result<Option<(super::on_demand_migration::OnDemandMigrationConfig, OffsetDateTime)>> {
+        super::ecstore_bucket::metadata_sys::get_on_demand_migration_config(bucket).await
     }
 
     pub(crate) async fn get_quota_config(bucket: &str) -> Result<(BucketQuota, OffsetDateTime)> {
@@ -869,7 +899,9 @@ pub(crate) mod bucket {
     pub(crate) use super::lifecycle;
     pub(crate) use super::metadata;
     pub(crate) use super::metadata_sys;
+    pub(crate) use super::on_demand_migration;
     pub(crate) use super::quota;
+    pub(crate) use super::remote_s3_client;
     pub(crate) use super::replication;
     pub(crate) use super::target;
     pub(crate) use super::versioning_sys;
@@ -969,7 +1001,7 @@ pub(crate) mod runtime {
 }
 
 pub(crate) mod s3 {
-    pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header};
+    pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, auth, header};
 
     /// Build an `S3Error` without reaching for the `s3s` error macro.
     ///
