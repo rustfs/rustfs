@@ -185,42 +185,14 @@ pub(super) async fn initialize_usage_baseline_bootstrap(
             "scanner usage baseline bootstrap is blocked by data movement".to_string(),
         ));
     };
-    let baseline = DataUsageInfo {
-        last_update: Some(std::time::SystemTime::now()),
-        usage_snapshot_converged: Some(false),
-        usage_snapshot_bootstrap_pending: true,
-        ..Default::default()
-    };
-    let data = serde_json::to_vec(&baseline)
-        .map_err(|err| ScannerError::Other(format!("failed to encode scanner usage baseline bootstrap: {err}")))?;
-    let save_result = save_config_with_publication_admission_for_epoch(
-        storeapi.clone(),
-        DATA_USAGE_OBJ_NAME_PATH.as_str(),
-        data.clone(),
-        DataUsageCacheRevision::Missing.preconditions(),
+    publish_scanner_usage_bootstrap_primary(
+        storeapi,
+        &DataUsageCacheRevision::Missing,
         expected_epoch,
+        None,
+        ScannerUsageBootstrapPublishContext::Initial,
     )
-    .await;
-    if save_result
-        .as_ref()
-        .ok()
-        .and_then(|info| info.etag.as_deref())
-        .is_some_and(|etag| !etag.is_empty())
-    {
-        return Ok(());
-    }
-
-    let (persisted, revision) = read_config_with_revision(storeapi, DATA_USAGE_OBJ_NAME_PATH.as_str())
-        .await
-        .map_err(|err| ScannerError::Other(format!("failed to reconcile scanner usage bootstrap: {err}")))?;
-    if persisted.as_deref() == Some(data.as_slice()) && matches!(revision, DataUsageCacheRevision::Etag(_)) {
-        return Ok(());
-    }
-
-    Err(ScannerError::Other(match save_result {
-        Ok(_) => "scanner usage bootstrap returned no ETag and could not be confirmed".to_string(),
-        Err(err) => format!("failed to persist scanner usage bootstrap: {err}"),
-    }))
+    .await
 }
 
 pub(super) async fn fence_scanner_usage_epoch_with_expected_epoch(
