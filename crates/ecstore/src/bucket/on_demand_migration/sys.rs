@@ -35,12 +35,16 @@
 //! The module switch (`RUSTFS_ON_DEMAND_MIGRATION_ENABLED`, default off) is
 //! injected by the `rustfs` binary through [`OnDemandMigrationSys::set_module_enabled`]
 //! before bucket metadata loads; this crate never reads the environment.
+//! The same startup step injects the [`OdmWriteBack`] the pull pipeline
+//! (`pull.rs`) stores objects with; each bucket state captures it at build
+//! time together with its lazily started [`PullQueue`].
 
 use super::breaker::{Breaker, BreakerState, BreakerTransition, BreakerVerdict};
 use super::config::{
     ON_DEMAND_MIGRATION_CONFIG_HOOK, OnDemandMigrationConfig, PathStyle as ConfigPathStyle, Provider, SourceConfig,
 };
 use super::negative_cache::NegativeCache;
+use super::pull::{OdmWriteBack, PullQueue};
 use super::source_client::{SourceClient, SourceClientSpec, SourceError, SourceProvider, SourceTimeouts};
 use super::stats::{GaugeGuard, OdmStats, OdmStatsSnapshot, PullFailureReason};
 use crate::bucket::remote_s3_client::{PathStyle as ClientPathStyle, RemoteCredentials, RemoteS3ClientError};
@@ -269,6 +273,9 @@ pub struct BucketOdmState {
     stats: Arc<OdmStats>,
     cancel: CancellationToken,
     last_source_error_logged_at: Mutex<Option<Instant>>,
+    write_back: Option<Arc<dyn OdmWriteBack>>,
+    /// Started by `pull::BucketOdmState::pull_queue` on first enqueue.
+    pub(super) pull_queue: OnceLock<Arc<PullQueue>>,
 }
 
 impl fmt::Debug for BucketOdmState {
@@ -286,7 +293,12 @@ impl fmt::Debug for BucketOdmState {
 }
 
 impl BucketOdmState {
-    async fn build(bucket: &str, config: &OnDemandMigrationConfig, stats: Arc<OdmStats>) -> Arc<Self> {
+    async fn build(
+        bucket: &str,
+        config: &OnDemandMigrationConfig,
+        stats: Arc<OdmStats>,
+        write_back: Option<Arc<dyn OdmWriteBack>>,
+    ) -> Arc<Self> {
         let spec = source_client_spec(config);
         let client = if config.source.credentials.is_none() {
             Err(OdmStateError::AnonymousUnsupported)
@@ -310,6 +322,8 @@ impl BucketOdmState {
             stats,
             cancel: CancellationToken::new(),
             last_source_error_logged_at: Mutex::new(None),
+            write_back,
+            pull_queue: OnceLock::new(),
         })
     }
 
@@ -344,6 +358,11 @@ impl BucketOdmState {
 
     pub fn stats(&self) -> &Arc<OdmStats> {
         &self.stats
+    }
+
+    /// The write-back injected by the binary when this state was built.
+    pub fn write_back(&self) -> Option<&Arc<dyn OdmWriteBack>> {
+        self.write_back.as_ref()
     }
 
     /// Fires when this state is replaced or removed; background pulls
@@ -601,6 +620,7 @@ pub struct OnDemandMigrationSys {
     module_enabled: AtomicBool,
     buckets: RwLock<HashMap<String, BucketSlot>>,
     generation: AtomicU64,
+    write_back: RwLock<Option<Arc<dyn OdmWriteBack>>>,
 }
 
 impl fmt::Debug for OnDemandMigrationSys {
@@ -625,6 +645,7 @@ impl OnDemandMigrationSys {
             module_enabled: AtomicBool::new(false),
             buckets: RwLock::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            write_back: RwLock::new(None),
         }
     }
 
@@ -639,6 +660,17 @@ impl OnDemandMigrationSys {
 
     pub fn is_module_enabled(&self) -> bool {
         self.module_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Installs the local write path used by every bucket state built from
+    /// now on (states built earlier keep what they captured). The binary
+    /// calls this before bucket metadata loads.
+    pub fn set_write_back(&self, write_back: Arc<dyn OdmWriteBack>) {
+        *self.write_back.write() = Some(write_back);
+    }
+
+    pub fn write_back(&self) -> Option<Arc<dyn OdmWriteBack>> {
+        self.write_back.read().clone()
     }
 
     /// Registers `publish` as the bucket-metadata publish hook. Returns
@@ -701,7 +733,7 @@ impl OnDemandMigrationSys {
             return ApplyOutcome::Unchanged;
         }
         let stats = self.state(bucket).map(|state| Arc::clone(&state.stats)).unwrap_or_default();
-        let state = BucketOdmState::build(bucket, config, stats).await;
+        let state = BucketOdmState::build(bucket, config, stats, self.write_back()).await;
 
         let (outcome, previous) = {
             let mut buckets = self.buckets.write();
