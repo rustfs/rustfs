@@ -166,6 +166,16 @@ pub mod bucket {
         pub use crate::bucket::migration::{LegacyBlobDecryptFn, try_migrate_bucket_metadata, try_migrate_iam_config};
     }
 
+    pub mod on_demand_migration {
+        pub mod source_client {
+            pub use crate::bucket::on_demand_migration::source_client::{
+                SourceClient, SourceClientSpec, SourceError, SourceGet, SourceHead, SourceObject, SourcePage, SourceProbe,
+                SourceProvider, SourceSse, SourceTimeouts, USER_AGENT_SUFFIX, is_multipart_etag, range_header_value,
+                resolve_path_style,
+            };
+        }
+    }
+
     pub mod object_lock {
         pub use crate::bucket::object_lock::{ObjectLockApi, ObjectLockStatusExt};
 
