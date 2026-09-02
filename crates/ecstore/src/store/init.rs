@@ -12903,7 +12903,7 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn batch_transitioned_delete_quorum_failure_rolls_back_without_free_version_receipt() {
+    async fn batch_transitioned_delete_post_commit_failures_roll_back_without_free_version_receipt() {
         let temp_dir = tempfile::tempdir().expect("create failed batch delete store dir");
         let (ctx, store, shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "batch-delete-local-failure", &[4])).await;
@@ -12994,13 +12994,15 @@ mod tests {
         };
 
         let set = store.pools[0].get_disks_by_key(object);
-        let (saved_first, saved_second) = {
-            let mut disks = set.disks.write().await;
-            (
-                disks[0].take().expect("first disk should be online before fault injection"),
-                disks[1].take().expect("second disk should be online before fault injection"),
-            )
-        };
+        let disks = set.disks.read().await;
+        assert_eq!(disks.len(), 4, "the rollback fixture must use four disks");
+        // Keep discovery fully online, then make a quorum of disks report an
+        // error only after their batch metadata commit has completed.
+        for disk in disks.iter().take(3) {
+            let disk = disk.as_ref().expect("injected rollback disks should be online");
+            crate::disk::local::set_delete_version_fail_after_commit(disk.path().as_path(), object);
+        }
+        drop(disks);
         let receipt_sink = crate::object_api::TierFreeVersionReceiptSink::new();
         let (_deleted, errors) = store
             .delete_objects(
@@ -13014,17 +13016,9 @@ mod tests {
             .await;
         assert_eq!(
             errors,
-            vec![
-                Some(StorageError::InsufficientWriteQuorum(bucket.to_string(), object.to_string())),
-                Some(StorageError::InsufficientWriteQuorum(bucket.to_string(), object.to_string())),
-            ],
-            "two online disks must reach batch delete commit and then miss its write quorum"
+            vec![Some(StorageError::Unexpected), Some(StorageError::Unexpected),],
+            "three post-commit disk errors must fail batch delete before receipts publish"
         );
-        {
-            let mut disks = set.disks.write().await;
-            disks[0] = Some(saved_first);
-            disks[1] = Some(saved_second);
-        }
 
         assert!(
             receipt_sink

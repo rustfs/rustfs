@@ -6444,6 +6444,9 @@ impl LocalDisk {
                     .abort_reserved_version_delete(object_dir, rollback_dir, volume, path, "delete_versions_commit_intent", err)
                     .await);
             }
+            if should_fail_after_delete_commit(self.root.as_path(), path) {
+                return Err(DiskError::Unexpected);
+            }
             return Ok(());
         }
 
@@ -6512,6 +6515,10 @@ impl LocalDisk {
             return Err(self
                 .abort_reserved_version_delete(object_dir, rollback_dir, volume, path, "delete_versions_commit_intent", err)
                 .await);
+        }
+
+        if should_fail_after_delete_commit(self.root.as_path(), path) {
+            return Err(DiskError::Unexpected);
         }
 
         Ok(())
