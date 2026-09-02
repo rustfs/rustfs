@@ -452,9 +452,9 @@ async fn fake_source_fault_actions_truncate_stall_and_status() -> TestResult {
     let stalled = client.head_object().bucket(SOURCE_BUCKET).key("faulty").send().await?;
     assert!(started.elapsed() >= Duration::from_millis(350), "stall must delay the first byte");
     assert_eq!(stalled.content_length(), Some(4096));
-    let unstalled_started = Instant::now();
+    let post_stall_started = Instant::now();
     client.head_object().bucket(SOURCE_BUCKET).key("faulty").send().await?;
-    assert!(unstalled_started.elapsed() < Duration::from_millis(350), "stall is consumed once");
+    assert!(post_stall_started.elapsed() < Duration::from_millis(350), "stall is consumed once");
 
     // The object is intact once the script is drained.
     let intact = client.get_object().bucket(SOURCE_BUCKET).key("faulty").send().await?;
