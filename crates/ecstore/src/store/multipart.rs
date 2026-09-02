@@ -17,10 +17,51 @@ use crate::core::pools::{DecommissionCapacityOwner, ensure_decommission_capacity
 use crate::multipart_listing::paginate_multipart_listing;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
+use crate::storage_api_contracts::object::ObjectOperations as _;
 use futures::{StreamExt, stream};
 use std::collections::HashSet;
 
 const MULTIPART_LIST_SET_CONCURRENCY: usize = 4;
+
+#[cfg(test)]
+static DATA_MOVEMENT_MULTIPART_DISCOVERY_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn data_movement_multipart_discovery_counts() -> &'static std::sync::Mutex<std::collections::HashMap<Uuid, usize>> {
+    DATA_MOVEMENT_MULTIPART_DISCOVERY_COUNTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn decommission_multipart_target_clear_pending(opts: &ObjectOptions, target: Option<&ObjectInfo>) -> Result<bool> {
+    let expected_mod_time = opts.mod_time.ok_or_else(|| Error::DecommissionCapacityBlocked {
+        message: "multipart cleanup cannot prove exact target absence without a modification time".to_string(),
+    })?;
+    let expected_version_id = opts
+        .version_id
+        .as_deref()
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|err| Error::DecommissionCapacityBlocked {
+            message: format!("multipart cleanup exact target version is invalid: {err}"),
+        })?
+        .filter(|version_id| !version_id.is_nil());
+    let Some(target) = target else {
+        return Ok(true);
+    };
+    if target.version_id.filter(|version_id| !version_id.is_nil()) != expected_version_id
+        || target.mod_time != Some(expected_mod_time)
+    {
+        return Err(Error::DecommissionCapacityBlocked {
+            message: "multipart cleanup found a target but cannot prove the exact staged identity is absent".to_string(),
+        });
+    }
+    if !crate::data_movement::is_owned_data_movement_target(target) {
+        return Err(Error::DecommissionCapacityBlocked {
+            message: "multipart cleanup found an exact target without its ownership proof".to_string(),
+        });
+    }
+    Ok(false)
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct MultipartUploadListRequest {
@@ -197,6 +238,24 @@ async fn list_pool_multipart_uploads_for_incarnation(
 }
 
 impl ECStore {
+    #[cfg(test)]
+    pub(crate) fn reset_data_movement_multipart_discovery_count_for_test(&self) {
+        data_movement_multipart_discovery_counts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.id, 0);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn data_movement_multipart_discovery_count_for_test(&self) -> usize {
+        data_movement_multipart_discovery_counts()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     pub(crate) async fn acquire_decommission_multipart_mutation_fence(
         &self,
         owner: DecommissionCapacityOwner,
@@ -744,16 +803,30 @@ impl ECStore {
             .pools
             .get(target_pool_idx)
             .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
-        let owner = DecommissionCapacityOwner::from_options(opts);
-        let has_capacity_state = match owner {
-            Some(owner) => {
-                self.has_decommission_capacity_temporary_mutation_state(target_pool_idx, owner)
-                    .await
-            }
-            None => false,
-        };
-        if !has_capacity_state {
+        let owner = DecommissionCapacityOwner::from_options(opts)
+            .ok_or_else(|| Error::other("data movement multipart cleanup is missing its capacity owner"))?;
+        if !self
+            .decommission_capacity_cleanup_target_indices(owner)
+            .await?
+            .contains(&target_pool_idx)
+        {
+            return Err(Error::other(format!(
+                "data movement multipart cleanup target pool {target_pool_idx} is outside its capacity reservation"
+            )));
+        }
+        if !self
+            .has_decommission_capacity_temporary_mutation_state(target_pool_idx, owner)
+            .await
+        {
             return Ok(());
+        }
+        #[cfg(test)]
+        {
+            *data_movement_multipart_discovery_counts()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(self.id)
+                .or_default() += 1;
         }
         let set = pool.get_disks_by_key(object);
         let upload_ids = set
@@ -781,6 +854,7 @@ impl ECStore {
         }
         let (mut opts, _bucket_lifecycle_guard) = self.guard_multipart_bucket_incarnation(bucket, opts).await?;
         ensure_decommission_capacity_mutation_id(bucket, object, &mut opts);
+        let capacity_owner = DecommissionCapacityOwner::from_options(&opts);
         let pool = self
             .pools
             .get(target_pool_idx)
@@ -797,26 +871,60 @@ impl ECStore {
             }
         }
         opts.no_lock = true;
-        let capacity_owner = DecommissionCapacityOwner::from_options(&opts);
         // Keep every upload namespace guard alive through the final capacity progress save.
-        let result = self
+        let cleanup_decision_error = self
             .run_decommission_capacity_temporary_release_with_capacity_lease(target_pool_idx, capacity_owner, |capacity_lease| {
                 let mut delete_opts = opts.clone();
                 let guards = &guards;
                 let set = &set;
+                let pool = &pool;
                 async move {
-                    if let Some(capacity_lease) = capacity_lease {
-                        delete_opts.add_namespace_lock_lost_signal(capacity_lease);
+                    if let Some(capacity_lease) = capacity_lease.as_ref() {
+                        delete_opts.add_namespace_lock_lost_signal(Arc::clone(capacity_lease));
                     }
+                    // The target capacity gate held by the surrounding
+                    // transaction makes this proof and its pending-ledger
+                    // decision one critical section with cleanup finalize.
+                    let (clear_pending, cleanup_decision_error) = if capacity_owner.is_some() {
+                        let mut lookup_opts = ObjectOptions {
+                            versioned: delete_opts.versioned,
+                            version_suspended: delete_opts.version_suspended,
+                            version_id: delete_opts.version_id.clone(),
+                            metadata_chg: delete_opts.version_id.is_some(),
+                            no_lock: true,
+                            ..Default::default()
+                        };
+                        if let Some(capacity_lease) = capacity_lease {
+                            lookup_opts.add_namespace_lock_lost_signal(capacity_lease);
+                        }
+                        let target = match pool.get_object_info(bucket, object, &lookup_opts).await {
+                            Ok(target) => Some(target),
+                            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+                            Err(err) => return Err(err),
+                        };
+                        match decommission_multipart_target_clear_pending(&delete_opts, target.as_ref()) {
+                            Ok(clear_pending) => (clear_pending, None),
+                            Err(err) => (false, Some(err)),
+                        }
+                    } else {
+                        (true, None)
+                    };
                     for guard in guards {
-                        guard.delete(set, bucket, object, &delete_opts).await?;
+                        match guard.delete(set, bucket, object, &delete_opts).await {
+                            Ok(()) => {}
+                            Err(err) if is_err_invalid_upload_id(&err) => {}
+                            Err(err) => return Err(err),
+                        }
                     }
-                    Ok(())
+                    Ok((cleanup_decision_error, clear_pending))
                 }
             })
-            .await;
+            .await?;
         drop(guards);
-        result
+        if let Some(err) = cleanup_decision_error {
+            return Err(err);
+        }
+        Ok(())
     }
 
     #[instrument(skip(self))]
@@ -1022,6 +1130,66 @@ mod tests {
             initiated: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn decommission_multipart_cleanup_requires_exact_target_evidence() {
+        let version_id = Uuid::new_v4();
+        let mod_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(7);
+        let opts = ObjectOptions {
+            versioned: true,
+            version_id: Some(version_id.to_string()),
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+
+        assert!(
+            decommission_multipart_target_clear_pending(&opts, None)
+                .expect("an exact target miss should authorize pending cleanup")
+        );
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVED, "true".to_string());
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVED_TAGS, "v1:".to_string());
+        let owned_target = ObjectInfo {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        assert!(
+            !decommission_multipart_target_clear_pending(&opts, Some(&owned_target))
+                .expect("an exact owned target should preserve pending capacity")
+        );
+
+        let missing_identity = ObjectOptions {
+            mod_time: None,
+            ..opts.clone()
+        };
+        assert!(matches!(
+            decommission_multipart_target_clear_pending(&missing_identity, None),
+            Err(Error::DecommissionCapacityBlocked { .. })
+        ));
+
+        let mismatched_target = ObjectInfo {
+            version_id: Some(Uuid::new_v4()),
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decommission_multipart_target_clear_pending(&opts, Some(&mismatched_target)),
+            Err(Error::DecommissionCapacityBlocked { .. })
+        ));
+
+        let unowned_target = ObjectInfo {
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
+            ..Default::default()
+        };
+        assert!(matches!(
+            decommission_multipart_target_clear_pending(&opts, Some(&unowned_target)),
+            Err(Error::DecommissionCapacityBlocked { .. })
+        ));
     }
 
     /// Models a single pool's `list_multipart_uploads`: returns uploads strictly

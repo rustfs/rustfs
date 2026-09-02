@@ -917,6 +917,29 @@ mod tests {
     use time::OffsetDateTime;
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
+
+    fn run_large_stack_async_test<C, F>(name: &str, case: C)
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: Future<Output = ()> + 'static,
+    {
+        const STACK_SIZE: usize = 32 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(STACK_SIZE)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .thread_stack_size(STACK_SIZE)
+                    .build()
+                    .expect("large-stack store test runtime should build");
+                runtime.block_on(case());
+            })
+            .expect("large-stack store test thread should spawn")
+            .join()
+            .expect("large-stack store test thread should complete");
+    }
     use uuid::Uuid;
 
     #[test]
@@ -2499,9 +2522,17 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[test]
     #[serial_test::serial(storage_class_env)]
-    async fn data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease() {
+    fn data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease() {
+        run_large_stack_async_test(
+            "multipart-part-staging-publication-fence",
+            data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease_case,
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease_case() {
         let temp_dir = tempfile::tempdir().expect("create multipart staging-fence store dir");
         let (ctx, store, shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "mpu-staging-publication", &[4, 4])).await;
@@ -5165,8 +5196,9 @@ mod tests {
                     let ordinary_faults_for_hook = Arc::clone(&ordinary_faults);
                     let fault_bucket = other_bucket.clone();
                     let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
-                        move |stage, bucket, object, attempt| {
-                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
+                        move |stage, bucket, object, attempt, succeeded| {
+                            let injected = succeeded
+                                && stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
                                 && bucket == fault_bucket.as_str()
                                 && object == other_object
                                 && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
@@ -5435,8 +5467,9 @@ mod tests {
                     let fault_calls_for_hook = Arc::clone(&fault_calls);
                     let fault_bucket = bucket.clone();
                     let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
-                        move |stage, called_bucket, called_object, attempt| {
-                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER
+                        move |stage, called_bucket, called_object, attempt, succeeded| {
+                            let injected = succeeded
+                                && stage == DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER
                                 && called_bucket == fault_bucket.as_str()
                                 && called_object == object
                                 && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
@@ -5555,8 +5588,9 @@ mod tests {
                     let fault_calls_for_hook = Arc::clone(&fault_calls);
                     let fault_bucket = bucket.clone();
                     let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
-                        move |stage, called_bucket, called_object, attempt| {
-                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_TIERED
+                        move |stage, called_bucket, called_object, attempt, succeeded| {
+                            let injected = succeeded
+                                && stage == DECOMMISSION_TEST_FAULT_STAGE_TIERED
                                 && called_bucket == fault_bucket.as_str()
                                 && called_object == object
                                 && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
@@ -5661,9 +5695,16 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[test]
     #[serial_test::serial(storage_class_env)]
-    async fn decommission_outer_fence_loss_blocks_multipart_commits() {
+    fn decommission_outer_fence_loss_blocks_multipart_commits() {
+        run_large_stack_async_test(
+            "decommission-multipart-outer-fence-loss",
+            decommission_outer_fence_loss_blocks_multipart_commits_case,
+        );
+    }
+
+    async fn decommission_outer_fence_loss_blocks_multipart_commits_case() {
         for (object, pause) in [
             ("complete.bin", crate::set_disk::MultipartCommitPause::BeforeLockLost),
             ("new-upload.bin", crate::set_disk::MultipartCommitPause::NewUploadBeforeLockLost),
