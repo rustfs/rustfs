@@ -30,12 +30,20 @@ use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use bytes::Bytes;
 use serde::Serialize;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Module switch the server reads at startup (`false` before GA). The harness
 /// turns it on so scenario tests exercise the feature without repeating it.
 pub const ODM_MODULE_SWITCH_ENV: &str = "RUSTFS_ON_DEMAND_MIGRATION_ENABLED";
+/// The fake source listens on loopback, which `validate_remote_endpoint`
+/// (`crates/ecstore/src/bucket/remote_s3_client.rs`) rejects for every remote
+/// S3 endpoint, migration sources included. This is the documented harness
+/// opt-in; see `docs/operations/outbound-connection-policy.md`.
+pub const ODM_ALLOW_LOOPBACK_SOURCE_ENV: &str = "RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET";
+/// Server environment every ODM scenario starts (and restarts) with.
+pub const ODM_SERVER_ENV: &[(&str, &str)] = &[(ODM_MODULE_SWITCH_ENV, "true"), (ODM_ALLOW_LOOPBACK_SOURCE_ENV, "true")];
 /// Admin route prefix; the bucket name is appended as one path segment.
 pub const ODM_ADMIN_ROUTE: &str = "/rustfs/admin/v3/on-demand-migration";
 /// Region the fake source is addressed with (it accepts any SigV4 region).
@@ -276,9 +284,7 @@ impl OdmTestEnv {
     pub async fn start_with_options(options: FakeS3TargetOptions) -> Result<Self, BoxError> {
         let source = FakeS3Target::start_with_options(options).await?;
         let mut rustfs = RustFSTestEnvironment::new().await?;
-        rustfs
-            .start_rustfs_server_with_env(vec![], &[(ODM_MODULE_SWITCH_ENV, "true")])
-            .await?;
+        rustfs.start_rustfs_server_with_env(vec![], ODM_SERVER_ENV).await?;
         let client = rustfs.create_s3_client();
         Ok(Self { rustfs, source, client })
     }
@@ -340,6 +346,81 @@ impl OdmTestEnv {
                     .await
             }
             BackfillOp::Status => self.admin(http::Method::GET, &format!("/{bucket}/backfill"), None).await,
+        }
+    }
+
+    /// `POST .../{bucket}/backfill?op=start`, retried while the server
+    /// answers `OnDemandMigrationDisabled`: the bucket state is built
+    /// asynchronously right after the config `PUT`, so an immediate start can
+    /// race it. Any other answer is returned as is.
+    pub async fn start_backfill(&self, bucket: &str, request: BackfillRequest) -> Result<AdminResponse, BoxError> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let response = self.backfill(bucket, BackfillOp::Start(request.clone())).await?;
+            let state_not_ready = response.status == 400 && response.body.contains("OnDemandMigrationDisabled");
+            if !state_not_ready || Instant::now() >= deadline {
+                return Ok(response);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The `job` document of `GET .../{bucket}/backfill`, `None` on 404.
+    pub async fn backfill_job(&self, bucket: &str) -> Result<Option<serde_json::Value>, BoxError> {
+        let response = self.backfill(bucket, BackfillOp::Status).await?;
+        match response.status {
+            200 => Ok(Some(response.json()?["job"].clone())),
+            404 => Ok(None),
+            status => Err(format!("GET backfill answered {status}: {}", response.body).into()),
+        }
+    }
+
+    /// Polls the backfill checkpoint until `accept` returns true or `timeout`
+    /// elapses (an error naming the last observed document).
+    pub async fn wait_for_backfill(
+        &self,
+        bucket: &str,
+        timeout: Duration,
+        accept: impl Fn(&serde_json::Value) -> bool,
+    ) -> Result<serde_json::Value, BoxError> {
+        let deadline = Instant::now() + timeout;
+        let mut last = serde_json::Value::Null;
+        loop {
+            if let Some(job) = self.backfill_job(bucket).await? {
+                if accept(&job) {
+                    return Ok(job);
+                }
+                last = job;
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    format!("backfill of {bucket} did not reach the expected state within {timeout:?}; last: {last}").into(),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Number of keys under `prefix` listed by the RustFS under test (local
+    /// state only, no migration side effects).
+    pub async fn local_key_count(&self, bucket: &str, prefix: &str) -> Result<usize, BoxError> {
+        let mut count = 0;
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(prefix)
+                .max_keys(1000)
+                .set_continuation_token(token.take())
+                .send()
+                .await?;
+            count += page.contents().len();
+            match page.next_continuation_token() {
+                Some(next) if page.is_truncated().unwrap_or(false) => token = Some(next.to_string()),
+                _ => return Ok(count),
+            }
         }
     }
 

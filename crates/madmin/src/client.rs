@@ -400,7 +400,7 @@ impl AdminClient {
     }
 
     /// Signed POST returning a decoded JSON body.
-    async fn post_json<T: for<'de> Deserialize<'de>>(
+    pub(crate) async fn post_json<T: for<'de> Deserialize<'de>>(
         &self,
         path: &str,
         query: &[(&str, String)],

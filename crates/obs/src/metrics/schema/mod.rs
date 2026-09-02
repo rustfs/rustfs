@@ -28,6 +28,7 @@ pub mod ilm;
 pub mod node_bucket;
 pub mod node_disk;
 pub mod notification_target;
+pub mod on_demand_migration_backfill;
 pub mod process_resource;
 pub mod replication;
 pub(crate) mod request;

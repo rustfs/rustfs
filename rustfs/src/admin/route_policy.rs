@@ -417,6 +417,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+        SET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+        GET_BUCKET_ON_DEMAND_MIGRATION,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
         HttpMethod::Get,
         "/rustfs/admin/export-bucket-metadata",
         EXPORT_BUCKET_METADATA,
@@ -2210,6 +2222,22 @@ mod tests {
             HttpMethod::Get,
             "/rustfs/admin/v3/on-demand-migration/{bucket}/status",
             GET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        // Backfill control (start/cancel) is a write; reading the checkpoint is not.
+        assert_action(
+            HttpMethod::Post,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+            GET_BUCKET_ON_DEMAND_MIGRATION,
+        );
+        assert_not_action(
+            HttpMethod::Get,
+            "/rustfs/admin/v3/on-demand-migration/{bucket}/backfill",
+            SET_BUCKET_ON_DEMAND_MIGRATION,
         );
         // Reads never require the write action, and the routes are not bucket-target routes.
         assert_not_action(
