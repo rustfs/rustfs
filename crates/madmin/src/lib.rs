@@ -20,6 +20,7 @@ pub mod health;
 pub mod info_commands;
 pub mod metrics;
 pub mod net;
+pub mod on_demand_migration;
 pub mod policy;
 pub mod service_commands;
 pub mod site_replication;
@@ -27,10 +28,14 @@ pub mod trace;
 pub mod user;
 pub mod utils;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use account::*;
 pub use client::*;
 pub use group::*;
 pub use info_commands::*;
+pub use on_demand_migration::*;
 pub use policy::*;
 pub use site_replication::*;
 pub use user::*;
