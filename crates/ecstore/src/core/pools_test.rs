@@ -195,8 +195,9 @@ mod capacity_dedup_tests {
 mod decommission_lock_order_tests {
     use crate::bucket::lifecycle::lifecycle::TRANSITION_PENDING;
     use crate::core::pools::{
-        DecommissionCapacityLockOrderBarrier, DecommissionCapacityOwner, DecommissionErasureLayout, DecommissionPoolCapacityInfo,
-        POOL_META_NAME, decommission_capacity_mutation_id, set_decommission_capacity_info_overrides_for_test,
+        DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX, DecommissionCapacityLockOrderBarrier, DecommissionCapacityOwner,
+        DecommissionErasureLayout, DecommissionPoolCapacityInfo, POOL_META_NAME, decommission_capacity_mutation_id,
+        set_decommission_capacity_info_overrides_for_test,
     };
     use crate::data_movement;
     use crate::disk::RUSTFS_META_BUCKET;
@@ -308,9 +309,18 @@ mod decommission_lock_order_tests {
 
     #[derive(Debug)]
     struct CapacityLeaseLossClient {
-        target: rustfs_lock::ObjectKey,
         control: Arc<CapacityLeaseLossControl>,
         active: tokio::sync::Mutex<HashMap<rustfs_lock::LockId, rustfs_lock::ObjectKey>>,
+    }
+
+    fn is_capacity_lease_resource(resource: &rustfs_lock::ObjectKey) -> bool {
+        resource.bucket.as_ref() == RUSTFS_META_BUCKET
+            && (resource.object.as_ref() == POOL_META_NAME
+                || resource
+                    .object
+                    .as_ref()
+                    .strip_prefix(DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX)
+                    .is_some_and(|suffix| suffix.starts_with('/')))
     }
 
     #[async_trait::async_trait]
@@ -345,7 +355,7 @@ mod decommission_lock_order_tests {
 
         async fn refresh(&self, lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
             let resource = self.active.lock().await.get(lock_id).cloned();
-            if resource.as_ref() == Some(&self.target) {
+            if resource.as_ref().is_some_and(is_capacity_lease_resource) {
                 self.control.calls.fetch_add(1, Ordering::Release);
                 return Ok(!self.control.fail_refresh.load(Ordering::Acquire));
             }
@@ -389,7 +399,6 @@ mod decommission_lock_order_tests {
         set.lockers = (0..set.lockers.len().max(1))
             .map(|_| {
                 Arc::new(CapacityLeaseLossClient {
-                    target: rustfs_lock::ObjectKey::new(RUSTFS_META_BUCKET, POOL_META_NAME),
                     control: Arc::clone(&refresh_calls),
                     active: tokio::sync::Mutex::new(HashMap::new()),
                 }) as Arc<dyn rustfs_lock::LockClient>
@@ -422,7 +431,6 @@ mod decommission_lock_order_tests {
             pool_meta_save_gate: tokio::sync::Mutex::new(
                 other_store.pool_meta_save_gate.lock().await.independent_clone_for_test(),
             ),
-            decommission_capacity_entry_gate: tokio::sync::Mutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         });

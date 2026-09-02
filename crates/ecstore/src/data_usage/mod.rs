@@ -2964,7 +2964,6 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: TokioMutex::new(()),
             pool_meta_save_gate: TokioMutex::default(),
-            decommission_capacity_entry_gate: TokioMutex::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
