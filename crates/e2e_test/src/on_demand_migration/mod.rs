@@ -12,27 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// #730: bucket subsystems still contain staged ECStore migration code.
+//! On-demand migration (ODM) end-to-end suite (rustfs/backlog#2147).
+//!
+//! `common` is the shared environment: one RustFS under test, one programmable
+//! fake S3 source, admin-API wrappers, seeding and local-state assertions.
+//! `harness_self_test` proves the harness itself; ODM behavior scenarios are
+//! separate modules wired by later tasks.
 
-pub mod bandwidth;
-pub mod bucket_target_sys;
-pub mod durability;
-pub mod error;
-pub mod lifecycle;
-pub mod metadata;
-pub mod metadata_sys;
-#[cfg(test)]
-mod metadata_test;
-pub mod migration;
-mod msgp_decode;
-pub mod object_lock;
-pub mod on_demand_migration;
-pub mod policy_sys;
-pub mod quota;
-pub mod remote_s3_client;
-pub mod replication;
-pub mod tagging;
-pub mod target;
-pub mod utils;
-pub mod versioning;
-pub mod versioning_sys;
+pub mod common;
+
+mod harness_self_test;

@@ -23,9 +23,16 @@ pub mod common;
 #[cfg(test)]
 pub mod chaos;
 
-// Programmable S3 target for replication failure-path tests (backlog#1147 repl-8).
+// Programmable S3 target for replication failure-path tests (backlog#1147 repl-8)
+// and on-demand-migration source scenarios (backlog#2151).
 #[cfg(test)]
 pub mod fake_s3_target;
+
+// On-demand migration (backlog#2147): shared two-server environment, admin
+// wrappers, and the harness self-test (backlog#2151). Behavior scenarios are
+// added by later ODM tasks.
+#[cfg(test)]
+pub mod on_demand_migration;
 
 // Socket-level network fault-injection proxy for black-box cluster tests
 // (backlog#1325 network fault-injection block): latency / blackhole / one-way

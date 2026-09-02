@@ -19,6 +19,7 @@
 //! layered on top of it by later tasks (rustfs/backlog#2147).
 
 pub mod config;
+pub mod source_client;
 
 pub use config::{
     ConfigPublishHook, FilterConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK, ON_DEMAND_MIGRATION_CONFIG_VERSION,

@@ -151,6 +151,13 @@ pub mod bucket {
             OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy,
             SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
         };
+        pub mod source_client {
+            pub use crate::bucket::on_demand_migration::source_client::{
+                SourceClient, SourceClientSpec, SourceError, SourceGet, SourceHead, SourceObject, SourcePage, SourceProbe,
+                SourceProvider, SourceSse, SourceTimeouts, USER_AGENT_SUFFIX, is_multipart_etag, range_header_value,
+                resolve_path_style,
+            };
+        }
     }
 
     pub mod metadata_sys {
@@ -205,6 +212,13 @@ pub mod bucket {
         pub mod checker {
             pub use crate::bucket::quota::checker::QuotaChecker;
         }
+    }
+
+    pub mod remote_s3_client {
+        pub use crate::bucket::remote_s3_client::{
+            PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, build_remote_s3_client,
+            validate_remote_endpoint,
+        };
     }
 
     pub mod replication {
