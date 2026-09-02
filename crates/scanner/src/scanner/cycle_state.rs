@@ -2027,7 +2027,7 @@ fn legacy_incomplete_usage_fence(data: &[u8], usage: &DataUsageInfo) -> Option<L
     legacy_empty_usage_fence(data, usage).or_else(|| legacy_non_empty_usage_fence(data, usage))
 }
 
-// RUSTFS_COMPAT_TODO(backlog-2181): accept rc.1-rc.3 usage floors that were fenced before a scanner cycle completed. Remove after those releases are no longer supported direct-upgrade sources.
+// RUSTFS_COMPAT_TODO(backlog-2122): accept rc.1-rc.3 usage floors that were fenced before a scanner cycle completed. Remove after those releases are no longer supported direct-upgrade sources.
 fn legacy_non_empty_usage_fence(data: &[u8], usage: &DataUsageInfo) -> Option<LegacyIncompleteUsageFence> {
     if usage.last_update.is_none()
         || usage.scanner_cycle.is_some()
