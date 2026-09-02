@@ -52,6 +52,7 @@ use crate::storage_api_contracts::{
     object::{DeleteAccounting, ObjectIO as _, ObjectOperations as _},
 };
 use parking_lot::Mutex as ParkingMutex;
+use rustfs_filemeta::ObjectPartInfo;
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_hold_duration, record_object_lock_diag_slow_acquire,
     record_object_lock_diag_slow_hold,
@@ -2114,18 +2115,6 @@ fn remote_tuple_publication_object_source_matches(expected: &ObjectInfo, current
     let (Ok(expected_actual_size), Ok(current_actual_size)) = (expected.get_actual_size(), current.get_actual_size()) else {
         return false;
     };
-    let parts_match = expected.parts.len() == current.parts.len()
-        && expected.parts.iter().all(|expected_part| {
-            current
-                .parts
-                .iter()
-                .find(|current_part| current_part.number == expected_part.number)
-                .is_some_and(|current_part| {
-                    current_part.size == expected_part.size
-                        && current_part.actual_size == expected_part.actual_size
-                        && current_part.etag == expected_part.etag
-                })
-        });
 
     expected.data_dir.is_some_and(|data_dir| !data_dir.is_nil())
         && expected.data_dir == current.data_dir
@@ -2133,6 +2122,7 @@ fn remote_tuple_publication_object_source_matches(expected: &ObjectInfo, current
         && expected.delete_marker == current.delete_marker
         && expected.size == current.size
         && expected_actual_size == current_actual_size
+        && expected.etag == current.etag
         && expected.checksum == current.checksum
         && expected.mod_time == current.mod_time
         && expected.storage_class == current.storage_class
@@ -2154,7 +2144,24 @@ fn remote_tuple_publication_object_source_matches(expected: &ObjectInfo, current
         && expected.transitioned_object.free_version == current.transitioned_object.free_version
         && expected.transitioned_object.status == current.transitioned_object.status
         && expected.transition_version_state == current.transition_version_state
-        && parts_match
+        && remote_tuple_publication_parts_match(&expected.parts, &current.parts)
+}
+
+fn remote_tuple_publication_parts_match(expected: &[ObjectPartInfo], current: &[ObjectPartInfo]) -> bool {
+    if expected.len() != current.len() {
+        return false;
+    }
+    let Some(mut current_parts) = crate::data_movement::data_movement_parts_by_number(current) else {
+        return false;
+    };
+
+    expected.iter().all(|expected_part| {
+        current_parts.remove(&expected_part.number).is_some_and(|current_part| {
+            current_part.size == expected_part.size
+                && current_part.actual_size == expected_part.actual_size
+                && current_part.etag == expected_part.etag
+        })
+    })
 }
 
 impl RemoteTuplePublicationFence {
@@ -5863,6 +5870,241 @@ mod tests {
             ..target
         };
         assert!(!ECStore::is_equivalent_decommission_capacity_target(&source, &wrong_bucket));
+    }
+
+    fn publication_part(number: usize) -> ObjectPartInfo {
+        ObjectPartInfo {
+            number,
+            size: 100 + number,
+            actual_size: i64::try_from(200 + number).expect("test part size should fit in i64"),
+            etag: format!("part-etag-{number}"),
+            ..Default::default()
+        }
+    }
+
+    fn publication_source(parts: Vec<ObjectPartInfo>) -> ObjectInfo {
+        ObjectInfo {
+            data_dir: Some(Uuid::new_v4()),
+            version_id: Some(Uuid::new_v4()),
+            size: 4096,
+            actual_size: 4096,
+            etag: Some("object-etag".to_string()),
+            checksum: Some(Bytes::from_static(b"object-checksum")),
+            mod_time: Some(time::OffsetDateTime::UNIX_EPOCH),
+            parts: Arc::new(parts),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn publication_parts_match_is_order_independent_and_bijective() {
+        let ordered = vec![publication_part(1), publication_part(2), publication_part(3)];
+        let mut reversed = ordered.clone();
+        reversed.reverse();
+
+        assert!(remote_tuple_publication_parts_match(&[], &[]));
+        assert!(remote_tuple_publication_parts_match(&ordered, &ordered));
+        assert!(remote_tuple_publication_parts_match(&ordered, &reversed));
+        assert!(!remote_tuple_publication_parts_match(&ordered[..2], &ordered));
+
+        let expected_duplicate = vec![publication_part(1), publication_part(1)];
+        let current_unique = vec![publication_part(1), publication_part(2)];
+        assert!(
+            !remote_tuple_publication_parts_match(&expected_duplicate, &current_unique),
+            "two expected entries must not reuse the same current part"
+        );
+        assert!(!remote_tuple_publication_parts_match(&current_unique, &expected_duplicate));
+        assert!(!remote_tuple_publication_parts_match(&expected_duplicate, &expected_duplicate));
+    }
+
+    #[test]
+    fn publication_parts_match_preserves_exact_part_identity_contract() {
+        let expected = vec![publication_part(1)];
+
+        let mut different_number = expected.clone();
+        different_number[0].number = 2;
+        assert!(!remote_tuple_publication_parts_match(&expected, &different_number));
+
+        let mut different_size = expected.clone();
+        different_size[0].size += 1;
+        assert!(!remote_tuple_publication_parts_match(&expected, &different_size));
+
+        let mut different_actual_size = expected.clone();
+        different_actual_size[0].actual_size += 1;
+        assert!(!remote_tuple_publication_parts_match(&expected, &different_actual_size));
+
+        let mut different_etag = expected.clone();
+        different_etag[0].etag.push_str("-changed");
+        assert!(!remote_tuple_publication_parts_match(&expected, &different_etag));
+
+        let mut ignored_fields = expected.clone();
+        ignored_fields[0].index = Some(Bytes::from_static(b"different-index"));
+        ignored_fields[0].checksums = Some(HashMap::from([("CRC32C".to_string(), "different".to_string())]));
+        ignored_fields[0].mod_time = Some(time::OffsetDateTime::UNIX_EPOCH);
+        assert!(
+            remote_tuple_publication_parts_match(&expected, &ignored_fields),
+            "the publication fence must retain its existing checksum/index/mod-time compatibility contract"
+        );
+
+        let zero_actual_size = vec![ObjectPartInfo {
+            actual_size: 0,
+            ..publication_part(1)
+        }];
+        assert!(
+            !remote_tuple_publication_parts_match(&zero_actual_size, &expected),
+            "the publication fence compares raw part actual sizes without the broader comparator's fallback"
+        );
+    }
+
+    #[test]
+    fn publication_source_match_rejects_object_etag_and_identity_mutations() {
+        let expected = publication_source(vec![publication_part(1)]);
+        assert!(remote_tuple_publication_object_source_matches(&expected, &expected));
+
+        let mut current = expected.clone();
+        current.etag = Some("changed-object-etag".to_string());
+        assert!(!remote_tuple_publication_object_source_matches(&expected, &current));
+
+        let mut current = expected.clone();
+        current.checksum = Some(Bytes::from_static(b"changed-checksum"));
+        assert!(!remote_tuple_publication_object_source_matches(&expected, &current));
+
+        let mut current = expected.clone();
+        current.actual_size += 1;
+        assert!(!remote_tuple_publication_object_source_matches(&expected, &current));
+
+        let mut current = expected.clone();
+        current.data_dir = Some(Uuid::new_v4());
+        assert!(!remote_tuple_publication_object_source_matches(&expected, &current));
+
+        let mut current = expected.clone();
+        current.version_id = Some(Uuid::new_v4());
+        assert!(!remote_tuple_publication_object_source_matches(&expected, &current));
+
+        let mut current = expected.clone();
+        current.mod_time = current.mod_time.map(|mod_time| mod_time + time::Duration::SECOND);
+        assert!(!remote_tuple_publication_object_source_matches(&expected, &current));
+    }
+
+    #[test]
+    fn publication_source_match_preserves_effective_actual_size_compatibility() {
+        let expected = publication_source(vec![publication_part(1)]);
+        let current = ObjectInfo {
+            actual_size: 0,
+            ..expected.clone()
+        };
+
+        assert_eq!(
+            expected.get_actual_size().expect("expected size should be valid"),
+            current.get_actual_size().expect("current size should be valid")
+        );
+        assert!(remote_tuple_publication_object_source_matches(&expected, &current));
+    }
+
+    #[test]
+    fn publication_source_match_rejects_duplicate_parts_through_the_full_fence() {
+        let expected = publication_source(vec![publication_part(1), publication_part(1)]);
+        let current = ObjectInfo {
+            parts: Arc::new(vec![publication_part(1), publication_part(2)]),
+            ..expected.clone()
+        };
+
+        assert!(
+            !remote_tuple_publication_object_source_matches(&expected, &current),
+            "the full source fence must reject the original non-bijective false-positive"
+        );
+    }
+
+    #[test]
+    fn publication_source_match_handles_10_000_reversed_parts_without_payload_cloning() {
+        let parts = Arc::new((1..=10_000).map(publication_part).collect::<Vec<_>>());
+        let mut reversed = parts.as_ref().clone();
+        reversed.reverse();
+        let expected = publication_source(Vec::new());
+        let expected = ObjectInfo {
+            parts: Arc::clone(&parts),
+            ..expected
+        };
+        let current = ObjectInfo {
+            parts: Arc::new(reversed),
+            ..expected.clone()
+        };
+        let expected_parts = Arc::clone(&expected.parts);
+
+        assert!(remote_tuple_publication_object_source_matches(&expected, &current));
+        assert!(Arc::ptr_eq(&expected.parts, &expected_parts));
+    }
+
+    #[tokio::test]
+    async fn publication_commit_guard_rejects_an_etag_only_source_change() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store =
+            Arc::new(new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await);
+        let bucket = "publication-etag-source-change";
+        let object = "source.bin";
+        for set in [&first_set, &second_set] {
+            set.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("publication ETag test bucket should be created");
+        }
+
+        let mut source_body = PutObjReader::from_vec(b"source body".to_vec());
+        first_set
+            .put_object(bucket, object, &mut source_body, &ObjectOptions::default())
+            .await
+            .expect("publication source should be written");
+        let source = first_set
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    include_part_checksums: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("publication source should be readable");
+        let publication = store
+            .acquire_remote_tuple_publication_fence(bucket, 0, &source, false)
+            .await
+            .expect("the source snapshot should produce a publication capability");
+
+        let changed = first_set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(HashMap::from([("etag".to_string(), "changed-etag".to_string())])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the source ETag should be updated in place");
+        assert_ne!(source.etag, changed.etag);
+        let unchanged_except_etag = ObjectInfo {
+            etag: source.etag.clone(),
+            ..changed.clone()
+        };
+        assert!(
+            remote_tuple_publication_object_source_matches(&source, &unchanged_except_etag),
+            "the persisted source update fixture must differ only by object ETag"
+        );
+
+        let encoded = encode_dir_object(object);
+        let err = match publication.into_commit_guard(1, bucket, &encoded).await {
+            Ok(_) => panic!("the publication guard must reject an ETag-only source change"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::DataMovementOverwriteErr(_, _, _)));
+        assert!(
+            second_set
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "a rejected publication must not create a target object"
+        );
     }
 
     #[tokio::test]
