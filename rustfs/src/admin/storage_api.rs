@@ -1001,7 +1001,7 @@ pub(crate) mod runtime {
 }
 
 pub(crate) mod s3 {
-    pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, header};
+    pub(crate) use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, auth, header};
 
     /// Build an `S3Error` without reaching for the `s3s` error macro.
     ///

@@ -43,6 +43,7 @@ use crate::admin::storage_api::bucket::on_demand_migration::{
 use crate::admin::storage_api::bucket::remote_s3_client::{PathStyle as RemotePathStyle, RemoteCredentials, RemoteS3ClientError};
 use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
+use crate::admin::storage_api::s3::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, error as admin_s3_error};
 use crate::admin::utils::{extract_query_params, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -52,7 +53,6 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -168,7 +168,7 @@ fn custom_error(code: &'static str, status: StatusCode, message: String) -> S3Er
 fn bucket_from_params(params: &Params<'_, '_>) -> S3Result<String> {
     let bucket = params.get("bucket").unwrap_or("").to_string();
     if bucket.is_empty() {
-        return Err(s3_error!(InvalidRequest, "bucket name is required"));
+        return Err(admin_s3_error(S3ErrorCode::InvalidRequest, "bucket name is required"));
     }
     Ok(bucket)
 }
@@ -178,7 +178,7 @@ async fn authorize_for_bucket(req: &S3Request<Body>, action: AdminAction, bucket
     let cred = authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
 
     let Some(store) = object_store_from_req(req) else {
-        return Err(s3_error!(InternalError, "object store is not initialized"));
+        return Err(admin_s3_error(S3ErrorCode::InternalError, "object store is not initialized"));
     };
     store
         .get_bucket_info(bucket, &BucketOptions::default())
@@ -193,7 +193,7 @@ async fn authorize_for_bucket(req: &S3Request<Body>, action: AdminAction, bucket
 /// the log.
 fn license_gate() -> S3Result<()> {
     license_check().map_err(|err| match err.kind() {
-        std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{err}"),
+        std::io::ErrorKind::PermissionDenied => admin_s3_error(S3ErrorCode::AccessDenied, format!("{err}")),
         _ => {
             tracing::error!(
                 event = EVENT_ADMIN_ON_DEMAND_MIGRATION_CONFIG,
@@ -202,20 +202,23 @@ fn license_gate() -> S3Result<()> {
                 error = %err,
                 "license check failed"
             );
-            s3_error!(InternalError, "License validation failed")
+            admin_s3_error(S3ErrorCode::InternalError, "License validation failed")
         }
     })
 }
 
 fn parse_config(body: &[u8]) -> S3Result<OnDemandMigrationConfig> {
     if body.is_empty() {
-        return Err(s3_error!(InvalidRequest, "request body is required: an on-demand migration config JSON"));
+        return Err(admin_s3_error(
+            S3ErrorCode::InvalidRequest,
+            "request body is required: an on-demand migration config JSON",
+        ));
     }
     OnDemandMigrationConfig::from_json(body).map_err(|err| match err {
         OnDemandMigrationConfigError::Malformed(reason) => {
-            s3_error!(InvalidArgument, "invalid on-demand migration config: {reason}")
+            admin_s3_error(S3ErrorCode::InvalidArgument, format!("invalid on-demand migration config: {reason}"))
         }
-        other => s3_error!(InvalidArgument, "{other}"),
+        other => admin_s3_error(S3ErrorCode::InvalidArgument, format!("{other}")),
     })
 }
 
@@ -252,7 +255,12 @@ async fn replication_target_endpoints(bucket: &str) -> S3Result<Vec<(String, Str
     let targets = match metadata_sys::list_bucket_targets(bucket).await {
         Ok(targets) => targets,
         Err(StorageError::ConfigNotFound) => return Ok(Vec::new()),
-        Err(err) => return Err(s3_error!(InternalError, "failed to read replication targets: {err}")),
+        Err(err) => {
+            return Err(admin_s3_error(
+                S3ErrorCode::InternalError,
+                format!("failed to read replication targets: {err}"),
+            ));
+        }
     };
     Ok(targets
         .targets
@@ -272,7 +280,7 @@ async fn validate_config(bucket: &str, config: &OnDemandMigrationConfig) -> S3Re
             local_endpoints: &local_endpoints,
             replication_target_endpoints: &replication_targets,
         })
-        .map_err(|err| s3_error!(InvalidArgument, "{err}"))
+        .map_err(|err| admin_s3_error(S3ErrorCode::InvalidArgument, format!("{err}")))
 }
 
 fn source_provider(config: &OnDemandMigrationConfig) -> SourceProvider {
@@ -326,10 +334,11 @@ pub(crate) fn source_client_spec(config: &OnDemandMigrationConfig) -> SourceClie
 /// naming the field instead of an opaque internal error.
 fn client_build_error(err: RemoteS3ClientError) -> S3Error {
     match err {
-        RemoteS3ClientError::MissingCredentials => {
-            s3_error!(InvalidArgument, "source.credentials is required: anonymous sources are not supported yet")
-        }
-        other => s3_error!(InvalidArgument, "source client cannot be built: {other}"),
+        RemoteS3ClientError::MissingCredentials => admin_s3_error(
+            S3ErrorCode::InvalidArgument,
+            "source.credentials is required: anonymous sources are not supported yet",
+        ),
+        other => admin_s3_error(S3ErrorCode::InvalidArgument, format!("source client cannot be built: {other}")),
     }
 }
 
@@ -365,7 +374,7 @@ async fn probe_source(bucket: &str, config: &OnDemandMigrationConfig) -> S3Resul
 fn format_updated_at(updated_at: OffsetDateTime) -> S3Result<String> {
     updated_at
         .format(&Rfc3339)
-        .map_err(|err| s3_error!(InternalError, "failed to format timestamp: {err}"))
+        .map_err(|err| admin_s3_error(S3ErrorCode::InternalError, format!("failed to format timestamp: {err}")))
 }
 
 /// Ask every peer to reload the bucket metadata so the new source takes
@@ -420,7 +429,7 @@ impl Operation for SetBucketOnDemandMigrationHandler {
         // must not receive this config.
         let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
             .await
-            .map_err(|err| s3_error!(InternalError, "failed to capture bucket incarnation: {err}"))?;
+            .map_err(|err| admin_s3_error(S3ErrorCode::InternalError, format!("failed to capture bucket incarnation: {err}")))?;
 
         let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &cred.secret_key).await?;
         let config = parse_config(&body)?;
@@ -432,11 +441,13 @@ impl Operation for SetBucketOnDemandMigrationHandler {
         } else {
             let json = config
                 .to_json()
-                .map_err(|err| s3_error!(InternalError, "failed to encode config: {err}"))?;
+                .map_err(|err| admin_s3_error(S3ErrorCode::InternalError, format!("failed to encode config: {err}")))?;
             let updated_at =
                 metadata_sys::update_if_incarnation(&bucket, BUCKET_ON_DEMAND_MIGRATION_CONFIG, json, expected_incarnation_id)
                     .await
-                    .map_err(|err| s3_error!(InternalError, "failed to save on-demand migration config: {err}"))?;
+                    .map_err(|err| {
+                        admin_s3_error(S3ErrorCode::InternalError, format!("failed to save on-demand migration config: {err}"))
+                    })?;
             info!(
                 event = EVENT_ADMIN_ON_DEMAND_MIGRATION_CONFIG,
                 component = LOG_COMPONENT_ADMIN,
@@ -467,9 +478,9 @@ impl Operation for GetBucketOnDemandMigrationHandler {
         let bucket = bucket_from_params(&params)?;
         let cred = authorize_for_bucket(&req, AdminAction::GetBucketOnDemandMigrationAction, &bucket).await?;
 
-        let Some((config, updated_at)) = metadata_sys::get_on_demand_migration_config(&bucket)
-            .await
-            .map_err(|err| s3_error!(InternalError, "failed to read on-demand migration config: {err}"))?
+        let Some((config, updated_at)) = metadata_sys::get_on_demand_migration_config(&bucket).await.map_err(|err| {
+            admin_s3_error(S3ErrorCode::InternalError, format!("failed to read on-demand migration config: {err}"))
+        })?
         else {
             return Err(custom_error(
                 ERR_CODE_NO_SUCH_CONFIGURATION,
@@ -496,13 +507,15 @@ impl Operation for DeleteBucketOnDemandMigrationHandler {
 
         let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
             .await
-            .map_err(|err| s3_error!(InternalError, "failed to capture bucket incarnation: {err}"))?;
+            .map_err(|err| admin_s3_error(S3ErrorCode::InternalError, format!("failed to capture bucket incarnation: {err}")))?;
 
         // Idempotent: clearing an absent config still rewrites the metadata
         // (fresh timestamp) and answers 204. Pulled objects stay in place.
         metadata_sys::delete_if_incarnation(&bucket, BUCKET_ON_DEMAND_MIGRATION_CONFIG, expected_incarnation_id)
             .await
-            .map_err(|err| s3_error!(InternalError, "failed to clear on-demand migration config: {err}"))?;
+            .map_err(|err| {
+                admin_s3_error(S3ErrorCode::InternalError, format!("failed to clear on-demand migration config: {err}"))
+            })?;
 
         info!(
             event = EVENT_ADMIN_ON_DEMAND_MIGRATION_CONFIG,
@@ -524,9 +537,9 @@ impl Operation for GetBucketOnDemandMigrationStatusHandler {
         let bucket = bucket_from_params(&params)?;
         let cred = authorize_for_bucket(&req, AdminAction::GetBucketOnDemandMigrationAction, &bucket).await?;
 
-        let config = metadata_sys::get_on_demand_migration_config(&bucket)
-            .await
-            .map_err(|err| s3_error!(InternalError, "failed to read on-demand migration config: {err}"))?;
+        let config = metadata_sys::get_on_demand_migration_config(&bucket).await.map_err(|err| {
+            admin_s3_error(S3ErrorCode::InternalError, format!("failed to read on-demand migration config: {err}"))
+        })?;
 
         let status = BucketOnDemandMigrationStatus {
             configured: config.is_some(),
@@ -809,6 +822,7 @@ mod store_tests {
     use crate::admin::runtime_sources::{NotificationSystemInterface, publish_test_app_context};
     use crate::admin::storage_api::NotificationSys;
     use crate::admin::storage_api::runtime_sources::ECStore;
+    use crate::admin::storage_api::s3::auth as s3_auth;
     use http::{Extensions, HeaderMap, Uri};
     use http_body_util::BodyExt as _;
     use rustfs_iam::store::{Store as _, UserType};
@@ -833,9 +847,9 @@ mod store_tests {
             uri: Uri::try_from(uri).expect("valid uri"),
             headers: HeaderMap::new(),
             extensions: Extensions::new(),
-            credentials: Some(s3s::auth::Credentials {
+            credentials: Some(s3_auth::Credentials {
                 access_key: access_key.to_string(),
-                secret_key: s3s::auth::SecretKey::from(secret_key.to_string()),
+                secret_key: s3_auth::SecretKey::from(secret_key.to_string()),
             }),
             region: None,
             service: None,
