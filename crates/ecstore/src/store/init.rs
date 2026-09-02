@@ -2308,6 +2308,200 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial(storage_class_env)]
+    async fn copy_object_immediately_reads_small_completed_multipart_source() {
+        let temp_dir = tempfile::tempdir().expect("create small multipart copy store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "small-multipart-copy", &[1])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("small-multipart-copy-{}", Uuid::new_v4());
+        let source_object = "docker/registry/v2/repositories/example/_uploads/upload-id/data";
+        let target_object = "docker/registry/v2/blobs/sha256/c0/digest/data";
+        let payload = vec![0xAB; 273];
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket for small multipart copy");
+        let upload = store
+            .new_multipart_upload(&bucket, source_object, &ObjectOptions::default())
+            .await
+            .expect("create source multipart upload");
+        let mut part_reader = PutObjReader::from_vec(payload.clone());
+        let part = store
+            .put_object_part(&bucket, source_object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("stage small multipart source part");
+        let completed = store
+            .clone()
+            .complete_multipart_upload(
+                &bucket,
+                source_object,
+                &upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete the small multipart source");
+        assert_eq!(completed.get_actual_size().expect("completed object logical size"), payload.len() as i64);
+
+        let source_reader = store
+            .get_object_reader(&bucket, source_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("completed multipart source should be immediately readable");
+        let mut copy_info = source_reader.object_info.clone();
+        let actual_size = copy_info.get_actual_size().expect("copy source logical size should resolve");
+        assert_eq!(actual_size, payload.len() as i64);
+        let copy_reader = rustfs_rio::HashReader::from_stream(source_reader.stream, actual_size, actual_size, None, None, false)
+            .expect("copy source hash reader should build");
+        copy_info.put_object_reader = Some(PutObjReader::new(copy_reader));
+
+        store
+            .copy_object(
+                &bucket,
+                source_object,
+                &bucket,
+                target_object,
+                &mut copy_info,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("CopyObject should accept a freshly completed multipart source");
+
+        let mut target_reader = store
+            .get_object_reader(&bucket, target_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("copied target should be readable");
+        let mut target_body = Vec::new();
+        target_reader
+            .stream
+            .read_to_end(&mut target_body)
+            .await
+            .expect("target body should stream");
+        assert_eq!(target_body, payload);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
+    async fn complete_multipart_waits_for_tail_rename_before_copy_source_visibility() {
+        let temp_dir = tempfile::tempdir().expect("create early-ack multipart copy store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "early-ack-multipart-copy", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+
+        let bucket = format!("early-ack-multipart-copy-{}", Uuid::new_v4());
+        let source_object = "docker/registry/v2/repositories/example/_uploads/upload-id/data";
+        let target_object = "docker/registry/v2/blobs/sha256/c0/digest/data";
+        let payload = vec![0xCD; 273];
+
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket for early-ack multipart copy");
+        let upload = store
+            .new_multipart_upload(&bucket, source_object, &ObjectOptions::default())
+            .await
+            .expect("create source multipart upload");
+        let mut part_reader = PutObjReader::from_vec(payload.clone());
+        let part = store
+            .put_object_part(&bucket, source_object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+            .await
+            .expect("stage small multipart source part");
+        let completed_parts = vec![crate::storage_api_contracts::multipart::CompletePart {
+            part_num: part.part_num,
+            etag: part.etag,
+            ..Default::default()
+        }];
+
+        temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let rename_tasks = crate::set_disk::rename_fanout_barrier::observe_tasks(source_object);
+            let rename_barrier = crate::set_disk::rename_fanout_barrier::arm(
+                source_object,
+                0,
+                crate::set_disk::rename_fanout_barrier::PHASE_RENAME,
+            );
+            let complete_store = Arc::clone(&store);
+            let complete_bucket = bucket.clone();
+            let complete_upload_id = upload.upload_id.clone();
+            let mut complete = tokio::spawn(async move {
+                complete_store
+                    .complete_multipart_upload(
+                        &complete_bucket,
+                        source_object,
+                        &complete_upload_id,
+                        completed_parts,
+                        &ObjectOptions::default(),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                .await
+                .expect("multipart completion should pause one tail disk during rename");
+            assert!(
+                rename_tasks.running() >= 1,
+                "the paused multipart tail disk must remain in flight before completion returns"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut complete).await.is_err(),
+                "CompleteMultipartUpload must not return while a copy source rename tail is still pending"
+            );
+            rename_barrier.release();
+            complete
+                .await
+                .expect("multipart completion task should join")
+                .expect("multipart completion should return after every rename tail finishes");
+
+            let source_reader = store
+                .get_object_reader(&bucket, source_object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("completed multipart source should be immediately readable after success");
+            let mut copy_info = source_reader.object_info.clone();
+            let actual_size = copy_info.get_actual_size().expect("copy source logical size should resolve");
+            assert_eq!(actual_size, payload.len() as i64);
+            let copy_reader =
+                rustfs_rio::HashReader::from_stream(source_reader.stream, actual_size, actual_size, None, None, false)
+                    .expect("copy source hash reader should build");
+            copy_info.put_object_reader = Some(PutObjReader::new(copy_reader));
+
+            store
+                .copy_object(
+                    &bucket,
+                    source_object,
+                    &bucket,
+                    target_object,
+                    &mut copy_info,
+                    &ObjectOptions::default(),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("CopyObject should accept a freshly completed multipart source");
+        })
+        .await;
+
+        let mut target_reader = store
+            .get_object_reader(&bucket, target_object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("copied target should be readable after tail release");
+        let mut target_body = Vec::new();
+        target_reader
+            .stream
+            .read_to_end(&mut target_body)
+            .await
+            .expect("target body should stream");
+        assert_eq!(target_body, payload);
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(storage_class_env)]
     async fn data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease() {
         let temp_dir = tempfile::tempdir().expect("create multipart staging-fence store dir");
         let (ctx, store, shutdown) =
