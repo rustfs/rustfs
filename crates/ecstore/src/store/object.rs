@@ -1398,6 +1398,19 @@ async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
     if let Some(state) = state {
         state.arrived.notify_one();
         state.release.notified().await;
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn notify_delete_namespace_pending(bucket: &str) {
+    let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete snapshot barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket)
+        .cloned();
+    if let Some(state) = state {
         state.namespace_pending.notify_one();
     }
 }
@@ -2585,6 +2598,10 @@ impl ECStore {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
+        #[cfg(any(test, feature = "test-util"))]
+        if matches!(op, "delete_object" | "delete_objects") {
+            notify_delete_namespace_pending(bucket);
+        }
         let guard = ns_lock
             .get_write_lock(get_lock_acquire_timeout())
             .await
@@ -4674,7 +4691,7 @@ impl ECStore {
             Ok(guards) => guards,
             Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if !_object_lock_guards.is_empty() {
             notify_delete_namespace_acquired(bucket);
         }

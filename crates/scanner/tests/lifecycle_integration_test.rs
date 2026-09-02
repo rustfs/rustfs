@@ -721,10 +721,11 @@ mod serial_tests {
             !delete_start_barrier.namespace_acquired() && !expiry.is_finished(),
             "expiry must wait for the in-flight GET's object read lock before committing the local delete"
         );
-        drop(delete_start_barrier);
 
         get_barrier.release();
         let expiry_outcome = tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, &mut expiry).await;
+        let delete_lock_acquired_after_get = delete_start_barrier.namespace_acquired();
+        drop(delete_start_barrier);
         let remove_arrival = tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, remove_barrier.wait_until_paused()).await;
 
         // Snapshot only lock-free observables while the cleanup worker holds
@@ -754,6 +755,10 @@ mod serial_tests {
             .expect("expire_transitioned_object must not wait for asynchronous remote-tier cleanup")
             .expect("the expiry task should not panic")
             .expect("expire_transitioned_object should succeed");
+        assert!(
+            delete_lock_acquired_after_get,
+            "expiry must acquire the object write lock only after the in-flight GET releases its read lock"
+        );
         remove_arrival.expect("the post-commit free-version worker should reach the remote DELETE barrier");
         remove_operation_dropped
             .expect("the remote DELETE should have reached the barrier")
