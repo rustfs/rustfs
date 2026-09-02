@@ -462,6 +462,7 @@ async fn cycle_budget_persist_cursor_failure_is_recovery_required() {
         &mut cycle,
         &mut revision,
         &mut leader_epoch,
+        false,
         std::future::pending(),
     )
     .await;
@@ -476,6 +477,52 @@ async fn cycle_budget_persist_cursor_failure_is_recovery_required() {
     assert_eq!(report.cycle_recovery_required_total, 1);
     assert_eq!(report.cycle_last_progress_age, 17);
     assert!(report.leader_lease_without_progress);
+}
+
+#[tokio::test]
+async fn cycle_budget_fence_accepts_bootstrap_pending_usage_marker() {
+    let store = Arc::new(MemoryConfigStore::default());
+    initialize_usage_baseline_bootstrap(store.clone())
+        .await
+        .expect("usage reset should publish a bootstrap marker");
+
+    let ctx = CancellationToken::new();
+    let mut revision = DataUsageCacheRevision::Missing;
+    let mut cycle = CurrentCycle {
+        current: 12,
+        next: 12,
+        ..Default::default()
+    };
+    let mut leader_epoch = 0;
+
+    let fenced = fence_scanner_epoch_after_cycle_timeout(
+        &ctx,
+        store.clone(),
+        &mut cycle,
+        &mut revision,
+        &mut leader_epoch,
+        true,
+        std::future::pending(),
+    )
+    .await;
+
+    assert!(fenced, "a valid reset bootstrap marker must not force cycle recovery after budget expiry");
+    assert!(!cycle_timeout_requires_recovery(true, true, fenced));
+    assert_eq!(leader_epoch, 1);
+
+    let persisted_cycle = read_config(store.clone(), &DATA_USAGE_BLOOM_NAME_PATH)
+        .await
+        .expect("timeout fence should persist the next leader epoch");
+    let (_, persisted_epoch) = decode_scanner_cycle_state(&persisted_cycle).expect("persisted epoch fence should decode");
+    assert_eq!(persisted_epoch, 1);
+
+    let usage = read_config(store, DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .expect("timeout fence should keep the bootstrap usage marker");
+    let usage = serde_json::from_slice::<DataUsageInfo>(&usage).expect("bootstrap marker should decode");
+    assert!(data_usage_info_is_bootstrap_pending(&usage));
+    assert_eq!(usage.scanner_epoch, Some(1));
+    assert!(!data_usage_info_has_persisted_baseline_identity(&usage));
 }
 
 #[tokio::test]
@@ -515,6 +562,7 @@ async fn cycle_budget_deadline_handler_fences_and_releases_guard() {
             cycle_revision: &mut cycle_revision,
             leader_epoch: &mut leader_epoch,
             cycle_budget: &budget,
+            allow_bootstrap_pending: false,
         },
         true,
         &mut guard,

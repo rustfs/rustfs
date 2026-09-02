@@ -1441,6 +1441,7 @@ async fn fence_scanner_epoch_after_cycle_timeout<Store, LockLost>(
     cycle_info: &mut CurrentCycle,
     cycle_revision: &mut DataUsageCacheRevision,
     leader_epoch: &mut u64,
+    allow_bootstrap_pending: bool,
     lock_lost: LockLost,
 ) -> bool
 where
@@ -1454,7 +1455,7 @@ where
         cycle_info,
         cycle_revision,
         leader_epoch,
-        false,
+        allow_bootstrap_pending,
         ScannerCycleResetPolicy::None,
     );
     tokio::pin!(claim);
@@ -1476,6 +1477,7 @@ struct ScannerCycleDeadlineState<'a> {
     cycle_revision: &'a mut DataUsageCacheRevision,
     leader_epoch: &'a mut u64,
     cycle_budget: &'a ScannerCycleBudget,
+    allow_bootstrap_pending: bool,
 }
 
 fn cycle_timeout_requires_recovery(worker_stopped: bool, cycle_state_persisted: bool, generation_fenced: bool) -> bool {
@@ -1497,6 +1499,7 @@ async fn handle_scanner_cycle_deadline<Store>(
         state.cycle_info,
         state.cycle_revision,
         state.leader_epoch,
+        state.allow_bootstrap_pending,
         guard.lock_lost_notified(),
     )
     .await;
@@ -2747,6 +2750,7 @@ async fn run_data_scanner_with_maintenance_state(
                         cycle_revision: &mut cycle_revision,
                         leader_epoch: &mut leader_epoch,
                         cycle_budget: &cycle_budget,
+                        allow_bootstrap_pending: allow_usage_floor_bootstrap_pending,
                     },
                     worker_stopped,
                     &mut guard,
@@ -3036,6 +3040,7 @@ async fn run_data_scanner_with_maintenance_state(
                         cycle_revision: &mut cycle_revision,
                         leader_epoch: &mut leader_epoch,
                         cycle_budget: &cycle_budget,
+                        allow_bootstrap_pending: allow_usage_floor_bootstrap_pending,
                     },
                     worker_stopped,
                     &mut guard,
