@@ -19,13 +19,10 @@
 //! layered on top of it by later tasks (rustfs/backlog#2147).
 
 pub mod config;
+pub mod source_client;
 
 pub use config::{
     ConfigPublishHook, FilterConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK, ON_DEMAND_MIGRATION_CONFIG_VERSION,
     OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy, SourceConfig,
     SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
 };
-//! On-demand migration (ODM): serve and back-fill objects from an external
-//! S3-compatible source bucket.
-
-pub mod source_client;
