@@ -37,8 +37,9 @@
 //!   header can therefore not be used to escape into an attacker-chosen bucket.
 //! - **Bucket extraction mirrors s3s host routing.** Virtual-hosted-style
 //!   requests resolve the bucket from the Host/authority against the same
-//!   expanded server-domain set the s3s router uses; everything else takes the
-//!   first path segment. Admin and table-catalog namespaces are not buckets.
+//!   configured server-domain set the s3s router uses, ignoring valid explicit
+//!   ports the same way s3s does; everything else takes the first path segment.
+//!   Admin and table-catalog namespaces are not buckets.
 //! - **Infra traffic is exempt** ([`is_rate_limit_exempt_path`]): health and
 //!   profiling probes, internode RPC/gRPC, and the console (which has its own
 //!   limiter, sharing this module's [`RateLimiter`] core).
@@ -55,7 +56,7 @@
 use crate::server::{
     CONSOLE_PREFIX, FAVICON_PATH, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_HEALTH_CLUSTER_PATH,
     MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
-    RPC_PREFIX, RemoteAddr, TONIC_PREFIX, has_path_prefix, is_admin_path, is_table_catalog_path,
+    RPC_PREFIX, RemoteAddr, TONIC_PREFIX, has_path_prefix, is_admin_path, is_table_catalog_path, strip_valid_port_suffix,
 };
 use crate::storage_api::server::layer::request_context::RequestContext;
 use bytes::Bytes;
@@ -65,7 +66,7 @@ use http_body_util::{BodyExt, Full};
 use metrics::counter;
 use rustfs_trusted_proxies::ClientInfo;
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -318,14 +319,12 @@ fn request_host<B>(req: &Request<B>) -> Option<&str> {
     req.headers().get(http::header::HOST).and_then(|value| value.to_str().ok())
 }
 
-/// `bucket.domain` → `bucket` when `host` is a subdomain of `domain`
-/// (ASCII-case-insensitive, port-inclusive — the configured domain set
-/// already carries port variants).
-fn strip_vh_prefix<'a>(host: &'a str, domain: &str) -> Option<&'a str> {
-    let (host_len, domain_len) = (host.len(), domain.len());
+/// `bucket.domain` → `bucket` when `host` is a subdomain of `domain_host`.
+fn strip_vh_prefix<'a>(host: &'a str, domain_host: &str) -> Option<&'a str> {
+    let (host_len, domain_len) = (host.len(), domain_host.len());
     if host_len > domain_len + 1
         && host.as_bytes()[host_len - domain_len - 1] == b'.'
-        && host[host_len - domain_len..].eq_ignore_ascii_case(domain)
+        && host[host_len - domain_len..].eq_ignore_ascii_case(domain_host)
     {
         Some(&host[..host_len - domain_len - 1])
     } else {
@@ -337,6 +336,20 @@ fn bounded_bucket_name(bucket: &str) -> Option<&str> {
     (!bucket.is_empty() && bucket.len() <= MAX_BUCKET_NAME_LENGTH).then_some(bucket)
 }
 
+fn rate_limit_vh_domain_hosts(vh_domains: Vec<String>) -> Arc<[String]> {
+    let mut domains = Vec::with_capacity(vh_domains.len());
+    let mut seen = HashSet::with_capacity(vh_domains.len());
+
+    for domain in vh_domains {
+        let domain_host = strip_valid_port_suffix(&domain);
+        if seen.insert(domain_host.to_ascii_lowercase()) {
+            domains.push(domain_host.to_string());
+        }
+    }
+
+    domains.into()
+}
+
 /// Extract the bucket a request addresses, if any.
 ///
 /// Mirrors s3s host routing: on a configured virtual-hosted-style domain the
@@ -345,21 +358,22 @@ fn bounded_bucket_name(bucket: &str) -> Option<&str> {
 /// namespaces are not buckets. Best-effort by design — a request this cannot
 /// classify simply skips the bucket dimension (the client dimension still
 /// applies).
-fn request_bucket<'a, B>(req: &'a Request<B>, vh_domains: &[String]) -> Option<&'a str> {
+fn request_bucket<'a, B>(req: &'a Request<B>, vh_domain_hosts: &[String]) -> Option<&'a str> {
     let path = req.uri().path();
     if is_admin_path(path) || is_table_catalog_path(path) {
         return None;
     }
 
-    if !vh_domains.is_empty()
+    if !vh_domain_hosts.is_empty()
         && let Some(host) = request_host(req)
     {
-        for domain in vh_domains {
-            if host.eq_ignore_ascii_case(domain) {
+        let host = strip_valid_port_suffix(host);
+        for domain_host in vh_domain_hosts {
+            if host.eq_ignore_ascii_case(domain_host) {
                 // Path-style request on the API domain itself.
                 break;
             }
-            if let Some(bucket) = strip_vh_prefix(host, domain) {
+            if let Some(bucket) = strip_vh_prefix(host, domain_host) {
                 return bounded_bucket_name(bucket);
             }
         }
@@ -445,11 +459,10 @@ fn s3_too_many_requests_response(request_id: Option<&str>, limit_rpm: u32, throt
 
 /// Build the S3 API rate limit layer from `RUSTFS_API_RATE_LIMIT_*`.
 ///
-/// `vh_domains` is the expanded virtual-hosted-style domain set (with port
-/// variants) the s3s host router uses; pass an empty vec when virtual-hosted
-/// routing is not configured. Returns `None` (no layer in the stack, zero
-/// request-path change) unless explicitly enabled with a non-zero RPM on at
-/// least one dimension.
+/// `vh_domains` is the configured virtual-hosted-style domain set the s3s host
+/// router uses; pass an empty vec when virtual-hosted routing is not configured.
+/// Returns `None` (no layer in the stack, zero request-path change) unless
+/// explicitly enabled with a non-zero RPM on at least one dimension.
 pub fn api_rate_limit_layer_from_env(vh_domains: Vec<String>) -> Option<RateLimitLayer> {
     if !rustfs_utils::get_env_bool(rustfs_config::ENV_API_RATE_LIMIT_ENABLE, rustfs_config::DEFAULT_API_RATE_LIMIT_ENABLE) {
         return None;
@@ -491,7 +504,7 @@ pub fn api_rate_limit_layer_from_env(vh_domains: Vec<String>) -> Option<RateLimi
 pub struct RateLimitLayer {
     client_limiter: Option<Arc<RateLimiter<IpAddr>>>,
     bucket_limiter: Option<Arc<RateLimiter<String>>>,
-    vh_domains: Arc<[String]>,
+    vh_domain_hosts: Arc<[String]>,
 }
 
 impl RateLimitLayer {
@@ -499,7 +512,7 @@ impl RateLimitLayer {
         Self {
             client_limiter: client_quota.map(|quota| Arc::new(RateLimiter::new(quota))),
             bucket_limiter: bucket_quota.map(|quota| Arc::new(RateLimiter::new(quota))),
-            vh_domains: vh_domains.into(),
+            vh_domain_hosts: rate_limit_vh_domain_hosts(vh_domains),
         }
     }
 
@@ -520,7 +533,7 @@ impl<S> Layer<S> for RateLimitLayer {
             inner,
             client_limiter: self.client_limiter.clone(),
             bucket_limiter: self.bucket_limiter.clone(),
-            vh_domains: self.vh_domains.clone(),
+            vh_domain_hosts: self.vh_domain_hosts.clone(),
         }
     }
 }
@@ -533,7 +546,7 @@ pub struct RateLimitService<S> {
     inner: S,
     client_limiter: Option<Arc<RateLimiter<IpAddr>>>,
     bucket_limiter: Option<Arc<RateLimiter<String>>>,
-    vh_domains: Arc<[String]>,
+    vh_domain_hosts: Arc<[String]>,
 }
 
 fn rejected_response<F, E, ReqBody>(
@@ -603,7 +616,7 @@ where
         }
 
         if let Some(limiter) = &self.bucket_limiter
-            && let Some(bucket) = request_bucket(&req, &self.vh_domains)
+            && let Some(bucket) = request_bucket(&req, &self.vh_domain_hosts)
             && let RateLimitDecision::Limited(throttle) = limiter.check(bucket)
         {
             let limit_rpm = limiter.quota().requests_per_minute;
@@ -791,9 +804,13 @@ mod tests {
         req
     }
 
+    fn vh_domain_hosts(domains: &[&str]) -> Arc<[String]> {
+        rate_limit_vh_domain_hosts(domains.iter().map(|domain| (*domain).to_string()).collect())
+    }
+
     #[test]
     fn request_bucket_takes_first_path_segment_for_path_style() {
-        let domains: Vec<String> = vec![];
+        let domains = vh_domain_hosts(&[]);
         let req = request_with_host("s3.example.com", "/photos/2024/cat.jpg");
         assert_eq!(request_bucket(&req, &domains), Some("photos"));
 
@@ -803,7 +820,7 @@ mod tests {
 
     #[test]
     fn request_bucket_rejects_oversized_path_segment() {
-        let domains: Vec<String> = vec![];
+        let domains = vh_domain_hosts(&[]);
         let maximum = "a".repeat(MAX_BUCKET_NAME_LENGTH);
         let maximum_path = format!("/{maximum}/object");
         let maximum_req = request_with_host("s3.example.com", &maximum_path);
@@ -816,7 +833,7 @@ mod tests {
 
     #[test]
     fn request_bucket_resolves_virtual_hosted_style_against_domains() {
-        let domains = vec!["s3.example.com".to_string(), "s3.example.com:9000".to_string()];
+        let domains = vh_domain_hosts(&["s3.example.com"]);
 
         let vh = request_with_host("photos.s3.example.com", "/2024/cat.jpg");
         assert_eq!(request_bucket(&vh, &domains), Some("photos"));
@@ -837,8 +854,22 @@ mod tests {
     }
 
     #[test]
+    fn request_bucket_matches_virtual_hosted_domains_port_agnostically() {
+        let domains = vh_domain_hosts(&["s3.example.com:1234"]);
+
+        let vh_bare = request_with_host("photos.s3.example.com", "/2024/cat.jpg");
+        assert_eq!(request_bucket(&vh_bare, &domains), Some("photos"));
+
+        let vh_other_port = request_with_host("photos.s3.example.com:443", "/2024/cat.jpg");
+        assert_eq!(request_bucket(&vh_other_port, &domains), Some("photos"));
+
+        let malformed_port = request_with_host("photos.s3.example.com:http", "/2024/cat.jpg");
+        assert_eq!(request_bucket(&malformed_port, &domains), Some("2024"));
+    }
+
+    #[test]
     fn request_bucket_rejects_oversized_virtual_host_prefix() {
-        let domains = vec!["s3.example.com".to_string()];
+        let domains = vh_domain_hosts(&["s3.example.com"]);
         let maximum = "a".repeat(MAX_BUCKET_NAME_LENGTH);
         let maximum_req = request_with_host(&format!("{maximum}.s3.example.com"), "/object");
         assert_eq!(request_bucket(&maximum_req, &domains), Some(maximum.as_str()));
@@ -850,7 +881,7 @@ mod tests {
 
     #[test]
     fn request_bucket_skips_admin_and_catalog_namespaces() {
-        let domains: Vec<String> = vec![];
+        let domains = vh_domain_hosts(&[]);
         for path in ["/rustfs/admin/v3/info", "/minio/admin/v3/info", "/iceberg/v1/config"] {
             let req = request_with_host("s3.example.com", path);
             assert_eq!(request_bucket(&req, &domains), None, "{path} must not be a bucket");
@@ -1048,6 +1079,23 @@ mod tests {
         // Path-style hit on the same bucket shares the budget.
         let path_style = request_from(ip(2), "/photos/b.jpg");
         assert_eq!(service.call(path_style).await.expect("ok").status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn bucket_dimension_shares_budget_for_port_carrying_virtual_hosts() {
+        let domains = vec!["s3.example.com".to_string()];
+        let mut service = RateLimitLayer::new(None, Some(quota(60, 1)), domains).layer(OkService);
+
+        let mut with_port = request_from(ip(1), "/a.jpg");
+        with_port
+            .headers_mut()
+            .insert(http::header::HOST, HeaderValue::from_static("photos.s3.example.com:443"));
+        assert_eq!(service.call(with_port).await.expect("ok").status(), StatusCode::OK);
+
+        let mut bare = request_from(ip(2), "/b.jpg");
+        bare.headers_mut()
+            .insert(http::header::HOST, HeaderValue::from_static("photos.s3.example.com"));
+        assert_eq!(service.call(bare).await.expect("ok").status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[tokio::test]
