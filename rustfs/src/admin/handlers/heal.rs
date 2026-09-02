@@ -655,7 +655,8 @@ fn aggregate_replacement_recovery_cluster_status(
     // only non-empty snapshots must agree with each other.
     let mut non_empty_records = snapshots
         .iter()
-        .filter_map(|snapshot| (!snapshot.records.is_empty()).then(|| canonical_replacement_records(&snapshot.records)));
+        .filter(|snapshot| !snapshot.records.is_empty())
+        .map(|snapshot| canonical_replacement_records(&snapshot.records));
     if let Some(first_records) = non_empty_records.next()
         && non_empty_records.any(|records| records != first_records)
     {
