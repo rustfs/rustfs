@@ -215,9 +215,11 @@ fn ensure_decommission_ledger_persistence_supported_for(
         "decommission".to_string(),
         "pool-metadata-version".to_string(),
         format!(
-            "durable unresolved-entry recovery requires pool metadata V2 or V3; enable both {} and {} only after every reader and writer supports V2",
+            "durable unresolved-entry recovery requires pool metadata V2 or V3; enable either the {} + {} V2 gate or the {} + {} V3 gate only after every reader and writer supports that format",
             rustfs_config::ENV_POOL_META_V2_WRITE,
             rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED,
+            rustfs_config::ENV_POOL_META_V3_WRITE,
+            rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED,
         ),
     ))
 }
@@ -16089,6 +16091,8 @@ mod tests {
         .expect_err("half-enabled rollout gates must not admit decommission");
         assert!(matches!(err, Error::InvalidArgument(..)));
         assert!(err.to_string().contains("durable unresolved-entry recovery"));
+        assert!(err.to_string().contains(rustfs_config::ENV_POOL_META_V3_WRITE));
+        assert!(err.to_string().contains(rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED));
     }
 
     #[test]
