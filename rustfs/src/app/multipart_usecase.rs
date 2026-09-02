@@ -320,10 +320,13 @@ fn validate_complete_multipart_checksum_type(headers: &HeaderMap, upload_metadat
     };
 
     if requested != recorded {
-        return Err(s3_error!(
-            InvalidRequest,
+        // Routed through `ApiError` rather than the s3s error macro so this
+        // validation does not widen the direct s3s surface the s3gate migration
+        // is shrinking (scripts/check_s3s_footprint.sh); the response is identical.
+        return Err(ApiError::invalid_request(format!(
             "The upload was created with checksum type {recorded}. The complete request must use the same checksum type, got {requested}."
-        ));
+        ))
+        .into());
     }
 
     Ok(())
