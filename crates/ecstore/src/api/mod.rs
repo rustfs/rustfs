@@ -128,7 +128,6 @@ pub mod bucket {
     }
 
     pub mod metadata {
-        pub use crate::bucket::metadata::BUCKET_DURABILITY_CONFIG;
         pub use crate::bucket::metadata::{
             BUCKET_ACCELERATE_CONFIG, BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_LOGGING_CONFIG,
             BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
@@ -137,11 +136,20 @@ pub mod bucket {
             BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, BUCKET_WEBSITE_CONFIG, BucketMetadata, OBJECT_LOCK_CONFIG,
             load_bucket_metadata, table_catalog_path_hash,
         };
+        pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
     }
 
     pub mod durability {
         pub use crate::bucket::durability::{
             BUCKET_DURABILITY_MODE_NONE, BUCKET_DURABILITY_MODE_RELAXED, BUCKET_DURABILITY_MODE_STRICT, BucketDurabilityConfig,
+        };
+    }
+
+    pub mod on_demand_migration {
+        pub use crate::bucket::on_demand_migration::{
+            ConfigPublishHook, FilterConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK, ON_DEMAND_MIGRATION_CONFIG_VERSION,
+            OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy,
+            SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
         };
     }
 
@@ -154,11 +162,11 @@ pub mod bucket {
             delete_if_incarnation, delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy,
             get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
-            get_object_lock_config, get_object_lock_config_state, get_public_access_block_config, get_quota_config,
-            get_replication_config, get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config,
-            get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
-            set_bucket_metadata, update, update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation,
-            update_quota_if_incarnation, update_under_transaction_lock,
+            get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config, get_public_access_block_config,
+            get_quota_config, get_replication_config, get_request_payment_config, get_sse_config, get_tagging_config,
+            get_versioning_config, get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata,
+            remove_bucket_metadata, set_bucket_metadata, update, update_bucket_targets_under_transaction_lock,
+            update_config_with, update_if_incarnation, update_quota_if_incarnation, update_under_transaction_lock,
         };
     }
 
