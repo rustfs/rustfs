@@ -85,11 +85,18 @@ reached its target.
 ERROR ... event=replication_object_failed bucket=photos object=backups/vm-image.qcow2
       version_id=... arn=arn:replication::wasabi endpoint=s3.wasabisys.com
       op_type=OBJECT size=6442450944 replication_status=FAILED
-      error="object of 6442450944 bytes was not written as multipart on the source and
-             exceeds the 5368709120 byte single-PutObject limit of an S3 target;
-             re-upload it with multipart to make it replicable"
+      error="object of 6442450944 bytes exceeds the 5368709120 byte single-PutObject
+             limit of an S3 target; its ETag 767e7a8379c0f62c39e0ceeea0e13de9 has no
+             part-count suffix, so replication uses a single PutObject and does not
+             re-chunk; if the object is in fact multipart this is a transport-selection
+             defect, otherwise re-upload it as a multipart upload to make it replicable"
       Replication failed for object
 ```
+
+The line quotes the ETag the transport decision was made from. Check it against
+the object's own listing: an ETag with a `-<part count>` suffix on this line
+means the object is multipart and was misrouted, which is a RustFS defect to
+report, not a reason to re-upload.
 
 The `error` field carries the target's own error code and message where the
 target produced one, so a remote rejection is diagnosable without lowering the
