@@ -2776,14 +2776,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         );
 
         if checksum_type.is_set() {
-            checksum_type
-                .merge(rustfs_rio::ChecksumType::MULTIPART)
-                .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
-            if !checksum_type.full_object_requested() {
-                checksum = rustfs_rio::Checksum::new_from_data(checksum_type, &checksum_combined)
-                    .ok_or_else(|| Error::other("checksum new_from_data failed"))?;
-            }
-            fi.checksum = Some(checksum.to_bytes(&checksum_combined));
+            fi.checksum = Some(multipart_object_checksum_record(checksum, checksum_type, &checksum_combined)?);
         }
 
         fi.metadata.remove(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM);
@@ -3430,6 +3423,43 @@ fn resolve_complete_etag(opts: &ObjectOptions, uploaded_parts: &[CompletePart]) 
         return etag.clone();
     }
     get_complete_multipart_md5(uploaded_parts)
+}
+
+/// Serialize the object-level checksum record that `complete_multipart_upload`
+/// persists into `FileInfo::checksum`.
+///
+/// `full_object` is the running checksum accumulated with
+/// [`rustfs_rio::Checksum::add_part`] over the parts (only meaningful when
+/// `checksum_type` asks for a full-object checksum); `combined` is the
+/// concatenation of the raw per-part digests.
+///
+/// Both shapes must be written with MULTIPART | INCLUDES_MULTIPART set. Those
+/// flags are what make [`rustfs_rio::read_checksums`] treat the object as
+/// multipart and — for the full-object shape — emit
+/// `x-amz-checksum-type: FULL_OBJECT`, which GET/HEAD echo back. `merge` takes
+/// `&mut self`, so the caller's `ChecksumType` and the copy already inside
+/// `full_object` drift apart at the merge; the full-object branch therefore has
+/// to be handed the merged type explicitly. It must *not* be rebuilt from
+/// `combined`: hashing the concatenated part digests yields the COMPOSITE value,
+/// a different number than the merged full-object one the client sent.
+fn multipart_object_checksum_record(
+    mut full_object: rustfs_rio::Checksum,
+    mut checksum_type: rustfs_rio::ChecksumType,
+    combined: &[u8],
+) -> Result<Bytes> {
+    checksum_type
+        .merge(rustfs_rio::ChecksumType::MULTIPART)
+        .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
+
+    let checksum = if checksum_type.full_object_requested() {
+        full_object.checksum_type = checksum_type;
+        full_object
+    } else {
+        rustfs_rio::Checksum::new_from_data(checksum_type, combined)
+            .ok_or_else(|| Error::other("checksum new_from_data failed"))?
+    };
+
+    Ok(checksum.to_bytes(combined))
 }
 
 #[cfg(test)]
@@ -8484,5 +8514,114 @@ mod tests {
         // Without either source the ETag is computed from the parts.
         let computed = resolve_complete_etag(&ObjectOptions::default(), &[]);
         assert_eq!(computed, get_complete_multipart_md5(&[]));
+    }
+
+    /// Accumulate the per-part digests and the running full-object checksum the
+    /// way the `complete_multipart_upload` part loop does, so the record tests
+    /// below exercise the same inputs `multipart_object_checksum_record` gets in
+    /// production.
+    fn accumulate_parts(
+        checksum_type: rustfs_rio::ChecksumType,
+        parts: &[&[u8]],
+        merge_full_object: bool,
+    ) -> (rustfs_rio::Checksum, Vec<u8>) {
+        let mut running = rustfs_rio::Checksum {
+            checksum_type,
+            ..Default::default()
+        };
+        let mut combined = Vec::new();
+        for part in parts {
+            let part_checksum = rustfs_rio::Checksum::new_from_data(checksum_type, part).expect("part checksum");
+            if merge_full_object {
+                running.add_part(&part_checksum, part.len() as i64).expect("add_part");
+            }
+            combined.extend_from_slice(part_checksum.raw.as_slice());
+        }
+        (running, combined)
+    }
+
+    /// A full-object multipart checksum must be persisted with the MULTIPART /
+    /// INCLUDES_MULTIPART flags, so the reader reports the object as multipart
+    /// and emits `x-amz-checksum-type: FULL_OBJECT`. Before the fix the record
+    /// carried the pre-merge type (the copy `Checksum` took at construction),
+    /// the reader never entered its MULTIPART branch, and GET/HEAD answered with
+    /// no checksum-type header at all.
+    #[test]
+    fn full_object_multipart_record_persists_merged_type_and_full_object_value() {
+        let part1 = b"full-object multipart part one payload".as_slice();
+        let part2 = b"full-object multipart part two payload".as_slice();
+        let checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type("crc32", "FULL_OBJECT");
+        assert!(checksum_type.full_object_requested());
+
+        let (running, combined) = accumulate_parts(checksum_type, &[part1, part2], true);
+        let record = multipart_object_checksum_record(running, checksum_type, &combined).expect("record");
+
+        let (map, is_multipart) = rustfs_rio::read_checksums(record.as_ref(), 0);
+        assert!(is_multipart, "full-object multipart record must read back as multipart");
+        assert_eq!(
+            map.get("x-amz-checksum-type").map(String::as_str),
+            Some("FULL_OBJECT"),
+            "full-object record must drive the FULL_OBJECT response header, got {map:?}"
+        );
+
+        // The persisted value stays the full-object checksum (CRC32 of the whole
+        // object), never the COMPOSITE hash of the concatenated part digests, and
+        // it carries no `-<parts>` suffix.
+        let whole: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+        let full_object = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, &whole).expect("full object");
+        let composite = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, &combined).expect("composite");
+        assert_ne!(full_object.encoded, composite.encoded, "test would not discriminate the two shapes");
+        assert_eq!(map.get("CRC32").map(String::as_str), Some(full_object.encoded.as_str()));
+
+        // Per-part digests are still recoverable from the record (INCLUDES_MULTIPART).
+        let (part_map, _) = rustfs_rio::read_checksums(record.as_ref(), 2);
+        let part2_checksum = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, part2).expect("part 2");
+        assert_eq!(part_map.get("CRC32").map(String::as_str), Some(part2_checksum.encoded.as_str()));
+    }
+
+    /// The composite shape is unchanged by the fix: value hashed from the
+    /// concatenated part digests, `-<parts>` suffix, no FULL_OBJECT entry.
+    #[test]
+    fn composite_multipart_record_keeps_part_count_suffix() {
+        let part1 = b"composite multipart part one payload".as_slice();
+        let part2 = b"composite multipart part two payload".as_slice();
+        let checksum_type = rustfs_rio::ChecksumType::from_string("sha256");
+        assert!(!checksum_type.full_object_requested());
+
+        let (running, combined) = accumulate_parts(checksum_type, &[part1, part2], false);
+        let record = multipart_object_checksum_record(running, checksum_type, &combined).expect("record");
+
+        let (map, is_multipart) = rustfs_rio::read_checksums(record.as_ref(), 0);
+        assert!(is_multipart);
+        assert_eq!(map.get("x-amz-checksum-type"), None, "composite must not claim FULL_OBJECT");
+        let composite = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, &combined).expect("composite");
+        assert_eq!(map.get("SHA256").map(String::as_str), Some(format!("{}-2", composite.encoded).as_str()));
+    }
+
+    /// Records written by builds from before the fix carry the bare algorithm
+    /// type with no MULTIPART flags and no trailing part block. Those bytes must
+    /// keep reading back to the same checksum value they always did — the fix
+    /// only changes what newly completed uploads write.
+    #[test]
+    fn legacy_full_object_record_without_flags_still_reads_back() {
+        let part1 = b"full-object multipart part one payload".as_slice();
+        let part2 = b"full-object multipart part two payload".as_slice();
+        let checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type("crc32", "FULL_OBJECT");
+        let (running, combined) = accumulate_parts(checksum_type, &[part1, part2], true);
+
+        // Exactly what the pre-fix code emitted: the unmerged type, serialized
+        // with the part digests offered but never appended.
+        let legacy = running.to_bytes(&combined);
+
+        let (map, is_multipart) = rustfs_rio::read_checksums(legacy.as_ref(), 0);
+        assert!(!is_multipart, "legacy record has no MULTIPART flag");
+        assert_eq!(map.get("x-amz-checksum-type"), None, "legacy record carries no type entry");
+        let whole: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+        let full_object = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, &whole).expect("full object");
+        assert_eq!(
+            map.get("CRC32").map(String::as_str),
+            Some(full_object.encoded.as_str()),
+            "legacy records must keep returning their stored checksum value"
+        );
     }
 }
