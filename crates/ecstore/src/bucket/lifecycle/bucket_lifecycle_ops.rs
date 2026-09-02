@@ -921,7 +921,7 @@ impl ExpiryState {
         Ok(())
     }
 
-    pub fn enqueue_free_version(&mut self, oi: ObjectInfo) -> bool {
+    pub fn enqueue_free_version(&self, oi: ObjectInfo) -> bool {
         let task = FreeVersionTask(oi);
         let wrkr = self.get_worker_ch(task.op_hash());
         if wrkr.is_none() {
@@ -1213,6 +1213,22 @@ impl ExpiryState {
             }
         }
     }
+}
+
+pub(crate) async fn enqueue_committed_free_versions(api: &ECStore, free_versions: Vec<ObjectInfo>) -> usize {
+    if free_versions.is_empty() {
+        return 0;
+    }
+
+    let expiry_state = api.ctx.expiry_state();
+    let state = expiry_state.read().await;
+    let mut queued = 0;
+    for free_version in free_versions {
+        if state.enqueue_free_version(free_version) {
+            queued += 1;
+        }
+    }
+    queued
 }
 
 async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryState>>, oi: ObjectInfo) -> bool {
@@ -6627,7 +6643,7 @@ mod tests {
     async fn enqueue_free_version_reports_false_without_worker_channel() {
         let state = ExpiryState::new();
         let recovery_notify = Arc::clone(&state.read().await.recovery_notify);
-        let mut state = state.write().await;
+        let state = state.write().await;
         let oi = ObjectInfo {
             bucket: "bucket".to_string(),
             name: "object".to_string(),
@@ -6819,7 +6835,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut state = state.write().await;
+        let state = state.write().await;
 
         assert!(state.enqueue_free_version(oi.clone()));
         assert!(recovery_notify.notified().now_or_never().is_none());

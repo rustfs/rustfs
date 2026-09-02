@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::bucket::lifecycle::{
-    bucket_lifecycle_ops::eval_action_from_lifecycle,
+    bucket_lifecycle_ops::{enqueue_committed_free_versions, eval_action_from_lifecycle},
     get_expiry_configs,
     tier_delete_journal::{
         ActiveTierDeleteDispatch, EVENT_LIFECYCLE_TIER_DELETE_JOURNAL, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_LIFECYCLE,
@@ -39,6 +39,7 @@ use crate::core::pools::{DecommissionCapacityOwner, ensure_decommission_capacity
 use crate::disk::OldCurrentSize;
 use crate::object_api::{
     NamespaceLockFence, ObjectLockConfigSnapshot, ScannerPublicationCommitScopeGuard, ScannerPublicationCommitState,
+    TierFreeVersionReceiptSink,
 };
 use crate::services::notification_sys::acquire_tier_delete_journal_fleet_proof;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
@@ -70,6 +71,26 @@ use tokio::io::{AsyncRead, ReadBuf};
 const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 1000;
 #[cfg(test)]
 const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 2;
+
+fn install_tier_free_version_receipt_sink(opts: &mut ObjectOptions) -> Option<TierFreeVersionReceiptSink> {
+    if opts.tier_free_version_receipt_sink.is_some() || opts.skip_free_version || opts.delete_prefix {
+        return None;
+    }
+
+    let sink = TierFreeVersionReceiptSink::new();
+    opts.tier_free_version_receipt_sink = Some(sink.clone());
+    Some(sink)
+}
+
+async fn enqueue_recorded_tier_free_versions(store: &ECStore, sink: Option<TierFreeVersionReceiptSink>) -> usize {
+    let Some(sink) = sink else {
+        return 0;
+    };
+    let Ok(receipts) = sink.drain() else {
+        return 0;
+    };
+    enqueue_committed_free_versions(store, receipts).await
+}
 
 fn build_tier_delete_journal_entry(
     bucket: &str,
@@ -4152,10 +4173,13 @@ impl ECStore {
         &self,
         bucket: &str,
         object: &str,
-        opts: ObjectOptions,
+        mut opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> Result<ObjectInfo> {
-        Box::pin(self.handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api)).await
+        let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
+        let result = Box::pin(self.handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api)).await;
+        enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+        result
     }
 
     async fn handle_delete_object_with_journal_inner(
@@ -4528,6 +4552,20 @@ impl ECStore {
     }
 
     pub(super) async fn handle_delete_objects_with_journal_and_accounting(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        mut opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
+        let result =
+            Box::pin(self.handle_delete_objects_with_journal_and_accounting_inner(bucket, objects, opts, tier_journal_api)).await;
+        enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+        result
+    }
+
+    async fn handle_delete_objects_with_journal_and_accounting_inner(
         &self,
         bucket: &str,
         objects: Vec<ObjectToDelete>,

@@ -10496,6 +10496,8 @@ mod tests {
         bucket: &str,
         object: &str,
         restore_before_delete: bool,
+        causal_enqueue: bool,
+        delete_with_journal: bool,
     ) {
         let temp_dir = tempfile::tempdir().expect("create transitioned delete store dir");
         let (ctx, store, _shutdown) =
@@ -10559,11 +10561,51 @@ mod tests {
             );
         }
 
-        backend.set_remove_failure(true);
-        store
-            .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
+        if causal_enqueue {
+            ExpiryState::resize_workers(1, store.clone()).await;
+        }
+        backend.set_remove_failure(!causal_enqueue);
+        if delete_with_journal {
+            store
+                .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
+                .await
+                .expect("transitioned source journal-wrapper delete should commit");
+        } else {
+            store
+                .delete_object(bucket, object, ObjectOptions::default())
+                .await
+                .expect("transitioned source plain object-layer delete should commit");
+        }
+
+        if causal_enqueue {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let metadata_absent = store.pools[0]
+                        .get_disks_by_key(object)
+                        .load_file_info_versions_exact(bucket, object)
+                        .await
+                        .expect("causal free-version cleanup metadata should remain readable")
+                        .is_none();
+                    if metadata_absent && backend.remove_versions().await.len() == 1 {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
             .await
-            .expect("transitioned source delete should commit");
+            .expect("committed free-version should be cleaned without a recovery scan");
+            assert_eq!(backend.object_count().await, 0, "causal cleanup should remove the remote object");
+            assert_eq!(
+                tier_delete_journal_count(store.clone()).await,
+                0,
+                "ordinary causal cleanup must not create a journal"
+            );
+            store
+                .delete_bucket(bucket, &DeleteBucketOptions::default())
+                .await
+                .expect("bucket delete should succeed after causal free-version cleanup");
+            return;
+        }
 
         let local_versions = store.pools[0]
             .get_disks_by_key(object)
@@ -10642,6 +10684,8 @@ mod tests {
             "transitioned-delete-journal-owner-bucket",
             "transition/archive.bin",
             false,
+            false,
+            true,
         )
         .await;
     }
@@ -10655,6 +10699,40 @@ mod tests {
             "RESTOREDELETEOWNER",
             "restored-transitioned-delete-journal-owner-bucket",
             "transition/archive.bin",
+            true,
+            false,
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transitioned_delete_causally_enqueues_free_version() {
+        run_transitioned_delete_free_version_owner_case(
+            "transitioned-delete-causal-enqueue",
+            "DELETE-CAUSAL",
+            "transitioned-delete-causal-enqueue-bucket",
+            "transition/archive.bin",
+            false,
+            true,
+            false,
+        )
+        .await;
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn restored_transitioned_delete_causally_enqueues_free_version() {
+        run_transitioned_delete_free_version_owner_case(
+            "restored-transitioned-delete-causal-enqueue",
+            "RESTORE-DELETE-CAUSAL",
+            "restored-transitioned-delete-causal-enqueue-bucket",
+            "transition/archive.bin",
+            true,
+            true,
             true,
         )
         .await;
@@ -12335,10 +12413,260 @@ mod tests {
                 .is_none(),
             "free-version recovery must remove the exact cleanup owner"
         );
+
+        let causal = "causal.bin";
+        let mut causal_reader = PutObjReader::from_vec(vec![b'c'; 1024 * 1024]);
+        let causal_source = store
+            .put_object(bucket, causal, &mut causal_reader, &ObjectOptions::default())
+            .await
+            .expect("causal batch source should be written");
+        store
+            .transition_object(
+                bucket,
+                causal,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: causal_source.etag.clone().expect("causal batch source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: causal_source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("causal batch source transition should commit");
+        let (_deleted, errors) = store
+            .delete_objects(
+                bucket,
+                vec![
+                    ObjectToDelete {
+                        object_name: causal.to_string(),
+                        ..Default::default()
+                    },
+                    ObjectToDelete {
+                        object_name: causal.to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(
+            errors.iter().all(Option::is_none),
+            "duplicate causal batch deletes should remain idempotent: {errors:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let metadata_absent = store.pools[0]
+                    .get_disks_by_key(causal)
+                    .load_file_info_versions_exact(bucket, causal)
+                    .await
+                    .expect("causal batch cleanup metadata should remain readable")
+                    .is_none();
+                if metadata_absent && backend.remove_versions().await.len() >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("batch free-version receipt should converge without another recovery scan");
+        assert_eq!(
+            backend.remove_versions().await.len(),
+            2,
+            "duplicate batch requests must cause only one remote delete for the causal object"
+        );
+
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("causal batch bucket versioning should be enabled");
+        let versioned_causal = "versioned-causal.bin";
+        let mut versioned_reader = PutObjReader::from_vec(vec![b'v'; 1024 * 1024]);
+        let versioned_source = store
+            .put_object(
+                bucket,
+                versioned_causal,
+                &mut versioned_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned causal batch source should be written");
+        let versioned_source_id = versioned_source
+            .version_id
+            .expect("versioned causal batch source should have an identity");
+        store
+            .transition_object(
+                bucket,
+                versioned_causal,
+                &ObjectOptions {
+                    version_id: Some(versioned_source_id.to_string()),
+                    versioned: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: versioned_source
+                            .etag
+                            .clone()
+                            .expect("versioned causal batch source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: versioned_source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned causal batch source transition should commit");
+        let (_deleted, errors) = store
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: versioned_causal.to_string(),
+                    version_id: Some(versioned_source_id),
+                    ..Default::default()
+                }],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(
+            errors.iter().all(Option::is_none),
+            "explicit-version causal batch delete should commit: {errors:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let metadata_absent = store.pools[0]
+                    .get_disks_by_key(versioned_causal)
+                    .load_file_info_versions_exact(bucket, versioned_causal)
+                    .await
+                    .expect("versioned causal batch cleanup metadata should remain readable")
+                    .is_none();
+                if metadata_absent && backend.remove_versions().await.len() == 3 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("explicit-version batch receipt should converge without a recovery scan");
         store
             .delete_bucket(bucket, &DeleteBucketOptions::default())
             .await
             .expect("batch source bucket should be physically empty");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn batch_transitioned_delete_aggregate_error_still_enqueues_committed_free_version() {
+        let temp_dir = tempfile::tempdir().expect("create aggregate-error batch delete store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "batch-transitioned-aggregate-error", &[4, 4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "BATCH-AGGREGATE-ERROR";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "batch-transitioned-aggregate-error-bucket";
+        let object = "archive.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("aggregate-error source bucket should be created");
+        let mut reader = PutObjReader::from_vec(vec![b'a'; 1024 * 1024]);
+        let source = store.pools[0]
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("aggregate-error source should be written");
+        store.pools[0]
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: source.etag.clone().expect("aggregate-error source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("aggregate-error source should transition");
+
+        // Model a data-movement copy: both pools own the same logical source
+        // and exact remote tuple, but each batch delete creates its own local
+        // free-version UUID in the shared request sink.
+        for disk_index in 0..4 {
+            let source_meta = temp_dir
+                .path()
+                .join(format!("pool0/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+            let target_meta = temp_dir
+                .path()
+                .join(format!("pool1/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+            tokio::fs::create_dir_all(target_meta.parent().expect("target xl.meta should have a parent"))
+                .await
+                .expect("second-pool object directory should be created");
+            tokio::fs::copy(&source_meta, &target_meta)
+                .await
+                .expect("transitioned xl.meta should copy exactly to the second pool");
+        }
+
+        ExpiryState::resize_workers(1, store.clone()).await;
+        let injection = crate::store::object::BatchDeletePoolErrorInjection::install(
+            bucket,
+            1,
+            vec![(object.to_string(), StorageError::ErasureWriteQuorum)],
+        );
+        let (deleted, errors) = store
+            .delete_objects(
+                bucket,
+                vec![ObjectToDelete {
+                    object_name: object.to_string(),
+                    ..Default::default()
+                }],
+                ObjectOptions::default(),
+            )
+            .await;
+        assert_eq!(injection.observed(), 1, "the second pool should inject one post-commit aggregate error");
+        assert_eq!(errors, vec![Some(StorageError::ErasureWriteQuorum)]);
+        assert!(deleted[0].found, "the aggregate error must retain the committed pool result");
+        drop(injection);
+
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let mut metadata_absent = true;
+                for pool in &store.pools {
+                    metadata_absent &= pool
+                        .get_disks_by_key(object)
+                        .load_file_info_versions_exact(bucket, object)
+                        .await
+                        .expect("aggregate-error cleanup metadata should remain readable")
+                        .is_none();
+                }
+                if metadata_absent && backend.remove_count().await == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aggregate failure must not suppress committed receipt dispatch");
+        assert_eq!(backend.object_count().await, 0, "the shared remote object should be removed exactly once");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("aggregate-error bucket should be physically empty");
+        shutdown.cancel();
     }
 
     #[cfg(feature = "test-util")]
@@ -12573,6 +12901,223 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn batch_transitioned_delete_quorum_failure_rolls_back_without_free_version_receipt() {
+        let temp_dir = tempfile::tempdir().expect("create failed batch delete store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "batch-delete-local-failure", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "BATCH-DELETE-LOCAL-FAIL";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "batch-delete-local-failure-bucket";
+        let object = "archive.bin";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("failed batch source bucket should be created");
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("failed batch bucket versioning should be enabled");
+        let mut transitioned_reader = PutObjReader::from_vec(vec![b't'; 1024 * 1024]);
+        let transitioned_source = store
+            .put_object(
+                bucket,
+                object,
+                &mut transitioned_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed batch transitioned version should be written");
+        let transitioned_version_id = transitioned_source
+            .version_id
+            .expect("failed batch transitioned source should have a version identity");
+        store
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(transitioned_version_id.to_string()),
+                    versioned: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name.to_string(),
+                        etag: transitioned_source
+                            .etag
+                            .clone()
+                            .expect("failed batch transitioned source should have an etag"),
+                        ..Default::default()
+                    },
+                    mod_time: transitioned_source.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed batch source version should transition");
+        let mut ordinary_reader = PutObjReader::from_vec(vec![b'o'; 1024 * 1024]);
+        let ordinary_source = store
+            .put_object(
+                bucket,
+                object,
+                &mut ordinary_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed batch ordinary sibling should be written");
+        let ordinary_version_id = ordinary_source
+            .version_id
+            .expect("failed batch ordinary sibling should have a version identity");
+        let delete_requests = || {
+            vec![
+                ObjectToDelete {
+                    object_name: object.to_string(),
+                    version_id: Some(transitioned_version_id),
+                    ..Default::default()
+                },
+                ObjectToDelete {
+                    object_name: object.to_string(),
+                    version_id: Some(ordinary_version_id),
+                    ..Default::default()
+                },
+            ]
+        };
+
+        let set = store.pools[0].get_disks_by_key(object);
+        let (saved_first, saved_second) = {
+            let mut disks = set.disks.write().await;
+            (
+                disks[0].take().expect("first disk should be online before fault injection"),
+                disks[1].take().expect("second disk should be online before fault injection"),
+            )
+        };
+        let receipt_sink = crate::object_api::TierFreeVersionReceiptSink::new();
+        let (_deleted, errors) = store
+            .delete_objects(
+                bucket,
+                delete_requests(),
+                ObjectOptions {
+                    tier_free_version_receipt_sink: Some(receipt_sink.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            errors,
+            vec![
+                Some(StorageError::InsufficientWriteQuorum(bucket.to_string(), object.to_string())),
+                Some(StorageError::InsufficientWriteQuorum(bucket.to_string(), object.to_string())),
+            ],
+            "two online disks must reach batch delete commit and then miss its write quorum"
+        );
+        {
+            let mut disks = set.disks.write().await;
+            disks[0] = Some(saved_first);
+            disks[1] = Some(saved_second);
+        }
+
+        assert!(
+            receipt_sink
+                .drain()
+                .expect("the test-owned failed-batch sink should drain exactly once")
+                .is_empty(),
+            "a rolled-back physical group must publish no cleanup receipt"
+        );
+        let retained_transitioned = store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(transitioned_version_id.to_string()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed batch delete must restore the transitioned sibling");
+        assert_eq!(retained_transitioned.transitioned_object.status, rustfs_filemeta::TRANSITION_COMPLETE);
+        let retained_ordinary = store
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(ordinary_version_id.to_string()),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed batch delete must restore the ordinary sibling");
+        assert_ne!(retained_ordinary.transitioned_object.status, rustfs_filemeta::TRANSITION_COMPLETE);
+        let retained_versions = set
+            .load_file_info_versions_exact(bucket, object)
+            .await
+            .expect("rolled-back batch metadata should decode")
+            .expect("rolled-back batch source should remain on disk");
+        assert_eq!(
+            retained_versions
+                .versions
+                .iter()
+                .chain(retained_versions.free_versions.iter())
+                .filter(|version| version.tier_free_version())
+                .count(),
+            0,
+            "failed batch quorum must not retain a free-version owner"
+        );
+        let retained_version_ids = retained_versions
+            .versions
+            .iter()
+            .filter_map(|version| version.version_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            retained_version_ids,
+            std::collections::HashSet::from([transitioned_version_id, ordinary_version_id]),
+            "the physical-group rollback must restore both explicit siblings"
+        );
+        assert_eq!(backend.object_count().await, 1, "failed batch commit must retain the remote object");
+        assert_eq!(backend.remove_count().await, 0, "failed batch commit must not dispatch remote cleanup");
+
+        ExpiryState::resize_workers(1, store.clone()).await;
+        let (_deleted, retry_errors) = store
+            .delete_objects(bucket, delete_requests(), ObjectOptions::default())
+            .await;
+        assert!(
+            retry_errors.iter().all(Option::is_none),
+            "retry after disk recovery should commit: {retry_errors:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let metadata_absent = set
+                    .load_file_info_versions_exact(bucket, object)
+                    .await
+                    .expect("retry cleanup metadata should remain readable")
+                    .is_none();
+                if metadata_absent && backend.remove_count().await == 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("successful batch retry should converge without a recovery scan");
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("successful batch retry should leave the bucket empty");
+        shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
     async fn run_multi_pool_same_remote_tuple_delete_case(batch: bool) {
         let temp_dir = tempfile::tempdir().expect("create shared-tuple multi-pool store dir");
         let case = if batch { "batch" } else { "single" };
@@ -12645,8 +13190,10 @@ mod tests {
         );
         assert_eq!(backend.object_count().await, 1);
 
+        let receipt_sink = crate::object_api::TierFreeVersionReceiptSink::new();
         let mut delete_opts = ObjectOptions {
             tier_delete_journal_api: Some(store.clone()),
+            tier_free_version_receipt_sink: Some(receipt_sink.clone()),
             ..Default::default()
         };
         if batch {
@@ -12774,7 +13321,20 @@ mod tests {
         );
 
         backend.set_remove_failure(false);
-        wait_for_tier_free_version_recovery(store.clone(), &backend, 1).await;
+        let receipts = receipt_sink
+            .drain()
+            .expect("the simulated outer multi-pool wrapper should drain exactly once");
+        assert_eq!(
+            receipts.len(),
+            1,
+            "the same physical key and remote tuple must collapse to one causal task"
+        );
+        assert_eq!(
+            crate::bucket::lifecycle::bucket_lifecycle_ops::enqueue_committed_free_versions(&store, receipts).await,
+            1,
+            "the committed shared-tuple task should enter the running worker"
+        );
+        wait_for_expiry_workers_idle(&store).await;
         assert_eq!(backend.remove_count().await, 1, "shared remote tuple should be deleted exactly once");
         for pool_idx in 0..2 {
             assert!(
