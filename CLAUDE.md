@@ -27,7 +27,7 @@ make build-docker BUILD_OS=ubuntu22.04
 
 ## Where to look (do not duplicate here)
 
-- Agent knowledge base index and doc-writing rules: [docs/README.md](docs/README.md)
+- Agent knowledge base index and doc-writing rules: [docs/architecture/README.md](docs/architecture/README.md)
 - Crate membership: `Cargo.toml` `[workspace].members`
 - Architecture, layering, crate map: [ARCHITECTURE.md](ARCHITECTURE.md)
 - Migration guardrails & readiness contracts: [docs/architecture/](docs/architecture/README.md)

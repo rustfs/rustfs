@@ -62,7 +62,7 @@ rustfs/                      # Workspace root (virtual manifest)
 │   ├── utils/               # Pure utility functions
 │   ├── ...                  # (see "Crate Reference" below)
 │   └── e2e_test/            # End-to-end integration tests
-└── docs/                    # Agent knowledge base: contracts, runbooks, testing rules (index: docs/README.md)
+└── docs/                    # Agent knowledge base: contracts, runbooks, testing rules (index: docs/architecture/README.md)
 ```
 
 ### Main Crate Layers (`rustfs/src/`)
