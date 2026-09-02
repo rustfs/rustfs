@@ -626,7 +626,7 @@ pub(crate) mod bucket {
 
     pub(crate) mod on_demand_migration {
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::{
-            SourceClient, SourceError, SourceHead,
+            SourceClient, SourceError, SourceGet, SourceHead,
         };
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
@@ -635,7 +635,7 @@ pub(crate) mod bucket {
         };
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
             BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OdmStateError, OnDemandMigrationSys, PolicyConfig,
-            SourceErrorPolicy,
+            PullError, PullLeader, PullOutcome, PullReason, PullSlot, RangeGetPolicy, SourceErrorPolicy, commit_inline,
         };
     }
 

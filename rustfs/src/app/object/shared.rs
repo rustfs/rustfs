@@ -15,7 +15,9 @@
 //! Cross-cutting helpers shared by the object use-case modules.
 
 use super::*;
-use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy};
+use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
+    OdmStateError, PolicyConfig, SourceErrorPolicy, SourceHead,
+};
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
@@ -868,6 +870,21 @@ pub(crate) fn odm_state_error_class(error: &OdmStateError) -> &'static str {
 
 pub(crate) fn mark_on_demand_migration_response(headers: &mut HeaderMap) {
     headers.insert(ON_DEMAND_MIGRATION_HEADER, ON_DEMAND_MIGRATION_SOURCE);
+}
+
+/// Evaluates the request's conditional headers (`If-Match`, `If-None-Match`,
+/// `If-Modified-Since`, `If-Unmodified-Since`) against the source's view of
+/// the object, with the same S3 semantics the local path applies to
+/// `ObjectInfo` (rustfs/backlog#2156). Conditional headers are never
+/// forwarded to the source: a 304/412 answered by the source would be
+/// indistinguishable from a source failure.
+pub(crate) fn odm_check_source_preconditions(headers: &HeaderMap, head: &SourceHead) -> S3Result<()> {
+    let info = ObjectInfo {
+        etag: head.etag.clone(),
+        mod_time: head.last_modified.map(OffsetDateTime::from),
+        ..Default::default()
+    };
+    check_preconditions(headers, &info)
 }
 
 #[cfg(test)]
@@ -1858,5 +1875,73 @@ mod on_demand_migration_tests {
         let mut headers = HeaderMap::new();
         mark_on_demand_migration_response(&mut headers);
         assert_eq!(headers.get("x-rustfs-on-demand-migration").and_then(|v| v.to_str().ok()), Some("source"));
+    }
+
+    fn conditional_source_head() -> SourceHead {
+        SourceHead {
+            etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+            size: 7,
+            // Thu, 01 Jan 2026 00:00:00 GMT
+            last_modified: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600)),
+            ..Default::default()
+        }
+    }
+
+    fn headers_with(name: http::header::HeaderName, value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(name, HeaderValue::from_static(value));
+        headers
+    }
+
+    #[test]
+    fn odm_source_preconditions_follow_local_semantics() {
+        let head = conditional_source_head();
+        assert!(odm_check_source_preconditions(&HeaderMap::new(), &head).is_ok());
+
+        // If-None-Match on the source ETag: 304 carrying the source ETag and Last-Modified.
+        let err = odm_check_source_preconditions(
+            &headers_with(http::header::IF_NONE_MATCH, "\"0123456789abcdef0123456789abcdef\""),
+            &head,
+        )
+        .expect_err("matching If-None-Match is 304");
+        assert_eq!(err.code(), &S3ErrorCode::NotModified);
+        assert_eq!(err.status_code(), Some(StatusCode::NOT_MODIFIED));
+        let echoed = err.headers().expect("304 echoes validators");
+        assert_eq!(
+            echoed.get("etag").and_then(|v| v.to_str().ok()),
+            Some("\"0123456789abcdef0123456789abcdef\"")
+        );
+        assert_eq!(
+            echoed.get("last-modified").and_then(|v| v.to_str().ok()),
+            Some("Thu, 01 Jan 2026 00:00:00 GMT")
+        );
+        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_NONE_MATCH, "\"other\""), &head).is_ok());
+
+        // If-Match on another ETag: 412.
+        let err = odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &head)
+            .expect_err("mismatching If-Match is 412");
+        assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+        assert!(
+            odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"0123456789abcdef0123456789abcdef\""), &head)
+                .is_ok()
+        );
+
+        // Date validators compare against the source Last-Modified.
+        let err = odm_check_source_preconditions(
+            &headers_with(http::header::IF_MODIFIED_SINCE, "Fri, 02 Jan 2026 00:00:00 GMT"),
+            &head,
+        )
+        .expect_err("not modified since a later date is 304");
+        assert_eq!(err.code(), &S3ErrorCode::NotModified);
+        let err = odm_check_source_preconditions(
+            &headers_with(http::header::IF_UNMODIFIED_SINCE, "Wed, 31 Dec 2025 00:00:00 GMT"),
+            &head,
+        )
+        .expect_err("modified since an earlier date is 412");
+        assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+
+        // A source without validators cannot fail a precondition.
+        let bare = SourceHead::default();
+        assert!(odm_check_source_preconditions(&headers_with(http::header::IF_MATCH, "\"other\""), &bare).is_ok());
     }
 }
