@@ -147,6 +147,14 @@ pub mod bucket {
 
     pub mod on_demand_migration {
         pub use crate::bucket::on_demand_migration::{
+            ApplyOutcome, BREAKER_FAILURE_THRESHOLD, BREAKER_FAILURE_WINDOW, BREAKER_HALF_OPEN_MAX_PROBES, BREAKER_OPEN_DURATION,
+            Breaker, BreakerState, BreakerTransition, BreakerVerdict, BucketOdmState, GLOBAL_ON_DEMAND_MIGRATION_SYS, GaugeGuard,
+            LastSourceError, LatencyBucketSnapshot, NEGATIVE_CACHE_MAX_ENTRIES, NegativeCache, OdmBucketSnapshot, OdmLookup,
+            OdmOp, OdmOutcome, OdmStateError, OdmStats, OdmStatsSnapshot, OnDemandMigrationSys, PullError, PullFailureReason,
+            PullFollower, PullLeader, PullOutcome, PullPath, PullResult, PullSlot, SOURCE_LATENCY_BUCKET_BOUNDS_MS,
+            SourceLatencySnapshot, source_client_spec,
+        };
+        pub use crate::bucket::on_demand_migration::{
             ConfigPublishHook, FilterConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK, ON_DEMAND_MIGRATION_CONFIG_VERSION,
             OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy,
             SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,

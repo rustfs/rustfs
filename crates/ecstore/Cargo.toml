@@ -166,7 +166,7 @@ uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnos
 reed-solomon-erasure = { workspace = true, features = ["simd-accel"] }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
-moka = { workspace = true, features = ["future"] }
+moka = { workspace = true, features = ["future", "sync"] }
 rustfs-lock.workspace = true
 rustfs-io-metrics.workspace = true
 regex = { workspace = true }
@@ -185,7 +185,7 @@ hyper-rustls = { workspace = true, default-features = false, features = ["native
 hostname.workspace = true
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync", "signal", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "sync", "signal", "fs", "rt-multi-thread", "time"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower = { workspace = true, features = ["timeout"] }

@@ -15,14 +15,33 @@
 //! On-Demand Migration (ODM): a bucket can name an external S3-compatible
 //! source bucket; GET misses are served from that source and backfilled
 //! locally. This module owns the bucket-level configuration model
-//! (`on-demand-migration.json` in the bucket metadata file); the runtime is
-//! layered on top of it by later tasks (rustfs/backlog#2147).
+//! (`on-demand-migration.json` in the bucket metadata file), the source
+//! client, and the per-node runtime (`sys`) that turns configs into live
+//! clients guarded by a breaker, a negative cache, singleflight and a pull
+//! concurrency limit (rustfs/backlog#2147).
 
+pub mod breaker;
 pub mod config;
+pub mod negative_cache;
 pub mod source_client;
+pub mod stats;
+pub mod sys;
 
+pub use breaker::{
+    BREAKER_FAILURE_THRESHOLD, BREAKER_FAILURE_WINDOW, BREAKER_HALF_OPEN_MAX_PROBES, BREAKER_OPEN_DURATION, Breaker,
+    BreakerState, BreakerTransition, BreakerVerdict,
+};
 pub use config::{
     ConfigPublishHook, FilterConfig, HeadPolicy, ON_DEMAND_MIGRATION_CONFIG_HOOK, ON_DEMAND_MIGRATION_CONFIG_VERSION,
     OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy, SourceConfig,
     SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
+};
+pub use negative_cache::{NEGATIVE_CACHE_MAX_ENTRIES, NegativeCache};
+pub use stats::{
+    GaugeGuard, LastSourceError, LatencyBucketSnapshot, OdmOp, OdmOutcome, OdmStats, OdmStatsSnapshot, PullFailureReason,
+    PullPath, SOURCE_LATENCY_BUCKET_BOUNDS_MS, SourceLatencySnapshot,
+};
+pub use sys::{
+    ApplyOutcome, BucketOdmState, GLOBAL_ON_DEMAND_MIGRATION_SYS, OdmBucketSnapshot, OdmLookup, OdmStateError,
+    OnDemandMigrationSys, PullError, PullFollower, PullLeader, PullOutcome, PullResult, PullSlot, source_client_spec,
 };

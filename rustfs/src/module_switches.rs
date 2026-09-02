@@ -35,9 +35,14 @@ pub(crate) const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 pub(crate) const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 pub(crate) const ENV_BITROT_SELFTEST_ENABLE: &str = "RUSTFS_BITROT_SELFTEST_ENABLE";
 pub(crate) const ENV_BITROT_SELFTEST_STRICT: &str = "RUSTFS_BITROT_SELFTEST_STRICT";
+/// On-demand migration module switch (rustfs/backlog#2152). Off until GA
+/// (rustfs/backlog#2163) so every intermediate PR ships dark.
+pub(crate) const ENV_ON_DEMAND_MIGRATION_ENABLED: &str = "RUSTFS_ON_DEMAND_MIGRATION_ENABLED";
+pub(crate) const DEFAULT_ON_DEMAND_MIGRATION_ENABLED: bool = false;
 
 static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_AUDIT_ENABLE);
 static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
+static ON_DEMAND_MIGRATION_MODULE_ENABLED: AtomicBool = AtomicBool::new(DEFAULT_ON_DEMAND_MIGRATION_ENABLED);
 
 /// Whether the data scanner is enabled, defaulting to on.
 pub(crate) fn scanner_enabled_from_env() -> bool {
@@ -79,4 +84,52 @@ pub fn is_notify_module_enabled() -> bool {
 /// Publish the notify-module state resolved by `server::refresh_notify_module_enabled`.
 pub(crate) fn set_notify_module_enabled(enabled: bool) {
     NOTIFY_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the on-demand migration module is enabled, defaulting to off.
+/// Read once at startup by `startup_bucket_metadata` and published below.
+pub(crate) fn on_demand_migration_enabled_from_env() -> bool {
+    rustfs_utils::get_env_bool(ENV_ON_DEMAND_MIGRATION_ENABLED, DEFAULT_ON_DEMAND_MIGRATION_ENABLED)
+}
+
+/// Last published on-demand migration module state.
+pub fn is_on_demand_migration_module_enabled() -> bool {
+    ON_DEMAND_MIGRATION_MODULE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Publish the on-demand migration module state resolved at startup. The
+/// ecstore runtime receives the same value through
+/// `OnDemandMigrationSys::set_module_enabled`, since ecstore cannot read
+/// this crate.
+pub(crate) fn set_on_demand_migration_module_enabled(enabled: bool) {
+    ON_DEMAND_MIGRATION_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn on_demand_migration_switch_defaults_off_and_follows_env() {
+        temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, None::<&str>, || {
+            assert!(!on_demand_migration_enabled_from_env());
+        });
+        temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, Some("true"), || {
+            assert!(on_demand_migration_enabled_from_env());
+        });
+        temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, Some("not-a-bool"), || {
+            assert!(!on_demand_migration_enabled_from_env(), "unparsable values keep the default");
+        });
+    }
+
+    #[test]
+    fn on_demand_migration_switch_publishes_to_the_cell() {
+        // The cell is process-global; restore it so sibling tests observe the default.
+        let before = is_on_demand_migration_module_enabled();
+        set_on_demand_migration_module_enabled(true);
+        assert!(is_on_demand_migration_module_enabled());
+        set_on_demand_migration_module_enabled(false);
+        assert!(!is_on_demand_migration_module_enabled());
+        set_on_demand_migration_module_enabled(before);
+    }
 }
