@@ -1273,7 +1273,6 @@ pub struct BucketMetadataSys {
     /// name floods while avoiding repeated namespace and erasure reads.
     missing_buckets: moka::future::Cache<String, ()>,
     api: Arc<ECStore>,
-    initialized: Arc<RwLock<bool>>,
 }
 
 impl BucketMetadataSys {
@@ -1302,7 +1301,6 @@ impl BucketMetadataSys {
                 .time_to_live(MISSING_BUCKET_TTL)
                 .build(),
             api,
-            initialized: Arc::new(RwLock::new(false)),
         }
     }
 
@@ -1403,9 +1401,6 @@ impl BucketMetadataSys {
 
             buckets = &buckets[count..]
         }
-
-        let mut initialized = self.initialized.write().await;
-        *initialized = true;
 
         Ok(())
     }
@@ -1897,23 +1892,13 @@ impl BucketMetadataSys {
                     "lazy metadata IO must start while the bucket namespace read lock is held"
                 );
             }
-            let (bm, persisted) = match await_bucket_namespace_operation(
+            let (bm, persisted) = await_bucket_namespace_operation(
                 Some(&guard),
                 bucket,
                 "lazy bucket metadata load",
                 Box::pin(load_bucket_metadata_parse_with_presence(self.api.clone(), bucket, true)),
             )
-            .await
-            {
-                Ok(res) => res,
-                Err(err) => {
-                    return if *self.initialized.read().await {
-                        Err(Error::other("errBucketMetadataNotInitialized"))
-                    } else {
-                        Err(err)
-                    };
-                }
-            };
+            .await?;
 
             let bm = Arc::new(bm);
 
