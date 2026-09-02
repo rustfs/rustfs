@@ -986,7 +986,7 @@ fn ensure_decommission_capacity_target_fence(
     phase: &str,
 ) -> Result<()> {
     if guard.is_lock_lost() {
-        return Err(Error::other(format!(
+        return Err(Error::DecommissionCapacity(format!(
             "target pool {target_pool_index} capacity mutation fence was lost during {phase}"
         )));
     }
@@ -8463,9 +8463,7 @@ impl ECStore {
                 required,
                 achieved,
             }),
-            Err(err) => Err(Error::other(format!(
-                "failed to acquire target pool {target_pool_index} capacity mutation gate: {err}"
-            ))),
+            Err(err) => Err(Error::Lock(err)),
         }
     }
 
@@ -8500,9 +8498,7 @@ impl ECStore {
                         required,
                         achieved,
                     },
-                    other => Error::other(format!(
-                        "failed to acquire target pool {target_pool_index} capacity terminal gate: {other}"
-                    )),
+                    other => Error::Lock(other),
                 })?;
             guards.push(guard);
         }
