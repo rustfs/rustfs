@@ -22,7 +22,7 @@
 //! not exercised by the harness self-test.
 
 use crate::common::{RustFSTestEnvironment, signed_request};
-use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FakeS3TargetOptions, SeedMetadata};
+use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FakeS3TargetOptions, Operation, SeedMetadata};
 use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -30,12 +30,16 @@ use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
 use bytes::Bytes;
 use serde::Serialize;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Module switch the server reads at startup (`false` before GA). The harness
 /// turns it on so scenario tests exercise the feature without repeating it.
 pub const ODM_MODULE_SWITCH_ENV: &str = "RUSTFS_ON_DEMAND_MIGRATION_ENABLED";
+/// The source client shares the replication egress guard, which rejects the
+/// fake source's loopback endpoint unless this switch is set.
+pub const ALLOW_LOOPBACK_SOURCE_ENV: &str = "RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET";
 /// Admin route prefix; the bucket name is appended as one path segment.
 pub const ODM_ADMIN_ROUTE: &str = "/rustfs/admin/v3/on-demand-migration";
 /// Region the fake source is addressed with (it accepts any SigV4 region).
@@ -235,6 +239,21 @@ impl AdminResponse {
     }
 }
 
+/// Raw S3 response (status, headers, body) for assertions on headers the
+/// SDK does not surface, such as `x-rustfs-on-demand-migration`.
+#[derive(Debug, Clone)]
+pub struct RawResponse {
+    pub status: u16,
+    pub headers: http::HeaderMap,
+    pub body: Bytes,
+}
+
+impl RawResponse {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|value| value.to_str().ok())
+    }
+}
+
 /// One object to seed into the source.
 #[derive(Clone)]
 pub struct SeedObject {
@@ -277,7 +296,7 @@ impl OdmTestEnv {
         let source = FakeS3Target::start_with_options(options).await?;
         let mut rustfs = RustFSTestEnvironment::new().await?;
         rustfs
-            .start_rustfs_server_with_env(vec![], &[(ODM_MODULE_SWITCH_ENV, "true")])
+            .start_rustfs_server_with_env(vec![], &[(ODM_MODULE_SWITCH_ENV, "true"), (ALLOW_LOOPBACK_SOURCE_ENV, "true")])
             .await?;
         let client = rustfs.create_s3_client();
         Ok(Self { rustfs, source, client })
@@ -410,6 +429,52 @@ impl OdmTestEnv {
             .unwrap_or_else(|error| panic!("reading {bucket}/{key} failed: {error}"))
             .into_bytes();
         assert_eq!(body.as_ref(), expected, "{bucket}/{key} local content mismatch");
+    }
+
+    /// Polls the listing until `key` is present locally or `timeout` elapses
+    /// (background pulls land after the response that triggered them).
+    pub async fn wait_local_listed(&self, bucket: &str, key: &str, timeout: Duration) -> Result<bool, BoxError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.local_key_listed(bucket, key).await? {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Raw signed `GET /{bucket}/{key}` against the RustFS under test.
+    pub async fn raw_get(&self, bucket: &str, key: &str) -> Result<RawResponse, BoxError> {
+        let url = format!("{}/{bucket}/{key}", self.rustfs.url);
+        let response =
+            signed_request(http::Method::GET, &url, &self.rustfs.access_key, &self.rustfs.secret_key, None, None).await?;
+        Ok(RawResponse {
+            status: response.status().as_u16(),
+            headers: response.headers().clone(),
+            body: response.bytes().await?,
+        })
+    }
+
+    /// Waits until the runtime consults the source for `bucket`: a config
+    /// install is applied asynchronously after the admin call returns. The
+    /// probe is a HEAD on a key that exists nowhere, so nothing is pulled and
+    /// only that key enters the negative cache.
+    pub async fn wait_until_source_consulted(&self, bucket: &str) -> Result<(), BoxError> {
+        const PROBE_KEY: &str = "_odm-readiness-probe";
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let _ = self.client.head_object().bucket(bucket).key(PROBE_KEY).send().await;
+            if self.source.count_requests(Operation::HeadObject, PROBE_KEY) > 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("on-demand migration runtime for {bucket} did not consult the source in time").into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Panics if `key` is listed locally.
