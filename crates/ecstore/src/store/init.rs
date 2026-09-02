@@ -3611,6 +3611,7 @@ mod tests {
                     assert_eq!(body, multipart_target_body);
 
                     let retry_object = "multipart-retry-object";
+                    let retry_object_etag = "0123456789abcdef0123456789abcdef".to_string();
                     let retry_first_part_size = 5 * 1024 * 1024;
                     let retry_object_mod_time =
                         OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed retry timestamp should be valid");
@@ -3700,6 +3701,7 @@ mod tests {
                             &ObjectOptions {
                                 mod_time: Some(retry_object_mod_time),
                                 want_checksum: Some(retry_object_checksum),
+                                preserve_etag: Some(retry_object_etag.clone()),
                                 ..Default::default()
                             },
                         )
@@ -3732,7 +3734,7 @@ mod tests {
                         part.checksums = Some(HashMap::from([(ChecksumType::CRC32C.to_string(), checksum.encoded.clone())]));
                     }
                     retry_source_info.parts = Arc::new(retry_source_parts);
-                    retry_source_info.etag = Some("0123456789abcdef0123456789abcdef".to_string());
+                    assert_eq!(retry_source_info.etag.as_deref(), Some(retry_object_etag.as_str()));
                     assert!(!retry_source_info.is_multipart());
                     assert!(retry_source_info.parts.iter().all(|part| part.checksums.is_some()));
                     assert_eq!(retry_source_info.checksum.as_deref(), Some(retry_object_checksum_bytes.as_ref()));
