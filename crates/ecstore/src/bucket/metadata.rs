@@ -270,6 +270,7 @@ pub const BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG: &str = "public-access-block.xml";
 pub const BUCKET_ACL_CONFIG: &str = "bucket-acl.json";
 pub const BUCKET_TABLE_CONFIG: &str = "table-bucket.json";
 pub const BUCKET_DURABILITY_CONFIG: &str = "durability.json";
+pub const BUCKET_ON_DEMAND_MIGRATION_CONFIG: &str = "on-demand-migration.json";
 pub const BUCKET_TABLE_RESERVED_PREFIX: &str = ".rustfs-table";
 pub const BUCKET_TABLE_CATALOG_META_PREFIX: &str = "s3tables/catalog";
 pub const BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX: &str = "table-buckets";
@@ -321,6 +322,7 @@ pub struct BucketMetadata {
     pub bucket_acl_config_json: Vec<u8>,
     pub table_bucket_config_json: Vec<u8>,
     pub durability_config_json: Vec<u8>,
+    pub on_demand_migration_config_json: Vec<u8>,
 
     pub policy_config_updated_at: OffsetDateTime,
     pub object_lock_config_updated_at: OffsetDateTime,
@@ -342,6 +344,7 @@ pub struct BucketMetadata {
     pub bucket_acl_config_updated_at: OffsetDateTime,
     pub table_bucket_config_updated_at: OffsetDateTime,
     pub durability_config_updated_at: OffsetDateTime,
+    pub on_demand_migration_config_updated_at: OffsetDateTime,
 
     pub new_field_updated_at: OffsetDateTime,
 
@@ -393,6 +396,7 @@ impl Default for BucketMetadata {
             bucket_acl_config_json: Default::default(),
             table_bucket_config_json: Default::default(),
             durability_config_json: Default::default(),
+            on_demand_migration_config_json: Default::default(),
             policy_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             object_lock_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             encryption_config_updated_at: OffsetDateTime::UNIX_EPOCH,
@@ -413,6 +417,7 @@ impl Default for BucketMetadata {
             bucket_acl_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             table_bucket_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             durability_config_updated_at: OffsetDateTime::UNIX_EPOCH,
+            on_demand_migration_config_updated_at: OffsetDateTime::UNIX_EPOCH,
             new_field_updated_at: OffsetDateTime::UNIX_EPOCH,
             policy_config: Default::default(),
             notification_config: Default::default(),
@@ -477,6 +482,23 @@ impl BucketMetadata {
     /// Absent/empty/unparsable payloads all mean "no override" (the bucket
     /// follows the global durability mode); a parse failure is logged so a
     /// corrupted entry cannot silently change fsync behavior.
+    /// Parsed on-demand migration config, if one is stored.
+    ///
+    /// `Ok(None)` means no config (absent or cleared). A stored payload that
+    /// does not parse is an error, never a default: the runtime must not
+    /// pull from a source it cannot describe.
+    pub fn on_demand_migration_config(
+        &self,
+    ) -> std::result::Result<
+        Option<super::on_demand_migration::OnDemandMigrationConfig>,
+        super::on_demand_migration::OnDemandMigrationConfigError,
+    > {
+        if self.on_demand_migration_config_json.is_empty() {
+            return Ok(None);
+        }
+        super::on_demand_migration::OnDemandMigrationConfig::from_json(&self.on_demand_migration_config_json).map(Some)
+    }
+
     pub fn durability_config(&self) -> Option<super::durability::BucketDurabilityConfig> {
         if self.durability_config_json.is_empty() {
             return None;
@@ -555,6 +577,9 @@ impl BucketMetadata {
                 "BucketAclConfigJSON" | "BucketAclConfigJson" => self.bucket_acl_config_json = read_msgp_bin(rd)?,
                 "TableBucketConfigJSON" | "TableBucketConfigJson" => self.table_bucket_config_json = read_msgp_bin(rd)?,
                 "DurabilityConfigJSON" | "DurabilityConfigJson" => self.durability_config_json = read_msgp_bin(rd)?,
+                "OnDemandMigrationConfigJSON" | "OnDemandMigrationConfigJson" => {
+                    self.on_demand_migration_config_json = read_msgp_bin(rd)?
+                }
                 "CorsConfigUpdatedAt" => self.cors_config_updated_at = read_msgp_time_value(rd)?,
                 "LoggingConfigUpdatedAt" => self.logging_config_updated_at = read_msgp_time_value(rd)?,
                 "WebsiteConfigUpdatedAt" => self.website_config_updated_at = read_msgp_time_value(rd)?,
@@ -564,6 +589,7 @@ impl BucketMetadata {
                 "BucketAclConfigUpdatedAt" => self.bucket_acl_config_updated_at = read_msgp_time_value(rd)?,
                 "TableBucketConfigUpdatedAt" => self.table_bucket_config_updated_at = read_msgp_time_value(rd)?,
                 "DurabilityConfigUpdatedAt" => self.durability_config_updated_at = read_msgp_time_value(rd)?,
+                "OnDemandMigrationConfigUpdatedAt" => self.on_demand_migration_config_updated_at = read_msgp_time_value(rd)?,
                 other => {
                     tracing::debug!(field = %other, "BucketMetadata decode_from: skipping unknown field");
                     skip_msgp_value(rd)?;
@@ -576,8 +602,8 @@ impl BucketMetadata {
 
     /// Encode to msgp bytes. Field order follows MinIO BucketMetadata for compatibility.
     pub fn encode_to<W: Write>(&self, wr: &mut W) -> Result<()> {
-        // Map size: MinIO fields (25) + RustFS extensions (19)
-        let map_len: u32 = 44;
+        // Map size: MinIO fields (25) + RustFS extensions (21)
+        let map_len: u32 = 46;
         rmp::encode::write_map_len(wr, map_len)?;
 
         // MinIO field order (same as Go struct)
@@ -637,6 +663,7 @@ impl BucketMetadata {
         write_bin_field(wr, "BucketAclConfigJSON", &self.bucket_acl_config_json)?;
         write_bin_field(wr, "TableBucketConfigJSON", &self.table_bucket_config_json)?;
         write_bin_field(wr, "DurabilityConfigJSON", &self.durability_config_json)?;
+        write_bin_field(wr, "OnDemandMigrationConfigJSON", &self.on_demand_migration_config_json)?;
         rmp::encode::write_str(wr, "CorsConfigUpdatedAt")?;
         write_msgp_time(wr, self.cors_config_updated_at)?;
         rmp::encode::write_str(wr, "LoggingConfigUpdatedAt")?;
@@ -655,6 +682,8 @@ impl BucketMetadata {
         write_msgp_time(wr, self.table_bucket_config_updated_at)?;
         rmp::encode::write_str(wr, "DurabilityConfigUpdatedAt")?;
         write_msgp_time(wr, self.durability_config_updated_at)?;
+        rmp::encode::write_str(wr, "OnDemandMigrationConfigUpdatedAt")?;
+        write_msgp_time(wr, self.on_demand_migration_config_updated_at)?;
 
         Ok(())
     }
@@ -755,6 +784,9 @@ impl BucketMetadata {
         }
         if self.durability_config_updated_at == OffsetDateTime::UNIX_EPOCH {
             self.durability_config_updated_at = self.created
+        }
+        if self.on_demand_migration_config_updated_at == OffsetDateTime::UNIX_EPOCH {
+            self.on_demand_migration_config_updated_at = self.created
         }
     }
 
@@ -870,6 +902,17 @@ impl BucketMetadata {
             BUCKET_DURABILITY_CONFIG => {
                 self.durability_config_json = data;
                 self.durability_config_updated_at = updated;
+            }
+            BUCKET_ON_DEMAND_MIGRATION_CONFIG => {
+                // Structural check only (shape, unknown fields); the
+                // deployment-relative rules run in the admin handler with a
+                // `ValidationContext`. A blob this build cannot read must not
+                // be persisted for every later reader to trip over.
+                if !data.is_empty() {
+                    super::on_demand_migration::OnDemandMigrationConfig::from_json(&data).map_err(Error::other)?;
+                }
+                self.on_demand_migration_config_json = data;
+                self.on_demand_migration_config_updated_at = updated;
             }
             _ => return Err(Error::other(format!("config file not found : {config_file}"))),
         }
@@ -1777,6 +1820,117 @@ mod test {
 
         bm.update_config(BUCKET_TABLE_CONFIG, Vec::new()).unwrap();
         assert!(!bm.table_bucket_enabled());
+    }
+
+    const ODM_JSON: &[u8] = br#"{"version":1,"enabled":true,"source":{"provider":"minio","endpoint":"https://legacy.example.com:9000","region":"auto","bucket":"legacy-bucket","credentials":{"access_key":"AK","secret_key":"SK"}}}"#;
+
+    /// rustfs/backlog#2148: the on-demand migration config is a RustFS
+    /// extension entry that round-trips through `update_config` and the
+    /// msgpack codec, clears on delete, and never parses corruption into a
+    /// default.
+    #[test]
+    fn on_demand_migration_config_round_trips_and_tracks_updates() {
+        use crate::bucket::on_demand_migration::{OnDemandMigrationConfig, OnDemandMigrationConfigError};
+
+        let mut bm = BucketMetadata::new("odm-bucket");
+        assert_eq!(bm.on_demand_migration_config(), Ok(None), "fresh metadata carries no config");
+
+        let expected = OnDemandMigrationConfig::from_json(ODM_JSON).unwrap();
+        bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
+            .expect("valid config is accepted");
+        assert_ne!(bm.on_demand_migration_config_updated_at, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(bm.on_demand_migration_config(), Ok(Some(expected.clone())));
+
+        let back = BucketMetadata::unmarshal(&bm.marshal_msg().unwrap()).unwrap();
+        assert_eq!(back.on_demand_migration_config_json, bm.on_demand_migration_config_json);
+        assert_eq!(
+            back.on_demand_migration_config_updated_at.unix_timestamp(),
+            bm.on_demand_migration_config_updated_at.unix_timestamp()
+        );
+        assert_eq!(back.on_demand_migration_config(), Ok(Some(expected)));
+
+        // A blob this build cannot read is rejected at the write boundary
+        // rather than persisted for every reader to trip over.
+        let before = bm.on_demand_migration_config_json.clone();
+        assert!(
+            bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, br#"{"source":{"provider":"s3"},"bogus":1}"#.to_vec())
+                .is_err()
+        );
+        assert_eq!(bm.on_demand_migration_config_json, before, "a rejected update leaves the blob untouched");
+
+        // Delete clears the entry.
+        let stamped = bm.on_demand_migration_config_updated_at;
+        bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, Vec::new()).unwrap();
+        assert!(bm.on_demand_migration_config_json.is_empty());
+        assert_eq!(bm.on_demand_migration_config(), Ok(None));
+        assert!(bm.on_demand_migration_config_updated_at >= stamped);
+
+        // Corruption that bypassed `update_config` (disk, another writer)
+        // is a typed error, never a default.
+        bm.on_demand_migration_config_json = b"not-json".to_vec();
+        assert!(matches!(bm.on_demand_migration_config(), Err(OnDemandMigrationConfigError::Malformed(_))));
+    }
+
+    /// rustfs/backlog#2148: a `.metadata.bin` written before the on-demand
+    /// migration keys existed decodes with an empty blob and an epoch
+    /// timestamp that `default_timestamps` back-fills from `created`.
+    #[test]
+    fn on_demand_migration_config_absent_in_legacy_blob_defaults_to_created() {
+        let blob = decode_hex(include_str!("../../tests/fixtures/minio/bucket_metadata.blob.hex"));
+        let mut bm = BucketMetadata::unmarshal(&blob[4..]).expect("unmarshal MinIO bucket metadata");
+        assert!(bm.on_demand_migration_config_json.is_empty());
+        assert_eq!(bm.on_demand_migration_config_updated_at, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(bm.on_demand_migration_config(), Ok(None));
+
+        bm.default_timestamps();
+        assert_ne!(bm.created, OffsetDateTime::UNIX_EPOCH, "fixture must carry a real creation time");
+        assert_eq!(bm.on_demand_migration_config_updated_at, bm.created);
+
+        // A metadata blob from this build with no config set stays
+        // indistinguishable from the legacy one for these fields.
+        let fresh = BucketMetadata::unmarshal(&BucketMetadata::new("fresh").marshal_msg().unwrap()).unwrap();
+        assert!(fresh.on_demand_migration_config_json.is_empty());
+        assert_eq!(fresh.on_demand_migration_config_updated_at, OffsetDateTime::UNIX_EPOCH);
+    }
+
+    /// rustfs/backlog#2148: a reader that predates the two on-demand
+    /// migration keys takes `decode_from`'s unknown-field branch, which is
+    /// `skip_msgp_value`. Walk the new-format blob with exactly that
+    /// primitive and prove both keys are skipped without desynchronising the
+    /// stream, so the fields that follow them still decode.
+    #[test]
+    fn old_decoder_skips_on_demand_migration_fields_without_desync() {
+        let mut bm = BucketMetadata::new("odm-skip");
+        bm.update_config(BUCKET_ON_DEMAND_MIGRATION_CONFIG, ODM_JSON.to_vec())
+            .unwrap();
+        bm.update_config(BUCKET_DURABILITY_CONFIG, br#"{"mode":"relaxed"}"#.to_vec())
+            .unwrap();
+        let buf = bm.marshal_msg().unwrap();
+
+        let mut rd = std::io::Cursor::new(buf.as_slice());
+        let fields = rmp::decode::read_map_len(&mut rd).unwrap();
+        let mut skipped = Vec::new();
+        let mut durability_json = Vec::new();
+        for _ in 0..fields {
+            let key_len = rmp::decode::read_str_len(&mut rd).unwrap();
+            let mut key = vec![0u8; key_len as usize];
+            rd.read_exact(&mut key).unwrap();
+            let key = String::from_utf8(key).unwrap();
+            match key.as_str() {
+                // The field an old reader knows that is encoded *after* the
+                // unknown JSON key and *before* the unknown timestamp key.
+                "DurabilityConfigJSON" => durability_json = read_msgp_bin(&mut rd).unwrap(),
+                other => {
+                    if other.starts_with("OnDemandMigration") {
+                        skipped.push(other.to_string());
+                    }
+                    skip_msgp_value(&mut rd).unwrap();
+                }
+            }
+        }
+        assert_eq!(skipped, ["OnDemandMigrationConfigJSON", "OnDemandMigrationConfigUpdatedAt"]);
+        assert_eq!(durability_json, br#"{"mode":"relaxed"}"#);
+        assert_eq!(rd.position() as usize, buf.len(), "old-style walk must consume the blob exactly");
     }
 
     /// HP-5b (rustfs/backlog#938): the durability override is a RustFS
