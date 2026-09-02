@@ -25,11 +25,106 @@ mod tests {
     use http::Method;
     use std::collections::HashSet;
     use std::error::Error;
+    use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use tokio::net::TcpStream;
     use tokio::time::{Duration, Instant, sleep, timeout};
     use tracing::info;
 
     const POOL_METADATA_OBJECT: &str = "pool.bin";
+
+    struct TcpPortBlackhole {
+        port: u16,
+        comment: String,
+        use_sudo: bool,
+        active: bool,
+    }
+
+    impl TcpPortBlackhole {
+        fn install(address: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
+            let address = address.parse::<SocketAddr>()?;
+            if !address.ip().is_loopback() {
+                return Err(format!("refusing to install a test firewall rule for non-loopback address {address}").into());
+            }
+
+            let id = Command::new("id").arg("-u").output()?;
+            if !id.status.success() {
+                return Err(format!("failed to determine the test process uid: {}", String::from_utf8_lossy(&id.stderr)).into());
+            }
+            let use_sudo = String::from_utf8_lossy(&id.stdout).trim() != "0";
+            let mut blackhole = Self {
+                port: address.port(),
+                comment: format!("rustfs-e2e-{}", uuid::Uuid::new_v4()),
+                use_sudo,
+                active: false,
+            };
+            blackhole.run_iptables(true)?;
+            blackhole.active = true;
+            Ok(blackhole)
+        }
+
+        fn restore(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+            if !self.active {
+                return Ok(());
+            }
+            self.run_iptables(false)?;
+            self.active = false;
+            Ok(())
+        }
+
+        fn run_iptables(&self, insert: bool) -> Result<(), Box<dyn Error + Send + Sync>> {
+            let mut command = if self.use_sudo {
+                let mut command = Command::new("sudo");
+                command.args(["-n", "iptables"]);
+                command
+            } else {
+                Command::new("iptables")
+            };
+            command.args(["-w", "5"]);
+            if insert {
+                command.args(["-I", "OUTPUT", "1"]);
+            } else {
+                command.args(["-D", "OUTPUT"]);
+            }
+            let port = self.port.to_string();
+            let output = command
+                .args([
+                    "-p",
+                    "tcp",
+                    "-d",
+                    "127.0.0.1/32",
+                    "--dport",
+                    &port,
+                    "-m",
+                    "comment",
+                    "--comment",
+                    &self.comment,
+                    "-j",
+                    "DROP",
+                ])
+                .output()?;
+            if !output.status.success() {
+                let action = if insert { "install" } else { "remove" };
+                return Err(format!(
+                    "failed to {action} endpoint blackhole rule for port {}: stdout={}, stderr={}",
+                    self.port,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+                .into());
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for TcpPortBlackhole {
+        fn drop(&mut self) {
+            if let Err(error) = self.restore() {
+                eprintln!("failed to remove {} firewall rule during test cleanup: {error}", self.comment);
+            }
+        }
+    }
 
     fn has_file_under(path: &Path) -> bool {
         let Ok(entries) = std::fs::read_dir(path) else {
@@ -671,7 +766,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cluster_root_heal_resumes_missing_remote_shards_after_node_restart() -> Result<(), Box<dyn Error + Send + Sync>>
     {
-        run_cluster_root_heal_restart(RestartScenario::IsolatedTarget).await
+        run_cluster_root_heal_interruption(InterruptionScenario::IsolatedTargetRestart).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -679,29 +774,43 @@ mod tests {
     {
         timeout(
             Duration::from_secs(420),
-            run_cluster_root_heal_restart(RestartScenario::BackgroundCoordinator),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundCoordinatorRestart),
         )
         .await?
     }
 
-    enum RestartScenario {
-        IsolatedTarget,
-        BackgroundCoordinator,
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_after_target_endpoint_blackhole() -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(420),
+            run_cluster_root_heal_interruption(InterruptionScenario::TargetEndpointBlackhole),
+        )
+        .await?
     }
 
-    async fn run_cluster_root_heal_restart(scenario: RestartScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let (background_enabled, restart_node) = match scenario {
-            RestartScenario::IsolatedTarget => (false, 1),
-            RestartScenario::BackgroundCoordinator => (true, 0),
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum InterruptionScenario {
+        IsolatedTargetRestart,
+        BackgroundCoordinatorRestart,
+        TargetEndpointBlackhole,
+    }
+
+    async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let (background_enabled, interruption_node, interruption_kind) = match scenario {
+            InterruptionScenario::IsolatedTargetRestart => (false, 1, "target_restart"),
+            InterruptionScenario::BackgroundCoordinatorRestart => (true, 0, "coordinator_restart"),
+            InterruptionScenario::TargetEndpointBlackhole => (false, 1, "target_endpoint_blackhole"),
         };
         init_logging();
         info!(
-            event = "heal_restart_started",
+            event = "heal_interruption_started",
             component = "e2e_test",
             subsystem = "heal",
             background_enabled,
-            restart_node,
-            "Starting root-heal restart test"
+            interruption_node,
+            interruption_kind,
+            "Starting root-heal interruption test"
         );
 
         let mut cluster = RustFSTestClusterEnvironment::new(4).await?;
@@ -1016,54 +1125,152 @@ mod tests {
             );
         }
         info!(
-            event = "heal_restart_checkpoint",
+            event = "heal_interruption_checkpoint",
             component = "e2e_test",
             subsystem = "heal",
             background_enabled,
-            restart_node,
+            interruption_node,
+            interruption_kind,
             partial_metadata_count = partial_count,
             verified_key = partial_manifest.key,
-            "Observed partial rebuild before node interruption"
+            "Observed partial rebuild before interruption"
         );
 
         let target_pid = cluster.nodes[1].process.as_ref().ok_or("target process is not running")?.id();
-        cluster.stop_node(restart_node)?;
-        let stopped_count = metadata_count(&replaced_disk, bucket, &expected_manifests);
-        assert!(
-            stopped_count > 0 && stopped_count < expected_manifests.len(),
-            "node {restart_node} must stop during a partial rebuild, observed before stop={partial_count}, after stop={stopped_count}, total={}",
-            expected_manifests.len()
-        );
-        assert!(
-            census_object_version_on_disk(&replaced_disk, bucket, &partial_manifest.key, None)?
-                .matches_manifest(&partial_manifest.shard_census),
-            "the witnessed complete shard must survive interruption"
-        );
-        let unclean_shutdown_marker = Path::new(&cluster.nodes[restart_node].data_dir)
-            .join(".rustfs.sys")
-            .join("unclean-shutdown");
-        if background_enabled {
+        if scenario == InterruptionScenario::TargetEndpointBlackhole {
+            let node_pids = cluster
+                .nodes
+                .iter()
+                .map(|node| {
+                    node.process
+                        .as_ref()
+                        .ok_or("cluster process is not running")
+                        .map(std::process::Child::id)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            timeout(Duration::from_secs(2), TcpStream::connect(&cluster.nodes[1].address)).await??;
+            let mut blackhole = TcpPortBlackhole::install(&cluster.nodes[1].address)?;
+            let blocked_connect = timeout(Duration::from_millis(500), TcpStream::connect(&cluster.nodes[1].address)).await;
             assert!(
-                unclean_shutdown_marker.is_file(),
-                "background restart must retain the real unclean-shutdown marker"
+                blocked_connect.is_err(),
+                "target endpoint connection must time out while the OUTPUT DROP rule is active: {blocked_connect:?}"
+            );
+
+            let stable_window_secs = std::env::var("RUSTFS_HEAL_CHAOS_BLACKHOLE_STABLE_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(2)
+                .clamp(1, 5);
+            let blackhole_timeout_secs = std::env::var("RUSTFS_HEAL_CHAOS_BLACKHOLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(20)
+                .clamp(stable_window_secs + 1, 60);
+            let blackhole_deadline = Instant::now() + Duration::from_secs(blackhole_timeout_secs);
+            let mut stable_count = metadata_count(&replaced_disk, bucket, &expected_manifests);
+            let mut stable_since = Instant::now();
+            loop {
+                for (node_index, (node, expected_pid)) in cluster.nodes.iter_mut().zip(&node_pids).enumerate() {
+                    let process = node
+                        .process
+                        .as_mut()
+                        .ok_or_else(|| format!("node {node_index} process disappeared"))?;
+                    assert_eq!(process.id(), *expected_pid, "node {node_index} PID changed during endpoint blackhole");
+                    assert!(process.try_wait()?.is_none(), "node {node_index} exited during endpoint blackhole");
+                }
+
+                let current_count = metadata_count(&replaced_disk, bucket, &expected_manifests);
+                if current_count == expected_manifests.len() {
+                    return Err("root heal completed before the endpoint blackhole became observable".into());
+                }
+                if current_count != stable_count {
+                    stable_count = current_count;
+                    stable_since = Instant::now();
+                }
+                if stable_since.elapsed() >= Duration::from_secs(stable_window_secs) {
+                    break;
+                }
+                if Instant::now() >= blackhole_deadline {
+                    return Err(format!(
+                        "target rebuild never remained stable for {stable_window_secs}s during the endpoint blackhole: last_count={stable_count}, total={}",
+                        expected_manifests.len()
+                    )
+                    .into());
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+
+            let blocked_task_body = timeout(
+                Duration::from_secs(5),
+                signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key),
+            )
+            .await??;
+            let blocked_task: serde_json::Value = serde_json::from_str(&blocked_task_body)
+                .map_err(|err| format!("blackholed task status is not JSON ({err}): {blocked_task_body}"))?;
+            assert_eq!(
+                blocked_task["summary"].as_str(),
+                Some("running"),
+                "the original admin task must remain resumable during the endpoint blackhole: {blocked_task}"
+            );
+            assert!(
+                census_object_version_on_disk(&replaced_disk, bucket, &partial_manifest.key, None)?
+                    .matches_manifest(&partial_manifest.shard_census),
+                "the witnessed complete shard must survive the endpoint blackhole"
+            );
+
+            blackhole.restore()?;
+            timeout(Duration::from_secs(2), TcpStream::connect(&cluster.nodes[1].address)).await??;
+            info!(
+                event = "heal_endpoint_blackhole_restored",
+                component = "e2e_test",
+                subsystem = "heal",
+                interruption_kind,
+                stable_metadata_count = stable_count,
+                stable_window_secs,
+                "Restored target endpoint forwarding"
             );
         } else {
-            match std::fs::remove_file(&unclean_shutdown_marker) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(format!("failed to isolate unclean recovery marker {unclean_shutdown_marker:?}: {error}").into());
+            cluster.stop_node(interruption_node)?;
+            let stopped_count = metadata_count(&replaced_disk, bucket, &expected_manifests);
+            assert!(
+                stopped_count > 0 && stopped_count < expected_manifests.len(),
+                "node {interruption_node} must stop during a partial rebuild, observed before stop={partial_count}, after stop={stopped_count}, total={}",
+                expected_manifests.len()
+            );
+            assert!(
+                census_object_version_on_disk(&replaced_disk, bucket, &partial_manifest.key, None)?
+                    .matches_manifest(&partial_manifest.shard_census),
+                "the witnessed complete shard must survive interruption"
+            );
+            let unclean_shutdown_marker = Path::new(&cluster.nodes[interruption_node].data_dir)
+                .join(".rustfs.sys")
+                .join("unclean-shutdown");
+            if background_enabled {
+                assert!(
+                    unclean_shutdown_marker.is_file(),
+                    "background restart must retain the real unclean-shutdown marker"
+                );
+            } else {
+                match std::fs::remove_file(&unclean_shutdown_marker) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(
+                            format!("failed to isolate unclean recovery marker {unclean_shutdown_marker:?}: {error}").into()
+                        );
+                    }
                 }
             }
-        }
-        cluster.start_node(restart_node).await?;
-        if restart_node == 0 {
-            let target = cluster.nodes[1]
-                .process
-                .as_mut()
-                .ok_or("target process disappeared during coordinator restart")?;
-            assert_eq!(target.id(), target_pid, "coordinator restart must not replace the target process");
-            assert!(target.try_wait()?.is_none(), "the target must remain alive during coordinator restart");
+            cluster.start_node(interruption_node).await?;
+            if interruption_node == 0 {
+                let target = cluster.nodes[1]
+                    .process
+                    .as_mut()
+                    .ok_or("target process disappeared during coordinator restart")?;
+                assert_eq!(target.id(), target_pid, "coordinator restart must not replace the target process");
+                assert!(target.try_wait()?.is_none(), "the target must remain alive during coordinator restart");
+            }
         }
 
         let scanner_cycle_floor = if background_enabled {
@@ -1118,7 +1325,7 @@ mod tests {
                     Err(_) => "replacement status request exceeded 5s diagnostic budget".to_string(),
                 };
                 return Err(format!(
-                    "root heal did not recover after node {restart_node} restart within {heal_timeout_secs}s: baseline={matching}/{}, outage={outage_census:?}, pool_metadata={pool_metadata:?}, status={final_status}, task_status={task_status}, pre_interrupt_status={pre_interrupt_status}, pre_heal_replacement={pre_heal_replacement}, pre_interrupt_replacement={pre_interrupt_replacement}, replacement_status={replacement_status}",
+                    "root heal did not recover after {interruption_kind} within {heal_timeout_secs}s: baseline={matching}/{}, outage={outage_census:?}, pool_metadata={pool_metadata:?}, status={final_status}, task_status={task_status}, pre_interrupt_status={pre_interrupt_status}, pre_heal_replacement={pre_heal_replacement}, pre_interrupt_replacement={pre_interrupt_replacement}, replacement_status={replacement_status}",
                     expected_manifests.len()
                 )
                 .into());
@@ -1185,7 +1392,7 @@ mod tests {
         let task_status_body = signed_admin_post(&task_status_url, None, &cluster.access_key, &cluster.secret_key).await?;
         let task_status: serde_json::Value = serde_json::from_str(&task_status_body)
             .map_err(|err| format!("heal task status is not JSON ({err}): {task_status_body}"))?;
-        if restart_node == 0 {
+        if interruption_node == 0 {
             // Admin tasks are process-local. Physical and queue convergence
             // above establish recovery; a lost task must not report success.
             assert_eq!(
@@ -1199,10 +1406,11 @@ mod tests {
                 "interrupted admin task must be explicitly unavailable: {task_status}"
             );
             info!(
-                event = "heal_restart_recovered",
+                event = "heal_interruption_recovered",
                 component = "e2e_test",
                 subsystem = "heal",
-                restart_node,
+                interruption_node,
+                interruption_kind,
                 task_state = "not_found",
                 "Physical recovery completed after coordinator restart"
             );
