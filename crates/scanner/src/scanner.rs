@@ -552,18 +552,21 @@ pub(super) fn data_usage_info_has_persisted_baseline_identity(info: &DataUsageIn
 }
 
 pub(super) fn data_usage_info_is_bootstrap_pending(info: &DataUsageInfo) -> bool {
-    if info.last_update.is_none() || info.scanner_cycle.is_some() {
+    let Some(last_update) = info.last_update else {
         return false;
-    }
+    };
 
-    let expected = DataUsageInfo {
-        last_update: info.last_update,
-        scanner_epoch: info.scanner_epoch,
+    info == &scanner_usage_bootstrap_marker(last_update, info.scanner_epoch)
+}
+
+pub(super) fn scanner_usage_bootstrap_marker(last_update: std::time::SystemTime, scanner_epoch: Option<u64>) -> DataUsageInfo {
+    DataUsageInfo {
+        last_update: Some(last_update),
+        scanner_epoch,
         usage_snapshot_converged: Some(false),
         usage_snapshot_bootstrap_pending: true,
         ..Default::default()
-    };
-    info == &expected
+    }
 }
 
 fn usage_cache_needs_prompt_scan(authoritative: &DataUsageInfo, observed: Option<&DataUsageInfo>) -> bool {
@@ -915,8 +918,8 @@ fn prepare_cycle_for_usage_floor_bootstrap(
                 },
             )
         }
-        PersistedUsageFloorStartup::RecoveredLegacyEmptyFence => {
-            // The legacy empty fence proves only its leader epoch, not
+        PersistedUsageFloorStartup::RecoveredLegacyIncompleteFence => {
+            // The legacy incomplete fence proves only its leader epoch, not
             // namespace coverage. Clear coverage while retaining the durable
             // cycle number so surviving caches cannot force a regression.
             let next = cycle_info.next;
@@ -2575,7 +2578,7 @@ async fn run_data_scanner_with_maintenance_state(
     match usage_floor_startup {
         PersistedUsageFloorStartup::Authoritative
         | PersistedUsageFloorStartup::BootstrapPending
-        | PersistedUsageFloorStartup::RecoveredLegacyEmptyFence => {}
+        | PersistedUsageFloorStartup::RecoveredLegacyIncompleteFence => {}
         PersistedUsageFloorStartup::Missing => {
             if ctx.is_cancelled() || guard.is_lock_lost() {
                 global_metrics().set_cycle(None).await;
@@ -2670,8 +2673,8 @@ async fn run_data_scanner_with_maintenance_state(
         finish_scanner_leader_iteration(false, "epoch_claim_failed", "leadership epoch claim failed".to_string()).await;
         return Ok(());
     }
-    if usage_floor_startup == PersistedUsageFloorStartup::RecoveredLegacyEmptyFence
-        && let Err(err) = complete_legacy_empty_usage_floor_recovery(storeapi.clone(), leader_epoch).await
+    if usage_floor_startup == PersistedUsageFloorStartup::RecoveredLegacyIncompleteFence
+        && let Err(err) = complete_legacy_incomplete_usage_floor_recovery(storeapi.clone(), leader_epoch).await
     {
         let error = err.to_string();
         warn!(
