@@ -26,7 +26,7 @@
 6|crates/ecstore/src/config/com.rs
 14|crates/ecstore/src/config/storageclass.rs
 182|crates/ecstore/src/core/pools.rs
-8|crates/ecstore/src/data_movement/mod.rs
+7|crates/ecstore/src/data_movement/mod.rs
 2|crates/ecstore/src/data_usage/local_snapshot.rs
 12|crates/ecstore/src/data_usage/mod.rs
 5|crates/ecstore/src/disk/local.rs
@@ -69,5 +69,5 @@
 12|crates/ecstore/src/store/init.rs
 2|crates/ecstore/src/store/init_format.rs
 3|crates/ecstore/src/store/multipart.rs
-7|crates/ecstore/src/store/object.rs
+6|crates/ecstore/src/store/object.rs
 5|crates/ecstore/src/store/rebalance/support.rs

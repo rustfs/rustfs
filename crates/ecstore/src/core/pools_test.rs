@@ -250,6 +250,27 @@ mod decommission_lock_order_tests {
             .expect("large-stack ecstore test thread should complete");
     }
 
+    fn run_large_stack_current_thread_async_test<C, F>(name: &str, case: C)
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: Future<Output = ()> + 'static,
+    {
+        const STACK_SIZE: usize = 32 * 1024 * 1024;
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(STACK_SIZE)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("large-stack current-thread ecstore test runtime should build");
+                runtime.block_on(case());
+            })
+            .expect("large-stack current-thread ecstore test should spawn")
+            .join()
+            .expect("large-stack current-thread ecstore test should complete");
+    }
+
     #[derive(Clone, Copy)]
     enum ExternalObjectMutation {
         Put,
@@ -1311,9 +1332,16 @@ mod decommission_lock_order_tests {
         assert_same_object_copy_fences_capacity_lease_loss(true).await;
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn data_movement_multipart_restart_cleans_exact_zero_delta_upload_without_capacity_ledger_state() {
+    fn data_movement_multipart_restart_cleans_exact_zero_delta_upload_with_recovery_marker() {
+        run_large_stack_async_test(
+            "multipart-zero-delta-restart",
+            data_movement_multipart_restart_cleans_exact_zero_delta_upload_with_recovery_marker_case,
+        );
+    }
+
+    async fn data_movement_multipart_restart_cleans_exact_zero_delta_upload_with_recovery_marker_case() {
         let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
         let bucket = test_bucket("multipart-zero-delta-restart");
         let object = "staged-without-statfs-delta.bin";
@@ -1418,8 +1446,9 @@ mod decommission_lock_order_tests {
                 .as_ref()
                 .and_then(|info| info.capacity_reservation.as_ref())
                 .expect("zero-delta reservation should remain active");
-            assert_eq!(reservation.pending_target_physical_bytes, 0);
+            assert_eq!(reservation.pending_target_physical_bytes, 1);
             assert_eq!(reservation.inflight_target_physical_bytes, 0);
+            assert_eq!(reservation.targets[0].pending_mutation_id, owner.mutation_id);
             assert_eq!(reservation.targets[0].temporary_mutations.len(), 1);
             assert_eq!(reservation.targets[0].temporary_mutations[0].mutation_id, owner.mutation_id.unwrap());
             assert_eq!(reservation.targets[0].temporary_mutations[0].physical_bytes, 0);
@@ -1463,6 +1492,181 @@ mod decommission_lock_order_tests {
             .await
             .expect("repeated cleanup should take the fast path after removing the marker");
         assert_eq!(store.data_movement_multipart_discovery_count_for_test(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn multipart_cleanup_proves_target_absence_after_acquiring_capacity_gate() {
+        let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("multipart-cleanup-target-race");
+        let object = "published-between-cleanup-proof-and-finalize.bin";
+        let body = vec![0x5a; 64 * 1024];
+        let version_id = uuid::Uuid::new_v4();
+        let mod_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(19);
+        let upload_identity = format!("v1:{version_id}:{}", mod_time.unix_timestamp_nanos());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create the cleanup target-race bucket");
+        let incarnation = store
+            .bucket_incarnation_id(&bucket)
+            .await
+            .expect("load the cleanup target-race bucket incarnation");
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        set_decommission_capacity_info_overrides_for_test(
+            store.id,
+            vec![vec![
+                DecommissionPoolCapacityInfo::for_test(0, layout, 0, body.len(), body.len()),
+                DecommissionPoolCapacityInfo::for_test(1, layout, 0, body.len().saturating_mul(2), body.len().saturating_mul(2)),
+                DecommissionPoolCapacityInfo::for_test(2, layout, body.len().saturating_mul(2), body.len().saturating_mul(2), 0),
+            ]],
+        );
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activate the cleanup target-race reservation");
+        let target_pool_index = store.pool_meta.read().await.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .and_then(|reservation| reservation.targets.first())
+            .expect("cleanup target-race fixture should reserve one target")
+            .pool_index;
+        assert_eq!(target_pool_index, 2);
+        let owner = decommission_capacity_owner(&*store.pool_meta.read().await).with_mutation_id(uuid::Uuid::new_v4());
+        let mut upload_opts = ObjectOptions {
+            data_movement: true,
+            src_pool_idx: 0,
+            versioned: true,
+            version_id: Some(version_id.to_string()),
+            mod_time: Some(mod_time),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        rustfs_utils::http::insert_str(
+            &mut upload_opts.user_defined,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            upload_identity.clone(),
+        );
+        owner.apply_to(&mut upload_opts);
+        let mut cleanup_opts = ObjectOptions {
+            data_movement: true,
+            src_pool_idx: 0,
+            versioned: true,
+            version_id: Some(version_id.to_string()),
+            mod_time: Some(mod_time),
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        owner.apply_to(&mut cleanup_opts);
+
+        let staging_store = Arc::clone(&store);
+        let staging_bucket = bucket.clone();
+        store
+            .run_decommission_capacity_temporary_mutation(target_pool_index, Some(owner), None, || async move {
+                new_multipart_upload(&staging_store, target_pool_index, &staging_bucket, object, upload_opts).await?;
+                Err::<(), crate::error::Error>(crate::error::Error::OperationCanceled)
+            })
+            .await
+            .expect_err("the fixture should fail after staging its recoverable upload");
+        store
+            .run_decommission_capacity_temporary_mutation(target_pool_index, Some(owner), Some(body.len()), || async {
+                Err::<(), crate::error::Error>(crate::error::Error::OperationCanceled)
+            })
+            .await
+            .expect_err("the fixture should retain an exact pending capacity intent");
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("cleanup target-race reservation should remain active");
+            assert!(reservation.pending_target_physical_bytes > 0);
+            assert_eq!(reservation.targets[0].pending_mutation_id, owner.mutation_id);
+            assert!(
+                reservation.targets[0]
+                    .temporary_mutations
+                    .iter()
+                    .any(|mutation| mutation.mutation_id == owner.mutation_id.unwrap())
+            );
+        }
+
+        let target_lock = store
+            .new_ns_lock(
+                RUSTFS_META_BUCKET,
+                &format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/{target_pool_index}"),
+            )
+            .await
+            .expect("create the cleanup target-race gate");
+        let target_guard = target_lock
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("hold the cleanup target-race gate");
+        let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+        barrier.disable_owner_pause();
+        barrier.pause_target_gate_acquire(target_pool_index);
+        let mut cleanup = tokio::spawn({
+            let cleanup_store = Arc::clone(&store);
+            let cleanup_bucket = bucket.clone();
+            let cleanup_identity = upload_identity.clone();
+            async move {
+                cleanup_store
+                    .reconcile_multipart_uploads_for_data_movement(
+                        target_pool_index,
+                        &cleanup_bucket,
+                        object,
+                        &cleanup_identity,
+                        &cleanup_opts,
+                    )
+                    .await
+            }
+        });
+        tokio::select! {
+            _ = barrier.wait_until_target_gate_acquire_paused() => {}
+            result = &mut cleanup => panic!("cleanup finished before its target-gate proof point: {result:?}"),
+        }
+
+        let mut target_data = PutObjReader::from_vec(body);
+        let published = store.pools[target_pool_index]
+            .put_object(
+                &bucket,
+                object,
+                &mut target_data,
+                &ObjectOptions {
+                    data_movement: true,
+                    src_pool_idx: 0,
+                    versioned: true,
+                    version_id: Some(version_id.to_string()),
+                    mod_time: Some(mod_time),
+                    expected_bucket_incarnation_id: Some(incarnation),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("publish the exact owned target while cleanup waits for its capacity gate");
+        assert!(crate::data_movement::is_owned_data_movement_target(&published));
+        drop(target_guard);
+        barrier.release_target_gate_acquire();
+        tokio::time::timeout(Duration::from_secs(30), cleanup)
+            .await
+            .expect("cleanup should finish after acquiring its target gate")
+            .expect("cleanup task should not panic")
+            .expect("cleanup should preserve the now-published target intent");
+        drop(barrier);
+
+        let pool_meta = store.pool_meta.read().await;
+        let reservation = pool_meta.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("cleanup target-race reservation should remain active");
+        assert!(
+            reservation.pending_target_physical_bytes > 0,
+            "cleanup must not clear capacity for a target published before its gated proof"
+        );
+        assert_eq!(reservation.targets[0].pending_mutation_id, owner.mutation_id);
+        assert!(reservation.targets[0].temporary_mutations.is_empty());
     }
 
     #[test]
@@ -4245,9 +4449,16 @@ mod decommission_lock_order_tests {
         }
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn data_movement_equivalent_target_reconciles_published_capacity_after_restart() {
+    fn data_movement_equivalent_target_reconciles_published_capacity_after_restart() {
+        run_large_stack_current_thread_async_test(
+            "equivalent-target-capacity-restart",
+            data_movement_equivalent_target_reconciles_published_capacity_after_restart_case,
+        );
+    }
+
+    async fn data_movement_equivalent_target_reconciles_published_capacity_after_restart_case() {
         let (_temp_dirs, store, other_store) =
             test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
         let bucket = test_bucket("equivalent-target");
@@ -4478,38 +4689,50 @@ mod decommission_lock_order_tests {
             crate::error::is_err_object_not_found(&interleaved_target_err)
                 || crate::error::is_err_version_not_found(&interleaved_target_err)
         );
-        let retry_reader = other_store.pools[0]
-            .get_object_reader(
-                &bucket,
-                object,
-                None,
-                HeaderMap::new(),
-                &ObjectOptions {
-                    versioned: true,
-                    version_id: Some(source_version),
-                    no_lock: true,
-                    data_movement: true,
-                    raw_data_movement_read: true,
-                    ..Default::default()
-                },
-            )
+        let target_lock = other_store
+            .new_ns_lock(RUSTFS_META_BUCKET, &format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/2"))
             .await
-            .expect("restart retry should reread the exact source version");
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            data_movement::migrate_decommission_object(
-                Arc::clone(&other_store),
-                0,
-                bucket.clone(),
-                retry_reader,
-                Some(incarnation),
-                "equivalent_target_reconcile_retry",
-                Some(retry_owner),
-            ),
-        )
-        .await
-        .expect("equivalent-target retry should not deadlock")
-        .expect("equivalent target retry should reconcile the pending capacity intent");
+            .expect("create the equivalent-target retry gate");
+        let target_guard = target_lock
+            .get_write_lock(Duration::from_secs(30))
+            .await
+            .expect("hold the equivalent-target gate before restart retry");
+        let retry_observer = DecommissionCapacityLockOrderBarrier::install(other_store.id, other_store.id);
+        retry_observer.disable_owner_pause();
+        let retry_set = other_store.pools[0].get_disks_by_key(object);
+        let mut retry = tokio::spawn({
+            let retry_store = Arc::clone(&other_store);
+            let retry_bucket = bucket.clone();
+            async move {
+                retry_store
+                    .decommission_entry_for_test(
+                        0,
+                        MetaCacheEntry {
+                            name: object.to_string(),
+                            ..Default::default()
+                        },
+                        retry_bucket,
+                        retry_set,
+                    )
+                    .await
+            }
+        });
+        tokio::select! {
+            _ = retry_observer.wait_until_target_gate_retry() => {}
+            result = &mut retry => panic!("equivalent-target retry finished before target contention: {result:?}"),
+        }
+        drop(target_guard);
+        tokio::time::timeout(Duration::from_secs(30), retry)
+            .await
+            .expect("equivalent-target retry should not deadlock after permit transfer")
+            .expect("equivalent-target retry task should not panic")
+            .expect("equivalent target retry should reconcile the pending capacity intent");
+        assert_eq!(
+            retry_observer.target_gate_exact_reloads(),
+            1,
+            "equivalent reconciliation must consume its exact target permit without re-entering busy recovery"
+        );
+        drop(retry_observer);
 
         let mut reconciled = crate::core::pools::PoolMeta::default();
         reconciled

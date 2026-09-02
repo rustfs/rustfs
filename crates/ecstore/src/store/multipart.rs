@@ -810,9 +810,11 @@ impl ECStore {
             .await?
             .contains(&target_pool_idx)
         {
-            return Err(Error::other(format!(
-                "data movement multipart cleanup target pool {target_pool_idx} is outside its capacity reservation"
-            )));
+            return Err(Error::DecommissionCapacityBlocked {
+                message: format!(
+                    "data movement multipart cleanup target pool {target_pool_idx} is outside its capacity reservation"
+                ),
+            });
         }
         if !self
             .has_decommission_capacity_temporary_mutation_state(target_pool_idx, owner)

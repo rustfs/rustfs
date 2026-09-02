@@ -2190,7 +2190,7 @@ fn release_decommission_target_inflight(
     } else {
         0
     };
-    let changed = temporary_mutation_changed || cleared_pending > 0;
+    let changed = released > 0 || temporary_mutation_changed || cleared_pending > 0;
     if changed {
         renew_decommission_capacity_reservation(reservation, now, true);
         pool.last_update = now;
@@ -8114,6 +8114,9 @@ struct DecommissionCapacityLockOrderBarrierState {
     target_gate_retry_entered: tokio::sync::Notify,
     target_gate_retry_entries: AtomicUsize,
     target_gate_exact_reloads: AtomicUsize,
+    target_gate_acquire_pause_target: AtomicUsize,
+    target_gate_acquire_entered: tokio::sync::Notify,
+    target_gate_acquire_release: tokio::sync::Notify,
     cancel_before_start_entered: tokio::sync::Notify,
     cancel_before_start_release: tokio::sync::Notify,
     cancel_before_start_paused: AtomicBool,
@@ -8150,6 +8153,9 @@ impl DecommissionCapacityLockOrderBarrier {
             target_gate_retry_entered: tokio::sync::Notify::new(),
             target_gate_retry_entries: AtomicUsize::new(0),
             target_gate_exact_reloads: AtomicUsize::new(0),
+            target_gate_acquire_pause_target: AtomicUsize::new(usize::MAX),
+            target_gate_acquire_entered: tokio::sync::Notify::new(),
+            target_gate_acquire_release: tokio::sync::Notify::new(),
             cancel_before_start_entered: tokio::sync::Notify::new(),
             cancel_before_start_release: tokio::sync::Notify::new(),
             cancel_before_start_paused: AtomicBool::new(false),
@@ -8238,6 +8244,28 @@ impl DecommissionCapacityLockOrderBarrier {
         self.state.target_gate_exact_reloads.load(Ordering::Acquire)
     }
 
+    #[cfg(feature = "test-util")]
+    pub(crate) fn pause_target_gate_acquire(&self, target_pool_index: usize) {
+        self.state
+            .target_gate_acquire_pause_target
+            .store(target_pool_index, Ordering::Release);
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) async fn wait_until_target_gate_acquire_paused(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), self.state.target_gate_acquire_entered.notified())
+            .await
+            .expect("decommission capacity mutation should pause before acquiring its target gate");
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn release_target_gate_acquire(&self) {
+        self.state
+            .target_gate_acquire_pause_target
+            .store(usize::MAX, Ordering::Release);
+        self.state.target_gate_acquire_release.notify_one();
+    }
+
     pub(crate) fn pause_cancel_before_start(&self) {
         self.state.cancel_before_start_paused.store(true, Ordering::Release);
     }
@@ -8255,6 +8283,7 @@ impl DecommissionCapacityLockOrderBarrier {
     #[cfg(feature = "test-util")]
     pub(crate) fn release_owner(&self) {
         self.state.owner_release.notify_one();
+        self.state.target_gate_acquire_release.notify_one();
     }
 
     #[cfg(feature = "test-util")]
@@ -8315,6 +8344,24 @@ async fn pause_decommission_capacity_before_owner_write(store_id: uuid::Uuid) {
     if let Some(barrier) = barrier {
         barrier.owner_arrived.notify_one();
         barrier.owner_release.notified().await;
+    }
+}
+
+#[cfg(test)]
+async fn pause_decommission_capacity_before_target_gate_acquire(store_id: uuid::Uuid, target_pool_index: usize) {
+    let barrier = DECOMMISSION_CAPACITY_LOCK_ORDER_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("decommission capacity lock-order barrier should not be poisoned")
+        .as_ref()
+        .filter(|state| {
+            state.owner_store_id == store_id
+                && state.target_gate_acquire_pause_target.load(Ordering::Acquire) == target_pool_index
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.target_gate_acquire_entered.notify_one();
+        barrier.target_gate_acquire_release.notified().await;
     }
 }
 
@@ -8894,6 +8941,8 @@ impl ECStore {
         })?;
         let object = format!("{DECOMMISSION_CAPACITY_TARGET_LOCK_PREFIX}/{target_pool_index}");
         let target_lock = pool.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+        #[cfg(test)]
+        pause_decommission_capacity_before_target_gate_acquire(self.id, target_pool_index).await;
         match target_lock
             .get_write_lock_quiet(DECOMMISSION_CAPACITY_TARGET_LOCK_TIMEOUT)
             .await
@@ -10010,7 +10059,7 @@ impl ECStore {
                 )?;
             }
             true
-        } else if expected_target_physical_bytes == 0 {
+        } else if temporary {
             record_decommission_target_inflight(
                 &mut snapshot,
                 source_pool_index,
@@ -17939,6 +17988,11 @@ mod tests {
         assert!(is_decommission_target_capacity_error(&wrap(Error::DiskFull)));
         assert!(is_decommission_target_capacity_error(&wrap(Error::StorageFull)));
         assert!(!is_decommission_target_capacity_error(&wrap(Error::SlowDown)));
+
+        let gate_busy = decommission_capacity_blocked_error(format!(
+            "{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_PREFIX}7{DECOMMISSION_CAPACITY_TARGET_GATE_BUSY_SUFFIX}"
+        ));
+        assert_eq!(decommission_capacity_target_gate_busy_index(&wrap(gate_busy)), Some(7));
 
         // Cleanup safety: a not-found surfacing from inside a stage is the same
         // condition as one surfacing directly, so the source entry stays
