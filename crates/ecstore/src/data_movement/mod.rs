@@ -717,8 +717,8 @@ fn is_equivalent_data_movement_part(source: &ObjectPartInfo, target: &ObjectPart
                 == target.checksums.as_ref().filter(|checksums| !checksums.is_empty()))
 }
 
-fn data_movement_parts_by_number(parts: &[ObjectPartInfo]) -> Option<BTreeMap<usize, &ObjectPartInfo>> {
-    let mut parts_by_number = BTreeMap::new();
+pub(crate) fn data_movement_parts_by_number(parts: &[ObjectPartInfo]) -> Option<HashMap<usize, &ObjectPartInfo>> {
+    let mut parts_by_number = HashMap::with_capacity(parts.len());
     for part in parts {
         if parts_by_number.insert(part.number, part).is_some() {
             return None;
