@@ -198,6 +198,11 @@ async fn bucket_delete_local_blocker(
         }
         if scan.diagnostic_truncated {
             residue.diagnostic_truncated = true;
+            if residue.files == 0 {
+                // A zero-evidence timeout is inconclusive. Preflight still uses
+                // non-recursive `force_if_empty`; post-failure keeps the physical error.
+                return Ok(None);
+            }
             record_bucket_delete_blocker(bucket, BucketDeleteBlockerKind::DiagnosticBudgetExceeded, &residue);
             return Ok(Some(StorageError::BucketNotEmptyWithDetails {
                 bucket: bucket.to_string(),
@@ -757,6 +762,16 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        self.handle_delete_bucket_with_diagnostic_budget(bucket, opts, BucketDeleteDiagnosticBudget::new())
+            .await
+    }
+
+    async fn handle_delete_bucket_with_diagnostic_budget(
+        &self,
+        bucket: &str,
+        opts: &DeleteBucketOptions,
+        mut diagnostic_budget: BucketDeleteDiagnosticBudget,
+    ) -> Result<()> {
         if is_meta_bucketname(bucket) {
             return Err(StorageError::BucketNameInvalid(bucket.to_string()));
         }
@@ -815,14 +830,11 @@ impl ECStore {
                 }
             }
         };
-        let mut diagnostic_budget = None;
-
         if bucket_exists {
             validate_table_bucket_delete_guard(&self.ctx, bucket).await?;
 
             if !opts.force {
-                let budget = diagnostic_budget.get_or_insert_with(BucketDeleteDiagnosticBudget::new);
-                if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket, budget).await? {
+                if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket, &mut diagnostic_budget).await? {
                     return Err(blocker);
                 }
                 delete_opts.force_if_empty = true;
@@ -859,16 +871,11 @@ impl ECStore {
         if let Err(err) = delete_result
             && (!sr_delete || !is_err_strict_volume_not_found(&err))
         {
-            if delete_opts.force_if_empty
-                && matches!(&err, StorageError::BucketNotEmpty(_))
-                && let Some(blocker) = bucket_delete_local_blocker(
-                    &self.ctx,
-                    bucket,
-                    diagnostic_budget.get_or_insert_with(BucketDeleteDiagnosticBudget::new),
-                )
-                .await?
-            {
-                return Err(blocker);
+            if delete_opts.force_if_empty && matches!(&err, StorageError::BucketNotEmpty(_)) {
+                let mut diagnostic_budget = BucketDeleteDiagnosticBudget::new();
+                if let Some(blocker) = bucket_delete_local_blocker(&self.ctx, bucket, &mut diagnostic_budget).await? {
+                    return Err(blocker);
+                }
             }
             return Err(err);
         }
@@ -895,10 +902,10 @@ impl ECStore {
 #[cfg(test)]
 mod tests {
     use super::{
-        BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES, BucketDeleteBlockerKind,
-        BucketDeleteDiagnosticBudget, SCANNER_BUCKET_LIST_SET_CONCURRENCY, await_bucket_namespace_operation,
-        bucket_delete_metadata_cleanup_prefixes, bucket_deleted_marker_prefix, bucket_deleted_marker_volume,
-        run_bucket_usage_cleanup, run_physical_bucket_deletion, scan_metadata_less_residue,
+        BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED, BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES,
+        BucketDeleteBlockerKind, BucketDeleteDiagnosticBudget, SCANNER_BUCKET_LIST_SET_CONCURRENCY,
+        await_bucket_namespace_operation, bucket_delete_metadata_cleanup_prefixes, bucket_deleted_marker_prefix,
+        bucket_deleted_marker_volume, run_bucket_usage_cleanup, run_physical_bucket_deletion, scan_metadata_less_residue,
         scan_metadata_less_residue_with_budget, scanner_bucket_list_set_concurrency, should_override_created_from_metadata,
         validate_table_bucket_delete_allowed,
     };
@@ -2030,6 +2037,86 @@ mod tests {
             .delete_bucket(&bucket, &DeleteBucketOptions::default())
             .await
             .expect("DeleteBucket must succeed once the client has drained the bucket");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_defers_zero_evidence_diagnostic_timeout_to_physical_empty_check() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-del-diag-{}", Uuid::new_v4().simple());
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("empty bucket should be created");
+        let first_io_started = Arc::new(AtomicBool::new(false));
+        let diagnostic_budget = BucketDeleteDiagnosticBudget::new().with_first_io_delay(
+            BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED + Duration::from_millis(100),
+            first_io_started.clone(),
+        );
+
+        ecstore
+            .handle_delete_bucket_with_diagnostic_budget(&bucket, &DeleteBucketOptions::default(), diagnostic_budget)
+            .await
+            .expect("a zero-evidence diagnostic timeout must defer to the physical empty check");
+
+        assert!(
+            first_io_started.load(Ordering::SeqCst),
+            "the regression must delay the first diagnostic read_dir"
+        );
+        assert!(
+            !any_disk_path_exists(&disk_paths, &bucket).await,
+            "the physical empty check should allow deletion of the actually empty bucket"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_preserves_unobserved_residue_after_diagnostic_timeout() {
+        let (disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-del-residue-{}", Uuid::new_v4().simple());
+        let object = "object.txt";
+
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        write_metadata_less_part_on_all_disks(&disk_paths, &bucket, object).await;
+        let first_io_started = Arc::new(AtomicBool::new(false));
+        let diagnostic_budget = BucketDeleteDiagnosticBudget::new().with_first_io_delay(
+            BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED + Duration::from_millis(100),
+            first_io_started.clone(),
+        );
+
+        let err = ecstore
+            .handle_delete_bucket_with_diagnostic_budget(&bucket, &DeleteBucketOptions::default(), diagnostic_budget)
+            .await
+            .expect_err("physical empty-bucket enforcement must reject unobserved residue");
+        assert!(
+            first_io_started.load(Ordering::SeqCst),
+            "the regression must time out before observing the residue"
+        );
+        match &err {
+            StorageError::BucketNotEmpty(err_bucket) | StorageError::BucketNotEmptyWithDetails { bucket: err_bucket, .. } => {
+                assert_eq!(err_bucket, &bucket)
+            }
+            other => panic!("expected an S3-compatible BucketNotEmpty error, got {other:?}"),
+        }
+        assert!(
+            any_disk_path_exists(&disk_paths, Path::new(&bucket).join(object)).await,
+            "physical empty-bucket enforcement must preserve unobserved residue"
+        );
+
+        ecstore
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("explicit force should clean up the test-owned residue");
     }
 
     #[tokio::test(flavor = "multi_thread")]
