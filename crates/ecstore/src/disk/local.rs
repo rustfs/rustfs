@@ -6964,6 +6964,17 @@ impl LocalDisk {
             while let Some((last_name, _, _, _)) = dir_stack.last()
                 && *last_name < name
             {
+                // A prior iteration of this same loop may have just recursed
+                // into a pending subdirectory and hit the page limit there.
+                // Popping and recursing into another one anyway would still
+                // scan (and emit entries for) a directory beyond where the
+                // page was supposed to stop - stop draining the stack the
+                // moment the limit is reached, same as the check below this
+                // loop guards against for the current entry itself.
+                if opts.limit > 0 && *objs_returned >= opts.limit {
+                    return Ok(());
+                }
+
                 let (pop, skip_object, dir_to_skip, scan_required) = dir_stack.pop().expect("operation should succeed");
                 write_metacache_obj(
                     out,
