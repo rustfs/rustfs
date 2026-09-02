@@ -240,6 +240,14 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::PUT, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::GET, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
         admin_route_sample(Method::DELETE, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
+        admin_route_sample(Method::PUT, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
+        admin_route_sample(Method::DELETE, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/on-demand-migration/{bucket}/status",
+            "/v3/on-demand-migration/test-bucket/status",
+        ),
         admin_route(Method::GET, "/export-bucket-metadata"),
         admin_route(Method::GET, "/v3/export-bucket-metadata"),
         admin_route(Method::PUT, "/import-bucket-metadata"),
@@ -1274,6 +1282,10 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/bucket-durability/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-durability/test-bucket"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/on-demand-migration/test-bucket"));
+    assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/on-demand-migration/test-bucket"));
+    assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket/status"));
 
     assert_route(&router, Method::GET, &admin_path("/export-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));
@@ -1403,6 +1415,10 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::POST, compat_admin_alias_path("/v3/scanner/cycle-state/reset")),
         (Method::POST, compat_admin_alias_path("/v3/scanner/usage-state/reset")),
         (Method::GET, compat_admin_alias_path("/v3/ilm/expiry/status")),
+        (Method::PUT, compat_admin_alias_path("/v3/on-demand-migration/b")),
+        (Method::GET, compat_admin_alias_path("/v3/on-demand-migration/b")),
+        (Method::DELETE, compat_admin_alias_path("/v3/on-demand-migration/b")),
+        (Method::GET, compat_admin_alias_path("/v3/on-demand-migration/b/status")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),

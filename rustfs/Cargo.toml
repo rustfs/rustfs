@@ -41,7 +41,7 @@ path = "src/bin/rustfs-cli.rs"
 
 [[bin]]
 name = "rustfs-cli-e2e"
-path = "src/bin/rustfs-cli.rs"
+path = "src/bin/rustfs-cli-e2e.rs"
 required-features = ["offline-enrollment-e2e-root"]
 
 # The Swift protocol suites are manual (#[ignore]) and need a server built with

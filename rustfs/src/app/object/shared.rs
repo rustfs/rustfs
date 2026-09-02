@@ -15,6 +15,7 @@
 //! Cross-cutting helpers shared by the object use-case modules.
 
 use super::*;
+use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{OdmStateError, PolicyConfig, SourceErrorPolicy};
 
 pub(super) const RUSTFS_EXPECTED_CURRENT_VERSION_ID: &str = "x-rustfs-expected-current-version-id";
 
@@ -789,6 +790,84 @@ pub(super) fn object_lock_checks_required_for_state(state: &metadata_sys::Object
         metadata_sys::ObjectLockConfigState::Configured { .. } | metadata_sys::ObjectLockConfigState::Fabricated => true,
         metadata_sys::ObjectLockConfigState::ConfirmedAbsent => false,
     }
+}
+
+/// Response header marking a HEAD/GET answered by the on-demand migration
+/// source instead of local storage (rustfs/backlog#2155).
+pub(crate) const ON_DEMAND_MIGRATION_HEADER: http::HeaderName = http::HeaderName::from_static("x-rustfs-on-demand-migration");
+pub(crate) const ON_DEMAND_MIGRATION_SOURCE: HeaderValue = HeaderValue::from_static("source");
+
+/// Custom S3 error code for a source failure surfaced under
+/// `policy.source_error = propagate`; carried on HTTP 424.
+pub(crate) const ODM_SOURCE_UNAVAILABLE_CODE: &str = "SourceUnavailable";
+
+/// How the local lookup missed, as seen by the on-demand migration gate.
+///
+/// Only a versioned bucket can report `DeleteMarker`: an unversioned bucket
+/// keeps nothing after a delete, so its lookup reports `NotFound` and
+/// `policy.respect_local_delete_marker` cannot hold the source back there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OdmLocalMiss {
+    NotFound,
+    DeleteMarker,
+}
+
+/// Classifies a local `get_object_info` result for the on-demand migration
+/// gate. `None` means the object is present or the lookup failed for a
+/// reason the source cannot answer (permissions, quorum, corruption).
+pub(crate) fn odm_local_miss(lookup: Result<&ObjectInfo, &EcstoreError>) -> Option<OdmLocalMiss> {
+    match lookup {
+        Ok(info) if info.delete_marker => Some(OdmLocalMiss::DeleteMarker),
+        Ok(_) => None,
+        Err(err) if is_err_object_not_found(err) || is_err_version_not_found(err) => Some(OdmLocalMiss::NotFound),
+        Err(_) => None,
+    }
+}
+
+/// Request-level gate shared by HEAD (ODM-08) and GET (ODM-09): a read of a
+/// specific version can only be answered locally, and a request carrying the
+/// `source-proxy-request` anti-loop marker (whatever its value) comes from a
+/// peer that must be answered locally, never bounced to the source.
+pub(crate) fn odm_request_may_consult_source(opts: &ObjectOptions) -> bool {
+    opts.version_id.is_none() && !opts.proxy_header_set
+}
+
+/// Bucket-policy gate for a local miss: a delete marker is honored as the
+/// final answer while `respect_local_delete_marker` is set.
+pub(crate) fn odm_policy_admits_miss(policy: &PolicyConfig, miss: OdmLocalMiss) -> bool {
+    match miss {
+        OdmLocalMiss::NotFound => true,
+        OdmLocalMiss::DeleteMarker => !policy.respect_local_delete_marker,
+    }
+}
+
+/// HTTP 424 with the `SourceUnavailable` code. The message carries only the
+/// error class: a source message may echo endpoint or key details.
+pub(crate) fn odm_source_unavailable_error(class: &'static str) -> S3Error {
+    let mut err = S3Error::with_message(S3ErrorCode::Custom(ODM_SOURCE_UNAVAILABLE_CODE.into()), class);
+    err.set_status_code(StatusCode::FAILED_DEPENDENCY);
+    err
+}
+
+/// Client-facing error for a source failure other than not-found, under
+/// `policy.source_error`.
+pub(crate) fn odm_source_error_response(policy: &PolicyConfig, class: &'static str) -> S3Error {
+    match policy.source_error {
+        SourceErrorPolicy::Propagate => odm_source_unavailable_error(class),
+        SourceErrorPolicy::NotFound => S3Error::new(S3ErrorCode::NoSuchKey),
+    }
+}
+
+/// Metrics/message label for a bucket whose source client could not be built.
+pub(crate) fn odm_state_error_class(error: &OdmStateError) -> &'static str {
+    match error {
+        OdmStateError::AnonymousUnsupported => "unsupported",
+        OdmStateError::ClientBuild(_) => "client_build",
+    }
+}
+
+pub(crate) fn mark_on_demand_migration_response(headers: &mut HeaderMap) {
+    headers.insert(ON_DEMAND_MIGRATION_HEADER, ON_DEMAND_MIGRATION_SOURCE);
 }
 
 #[cfg(test)]
@@ -1678,5 +1757,106 @@ mod tests {
         )
         .expect_err("unknown authoritative usage must not admit a quota-controlled write");
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+    }
+}
+
+#[cfg(test)]
+mod on_demand_migration_tests {
+    use super::*;
+
+    #[test]
+    fn odm_local_miss_classifies_lookup_results() {
+        let present = ObjectInfo::default();
+        assert_eq!(odm_local_miss(Ok(&present)), None, "a present object is never a miss");
+
+        let marker = ObjectInfo {
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert_eq!(odm_local_miss(Ok(&marker)), Some(OdmLocalMiss::DeleteMarker));
+
+        let not_found = EcstoreError::ObjectNotFound("b".to_string(), "k".to_string());
+        assert_eq!(odm_local_miss(Err(&not_found)), Some(OdmLocalMiss::NotFound));
+        let version_not_found = EcstoreError::VersionNotFound("b".to_string(), "k".to_string(), "v".to_string());
+        assert_eq!(odm_local_miss(Err(&version_not_found)), Some(OdmLocalMiss::NotFound));
+
+        let other = EcstoreError::MethodNotAllowed;
+        assert_eq!(odm_local_miss(Err(&other)), None, "non-404 failures are not the source's to answer");
+    }
+
+    #[test]
+    fn odm_request_gate_rejects_version_reads_and_anti_loop_marker() {
+        let plain = ObjectOptions::default();
+        assert!(odm_request_may_consult_source(&plain));
+
+        let versioned_read = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        assert!(
+            !odm_request_may_consult_source(&versioned_read),
+            "HEAD ?versionId never consults the source"
+        );
+
+        // The marker disables the passthrough by presence alone, so a peer's
+        // "false" convergence probe is answered locally too.
+        let proxy_marked = ObjectOptions {
+            proxy_header_set: true,
+            proxy_request: false,
+            ..Default::default()
+        };
+        assert!(!odm_request_may_consult_source(&proxy_marked));
+    }
+
+    #[test]
+    fn odm_policy_gate_honors_delete_marker_only_when_configured() {
+        let respecting = PolicyConfig::default();
+        assert!(respecting.respect_local_delete_marker, "default policy respects local delete markers");
+        assert!(odm_policy_admits_miss(&respecting, OdmLocalMiss::NotFound));
+        assert!(!odm_policy_admits_miss(&respecting, OdmLocalMiss::DeleteMarker));
+
+        let overriding = PolicyConfig {
+            respect_local_delete_marker: false,
+            ..Default::default()
+        };
+        assert!(odm_policy_admits_miss(&overriding, OdmLocalMiss::DeleteMarker));
+    }
+
+    #[test]
+    fn odm_source_unavailable_error_is_424_with_class_only() {
+        let err = odm_source_unavailable_error("server_error");
+        assert_eq!(err.status_code(), Some(StatusCode::FAILED_DEPENDENCY));
+        assert_eq!(err.code(), &S3ErrorCode::Custom(ODM_SOURCE_UNAVAILABLE_CODE.into()));
+        assert_eq!(err.message(), Some("server_error"));
+    }
+
+    #[test]
+    fn odm_source_error_response_follows_policy() {
+        let propagate = PolicyConfig::default();
+        assert_eq!(propagate.source_error, SourceErrorPolicy::Propagate);
+        let err = odm_source_error_response(&propagate, "timeout");
+        assert_eq!(err.status_code(), Some(StatusCode::FAILED_DEPENDENCY));
+        assert_eq!(err.message(), Some("timeout"));
+
+        let hide = PolicyConfig {
+            source_error: SourceErrorPolicy::NotFound,
+            ..Default::default()
+        };
+        let err = odm_source_error_response(&hide, "timeout");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(err.status_code(), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[test]
+    fn odm_state_error_class_is_stable() {
+        assert_eq!(odm_state_error_class(&OdmStateError::AnonymousUnsupported), "unsupported");
+        assert_eq!(odm_state_error_class(&OdmStateError::ClientBuild("tls".to_string())), "client_build");
+    }
+
+    #[test]
+    fn mark_on_demand_migration_response_sets_header() {
+        let mut headers = HeaderMap::new();
+        mark_on_demand_migration_response(&mut headers);
+        assert_eq!(headers.get("x-rustfs-on-demand-migration").and_then(|v| v.to_str().ok()), Some("source"));
     }
 }
