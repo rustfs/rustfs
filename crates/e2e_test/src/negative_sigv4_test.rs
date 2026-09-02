@@ -225,8 +225,8 @@ fn encode_unsigned_aws_chunked_with_sha256_trailer(decoded: &[u8]) -> Vec<u8> {
     let checksum = sha256_base64(decoded);
     let mut encoded = format!("{:x}\r\n", decoded.len()).into_bytes();
     encoded.extend_from_slice(decoded);
-    encoded.extend_from_slice(b"\r\n0\r\n\r\n");
-    encoded.extend_from_slice(format!("x-amz-checksum-sha256:{checksum}").as_bytes());
+    encoded.extend_from_slice(b"\r\n0\r\n");
+    encoded.extend_from_slice(format!("x-amz-checksum-sha256:{checksum}\r\n\r\n").as_bytes());
     encoded
 }
 
@@ -546,6 +546,68 @@ async fn tampered_upload_part_payload_is_rejected() -> Result<(), Box<dyn std::e
         .upload_id(upload_id)
         .send()
         .await?;
+    Ok(())
+}
+
+/// s3s v0.16 validates the aws-chunked decoded length while RustFS consumes the
+/// body stream. Mismatches are client body errors and must not leak as 500s.
+#[tokio::test]
+async fn aws_chunked_decoded_length_mismatch_returns_incomplete_body() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    init_logging();
+    let mut env = RustFSTestEnvironment::new().await?;
+    setup(&mut env).await?;
+
+    for (key, declared_len) in [
+        ("decoded-length-overrun.bin", 3_usize),
+        ("decoded-length-shortfall.bin", 9_usize),
+    ] {
+        let decoded = b"decoded";
+        assert_ne!(declared_len, decoded.len(), "test case must exercise a mismatch");
+        let encoded_body = encode_unsigned_aws_chunked_with_sha256_trailer(decoded);
+        let decoded_content_length = declared_len.to_string();
+        let path = format!("/{BUCKET}/{key}");
+        let signer = SigV4::new(&env);
+        let extra_signed_headers = [
+            ("content-encoding", "aws-chunked"),
+            ("x-amz-decoded-content-length", decoded_content_length.as_str()),
+            ("x-amz-trailer", "x-amz-checksum-sha256"),
+        ];
+        let headers = signer.sign_with_extra_headers("PUT", &path, "", UNSIGNED_PAYLOAD_TRAILER, &extra_signed_headers);
+
+        let response = local_http_client()
+            .put(format!("{}{}", env.url, path))
+            .header("authorization", &headers.authorization)
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-content-sha256", &headers.content_sha256)
+            .header("x-amz-date", &headers.amz_date)
+            .header("x-amz-decoded-content-length", &decoded_content_length)
+            .header("x-amz-trailer", "x-amz-checksum-sha256")
+            .body(encoded_body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "decoded length mismatch must be a client error, body:\n{body}"
+        );
+        assert_error_code(&body, "IncompleteBody");
+
+        let absent = env
+            .create_s3_client()
+            .get_object()
+            .bucket(BUCKET)
+            .key(key)
+            .send()
+            .await
+            .expect_err("decoded length mismatch must not publish an object");
+        assert_eq!(absent.raw_response().map(|response| response.status().as_u16()), Some(404));
+        assert_eq!(absent.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    }
+
+    env.stop_server();
     Ok(())
 }
 
