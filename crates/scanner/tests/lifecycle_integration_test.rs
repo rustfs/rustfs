@@ -601,24 +601,21 @@ mod serial_tests {
     /// persisted free-version recovery -- so no live local metadata ever points
     /// at an already-removed remote version.
     ///
-    /// This test pins the FIXED contract two complementary ways, both
-    /// revert-proof (reverting to remote-first ordering turns them red):
+    /// This test pins the fixed contract with deterministic GET and DELETE
+    /// barriers (reverting to remote-first ordering turns it red):
     ///
-    ///  1. Ordering (deterministic): immediately after
-    ///     `expire_transitioned_object` returns, the remote tier object is still
-    ///     present and the mock recorded **zero** remote `remove` calls --
-    ///     proving the local delete happened with no synchronous remote removal
-    ///     (local-first). Remote-first ordering loses the object and records a
-    ///     `remove`.
-    ///  2. Concurrent GET (user-visible): a tight GET loop runs concurrently
-    ///     with the expiry; every observation must be either a full, correct
-    ///     body (GET won) or a clean object/version-not-found (expiry won). A
-    ///     tier-fetch failure -- the #3491 symptom -- is never tolerated.
+    ///  1. A GET that already resolved the transitioned metadata keeps its read
+    ///     lock and returns the complete remote body while expiry waits.
+    ///  2. Expiry returns after committing the local free-version without
+    ///     waiting for the post-commit worker's remote DELETE. While that DELETE
+    ///     is paused, the durable marker and remote body must both still exist.
+    ///  3. A later GET observes a clean object/version-not-found, never a tier
+    ///     fetch or read-quorum failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-2)"]
     async fn test_expire_transitioned_object_never_races_concurrent_get() {
-        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+        let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&tier_name).await;
@@ -664,56 +661,41 @@ mod serial_tests {
             "the regression must exercise an unversioned remote tier"
         );
 
-        // Concurrent GET loop: hammer GET while the expiry runs. Every outcome
-        // must be a full correct body or a clean not-found -- never a tier-fetch
-        // failure.
+        ExpiryState::resize_workers(1, ecstore.clone()).await;
+
+        // Pause one real tier GET after it has resolved local transition
+        // metadata. The reader still owns the object read lock, so local expiry
+        // cannot commit until this GET finishes.
+        let get_barrier = backend.arm_get_barrier().await;
         let get_store = ecstore.clone();
         let get_bucket = bucket_name.clone();
         let get_object = object_name.to_string();
-        let expected = payload.clone();
-        let get_loop = tokio::spawn(async move {
-            let mut saw_full_body = 0usize;
-            let mut saw_not_found = 0usize;
-            for _ in 0..400 {
-                match get_store
-                    .get_object_reader(
-                        get_bucket.as_str(),
-                        get_object.as_str(),
-                        None,
-                        http::HeaderMap::new(),
-                        &ObjectOptions::default(),
-                    )
-                    .await
-                {
-                    Ok(mut reader) => {
-                        let mut data = Vec::new();
-                        match reader.stream.read_to_end(&mut data).await {
-                            Ok(_) => {
-                                assert_eq!(
-                                    data, expected,
-                                    "a successful GET during expiry must return the complete, correct body"
-                                );
-                                saw_full_body += 1;
-                            }
-                            Err(err) => {
-                                panic!("GET during expiry streamed a truncated/failed body (expire/GET race regression): {err:?}")
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        let ec: &EcstoreError = &err;
-                        assert!(
-                            is_err_object_not_found(ec) || is_err_version_not_found(ec),
-                            "GET during expiry may only fail with a clean object/version-not-found (expiry won \
-                             the race); a tier-fetch failure is the #3491 regression: {err:?}"
-                        );
-                        saw_not_found += 1;
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-            (saw_full_body, saw_not_found)
+        let in_flight_get = tokio::spawn(async move {
+            let mut reader = get_store
+                .get_object_reader(
+                    get_bucket.as_str(),
+                    get_object.as_str(),
+                    None,
+                    http::HeaderMap::new(),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .map_err(|err| format!("in-flight GET failed before streaming: {err:?}"))?;
+            let mut data = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut data)
+                .await
+                .map_err(|err| format!("in-flight GET returned a failed or truncated stream: {err:?}"))?;
+            Ok::<_, String>(data)
         });
+        get_barrier.wait_until_paused().await;
+
+        // The next remote DELETE pauses and then fails. A correct local-first
+        // expiry returns while this barrier is still held; synchronous cleanup
+        // (remote-first or local-first) instead times out here.
+        let remove_barrier = backend.arm_failing_remove_barrier().await;
+        get_barrier.release();
 
         // Run the exact expiry action the scanner drives for a transitioned
         // current version.
@@ -725,39 +707,68 @@ mod serial_tests {
             .bucket_incarnation_id(bucket_name.as_str())
             .await
             .expect("read bucket incarnation");
-        expire_transitioned_object(ecstore.clone(), &oi, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id)
-            .await
+        let expiry_outcome = tokio::time::timeout(
+            TRANSITION_WAIT_TIMEOUT,
+            expire_transitioned_object(ecstore.clone(), &oi, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id),
+        )
+        .await;
+        let remove_arrival = tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, remove_barrier.wait_until_paused()).await;
+
+        // Snapshot only lock-free observables while the cleanup worker holds
+        // the object write lock. Store API reads wait until the barrier is
+        // released below.
+        let free_version_persisted = free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await > 0;
+        let remote_present_at_cleanup = backend.contains(&remote_object).await;
+
+        remove_barrier.release();
+        let remove_operation_dropped = if remove_arrival.is_ok() {
+            Some(tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, remove_barrier.wait_until_operation_dropped()).await)
+        } else {
+            None
+        };
+        let in_flight_get_outcome = tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, in_flight_get).await;
+        let post_expiry_get = tokio::time::timeout(
+            TRANSITION_WAIT_TIMEOUT,
+            ecstore.get_object_reader(bucket_name.as_str(), object_name, None, http::HeaderMap::new(), &ObjectOptions::default()),
+        )
+        .await;
+
+        expiry_outcome
+            .expect("expire_transitioned_object must not wait for asynchronous remote-tier cleanup")
             .expect("expire_transitioned_object should succeed");
+        remove_arrival.expect("the post-commit free-version worker should reach the remote DELETE barrier");
+        remove_operation_dropped
+            .expect("the remote DELETE should have reached the barrier")
+            .expect("the injected remote DELETE should finish after release");
+        assert!(
+            free_version_persisted,
+            "the durable free-version marker must exist before asynchronous remote cleanup"
+        );
+        assert!(
+            remote_present_at_cleanup,
+            "the remote object must remain readable until the paused cleanup DELETE is released"
+        );
 
-        // --- Ordering contract (deterministic revert-proof) ----------------
-        // #3491 defers remote cleanup to free-version recovery, so immediately
-        // after expiry the remote object is still present and NO synchronous
-        // remote `remove` was issued. Reverting to remote-first ordering makes
-        // both assertions fail.
+        let in_flight_body = in_flight_get_outcome
+            .expect("the in-flight GET should finish within the test deadline")
+            .expect("the in-flight GET task should not panic")
+            .expect("a GET that wins the expiry race must return a complete body");
         assert_eq!(
-            backend.remove_count().await,
-            0,
-            "expire_transitioned_object must NOT issue a synchronous remote-tier removal (local-first \
-             ordering, #3491); remote cleanup is deferred to free-version recovery"
-        );
-        assert!(
-            backend.contains(&remote_object).await,
-            "remote tier object must still exist immediately after expiry (deferred cleanup, #3491)"
+            in_flight_body, payload,
+            "a GET that resolved transitioned metadata before expiry must return the complete, correct body"
         );
 
-        // Local metadata is gone: the object is atomically unreachable.
-        assert!(
-            wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(5)).await,
-            "local metadata for the expired transitioned object should be gone"
-        );
-
-        // Drain the concurrent GET loop; its internal asserts already guarantee
-        // no #3491-style tier-fetch failure was ever observed.
-        let (saw_full_body, saw_not_found) = get_loop.await.expect("concurrent GET loop task panicked");
-        assert!(
-            saw_full_body + saw_not_found > 0,
-            "the concurrent GET loop should have observed at least one GET outcome"
-        );
+        match post_expiry_get.expect("the post-expiry GET should finish within the test deadline") {
+            Ok(_) => panic!("the locally expired transitioned object must no longer be readable"),
+            Err(err) => {
+                let ec: &EcstoreError = &err;
+                assert!(
+                    is_err_object_not_found(ec) || is_err_version_not_found(ec),
+                    "a GET after expiry may only fail with a clean object/version-not-found; \
+                     a tier-fetch or read-quorum failure is the #3491 regression: {err:?}"
+                );
+            }
+        }
     }
 
     #[test]
