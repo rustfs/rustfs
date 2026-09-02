@@ -247,7 +247,7 @@ aws-smithy-http-client = { default-features = false, version = "1.4.0" }
 aws-smithy-runtime-api = { version = "1.15.0" }
 aws-smithy-types = { version = "1.6.2" }
 base64-simd = "0.8.0"
-brotli = "8.0.4"
+brotli = "9.0.0"
 clap = { version = "4.6.6" }
 const-str = { version = "1.1.0" }
 convert_case = "0.12.0"
