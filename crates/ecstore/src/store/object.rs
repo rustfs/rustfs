@@ -1314,7 +1314,7 @@ fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool 
     (opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 struct DeleteAfterObjectLockSnapshotBarrierState {
     bucket: String,
     arrived: tokio::sync::Notify,
@@ -1323,19 +1323,19 @@ struct DeleteAfterObjectLockSnapshotBarrierState {
     namespace_acquired: AtomicBool,
 }
 
-#[cfg(test)]
-pub(crate) struct DeleteAfterObjectLockSnapshotBarrier {
+#[cfg(any(test, feature = "test-util"))]
+pub struct DeleteAfterObjectLockSnapshotBarrier {
     state: Arc<DeleteAfterObjectLockSnapshotBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<Arc<DeleteAfterObjectLockSnapshotBarrierState>>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl DeleteAfterObjectLockSnapshotBarrier {
-    pub(crate) fn install(bucket: &str) -> Self {
+    pub fn install(bucket: &str) -> Self {
         let state = Arc::new(DeleteAfterObjectLockSnapshotBarrierState {
             bucket: bucket.to_string(),
             arrived: tokio::sync::Notify::new(),
@@ -1352,15 +1352,15 @@ impl DeleteAfterObjectLockSnapshotBarrier {
         Self { state }
     }
 
-    pub(crate) async fn wait_until_paused(&self) {
+    pub async fn wait_until_paused(&self) {
         self.state.arrived.notified().await;
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         self.state.release.notify_one();
     }
 
-    pub(crate) async fn release_and_wait_until_namespace_pending(&self) {
+    pub async fn release_and_wait_until_namespace_pending(&self) {
         let namespace_pending = self.state.namespace_pending.notified();
         self.release();
         tokio::time::timeout(Duration::from_secs(5), namespace_pending)
@@ -1368,12 +1368,12 @@ impl DeleteAfterObjectLockSnapshotBarrier {
             .expect("delete should proceed to its namespace lock after leaving the snapshot barrier");
     }
 
-    pub(crate) fn namespace_acquired(&self) -> bool {
+    pub fn namespace_acquired(&self) -> bool {
         self.state.namespace_acquired.load(Ordering::Acquire)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for DeleteAfterObjectLockSnapshotBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -1386,7 +1386,7 @@ impl Drop for DeleteAfterObjectLockSnapshotBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
     let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -1402,7 +1402,7 @@ async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 fn notify_delete_namespace_acquired(bucket: &str) {
     let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -4259,7 +4259,7 @@ impl ECStore {
         if opts.delete_prefix && opts.expected_bucket_incarnation_id.is_none() {
             opts.expected_bucket_incarnation_id = current_bucket_incarnation_id;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         pause_delete_after_object_lock_snapshot(bucket).await;
 
         if opts.delete_prefix && !opts.delete_prefix_object {
@@ -4273,7 +4273,7 @@ impl ECStore {
         } else {
             None
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if _object_lock_guard.is_some() {
             notify_delete_namespace_acquired(bucket);
         }
@@ -4666,7 +4666,7 @@ impl ECStore {
                 StorageError::BucketNotFound(bucket.to_string()),
             );
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if current_bucket_incarnation_id.is_some() {
             pause_delete_after_object_lock_snapshot(bucket).await;
         }

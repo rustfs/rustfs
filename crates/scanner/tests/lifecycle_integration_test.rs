@@ -40,14 +40,15 @@ use uuid::Uuid;
 mod storage_api;
 
 use storage_api::lifecycle::{
-    BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskOption, ECStore,
-    EcstoreError, Endpoint, EndpointServerPools, Endpoints, ExpiryState, IlmAction, LcEvent, LcEventSrc, ListOperations as _,
-    MakeBucketOptions, MockWarmBackend, MultipartOperations as _, ObjectIO as _, ObjectOperations as _, PoolEndpoints,
-    STORAGE_FORMAT_FILE, TRANSITION_PENDING, TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
-    enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
-    get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
-    is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_transition_transaction_records,
-    register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
+    BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart,
+    DeleteAfterObjectLockSnapshotBarrier, DiskOption, ECStore, EcstoreError, Endpoint, EndpointServerPools, Endpoints,
+    ExpiryState, IlmAction, LcEvent, LcEventSrc, ListOperations as _, MakeBucketOptions, MockWarmBackend,
+    MultipartOperations as _, ObjectIO as _, ObjectOperations as _, PoolEndpoints, STORAGE_FORMAT_FILE, TRANSITION_PENDING,
+    TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent, enqueue_transition_for_existing_objects,
+    expire_transitioned_object, free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry,
+    init_bucket_metadata_sys, init_local_disks, is_err_object_not_found, is_err_version_not_found, new_disk,
+    path2_bucket_object_with_base_path, recover_transition_transaction_records, register_mock_tier_util, update_bucket_metadata,
+    wait_for_free_version_absence,
 };
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
@@ -662,6 +663,14 @@ mod serial_tests {
         );
 
         ExpiryState::resize_workers(1, ecstore.clone()).await;
+        let lc_event = LcEvent {
+            action: IlmAction::DeleteAction,
+            ..Default::default()
+        };
+        let bucket_incarnation_id = ecstore
+            .bucket_incarnation_id(bucket_name.as_str())
+            .await
+            .expect("read bucket incarnation");
 
         // Pause one real tier GET after it has resolved local transition
         // metadata. The reader still owns the object read lock, so local expiry
@@ -689,29 +698,33 @@ mod serial_tests {
                 .map_err(|err| format!("in-flight GET returned a failed or truncated stream: {err:?}"))?;
             Ok::<_, String>(data)
         });
-        get_barrier.wait_until_paused().await;
+        tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, get_barrier.wait_until_paused())
+            .await
+            .expect("the in-flight GET should reach the remote read barrier");
 
         // The next remote DELETE pauses and then fails. A correct local-first
         // expiry returns while this barrier is still held; synchronous cleanup
         // (remote-first or local-first) instead times out here.
+        let delete_start_barrier = DeleteAfterObjectLockSnapshotBarrier::install(bucket_name.as_str());
         let remove_barrier = backend.arm_failing_remove_barrier().await;
-        get_barrier.release();
-
-        // Run the exact expiry action the scanner drives for a transitioned
-        // current version.
-        let lc_event = LcEvent {
-            action: IlmAction::DeleteAction,
-            ..Default::default()
-        };
-        let bucket_incarnation_id = ecstore
-            .bucket_incarnation_id(bucket_name.as_str())
+        let expiry_store = ecstore.clone();
+        let expiry_oi = oi.clone();
+        let expiry_event = lc_event.clone();
+        let mut expiry = tokio::spawn(async move {
+            expire_transitioned_object(expiry_store, &expiry_oi, &expiry_event, &LcEventSrc::Scanner, bucket_incarnation_id).await
+        });
+        tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, delete_start_barrier.wait_until_paused())
             .await
-            .expect("read bucket incarnation");
-        let expiry_outcome = tokio::time::timeout(
-            TRANSITION_WAIT_TIMEOUT,
-            expire_transitioned_object(ecstore.clone(), &oi, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id),
-        )
-        .await;
+            .expect("expiry should reach the store delete path while the GET remains paused");
+        delete_start_barrier.release_and_wait_until_namespace_pending().await;
+        assert!(
+            !delete_start_barrier.namespace_acquired() && !expiry.is_finished(),
+            "expiry must wait for the in-flight GET's object read lock before committing the local delete"
+        );
+        drop(delete_start_barrier);
+
+        get_barrier.release();
+        let expiry_outcome = tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, &mut expiry).await;
         let remove_arrival = tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, remove_barrier.wait_until_paused()).await;
 
         // Snapshot only lock-free observables while the cleanup worker holds
@@ -726,6 +739,10 @@ mod serial_tests {
         } else {
             None
         };
+        if expiry_outcome.is_err() && tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, &mut expiry).await.is_err() {
+            expiry.abort();
+            let _ = expiry.await;
+        }
         let in_flight_get_outcome = tokio::time::timeout(TRANSITION_WAIT_TIMEOUT, in_flight_get).await;
         let post_expiry_get = tokio::time::timeout(
             TRANSITION_WAIT_TIMEOUT,
@@ -735,6 +752,7 @@ mod serial_tests {
 
         expiry_outcome
             .expect("expire_transitioned_object must not wait for asynchronous remote-tier cleanup")
+            .expect("the expiry task should not panic")
             .expect("expire_transitioned_object should succeed");
         remove_arrival.expect("the post-commit free-version worker should reach the remote DELETE barrier");
         remove_operation_dropped
