@@ -97,6 +97,8 @@ pub(crate) struct BucketDeleteDiagnosticBudget {
     deadline: Option<tokio::time::Instant>,
     max_elapsed: Duration,
     entries_remaining: usize,
+    #[cfg(test)]
+    first_io_delay: Option<(Duration, Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 impl BucketDeleteDiagnosticBudget {
@@ -109,7 +111,15 @@ impl BucketDeleteDiagnosticBudget {
             deadline: None,
             max_elapsed: elapsed,
             entries_remaining: entries,
+            #[cfg(test)]
+            first_io_delay: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_first_io_delay(mut self, delay: Duration, started: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.first_io_delay = Some((delay, started));
+        self
     }
 
     fn deadline(&mut self) -> tokio::time::Instant {
@@ -137,7 +147,20 @@ impl BucketDeleteDiagnosticBudget {
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);
         }
-        match tokio::time::timeout_at(deadline, future).await {
+        #[cfg(test)]
+        let first_io_delay = self.first_io_delay.take();
+        #[cfg(test)]
+        let timeout_result = tokio::time::timeout_at(deadline, async move {
+            if let Some((delay, started)) = first_io_delay {
+                started.store(true, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+            }
+            future.await
+        })
+        .await;
+        #[cfg(not(test))]
+        let timeout_result = tokio::time::timeout_at(deadline, future).await;
+        match timeout_result {
             Ok(result) => result.map(Some),
             Err(_) => Ok(None),
         }
