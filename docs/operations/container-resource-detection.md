@@ -1,203 +1,70 @@
-# Container Resource Detection
+# Container resource detection
 
-RustFS automatically detects container resource limits (CPU and memory) from cgroup v1/v2. This ensures correct resource allocation and accurate metrics in containerized environments (Kubernetes, Docker, etc.).
+**Use this when:** RustFS runs under a cgroup CPU or memory limit (Kubernetes, Docker) and you need to know which limit it detected, how to override it, or which log line and metrics expose it.
+**Source of truth:** `rustfs/src/cgroup_resources.rs` (detection, `ContainerResources`, `container_resources()`), `rustfs/src/memory_observability.rs` (metrics), `rustfs/src/server/runtime.rs` (Tokio thread sizing consumer), `rustfs/src/startup_entrypoint.rs` (startup log call).
 
-## Problem
+RustFS resolves the CPU core count and the memory limit once at startup (cached in a `OnceLock`) and uses them for Tokio worker/blocking-thread sizing, the memory budget, and memory metrics. Precedence is override env var, then cgroup limit, then host value from `sysinfo`.
 
-When RustFS runs in a container, the underlying system libraries report the **host's** total CPU cores and memory, not the container's limits. This leads to:
+## Detection rules
 
-1. **Over-provisioned Tokio threads**: Too many worker and blocking threads
-2. **Incorrect memory metrics**: `rustfs_memory_usage_percent` shows host-based percentage
-3. **Memory budget errors**: Object data cache sized to host RAM instead of container limit
-4. **OOMKills**: Container exceeds its memory limit and gets killed
+| Resource | Order | Source | Rule |
+| --- | --- | --- | --- |
+| CPU | 1 | cgroup v2 `/sys/fs/cgroup/cpu.max` | `"<quota> <period>"` (or bare `"<quota>"` with period 100000) gives `ceil(quota / period)`; `"max"` or a zero quota means no limit. |
+| CPU | 2 | cgroup v1 `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` with `cpu.cfs_period_us` | `ceil(quota / period)`; a zero, unparsable, or `u64::MAX` quota means no limit. |
+| CPU | 3 | host | `sysinfo` CPU count, minimum 1. |
+| Memory | 1 | cgroup v2 `/sys/fs/cgroup/memory.max` | bytes; `"max"` means no limit. |
+| Memory | 2 | cgroup v1 `/sys/fs/cgroup/memory/memory.limit_in_bytes` | bytes; values `>= 1 << 62` mean no limit. |
+| Memory | 3 | host | `sysinfo` total memory. |
 
-## Solution
+cgroup reads are compiled only for Linux; other platforms always take the host branch. `cgroup_detected` is true when at least one of the two cgroup reads returned a limit.
 
-RustFS now detects cgroup limits directly from the filesystem:
+## Environment variables
 
-- **CPU**: `/sys/fs/cgroup/cpu.max` (v2) or `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` (v1)
-- **Memory**: `/sys/fs/cgroup/memory.max` (v2) or `/sys/fs/cgroup/memory/memory.limit_in_bytes` (v1)
+Names are the constants `ENV_DISABLE_CGROUP_DETECTION`, `ENV_OVERRIDE_CPU_CORES`, and `ENV_OVERRIDE_MEMORY_BYTES` in `rustfs/src/cgroup_resources.rs`.
 
-The effective resource limits are the **minimum** of host and cgroup values.
+| Variable | Accepted values | Effect |
+| --- | --- | --- |
+| `RUSTFS_DISABLE_CGROUP_DETECTION` | `1` or `true` (case-insensitive) | Skip cgroup reads; host values apply unless overridden. |
+| `RUSTFS_OVERRIDE_CPU_CORES` | integer `> 0` | Replaces the CPU core count regardless of cgroup or host. |
+| `RUSTFS_OVERRIDE_MEMORY_BYTES` | integer `> 0`, bytes | Replaces the memory limit regardless of cgroup or host. |
 
-## Detection Logic
+Non-positive or unparsable override values are ignored. Changes take effect on process restart.
 
-### CPU Detection
+## Startup log
 
-1. Read cgroup v2 `/sys/fs/cgroup/cpu.max`
-   - Format: `"$QUOTA $PERIOD"` or `"max"` (unlimited)
-   - Calculate: `cores = ceil(quota / period)`
-2. Fallback to cgroup v1 `/sys/fs/cgroup/cpu/cpu.cfs_quota_us`
-   - Calculate: `cores = ceil(quota / period)`
-3. Fallback to host CPU count from `sysinfo`
+`log_container_resources` emits exactly one of these lines with `cpu_cores` and `memory_bytes` fields (the INFO variants also carry `memory_mib`):
 
-### Memory Detection
-
-1. Read cgroup v2 `/sys/fs/cgroup/memory.max`
-   - Value in bytes or `"max"` (unlimited)
-2. Fallback to cgroup v1 `/sys/fs/cgroup/memory/memory.limit_in_bytes`
-   - Very large values (≥2^62) indicate unlimited
-3. Fallback to host memory from `sysinfo`
-
-## Environment Variables
-
-### Disable Cgroup Detection
-
-```bash
-RUSTFS_DISABLE_CGROUP_DETECTION=1
-```
-
-Disables cgroup detection entirely. Useful for testing or when cgroup filesystem is not accessible.
-
-### Override CPU Cores
-
-```bash
-RUSTFS_OVERRIDE_CPU_CORES=4
-```
-
-Overrides detected CPU cores. Takes precedence over cgroup detection.
-
-### Override Memory Limit
-
-```bash
-RUSTFS_OVERRIDE_MEMORY_BYTES=2147483648
-```
-
-Overrides detected memory limit in bytes. Takes precedence over cgroup detection.
+| Message | Level | Condition |
+| --- | --- | --- |
+| `container resources (overridden by environment variables)` | INFO | an override env var was applied; also carries `cgroup_detected` |
+| `container resources (detected from cgroup)` | INFO | no override, at least one cgroup limit read |
+| `container resources (using host values)` | DEBUG | neither override nor cgroup limit |
 
 ## Metrics
 
-### New Metrics
+Gauges emitted from `rustfs/src/memory_observability.rs`.
 
-| Metric | Description |
-|--------|-------------|
-| `rustfs_memory_effective_total_bytes` | Effective memory total (host or cgroup) |
-| `rustfs_cgroup_detected` | Whether cgroup limits were detected (1=yes, 0=no) |
-| `rustfs_cgroup_cpu_cores_limit` | Detected CPU cores limit |
-| `rustfs_cgroup_memory_limit_bytes` | Detected memory limit |
-
-### Updated Metrics
-
-| Metric | Change |
-|--------|--------|
-| `rustfs_memory_total_bytes` | Now uses effective memory (cgroup-aware) |
-| `rustfs_memory_usage_percent` | Now calculated against effective memory |
-
-## Startup Logging
-
-RustFS logs detected container resources at startup:
-
-```
-INFO container resources (detected from cgroup) cpu_cores=2 memory_bytes=1073741824 memory_mib=1024
-```
-
-or
-
-```
-INFO container resources (overridden by environment variables) cpu_cores=4 memory_bytes=2147483648 memory_mib=2048
-```
-
-## Examples
-
-### Kubernetes with Resource Limits
-
-```yaml
-resources:
-  limits:
-    cpu: "2"
-    memory: "1Gi"
-  requests:
-    cpu: "500m"
-    memory: "512Mi"
-```
-
-RustFS will detect:
-- CPU cores: 2
-- Memory: 1 GiB (1073741824 bytes)
-
-### Docker with CPU and Memory Limits
-
-```bash
-docker run --cpus=2 --memory=1g rustfs/rustfs:latest
-```
-
-RustFS will detect:
-- CPU cores: 2
-- Memory: 1 GiB
-
-### Manual Override
-
-```bash
-export RUSTFS_OVERRIDE_CPU_CORES=4
-export RUSTFS_OVERRIDE_MEMORY_BYTES=2147483648
-```
-
-RustFS will use:
-- CPU cores: 4
-- Memory: 2 GiB
+| Metric | Meaning |
+| --- | --- |
+| `rustfs_memory_effective_total_bytes{basis}` | Effective memory total. `basis` is `cgroup` when a cgroup limit was detected, else `host`; an override does not change the basis label. |
+| `rustfs_container_cpu_cores` | Effective CPU cores. |
+| `rustfs_container_memory_bytes` | Effective memory limit in bytes. |
+| `rustfs_container_cgroup_detected` | `1` when a cgroup limit was read, else `0`. |
+| `rustfs_container_overridden` | `1` when an override env var was applied, else `0`. |
+| `rustfs_memory_total_bytes`, `rustfs_memory_usage_percent` | Computed against the effective total (`record_memory_usage` in `crates/io-metrics/src/lib.rs`). |
 
 ## Troubleshooting
 
-### Cgroup Detection Not Working
+When effective values look like the host rather than the container:
 
-1. Check if cgroup filesystem is mounted:
-   ```bash
-   ls -la /sys/fs/cgroup/
-   ```
+1. Confirm detection is not disabled: `env | grep RUSTFS_DISABLE_CGROUP_DETECTION`.
+2. Find the startup line: `grep "container resources" <rustfs log>`. The `(using host values)` variant is DEBUG, so raise the log level if no variant appears.
+3. Inspect the cgroup filesystem inside the container:
 
-2. Check cgroup version:
-   ```bash
-   stat -fc %T /sys/fs/cgroup/
-   ```
-   - `cgroup2fs` = cgroup v2
-   - `tmpfs` = cgroup v1
+```bash
+stat -fc %T /sys/fs/cgroup/                                                        # cgroup2fs = v2, tmpfs = v1
+cat /sys/fs/cgroup/cpu.max /sys/fs/cgroup/memory.max                                # v2
+cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us /sys/fs/cgroup/memory/memory.limit_in_bytes # v1
+```
 
-3. Check if limits are set:
-   ```bash
-   # cgroup v2
-   cat /sys/fs/cgroup/cpu.max
-   cat /sys/fs/cgroup/memory.max
-
-   # cgroup v1
-   cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us
-   cat /sys/fs/cgroup/memory/memory.limit_in_bytes
-   ```
-
-### Metrics Show Host Values
-
-If `rustfs_memory_effective_total_bytes` shows host memory instead of cgroup limit:
-
-1. Verify cgroup detection is not disabled:
-   ```bash
-   echo $RUSTFS_DISABLE_CGROUP_DETECTION
-   ```
-
-2. Check startup logs for cgroup detection:
-   ```bash
-   grep "container resources" /logs/rustfs.log
-   ```
-
-3. Use environment variable override as workaround:
-   ```bash
-   export RUSTFS_OVERRIDE_MEMORY_BYTES=1073741824
-   ```
-
-## Implementation Details
-
-### Files Modified
-
-- `rustfs/src/cgroup_resources.rs` - Core cgroup detection logic
-- `rustfs/src/container_config.rs` - Container configuration with overrides
-- `rustfs/src/memory_observability.rs` - Updated memory metrics
-- `rustfs/src/server/runtime.rs` - Updated Tokio runtime configuration
-- `rustfs/src/startup_entrypoint.rs` - Startup logging
-
-### Performance Impact
-
-- **Startup**: One-time detection adds ~1ms overhead
-- **Runtime**: Cached values, no repeated filesystem reads
-- **Memory**: Negligible (<1KB for cached values)
-
-### Thread Safety
-
-All detection functions are thread-safe and use `OnceLock` for caching.
+4. If the runtime does not expose limits to the container, pin them with `RUSTFS_OVERRIDE_CPU_CORES` / `RUSTFS_OVERRIDE_MEMORY_BYTES` and confirm `rustfs_container_overridden` reads `1`.

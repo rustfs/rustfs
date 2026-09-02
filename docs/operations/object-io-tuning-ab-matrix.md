@@ -1,50 +1,29 @@
 # Object I/O (GET/PUT) tuning A/B matrix runbook
 
-> Scope: **parameter tuning** — measuring the effect of changing one
-> `RUSTFS_*` runtime knob at a time, against a fixed binary. This is
-> deliberately different from the code-change A/B gate in
-> [`hotpath-warp-ab-runbook.md`](hotpath-warp-ab-runbook.md) and the formal
-> ABBA validation in
-> [`hotpath-warp-abba-runbook.md`](hotpath-warp-abba-runbook.md), which compare
-> a baseline binary against a candidate binary.
->
-> When a knob change turns out to need a code change, use those two runbooks
-> for the code-level validation and come back here for the knob-level sweep.
+**Use this when:** you want to measure the effect of changing one `RUSTFS_*` runtime knob at a time against a fixed binary, or you need the catalog of GET/PUT tuning knobs, their defaults, and the stage metric that validates each.
+**Source of truth:** `crates/io-metrics/src/lib.rs` (stage histogram names and stage tokens); `crates/config/src/constants/object.rs` and `crates/ecstore/src/erasure/coding/encode.rs` (knob defaults); `crates/ecstore/src/set_disk/mod.rs` (codec-streaming rollout and engine defaults); `rustfs/src/app/object/get.rs` (GET experimental switches).
 
-## 1. What this runbook answers
+Scope: **parameter tuning** with a fixed binary. The code-change A/B gate that compares a baseline binary against a candidate binary is [`hotpath-warp-ab-runbook.md`](hotpath-warp-ab-runbook.md); when a knob change turns out to need a code change, validate it there and come back here for the knob-level sweep.
 
-For each tuning knob it answers three questions:
+## 1. Questions this runbook answers
 
-1. Which stage is actually slow — `set_disk_encode`, `set_disk_rename`,
-   `metadata_fanout`, `bitrot_verify`, etc.?
+1. Which stage is actually slow — `set_disk_encode`, `set_disk_rename`, `metadata_fanout`, `bitrot_verify`, ...?
 2. Is the knob the real bottleneck, or is the stage slow for another reason?
-3. Does widening/loosening the knob buy throughput without an unacceptable
-   memory (RSS) or tail-latency regression?
+3. Does widening the knob buy throughput without an unacceptable memory (RSS) or tail-latency regression?
 
-The core discipline is **one variable per A/B cell**. Never change two knobs in
-the same cell, or the result is unexplainable.
+The core discipline is **one variable per A/B cell**. A cell that changes two knobs is thrown away.
 
 ## 2. Prerequisites
 
-- Linux bench host (or an ansible-managed cluster); a laptop smoke run is too
-  noisy to decide anything.
-- `warp` on `PATH` (or pass `--warp-bin` to the driver).
-- The observability metrics runtime **enabled**. The stage histograms below are
-  not emitted when `RUSTFS_OBS_METRICS_EXPORT_ENABLED=false` or the runtime is
-  otherwise off — see
-  [`hotpath-warp-ab-runbook.md`](hotpath-warp-ab-runbook.md) for the no-log /
-  no-monitor baseline env.
-- A warm, disposable data set. Recreate the bucket per run; do not bench against
-  production data.
+Host, `warp`, and the no-log / no-monitor baseline environment are as in [`hotpath-warp-ab-runbook.md`](hotpath-warp-ab-runbook.md). Two additions: the observability metrics runtime must be **enabled** (the stage histograms are not emitted when `RUSTFS_OBS_METRICS_EXPORT_ENABLED=false`), and the data set must be disposable — recreate the bucket per run.
 
 Load driver and gate are reused, not reimplemented:
 
-- `scripts/run_object_batch_bench_enhanced.sh` — warp driver with rounds,
-  median aggregation, `baseline_compare.csv`, and Prometheus service-metric
-  capture.
-- `scripts/hotpath_warp_ab_gate.sh` — relative budget gate over the deltas.
-- `scripts/run_hotpath_warp_ab.sh` — optional orchestrator when a knob needs
-  the full baseline-vs-candidate treatment (e.g. two different defaults).
+| Script | Role |
+| --- | --- |
+| `scripts/run_object_batch_bench_enhanced.sh` | warp driver with rounds, median aggregation, `baseline_compare.csv`, Prometheus service-metric capture |
+| `scripts/hotpath_warp_ab_gate.sh` | relative budget gate over the deltas |
+| `scripts/run_hotpath_warp_ab.sh` | orchestrator when a knob needs the full baseline-vs-candidate treatment (e.g. two different defaults) |
 
 ## 3. Fixed test conditions (lock before you start)
 
@@ -56,9 +35,6 @@ network, erasure_set_drive_count, endpoint_mode (direct|lb),
 rustfs_commit_sha, warp --version, durability mode
 ```
 
-Workload matrix (the same shapes the hotpath gate uses, expanded for the
-stage-breakdown object sizes):
-
 | Workload | mode | sizes |
 | --- | --- | --- |
 | small-fixed | put / get | 4KiB, 100KiB |
@@ -66,39 +42,19 @@ stage-breakdown object sizes):
 | large-stream | put / get | 10MiB, 16MiB, 32MiB |
 | mixed | mixed | 256KiB |
 
-Concurrency ladder: `8, 16, 32, 64` (add `96, 128` on a bigger rig). Duration
-`120s`, `--rounds >= 3`, cooldown `>= 30s`.
-
-Isolate background noise before the sweep: scanner deep-verify, heal,
-replication, lifecycle transition, periodic capacity refresh — record whether
-each is on rather than silently assuming it is off.
+Concurrency ladder `8, 16, 32, 64` (add `96, 128` on a bigger rig); duration `120s`, `--rounds >= 3`, cooldown `>= 30s`. Record whether scanner deep-verify, heal, replication, lifecycle transition, and periodic capacity refresh are on rather than assuming they are off.
 
 ## 4. Measurement stack
 
-The code already instruments every stage below. Drive each A/B cell with these
-histograms (names verified against `crates/io-metrics/src/lib.rs`):
+Drive each cell with the stage histograms emitted by `crates/io-metrics/src/lib.rs`; the stage and path label tokens are defined there and are not repeated here.
 
-- PUT stages: `rustfs_s3_put_object_stage_duration_ms{stage=...}` — compute
-  P50/P95/P99 per stage. Stages: `app_bucket_validate`, `app_sse_config_lookup`,
-  `app_object_lock_config_lookup`, `app_put_opts_build`, `app_prelookup`,
-  `ingress_prepare`, `app_encryption_prepare`, `app_replication_decision`,
-  `app_store_put`, `app_post_store_bookkeeping`, `app_capacity_update`,
-  `set_disk_writer_setup`, `set_disk_encode`, `set_disk_rename`,
-  `set_disk_old_data_cleanup`.
-- GET stages: `rustfs_io_get_object_stage_duration_seconds{path=..., stage=...}` —
-  the `path` label separates the read paths: `legacy_duplex`, `codec_streaming`,
-  `direct_memory`, `body_cache`, `inline_direct`, `internal_meta`,
-  `remote_transition`, `set_disk`, `empty`. Stages: `metadata`,
-  `metadata_cache_lookup`, `metadata_fanout`, `metadata_resolve`, `object_info`,
-  `path_decision`, `quorum_reached`, `range`, `reader_setup`,
-  `stripe_read`, `stripe_read_first_shard`, `stripe_read_quorum`, `decode`,
-  `reconstruct`, `emit`, `fill`, `output_poll`, `output_lock_wait`,
-  `bitrot_verify`, `first_byte`, `full_body`, `response_handoff`,
-  `lock_acquire`.
-- EC memory pressure: `rustfs_ec_encode_inflight_bytes_current` and the
-  allocator reclaim gauge; plus node RSS and CPU.
+| Metric | Labels | Use |
+| --- | --- | --- |
+| `rustfs_s3_put_object_stage_duration_ms` | `stage` | P50/P95/P99 per PUT stage (`app_*`, `ingress_prepare`, `set_disk_*`) |
+| `rustfs_io_get_object_stage_duration_seconds` | `path`, `stage` | Per GET stage, split by read path (`legacy_duplex`, `codec_streaming`, ...) |
+| `rustfs_ec_encode_inflight_bytes_current` | — | EC encode memory pressure; pair with node RSS and CPU |
 
-Host telemetry (collect alongside every cell):
+Host telemetry, collected alongside every cell:
 
 ```bash
 pidstat -durh 5 > telemetry/pidstat.txt &
@@ -108,37 +64,34 @@ iostat -xz 5 > telemetry/iostat.txt &
 
 ## 5. Tuning knob catalog
 
-Defaults are verified against `crates/config/src/constants/object.rs` and
-`crates/ecstore/src/erasure/coding/encode.rs`.
-
 ### 5.1 PUT
 
 | Knob | Default | Controls | Validating stage | Risk if widened |
 | --- | --- | --- | --- | --- |
-| `RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES` | 32MiB | EC encode producer/consumer memory budget (blocks queued between encode and shard write) | `set_disk_encode` P95 + `rustfs_ec_encode_inflight_bytes_current` | RSS growth under high concurrency |
-| `RUSTFS_OBJECT_IO_BUFFER_SIZE` | 128KiB | Streaming read-in / write-out block size | `ingress_prepare`, `set_disk_encode` | Larger buffers = fewer polls, more resident memory |
-| `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE` | 4MiB | duplex pipe capacity (shared, but PUT path uses it less than GET) | `set_disk_encode` feed smoothness | Memory per in-flight request |
-| `RUSTFS_DURABILITY_MODE` / `RUSTFS_DRIVE_SYNC_ENABLE` | mode-dependent | per-shard fsync/sync discipline on commit | `set_disk_rename` P99 | Weakening it changes the durability contract — treat as a deliberate tradeoff, not a free win |
-| `RUSTFS_RUNTIME_WORKER_THREADS` / `RUSTFS_RUNTIME_MAX_BLOCKING_THREADS` | Tokio defaults | async workers + `spawn_blocking` pool feeding per-block encode | `set_disk_encode` P95 + mpstat | Oversubscription |
+| `RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES` | 32MiB (`crates/ecstore/src/erasure/coding/encode.rs`) | EC encode producer/consumer memory budget (blocks queued between encode and shard write) | `set_disk_encode` P95 + `rustfs_ec_encode_inflight_bytes_current` | RSS growth under high concurrency |
+| `RUSTFS_OBJECT_IO_BUFFER_SIZE` | 128KiB (`crates/config/src/constants/object.rs`) | Streaming read-in / write-out block size | `ingress_prepare`, `set_disk_encode` | Larger buffers = fewer polls, more resident memory |
+| `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE` | 4MiB (`crates/config/src/constants/object.rs`) | Duplex pipe capacity (shared; PUT uses it less than GET) | `set_disk_encode` feed smoothness | Memory per in-flight request |
+| `RUSTFS_DURABILITY_MODE` / `RUSTFS_DRIVE_SYNC_ENABLE` | mode-dependent | Per-shard fsync/sync discipline on commit | `set_disk_rename` P99 | Weakening it changes the durability contract — a deliberate tradeoff, never a free win |
+| `RUSTFS_RUNTIME_WORKER_THREADS` / `RUSTFS_RUNTIME_MAX_BLOCKING_THREADS` | Tokio defaults | Async workers + `spawn_blocking` pool feeding per-block encode | `set_disk_encode` P95 + mpstat | Oversubscription |
 
 ### 5.2 GET
 
 | Knob | Default | Controls | Validating stage | Risk if enabled |
 | --- | --- | --- | --- | --- |
-| `RUSTFS_GET_CODEC_STREAMING_ROLLOUT` | `off` | switches the read path from `legacy_duplex` to the pull-based `ErasureDecodeReader` (`codec_streaming`) | compare `path="legacy_duplex"` vs `path="codec_streaming"` for `decode`/`emit`/`output_lock_wait`/`stripe_read` | behavioral change to the read path; rollout is `off` by default for a reason |
-| `RUSTFS_GET_CODEC_STREAMING_ENGINE` | `legacy` | `legacy` vs `rustfs` decode engine under the streaming reader | `reconstruct`/`decode` per `path` | engine swap on a correctness-critical path |
-| `RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE` | `false` | multipart objects on the streaming reader | same, multipart cells | wider format coverage |
-| `RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE` (+ `_MAX_SIZE`, `_FIRST_READER_SETUP`) | `false` / 512KiB | prefer data-shard readers before parity | `stripe_read_first_shard`/`stripe_read_quorum` | shard-selection order change |
-| `RUSTFS_OBJECT_GET_SKIP_BITROT_VERIFY` | `false` | skip per-shard HighwayHash verify | `bitrot_verify` | **do not default on** — measures the theoretical ceiling only |
-| `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE` | 4MiB | legacy GET in-process pipe capacity | `output_lock_wait`/`output_poll` | memory per in-flight GET |
-| `RUSTFS_GET_SEEK_BUFFER_ENABLE` | `false` | in-memory seek buffer for small GET | `first_byte` | experimental, startup-latched — see [`get-path-experimental-switches.md`](get-path-experimental-switches.md) |
-| `RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE` | `false` | adds `response_handoff` attribution (metrics only) | `response_handoff` | small per-request bookkeeping cost |
+| `RUSTFS_GET_CODEC_STREAMING_ROLLOUT` | `off` (`crates/ecstore/src/set_disk/mod.rs`) | Switches the read path from `legacy_duplex` to the pull-based `ErasureDecodeReader` (`codec_streaming`) | `path="legacy_duplex"` vs `path="codec_streaming"` for `decode`/`emit`/`output_lock_wait`/`stripe_read` | Behavioral change to the read path |
+| `RUSTFS_GET_CODEC_STREAMING_ENGINE` | `legacy` | `legacy` vs `rustfs` decode engine under the streaming reader | `reconstruct`/`decode` per `path` | Engine swap on a correctness-critical path |
+| `RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE` | `false` | Multipart objects on the streaming reader | Same, multipart cells | Wider format coverage |
+| `RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE` (+ `_MAX_SIZE`, `_FIRST_READER_SETUP`) | `false` / 512KiB | Prefer data-shard readers before parity | `stripe_read_first_shard`/`stripe_read_quorum` | Shard-selection order change |
+| `RUSTFS_OBJECT_GET_SKIP_BITROT_VERIFY` | `false` | Skip per-shard HighwayHash verify | `bitrot_verify` | **Never default on** — measures the theoretical ceiling only |
+| `RUSTFS_OBJECT_DUPLEX_BUFFER_SIZE` | 4MiB | Legacy GET in-process pipe capacity | `output_lock_wait`/`output_poll` | Memory per in-flight GET |
+| `RUSTFS_GET_SEEK_BUFFER_ENABLE` [^latched] | `false` | Serves small GETs through an in-memory seek buffer (seek support without re-reading the object); gates `should_buffer_get_object_in_memory_with_threshold` | `first_byte` | Experimental; read by `scripts/run_get_1mib_abba_stage_metrics.sh` |
+| `RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE` [^latched] | `false` | Attributes output-handoff timing to the `response_handoff` stage (metrics only) | `response_handoff` | Small per-request bookkeeping cost; set by `scripts/run_get_codec_streaming_smoke.sh` and `scripts/test_get_1mib_abba_stage_metrics.sh` |
+
+[^latched]: Both switches are startup-latched `OnceLock` booleans in `rustfs/src/app/object/get.rs` (`ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE` / `is_get_seek_buffer_enabled`, `ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE` / `is_get_output_handoff_attribution_enabled`), read once via `get_env_bool(.., false)`; changing a value requires a process restart. They exist to support A/B runs, are referenced only by the harness scripts named above, and are kept deliberately — do not remove either switch or the seek-buffer path as dead code. Leave both unset in production. The codec-streaming switches above are startup-latched as well.
 
 ## 6. A/B matrix
 
-Run each row as an independent cell. Baseline is the shipped default; candidate
-is one knob moved. Everything else (topology, sizes, concurrency, rounds,
-durability) stays fixed.
+Run each row as an independent cell. Baseline is the shipped default; candidate is one knob moved. Everything else (topology, sizes, concurrency, rounds, durability) stays fixed.
 
 ### 6.1 PUT
 
@@ -162,17 +115,12 @@ durability) stays fixed.
 | G5 | duplex buffer | 4MiB | 8MiB, 16MiB | `output_lock_wait`/`output_poll` (legacy path) | only if still on `legacy_duplex` |
 | G6 | skip bitrot verify | `false` | `true` | `bitrot_verify` | **ceiling measurement only**; do not carry into production |
 
-## 7. Execution sequence
+## 7. Execution and interpretation
 
 1. Freeze the conditions in §3 and record the provenance block.
-2. Run the baseline cell (all defaults) and capture stage histograms + host
-   telemetry.
-3. Pick the **one** most-likely knob from the analysis. For large-object PUT
-   that is almost always `set_disk_encode` → P1; for GET it is G1 (the
-   `legacy_duplex` → `codec_streaming` switch).
-4. Sweep that knob's candidate column one value at a time, same workload.
-5. Read the decision table in §8; if the stage did not move, the knob is not
-   the bottleneck — stop widening it and pick the next stage.
+2. Run the baseline cell (all defaults) and capture stage histograms plus host telemetry.
+3. Pick the **one** most-likely knob from the decision table below (large-object PUT is almost always `set_disk_encode` → P1; GET is G1), sweep its candidate column one value at a time on the same workload, and stop widening as soon as the stage stops moving — the knob is then not the bottleneck.
+4. Keep `baseline_compare.csv`, `median_summary.csv`, stage histograms, and host telemetry per cell; the conclusion must trace back to them. Record results in the issue tracker, not the repo.
 
 Driver invocation for one PUT cell:
 
@@ -185,8 +133,6 @@ scripts/run_object_batch_bench_enhanced.sh \
   --out-dir target/bench/put-tuning-p1-64mib
 ```
 
-## 8. Interpretation / decision table
-
 | Stage high | Most likely cause | Next action |
 | --- | --- | --- |
 | `set_disk_encode` | per-block EC encode scheduling + in-flight budget | P1 → P4 → P2, in that order |
@@ -198,21 +144,4 @@ scripts/run_object_batch_bench_enhanced.sh \
 | `output_lock_wait` / `output_poll` | legacy duplex backpressure | G1 (move off duplex) or G5 |
 | `stripe_read*` | shard concurrency / selection | G4 shard-selection, disk/network tail |
 
-## 9. Guardrails
-
-- **Never weaken correctness for throughput**: read/write quorum, bitrot verify,
-  `xl.meta` validation, and durability (`RUSTFS_DURABILITY_MODE`) are integrity
-  contracts, not knobs. P5 and G6 are ceiling measurements and must be labelled
-  as such; do not carry their values into production without an explicit
-  durability/correctness decision.
-- **One variable per cell.** A cell that changes two knobs is thrown away.
-- **Memory is part of the result.** A throughput win with unbounded RSS growth
-  is a regression; record RSS and the EC in-flight gauge for every PUT cell.
-- **Startup-latched knobs** (`RUSTFS_GET_SEEK_BUFFER_ENABLE`,
-  `RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE`, and the codec-streaming
-  switches) require a process restart to change — see
-  [`get-path-experimental-switches.md`](get-path-experimental-switches.md).
-- **Archive the raw data.** Keep the `baseline_compare.csv`, `median_summary.csv`,
-  stage histograms, and host telemetry per cell; the conclusion must trace back
-  to them. Do not commit benchmark result snapshots to the repo — record them in
-  the issue tracker.
+Read/write quorum, bitrot verify, `xl.meta` validation, and durability are integrity contracts, not knobs: P5 and G6 are ceiling measurements and must be labelled as such. A throughput win with unbounded RSS growth is a regression — RSS and the EC in-flight gauge are part of every PUT result.

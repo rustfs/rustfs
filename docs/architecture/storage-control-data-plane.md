@@ -1,7 +1,7 @@
 # Storage, Control Plane, And Background Controllers
 
-This document defines migration boundaries for the storage hot path and adjacent
-control-plane responsibilities.
+**Use this when:** adding a storage API surface, a cluster read model, or a background-service status/reconcile surface, and you need to know which layer owns it and what must not drift.
+**Source of truth:** `crates/storage-api` (trait contracts), `crates/ecstore/src/api/mod.rs` (facade groups, `api::cluster`), `crates/ecstore/src/cluster/` (control plane), [background-controller-contract.md](background-controller-contract.md) (controller vocabulary).
 
 ## Storage API Contracts
 
@@ -42,9 +42,11 @@ It maps existing endpoint pools into the shared storage-api topology contract an
 an ECStore-owned static membership snapshot. It must not expose local disk paths,
 start health checks, mutate endpoint ownership, or change placement/readiness.
 The same facade also owns static pool-state, local-node storage, and peer-health
-status projections. Peer health remains explicitly unknown until a later slice
-wires real health signals; this document does not authorize background probes or
-RPC-based health checks.
+status projections. `peer_health_snapshot` in
+`crates/ecstore/src/cluster/control_plane.rs` projects the internode health
+tracker's per-node reachability (`PEER_HEALTH_REACHABLE` /
+`PEER_HEALTH_UNREACHABLE`, or not-reported); the facade itself starts no probes
+and issues no RPC-based health checks.
 Readiness impact for storage, lock quorum, peer health, probes, admin routes,
 RPC, and the S3 data plane is recorded in
 [`readiness-matrix.md`](readiness-matrix.md).

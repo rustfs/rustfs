@@ -1,5 +1,8 @@
 # Atomic object undo precondition
 
+**Use this when:** you need the `x-rustfs-expected-current-version-id` precondition for undo-style CopyObject restores or delete-marker removal, or you are changing how it is parsed or enforced.
+**Source of truth:** `rustfs/src/app/object/shared.rs` (`expected_current_version_id` header parser), `rustfs/src/app/object/copy.rs` (CopyObject enforcement), `crates/ecstore/src/set_disk/ops/object.rs` (`expected_current_version_id` checks under the namespace write lock).
+
 RustFS supports a destination-side version precondition for the two S3
 operations used to undo changes in a versioned bucket:
 

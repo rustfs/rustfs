@@ -50,10 +50,11 @@ consider adding it to the script's `checked_files` list.
 
 ## `check_doc_paths.sh`
 
-Instruction/architecture docs (`AGENTS.md`, `CLAUDE.md`, `ARCHITECTURE.md`,
-`docs/architecture/*.md`) must not reference repo file paths that no longer
-exist. If your refactor moved code, update the docs that point at it — the
-error message lists `doc -> stale-path` pairs.
+Instruction docs (`AGENTS.md`, `CLAUDE.md`, `ARCHITECTURE.md`) and every
+Markdown file under `docs/` (architecture, operations, testing, index) must not
+reference repo file paths that no longer exist. If your refactor moved code,
+update the docs that point at it — the error message lists `doc -> stale-path`
+pairs. Cite paths plus symbol names, never line numbers (see `docs/README.md`).
 
 ## `check_no_planning_docs.sh`
 

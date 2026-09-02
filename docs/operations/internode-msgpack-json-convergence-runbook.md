@@ -1,75 +1,37 @@
-# Internode msgpack/JSON Convergence Runbook
+# Internode msgpack/JSON convergence runbook
 
-Operational runbook for retiring the redundant JSON compatibility fields on internode
-gRPC metadata RPCs (grpc-optimization **P2-1**). This is a **cross-version** change: it
-proceeds strictly by observation-gated stages, never in one step.
+**Use this when:** operating or changing the staged retirement of the JSON compatibility fields on internode gRPC metadata RPCs, deciding whether a fleet may enable `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY`, or adding a new `*_bin` proto field.
+**Source of truth:** `crates/config/src/constants/internode.rs` (`ENV_INTERNODE_RPC_MSGPACK_ONLY`, `ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` and their compile-time default-off asserts), `crates/protos/src/node.proto` (`*_bin` fields), `decode_msgpack_or_json` in `rustfs/src/storage/rpc/node_service/disk.rs` (server side) and `crates/ecstore/src/cluster/rpc/remote_disk.rs` (client side), `crates/io-metrics/src/internode_metrics.rs` (counters).
+
+This is a cross-version change and proceeds by observation-gated stages, never in one step.
 
 ## Background
 
-Internode RPCs dual-encode each metadata value as **both**:
+Internode RPCs dual-encode each metadata value as a msgpack binary field (`*_bin`, for example `file_info_bin`) and a JSON compatibility string (for example `file_info`). Decoders prefer `_bin` and fall back to JSON only when `_bin` is empty. The dual-write costs bandwidth and CPU; before the JSON fields can be dropped, the fallback branch must be proven unused across the fleet, otherwise a mixed-version rolling upgrade could read an emptied field.
 
-- a msgpack binary field (`*_bin`, e.g. `file_info_bin`), and
-- a JSON compatibility string (e.g. `file_info`).
+## Observation counters
 
-Decoders prefer the `_bin` payload and fall back to the JSON string only when `_bin` is
-empty (`decode_msgpack_or_json`). The dual-write costs bandwidth and CPU. Before the JSON
-fields can be dropped, the fallback branch must be proven **unused** in production —
-otherwise a rolling upgrade with mixed node versions could read an emptied field.
+| Counter | Labels | Increments when |
+| --- | --- | --- |
+| `rustfs_system_network_internode_msgpack_json_decode_total` | `direction`, `message`, `codec` | a msgpack or JSON decode succeeded |
+| `rustfs_system_network_internode_msgpack_json_fallback_total` | `direction`, `message` | a decode fell back to JSON because `_bin` was empty |
+| `rustfs_system_network_internode_msgpack_json_decode_error_total` | `direction`, `message`, `codec` | either codec failed to decode (`codec` = the failed codec) |
 
-## The observation metric (already shipped)
+`direction="request"` is a server decoding a peer's request (`node_service/disk.rs`); `direction="response"` is a client decoding a peer's response (`cluster/rpc/remote_disk.rs`), including the list-level `ReadMultiple` / `BatchReadVersion` fallbacks. `message` is the value name (`FileInfo`, `RawFileInfo`, `ReadMultipleResp`, ...).
 
-```
-rustfs_system_network_internode_msgpack_json_fallback_total{direction, message}
-rustfs_system_network_internode_msgpack_json_decode_total{direction, message, codec}
-rustfs_system_network_internode_msgpack_json_decode_error_total{direction, message, codec}
-```
-
-The decode counter increments after a successful msgpack or JSON compatibility decode. The fallback counter increments whenever a decode falls back to the JSON field because the msgpack payload was absent. The decode-error counter increments whenever either codec fails to decode.
-
-- `direction="request"` — a server decoding a peer's request (`node_service/disk.rs`).
-- `direction="response"` — a client decoding a peer's response (`cluster/rpc/remote_disk.rs`),
-  including the list-level `ReadMultiple` / `BatchReadVersion` fallbacks.
-- `message` — the value name, e.g. `FileInfo`, `RawFileInfo`, `ReadMultipleResp`.
-- `codec` — the failed codec for decode errors: `msgpack` for corrupt non-empty `_bin`, or `json` for corrupt legacy fallback JSON.
-
-## Stage 0 — Observe (current stage)
-
-Ship the current release (which contains these counters) and let it run for **at least one
-full release window** across the whole fleet. The fallback and decode-error counters must stay at **zero**.
-
-First confirm each expected message/direction has real traffic in the observation window:
+Gate query template, run over the whole observation window (adjust `[30d]`):
 
 ```promql
-sum by (direction, message, codec) (
-  increase(rustfs_system_network_internode_msgpack_json_decode_total[30d])
-)
+sum by (direction, message, codec) (increase(<counter>[30d]))
 ```
 
-For every convergence-ready message/direction below, the `codec="msgpack"` series must be non-zero before a zero fallback result is meaningful. Missing series, zero traffic, counter reset, or scrape gaps make the gate inconclusive rather than passed.
+| Counter | Required reading | Meaning of a violation |
+| --- | --- | --- |
+| `..._decode_total` | every convergence-ready `{direction, message}` has a non-zero `codec="msgpack"` series | no traffic, a counter reset, or scrape gaps make the gate inconclusive, not passed |
+| `..._fallback_total` | `0` for every series | some peer still sends an empty `_bin` (old node, or a sender that does not fill `_bin`); investigate the labels |
+| `..._decode_error_total` | `0` for every series | `codec="msgpack"`: corrupt or incompatible `_bin` bytes; `codec="json"`: corrupt legacy fallback. Either blocks convergence and rollback confidence |
 
-Confirm zero across the observation window (adjust `[30d]` to the window length):
-
-```promql
-sum by (direction, message) (
-  increase(rustfs_system_network_internode_msgpack_json_fallback_total[30d])
-)
-```
-
-Every series must be `0`. A non-zero value means some peer is still emitting an empty
-`_bin` (an old node, or a message whose sender does not fill `_bin`) — investigate the
-`{direction, message}` label before proceeding.
-
-Decode errors must also stay at zero across the observation window:
-
-```promql
-sum by (direction, message, codec) (
-  increase(rustfs_system_network_internode_msgpack_json_decode_error_total[30d])
-)
-```
-
-A non-zero `codec="msgpack"` series means a peer sent corrupt or incompatible `_bin` bytes; it must fail closed and block convergence. A non-zero `codec="json"` series means the legacy fallback field was corrupt or semantically incompatible; it also blocks convergence and rollback confidence.
-
-Standing alert (keep enabled through all stages):
+Standing alerts (keep enabled through every stage):
 
 ```yaml
 - alert: InternodeMsgpackJsonFallback
@@ -90,96 +52,70 @@ Standing alert (keep enabled through all stages):
 
 ## Field → peer-decoder audit
 
-The send-side change (Stage 1) may only empty a JSON field whose **peer decodes `_bin`
-first**. The following mapping is verified against the current code.
+Stage 1 may only empty a JSON field whose peer decodes `_bin` first. Any `*_bin` field not listed here must be mapped to a confirmed `_bin`-first peer decoder before it joins the convergence set.
 
-### Convergence-ready (peer decodes `_bin` first)
+Convergence-ready:
 
 | Direction | Message / field | Peer decoder |
-|---|---|---|
-| request | `WriteMetadata.file_info` | `FileInfo` (node_service/disk.rs) |
+| --- | --- | --- |
+| request | `WriteMetadata.file_info` | `FileInfo` (`node_service/disk.rs`) |
 | request | `UpdateMetadata.file_info` | `FileInfo` |
 | request | `UpdateMetadata.opts` | `UpdateMetadataOpts` |
 | request | `RenameData.file_info` | `FileInfo` |
 | request | `ReadMultiple.read_multiple_req` | `ReadMultipleReq` |
 | request | `BatchReadVersion.batch_read_version_req` | `BatchReadVersionReq` |
 | request | `Read*.opts` | `ReadOptions` |
-| response | `ReadVersion.file_info` | `FileInfo` (cluster/rpc/remote_disk.rs) |
+| response | `ReadVersion.file_info` | `FileInfo` (`cluster/rpc/remote_disk.rs`) |
 | response | `ReadXL.raw_file_info` | `RawFileInfo` |
 | response | `RenameData.rename_data_resp` | `RenameDataResp` |
-| response | `ReadMultiple` resp list | per-item + list fallback |
-| response | `BatchReadVersion` resp list | per-item + list fallback |
+| response | `ReadMultiple` response list | per-item plus list fallback |
+| response | `BatchReadVersion` response list | per-item plus list fallback |
 
-### `_bin` support added THIS release — converge after their own window
-
-The `DeleteVersion`/`DeleteVersions` protos had **no `_bin` fields**. They gained additive
-`*_bin` fields plus bin-first server decoders in this release, and the client now dual-writes
-them. They are **kept out** of the msgpack-only set (always dual-write) until their own
-fallback counter has read zero across a window with the new decoders fully deployed.
+Delete messages, kept on dual-write until their own window reads zero with `_bin`-first decoders deployed fleet-wide (the client always dual-writes these regardless of the flags):
 
 | Direction | Message / field | Status |
-|---|---|---|
-| request | `DeleteVersion.file_info` (`FileInfo`) | `_bin` added; dual-write; converge after window |
-| request | `DeleteVersion.opts` (`DeleteOptions`) | `_bin` added; dual-write; converge after window |
-| request | `DeleteVersions.versions` (`FileInfoVersions`) | `_bin` added; dual-write; converge after window |
-| request | `DeleteVersions.opts` (`DeleteOptions`) | `_bin` added; dual-write; converge after window |
+| --- | --- | --- |
+| request | `DeleteVersion.file_info` (`FileInfo`) | `_bin` present; dual-write; converge after its own window |
+| request | `DeleteVersion.opts` (`DeleteOptions`) | same |
+| request | `DeleteVersions.versions` (`FileInfoVersions`) | same |
+| request | `DeleteVersions.opts` (`DeleteOptions`) | same |
 
-> Any `*_bin` proto field not in the tables above must be mapped to a confirmed `_bin`-first
-> peer decoder before it is added to the convergence set.
-
-### Still JSON-only (no `_bin` field)
+Still JSON-only:
 
 | Direction | Message / field | Note |
-|---|---|---|
-| response | `DeleteVersion.raw_file_info` | proto has no `_bin`; needs an additive proto field before it can converge. |
+| --- | --- | --- |
+| response | `DeleteVersion.raw_file_info` | proto has no `_bin`; needs an additive proto field before it can converge |
 
-## Stage 1 — Stop writing JSON (env-gated, after Stage 0 reads zero)
+## Stage 0 — Observe
 
-The send-side lever is **implemented** and requires two default-off env flags:
+Run the fleet with both flags at their default (`false`) for at least one full observation window and evaluate the three gate rows above. All three must hold before Stage 1.
 
-- `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true`
-- `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true`
+## Stage 1 — Stop writing JSON (env-gated)
 
-The first flag only requests msgpack-only. The second flag is the explicit proof gate that the fleet has passed the release-window fallback, capability, and rollback checks. If only `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` is set, RustFS keeps dual-writing JSON compatibility fields so old JSON-only peers remain compatible. When both flags are enabled, the convergence-ready fields above send only `_bin` and leave the JSON string empty; the `_bin` payload is always sent and decoders keep the JSON read fallback unchanged. The delete fields are excluded (dual-write) per the section above.
+Flag semantics are defined on `ENV_INTERNODE_RPC_MSGPACK_ONLY` and `ENV_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` in `crates/config/src/constants/internode.rs`; both default off and only their conjunction stops the JSON write for convergence-ready fields. Decoders keep the JSON fallback in every state.
 
-Only enable it **after** Stage 0 has read zero for a full window across the fleet:
+1. Rehearse `request-only`: `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true`, `..._FLEET_CONFIRMED=false`. Behaviour is unchanged (still dual-write) and safe with old peers; any fallback or decode-error increment still blocks.
+2. Canary: set both flags `true` on one node, restart that node only, and watch the fallback and decode-error counters for a soak period with real internode traffic.
+3. Fleet: if the counters stay zero, enable both flags fleet-wide with a rolling restart.
+4. Rollback: set either flag to `false` (or unset it) and restart; no wire format changed, so rollback is immediate.
 
-1. Ship with the flag **off** (no behavior change).
-2. Rehearse the `request-only` gate with `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false`. This must keep writing JSON compatibility fields and is safe with unsupported/old peers; any fallback or decode-error increment still blocks convergence.
-3. Enable it on one canary node with both `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=true` and `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=true`, then restart that node only and watch the fallback and decode-error counters for a soak period while real internode traffic is present. If they stay zero, enable fleet-wide.
-4. **Rollback:** set either `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY=false` or `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED=false` (or unset either flag) and restart. No
-   wire-format was broken in this stage, so rollback is immediate and safe.
+The benchmark driver pins these operator states as dry-run phases (`before`, `request-only`, `canary`, `after`, `rollback`); see [internode-grpc-benchmark-runbook.md](internode-grpc-benchmark-runbook.md).
 
-The benchmark helper pins these operator states as dry-run phases:
+## Stage 2 — Remove the proto JSON fields
 
-```bash
-scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase before --dry-run
-scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase request-only --dry-run
-scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase canary --dry-run
-scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase after --dry-run
-scripts/run_internode_grpc_ab_bench.sh --stage p2 --phase rollback --dry-run
-```
+Only after Stage 1 has been stable fleet-wide for a full window with the counters still zero.
 
-## Stage 2 — Remove the proto JSON fields (next release, N+1)
-
-Only after Stage 1 has been stable with the flag on for a full window and the counter is
-still zero.
-
-1. Mark the retired text fields `reserved` in `crates/protos/src/node.proto` (never reuse
-   the field numbers) and delete the JSON read-fallback branches; codec becomes msgpack-only.
-2. This is a hard wire-format change — it requires the mixed-version upgrade rehearsal
-   (four-node scripts) to pass, and it cannot be rolled back by env alone.
+1. Mark the retired text fields `reserved` in `crates/protos/src/node.proto` (never reuse field numbers) and delete the JSON read-fallback branches.
+2. This is a hard wire-format change: it requires the mixed-version upgrade rehearsal (four-node scripts) to pass and cannot be rolled back by env alone.
 
 ## Rollback matrix
 
-| Stage | Wire-format broken? | Rollback |
-|---|---|---|
-| 0 Observe | no | n/a (metric only) |
-| 1 msgpack-only send | no | unset either msgpack-only env flag + restart |
-| 2 remove fields | yes | redeploy prior release; field numbers stay `reserved` |
+| Stage | Wire format broken? | Rollback |
+| --- | --- | --- |
+| 0 Observe | no | n/a (metrics only) |
+| 1 msgpack-only send | no | unset either flag and restart |
+| 2 remove fields | yes | redeploy the prior release; field numbers stay `reserved` |
 
 ## Related
 
-- Codec + counter implementation: commit `feat(internode): P2 msgpack/JSON codec observability + encode buffer presizing`.
-- Decoders: `decode_msgpack_or_json` in `crates/ecstore/src/cluster/rpc/remote_disk.rs` (client)
-  and `rustfs/src/storage/rpc/node_service/disk.rs` (server).
+- Transport and codec observability landed in `feat(internode): optimize gRPC transport (#4337)`.

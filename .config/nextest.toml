@@ -355,7 +355,8 @@ test-group = 'ecstore-serial-flaky'
 # allowlist", so any new replication test lands in nightly by default (never
 # silently unrun) until it is explicitly blessed as fast here. Keep the two
 # regexes byte-identical. The committed profile selection digests make changes
-# visible in CI; current counts live in docs/testing/e2e-suite-inventory.md.
+# visible in CI; list current membership with `cargo nextest list -p e2e_test
+# --profile <profile>` (platform-dependent; see docs/testing/README.md).
 # HISTORY (2026-07-11): the 20 fast tests were briefly pulled out of this lane
 # (#4724) because they set a loopback (127.0.0.1) replication target that the
 # SSRF egress guard rejected on every PR after repl-1 (#4712). That is fixed —
@@ -508,7 +509,7 @@ path = "junit.xml"
 # quota, checksum, encryption,
 # security-boundary, ... — that the fast PR `e2e-smoke` subset deliberately
 # skips. Budget <= 45 min; authority for the suite count is `cargo nextest list
-# --profile e2e-full` (see docs/testing/e2e-suite-inventory.md).
+# --profile e2e-full -p e2e_test` (platform-dependent; see docs/testing/README.md).
 #
 # The filter is "the whole e2e_test crate MINUS the sets owned by other lanes":
 #   * protocols:: — FTPS/SFTP/WebDAV, run from the dedicated protocol profile

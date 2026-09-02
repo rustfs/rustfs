@@ -1,66 +1,66 @@
-# 日志故障诊断(`rustfs diagnose`)
+# Log diagnosis (`rustfs diagnose`)
 
-对客户/现场提供的日志文件做离线故障归因:解析 RustFS 的 JSON 日志
-(含 `kubectl logs` / docker compose / journald 采集前缀与 stderr panic 块),
-匹配内置故障规则库,输出按严重度排序的诊断报告。设计与规则清单见
-rustfs/backlog#1281(总纲)。
+**Use this when:** you have RustFS log files from a customer or a cluster (plain, rotated, archived, or `kubectl logs` output) and need an offline root-cause report, or you need to add or override a diagnosis rule without waiting for a release.
+**Source of truth:** `rustfs/src/config/cli.rs` (`DiagnoseOpts`, `DiagnoseFormat`); `rustfs/src/diagnose.rs` (exit codes, time parsing); `crates/log-analyzer/src/rules/model.rs` (`Severity`, `Matcher`, `Rule`); `crates/log-analyzer/src/rules/external.rs` (`EXTERNAL_FILE` mirrors the example below).
 
-不启动存储、不联网、跑完即退,任何装有 `rustfs` 二进制的机器都可用。
+`rustfs diagnose` parses RustFS JSON logs — including `kubectl logs`, docker compose, and journald collection prefixes, and stderr panic blocks — matches them against the built-in rule library, and prints findings sorted by severity. It starts no storage, opens no network connection, and exits once the report is written; any host with the `rustfs` binary can run it.
 
-## 用法
+## Usage
 
 ```bash
-# 分析一个目录(自动处理 .zst/.gz 轮转归档)
+# Analyze a directory (rotated .zst/.gz archives are handled automatically)
 rustfs diagnose /var/log/rustfs/
 
-# 客户打包的多节点日志(zip/tar.gz 自动递归展开,第一层目录名作为节点标签)
+# Multi-node bundle from a customer (zip/tar.gz are expanded recursively;
+# the first-level directory name becomes the node label)
 rustfs diagnose customer-logs.zip
 
-# 从 stdin 读(容器场景)
+# Read from stdin (container workflows)
 kubectl logs rustfs-0 | rustfs diagnose -
 
-# 只看最近 24 小时,输出 Markdown 直接贴工单
+# Last 24 hours only, Markdown output ready to paste into a ticket
 rustfs diagnose logs.tar.gz --since 24h --format md > report.md
 ```
 
-常用参数:`--format text|json|md`(默认 text;JSON 带稳定 `schema_version`)、
-`--since/--until`(RFC-3339 或相对时间 `30m`/`24h`/`7d`)、`--min-level`、
-`--top N`(未识别模式条数)、`--samples N`(每个 finding 的样本行数)。
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `<paths>...` | Files, directories, archives (`.zip`, `.tar`, `.tar.gz`, `.zst`, `.gz`), or `-` for stdin | required |
+| `--format text\|json\|md` | Output format; JSON carries a stable `schema_version` | `text` |
+| `--since`, `--until` | Time window bounds: RFC-3339, or relative (`30m`, `24h`, `7d`) counted back from now | unbounded |
+| `--min-level` | Minimum level to analyze (`trace\|debug\|info\|warn\|error`) | all levels |
+| `--top N` | Number of unrecognized error patterns to list | 20 |
+| `--samples N` | Sample lines per finding | 3 |
+| `--redact` | Hash customer identifiers in the report | off |
+| `--rules <file.json>` | Extra rules file; same-id rules override built-ins | none |
 
-## 报告解读
+Exit codes: `0` — diagnosis completed, with or without findings; `2` — a rejected argument value (`--since`, `--until`, `--min-level`, `--rules`) or no readable input; `1` — a clap usage error (missing path, unknown flag). Findings never fail the process: this is a diagnosis tool, not a CI gate.
 
-- **发现(按严重度)**:P0 数据风险 → P1 服务不可用 → P2 降级 → P3 客户端侧
-  → P4 提示。每条带诊断结论、建议动作、证据字段与样本行。
-- **因果折叠**:当症状类发现(如 quorum 刷屏)在时间上跟随其已知根因
-  (如盘 faulty)出现时,报告把症状折叠进根因块的"级联症状"行,根因块
-  提升到两者中更高的严重度位置——报告首块直接回答"最可能的原因"。
-  JSON 输出保留全部 findings(`collapsed_into` / `caused` 字段标注关系)。
-- **时间线异常(提示)**:三个确定性启发,均为提示不定罪——混合 UTC 偏移
-  (伴签名错误时点名时钟偏移)、节点时间范围完全不重叠、时间线断档
-  (断档后紧跟 startup 类发现时升级为"重启证据")。
-- **低频提示**:命中数低于规则阈值的匹配(如零星的签名错误),仅供参考。
-- **未识别的高频错误**:规则库未覆盖的 WARN/ERROR 消息模板聚类。这一节是
-  规则库迭代的输入——反复出现的新模板请提给维护者补规则
-  (`crates/log-analyzer/src/rules/seed/`)。
-- **跳过的输入与时区提示**:所有被跳过的文件(二进制/超限)逐条披露;
-  混合 UTC 偏移会显式提醒(时钟偏移本身就是 `SignatureDoesNotMatch`
-  的常见根因)。
+## Reading the report
 
-## `--redact`(报告需要转发时)
+| Section | Content |
+| --- | --- |
+| Findings, by severity | `P0 data risk` → `P1 unavailable` → `P2 degraded` → `P3 client side` → `P4 info`. Each finding carries a diagnosis, a suggested action, evidence fields, and sample lines |
+| Causal folding | When a symptom finding (for example a burst of quorum errors) follows its known root cause (for example a faulty disk) in time, the symptom is folded into the root-cause block as a cascaded symptom and that block is promoted to the higher severity of the two, so the first block answers "most likely cause". JSON output keeps every finding and marks the relation with `collapsed_into` / `caused` |
+| Timeline anomalies (hints) | Three deterministic heuristics, advisory only: mixed UTC offsets (naming clock skew when signature errors coincide), node time ranges that do not overlap, and log gaps (upgraded to restart evidence when a startup finding follows the gap) |
+| Low-confidence hits | Matches below a rule's `min_count` threshold (for example sporadic signature errors), for reference only |
+| Unrecognized high-frequency errors | Clustered WARN/ERROR message templates the rule library does not cover. Recurring new templates are the input for new rules under `crates/log-analyzer/src/rules/seed/` |
+| Skipped inputs and timezone hints | Every skipped file (binary, or over the size cap) is listed; mixed UTC offsets are called out explicitly because clock skew is a common root cause of `SignatureDoesNotMatch` |
 
-把 bucket/object/AK、IPv4/IPv6、peer 与磁盘路径、节点标签、来源文件路径等客户标识替换为稳定哈希(同值同哈希,保持可关联);规则 id、诊断文本、模块 target 与 panic 源码位置(RustFS 自身代码,非客户数据)保留。样本会连同其完整 `fields` 一起脱敏。
+## `--redact`
 
-覆盖是尽力而为,不是绝对保证:结构化字段与 `key=value`/IP 形态的文本都会被处理,但散落在自由文本里、既非字段形态也非 IP 的标识(例如句子里顺带提到的一个 bucket 名)可能仍有残留。转发前建议再抽查一遍。
+Replaces customer identifiers — bucket, object, and access-key names, IPv4/IPv6 addresses, peer and disk paths, node labels, source file paths — with stable hashes: equal values hash equally, so correlation survives. Rule ids, diagnosis text, module targets, and panic source locations (RustFS code, not customer data) are kept. Samples are redacted together with their full `fields`.
 
-## 自定义规则(`--rules <file.json>`)
+Coverage is best-effort, not a guarantee: structured fields and `key=value` / IP-shaped text are handled, but an identifier embedded in free text that is neither field-shaped nor an IP (for example a bucket name mentioned mid-sentence) can survive. Spot-check the report before forwarding it.
 
-支持团队可以在不等发版的情况下补规则,或热修一条误报的内置规则:
+## Custom rules (`--rules <file.json>`)
+
+Support teams can add rules, or hot-fix a false positive in a built-in rule, without waiting for a release:
 
 ```bash
 rustfs diagnose customer.zip --rules extra-rules.json
 ```
 
-文件格式(`Rule` 的 JSON 表示与内置规则完全一致):
+The file is the JSON form of `Rule`, identical to the built-in rules. Rule text fields (`title`, `diagnosis`, `suggestion`) are operator-facing Chinese by design; this example is the one mirrored by `EXTERNAL_FILE` in `crates/log-analyzer/src/rules/external.rs`:
 
 ```json
 {
@@ -79,20 +79,18 @@ rustfs diagnose customer.zip --rules extra-rules.json
 }
 ```
 
-- `severity`:`p0_data_risk | p1_unavailable | p2_degraded | p3_client_side | p4_info`;
-- `matcher`:`message_prefix` / `message_contains` / `message_regex` /
-  `field_equals {name, value}` / `target_prefix` / `is_panic` / `min_level` /
-  `all [..]` / `any [..]`,与内置规则同一套类型;
-- 可选字段:`evidence_fields`、`min_count`(默认 1)、`implies_root_cause`
-  (参与因果折叠)、`anchors`;
-- **同 id 覆盖内置规则**(用于热修误报);合并后的规则集整体校验,任何错误
-  (坏 regex、重复 id、空 matcher 组)会逐条打印并以退出码 2 失败——不会
-  带着半坏的规则集分析;
-- 外部规则的 `anchors` 不受 CI 锚点守卫约束,质量由文件作者自担。
+| Field | Values |
+| --- | --- |
+| `severity` | `p0_data_risk`, `p1_unavailable`, `p2_degraded`, `p3_client_side`, `p4_info` |
+| `matcher` | `message_prefix`, `message_contains`, `message_regex`, `field_equals {name, value}`, `target_prefix`, `is_panic`, `min_level`, `all [..]`, `any [..]` — the same types the built-in rules use |
+| Optional fields | `evidence_fields`, `min_count` (default 1), `implies_root_cause` (participates in causal folding), `anchors` |
 
-## 已知边界
+- A rule with the same `id` as a built-in rule replaces it (this is the hot-fix path for a false positive).
+- The merged rule set is validated as a whole; every error (bad regex, duplicate id, empty matcher group) is printed and the command exits with code 2 rather than analyzing with a half-broken set.
+- `anchors` in external rules are not checked by the CI anchor guard (`scripts/check_log_analyzer_rules.sh`); their quality is the author's responsibility.
 
-- panic 只出现在 stderr:若客户只采集了 stdout,panic 不会出现在日志里,
-  但 `rwlock ... poisoned` 类发现会提示"曾发生 panic"。
-- 审计日志(camelCase 外发流)不在本工具范围内。
-- 规则锚点由 CI 守卫(rustfs/backlog#1289)保证与源码日志文案同步。
+## Known boundaries
+
+- Panics appear only on stderr. If a customer collected stdout only, the panic itself is absent, but a `rwlock ... poisoned` finding hints that a panic occurred.
+- Audit logs (the camelCase outbound stream) are out of scope.
+- Built-in rule anchors are kept in sync with the source log messages by the CI guard `scripts/check_log_analyzer_rules.sh`.

@@ -1,87 +1,30 @@
 # RustFS Testing
 
-> **Owner: backlog#1153 (infra-11).** This file is the authoritative home for
-> the test-layer taxonomy, naming conventions, and serial/nextest rules. The
-> event × budget × required-status matrix is owned separately by
-> `docs/testing/ci-gates.md` (backlog#1149 ci-15); this file links to it rather
-> than duplicating counts, timeouts, or required-check names.
+**Use this when:** you need to pick a test layer for a change, name a test so a gate keeps selecting it, understand why `#[serial]` does nothing under nextest, or handle a flaky test.
+**Source of truth:** `.config/nextest.toml` (profiles, test-groups, quarantine), `.config/make/tests.mak` (`make test`), `.github/workflows/*.yml` (what runs when; matrix in [ci-gates.md](ci-gates.md)).
 
 ## Test taxonomy
 
-RustFS layers its tests from cheap-and-narrow to expensive-and-broad. Higher
-layers catch what lower layers cannot but cost more wall-clock and setup, so
-each layer has a clear entry point and a clear "when". Pick the lowest layer
-that can prove your change; add a higher-layer test only when the behaviour is
-not observable below it.
+Pick the lowest layer that can prove the change; add a higher-layer test only when the behaviour is not observable below it.
 
-| Layer | What it covers | Entry command | When it runs |
+| Layer | What it covers | Entry command | When it runs (details: [ci-gates.md](ci-gates.md)) |
 |---|---|---|---|
-| Unit & crate integration | Per-crate logic and in-process integration tests, run under nextest | `cargo nextest run --all --exclude e2e_test` (or `-p <crate>`) | Every PR (required) |
-| ecstore black-box | Erasure-coded read/write/recovery validation of the ecstore stack | `scripts/run_ecstore_validation_suite.sh --profile quick` | Local / release validation (not in CI workflows) |
-| e2e (`e2e_test` crate) | Full server spun up per test, driven over the S3 API | `cargo nextest run --profile e2e-smoke -p e2e_test` | PR smoke lane + scheduled full/nightly lanes |
-| s3s-e2e conformance | External S3 conformance tool run against a live rustfs server | `./scripts/e2e-run.sh ./target/debug/rustfs /tmp/rustfs-e2e-data` | Per-PR e2e gate (`e2e-tests` job) |
-| S3 compatibility | Third-party suites: `ceph/s3-tests` (boto3) and MinIO `mint` (many SDKs) | `scripts/s3-tests/run.sh` (mint: `.github/workflows/mint.yml`) | s3-tests: per-PR gate; mint: scheduled, report-only |
-| Chaos / fault-injection | Multi-node, power-loss, and disk-fault harness | — (harness planned) | Planned — tracked in backlog#1100 |
-| Fuzz | `cargo-fuzz` targets over untrusted parsing/validation surfaces | `./scripts/fuzz/run.sh` (or `cd fuzz && cargo +nightly fuzz run <target>`) | PR smoke + nightly corpus (`.github/workflows/fuzz.yml`) |
-| Benchmarks | Criterion micro/throughput benchmarks | `cargo bench -p <crate>` | On-demand / local |
+| Unit & crate integration | Per-crate logic and in-process integration tests | `cargo nextest run --all --exclude e2e_test` (or `-p <crate>`); `make test` wraps it | Every PR, required (`Test and Lint`, `ci` profile) |
+| ecstore black-box | Erasure-coded read/write/recovery validation; profiles `quick` / `full` / `destructive` / `fuzz` | `scripts/run_ecstore_validation_suite.sh --profile quick` | Local and release validation only; not wired into any workflow. Contract: [ecstore-validation-suite-design.md](ecstore-validation-suite-design.md) |
+| e2e (`e2e_test` crate) | A real `rustfs` binary per test, driven over the S3, admin, and protocol APIs | `cargo nextest run --profile e2e-smoke -p e2e_test` | PR: `e2e-smoke` (report-only); merge queue / main push: `e2e-full`; nightly: `e2e-repl-nightly`, `e2e-nightly`, `e2e-protocols`. Guide: [`crates/e2e_test/README.md`](../../crates/e2e_test/README.md) |
+| s3s-e2e conformance | External S3 conformance tool against a live server | `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>` | PR, report-only (second half of the `End-to-End Tests` job) |
+| S3 compatibility | `ceph/s3-tests` (boto3; allow-list `scripts/s3-tests/implemented_tests.txt`) and MinIO `mint` | `scripts/s3-tests/run.sh`; mint via `.github/workflows/mint.yml` | s3-tests: PR report-only plus a weekly full sweep; mint: weekly, report-only |
+| Chaos / fault-injection | Single-node disk fault injection (`crates/e2e_test/src/chaos.rs`, `crates/e2e_test/src/fault_proxy.rs`) used by the reliability and heal e2e modules | Part of the e2e crate (`e2e-reliability` test-group) | With the `e2e-full` and nightly e2e lanes. A multi-node power-loss harness is not in tree |
+| Fuzz | `cargo-fuzz` targets over untrusted parsing surfaces; isolated sub-workspace under `fuzz/` | `./scripts/fuzz/run.sh` (see [`fuzz/README.md`](../../fuzz/README.md)) | PR smoke on the paths listed in `.github/workflows/fuzz.yml`, plus nightly corpus |
+| Benchmarks | Criterion benches under each crate's `benches/` | `cargo bench -p <crate>` | On demand; never a gate |
 
-> The **When it runs** column is a qualitative pointer only. The authoritative
-> event × timeout × required-status matrix lives in `docs/testing/ci-gates.md`
-> (ci-15) — do not duplicate its numbers here.
-
-Layer notes:
-
-- **Unit & crate integration** — the primary gate. `make test` wraps
-  `cargo nextest run --all --exclude e2e_test`; CI runs the same set under the
-  strict `ci` profile (`.config/nextest.toml`). Requires `cargo-nextest` (see
-  [Serial execution & nextest profiles](#serial-execution--nextest-profiles)).
-- **ecstore black-box** — `scripts/run_ecstore_validation_suite.sh` has four
-  profiles (`quick` / `full` / `destructive` / `fuzz`); `quick` is the
-  PR-smoke-sized core read/write/recovery pass. It is a local and
-  release-validation tool, not wired into a CI workflow.
-- **e2e** — each test spawns its own single-node rustfs server on a random port
-  with an isolated temp dir, so the suite is parallel-safe. The `e2e-smoke`
-  profile is the single PR wiring mechanism; slow/cross-process suites run in
-  scheduled lanes (`e2e-repl-nightly`, and the reliability group). Full
-  contributor guide: [`crates/e2e_test/README.md`](../../crates/e2e_test/README.md);
-  per-module counts: [`e2e-suite-inventory.md`](e2e-suite-inventory.md).
-- **s3s-e2e** — an external black-box conformance tool installed in CI; locally
-  run it against a freshly built binary with `scripts/e2e-run.sh <binary>
-  <data-dir>`.
-- **S3 compatibility** — `ceph/s3-tests` exercises S3 semantics through boto3
-  and is gated on a committed allow-list
-  (`scripts/s3-tests/implemented_tests.txt`); MinIO `mint` runs many real
-  client SDKs and is report-only until suites pass reliably (see the header of
-  `.github/workflows/mint.yml`).
-- **Chaos / fault-injection** — multi-node, power-loss, and disk-fault
-  scenarios are out of scope for this repo's in-tree suites; the harness is
-  tracked in backlog#1100. (Single-node disk-fault e2e tests already live in the
-  e2e crate's `e2e-reliability` group.)
-- **Fuzz** — the `cargo-fuzz` harness is an isolated sub-workspace under
-  `fuzz/` (kept out of the root workspace on purpose); see
-  [`fuzz/README.md`](../../fuzz/README.md) for targets and corpus rules.
-- **Benchmarks** — Criterion benches live under each crate's `benches/`. They
-  are not a gate; run them locally to compare before/after on a specific crate.
-
-Script inventory: every entry under `scripts/` — including the runners above —
-is indexed in [`scripts/README.md`](../../scripts/README.md) with its status
-(ci-gate / dev-tool / archived) and wiring.
-
-### Security advisory regression tests
-
-Fixed GHSA advisories map to named, discoverable regression tests. The
-advisory -> test map lives in
-[`docs/testing/security-regressions.md`](security-regressions.md). sec-14
-(backlog#1151) formalizes the written admission policy in `AGENTS.md`.
+Every script named above is indexed with status and wiring in [`scripts/README.md`](../../scripts/README.md). Fixed GHSA advisories map to named regression tests in [security-regressions.md](security-regressions.md).
 
 ## Naming conventions
 
 ### Reserved test-name substrings (migration gate)
 
-The migration-critical CI gate selects tests **by name substring** rather than
-by module path, so a rename that drops the substring silently thins the gate.
-These substrings are therefore reserved: keep them in the test name when a test
-proves migration-critical behaviour.
+`scripts/check_migration_gate_count.sh` (runs in `Test and Lint`) selects migration-critical tests by name substring and fails when the count drops below `.config/migration-gate-floor.txt`. A rename that drops a substring silently thins the gate, so these substrings are reserved:
 
 | Substring | Guards |
 |---|---|
@@ -91,138 +34,55 @@ proves migration-critical behaviour.
 | `source_cleanup` | Post-migration source cleanup |
 | `delete_marker` | Delete-marker handling across migration |
 
-The gate is enforced by
-[`scripts/check_migration_gate_count.sh`](../../scripts/check_migration_gate_count.sh),
-which counts the selected tests and fails if the count drops below the committed
-floor in
-[`.config/migration-gate-floor.txt`](../../.config/migration-gate-floor.txt).
-A deliberate reduction must lower the floor in the same PR, so the change is
-reviewable in the diff (backlog#1153 infra-12). The substring list above is the
-same one the gate uses; keep the two in sync when adding a reserved word.
+A deliberate reduction lowers the floor in the same PR. The list above mirrors the script; change both together.
 
 ### General naming
 
-- Name a regression test after what it pins: the issue or advisory number
-  (`..._regression_test`, `..._issue_NNNN_...`) or the invariant it protects, so
-  a reviewer can find the guard for a past bug by grepping.
-- e2e lane membership is driven by test-name patterns in `.config/nextest.toml`
-  (for example the `_real_dual_node` / `_real_single_node` markers route
-  replication tests into the nightly lane). Follow the existing marker when
-  adding a test to an established suite; see
-  [`crates/e2e_test/README.md`](../../crates/e2e_test/README.md).
-- Follow the Rust API Guidelines for symbol naming (see `AGENTS.md`).
+- Name a regression test after what it pins (issue or advisory number, or the invariant) so `rg` finds the guard for a past bug.
+- e2e lane membership is selected by test-name patterns in `.config/nextest.toml` (for example `_real_dual_node` / `_real_single_node` route replication tests to the nightly lane). Follow the existing marker of the suite you extend.
+- Symbol naming follows the Rust API Guidelines (see `AGENTS.md`).
 
-## Serial execution & nextest profiles
+## nextest and `#[serial]`
 
-**`cargo-nextest` is the runner.** `make test` requires it and CI installs it;
-plain `cargo test` is not a faithful substitute because the two runners execute
-tests differently.
+`cargo-nextest` is the runner: `make test` requires it and CI installs it. nextest runs every test in its own process, so `serial_test`'s in-process `#[serial]` mutex does **not** serialize tests against each other; it only affects the plain `cargo test` fallback. Cross-test serialization under nextest comes from a `[test-groups]` entry with `max-threads = 1` in `.config/nextest.toml` (for example `ecstore-serial-flaky`, `e2e-reliability`) or from a `-j 1` lane. Prefer making tests self-isolating (per-test instance context, random port, own temp dir) over adding serialization. `RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1 make test` runs plain `cargo test`; its results are not authoritative because `[test-groups]` do not apply.
 
-- **Install:** `cargo install cargo-nextest --locked`, or a prebuilt binary
-  (faster) from <https://nexte.st/docs/installation/>.
-- **Escape hatch:** `RUSTFS_ALLOW_CARGO_TEST_FALLBACK=1 make test` runs the
-  plain `cargo test` fallback, but the results are **not authoritative** —
-  serialization semantics differ from CI and `[test-groups]` do not apply.
+Time-driven tests use paused tokio time (`start_paused` plus `tokio::time::advance`) or explicit synchronization instead of fixed `sleep` windows.
 
-**Why `#[serial]` is mostly a no-op under nextest.** nextest runs every test in
-its own process, so `serial_test`'s in-process `#[serial]` mutex does **not**
-serialize tests against each other. The mechanism that actually serializes
-across nextest's process boundary is a nextest `[test-groups]` entry with
-`max-threads = 1` (for example `ecstore-serial-flaky` and `e2e-reliability` in
-`.config/nextest.toml`). Consequences:
+### Profiles
 
-- Do not add `#[serial]` expecting cross-test isolation under nextest. If two
-  tests genuinely share process/global state or a fixed external resource,
-  serialize them with a `[test-groups]` entry, or make each test self-isolating
-  (per-test instance context — see backlog#1153 infra-7 / infra-8).
-- A large share of the repo's existing `#[serial]` markers only affect the
-  `cargo test` fallback. The serial-debt census and removal plan are tracked in
-  backlog#1153 infra-7.
+All profiles are defined in `.config/nextest.toml`; its block comments hold the filters and rationale.
 
-**Profiles** (all defined in `.config/nextest.toml`):
+| Profile | Role |
+|---|---|
+| `default` | Local runs; never retries |
+| `ci` | PR gate for everything except `e2e_test`; global `retries = 0` plus the quarantine list |
+| `e2e-smoke` | PR subset of `e2e_test` |
+| `e2e-full` | Merge-queue / main-push single-node e2e lane |
+| `e2e-repl-nightly` | Nightly slow / cross-process replication lane |
+| `e2e-nightly` | Nightly serial multi-process cluster fault lane |
+| `e2e-protocols` | Nightly fixed-port FTPS/SFTP/WebDAV lane, run with `-j 1` |
 
-- `default` — local runs. **Never retries**: a red test locally is a real
-  failure to investigate, not noise to retry away.
-- `ci` — the strict CI gate: global `retries = 0` plus a narrowly-scoped
-  quarantine list (`retries = 2`) for tests with a tracked OPEN flake issue.
-- `e2e-smoke` — the PR smoke subset of the `e2e_test` crate (the single wiring
-  mechanism for e2e in PR CI).
-- `e2e-repl-nightly` — the scheduled slow/cross-process replication lane.
+Membership of each e2e profile is pinned by a digest in `.config/e2e-<profile>-selection.txt` and checked by `scripts/check_test_wiring.py --check-profile <profile>` before the lane runs. To list what a profile selects on your platform (the result is platform-dependent because some modules are linux-only):
 
-### Time control (paused vs real clock)
-
-Time-driven tests should prefer paused time (`tokio::time` with `start_paused`
-and `advance`) or explicit event synchronization over fixed `sleep` race
-windows. The written convention and the `docs/testing/time-control.md` guide are
-added by backlog#1153 infra-4.
-
-## Coverage
-
-Workspace line coverage is measured weekly. Pull requests that touch iam, kms,
-policy, or crypto also run a non-required, report-only comparison against
-`.config/coverage-baselines.toml`. During calibration, a regression is recorded
-in the job summary without failing the job; missing or malformed coverage
-evidence still fails closed (backlog#1153 infra-6).
-
-- **CI**: `.github/workflows/coverage.yml` runs every Sunday and on manual
-  dispatch: `cargo llvm-cov nextest --workspace --exclude e2e_test` under the
-  `ci` nextest profile — the same scope and profile as the PR test gate. The
-  per-crate line-coverage table lands in the run's job summary; the lcov +
-  JSON exports are uploaded as a `coverage-lcov-<run>` artifact kept for
-  90 days. Scheduled failures open/append the `[scheduled-failure] coverage`
-  issue via the shared alert action (ci-8).
-- **Local**: `make coverage` is the equivalent (slow — instrumented rebuild
-  plus the full suite). It prints the same per-crate table via
-  `scripts/coverage_per_crate.py` and writes `target/llvm-cov/lcov.info` and
-  `coverage.json`.
-- **Security-critical ratchet**: relevant pull requests compare iam / kms /
-  policy / crypto line coverage with the versioned baseline. Drops greater than
-  the configured one-percentage-point calibration threshold are marked
-  `REGRESSION (report-only)`. The weekly summary runs the same comparison so
-  calibration continues even when no relevant pull request is open. Baseline
-  changes require a linked coverage run and a reviewed explanation.
-- **Trend comparison**: each run's job summary is the weekly per-crate
-  snapshot — open two runs from the Actions history (workflow "coverage") and
-  compare their tables. For line-level diffs, download the two runs'
-  `coverage-lcov-*` artifacts and compare the `lcov.info` files with your lcov
-  tooling of choice.
-- **Not measured**: doctests (ci.yml runs them uninstrumented; covering them
-  would require a nightly toolchain) and the `e2e_test` crate (excluded from
-  the unit gate; its lanes are described in the taxonomy above).
+```bash
+cargo nextest list -p e2e_test --profile e2e-smoke --message-format json \
+  | jq -r '.["rust-suites"][].testcases | to_entries[] | select(.value["filter-match"].status == "matches") | .key | split("::")[0]' \
+  | sort | uniq -c
+```
 
 ## Flake policy
 
-A flaky test is one that fails non-deterministically without a corresponding
-code change. Flakes erode trust in the gate and block tightening required
-checks, so they are handled on a strict, time-boxed loop.
+A flaky test fails non-deterministically without a corresponding code change. Retry semantics live in `.config/nextest.toml`: `default` never retries, `ci` has global `retries = 0`, and only quarantined tests get `retries = 2` under `ci`. A quarantined test that passes on retry is marked `flaky` in `target/nextest/ci/junit.xml` (uploaded as a CI artifact); that marker, not a green check, is how a live flake stays visible.
 
-**Retry semantics (source of truth: `.config/nextest.toml`):**
+1. **Discover** — a non-deterministic failure (CI or local) or a `flaky` JUnit marker.
+2. **Open an issue within 24h** describing symptom, suspected cause, and affected suite. No silent re-runs.
+3. **Quarantine** — add a `[[profile.ci.overrides]]` entry with `retries = 2` and a comment linking exactly one OPEN issue. The current quarantine list is the `[[profile.ci.overrides]]` block in `.config/nextest.toml`.
+4. **Fix or delete within 30 days** — make the test robust and remove the entry, or delete the test. An entry without a live OPEN issue link is a policy violation.
 
-- The **local `default` profile never retries.** A red test on your machine is
-  a real failure to investigate, not noise to paper over.
-- The **CI `ci` profile runs with global `retries = 0`.** A new race must fail
-  on its first occurrence so the first crime scene is never masked.
-- Only tests on the **quarantine list** get `retries = 2`, and only under the
-  `ci` profile. Each quarantine entry MUST link exactly one OPEN issue.
-- **JUnit flaky markers are the observable.** A quarantined test that passes
-  only after a retry is marked `flaky` in `target/nextest/ci/junit.xml`
-  (uploaded as a CI artifact). That marker — not a green check — is how we see
-  a flake is still live.
+## Coverage
 
-**Lifecycle of a flake:**
-
-1. **Discover** — a test fails non-deterministically (CI or local), or shows a
-   `flaky` marker in the JUnit report.
-2. **Open an issue within 24h** — file/track an issue describing the flake
-   (symptom, suspected cause, affected suite). No silent re-runs.
-3. **Quarantine** — add the test to the quarantine override block in
-   `.config/nextest.toml` with a comment linking that OPEN issue. This grants
-   `retries = 2` under CI so the flake stops reddening unrelated PRs, while the
-   `flaky` marker keeps it visible.
-4. **Fix or delete within 30 days** — make the test robust (then remove the
-   quarantine entry) or delete the test. A quarantine entry may not outlive its
-   fix window; an entry without a live OPEN issue link is a policy violation.
-
-First quarantine members: the two backlog#937 ecstore groups
-(`concurrent_resend_same_part_commits_one_generation` and
-`store::bucket::tests::bucket_delete_*`).
+- `.github/workflows/coverage.yml` measures workspace line coverage on its schedule and on manual dispatch: `cargo llvm-cov nextest --workspace --exclude e2e_test` under the `ci` profile, the same scope as the PR gate. The per-crate table lands in the job summary; lcov and JSON exports are uploaded as an artifact (retention set in the workflow).
+- PRs touching the paths listed in `coverage.yml` also run a report-only comparison against `.config/coverage-baselines.toml` via `scripts/check_security_coverage.py`: a regression is recorded in the summary without failing the job; missing or malformed coverage evidence fails closed.
+- `make coverage` (`.config/make/coverage.mak`) is the local equivalent; it writes `target/llvm-cov/lcov.info` and `coverage.json` and prints the same table via `scripts/coverage_per_crate.py`.
+- Not measured: doctests (`ci.yml` runs them uninstrumented) and the `e2e_test` crate.
+- A baseline change needs a linked coverage run and a reviewed explanation in the PR.

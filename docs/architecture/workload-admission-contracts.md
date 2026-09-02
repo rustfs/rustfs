@@ -1,130 +1,40 @@
 # Workload Admission Contracts
 
-This document records the `rustfs/backlog#660` PR-05 and PR-07 scheduler
-preservation and runtime workload-class contract slice.
+**Use this when:** adding a workload class or snapshot provider, consuming admission state from a background job, or deciding whether a job can "join" admission (it cannot; see Observation Surface Only).
+**Source of truth:** `WorkloadClass`, `AdmissionState`, `WorkloadAdmissionSnapshot`, `WorkloadAdmissionRegistrySnapshot`, `WorkloadAdmissionSnapshotProvider`, and `foreground_pressure` in `crates/concurrency/src/workload.rs`; the provider and consumer files named below.
 
-## Preservation Coverage
+## Contract Shapes
 
-The `rustfs-concurrency` tests pin the current reusable admission-facing
-behavior before later snapshot extraction:
+`rustfs-concurrency` owns the read-only shapes. `WorkloadClass` enumerates the admission categories (the variants are the source of truth); `AdmissionState`, `WorkloadAdmissionSnapshot`, and `WorkloadAdmissionRegistrySnapshot` are status shapes for runtime owners to fill. They do not replace the scheduler, request guards, scanner, heal, replication, or ECStore placement behavior. `GetObjectQueueSnapshot` permit semantics (saturated, over-available, zero-total) and worker-slot over-release clamping are pinned by `rustfs-concurrency` tests; scheduler buffer/priority behavior is pinned by `rustfs-io-core` and `rustfs/src/storage/concurrency/` tests.
 
-- Worker slot over-release remains clamped by the configured worker limit.
-- `GetObjectQueueSnapshot` preserves saturated, over-available, and zero-total
-  permit semantics.
+## Class To Provider Table
 
-The former reusable scheduler and backpressure-pipe facades (and their
-preservation tests) were removed as zero-caller dead code in backlog#1025;
-scheduler buffer/priority behavior is now pinned by `rustfs-io-core` and
-`rustfs/src/storage/concurrency` tests.
+| Class | Provider (`impl WorkloadAdmissionSnapshotProvider`) | `active` / `queued` / `limit` source | Reports `Unknown` when |
+|---|---|---|---|
+| `ForegroundRead` | `ConcurrencyManager` in `rustfs/src/storage/concurrency/manager.rs` (source of truth); re-exposed unchanged by the RustFS runtime provider | disk-read permits in use / `None` (the semaphore exposes no waiter count) / configured max concurrent disk reads | the storage registry has no entry |
+| `ForegroundWrite` | none | none | always: no write-specific admission owner exposes a read-only surface yet |
+| `Metadata` | `RustFsWorkloadAdmissionSnapshotProvider` in `rustfs/src/workload_admission.rs` | `Open` once the bucket metadata runtime handle exists; no counts | bucket metadata runtime not initialized |
+| `Scanner` | same | scanner active work-unit counter / none / none | the counter is zero (idle and uninitialized are indistinguishable) |
+| `Repair` | same | heal active tasks / heal queue length / `None` (limits live behind the async heal manager state) | heal manager not initialized |
+| `Replication` | same | active regular + large-object + MRF workers / site replication queue count / `None` (limits owned by the async pool and resize policy) | replication runtime not initialized, or queue stats currently locked |
 
-## Workload Class Contract
+## Observation Surface Only
 
-`WorkloadClass` defines the required future admission categories:
+This is an observation surface only. Permit acquisition, priority assignment, buffer sizing, storage media detection, request guards, queue capacity, heal admission and priority merge/drop policy, replication worker resize and MRF handling, scanner cycle scheduling, bucket metadata loading and locks, and object write paths are unchanged by any provider. There is no runtime admission API for a background job to join; a job that needs bounded contention must bound it itself (see [kms-bulk-rekey-contract.md](kms-bulk-rekey-contract.md)).
 
-- Foreground read.
-- Foreground write.
-- Metadata.
-- Scanner.
-- Repair.
-- Replication.
+Consumers that read the snapshot to self-throttle exist, and they do not change the owners' decisions:
 
-`AdmissionState`, `WorkloadAdmissionSnapshot`, and
-`WorkloadAdmissionRegistrySnapshot` define read-only status shapes for later
-runtime owners. They do not replace the current scheduler, request guard,
-scanner, heal, replication, or ECStore placement behavior.
+| Consumer | File | Behavior |
+|---|---|---|
+| Data-movement backpressure (decommission, rebalance) | `crates/ecstore/src/data_movement/backpressure.rs` (`wait_for_data_movement_admission`, `foreground_pressure`) | Delays the next data-movement step while `ForegroundRead` or `ForegroundWrite` usage exceeds the configured high-water percent. ECStore receives the provider through `set_workload_admission_snapshot_provider` (`crates/ecstore/src/lib.rs`), published from `rustfs/src/startup_background.rs`; with no provider the step is admitted immediately. |
+| Heal manager mainline throttle | `crates/heal/src/heal/manager.rs` (`new_with_workload_provider`) | When `mainline_throttle_enable` is set, defers heal work while `ForegroundRead` or `ForegroundWrite` utilization exceeds the configured high-water percents; with no provider or the throttle disabled, heal pacing is unchanged. |
 
 ## Boundary Rules
 
-- `rustfs-concurrency` owns this reusable contract surface.
-- The contract does not depend on `rustfs-ecstore` or RustFS binary runtime
-  state.
-- No scheduler decision logic, queue capacity, Tokio runtime default, scanner
-  admission, heal admission, replication admission, placement, membership, or
-  NUMA behavior changes are part of this slice.
+- `rustfs-concurrency` owns the contract surface and does not depend on `rustfs-ecstore` or RustFS binary runtime state.
+- Adding a class or provider changes no scheduler decision logic, queue capacity, Tokio runtime default, scanner/heal/replication admission, placement, membership, or NUMA behavior.
+- Providers report `Unknown` rather than blocking or guessing when their owner is uninitialized or its stats are not immediately observable.
 
-## Set-Local Snapshot Extraction
+## Provider Composition
 
-The RustFS storage `ConcurrencyManager` now implements
-`WorkloadAdmissionSnapshotProvider` for local foreground-read admission:
-
-- `ForegroundRead` reports local disk-read permit usage through
-  `GetObjectQueueSnapshot`.
-- `active` is the number of disk-read permits currently in use.
-- `limit` is the configured maximum concurrent disk reads.
-- `queued` remains `None` because the current semaphore does not expose waiter
-  counts.
-- Scanner, repair, replication, foreground write, and metadata entries remain
-  `Unknown` until their owning runtime components expose read-only status.
-
-This is an observation surface only. Permit acquisition, priority assignment,
-buffer sizing, storage media detection, request guards, and queue behavior are
-unchanged.
-
-## Heal Repair Snapshot Extraction
-
-The RustFS integration layer now exposes a read-only repair admission snapshot
-from the heal runtime counters:
-
-- `Repair` reports the current heal active task count.
-- `queued` reports the current heal queue length.
-- `limit` remains `None` because the configured heal queue and concurrency
-  limits live behind the async heal manager state.
-- Other workload classes remain `Unknown` in this provider until their owning
-  runtime components expose read-only status.
-
-This is an observation surface only. Heal request admission, queue capacity,
-priority merge/drop policy, task scheduling, retry handling, and repair
-behavior are unchanged.
-
-## Replication Snapshot Extraction
-
-The RustFS integration layer now exposes a read-only replication admission
-snapshot from the existing replication pool and queue statistics:
-
-- `Replication` reports active regular, large-object, and MRF worker counts.
-- `queued` reports the current site replication queue count when queue stats
-  are immediately observable.
-- `limit` remains `None` because replication worker limits remain owned by the
-  async replication pool and resize policy.
-- If the replication runtime has not initialized, or queue stats are currently
-  locked, the snapshot reports `Unknown` instead of blocking or guessing.
-
-This is an observation surface only. Replication admission, queue channel
-capacity, worker resize behavior, MRF handling, target dispatch, and resync
-behavior are unchanged.
-
-## RustFS Runtime Owner Snapshot Extraction
-
-The RustFS integration layer now extends the workload admission registry with
-additional read-only owner mappings:
-
-- `ForegroundRead` reuses the storage `ConcurrencyManager` disk-read permit
-  snapshot so the RustFS-level provider exposes the same active and limit
-  counts as the storage-local provider.
-- `Scanner` reports the existing scanner active work-unit counter. When the
-  counter is zero, the snapshot remains `Unknown` because the current counter
-  cannot distinguish an idle scanner from a scanner that has not initialized.
-- `Metadata` reports `Open` once the bucket metadata runtime handle is
-  available, and `Unknown` before initialization.
-- `ForegroundWrite` remains `Unknown` until a write-specific admission owner
-  exposes a read-only surface.
-
-This is an observation surface only. Disk-read permit acquisition, scanner
-cycle scheduling, bucket metadata loading, metadata locks, object write paths,
-and queue behavior are unchanged.
-
-## Provider Composition Boundary
-
-`WorkloadAdmissionRegistrySnapshot::overlay` composes provider-owned registry
-snapshots without mutating runtime owners:
-
-- The storage concurrency provider remains the source of truth for
-  `ForegroundRead`.
-- The RustFS runtime owner provider overlays metadata, scanner, repair,
-  replication, and foreground-write status on top of the storage registry.
-- Matching workload classes are replaced by the later provider snapshot; new
-  classes are appended without reordering existing unrelated entries.
-
-This keeps the later controller/status layer consuming a single read-only
-registry while preserving the existing storage, scanner, heal, replication, and
-metadata ownership boundaries.
+`WorkloadAdmissionRegistrySnapshot::overlay` composes provider-owned registries without mutating runtime owners: the storage concurrency provider is the source of truth for `ForegroundRead`; the RustFS runtime owner provider overlays metadata, scanner, repair, replication, and foreground-write status on top; matching classes are replaced by the later snapshot and new classes are appended without reordering. `workload_admission_registry_snapshot` in `rustfs/src/workload_admission.rs` is the single composed registry consumers read.

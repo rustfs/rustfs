@@ -1,416 +1,148 @@
-# MinIO File-Format Interoperability — Gap Analysis & Phased Plan
+# MinIO On-Disk Format Interoperability
 
-Assesses how closely the RustFS on-disk format matches MinIO's, so that a
-MinIO drive set can be read (and eventually served) by RustFS and vice versa.
-This is a **plan and analysis document**. It changes no storage code. Every
-claim below cites the code that backs it.
+**Use this when:** deciding whether a MinIO drive set, bucket-metadata blob, or SSE object can be read or imported by a given RustFS build, or before touching any constant or codec listed under Version Anchors.
+**Source of truth:** `crates/filemeta/src/filemeta.rs`, `crates/filemeta/src/filemeta/codec.rs`, `crates/ecstore/src/bucket/metadata.rs`, `crates/ecstore/src/bucket/migration.rs`, `rustfs/src/storage/sse.rs`, `rustfs/Cargo.toml` `[features]`, `.github/workflows/ci.yml`, `.github/workflows/minio-interop.yml`.
 
-Scope: the two on-disk artifacts that matter for interop are the per-object
-`xl.meta` (object metadata + inline data) and the per-bucket `.metadata.bin`
-(bucket configuration blob). IAM/config layout is noted where it affects
-bucket-metadata migration.
+This is an interop contract, not a plan. Migration is one-way (MinIO to RustFS). Erasure-coding internals are owned by [erasure-coding.md](erasure-coding.md); this document owns the interop claim, the fixture evidence, and the out-of-scope list.
 
-Refs rustfs/backlog#580.
+## Scope Matrix By Build Variant
 
-## Executive Summary
+Build variants are the `rustfs` crate features in `rustfs/Cargo.toml`: `default`, `full`, and `rio-v2` (which enables `rustfs-ecstore/rio-v2` and pulls in `crates/rio-v2`). `rio-v2` is absent from both `default` and `full`.
 
-- **`xl.meta`**: RustFS writes `XL_META_VERSION = 3` and reads meta_ver ≤ 3,
-  including legacy meta_ver 2 objects with legacy checksums. Magic `XL2 `,
-  erasure algorithm `rs-vandermonde` (Reed-Solomon), and HighwayHash256 bitrot
-  all match MinIO. `xl.meta` interop is the **strong** part of the story.
-- **`.metadata.bin`**: RustFS uses the same filename, the same 4-byte
-  `format|version` header, the same MessagePack blob layout, and the same
-  per-config field encodings (XML/JSON) as MinIO's `bucketMetadata`. The
-  divergence is a small set of RustFS-only fields (table-bucket support,
-  bucket-targets meta) — not a format mismatch.
-- **Migration**: RustFS already ships a one-way importer that reads a legacy
-  meta bucket and rewrites bucket-metadata + IAM config into the RustFS meta
-  bucket (`crates/ecstore/src/bucket/migration.rs`).
-- **Server-side encryption**: not covered by the above. Objects MinIO wrote with SSE-S3, SSE-KMS, or SSE-C are **not readable by RustFS** in any shipped build. See [Part C](#part-c--server-side-encryption-sse) before planning a migration that includes encrypted objects.
+| MinIO artifact | `default` / `full` build | `rio-v2` build | Notes |
+|---|:--:|:--:|---|
+| Unencrypted `xl.meta` (meta_ver 1-3, inline, multipart, versioned, delete marker) | Read | Read | Part A. Normalized to meta_ver 3 on rewrite. |
+| Transitioned (tiered) `xl.meta` | Not fixture-proven | Not fixture-proven | Out of scope; see erasure-coding.md for the tolerant `transitioned-versionID` read rule. |
+| `.metadata.bin` bucket config | Read and imported | Read and imported | Part B. Importer reads a `.minio.sys` layout end to end. |
+| IAM config under `config/iam/` | Imported | Imported | `try_migrate_iam_config`; legacy field aliases normalized. |
+| SSE-S3 / SSE-KMS objects, MinIO builtin static KMS | Fail closed, diagnosed | Read | Part C. Requires the shared master key. |
+| SSE-C objects | Fail closed, diagnosed | Read | Part C. Customer key supplied per request. |
+| Any SSE object, MinIO backed by KES / KMS plugin / MinKMS | Fail closed | Fail closed | Not planned; the DEK is sealed by the KES service. |
+| RustFS-written drive set read by a live MinIO binary | Unsupported | Unsupported | Set-level divergence: MinIO looks for `.minio.sys`, RustFS writes `.rustfs.sys`. |
+| RustFS-written SSE objects read by MinIO | Unsupported | Unsupported | Part C, reverse direction. |
 
-For unencrypted objects the remaining work is verification breadth and closing
-per-config parsing gaps, not a format rewrite. Encrypted objects are a separate,
-unsolved axis (rustfs/backlog#1638).
+## Version Anchors
 
----
+These constants are compatibility anchors. Bumping any of them requires a read-compat path for the prior value and a migration story, exactly as the meta_ver 2 to 3 read path provides. Values live in code; do not copy them elsewhere.
+
+| Anchor | Symbol | File | Rule |
+|---|---|---|---|
+| `xl.meta` magic | `XL_FILE_HEADER` | `crates/filemeta/src/filemeta.rs` | Must equal MinIO's XL2 magic. |
+| Container major / minor | `XL_FILE_VERSION_MAJOR`, `XL_FILE_VERSION_MINOR` | `crates/filemeta/src/filemeta.rs` | `check_xl2_v1` (`crates/filemeta/src/filemeta/codec.rs`) rejects `major > XL_FILE_VERSION_MAJOR`. |
+| Header version | `XL_HEADER_VERSION` | `crates/filemeta/src/filemeta.rs` | `decode_xl_headers` rejects `header_ver > XL_HEADER_VERSION`. |
+| Metadata version | `XL_META_VERSION` | `crates/filemeta/src/filemeta.rs` | Written by `FileMeta::new`; `decode_xl_headers` rejects `meta_ver > XL_META_VERSION` (accept-older, reject-newer). |
+| Bucket metadata header | `BUCKET_METADATA_FORMAT`, `BUCKET_METADATA_VERSION` | `crates/ecstore/src/bucket/metadata.rs` | Checked by `check_header`; both match MinIO's `bucketMetadataFormat` / `bucketMetadataVersion`. |
+| Erasure algorithm string | `ERASURE_ALGORITHM` | `crates/ecstore/src/object_api/mod.rs` | `rs-vandermonde`; enum `ErasureAlgo` in `crates/filemeta/src/fileinfo.rs`. |
+| Meta bucket names | `RUSTFS_META_BUCKET`, `MIGRATING_META_BUCKET`, `BUCKET_META_PREFIX` | `crates/ecstore/src/disk/mod.rs` | `.rustfs.sys` is the live meta bucket; `.minio.sys` is the importer source. |
 
 ## Part A — `xl.meta` Object Format
 
-### Version support
-
-| Aspect | Value | Evidence |
+| Aspect | Contract | Where |
 |---|---|---|
-| Write version (`meta_ver`) | 3 | `crates/filemeta/src/filemeta.rs:54` (`XL_META_VERSION = 3`), written in `FileMeta::new` at `crates/filemeta/src/filemeta.rs:121` |
-| Read versions accepted | ≤ 3 (1, 2, 3) | Decode rejects only `meta_ver > XL_META_VERSION` — see `crates/filemeta/src/filemeta/codec.rs` (`decode_xl_headers`); `load_or_convert` doc at `crates/filemeta/src/filemeta.rs:864` |
-| Legacy meta_ver 2 read | Supported (with legacy checksum) | Regression fixtures `test_issue_2265_legacy_meta_v2_object_compatibility` / `test_issue_2288_legacy_xlmeta_compatibility` at `crates/filemeta/src/filemeta.rs:1130`, `:1152`; `uses_legacy_checksum` asserted at `:1174` |
+| Version probe | `read_format_versions` returns `(major, minor, header_ver, meta_ver)` without a full parse | `crates/filemeta/src/filemeta/codec.rs` |
+| Read compatibility | Accepts meta_ver 1-3 including legacy meta_ver 2 with legacy checksums (`uses_legacy_checksum`); `load_or_convert` normalizes on rewrite | `crates/filemeta/src/filemeta.rs`, `crates/ecstore/src/set_disk/read.rs` |
+| Container layout | 8-byte header, bin-length-prefixed msgpack header block, CRC trailer, optional inline data (MinIO XL2 v1 shape) | `crates/filemeta/src/filemeta/codec.rs` |
+| Erasure coding | Reed-Solomon Vandermonde, `rs-vandermonde` identifier, codec crate `rustfs-erasure-codec` | `Cargo.toml`, [erasure-coding.md](erasure-coding.md) |
+| Bitrot | `HighwayHash256S` default; `HighwayHash256SLegacy` (fixed key) for older shards | `crates/ecstore/src/io_support/bitrot.rs`, `crates/ecstore/tests/legacy_bitrot_read_test.rs` |
+| Inline data | Inline block after the CRC trailer; `null` / version-id keying via `data_key_for_version`; `physical_data_dir` accounting | `crates/filemeta/src/filemeta.rs`, `crates/filemeta/src/filemeta/inline_data.rs` |
 
-RustFS is a **read-forward-compatible** consumer of MinIO's `xl.meta`: it can
-parse older MinIO objects and normalizes them to meta_ver 3 on rewrite. It does
-not write MinIO's older versions.
-
-### Container header
-
-| Field | RustFS value | Evidence |
-|---|---|---|
-| Magic | `XL2 ` (`[b'X', b'L', b'2', b' ']`) | `crates/filemeta/src/filemeta.rs:46` |
-| File version major / minor | 1 / 3 | `crates/filemeta/src/filemeta.rs:51-52` |
-| Header version | 3 | `crates/filemeta/src/filemeta.rs:53` |
-| Magic + version check (decode entry) | `check_xl2_v1` validates magic and rejects `major > 1` | `crates/filemeta/src/filemeta/codec.rs:45-61` |
-| Version-only probe (no full parse) | `read_format_versions` returns `(major, minor, header_ver, meta_ver)` | `crates/filemeta/src/filemeta/codec.rs:30-43` |
-
-The layout after the 8-byte header is `bin-length-prefixed msgpack header block`
-followed by a CRC trailer and optional inline data — matching MinIO's XL2 v1
-container.
-
-### Erasure coding
-
-| Aspect | Value | Evidence |
-|---|---|---|
-| Algorithm enum | `ErasureAlgo::ReedSolomon = 1` | `crates/filemeta/src/fileinfo.rs:83-106` |
-| Algorithm string | `rs-vandermonde` | `crates/filemeta/src/fileinfo.rs:31` (`ERASURE_ALGORITHM`); also `crates/ecstore/src/object_api/mod.rs:52` |
-| Codec crate | `rustfs-erasure-codec` (Reed-Solomon, SIMD) | `Cargo.toml:277` |
-
-Same Reed-Solomon Vandermonde scheme and identifier string as MinIO.
-
-### Bitrot / shard integrity
-
-| Aspect | Value | Evidence |
-|---|---|---|
-| Default hash | `HashAlgorithm::HighwayHash256S` | Bitrot read/write paths in `crates/ecstore/src/io_support/bitrot.rs` (e.g. `:564`, `:767`) |
-| Legacy variant | `HighwayHash256SLegacy` (fixed key) for old objects | referenced from `rustfs_utils::HashAlgorithm` (imported at `crates/ecstore/src/io_support/bitrot.rs:26`) |
-| HighwayHash crate | `highway` 1.3.0 | `Cargo.toml:252` |
-| Legacy bitrot read coverage | dedicated test | `crates/ecstore/tests/legacy_bitrot_read_test.rs` |
-
-MinIO uses HighwayHash256 for bitrot; RustFS's default `HighwayHash256S` is
-compatible, with a legacy-key variant retained for older shards.
-
-### Inline data
-
-Small objects are inlined into the `xl.meta` container after the CRC trailer
-rather than written as a separate `part.1`. Handling lives in
-`crates/filemeta/src/filemeta/inline_data.rs` (e.g. `physical_data_dir` and the
-shared-data-dir accounting), and the inline block is appended/consumed by the
-codec in `crates/filemeta/src/filemeta/codec.rs`. This mirrors MinIO's inline
-data feature and the `null`/version-id keying used for the inline map
-(`data_key_for_version` at `crates/filemeta/src/filemeta.rs:69`, legacy key at
-`:77`).
-
-### `xl.meta` interop verdict
-
-| Item | Done | Partial | Todo |
-|---|:--:|:--:|:--:|
-| Read MinIO meta_ver ≤ 3 | ✅ | | |
-| Legacy meta_ver 2 + legacy checksum read | ✅ | | |
-| XL2 container magic/version parity | ✅ | | |
-| Reed-Solomon `rs-vandermonde` parity | ✅ | | |
-| HighwayHash256 bitrot parity | ✅ | | |
-| Inline data parity | ✅ | | |
-| Broad fixture corpus from real MinIO writers | | ⚠️ | |
-| Write-back parity for round-trip (RustFS→MinIO read) | | ⚠️ | |
-
-The two ⚠️ items are verification breadth, not known incompatibilities: the
-current fixtures are targeted regressions (issues #2265, #2288), and there is no
-CI job proving a MinIO binary can re-read a RustFS-written `xl.meta`.
-
----
+MinIO stores an inlined object body as `[HighwayHash256 (32 B)][body]`. Feeding the raw inline shard through RustFS's `BitrotReader` with `HighwayHash256S` verifies the checksum and yields the exact payload; the bitrot prefix is not a format incompatibility.
 
 ## Part B — Bucket Metadata (`.metadata.bin`)
 
-### On-disk layout
-
-| Aspect | RustFS value | Evidence |
+| Aspect | Contract | Where |
 |---|---|---|
-| Meta bucket | `.rustfs.sys` | `crates/ecstore/src/disk/mod.rs:29` (`RUSTFS_META_BUCKET`) |
-| Bucket-config prefix | `buckets` | `crates/ecstore/src/disk/mod.rs:34` (`BUCKET_META_PREFIX`) |
-| Blob file | `.metadata.bin` | `crates/ecstore/src/bucket/metadata.rs:227` (`BUCKET_METADATA_FILE`) |
-| Full path | `buckets/{bucket}/.metadata.bin` | `crates/ecstore/src/bucket/metadata.rs:415-416` (`save_file_path`) |
-| Header | `format: u16 LE` + `version: u16 LE`, both `= 1` | `crates/ecstore/src/bucket/metadata.rs:228-229`, checked in `check_header` at `:595-614` |
-| Body | MessagePack-encoded `BucketMetadata` | `marshal_msg`/`unmarshal` at `crates/ecstore/src/bucket/metadata.rs:582-593`; read strips the 4-byte header (`unmarshal(&data[4..])` at `:1079`) |
+| Path | `buckets/{bucket}/.metadata.bin` under the meta bucket (`BUCKET_METADATA_FILE`, `save_file_path`) | `crates/ecstore/src/bucket/metadata.rs` |
+| Header | 4 bytes: `format: u16 LE` + `version: u16 LE`, stripped before `unmarshal` | `check_header` in `crates/ecstore/src/bucket/metadata.rs` |
+| Body | MessagePack-encoded `BucketMetadata`; field names map one-to-one onto MinIO's `bucketMetadata` (PascalCase on the wire) | `BucketMetadata` in `crates/ecstore/src/bucket/metadata.rs` |
+| Per-config encoding | XML for S3-XML configs, JSON for policy / quota / targets / ACL; the per-config filename constants (`policy.json`, `lifecycle.xml`, ...) are `update_config` field-selector keys, not separate files | `update_config`, `parse_all_configs` in `crates/ecstore/src/bucket/metadata.rs` |
+| RustFS-only fields | `bucket_targets_config_meta_json`, `table_bucket_config_json`; a MinIO reader ignores unknown msgpack fields | `crates/ecstore/src/bucket/metadata.rs` |
+| Partial interop | `bucket_targets` meta side-channel is RustFS-specific; `bucket_acl` round-trips as a blob but only canned ACLs are enforced (see [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md)) | |
 
-This is the same design as MinIO's bucket metadata: a single
-`.minio.sys/buckets/<bucket>/.metadata.bin` blob with a 4-byte
-`bucketMetadataFormat|bucketMetadataVersion` header and a msgpack body. The
-filename, header shape, and format/version values (`1`/`1`) all match. The
-`BucketMetadata` field names correspond one-to-one to MinIO's `bucketMetadata`
-struct (`policyConfigJSON`, `lifecycleConfigXML`, `objectLockConfigXML`, …).
+### Importer
 
-> Correction to a common misconception: modern MinIO does **not** store each
-> bucket config as a separate loose `versioning.json` / `lifecycle.json` file —
-> it embeds them in the same `.metadata.bin` blob, with XML for the S3-XML
-> configs and JSON for policy/quota/targets. The per-config filename constants
-> in RustFS (`policy.json`, `lifecycle.xml`, …) are the **keys used by
-> `update_config`** to select a field, not separate on-disk files.
+`crates/ecstore/src/bucket/migration.rs` is a one-way, idempotent importer from a `MIGRATING_META_BUCKET` (`.minio.sys`) layout into `.rustfs.sys`, run at startup from `rustfs/src/startup_bucket_metadata.rs`:
 
-### Interop matrix (backlog#580 items)
-
-Field/constant references are in `crates/ecstore/src/bucket/metadata.rs`.
-"Encoding" is the payload RustFS stores in that field and must match MinIO's for
-byte-level interop. Getter functions live in
-`crates/ecstore/src/bucket/metadata_sys.rs`.
-
-| Config item | RustFS field / constant | Encoding | MinIO field | Status |
-|---|---|---|---|---|
-| versioning | `versioning_config_xml` / `BUCKET_VERSIONING_CONFIG` = `versioning.xml` | XML | versioningConfigXML | Done |
-| quota | `quota_config_json` / `BUCKET_QUOTA_CONFIG_FILE` = `quota.json` | JSON | quotaConfigJSON | Done |
-| object_lock | `object_lock_config_xml` / `OBJECT_LOCK_CONFIG` = `object-lock.xml` | XML | objectLockConfigXML | Done |
-| replication | `replication_config_xml` / `BUCKET_REPLICATION_CONFIG` = `replication.xml` | XML | replicationConfigXML | Done |
-| policy | `policy_config_json` / `BUCKET_POLICY_CONFIG` = `policy.json` | JSON | policyConfigJSON | Done |
-| lifecycle | `lifecycle_config_xml` / `BUCKET_LIFECYCLE_CONFIG` = `lifecycle.xml` | XML | lifecycleConfigXML | Done |
-| tagging | `tagging_config_xml` / `BUCKET_TAGGING_CONFIG` = `tagging.xml` | XML | taggingConfigXML | Done |
-| bucket_targets | `bucket_targets_config_json` + `bucket_targets_config_meta_json` / `BUCKET_TARGETS_FILE` = `bucket-targets.json` | JSON | bucketTargetsConfigJSON (+ meta variant) | Partial |
-| notification | `notification_config_xml` / `BUCKET_NOTIFICATION_CONFIG` = `notification.xml` | XML | notificationConfigXML | Done |
-| encryption | `encryption_config_xml` / `BUCKET_SSECONFIG` = `bucket-encryption.xml` | XML | encryptionConfigXML | Done |
-| cors | `cors_config_xml` / `BUCKET_CORS_CONFIG` = `cors.xml` | XML | corsConfigXML | Done |
-| public_access | `public_access_block_config_xml` / `BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG` = `public-access-block.xml` | XML | publicAccessBlockConfigXML | Done |
-| bucket_acl | `bucket_acl_config_json` / `BUCKET_ACL_CONFIG` = `bucket-acl.json` | JSON | bucketACLConfigJSON | Partial |
-
-Field definitions: `crates/ecstore/src/bucket/metadata.rs:274-336`. Constants:
-`:227-247`. `update_config` field routing: `:678-761`. `parse_all_configs` is
-invoked on load (`load_bucket_metadata_parse` at `:1043`).
-
-Notes on the two "Partial" rows:
-
-- **bucket_targets** — RustFS carries an extra `bucket_targets_config_meta_json`
-  field (`:288`) beyond MinIO's single targets blob. The primary
-  `bucket-targets.json` payload is interoperable; the meta side-channel is
-  RustFS-specific and a MinIO reader would ignore it. ACL enforcement itself is
-  bounded (S3 `PutBucketAcl`/`PutObjectAcl` accept canned ACLs only — see
-  [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md)).
-- **bucket_acl** — stored and round-tripped in the blob, but ACL grant
-  semantics are intentionally limited at the S3 layer.
-
-RustFS also defines fields with no interop requirement from backlog#580 but
-worth noting so a migration tool does not choke on them: `logging_config_xml`,
-`website_config_xml`, `accelerate_config_xml`, `request_payment_config_xml`
-(`:242-245`), and the RustFS-only `table_bucket_config_json`
-(`BUCKET_TABLE_CONFIG` = `table-bucket.json`, `:248`). A MinIO reader that does
-not know `table_bucket_config_json` will ignore the unknown msgpack field.
-
-### Old-RustFS → new-RustFS migration
-
-RustFS ships a one-way importer that reads a legacy meta bucket
-(`MIGRATING_META_BUCKET`) and rewrites both bucket metadata and IAM config into
-the current RustFS meta bucket, skipping entries that already exist
-(idempotent). See `crates/ecstore/src/bucket/migration.rs`:
-
-- `try_migrate_bucket_metadata` copies `buckets/{bucket}/.metadata.bin` and the
-  replication resync blob for each bucket (`crates/ecstore/src/bucket/migration.rs:193`).
-- `try_migrate_iam_config` walks `config/iam/` and normalizes legacy IAM
-  records — legacy timestamp fields (`update_at` → `updatedAt`) and legacy
-  policy-mapping field aliases (`policies` → `policy`) are rewritten
-  (`normalize_iam_config_blob` at `:97`; regression test at `:428`).
-- Bucket resync metadata is re-encoded through `ReplicationMigrationBridge`
-  (`normalize_bucket_meta_blob` at `:178`).
-
-This importer is the practical basis for a MinIO → RustFS bucket-metadata
-migration: because the blob layout and field encodings already match, the
-missing piece is a source adapter that points the importer at a MinIO
-`.minio.sys` layout rather than the RustFS legacy layout.
-
-### Bucket-metadata interop verdict
-
-| Item | Done | Partial | Todo |
-|---|:--:|:--:|:--:|
-| `.metadata.bin` filename + header + msgpack layout parity | ✅ | | |
-| Per-config field encodings (XML/JSON) match MinIO | ✅ | | |
-| versioning/quota/object_lock/replication/policy/lifecycle/tagging/notification/encryption/cors/public_access round-trip | ✅ | | |
-| bucket_targets primary blob | ✅ | | |
-| bucket_targets meta side-channel + ACL grant semantics | | ⚠️ | |
-| Old-RustFS → new-RustFS importer | ✅ | | |
-| MinIO `.minio.sys` source adapter for the importer | | | ❌ |
-| CI proof a MinIO-written `.metadata.bin` loads unchanged | | | ❌ |
-
----
+| Function | Imports |
+|---|---|
+| `try_migrate_bucket_metadata` | `buckets/{bucket}/.metadata.bin` plus the replication resync blob (`normalize_bucket_meta_blob` via `ReplicationMigrationBridge`) |
+| `try_migrate_iam_config` | `config/iam/` records; `normalize_iam_config_blob` rewrites legacy timestamp and policy-mapping aliases |
 
 ## Part C — Server-Side Encryption (SSE)
 
-Reading MinIO-written SSE objects is implemented, with a deliberate build boundary. The read path lives behind the `rio-v2` feature and is a **special-purpose migration capability**: it is not compiled into released binaries or container images, and there is no short-term plan to promote it into default builds. A default build fails such reads closed with a diagnosed error (see "How default builds fail" below); a `rio-v2` build reads them, within the scenario matrix below. The read-path work was tracked in rustfs/backlog#1638 (landed across rustfs/rustfs#6191, #6784, #6785).
+The `xl.meta` around a MinIO SSE object parses in every build, so such objects list, HEAD, and report plausible sizes; only payload readability depends on the build. KMS wire protocols (AWS `awsJson1_1` client in `crates/kms/src/backends/aws.rs`, MinIO KES) are non-targets.
 
-### Scope boundary: KMS wire protocols and the production gate
-
-This document covers MinIO on-disk metadata and object-encryption seams only. The **AWS KMS wire protocol** and the **MinIO KES wire protocol** are explicit non-targets: RustFS's AWS backend uses the AWS SDK's `awsJson1_1` client path (`crates/kms/src/backends/aws.rs:830`), while KES compatibility is outside this interop work. Those ecosystem evaluations remain separate work in the [#1562 Production Ready exit gate](https://github.com/rustfs/backlog/issues/1562), whose compatibility criterion covers MinIO/RustFS SSE data and rolling upgrades. Closing #1638 does not by itself close that gate.
-
-Note the asymmetry with Parts A and B: the `xl.meta` around a MinIO SSE object parses fine, so such objects list, HEAD, and report plausible sizes. Only payload readability depends on the build and the scenario.
-
-### What can and cannot be migrated
-
-| Object class | Default build | `rio-v2` build | Notes |
+| Object class | `default` / `full` | `rio-v2` | Requirement |
 |---|:--:|:--:|---|
-| Unencrypted objects | ✅ | ✅ | Parts A and B apply. |
-| Bucket metadata, IAM config | ✅ | ✅ | Via the importer, once a `.minio.sys` source adapter exists (see Part B). |
-| Bucket-level default-encryption *configuration* | ✅ | ✅ | The `encryption` config blob round-trips as a blob; it does not make existing ciphertext readable. |
-| SSE-S3 / SSE-KMS, MinIO builtin static KMS (`MINIO_KMS_SECRET_KEY`), single- and multipart | ❌ diagnosed | ✅ | Requires `RUSTFS_SSE_S3_MASTER_KEY` set to the same 32-byte key material as MinIO's static secret. Proven against real MinIO fixtures (rustfs/rustfs#6191). |
-| SSE-C, MinIO-written | ❌ diagnosed | ✅ | Detection via MinIO's sealed-key slot; the customer key is proven by the AEAD unseal, since MinIO stores no key MD5 (rustfs/rustfs#6785). |
-| Any SSE, MinIO backed by KES / KMS plugin / MinKMS | ❌ | ❌ **not planned** | The wrapped DEK is sealed by the KES service itself; it is not a Vault/Transit ciphertext RustFS could be pointed at. Re-encrypt on the MinIO side before migrating. |
-| Objects sealed with legacy `DARE-SHA256` (`InsecureSealAlgorithm`) | ❌ | ❌ out of scope | Pre-DAREv2-HMAC MinIO; `parse_minio_managed_sealed_key` rejects the algorithm and the read fails closed. |
-| RustFS-written SSE objects read back by MinIO | ❌ | ❌ | See "Reverse direction". |
+| SSE-S3 / SSE-KMS, MinIO builtin static KMS, single- and multipart | Fail closed, diagnosed | Read | `RUSTFS_SSE_S3_MASTER_KEY` (base64, 32 bytes) equal to the source MinIO's static secret. |
+| SSE-C, MinIO-written | Fail closed, diagnosed | Read | Client supplies the customer key per request; MinIO stores no key MD5, so the AEAD unseal is the key proof. |
+| Any SSE, MinIO backed by KES / KMS plugin / MinKMS | Fail closed | Fail closed | Not planned. Re-encrypt or decrypt on the MinIO side first. |
+| Bucket default-encryption *configuration* | Round-trips | Round-trips | A config blob; it does not make existing ciphertext readable. |
 
-### The seams, and where they closed
+### Seams
 
-The cryptographic primitives were never the gap — RustFS implements the same DARE V2 stream format, object-key derivation, and sealing. Three seams above the cryptography rejected MinIO-written objects; all three are closed in `rio-v2` builds.
+The cryptography (DARE v2 stream format, object-key derivation, sealing) was never the gap. Three metadata seams above it rejected MinIO objects; all are closed in `rio-v2` builds. Symbols are in `rustfs/src/storage/sse.rs` unless noted.
 
-| # | Seam | Resolution |
-|---|---|---|
-| 1 | Managed-SSE detection required the *persisted* public `x-amz-server-side-encryption` key, which MinIO synthesizes at response time and never stores. | Closed by rustfs/rustfs#6191: `infer_minio_managed_sse_type` infers the scheme from which MinIO sealed-key slot is present (the slot also selects the sealing-key domain, so a wrong inference cannot silently derive a wrong key). Inference from the KMS key id would misclassify — MinIO writes `-S3-Kms-Key-Id` on SSE-S3 objects too. |
-| 2 | MinIO's wrapped-DEK ciphertext was not accepted by any envelope parser. | Closed by rustfs/rustfs#6191: `decrypt_minio_kms_data_key` implements MinIO's builtin-KMS sealing (`sealingKey = HMAC-SHA256(master, iv)`), accepting both the raw `sealed‖iv‖nonce` layout and the legacy `{"aead": ...}` JSON. Routing is by the data key's own byte shape — RustFS's strict JSON envelopes are recognized positively, everything else goes to the MinIO decoder — because slot names cannot distinguish the writer. `LocalSseDekEnvelope` keeps `deny_unknown_fields`. |
-| 3 | SSE-C detection keyed on the stored customer-algorithm header, which MinIO also never persists, and the early key check demanded a stored key MD5 MinIO does not write. | Closed by rustfs/rustfs#6785: `stored_ssec_metadata` also accepts MinIO's SSE-C sealed-key slot (rio-v2 builds only), and `verify_ssec_key_match` tolerates a missing stored MD5 for exactly that shape — the AEAD unseal remains the key proof, and a wrong key still fails there. |
-
-Two further single-part defects were fixed on the way (both rustfs/rustfs#6191 follow-ups): multipart classification now trusts MinIO's own `X-Minio-Internal-Encrypted-Multipart` marker instead of an ETag-length heuristic (MinIO stores *encrypted* ETags, so every single-part SSE object mis-classified as multipart), and single-part plaintext sizes are recovered by DARE reverse-size arithmetic (`dare_v2_decrypted_size`) since MinIO records an explicit size only for multipart uploads.
+| Seam | Resolution |
+|---|---|
+| Managed-SSE detection required the persisted public `x-amz-server-side-encryption` key, which MinIO synthesizes at response time | `infer_minio_managed_sse_type` infers the scheme from which MinIO sealed-key slot is present; the slot also selects the sealing-key domain, so a wrong inference cannot derive a wrong key. |
+| MinIO's wrapped-DEK ciphertext was accepted by no envelope parser | `decrypt_minio_kms_data_key` implements MinIO's builtin-KMS sealing for both the raw `sealed‖iv‖nonce` layout and the legacy `{"aead": ...}` JSON. Routing is by byte shape: `LocalSseDekEnvelope` (`deny_unknown_fields`) is recognized positively, everything else goes to the MinIO decoder. |
+| SSE-C detection keyed on the stored customer-algorithm header, which MinIO also never persists, and demanded a stored key MD5 | `stored_ssec_metadata` accepts MinIO's SSE-C sealed-key slot (`rio-v2` only); `verify_ssec_key_match` tolerates a missing stored MD5 for exactly that shape. |
+| Multipart classification used an ETag-length heuristic (MinIO stores encrypted ETags) | Trusts MinIO's own `X-Minio-Internal-Encrypted-Multipart` marker (`crates/utils/src/http/header_compat.rs`). |
 
 ### How default builds fail
 
-The read fails closed: ciphertext is never served as plaintext. `is_object_encryption_marker` matches the whole `x-minio-internal-server-side-encryption-` prefix, so `ObjectInfo::is_encrypted()` is true for these objects, and the read plan refuses to construct a reader without decryption material. Since rustfs/rustfs#6784 the refusal is diagnosed: the resolver raises a typed error naming the condition — in default builds it points at the MinIO-compatible sealed format and the `rio-v2` read path it would require — and it surfaces as S3 `InvalidObjectState` (non-retryable) instead of the former undiagnosed 500 `InternalError`. List and HEAD still succeed, because `xl.meta` parses normally.
-
-### What a `rio-v2` migration build needs
-
-- A binary built with `--features rio-v2`. The feature is deliberately absent from `default` and `full` in `rustfs/Cargo.toml`; released binaries and images never include it.
-- For SSE-S3/SSE-KMS objects: `RUSTFS_SSE_S3_MASTER_KEY` (base64, 32 bytes) set to the same key material as the source MinIO's `MINIO_KMS_SECRET_KEY`. For SSE-C objects: nothing server-side — the client supplies the customer key per request, as on MinIO.
-- The interop harness is the evidence chain: `rustfs/src/storage/minio_generated_read_test.rs` (`#[ignore]` reader tests over real MinIO-generated fixtures, run with `--features rio-v2`), the fixture lab under `crates/rio-v2/tests/minio_fixture_lab/`, and the `minio-interop` workflow. The SSE-C lane of that harness (customer-key handout from a fixture capture to the reader test) is not wired yet; SSE-C coverage currently lives in the unit suite, which builds the MinIO shape with the same sealing primitives the fixture suite proved byte-compatible.
-
-Known unverified edge: MinIO seals ETags on SSE objects (`SealETag`); RustFS does not unseal them, so ETag display and `If-Match` semantics on migrated SSE objects are not guaranteed to match MinIO's.
+`is_object_encryption_marker` (`crates/utils/src/http/header_compat.rs`) matches the whole `x-minio-internal-server-side-encryption-` prefix, so `ObjectInfo::is_encrypted()` is true and the read plan refuses to construct a reader without decryption material. The refusal is a typed error that names the MinIO-compatible sealed format and the `rio-v2` read path it requires, surfaced as S3 `InvalidObjectState` (non-retryable). Ciphertext is never served as plaintext.
 
 ### Reverse direction
 
-Migrating back is also unsupported. Under `rio-v2` RustFS writes its own DEK envelope into MinIO's sealed-key metadata slots and labels it with MinIO's seal algorithm (`rustfs/src/storage/sse.rs:1830-1852`), so the metadata is MinIO-shaped while the key bytes are not MinIO-openable. Default builds do not populate those slots at all (`rustfs/src/storage/sse.rs:1796-1798`). Treat RustFS-written SSE objects as readable only by RustFS.
+Under `rio-v2` RustFS writes its own DEK envelope into MinIO's sealed-key metadata slots labelled with MinIO's seal algorithm, so the metadata is MinIO-shaped while the key bytes are not MinIO-openable. Default builds do not populate those slots. Treat RustFS-written SSE objects as readable only by RustFS. Known unverified edge: MinIO seals ETags on SSE objects; RustFS does not unseal them, so ETag display and `If-Match` on migrated SSE objects are not guaranteed to match MinIO.
 
-### Migration options
+### Migration options for encrypted objects
 
-- For static-KMS MinIO sources: run the migration through a `rio-v2` build with the shared master key (see above), either serving reads in place or copying objects out into a default-build cluster (the copy re-encrypts under RustFS's own KMS).
-- For KES/MinKMS-backed sources, or when a special-purpose build is not wanted: decrypt on the MinIO side first — rewrite the affected objects as plaintext, or copy them out through MinIO's S3 endpoint, which decrypts on read — and let RustFS apply its own encryption on ingest.
-- Leave encrypted objects on MinIO and migrate only unencrypted data.
+1. Static-KMS source: run the migration through a `rio-v2` build with the shared master key, serving in place or copying into a default-build cluster (the copy re-encrypts under RustFS's own KMS).
+2. KES / MinKMS source, or no special-purpose build wanted: decrypt on the MinIO side (rewrite as plaintext, or copy out through MinIO's S3 endpoint) and let RustFS encrypt on ingest.
+3. Leave encrypted objects on MinIO and migrate only unencrypted data.
 
-Inventory the source first — bucket default-encryption settings mean objects can be encrypted without the uploader having asked for it, so "we never set SSE headers" is not sufficient evidence that a bucket has no encrypted objects.
+Inventory the source first: bucket default encryption means objects can be encrypted without the uploader asking, so "we never set SSE headers" is not evidence that a bucket has no encrypted objects.
 
-### SSE interop verdict
+## rio-v2 variant lifecycle
 
-| Item | Done | Partial | Todo |
-|---|:--:|:--:|:--:|
-| DARE V2 stream format parity | ✅ | | |
-| Object-key derivation / sealing parity | ✅ | | |
-| Managed-SSE detection accepts MinIO-written metadata (`rio-v2`) | ✅ | | |
-| MinIO builtin-KMS wrapped-DEK parser (raw + legacy JSON) | ✅ | | |
-| SSE-C detection accepts MinIO-written metadata (`rio-v2`) | ✅ | | |
-| Read MinIO-written SSE-S3 / SSE-KMS end to end, single- and multipart | ✅ | | |
-| Read MinIO-written SSE-C end to end | | ⚠️ unit-proven; fixture-lab lane unwired | |
-| Migrated-object sealed-ETag semantics | | | ❌ unverified |
-| KES / MinKMS / legacy `DARE-SHA256` sources | | | ❌ not planned |
-| RustFS-written SSE objects readable by MinIO | | | ❌ |
-| CI proof of SSE read parity | | ⚠️ `minio-interop` workflow; nightly once re-enabled | |
+`rio-v2` is a dormant, special-purpose migration variant tracked under `rustfs/backlog#1835`.
 
----
+| Fact | Value |
+|---|---|
+| Shipping status | Ships in no default build: absent from `default` and `full` in `rustfs/Cargo.toml`; released binaries and container images never include it. Enable with `--features rio-v2`. |
+| Pull-request coverage | `test-and-lint-rio-v2` in `.github/workflows/ci.yml`: clippy plus `cargo nextest` for `rustfs` and `rustfs-ecstore` with `--features rio-v2`. This is the cfg-seam guard; it keeps the feature compiling and its unit suite green on every pull request. |
+| Full-suite lane | `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` in `ci.yml` run only on the weekly schedule and manual dispatch (`cache-warm.yml` keeps the `ci-feat-rio` cache warm so the scheduled build fits its timeout). |
+| Interop evidence | `.github/workflows/minio-interop.yml` (nightly plus manual) regenerates real MinIO backend trees via `crates/rio-v2/tests/minio_fixture_lab/` and runs the `#[ignore]` reader tests in `rustfs/src/storage/minio_generated_read_test.rs` with `--features rio-v2`. Its freshness is tracked in `.github/scheduled-validations.json`. |
+| Promote-or-delete condition | The variant stays dormant until one of two things happens. **Promote**: a release commits to shipping MinIO SSE migration as a supported capability; then `rio-v2` joins `default`/`full`, the scheduled lanes run on every pull request, and this section is rewritten. **Delete**: no release commits to it and the scheduled lanes are not kept green; then the feature flag, `crates/rio-v2`, the cfg seams in `rustfs/src/storage/sse.rs`, the three `ci.yml` jobs, the `cache-warm.yml` warm step, `minio-interop.yml`, and its `scheduled-validations.json` entry are removed in one change. Either outcome must update `ARCHITECTURE.md` and the `ci.yml` job comments that cite this section. |
 
-## Phased Plan
+## Fixture Evidence
 
-The format is already close; the plan is verification, a source adapter, and
-closing the two partial encodings — not a rewrite.
+Fixtures were captured from a real MinIO single-drive instance and live under `crates/filemeta/tests/fixtures/minio/` and `crates/ecstore/tests/fixtures/minio/`. These tests run in the normal `cargo test` / nextest lanes.
 
-### Phase 1 — Read parity, proven (verification)
+| Test | File | Proves |
+|---|---|---|
+| `parses_real_minio_object_xlmeta` | `crates/filemeta/src/filemeta.rs` | Inline, two-version plus delete-marker, and multipart `xl.meta` parse to the expected `FileInfo`. |
+| `parses_real_minio_bucket_metadata_blob_without_loss` | `crates/ecstore/src/bucket/metadata.rs` | The msgpack blob decodes via MinIO's field names and `parse_all_configs` loads every config in the corpus, including MinIO's lifecycle `<ExpiryUpdatedAt>` and replication `DeleteMarkerReplication` / `ExistingObjectReplication` extensions. |
+| `reads_minio_inline_bucket_metadata_via_bitrot` | `crates/ecstore/src/bucket/metadata.rs` | The inline shard's HighwayHash prefix verifies under `HighwayHash256S` and yields the exact `.metadata.bin` blob. |
+| `migrates_real_minio_bucket_metadata_end_to_end` | `crates/ecstore/src/bucket/migration.rs` | A real `.metadata.bin` seeded under a `.minio.sys` layout is imported by `try_migrate_bucket_metadata` into `.rustfs.sys` byte-identical, through the object layer on a 4-drive `ECStore`. |
+| `test_issue_2265_legacy_meta_v2_object_compatibility`, `test_issue_2288_legacy_xlmeta_compatibility` | `crates/filemeta/src/filemeta.rs` | Legacy meta_ver 2 objects with legacy checksums still read. |
+| `minio_generated_read_test.rs` (`#[ignore]`, `rio-v2`) | `rustfs/src/storage/minio_generated_read_test.rs` | Byte-identical plaintext reconstruction of MinIO SSE-S3 / SSE-KMS fixtures; driven by `minio-interop.yml`. |
 
-- Add a MinIO-writer fixture corpus for `xl.meta` (inline + multipart +
-  versioned + delete-marker + transitioned) and assert RustFS parses each to a
-  `FileInfo` equivalent to MinIO's, alongside the existing issue #2265 / #2288
-  fixtures in `crates/filemeta/src/filemeta.rs`.
-- Add a fixture `.metadata.bin` written by MinIO and assert
-  `BucketMetadata::unmarshal` + `parse_all_configs` load every field without
-  loss (`crates/ecstore/src/bucket/metadata.rs`).
-- Exit criterion: a CI job that fails if a real MinIO-written object or bucket
-  blob cannot be read.
+Not fixture-proven: transitioned `xl.meta`; CORS, public-access-block, and bucket-ACL configs (the SNSD corpus did not exercise them); bucket-targets credentials (MinIO stores them KMS-encrypted); the SSE-C fixture-lab lane (customer-key handout is not wired; SSE-C coverage is unit-level).
 
-#### Phase 1 status — first fixtures landed (verified 2026-07-07)
+## Out Of Scope
 
-A real MinIO `RELEASE.2025-07-23` single-drive instance wrote a bucket with
-versioning, object-lock (GOVERNANCE default), lifecycle, tagging, quota, and a
-public-download policy, plus inline / versioned / multipart objects. The on-disk
-`xl.meta` blobs are captured as hex fixtures
-(`crates/filemeta/tests/fixtures/minio/`, `crates/ecstore/tests/fixtures/minio/`).
-
-Proven by regression tests:
-
-- **Object `xl.meta` read parity** — `parses_real_minio_object_xlmeta`
-  (`crates/filemeta/src/filemeta.rs`): small inline, two-object-version + delete
-  marker, and multipart objects all parse to the expected `FileInfo`.
-- **Bucket-metadata parse parity** — `parses_real_minio_bucket_metadata_blob_without_loss`
-  (`crates/ecstore/src/bucket/metadata.rs`): the msgpack blob decodes via the
-  PascalCase MinIO field names, and `parse_all_configs` loads **all ten** config
-  types present in the corpus without loss — policy, lifecycle (**including
-  MinIO's `<ExpiryUpdatedAt>` extension**), object-lock, versioning, tagging,
-  quota, notification, encryption (SSE-S3), and replication (**including the
-  `DeleteMarkerReplication` / `ExistingObjectReplication` MinIO extensions**).
-- **Inline bucket-metadata read parity** — `reads_minio_inline_bucket_metadata_via_bitrot`
-  (`crates/ecstore/src/bucket/metadata.rs`): MinIO stores an inlined object body
-  as `[HighwayHash256 (32B)][body]`. The "`inline_data` 前缀不同" that weisd
-  raised on 2026-03-06 is exactly that bitrot prefix — **not** a format
-  incompatibility. Feeding the raw inline shard through RustFS's `BitrotReader`
-  with the default `HighwayHash256S` verifies the checksum (confirming RustFS's
-  hash matches MinIO's) and yields the exact `.metadata.bin` blob, which then
-  parses. So the object-layer inline read is compatible; the earlier "extract
-  `fi.data` directly" concern was reading the shard before the bitrot layer
-  strips its prefix.
-- **End-to-end migration** — `migrates_real_minio_bucket_metadata_end_to_end`
-  (`crates/ecstore/src/bucket/migration.rs`): on a throwaway 4-drive local
-  `ECStore`, a real MinIO `.metadata.bin` seeded under a `.minio.sys` layout is
-  migrated by `try_migrate_bucket_metadata` into `.rustfs.sys`, and the migrated
-  blob carries every config (policy / lifecycle / object-lock / versioning /
-  tagging / quota / notification / encryption / replication) byte-identical to
-  the source. This exercises the Phase 2 source adapter
-  (`MIGRATING_META_BUCKET = ".minio.sys"`) end-to-end through the object layer —
-  proven, not just present.
-
-Still to broaden: transitioned `xl.meta`; CORS, public-access-block, and bucket
-ACL configs (the SNSD test binary/`mc` did not expose these); and bucket-targets
-credentials, which MinIO stores KMS-encrypted (a documented partial). These run
-as ordinary crate tests, so they already execute in the normal `cargo
-test`/nextest CI jobs.
-
-### Phase 2 — MinIO source adapter for migration
-
-- Generalize the importer in `crates/ecstore/src/bucket/migration.rs` so the
-  source can be a MinIO `.minio.sys/buckets/<bucket>/.metadata.bin` layout, not
-  only the RustFS legacy meta bucket. Because the blob format matches, this is
-  mostly source-path plumbing plus IAM record normalization reuse.
-- Exit criterion: importing a MinIO backup reproduces all backlog#580
-  bucket-config items with byte-identical config payloads.
-
-### Phase 3 — Close the two partial encodings
-
-- bucket_targets: document/normalize the RustFS-only
-  `bucket_targets_config_meta_json` so a round-trip through MinIO and back does
-  not silently drop it; or fold its content into a MinIO-compatible
-  representation.
-- bucket_acl: decide whether ACL grant semantics beyond canned ACLs are in
-  scope; if not, keep the blob round-trippable but document the enforcement
-  limit (already reflected in the router compatibility matrix).
-
-### Phase 4 — Round-trip / write-back parity (non-goal for migration)
-
-Proving a MinIO binary can re-read a *RustFS-written drive set* (the reverse
-direction) is **out of scope for the migration use case**, which is one-way
-MinIO → RustFS:
-
-- RustFS's meta bucket is `.rustfs.sys` (`crates/ecstore/src/disk/mod.rs:29`);
-  MinIO looks for `.minio.sys`. A MinIO binary pointed at a RustFS drive set
-  does not find `format.json` or bucket configs and refuses the set — this is a
-  set-level divergence, not an object-format one.
-- The object-level `xl.meta` format *does* match (proven above), so the reverse
-  direction is limited by drive-set discovery, not by per-object encoding.
-- The supported flow is one-way: `try_migrate_bucket_metadata` /
-  `try_migrate_iam_config` / `format.json` migration import a MinIO layout into
-  RustFS. There is no requirement to keep a live MinIO able to serve
-  RustFS-written drives.
-
-If a true bidirectional round-trip is ever needed, it would require RustFS to
-optionally write the `.minio.sys` set layout — a separate feature, not part of
-the interop/migration story tracked here.
-
----
+- A live MinIO binary serving a RustFS-written drive set (set-level `.minio.sys` vs `.rustfs.sys` divergence). A bidirectional round-trip would require RustFS to optionally write the `.minio.sys` set layout, which is a separate feature.
+- RustFS-written SSE objects readable by MinIO.
+- KES / MinKMS / KMS-plugin-sealed MinIO objects.
+- Objects sealed with pre-DARE-v2-HMAC MinIO seal algorithms; `parse_minio_managed_sealed_key` rejects unknown algorithms and the read fails closed.
+- AWS KMS and KES wire-protocol compatibility.
 
 ## Guardrails
 
-- This document is analysis only. Any change to `crates/filemeta` or
-  `crates/ecstore/src/bucket` metadata encoding is a storage-format change and
-  must follow the migration and readiness contracts in
-  [README.md](README.md) and the ecstore layout boundary rules.
-- The version constants (`XL_META_VERSION`,
-  `BUCKET_METADATA_FORMAT`/`BUCKET_METADATA_VERSION`) are compatibility anchors.
-  Bumping any of them requires a read-compat path for the prior value and a
-  migration story, exactly as the current meta_ver 2 → 3 read path provides.
+- Any change to `crates/filemeta` or `crates/ecstore/src/bucket` metadata encoding is a storage-format change and follows the migration and readiness contracts in [README.md](README.md) and the ecstore layout boundary rules.
+- Do not bump a Version Anchor without a read path for the prior value; see [erasure-coding.md](erasure-coding.md) for the accept-older, reject-newer rule.
+- `.github/workflows/ci.yml`, `.github/workflows/cache-warm.yml`, and `ARCHITECTURE.md` cite the [rio-v2 variant lifecycle](#rio-v2-variant-lifecycle) heading; keep it when editing this file.

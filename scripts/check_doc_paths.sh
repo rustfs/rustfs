@@ -2,13 +2,14 @@
 #
 # Fail when an agent-instruction or architecture document references a
 # repository file path that no longer exists. Keeps CLAUDE.md / AGENTS.md /
-# ARCHITECTURE.md / docs/architecture honest after refactors move code.
+# ARCHITECTURE.md / docs/ honest after refactors move code.
 #
-# Checked files: all tracked AGENTS.md, CLAUDE.md, ARCHITECTURE.md, and
-# docs/architecture/*.md.
+# Checked files: all tracked AGENTS.md, CLAUDE.md, ARCHITECTURE.md, and every
+# Markdown file under docs/ (architecture, operations, testing, and the index).
 #
 # A reference is any token starting with crates/, rustfs/, scripts/, docs/,
-# .github/ or .config/ that ends in a known file extension. Tokens containing
+# helm/, deploy/, .github/ or .config/ (at a word boundary, so helm/rustfs/...
+# is not misread as rustfs/...) that ends in a known file extension. Tokens containing
 # globs or placeholders, extensionless tokens (HTTP routes, directory
 # references, org/repo shorthands), and lines containing URLs are skipped.
 
@@ -20,7 +21,7 @@ cd "$ROOT_DIR"
 FAILURES=0
 
 doc_files() {
-  git ls-files 'AGENTS.md' '*/AGENTS.md' 'CLAUDE.md' 'ARCHITECTURE.md' 'docs/architecture/*.md'
+  git ls-files 'AGENTS.md' '*/AGENTS.md' 'CLAUDE.md' 'ARCHITECTURE.md' 'docs/*.md' 'docs/architecture/*.md' 'docs/operations/*.md' 'docs/testing/*.md'
 }
 
 check_file() {
@@ -30,8 +31,8 @@ check_file() {
   # external, not repo paths.
   # grep exits 1 on no matches; that must not kill the script under pipefail.
   { grep -vE 'https?://' "$doc" || true; } \
-    | { grep -oE '(crates|rustfs|scripts|docs|\.github|\.config)/[A-Za-z0-9_./-]+' || true; } \
-    | sed -e 's/[.,;:)]*$//' -e 's:/$::' \
+    | { grep -oE '(^|[^A-Za-z0-9_./-])(crates|rustfs|scripts|docs|helm|deploy|\.github|\.config)/[A-Za-z0-9_./-]+' || true; } \
+    | sed -E -e 's/^[^A-Za-z0-9_.]//' -e 's/[.,;:)]*$//' -e 's:/$::' \
     | sort -u \
     | while IFS= read -r ref; do
         case "$ref" in

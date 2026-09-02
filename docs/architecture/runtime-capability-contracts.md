@@ -1,70 +1,28 @@
 # Runtime Capability Contracts
 
-This document records the `rustfs/backlog#660` PR-08 and PR-09 contract slice.
-It adds read-only observability and topology snapshot shapes to
-`rustfs-storage-api` without coupling the contract crate to runtime, ECStore,
-admin routes, profiling, or observability implementation crates.
+**Use this when:** changing the read-only observability or topology snapshot contracts in `rustfs-storage-api`, their RustFS providers, or the `storage_classes` payload of `GET /rustfs/admin/v4/runtime/capabilities`.
+**Source of truth:** `ObservabilitySnapshot` in `crates/storage-api/src/observability.rs`; `TopologySnapshot` in `crates/storage-api/src/topology.rs`; `CapabilityState` and `CapabilitySnapshotError` in `crates/storage-api/src/capability.rs`; providers in `rustfs/src/runtime_capabilities.rs`; storage-class constants in `crates/ecstore/src/config/storageclass.rs`.
 
-## Observability Snapshot Contract
+## Snapshot Contracts
 
-`ObservabilitySnapshot` records:
+Field lists live on the defining types and are not repeated here.
 
-- Runtime telemetry capability state.
-- Userspace CPU and memory profiling capability state.
-- Process, system, and cgroup memory sampling state.
-- Platform support for target triple, OS, architecture, allocator, eBPF, and
-  NUMA capability.
+| Contract | Defining type | RustFS provider | Rule |
+|---|---|---|---|
+| Observability | `ObservabilitySnapshot` | `RustFsObservabilitySnapshotProvider` | Reports runtime telemetry, profiling, memory-sampling, platform, allocator, eBPF, and NUMA capability as `CapabilityState` values without starting telemetry, profiling, allocator reclaim, or memory-observability workers. |
+| Topology | `TopologySnapshot` | `EndpointTopologySnapshotProvider` | Maps `EndpointServerPools` into pool/set/disk indexes, optional stable IDs, and optional zone/rack/node/media/NUMA labels without changing endpoint construction, placement, readiness, locks, or ECStore metadata. Local file endpoint paths are never used as disk IDs or labels; extra labels go in the `additional` map so future inventory labels need no ECStore type leakage. |
 
-Unsupported, disabled, and unknown states are represented by `CapabilityState`
-instead of failing snapshot construction. The contract is intentionally read
-only and does not replace existing profiling routes, telemetry APIs, exporter
-pipelines, or startup behavior.
-
-## Topology Snapshot Contract
-
-`TopologySnapshot` records:
-
-- Pool, set, and disk identity indexes plus optional stable IDs.
-- Optional zone, rack, node, media, NUMA, and additional labels.
-- Topology-wide profiling, NUMA, failure-domain label, and media-label
-  capability states.
-- Per-disk media, failure-domain, NUMA, and profiling capability states.
-
-Missing labels are represented as absent `Option` values. Extra topology labels
-belong in the `additional` label map, so future inventory labels do not require
-ECStore type leakage.
+Unsupported, disabled, and unknown states are values of `CapabilityState`, not construction failures. Missing labels are `None`. Providers map implementation failures into `CapabilitySnapshotError` before crossing the contract boundary. Neither contract replaces existing profiling routes, telemetry APIs, exporter pipelines, or startup behavior.
 
 ## Boundary Rules
 
-- No `rustfs-ecstore`, `rustfs-obs`, Axum, KMS, admin route, OTEL, eBPF, or
-  profiling implementation dependency is added to `rustfs-storage-api`.
-- No placement, membership, NUMA pinning, profiling, startup, admin route, or
-  exporter behavior changes are part of this contract slice.
-- Providers must map implementation failures into `CapabilitySnapshotError`
-  before crossing the contract boundary.
-
-## RustFS Provider Slice
-
-`rustfs/src/runtime_capabilities.rs` wires the contracts to RustFS runtime
-owners through read-only providers:
-
-- `RustFsObservabilitySnapshotProvider` maps current dial9, profiling,
-  memory-sampling, platform, allocator, eBPF, and NUMA capability state without
-  starting telemetry, profiling, allocator reclaim, or memory-observability
-  workers.
-- `EndpointTopologySnapshotProvider` maps `EndpointServerPools` into pool, set,
-  and disk topology snapshots without changing endpoint construction,
-  placement, readiness, locks, or ECStore metadata. Local file endpoint paths are
-  intentionally not used as disk IDs or labels.
-
-Unsupported or unavailable runtime capabilities are reported as `unsupported`
-or `unknown` contract states instead of activating fallback behavior.
+- `rustfs-storage-api` gains no dependency on `rustfs-ecstore`, `rustfs-obs`, Axum, KMS, admin routes, OTEL, eBPF, or profiling implementation crates.
+- Providers are read-only. Adding or changing a provider changes no placement, membership, NUMA pinning, profiling, startup, admin-route, or exporter behavior.
+- Unsupported or unavailable runtime capabilities are reported as `unsupported` or `unknown`; they never activate fallback behavior.
 
 ## Storage-Class Write Contract
 
-Authenticated clients discover the storage-class write contract from
-`GET /rustfs/admin/v4/runtime/capabilities`. The additive
-`storage_classes` object is versioned independently from the route:
+Authenticated clients discover the storage-class write contract from `GET /rustfs/admin/v4/runtime/capabilities`. The additive `storage_classes` object is versioned independently from the route:
 
 ```json
 {
@@ -77,15 +35,11 @@ Authenticated clients discover the storage-class write contract from
 }
 ```
 
-`supported_write_classes` is the complete client-selectable write allowlist.
-Any other value fails before object or multipart mutation with the stable S3
-error named by `unsupported_write_error`. `legacy_label_behavior` means
-non-transitioned historical label-only metadata is reported as its effective
-local class; actual lifecycle transition tier names remain unchanged.
+| Field | Meaning |
+|---|---|
+| `supported_write_classes` | The complete client-selectable write allowlist. Any other value fails before object or multipart mutation with the S3 error named by `unsupported_write_error`. |
+| `unsupported_write_error` | Stable S3 error code (`UNSUPPORTED_WRITE_ERROR` in `crates/ecstore/src/config/storageclass.rs`). |
+| `legacy_label_behavior` | Non-transitioned historical label-only metadata is reported as its effective local class; lifecycle transition tier names are unchanged. |
+| `contract_version` | Consumers must branch on it before assigning meaning to future fields. |
 
-The values are sourced from
-[`crates/ecstore/src/config/storageclass.rs`](../../crates/ecstore/src/config/storageclass.rs),
-which also owns write validation and response normalization. Consumers must
-branch on `contract_version` before assigning meaning to future fields. The
-admin route continues to require `ServerInfoAdminAction`; capability discovery
-does not weaken authentication or authorization.
+Values, write validation, and response normalization are owned by `crates/ecstore/src/config/storageclass.rs`. The route continues to require `ServerInfoAdminAction`; capability discovery does not weaken authentication or authorization.

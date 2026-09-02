@@ -1,8 +1,7 @@
 # Readiness Matrix
 
-This document records the current request and dependency behavior around
-startup readiness. It is a behavior-preservation baseline for architecture
-migration work, not a new readiness policy.
+**Use this when:** changing what a request surface does before storage or IAM is ready, changing probe semantics, or adding a runtime dependency that readiness must wait for.
+**Source of truth:** `rustfs/src/server/readiness.rs` (probe paths, `Retry-After`), `crates/common/src/readiness.rs` (`StorageReady`, `IamReady`, `FullReady`), `crates/config/src/constants/health.rs` (`RUSTFS_HEALTH_*` gates). This matrix is a behavior-preservation baseline, not a new readiness policy.
 
 ## Request Behavior Matrix
 
@@ -23,7 +22,7 @@ migration work, not a new readiness policy.
 | IamReady | Inline IAM bootstrap or deferred IAM recovery publication. | Yes. | Deferred recovery can publish IAM readiness after HTTP has already started. |
 | Lock quorum | Per-set write quorum readiness. | Yes. | Do not replace the distributed lock quorum check with node count or endpoint count. |
 | Peer health | `peer_health_ready` runtime status. | Only when `RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE` is enabled. | The gate is disabled by default; unknown peer health degrades readiness only when enabled. |
-| KMS compatibility | KMS health compatibility readiness. | Only when the KMS compatibility readiness check is enabled. | KMS startup fatality and health reporting remain separate from pure docs work. |
+| KMS compatibility | KMS health compatibility readiness. | Only when `RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE` is enabled (default off; `crates/config/src/constants/health.rs`). | When enabled, `/health/ready` additionally requires the KMS service to be running if a global KMS manager exists. KMS startup fatality and health reporting remain separate from pure docs work. |
 
 Effective `FullReady` is:
 

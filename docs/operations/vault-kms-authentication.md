@@ -1,6 +1,8 @@
 # Vault KMS authentication runbook
 
-This runbook covers how the RustFS Vault KMS backends (KV2 and Transit) authenticate to Vault, how to deploy AppRole and Vault Agent token-file authentication, and how the fail-closed credential window behaves in production. For what each backend stores in Vault and the KV2/Transit policy scopes, see [KMS backend security properties](kms-backend-security.md).
+**Use this when:** configuring how the Vault KMS backends (KV2 and Transit) authenticate to Vault, rotating AppRole SecretIDs or agent tokens, or diagnosing `KMS credentials unavailable` errors.
+
+**Source of truth:** `crates/kms/src/backends/vault_credentials.rs` (`DEFAULT_TOKEN_FILE_POLL_INTERVAL_SECS`, `refresh_safety_window_secs`, the renewal loop and its log lines), `crates/kms/src/config.rs` (`RUSTFS_KMS_TIMEOUT_SECS` default). For what each backend stores in Vault and the KV2/Transit policy scopes, see [KMS backend security properties](kms-backend-security.md).
 
 ## Choosing an authentication method
 
@@ -11,7 +13,7 @@ This runbook covers how the RustFS Vault KMS backends (KV2 and Transit) authenti
 | Kubernetes | `Kubernetes` | Lease-bound token obtained by login; renewed by RustFS | Renew at half TTL, re-login on failure | Production on Kubernetes, with no credential to distribute |
 | Agent token file | `TokenFile` | Owned by Vault Agent; RustFS only re-reads the sink file | File re-read once per poll interval | Production with a Vault Agent (or equivalent) managing auth |
 
-Exactly one method must be configured. Setting `RUSTFS_KMS_VAULT_TOKEN_FILE` together with any other method, or `RUSTFS_KMS_VAULT_KUBERNETES_ROLE` together with `RUSTFS_KMS_VAULT_APPROLE_ROLE_ID`, is rejected at startup with a configuration error, because the effective identity would be ambiguous. A leftover `RUSTFS_KMS_VAULT_TOKEN` alongside a configured login method is tolerated and ignored, so a stale variable cannot silently downgrade the identity.
+Exactly one method must be configured. Setting `RUSTFS_KMS_VAULT_TOKEN_FILE` together with any other method, or `RUSTFS_KMS_VAULT_KUBERNETES_ROLE` together with `RUSTFS_KMS_VAULT_APPROLE_ROLE_ID`, is rejected at startup with a configuration error because the effective identity would be ambiguous. A leftover `RUSTFS_KMS_VAULT_TOKEN` alongside a configured login method is tolerated and ignored, so a stale variable cannot silently downgrade the identity.
 
 All of these are read the same way whether the service is started with `RUSTFS_KMS_ENABLE=true` or configured later through `POST /rustfs/admin/v3/kms/configure`.
 
@@ -55,11 +57,15 @@ RustFS logs in at startup, then renews the token at half its TTL in the backgrou
 
 ### SecretID delivery and rotation
 
-Deliver the SecretID out of band — a secrets-manager-mounted file, an init-container writing `RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE`, or Vault response wrapping unwrapped by your deployment tooling. Treat it like a password: owner-readable file permissions, never in logs or shell history.
+Deliver the SecretID out of band (a secrets-manager-mounted file, an init-container writing `RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE`, or Vault response wrapping unwrapped by your deployment tooling). Treat it like a password: owner-readable file permissions, never in logs or shell history.
 
-The secret_id file is re-read on every login attempt, so rotating the SecretID is a two-step operation with no restart: generate a new SecretID (`vault write -f auth/approle/role/rustfs-kms/secret-id`), atomically replace the file, then revoke the old SecretID accessor. The already-issued token keeps renewing; the new SecretID is only needed at the next full re-login.
+The secret_id file is re-read on every login attempt, so rotating the SecretID needs no restart:
 
-An empty or missing secret_id file fails the login attempt immediately (no Vault round trip). At startup the error is fatal — provider construction fails and the process exits — so a file missing at boot is recovered by restarting the process, not by an in-process retry. Once RustFS is running, the same failure is retried on the normal refresh cadence, so repairing the file mid-run heals the backend without a restart.
+1. Generate a new SecretID: `vault write -f auth/approle/role/rustfs-kms/secret-id`.
+2. Atomically replace the file.
+3. Revoke the old SecretID accessor. The already-issued token keeps renewing; the new SecretID is only needed at the next full re-login.
+
+An empty or missing secret_id file fails the login attempt immediately (no Vault round trip). At startup the error is fatal: provider construction fails and the process exits, so a file missing at boot is recovered by restarting the process, not by an in-process retry. Once RustFS is running, the same failure is retried on the normal refresh cadence, so repairing the file mid-run heals the backend without a restart.
 
 ## Kubernetes authentication
 
@@ -96,7 +102,7 @@ RUSTFS_KMS_VAULT_KUBERNETES_ROLE=rustfs
 
 RustFS logs in at startup and renews the token at half its TTL, falling back to a fresh login exactly as AppRole does. The ServiceAccount token is re-read from disk on every login rather than cached, so a projected token the kubelet rotates is picked up without a restart.
 
-A missing or empty token file fails the login attempt immediately (no Vault round trip). At startup the error is fatal — provider construction fails and the process exits — so a token projected late during a slow pod start is recovered by the pod restart loop, not by an in-process retry. Once RustFS is running, a token file that goes missing or turns empty is retried on the normal refresh cadence and heals the backend on its own.
+A missing or empty token file fails the login attempt immediately (no Vault round trip). At startup the error is fatal (provider construction fails and the process exits), so a token projected late during a slow pod start is recovered by the pod restart loop, not by an in-process retry. Once RustFS is running, a token file that goes missing or turns empty is retried on the normal refresh cadence and heals the backend on its own.
 
 ## Vault Agent token file
 
@@ -130,22 +136,24 @@ RUSTFS_KMS_VAULT_ADDRESS=https://vault.example.com:8200
 RUSTFS_KMS_VAULT_TOKEN_FILE=/run/vault-agent/token
 ```
 
-The poll interval (`poll_interval_secs` in the `TokenFile` auth configuration, default 30 seconds) controls how often the file is re-read. Each successful read grants the token an observed validity of twice the poll interval and installs a fresh client generation, so an agent-rotated token is picked up within one poll interval of the atomic replace.
+The poll interval (`poll_interval_secs` in the `TokenFile` auth configuration, `DEFAULT_TOKEN_FILE_POLL_INTERVAL_SECS`, 30 seconds) controls how often the file is re-read. Each successful read grants the token an observed validity of twice the poll interval and installs a fresh client generation, so an agent-rotated token is picked up within one poll interval of the atomic replace.
 
 Requirements enforced at every read, each failing the refresh without contacting Vault:
 
 - The file must exist and be non-empty after trimming whitespace.
 - On Unix, the file must not be readable or writable by group or other (mode `0600` or stricter). Wider permissions are a hard error naming the offending mode, mirroring the SFTP host-key rule. RustFS must run as the file's owner.
 
-If the agent stops refreshing the file that is fine — RustFS re-reads the same token and keeps going as long as the token itself is valid on the Vault side. If the file disappears or turns empty, RustFS keeps serving requests on the last-read token until the fail-closed window trips, and heals automatically once the file is restored.
+If the agent stops refreshing the file, RustFS re-reads the same token and keeps going as long as the token itself is valid on the Vault side. If the file disappears or turns empty, RustFS keeps serving requests on the last-read token until the fail-closed window trips, and heals automatically once the file is restored.
 
 ## Fail-closed window
 
 For lease-bound credentials (AppRole and Kubernetes tokens, token files), `current()` refuses to hand out a token that is within the safety window of its expiry and has not been refreshed. Requests then fail with `KMS credentials unavailable: ...` instead of being sent with a token that could lapse mid-flight and fail unpredictably on the Vault side.
 
-- Default window: one per-attempt timeout (`RUSTFS_KMS_TIMEOUT_SECS`, default 30s) — a request issued now can legitimately stay in flight that long, so the token must outlive it.
-- Override: `refresh_safety_window_secs` on the `AppRole`, `Kubernetes` or `TokenFile` auth configuration.
-- Static tokens never trip the window: they carry no lease and are assumed valid until Vault says otherwise.
+| Aspect | Value |
+| --- | --- |
+| Default window | One per-attempt timeout (`RUSTFS_KMS_TIMEOUT_SECS`, default 30s): a request issued now can legitimately stay in flight that long, so the token must outlive it. |
+| Override | `refresh_safety_window_secs` on the `AppRole`, `Kubernetes` or `TokenFile` auth configuration. |
+| Static tokens | Never trip the window; they carry no lease and are assumed valid until Vault says otherwise. |
 
 The window is a symptom threshold, not the fault itself: by the time it trips, refresh has been failing for roughly half the token TTL (AppRole, Kubernetes) or two poll intervals (token file).
 
@@ -153,12 +161,12 @@ The window is a symptom threshold, not the fault itself: by the time it trips, r
 
 | Symptom | Log line to look for | Likely cause and fix |
 | --- | --- | --- |
-| Requests fail with `KMS credentials unavailable` | `Vault credential refresh failed; retrying until the credentials recover` (warn, repeated) | Vault unreachable/sealed, or the credential source is broken; the provider recovers on its own once refresh succeeds — fix the cause, no restart needed |
-| Renewal succeeded but re-login later fails | `Vault token renewal failed; falling back to a fresh login` followed by login errors | SecretID expired/revoked or AppRole role changed; rotate the secret_id file |
-| Token file mode error at startup or during polls | `has insecure permissions` in the error | Fix the sink `mode` (0600) and the file owner; the next poll heals the provider |
-| Token file missing/empty errors | `Failed to read Vault token file` / `token file ... is empty` | Vault Agent down or sink misconfigured; restart the agent, the next poll heals the provider |
-| Kubernetes login fails with a permission error | `Vault Kubernetes login failed` | The pod's ServiceAccount is not in the role's `bound_service_account_names`/`_namespaces`, or `auth/kubernetes/config` names the wrong API server |
-| Kubernetes ServiceAccount token errors | `Failed to read Kubernetes ServiceAccount token` / `ServiceAccount token ... is empty` | The token is not projected into the pod (check `automountServiceAccountToken` and the volume mount); the next refresh cycle heals the provider |
-| Startup fails immediately with a configuration error naming two env vars | — | Two auth methods configured at once; keep exactly one of token, AppRole, Kubernetes, token file |
+| Requests fail with `KMS credentials unavailable` | `Vault credential refresh failed; retrying until the credentials recover` (warn, repeated) | Vault unreachable/sealed, or the credential source is broken; the provider recovers on its own once refresh succeeds. Fix the cause; no restart needed. |
+| Renewal succeeded but re-login later fails | `Vault token renewal failed; falling back to a fresh login` followed by login errors | SecretID expired/revoked or AppRole role changed; rotate the secret_id file. |
+| Token file mode error at startup or during polls | `has insecure permissions` in the error | Fix the sink `mode` (0600) and the file owner; the next poll heals the provider. |
+| Token file missing/empty errors | `Failed to read Vault token file` / `token file ... is empty` | Vault Agent down or sink misconfigured; restart the agent, the next poll heals the provider. |
+| Kubernetes login fails with a permission error | `Vault Kubernetes login failed` | The pod's ServiceAccount is not in the role's `bound_service_account_names`/`_namespaces`, or `auth/kubernetes/config` names the wrong API server. |
+| Kubernetes ServiceAccount token errors | `Failed to read Kubernetes ServiceAccount token` / `ServiceAccount token ... is empty` | The token is not projected into the pod (check `automountServiceAccountToken` and the volume mount); the next refresh cycle heals the provider. |
+| Startup fails immediately with a configuration error naming two env vars | (none) | Two auth methods configured at once; keep exactly one of token, AppRole, Kubernetes, token file. |
 
 When diagnosing, confirm three clocks/lifetimes in order: the Vault token TTL (`vault token lookup` with the token's accessor), the RustFS refresh cadence (half TTL or the poll interval), and the fail-closed window. The renewal task logs every failed cycle, so a silent gap in warnings combined with `CredentialsUnavailable` errors points at the process clock or a paused runtime rather than Vault.
