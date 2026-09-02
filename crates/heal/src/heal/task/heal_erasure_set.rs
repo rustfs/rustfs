@@ -13,6 +13,13 @@
 // limitations under the License.
 /// erasure-set heal: drives the ErasureSetHealer across the set's buckets
 use super::*;
+use crate::heal::DiskStore;
+
+pub(super) async fn load_verified_replacement_resume(disk: &DiskStore, task_id: &str) -> Result<ResumeManager> {
+    let resume_manager = ResumeManager::load_replacement_intent(disk.clone(), task_id).await?;
+    resume_manager.ensure_replacement_completion_proof().await?;
+    Ok(resume_manager)
+}
 
 impl HealTask {
     pub(super) async fn heal_erasure_set(&self, buckets: Vec<String>, set_disk_id: String) -> Result<()> {
@@ -445,14 +452,16 @@ impl HealTask {
                     self.verify_replacement_identity_fence(expected_identities, &set_disk_id, "marker completion")
                         .await?;
                 }
+                let verified_replacement_resume = if let Some((disk, _, _)) = replacement_resume.as_ref() {
+                    Some((disk.clone(), load_verified_replacement_resume(disk, &self.id).await?))
+                } else {
+                    None
+                };
                 super::super::clear_healing_markers_after_verified(&self.heal_endpoints, &healing_marker).await?;
-                if let Some((disk, resume_manager, _)) = replacement_resume.as_ref() {
+                if let Some((disk, resume_manager)) = verified_replacement_resume {
                     resume_manager.mark_replacement_cleanup_pending().await?;
-                    if CheckpointManager::has_checkpoint(disk, &self.id).await {
-                        CheckpointManager::load_from_disk(disk.clone(), &self.id)
-                            .await?
-                            .cleanup()
-                            .await?;
+                    if CheckpointManager::has_checkpoint(&disk, &self.id).await {
+                        CheckpointManager::load_from_disk(disk, &self.id).await?.cleanup().await?;
                     }
                     resume_manager.cleanup().await?;
                 }
