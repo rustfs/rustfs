@@ -293,7 +293,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
         run: |
           set -uo pipefail
-          if [ -z "${{GH_TOKEN:-}}" ]; then
+          if [ -z "${GH_TOKEN:-}" ]; then
             echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
             exit 1
           fi
@@ -302,31 +302,31 @@ jobs:
             if gh api --method POST repos/rustfs/rustfs/dispatches \
               -f event_type='rustfs-chain-pool' \
               -F 'client_payload[from_suite]=heal'; then
-              echo "dispatched next suite Pool expansion (attempt ${{attempt}})"
+              echo "dispatched next suite Pool expansion (attempt ${attempt})"
               DISPATCHED=1
               break
             fi
-            echo "dispatch attempt ${{attempt}} failed; retrying in ${{attempt}}0s" >&2
-            sleep "${{attempt}}0"
+            echo "dispatch attempt ${attempt} failed; retrying in ${attempt}0s" >&2
+            sleep "${attempt}0"
           done
-          if [ "${{DISPATCHED:-0}}" -ne 1 ]; then
+          if [ "${DISPATCHED:-0}" -ne 1 ]; then
             echo "ERROR: functional chain stalled: could not dispatch Pool expansion after 3 attempts" >&2
-            TITLE="[functional][chain] stalled after heal (run ${{GITHUB_RUN_ID}})"
+            TITLE="[functional][chain] stalled after heal (run ${GITHUB_RUN_ID})"
             BODY_FILE="$(mktemp)"
             {
               echo "The functional chain could not hand off from **heal** to **Pool expansion** after 3 attempts."
               echo ""
-              echo "- Failed suite job: ${{GITHUB_SERVER_URL}}/${{GITHUB_REPOSITORY}}/actions/runs/${{GITHUB_RUN_ID}}"
-              echo "- Expected next event: `rustfs-chain-pool`"
+              echo "- Failed suite job: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              echo "- Expected next event: 'rustfs-chain-pool'"
               echo "- Likely cause: PF_TESTING_GH_TOKEN lacks contents:write on rustfs/rustfs, or the GitHub API was unavailable."
               echo "- Recovery: re-dispatch manually with"
-              echo "  ```"
+              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
               echo "  gh api --method POST repos/rustfs/rustfs/dispatches -f event_type='rustfs-chain-pool'"
-              echo "  ```"
-            } > "${{BODY_FILE}}"
-            gh issue create -R rustfs/backlog --title "${{TITLE}}" \
-              --body-file "${{BODY_FILE}}" --label functional-test \
-              || gh issue create -R rustfs/backlog --title "${{TITLE}}" --body-file "${{BODY_FILE}}" \
+              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
+            } > "${BODY_FILE}"
+            gh issue create -R rustfs/backlog --title "${TITLE}" \
+              --body-file "${BODY_FILE}" --label functional-test \
+              || gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}" \
               || echo "could not file the stall alert issue either; check the token" >&2
             exit 1
           fi
