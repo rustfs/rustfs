@@ -895,6 +895,226 @@ fn is_post_object_sse_kms_requested(input: &PutObjectInput, headers: &HeaderMap)
     is_sse_kms_requested(input, headers)
 }
 
+/// Standard content headers and the tagging / storage-class values of a PUT
+/// that become object metadata through [`apply_put_request_metadata`].
+pub(super) struct PutObjectContentInput {
+    pub(super) cache_control: Option<CacheControl>,
+    pub(super) content_disposition: Option<ContentDisposition>,
+    pub(super) content_encoding: Option<ContentEncoding>,
+    pub(super) content_language: Option<ContentLanguage>,
+    pub(super) content_type: Option<ContentType>,
+    pub(super) expires: Option<String>,
+    pub(super) website_redirect_location: Option<WebsiteRedirectLocation>,
+    pub(super) tagging: Option<TaggingHeader>,
+    pub(super) storage_class: Option<StorageClass>,
+}
+
+/// Encryption inputs of a PUT after the S3 input/header merge.
+pub(super) struct PutObjectSseInput {
+    pub(super) server_side_encryption: Option<ServerSideEncryption>,
+    pub(super) ssekms_key_id: Option<SSEKMSKeyId>,
+    pub(super) sse_customer_algorithm: Option<SSECustomerAlgorithm>,
+    pub(super) sse_customer_key: Option<s3s::dto::SSECustomerKey>,
+    pub(super) sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+}
+
+/// Explicit Object Lock values of a PUT; all `None` means the bucket default
+/// retention decides.
+pub(super) struct PutObjectLockInput {
+    pub(super) legal_hold_status: Option<ObjectLockLegalHoldStatus>,
+    pub(super) mode: Option<ObjectLockMode>,
+    pub(super) retain_until_date: Option<Timestamp>,
+}
+
+/// Expected body MD5 as the caller carries it. It is decoded at the same
+/// point of the write path for every origin so an invalid digest keeps its
+/// precedence relative to quota, admission and Object Lock errors.
+pub(super) enum PutObjectContentMd5 {
+    /// `Content-MD5` request header value.
+    Base64(String),
+    /// Lowercase hex digest, as an internal caller already holds it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "constructed by the internal put entry point"))]
+    Hex(String),
+}
+
+/// Where a single-object write originates.
+pub(super) enum PutObjectOrigin<'a> {
+    /// The S3 PutObject/PostObject handler: request-bound identity, the
+    /// audit/notification chain and the bucket-generation guard installed by
+    /// the access layer all come from the request.
+    S3 {
+        req: &'a S3Request<PutObjectInput>,
+        event_name: EventName,
+    },
+    /// A trusted in-process caller writing on the server's behalf. There is no
+    /// request and no credential: managed-SSE authorization treats the write
+    /// as internal, and the creation event, when requested, names
+    /// `principal_id` instead of an access key.
+    #[cfg_attr(not(test), expect(dead_code, reason = "constructed by the internal put entry point"))]
+    Internal { principal_id: &'static str, emit_events: bool },
+}
+
+impl PutObjectOrigin<'_> {
+    fn replication_request_authorized(&self) -> bool {
+        match self {
+            Self::S3 { req, .. } => replication_request_authorized(req),
+            Self::Internal { .. } => false,
+        }
+    }
+
+    fn apply_bucket_generation_guard(&self, bucket: &str, opts: &mut ObjectOptions) -> S3Result<()> {
+        match self {
+            Self::S3 { req, .. } => apply_bucket_generation_guard(req, bucket, opts),
+            Self::Internal { .. } => Ok(()),
+        }
+    }
+
+    fn sse_principal(&self) -> Option<SseKmsPrincipal> {
+        match self {
+            Self::S3 { req, .. } => SseKmsPrincipal::from_request(req),
+            Self::Internal { .. } => None,
+        }
+    }
+}
+
+/// Every input the shared single-object write path needs, independent of
+/// whether an S3 request or an internal caller produced it.
+pub(super) struct PutObjectWriteRequest<'a> {
+    pub(super) bucket: String,
+    pub(super) key: String,
+    /// Authoritative plaintext length; never negative.
+    pub(super) size: i64,
+    pub(super) quota_operation: QuotaOperation,
+    /// Authorized SSE-C replication body that is already ciphertext.
+    pub(super) ciphertext_passthrough: bool,
+    pub(super) inbound_replication_put: bool,
+    /// Request headers, or the object's content headers for an internal write.
+    pub(super) headers: &'a HeaderMap,
+    pub(super) query: Option<&'a str>,
+    pub(super) trailing_headers: Option<s3s::TrailingHeaders>,
+    pub(super) version_id: Option<String>,
+    pub(super) sse: PutObjectSseInput,
+    /// User metadata keyed the way s3s delivers it (`x-amz-meta-` stripped).
+    pub(super) user_metadata: HashMap<String, String>,
+    /// Internal `x-rustfs-internal-*` / `x-minio-internal-*` keys written
+    /// verbatim onto the object; empty for S3 requests.
+    pub(super) internal_metadata: HashMap<String, String>,
+    pub(super) content: PutObjectContentInput,
+    pub(super) object_lock: PutObjectLockInput,
+    pub(super) content_md5: Option<PutObjectContentMd5>,
+    /// ETag to store instead of the computed one; `None` keeps the computed
+    /// (or replication-header-derived) value.
+    pub(super) preserve_etag: Option<String>,
+    pub(super) origin: PutObjectOrigin<'a>,
+}
+
+/// Audit/notification completion of a write, per origin.
+pub(super) enum PutObjectCompletion {
+    S3(OperationHelper),
+    Internal(Option<Box<InternalPutObjectEvent>>),
+}
+
+impl PutObjectCompletion {
+    fn object(self, obj_info: ObjectInfo) -> Self {
+        match self {
+            Self::S3(helper) => Self::S3(helper.object(obj_info)),
+            Self::Internal(event) => Self::Internal(event.map(|event| Box::new(event.object(obj_info)))),
+        }
+    }
+
+    fn version_id(self, version_id: String) -> Self {
+        match self {
+            Self::S3(helper) => Self::S3(helper.version_id(version_id)),
+            Self::Internal(event) => Self::Internal(event.map(|event| Box::new(event.version_id(version_id)))),
+        }
+    }
+
+    fn complete<T>(self, result: &S3Result<S3Response<T>>) -> Self {
+        match self {
+            Self::S3(helper) => Self::S3(helper.complete(result)),
+            Self::Internal(event) => {
+                if let Some(event) = event {
+                    event.complete(result);
+                }
+                Self::Internal(None)
+            }
+        }
+    }
+}
+
+/// Record the failed completion and hand the error back to the caller.
+fn fail_put_object(completion: PutObjectCompletion, err: S3Error) -> S3Error {
+    let result: S3Result<S3Response<()>> = Err(err);
+    let _ = completion.complete(&result);
+    match result {
+        Err(err) => err,
+        Ok(_) => unreachable!("failed PutObject completion carries an error"),
+    }
+}
+
+/// A committed single-object write awaiting its response-side completion.
+pub(super) struct PutObjectCommitted {
+    pub(super) obj_info: ObjectInfo,
+    pub(super) put_versioned: bool,
+    pub(super) effective_sse: Option<ServerSideEncryption>,
+    pub(super) effective_kms_key_id: Option<SSEKMSKeyId>,
+    pub(super) sse_customer_algorithm: Option<SSECustomerAlgorithm>,
+    pub(super) sse_customer_key_md5: Option<SSECustomerKeyMD5>,
+    pub(super) put_extra_checksum_headers: Vec<(&'static str, String)>,
+    completion: PutObjectCompletion,
+    put_request_guard: PutObjectGuard,
+    bucket: String,
+    key: String,
+    start_time: Instant,
+    size: i64,
+    use_zero_copy_eager_put_path: bool,
+    concurrent_put_requests: usize,
+    buffer_size: usize,
+}
+
+impl PutObjectCommitted {
+    /// Publish the audit entry / creation event for `result`, record the
+    /// request-level PutObject metrics and release the request guard.
+    pub(super) fn finish<T>(self, result: &S3Result<S3Response<T>>) {
+        let Self {
+            completion,
+            mut put_request_guard,
+            bucket,
+            key,
+            start_time,
+            size,
+            use_zero_copy_eager_put_path,
+            concurrent_put_requests,
+            buffer_size,
+            ..
+        } = self;
+        let _ = completion.complete(result);
+
+        // Record PutObject metrics via zero-copy-metrics
+        {
+            let duration_ms = start_time.elapsed().as_millis() as f64;
+            rustfs_io_metrics::record_put_object(
+                duration_ms,
+                size,
+                use_zero_copy_eager_put_path, // Track if zero-copy was enabled
+            );
+        }
+
+        debug!(
+            target: "rustfs::app::object_usecase",
+            component = "app",
+            subsystem = "object",
+            bucket = %bucket,
+            key = %key,
+            concurrent_put_requests,
+            buffer_size,
+            "PutObject request completed"
+        );
+
+        put_request_guard.finish_ok();
+    }
+}
+
 impl DefaultObjectUsecase {
     fn should_use_large_put_concurrency_tuning(size: i64) -> bool {
         size >= DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES
@@ -1055,13 +1275,147 @@ impl DefaultObjectUsecase {
         };
 
         // Resolve the authoritative decoded/plain object length (rejecting negative/unknown) before anything else consumes it.
-        let mut size = resolve_put_object_authoritative_size(&req.headers, content_length)?;
+        let size = resolve_put_object_authoritative_size(&req.headers, content_length)?;
 
         if let Some(limit) = max_content_length
             && u64::try_from(size).is_ok_and(|size| size > limit)
         {
             return Err(S3Error::new(S3ErrorCode::EntityTooLarge));
         }
+
+        let write = PutObjectWriteRequest {
+            bucket: bucket.clone(),
+            key,
+            size,
+            quota_operation,
+            ciphertext_passthrough,
+            inbound_replication_put,
+            headers: &req.headers,
+            query: req.uri.query(),
+            trailing_headers: req.trailing_headers.clone(),
+            version_id,
+            sse: PutObjectSseInput {
+                server_side_encryption,
+                ssekms_key_id,
+                sse_customer_algorithm,
+                sse_customer_key,
+                sse_customer_key_md5,
+            },
+            user_metadata: metadata.unwrap_or_default(),
+            internal_metadata: HashMap::new(),
+            content: PutObjectContentInput {
+                cache_control,
+                content_disposition,
+                content_encoding,
+                content_language,
+                content_type,
+                expires,
+                website_redirect_location,
+                tagging,
+                storage_class,
+            },
+            object_lock: PutObjectLockInput {
+                legal_hold_status: object_lock_legal_hold_status,
+                mode: object_lock_mode,
+                retain_until_date: object_lock_retain_until_date,
+            },
+            content_md5: content_md5.map(PutObjectContentMd5::Base64),
+            preserve_etag: None,
+            origin: PutObjectOrigin::S3 { req: &req, event_name },
+        };
+        let committed = self.put_object_core(write, body, start_time).await?;
+
+        let raw_version = committed.obj_info.version_id.map(|v| v.to_string());
+        let put_version = if committed.put_versioned { raw_version } else { None };
+
+        let e_tag = committed.obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
+
+        let expiration = resolve_put_object_expiration(&bucket, &committed.obj_info).await;
+
+        let mut checksums = PutObjectChecksums {
+            crc32: input.checksum_crc32,
+            crc32c: input.checksum_crc32c,
+            sha1: input.checksum_sha1,
+            sha256: input.checksum_sha256,
+            crc64nvme: input.checksum_crc64nvme,
+        };
+        apply_trailing_checksums(
+            input.checksum_algorithm.as_ref().map(|a| a.as_str()),
+            &req.trailing_headers,
+            &mut checksums,
+        );
+
+        let output = PutObjectOutput {
+            e_tag,
+            server_side_encryption: committed.effective_sse.clone(),
+            sse_customer_algorithm: committed.sse_customer_algorithm.clone(),
+            sse_customer_key_md5: committed.sse_customer_key_md5.clone(),
+            ssekms_key_id: committed.effective_kms_key_id.clone(),
+            expiration,
+            checksum_crc32: checksums.crc32,
+            checksum_crc32c: checksums.crc32c,
+            checksum_sha1: checksums.sha1,
+            checksum_sha256: checksums.sha256,
+            checksum_crc64nvme: checksums.crc64nvme,
+            version_id: put_version,
+            ..Default::default()
+        };
+
+        // For browser-based POST uploads (multipart/form-data), response status/body handling
+        // is decided by s3s PostObject serializer (success_action_status / redirect semantics).
+
+        let response_build_stage_start = put_stage_metrics_enabled.then(Instant::now);
+        let mut response = S3Response::new(output);
+        // Echo XXHash3/64/128 / SHA-512 checksums that s3s PutObjectOutput has no typed
+        // field for (#1256).
+        inject_additional_checksum_headers(&mut response.headers, &committed.put_extra_checksum_headers);
+        rustfs_io_metrics::record_put_object_stage_duration_from("app_response_build", response_build_stage_start);
+        let result = Ok(response);
+        committed.finish(&result);
+
+        result
+    }
+
+    /// The single-object write path shared by the S3 handler and internal
+    /// callers: quota admission, foreground write admission, bucket default
+    /// SSE, Object Lock defaults, put options, the hashing/compressing/
+    /// encrypting reader, the owned store commit, usage accounting,
+    /// replication scheduling and the creation-event setup. The caller shapes
+    /// the request before and builds its response after.
+    pub(super) async fn put_object_core(
+        &self,
+        write: PutObjectWriteRequest<'_>,
+        body: StreamingBlob,
+        start_time: Instant,
+    ) -> S3Result<PutObjectCommitted> {
+        let put_stage_metrics_enabled = rustfs_io_metrics::put_stage_metrics_enabled();
+        let PutObjectWriteRequest {
+            bucket,
+            key,
+            mut size,
+            quota_operation,
+            ciphertext_passthrough,
+            inbound_replication_put,
+            headers,
+            query,
+            trailing_headers,
+            version_id,
+            sse,
+            user_metadata,
+            internal_metadata,
+            content,
+            object_lock,
+            content_md5,
+            preserve_etag,
+            origin,
+        } = write;
+        let PutObjectSseInput {
+            server_side_encryption,
+            ssekms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key,
+            sse_customer_key_md5,
+        } = sse;
 
         // The app check preserves the existing S3 error contract; the storage
         // commit path reserves the exact net logical growth under its locks.
@@ -1084,7 +1438,7 @@ impl DefaultObjectUsecase {
 
         let ingress_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let should_compress =
-            is_disk_compressible(&req.headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
+            is_disk_compressible(headers, &key) && size > MIN_DISK_COMPRESSIBLE_SIZE as i64 && !ciphertext_passthrough;
 
         // Resolve the store through the request-bound server context
         // (backlog#1052 S6), not the process-global handle, so an embedded
@@ -1175,7 +1529,7 @@ impl DefaultObjectUsecase {
         let (put_path, zero_copy_eager_put_path_status, use_zero_copy_eager_put_path, use_empty_or_small_eager_put_path) =
             select_put_path_with_concurrency(
                 size,
-                &req.headers,
+                headers,
                 server_side_encryption_requested,
                 should_compress,
                 false,
@@ -1200,33 +1554,33 @@ impl DefaultObjectUsecase {
         validate_sse_headers_for_write(
             effective_sse.as_ref(),
             effective_kms_key_id.as_ref(),
-            extract_ssekms_context_from_headers(&req.headers)?.as_ref(),
+            extract_ssekms_context_from_headers(headers)?.as_ref(),
             sse_customer_algorithm.as_ref(),
             sse_customer_key.as_ref(),
             sse_customer_key_md5.as_ref(),
             true, // PutObject requires all three: algorithm, key, key_md5
         )?;
 
-        let mut metadata = metadata.unwrap_or_default();
-        let has_explicit_object_lock_retention = object_lock_mode.is_some()
-            || object_lock_retain_until_date.is_some()
-            || has_replication_retention_update(&req.headers, inbound_replication_put);
+        let mut metadata = user_metadata;
+        let has_explicit_object_lock_retention = object_lock.mode.is_some()
+            || object_lock.retain_until_date.is_some()
+            || has_replication_retention_update(headers, inbound_replication_put);
         let object_lock_config_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket).await?;
         rustfs_io_metrics::record_put_object_stage_duration_from("app_object_lock_config_lookup", object_lock_config_stage_start);
         apply_put_request_metadata(
             &mut metadata,
-            &req.headers,
+            headers,
             &key,
-            cache_control,
-            content_disposition,
-            content_encoding,
-            content_language,
-            content_type,
-            expires,
-            website_redirect_location,
-            tagging,
-            storage_class.clone(),
+            content.cache_control,
+            content.content_disposition,
+            content.content_encoding,
+            content.content_language,
+            content.content_type,
+            content.expires,
+            content.website_redirect_location,
+            content.tagging,
+            content.storage_class,
         )?;
         apply_bucket_default_lock_retention(
             &bucket,
@@ -1234,29 +1588,33 @@ impl DefaultObjectUsecase {
             &mut metadata,
             has_explicit_object_lock_retention,
         )?;
+        metadata.extend(internal_metadata);
 
         let put_opts_stage_start = put_stage_metrics_enabled.then(Instant::now);
         let mut opts: ObjectOptions = put_opts_with_replication_authorization(
             &bucket,
             &key,
             version_id.clone(),
-            &req.headers,
+            headers,
             metadata.clone(),
-            replication_request_authorized(&req),
+            origin.replication_request_authorized(),
         )
         .await
         .map_err(ApiError::from)?;
+        if let Some(etag) = preserve_etag {
+            opts.preserve_etag = Some(etag);
+        }
         if let Some(quota_check) = quota_check.as_ref() {
             apply_quota_admission(&mut opts, quota_check)?;
         }
         rustfs_io_metrics::record_put_object_stage_duration_from("app_put_opts_build", put_opts_stage_start);
-        apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
+        origin.apply_bucket_generation_guard(&bucket, &mut opts)?;
         apply_put_request_object_lock_opts(
             &bucket,
             &object_lock_config_state,
-            object_lock_legal_hold_status,
-            object_lock_mode,
-            object_lock_retain_until_date,
+            object_lock.legal_hold_status,
+            object_lock.mode,
+            object_lock.retain_until_date,
             &mut opts,
         )?;
         let eager_put_commit_cancellation =
@@ -1278,7 +1636,7 @@ impl DefaultObjectUsecase {
         let prelookup_stage_start = (prelookup_required && put_stage_metrics_enabled).then(Instant::now);
         let prelookup_previous_current_size: Option<Option<u64>> = if prelookup_required {
             let current_opts: ObjectOptions = internal_object_info_lookup_opts(
-                get_opts(&bucket, &key, version_id.clone(), None, &req.headers)
+                get_opts(&bucket, &key, version_id.clone(), None, headers)
                     .await
                     .map_err(ApiError::from)?,
             );
@@ -1315,16 +1673,18 @@ impl DefaultObjectUsecase {
             )?;
         }
 
-        let mut md5hex = if let Some(base64_md5) = content_md5 {
-            let md5 = base64_simd::STANDARD
-                .decode_to_vec(base64_md5.as_bytes())
-                .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
-            Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
-        } else {
-            None
+        let mut md5hex = match content_md5 {
+            Some(PutObjectContentMd5::Base64(base64_md5)) => {
+                let md5 = base64_simd::STANDARD
+                    .decode_to_vec(base64_md5.as_bytes())
+                    .map_err(|e| ApiError::from(StorageError::other(format!("Invalid content MD5: {e}"))))?;
+                Some(hex_simd::encode_to_string(&md5, hex_simd::AsciiCase::Lower))
+            }
+            Some(PutObjectContentMd5::Hex(md5hex)) => Some(md5hex),
+            None => None,
         };
 
-        let mut sha256hex = get_content_sha256_with_query(&req.headers, req.uri.query());
+        let mut sha256hex = get_content_sha256_with_query(headers, query);
 
         let mut write_plan = WritePlan::new();
         // Additional-checksum (XXHash3/64/128, SHA-512) values to echo on the PutObject
@@ -1342,7 +1702,7 @@ impl DefaultObjectUsecase {
             let mut hrd =
                 HashReader::from_stream(body, size, size, md5hex.take(), sha256hex.take(), false).map_err(ApiError::from)?;
 
-            if let Err(err) = hrd.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+            if let Err(err) = hrd.add_checksum_from_s3s(headers, trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -1392,7 +1752,7 @@ impl DefaultObjectUsecase {
         };
 
         if size >= 0 {
-            if let Err(err) = reader.add_checksum_from_s3s(&req.headers, req.trailing_headers.clone(), false) {
+            if let Err(err) = reader.add_checksum_from_s3s(headers, trailing_headers.clone(), false) {
                 return Err(ApiError::from(err).into());
             }
 
@@ -1402,12 +1762,35 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_path(put_path);
         rustfs_io_metrics::record_put_object_stage_duration_from("ingress_prepare", ingress_stage_start);
 
-        let mut helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
-        let ssekms_context = extract_ssekms_context_from_headers(&req.headers)?;
+        let (mut completion, request_context) = match &origin {
+            PutObjectOrigin::S3 { req, event_name } => (
+                PutObjectCompletion::S3(OperationHelper::new(req, *event_name, S3Operation::PutObject)),
+                req.extensions.get::<request_context::RequestContext>().cloned(),
+            ),
+            PutObjectOrigin::Internal {
+                principal_id,
+                emit_events,
+            } => {
+                let principal_id = *principal_id;
+                let request_context = request_context::RequestContext::fallback();
+                let event = emit_events.then(|| {
+                    InternalPutObjectEvent::new(
+                        current_notify_interface_for_context(self.context.as_deref()),
+                        request_context.clone(),
+                        EventName::ObjectCreatedPut,
+                        &bucket,
+                        &key,
+                        principal_id,
+                    )
+                });
+                (PutObjectCompletion::Internal(event.flatten().map(Box::new)), Some(request_context))
+            }
+        };
+        let ssekms_context = extract_ssekms_context_from_headers(headers)?;
 
         // Apply encryption using unified SSE API.
         let encryption_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let write_principal = SseKmsPrincipal::from_request(&req);
+        let write_principal = origin.sse_principal();
         let encryption_request = EncryptionRequest {
             bucket: &bucket,
             key: &key,
@@ -1430,11 +1813,7 @@ impl DefaultObjectUsecase {
         } else {
             match sse_encryption(encryption_request).await {
                 Ok(material) => material,
-                Err(err) => {
-                    let result = Err(err.into());
-                    let _ = helper.complete(&result);
-                    return result;
-                }
+                Err(err) => return Err(fail_put_object(completion, err.into())),
             }
         };
 
@@ -1460,7 +1839,6 @@ impl DefaultObjectUsecase {
 
         let mt2 = metadata.clone();
         opts.user_defined.extend(metadata);
-        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let request_id = request_context
             .as_ref()
             .map(|ctx| ctx.request_id.clone())
@@ -1660,100 +2038,41 @@ impl DefaultObjectUsecase {
         let PutObjectCommitResult { obj_info, put_versioned } = match put_commit_result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
-                let result: S3Result<S3Response<PutObjectOutput>> = Err(err);
                 put_request_guard.finish_err();
-                let _ = helper.complete(&result);
-                return result;
+                return Err(fail_put_object(completion, err));
             }
             Err(err) => {
-                let result: S3Result<S3Response<PutObjectOutput>> = Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    format!("put object commit owner task failed: {err}"),
-                ));
                 put_request_guard.finish_err();
-                let _ = helper.complete(&result);
-                return result;
+                return Err(fail_put_object(
+                    completion,
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("put object commit owner task failed: {err}")),
+                ));
             }
         };
 
-        let raw_version = obj_info.version_id.map(|v| v.to_string());
-
-        helper = helper.object(obj_info.clone());
-        if let Some(version_id) = &raw_version {
-            helper = helper.version_id(version_id.clone());
+        completion = completion.object(obj_info.clone());
+        if let Some(version_id) = obj_info.version_id {
+            completion = completion.version_id(version_id.to_string());
         }
 
-        let put_version = if put_versioned { raw_version } else { None };
-
-        let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
-
-        let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
-
-        let mut checksums = PutObjectChecksums {
-            crc32: input.checksum_crc32,
-            crc32c: input.checksum_crc32c,
-            sha1: input.checksum_sha1,
-            sha256: input.checksum_sha256,
-            crc64nvme: input.checksum_crc64nvme,
-        };
-        apply_trailing_checksums(
-            input.checksum_algorithm.as_ref().map(|a| a.as_str()),
-            &req.trailing_headers,
-            &mut checksums,
-        );
-
-        let output = PutObjectOutput {
-            e_tag,
-            server_side_encryption: effective_sse,
-            sse_customer_algorithm: sse_customer_algorithm.clone(),
-            sse_customer_key_md5: sse_customer_key_md5.clone(),
-            ssekms_key_id: effective_kms_key_id,
-            expiration,
-            checksum_crc32: checksums.crc32,
-            checksum_crc32c: checksums.crc32c,
-            checksum_sha1: checksums.sha1,
-            checksum_sha256: checksums.sha256,
-            checksum_crc64nvme: checksums.crc64nvme,
-            version_id: put_version,
-            ..Default::default()
-        };
-
-        // For browser-based POST uploads (multipart/form-data), response status/body handling
-        // is decided by s3s PostObject serializer (success_action_status / redirect semantics).
-
-        let response_build_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let mut response = S3Response::new(output);
-        // Echo XXHash3/64/128 / SHA-512 checksums that s3s PutObjectOutput has no typed
-        // field for (#1256).
-        inject_additional_checksum_headers(&mut response.headers, &put_extra_checksum_headers);
-        rustfs_io_metrics::record_put_object_stage_duration_from("app_response_build", response_build_stage_start);
-        let result = Ok(response);
-        let _ = helper.complete(&result);
-
-        // Record PutObject metrics via zero-copy-metrics
-        {
-            let duration_ms = start_time.elapsed().as_millis() as f64;
-            rustfs_io_metrics::record_put_object(
-                duration_ms,
-                size,
-                use_zero_copy_eager_put_path, // Track if zero-copy was enabled
-            );
-        }
-
-        debug!(
-            target: "rustfs::app::object_usecase",
-            component = "app",
-            subsystem = "object",
-            bucket = %bucket,
-            key = %key,
+        Ok(PutObjectCommitted {
+            obj_info,
+            put_versioned,
+            effective_sse,
+            effective_kms_key_id,
+            sse_customer_algorithm,
+            sse_customer_key_md5,
+            put_extra_checksum_headers,
+            completion,
+            put_request_guard,
+            bucket,
+            key,
+            start_time,
+            size,
+            use_zero_copy_eager_put_path,
             concurrent_put_requests,
             buffer_size,
-            "PutObject request completed"
-        );
-
-        put_request_guard.finish_ok();
-
-        result
+        })
     }
 }
 
