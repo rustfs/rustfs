@@ -111,9 +111,12 @@ impl ECStore {
         write_state.ensure_write_safe("heal format fence failed")?;
 
         // Metadata fence order is part of the decommission/rebalance protocol:
-        // pool.bin must always be acquired before rebalance.bin.
+        // pool.bin must always be acquired before rebalance.bin. A read guard is
+        // sufficient to freeze the pool snapshot and lets replacement format
+        // recovery coexist with ordinary Heal's capacity fence. The rebalance
+        // write guard still serializes format repair and excludes transitions.
         let pool_lock = metadata_pool.new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME).await?;
-        let pool_guard = pool_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+        let pool_guard = pool_lock.get_read_lock(get_lock_acquire_timeout()).await?;
         let rebalance_lock = metadata_pool.new_ns_lock(RUSTFS_META_BUCKET, REBAL_META_NAME).await?;
         let rebalance_guard = rebalance_lock.get_write_lock(get_lock_acquire_timeout()).await?;
 
@@ -1102,7 +1105,8 @@ mod tests {
         pool_index: usize,
         disk_index: usize,
     ) -> String {
-        let target = store.pools[pool_index].endpoints.endpoints.as_ref()[disk_index].to_string();
+        let endpoint = store.pools[pool_index].endpoints.endpoints.as_ref()[disk_index].clone();
+        let target = endpoint.to_string();
         let format_path = heal_test_format_path(temp_dir, pool_index, disk_index);
         tokio::fs::remove_file(&format_path)
             .await
@@ -1112,6 +1116,22 @@ mod tests {
                 .await
                 .expect("replacement target format path should be inspectable")
         );
+        let replacement = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("unformatted replacement disk should open");
+        let set = &store.pools[pool_index].disk_set[0];
+        let target_slot = set
+            .set_endpoints
+            .iter()
+            .position(|candidate| candidate == &endpoint)
+            .expect("replacement endpoint should belong to its set");
+        set.disks.write().await[target_slot] = Some(replacement);
         target
     }
 
@@ -1122,6 +1142,74 @@ mod tests {
                 .expect("replacement target format path should be inspectable"),
             "format heal must not write the replacement target"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_format_heal_coexists_with_capacity_read_fence() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        let capacity_guard = store
+            .acquire_external_decommission_capacity_fence(&[0], "heal")
+            .await
+            .expect("ordinary heal capacity fence should be acquired");
+
+        let (_, err) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), store.heal_replacement_format(false, 0, 0, &[target]))
+                .await
+                .expect("replacement format heal must not wait on an existing capacity read fence")
+                .expect("replacement format heal should complete");
+
+        assert!(err.is_none(), "replacement format heal should succeed: {err:?}");
+        assert!(
+            tokio::fs::try_exists(heal_test_format_path(&temp_dir, 0, 3))
+                .await
+                .expect("replacement target format path should be inspectable"),
+            "replacement format heal should restore the target while the capacity read fence is held"
+        );
+        drop(capacity_guard);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_format_heal_remains_blocked_by_pool_metadata_writer() {
+        let (temp_dir, store, shutdown) = multi_pool_heal_store().await;
+        let target = remove_heal_test_format(&temp_dir, &store, 0, 3).await;
+        let pool_lock = store.pools[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("pool metadata lock should be created");
+        let pool_writer = pool_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("pool metadata writer should be acquired");
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                store.heal_replacement_format(false, 0, 0, std::slice::from_ref(&target)),
+            )
+            .await
+            .is_err(),
+            "replacement format heal must wait for a pool metadata writer"
+        );
+        assert_heal_test_format_missing(&temp_dir, 0, 3).await;
+
+        drop(pool_writer);
+        let (_, err) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), store.heal_replacement_format(false, 0, 0, &[target]))
+                .await
+                .expect("replacement format heal should resume after the writer releases")
+                .expect("replacement format heal should complete after the writer releases");
+        assert!(err.is_none(), "replacement format heal should succeed: {err:?}");
+        assert!(
+            tokio::fs::try_exists(heal_test_format_path(&temp_dir, 0, 3))
+                .await
+                .expect("replacement target format path should be inspectable"),
+            "replacement format heal should restore the target after the writer releases"
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test]
