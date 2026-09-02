@@ -163,7 +163,7 @@ impl InternalPutObjectEvent {
         })
     }
 
-    fn builder(event_name: EventName, bucket: &str, key: &str, principal_id: &'static str) -> EventArgsBuilder {
+    pub(super) fn builder(event_name: EventName, bucket: &str, key: &str, principal_id: &'static str) -> EventArgsBuilder {
         // The object is a placeholder until `object()` supplies the committed
         // ObjectInfo, matching the S3 helper.
         let placeholder = ObjectInfo {

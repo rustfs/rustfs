@@ -159,6 +159,11 @@ pub mod bucket {
             OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy,
             SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
         };
+        pub use crate::bucket::on_demand_migration::{
+            EnqueueOutcome, LocalObject, MAX_MULTIPART_PARTS, OdmWriteBack, PULL_MAX_RETRIES, PULL_RETRY_BASE_DELAYS,
+            PullCompletion, PullQueue, PullReason, PullSource, SourceBody, WriteBackBody, WriteBackError, WriteBackOutcome,
+            WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with,
+        };
         pub mod source_client {
             pub use crate::bucket::on_demand_migration::source_client::{
                 SourceClient, SourceClientSpec, SourceError, SourceGet, SourceHead, SourceObject, SourcePage, SourceProbe,
