@@ -2117,10 +2117,13 @@ fn release_decommission_target_inflight(
     target_pool_index: usize,
     released_physical_bytes: usize,
     mutation_id: uuid::Uuid,
-    confirmed_absent: bool,
-    clear_pending: bool,
+    proof: DecommissionCapacityReleaseProof,
     now: OffsetDateTime,
 ) -> Result<bool> {
+    let DecommissionCapacityReleaseProof {
+        confirmed_absent,
+        clear_pending,
+    } = proof;
     let pool_count = meta.pools.len();
     let pool = meta
         .pools
@@ -7388,6 +7391,28 @@ pub struct DecommissionCapacityReservation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecommissionCapacityMutationMode {
+    Durable,
+    Temporary,
+    TemporaryRelease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecommissionCapacityReleaseProof {
+    confirmed_absent: bool,
+    clear_pending: bool,
+}
+
+impl DecommissionCapacityReleaseProof {
+    const fn confirmed_absence(clear_pending: bool) -> Self {
+        Self {
+            confirmed_absent: true,
+            clear_pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DecommissionCapacityOwner {
     pub(crate) source_pool_index: usize,
     pub(crate) operation_id: uuid::Uuid,
@@ -9126,8 +9151,7 @@ impl ECStore {
             target_pool_index,
             capacity_owner,
             expected_data_bytes,
-            false,
-            false,
+            DecommissionCapacityMutationMode::Durable,
             |_| false,
             |_| operation(),
         )
@@ -9149,8 +9173,7 @@ impl ECStore {
             target_pool_index,
             capacity_owner,
             expected_data_bytes,
-            false,
-            false,
+            DecommissionCapacityMutationMode::Durable,
             |_| false,
             operation,
         )
@@ -9484,8 +9507,7 @@ impl ECStore {
             target_pool_index,
             capacity_owner,
             expected_data_bytes,
-            true,
-            false,
+            DecommissionCapacityMutationMode::Temporary,
             |_| false,
             |_| operation(),
         )
@@ -9507,8 +9529,7 @@ impl ECStore {
             target_pool_index,
             capacity_owner,
             expected_data_bytes,
-            true,
-            false,
+            DecommissionCapacityMutationMode::Temporary,
             |_| false,
             operation,
         )
@@ -9730,8 +9751,7 @@ impl ECStore {
             target_pool_index,
             capacity_owner,
             None,
-            false,
-            true,
+            DecommissionCapacityMutationMode::TemporaryRelease,
             |result: &(T, bool)| result.1,
             operation,
         )
@@ -9744,8 +9764,7 @@ impl ECStore {
         target_pool_index: usize,
         capacity_owner: Option<DecommissionCapacityOwner>,
         expected_data_bytes: Option<usize>,
-        temporary: bool,
-        temporary_release: bool,
+        mode: DecommissionCapacityMutationMode,
         clear_pending_on_temporary_release: P,
         operation: F,
     ) -> Result<T>
@@ -9754,6 +9773,8 @@ impl ECStore {
         Fut: std::future::Future<Output = Result<T>>,
         P: Fn(&T) -> bool,
     {
+        let temporary = matches!(mode, DecommissionCapacityMutationMode::Temporary);
+        let temporary_release = matches!(mode, DecommissionCapacityMutationMode::TemporaryRelease);
         let mut operation = Some(operation);
         let mut save_guard = self.pool_meta_save_gate.lock().await;
         let (read_guard, snapshot) = self
@@ -10015,8 +10036,7 @@ impl ECStore {
                     target_pool_index,
                     released_physical_bytes,
                     mutation_id,
-                    true,
-                    clear_pending_on_temporary_release,
+                    DecommissionCapacityReleaseProof::confirmed_absence(clear_pending_on_temporary_release),
                     now,
                 )?
             } else {
@@ -19166,8 +19186,8 @@ mod pools_tests {
         with_decommission_entry_context,
     };
     use super::{
-        DecommissionCapacityOwner, DecommissionCapacityReservation, DecommissionCapacityTemporaryMutation,
-        decommission_capacity_mutation_id, ensure_decommission_target_owner_admission,
+        DecommissionCapacityOwner, DecommissionCapacityReleaseProof, DecommissionCapacityReservation,
+        DecommissionCapacityTemporaryMutation, decommission_capacity_mutation_id, ensure_decommission_target_owner_admission,
         ensure_exact_delete_capacity_namespace_fences, ensure_external_decommission_target_admission,
         is_decommission_capacity_blocked_error, plan_exact_delete_capacity_reconciliations,
         record_decommission_target_consumption, release_decommission_target_inflight, reserve_decommission_target_pending,
@@ -23809,8 +23829,7 @@ mod pools_tests {
                 1,
                 0,
                 mutation_id,
-                true,
-                true,
+                DecommissionCapacityReleaseProof::confirmed_absence(true),
                 OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
             )
             .expect("confirmed absence should release the exact mutation")
@@ -23837,8 +23856,7 @@ mod pools_tests {
                 1,
                 0,
                 mutation_id,
-                true,
-                true,
+                DecommissionCapacityReleaseProof::confirmed_absence(true),
                 OffsetDateTime::UNIX_EPOCH + Duration::seconds(2),
             )
             .expect("repeated confirmed absence should be a metadata no-op")
@@ -23863,8 +23881,7 @@ mod pools_tests {
                 1,
                 12,
                 mutation_id,
-                true,
-                true,
+                DecommissionCapacityReleaseProof::confirmed_absence(true),
                 OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
             )
             .expect("legacy unscoped cleanup should use its observed release delta")
@@ -23895,8 +23912,7 @@ mod pools_tests {
                 1,
                 7,
                 mutation_id,
-                true,
-                true,
+                DecommissionCapacityReleaseProof::confirmed_absence(true),
                 OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
             )
             .expect("a confirmed absent upload should clear its matching pending identity")
@@ -23931,8 +23947,7 @@ mod pools_tests {
                 1,
                 0,
                 mutation_id,
-                true,
-                false,
+                DecommissionCapacityReleaseProof::confirmed_absence(false),
                 OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
             )
             .expect("published-target cleanup should release only its temporary staging state")
@@ -23972,8 +23987,7 @@ mod pools_tests {
                 1,
                 7,
                 mutation_id,
-                true,
-                false,
+                DecommissionCapacityReleaseProof::confirmed_absence(false),
                 OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
             )
             .expect("a delayed statfs release must not block published-target reconciliation")
@@ -24011,8 +24025,7 @@ mod pools_tests {
             1,
             5,
             uuid::Uuid::new_v4(),
-            true,
-            true,
+            DecommissionCapacityReleaseProof::confirmed_absence(true),
             OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
         )
         .expect_err("an observed release cannot be charged to a foreign scoped mutation");
@@ -24042,8 +24055,7 @@ mod pools_tests {
                 1,
                 7,
                 uuid::Uuid::new_v4(),
-                true,
-                true,
+                DecommissionCapacityReleaseProof::confirmed_absence(true),
                 OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
             )
             .expect("confirmed absence without tracked state should ignore a delayed capacity observation")
@@ -24078,8 +24090,7 @@ mod pools_tests {
             1,
             7,
             uuid::Uuid::new_v4(),
-            true,
-            true,
+            DecommissionCapacityReleaseProof::confirmed_absence(true),
             OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
         )
         .expect_err("a delayed release observation must not clear a foreign pending mutation");
