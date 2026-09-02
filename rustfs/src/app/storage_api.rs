@@ -1157,6 +1157,19 @@ pub(crate) mod bucket_usecase {
 pub(crate) mod object_usecase {
     pub(crate) use super::storage_contracts::BUCKET_LIFECYCLE_LOCK_OBJECT;
 
+    pub(crate) mod on_demand_migration {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::PullFailureReason;
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::SourceSse;
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::{
+            SourceHead, is_multipart_etag,
+        };
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
+            LocalObject, OdmWriteBack, WriteBackBody, WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest,
+        };
+    }
+
     pub(crate) mod object_cache {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_object::GetObjectBodySource;
@@ -1285,6 +1298,7 @@ pub(crate) mod test {
     pub(crate) mod data_usage {
         pub(crate) use super::super::data_usage::*;
     }
+    pub(crate) use crate::storage::storage_api::bootstrap_instance_ctx;
     pub(crate) use crate::storage::storage_api::ecstore_bucket::install_all_v6_fleet_capability_proof;
     pub(crate) use crate::storage::storage_api::test_consumer::{get_global_bucket_metadata_sys, set_bucket_metadata};
     pub(crate) use crate::storage::storage_api::{

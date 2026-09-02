@@ -933,7 +933,6 @@ pub(super) enum PutObjectContentMd5 {
     /// `Content-MD5` request header value.
     Base64(String),
     /// Lowercase hex digest, as an internal caller already holds it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "constructed by the internal put entry point"))]
     Hex(String),
 }
 
@@ -950,7 +949,6 @@ pub(super) enum PutObjectOrigin<'a> {
     /// request and no credential: managed-SSE authorization treats the write
     /// as internal, and the creation event, when requested, names
     /// `principal_id` instead of an access key.
-    #[cfg_attr(not(test), expect(dead_code, reason = "constructed by the internal put entry point"))]
     Internal { principal_id: &'static str, emit_events: bool },
 }
 

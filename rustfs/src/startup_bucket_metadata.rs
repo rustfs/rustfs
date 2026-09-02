@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::object::OnDemandMigrationWriteBack;
 use crate::module_switches::{on_demand_migration_enabled_from_env, set_on_demand_migration_module_enabled};
 use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::startup::bucket_metadata::{
@@ -90,15 +91,18 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
     Ok(buckets)
 }
 
-/// Publishes the on-demand migration module switch and registers the
-/// runtime's config hook before bucket metadata is loaded, so every cache
-/// install path (initial load included) reaches `OnDemandMigrationSys`
-/// (rustfs/backlog#2152). Idempotent across embedded and server startups.
+/// Publishes the on-demand migration module switch, installs the app-layer
+/// write-back the pull pipeline stores objects with (rustfs/backlog#2153),
+/// and registers the runtime's config hook before bucket metadata is
+/// loaded, so every cache install path (initial load included) reaches
+/// `OnDemandMigrationSys` with a usable write-back (rustfs/backlog#2152).
+/// Idempotent across embedded and server startups.
 fn init_on_demand_migration_runtime() {
     let enabled = on_demand_migration_enabled_from_env();
     set_on_demand_migration_module_enabled(enabled);
     let sys = OnDemandMigrationSys::get();
     sys.set_module_enabled(enabled);
+    sys.set_write_back(Arc::new(OnDemandMigrationWriteBack::new()));
     let hook_registered = sys.register_config_hook();
     tracing::info!(
         event = EVENT_ON_DEMAND_MIGRATION_RUNTIME_INITIALIZED,
