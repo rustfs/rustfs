@@ -52,7 +52,6 @@ use super::runtime_boundary as runtime_sources;
 use futures_util::stream::{self, StreamExt};
 use metrics::{counter, histogram};
 use rustfs_utils::hash::HashAlgorithm;
-use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
@@ -939,7 +938,11 @@ async fn replay_mrf_object_entry<S: ReplicationStorage>(
         Some(queue_replication_heal(&entry.bucket, oi, entry.retry_count.max(0) as u32).await)
     } else {
         let roi = admitted_mrf_replicate_object(oi, entry, entry.op.replication_type());
-        if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+        if replicate_object_with_outcome(roi, storage.clone())
+            .await
+            .1
+            .consumes_mrf_entry()
+        {
             Some(ReplicationQueueAdmission::Queued)
         } else {
             Some(ReplicationQueueAdmission::Missed)
@@ -978,7 +981,11 @@ async fn replay_mrf_metadata_entry<S: ReplicationStorage>(
         Some(queue_replication_metadata(&entry.bucket, oi, entry.retry_count.max(0) as u32).await)
     } else {
         let roi = admitted_mrf_replicate_object(oi, entry, ReplicationType::Metadata);
-        if replicate_object_with_outcome(roi, storage.clone()).await.1 {
+        if replicate_object_with_outcome(roi, storage.clone())
+            .await
+            .1
+            .consumes_mrf_entry()
+        {
             Some(ReplicationQueueAdmission::Queued)
         } else {
             Some(ReplicationQueueAdmission::Missed)
@@ -2978,8 +2985,11 @@ fn replicate_object_info_from_object_info(
 ) -> ReplicateObjectInfo {
     let tgt_statuses = replication_statuses_map(&oi.replication_status_internal.clone().unwrap_or_default());
     let purge_statuses = version_purge_statuses_map(&oi.version_purge_status_internal.clone().unwrap_or_default());
-    let tm = get_str(&oi.user_defined, SUFFIX_REPLICATION_TIMESTAMP)
-        .map(|v| OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
+    let replication_generation = oi.replication_generation_snapshot();
+    let tm = replication_generation
+        .timestamp
+        .as_deref()
+        .map(|value| OffsetDateTime::parse(value, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH));
     let mut rstate = oi.replication_state();
     rstate.replicate_decision_str = dsc.to_string();
     let asz = oi.get_actual_size_or_physical();
@@ -3006,6 +3016,7 @@ fn replicate_object_info_from_object_info(
         target_statuses: tgt_statuses,
         target_purge_statuses: purge_statuses,
         replication_timestamp: tm,
+        replication_generation,
         user_tags: (*oi.user_tags).clone(),
         checksum,
         retry_count: 0,

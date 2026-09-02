@@ -18,7 +18,11 @@ use tokio_util::sync::CancellationToken;
 use super::replication_error_boundary::Error;
 use super::replication_filemeta_boundary::{replication_state_from_filemeta, version_purge_status_from_filemeta};
 pub(crate) type ReplicationObjectStore = crate::store::ECStore;
-pub(crate) use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+pub(crate) use crate::object_api::{
+    GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode,
+};
+#[cfg(test)]
+pub(crate) use crate::object_api::{NamespaceLockFence, NamespaceLockSignalTestFence};
 pub(crate) use crate::storage_api_contracts::list::{
     ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
 };

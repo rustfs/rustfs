@@ -30,8 +30,8 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
-        ReplicationRule, ReplicationRuleStatus, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-        ServerSideEncryptionRule, VersioningConfiguration,
+        ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault,
+        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
     };
 }
 

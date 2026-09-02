@@ -99,11 +99,11 @@ use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
 #[cfg(test)]
-use rustfs_utils::http::insert_header;
+use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, insert_header};
 use rustfs_utils::http::{
-    SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS,
-    SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_consistent_str, get_header,
-    get_source_scheme,
+    SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICATION_GENERATION,
+    SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_consistent_str, get_header, get_source_scheme,
     headers::{AMZ_CHECKSUM_TYPE, AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     insert_str,
 };
@@ -733,6 +733,43 @@ impl DefaultMultipartUsecase {
             None => None,
         };
 
+        // Replication admission is decided at the object-creation commit, not
+        // at multipart-session creation. Configuration and matching targets
+        // can change while parts are uploaded, so persist the exact decision's
+        // generation and PENDING set atomically with the completed object and
+        // reuse the same decision for scheduling below.
+        let completion_replication_decision = must_replicate_object(
+            &bucket,
+            &key,
+            &multipart_info.user_defined,
+            "".to_string(),
+            opts.delete_marker_replication_status(),
+            opts.clone(),
+        )
+        .await;
+        let mut completion_replication_metadata = HashMap::new();
+        if completion_replication_decision.replicate_any() {
+            insert_str(
+                &mut completion_replication_metadata,
+                SUFFIX_REPLICATION_GENERATION,
+                Uuid::new_v4().to_string(),
+            );
+            insert_str(
+                &mut completion_replication_metadata,
+                SUFFIX_REPLICATION_TIMESTAMP,
+                jiff::Zoned::now().to_string(),
+            );
+            insert_str(
+                &mut completion_replication_metadata,
+                SUFFIX_REPLICATION_STATUS,
+                completion_replication_decision.pending_status().unwrap_or_default(),
+            );
+        }
+        // `Some(empty)` deliberately means that completion re-evaluated the
+        // session as not admitted; storage removes stale Create-MPU admission
+        // metadata in the same final-object commit.
+        opts.eval_metadata = Some(completion_replication_metadata);
+
         let complete_commit = spawn_traced_join({
             let store = Arc::clone(&store);
             let bucket = bucket.clone();
@@ -760,20 +797,9 @@ impl DefaultMultipartUsecase {
 
                 enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
 
-                let mt2 = obj_info.user_defined.clone();
-                let dsc = must_replicate_object(
-                    &bucket,
-                    &key,
-                    &mt2,
-                    "".to_string(),
-                    opts.delete_marker_replication_status(),
-                    opts.clone(),
-                )
-                .await;
-
-                if dsc.replicate_any() {
+                if completion_replication_decision.replicate_any() {
                     warn!("need multipart replication");
-                    schedule_object_replication(obj_info.clone(), store, dsc).await;
+                    schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
                 }
 
                 rustfs_scanner::record_dirty_usage_bucket(&bucket);
@@ -1037,6 +1063,7 @@ impl DefaultMultipartUsecase {
             must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
                 .await;
         if dsc.replicate_any() {
+            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(
                 &mut opts.user_defined,
@@ -2497,6 +2524,80 @@ mod tests {
                 .expect("read live quota usage");
             assert_eq!(quota.current_usage, Some(actual_size as u64));
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn authorized_replica_only_multipart_complete_preserves_persisted_anti_cascade_state() {
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("replica-only-complete", 16_384).await;
+        let object = "object";
+        let usecase = DefaultMultipartUsecase::from_global();
+
+        let create_input = CreateMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .build()
+            .expect("create multipart input should build");
+        let mut create_request = build_request(create_input, Method::POST);
+        create_request
+            .headers
+            .insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
+        create_request.extensions.insert(crate::storage::access::ReqInfo {
+            replication_request_authorized: true,
+            ..Default::default()
+        });
+        let upload_id = usecase
+            .execute_create_multipart_upload(create_request)
+            .await
+            .expect("authorized REPLICA-only create should succeed")
+            .output
+            .upload_id
+            .expect("create response should contain upload id");
+
+        let mut reader = PutObjReader::from_vec(b"authorized replica-only multipart body".to_vec());
+        let part = store
+            .put_object_part(&bucket, object, &upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("replica part should be staged");
+        let complete_input = CompleteMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_string())
+            .upload_id(upload_id)
+            .multipart_upload(Some(CompletedMultipartUpload {
+                parts: Some(vec![CompletedPart {
+                    part_number: Some(1),
+                    e_tag: part.etag.map(|etag| to_s3s_etag(&etag)),
+                    ..Default::default()
+                }]),
+            }))
+            .build()
+            .expect("complete multipart input should build");
+        let mut complete_request = build_request(complete_input, Method::POST);
+        complete_request
+            .headers
+            .insert(AMZ_BUCKET_REPLICATION_STATUS, HeaderValue::from_static("REPLICA"));
+        complete_request.extensions.insert(crate::storage::access::ReqInfo {
+            replication_request_authorized: true,
+            ..Default::default()
+        });
+        usecase
+            .execute_complete_multipart_upload(complete_request)
+            .await
+            .expect("authorized REPLICA-only completion should succeed without the source-request marker");
+
+        let persisted = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("completed replica should be readable from storage");
+        assert_eq!(
+            persisted
+                .user_defined
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS))
+                .map(|(_, value)| value.as_str()),
+            Some("REPLICA"),
+            "the committed xl.meta must retain REPLICA to prevent scanner cascades"
+        );
     }
 
     #[tokio::test]

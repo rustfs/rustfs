@@ -721,11 +721,7 @@ impl DefaultObjectUsecase {
         // exempt: the authorized replication request owns these keys (see
         // copy_dst_opts_with_replication_authorization above).
         if !dst_opts.replication_request {
-            user_defined.retain(|k, _| !k.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS));
-            remove_str(&mut user_defined, SUFFIX_REPLICATION_STATUS);
-            remove_str(&mut user_defined, SUFFIX_REPLICATION_TIMESTAMP);
-            remove_str(&mut user_defined, SUFFIX_REPLICA_STATUS);
-            remove_str(&mut user_defined, SUFFIX_REPLICA_TIMESTAMP);
+            remove_source_replication_bookkeeping(&mut user_defined);
         }
 
         // Compute the replication decision exactly once per copy. The same
@@ -746,6 +742,7 @@ impl DefaultObjectUsecase {
         )
         .await;
         if dsc.replicate_any() {
+            insert_str(&mut user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(&mut user_defined, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
         }
@@ -913,6 +910,37 @@ mod tests {
     use s3s::dto::{ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule};
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn local_copy_does_not_inherit_source_replication_generation() {
+        let mut metadata = HashMap::from([
+            (AMZ_BUCKET_REPLICATION_STATUS.to_string(), "COMPLETED".to_string()),
+            ("x-amz-meta-owner".to_string(), "source".to_string()),
+        ]);
+        for suffix in [
+            SUFFIX_REPLICATION_GENERATION,
+            SUFFIX_REPLICATION_STATUS,
+            SUFFIX_REPLICATION_TIMESTAMP,
+            SUFFIX_REPLICA_STATUS,
+            SUFFIX_REPLICA_TIMESTAMP,
+        ] {
+            insert_str(&mut metadata, suffix, format!("source-{suffix}"));
+        }
+
+        remove_source_replication_bookkeeping(&mut metadata);
+
+        assert_eq!(metadata.get("x-amz-meta-owner").map(String::as_str), Some("source"));
+        assert!(!metadata.contains_key(AMZ_BUCKET_REPLICATION_STATUS));
+        for suffix in [
+            SUFFIX_REPLICATION_GENERATION,
+            SUFFIX_REPLICATION_STATUS,
+            SUFFIX_REPLICATION_TIMESTAMP,
+            SUFFIX_REPLICA_STATUS,
+            SUFFIX_REPLICA_TIMESTAMP,
+        ] {
+            assert!(!rustfs_utils::http::contains_key_str(&metadata, suffix));
+        }
+    }
 
     // A malformed bucket-default algorithm reaches this resolution only through
     // corrupt or hand-edited bucket metadata (PutBucketEncryption validates the

@@ -44,7 +44,8 @@ use http::HeaderName;
 /// `Content-Language`, `Expires`), `user_metadata` carries `x-amz-meta-*`
 /// entries with the prefix stripped, `tags` is the `x-amz-tagging` query
 /// string and `internal_metadata` holds `x-rustfs-internal-*` /
-/// `x-minio-internal-*` keys written verbatim.
+/// `x-minio-internal-*` keys. Source replication bookkeeping is stripped;
+/// other internal provenance is written verbatim.
 pub(crate) struct InternalPutContext {
     pub(crate) bucket: String,
     pub(crate) key: String,
@@ -242,7 +243,7 @@ impl DefaultObjectUsecase {
             content_headers,
             user_metadata,
             tags,
-            internal_metadata,
+            mut internal_metadata,
             emit_events,
             principal_id,
         } = ctx;
@@ -253,6 +254,7 @@ impl DefaultObjectUsecase {
 
         let headers = internal_put_headers(&content_headers)?;
         validate_internal_write_target(&key, &bucket, &headers).await?;
+        remove_source_replication_bookkeeping(&mut internal_metadata);
 
         let write = PutObjectWriteRequest {
             bucket,
@@ -349,6 +351,7 @@ impl DefaultObjectUsecase {
             );
         }
         metadata.extend(ctx.internal_metadata.clone());
+        remove_source_replication_bookkeeping(&mut metadata);
 
         let mt2 = metadata.clone();
         let mut opts = put_opts_with_replication_authorization(&ctx.bucket, &ctx.key, None, &headers, metadata, false)
@@ -365,6 +368,7 @@ impl DefaultObjectUsecase {
         )
         .await;
         if dsc.replicate_any() {
+            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(
                 &mut opts.user_defined,
@@ -533,6 +537,11 @@ impl DefaultObjectUsecase {
         let capacity_scope_token = Uuid::new_v4();
         opts.capacity_scope_token = Some(capacity_scope_token);
 
+        let multipart_info = store
+            .get_multipart_info(&bucket, &key, upload_id, &opts)
+            .await
+            .map_err(ApiError::from)?;
+
         let current_opts =
             internal_object_info_lookup_opts(get_opts(&bucket, &key, None, None, &headers).await.map_err(ApiError::from)?);
         let object_lock_config_state = load_bucket_object_lock_config_state(&bucket)
@@ -576,6 +585,44 @@ impl DefaultObjectUsecase {
             None => None,
         };
 
+        // Internal multipart writes use the same object-creation admission
+        // contract as the S3 completion path. Re-evaluate against the staged
+        // metadata immediately before commit, persist the exact generation and
+        // PENDING target set atomically with the object, and reuse that same
+        // immutable decision for scheduling below.
+        let mut completion_source_metadata = multipart_info.user_defined.clone();
+        remove_source_replication_bookkeeping(&mut completion_source_metadata);
+        let completion_replication_decision = must_replicate_object(
+            &bucket,
+            &key,
+            &completion_source_metadata,
+            "".to_string(),
+            opts.delete_marker_replication_status(),
+            opts.clone(),
+        )
+        .await;
+        let mut completion_replication_metadata = HashMap::new();
+        if completion_replication_decision.replicate_any() {
+            insert_str(
+                &mut completion_replication_metadata,
+                SUFFIX_REPLICATION_GENERATION,
+                Uuid::new_v4().to_string(),
+            );
+            insert_str(
+                &mut completion_replication_metadata,
+                SUFFIX_REPLICATION_TIMESTAMP,
+                jiff::Zoned::now().to_string(),
+            );
+            insert_str(
+                &mut completion_replication_metadata,
+                SUFFIX_REPLICATION_STATUS,
+                completion_replication_decision.pending_status().unwrap_or_default(),
+            );
+        }
+        // `Some(empty)` clears a stale create-time admission when replication
+        // was disabled or no rule matches at completion.
+        opts.eval_metadata = Some(completion_replication_metadata);
+
         let event = ctx.emit_events.then(|| {
             InternalPutObjectEvent::new(
                 current_notify_interface_for_context(self.context.as_deref()),
@@ -615,18 +662,8 @@ impl DefaultObjectUsecase {
 
                 enqueue_transition_immediate(&obj_info, LcEventSrc::S3CompleteMultipartUpload).await;
 
-                let mt2 = obj_info.user_defined.clone();
-                let dsc = must_replicate_object(
-                    &bucket,
-                    &key,
-                    &mt2,
-                    "".to_string(),
-                    opts.delete_marker_replication_status(),
-                    opts.clone(),
-                )
-                .await;
-                if dsc.replicate_any() {
-                    schedule_object_replication(obj_info.clone(), store, dsc).await;
+                if completion_replication_decision.replicate_any() {
+                    schedule_object_replication(obj_info.clone(), store, completion_replication_decision).await;
                 }
 
                 rustfs_scanner::record_dirty_usage_bucket(&bucket);
@@ -663,10 +700,16 @@ impl DefaultObjectUsecase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::storage_api::s3::{
+        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
+        ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, Tag, VersioningConfiguration,
+    };
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+    use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
     use rustfs_utils::http::{
         MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_ODM_PULLED_AT, SUFFIX_ODM_SOURCE, SUFFIX_ODM_SOURCE_ETAG,
-        SUFFIX_ODM_SOURCE_LAST_MODIFIED, SUFFIX_ODM_SOURCE_VERSION_ID, contains_key_str, get_str,
+        SUFFIX_ODM_SOURCE_LAST_MODIFIED, SUFFIX_ODM_SOURCE_VERSION_ID, contains_key_str, get_consistent_str, get_str,
+        has_internal_suffix,
     };
 
     const TEST_PRINCIPAL: &str = "rustfs-internal-put-test";
@@ -727,6 +770,70 @@ mod tests {
         (store, bucket)
     }
 
+    async fn install_internal_replication_config(bucket: &str, target: Option<&str>) {
+        install_internal_replication_config_with_tag(bucket, target, None).await;
+    }
+
+    async fn install_internal_replication_config_with_tag(
+        bucket: &str,
+        target: Option<&str>,
+        required_tag: Option<(&str, &str)>,
+    ) {
+        use crate::app::storage_api::test::bucket::utils::serialize;
+
+        let sys = get_global_bucket_metadata_sys().expect("bucket metadata system should be initialized");
+        let metadata = {
+            let sys = sys.read().await;
+            sys.get(bucket)
+                .await
+                .expect("bucket metadata should be cached before replication config injection")
+        };
+        let mut metadata = (*metadata).clone();
+        metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+        metadata.versioning_config = Some(VersioningConfiguration {
+            status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            ..Default::default()
+        });
+
+        if let Some(target) = target {
+            let filter = required_tag.map(|(key, value)| ReplicationRuleFilter {
+                tag: Some(Tag {
+                    key: Some(key.to_string()),
+                    value: Some(value.to_string()),
+                }),
+                ..Default::default()
+            });
+            let config = ReplicationConfiguration {
+                role: String::new(),
+                rules: vec![ReplicationRule {
+                    delete_marker_replication: Some(DeleteMarkerReplication {
+                        status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::DISABLED)),
+                    }),
+                    delete_replication: None,
+                    destination: Destination {
+                        bucket: target.to_string(),
+                        ..Default::default()
+                    },
+                    existing_object_replication: None,
+                    filter,
+                    id: Some("internal-multipart".to_string()),
+                    prefix: Some(String::new()),
+                    priority: Some(1),
+                    source_selection_criteria: None,
+                    status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+                }],
+            };
+            metadata.replication_config_xml = serialize(&config).expect("replication test config should serialize");
+            metadata.replication_config = Some(config);
+        } else {
+            metadata.replication_config_xml.clear();
+            metadata.replication_config = None;
+        }
+        set_bucket_metadata(bucket.to_string(), metadata)
+            .await
+            .expect("replication test metadata should be installed");
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn internal_put_object_writes_through_the_shared_put_path() {
@@ -768,6 +875,120 @@ mod tests {
             );
         }
         assert_eq!(get_str(metadata, SUFFIX_ODM_SOURCE).as_deref(), Some("s3:source-bucket"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn internal_put_drops_foreign_admission_before_later_matching_metadata() {
+        let (store, bucket) = internal_put_test_bucket("internal-put-foreign-admission").await;
+        let target = "arn:aws:s3:::internal-tag-filter-target";
+        install_internal_replication_config_with_tag(&bucket, Some(target), Some(("replicate", "yes"))).await;
+
+        let body = b"initially unadmitted internal object".to_vec();
+        let mut ctx = internal_context(&bucket, "foreign-admission.txt", &body);
+        ctx.tags = Some("replicate=no".to_string());
+        ctx.internal_metadata
+            .insert("X-Minio-Internal-Replication-Status".to_string(), format!("{target}=COMPLETED;"));
+        ctx.internal_metadata
+            .insert(AMZ_BUCKET_REPLICATION_STATUS.to_string(), "COMPLETED".to_string());
+
+        DefaultObjectUsecase::from_global()
+            .internal_put_object(ctx, body_stream(vec![Bytes::from(body)]))
+            .await
+            .expect("internal put with foreign bookkeeping should succeed after sanitization");
+        let stored = store
+            .get_object_info(&bucket, "foreign-admission.txt", &ObjectOptions::default())
+            .await
+            .expect("sanitized internal object should be readable");
+        assert!(!contains_key_str(&stored.user_defined, SUFFIX_REPLICATION_STATUS));
+        assert!(
+            stored
+                .user_defined
+                .keys()
+                .all(|key| !key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS)),
+            "an unadmitted object must not retain a caller-supplied surfaced status"
+        );
+
+        let later_matching = crate::app::storage_api::object_usecase::bucket::replication::must_replicate_metadata(
+            &bucket,
+            "foreign-admission.txt",
+            &stored.user_defined,
+            "replicate=yes".to_string(),
+            stored.replication_status.clone(),
+            ObjectOptions::default(),
+        )
+        .await;
+        assert!(
+            !later_matching.replicate_any(),
+            "a caller-supplied source status must not forge historical admission for a later matching tag"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn internal_put_replaces_mixed_case_foreign_generation_with_local_canonical_aliases() {
+        let (store, bucket) = internal_put_test_bucket("internal-put-foreign-gen").await;
+        let target = "arn:aws:s3:::internal-generation-target";
+        install_internal_replication_config(&bucket, Some(target)).await;
+
+        let body = b"replication-admitted internal object".to_vec();
+        let mut ctx = internal_context(&bucket, "foreign-generation.txt", &body);
+        let foreign_generation = Uuid::from_u128(9001).to_string();
+        for (key, value) in [
+            ("X-Minio-Internal-Replication-Generation", foreign_generation.as_str()),
+            ("X-Minio-Internal-Replication-Timestamp", "foreign-replication-time"),
+            ("X-Minio-Internal-Replication-Status", "arn:foreign=COMPLETED;"),
+            ("X-Minio-Internal-Replica-Status", "REPLICA"),
+            ("X-Minio-Internal-Replica-Timestamp", "foreign-replica-time"),
+        ] {
+            ctx.internal_metadata.insert(key.to_string(), value.to_string());
+        }
+        ctx.internal_metadata
+            .insert(AMZ_BUCKET_REPLICATION_STATUS.to_string(), "REPLICA".to_string());
+
+        DefaultObjectUsecase::from_global()
+            .internal_put_object(ctx, body_stream(vec![Bytes::from(body)]))
+            .await
+            .expect("replication-admitted internal put should sanitize foreign bookkeeping");
+        let stored = store
+            .get_object_info(&bucket, "foreign-generation.txt", &ObjectOptions::default())
+            .await
+            .expect("replication-admitted internal object should be readable");
+
+        let local_generation =
+            get_consistent_str(&stored.user_defined, SUFFIX_REPLICATION_GENERATION).expect("local generation aliases must agree");
+        Uuid::parse_str(local_generation).expect("local generation must be a UUID");
+        assert_ne!(local_generation, foreign_generation);
+        assert!(get_consistent_str(&stored.user_defined, SUFFIX_REPLICATION_TIMESTAMP).is_some());
+        assert!(
+            get_consistent_str(&stored.user_defined, SUFFIX_REPLICATION_STATUS).is_some_and(|status| status.contains(target))
+        );
+        for suffix in [
+            SUFFIX_REPLICATION_GENERATION,
+            SUFFIX_REPLICATION_TIMESTAMP,
+            SUFFIX_REPLICATION_STATUS,
+        ] {
+            assert_eq!(
+                stored
+                    .user_defined
+                    .keys()
+                    .filter(|key| has_internal_suffix(key, suffix))
+                    .count(),
+                2,
+                "{suffix} must be persisted as exactly one canonical dual-key pair"
+            );
+        }
+        for suffix in [SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP] {
+            assert!(!contains_key_str(&stored.user_defined, suffix), "foreign {suffix} must be removed");
+        }
+        assert!(
+            stored
+                .user_defined
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS))
+                .all(|(_, value)| value != "REPLICA"),
+            "a local source admission may surface its own status but must not preserve foreign REPLICA state"
+        );
     }
 
     #[tokio::test]
@@ -833,7 +1054,7 @@ mod tests {
     #[serial_test::serial]
     async fn internal_multipart_roundtrip_completes_and_abort_leaves_nothing() {
         const FIRST_PART_SIZE: usize = 5 * 1024 * 1024;
-        let (store, bucket) = internal_put_test_bucket("internal-mpu").await;
+        let (store, bucket) = Box::pin(internal_put_test_bucket("internal-mpu")).await;
         let usecase = DefaultObjectUsecase::from_global();
         let first_part = vec![0x41u8; FIRST_PART_SIZE];
         let last_part = b"tail of the multipart object".to_vec();
@@ -842,37 +1063,33 @@ mod tests {
         ctx.expected_md5_hex = None;
         ctx.preserve_etag = Some("0123456789abcdef0123456789abcdef-2".to_string());
 
-        let upload_id = usecase
-            .internal_create_multipart_upload(&ctx)
+        let upload_id = Box::pin(usecase.internal_create_multipart_upload(&ctx))
             .await
             .expect("internal multipart create must succeed");
-        let part_one = usecase
-            .internal_upload_part(
-                &ctx,
-                &upload_id,
-                1,
-                first_part.len() as u64,
-                Some(md5_hex(&first_part)),
-                body_stream(vec![Bytes::from(first_part.clone())]),
-            )
-            .await
-            .expect("first internal part must stage");
-        let part_two = usecase
-            .internal_upload_part(
-                &ctx,
-                &upload_id,
-                2,
-                last_part.len() as u64,
-                Some(md5_hex(&last_part)),
-                body_stream(vec![Bytes::from(last_part.clone())]),
-            )
-            .await
-            .expect("last internal part must stage");
+        let part_one = Box::pin(usecase.internal_upload_part(
+            &ctx,
+            &upload_id,
+            1,
+            first_part.len() as u64,
+            Some(md5_hex(&first_part)),
+            body_stream(vec![Bytes::from(first_part.clone())]),
+        ))
+        .await
+        .expect("first internal part must stage");
+        let part_two = Box::pin(usecase.internal_upload_part(
+            &ctx,
+            &upload_id,
+            2,
+            last_part.len() as u64,
+            Some(md5_hex(&last_part)),
+            body_stream(vec![Bytes::from(last_part.clone())]),
+        ))
+        .await
+        .expect("last internal part must stage");
         assert_eq!(part_one.part_num, 1);
         assert_eq!(part_two.part_num, 2);
 
-        let obj_info = usecase
-            .internal_complete_multipart_upload(&ctx, &upload_id, vec![part_one, part_two])
+        let obj_info = Box::pin(usecase.internal_complete_multipart_upload(&ctx, &upload_id, vec![part_one, part_two]))
             .await
             .expect("internal multipart complete must succeed");
         assert_eq!(obj_info.size, (first_part.len() + last_part.len()) as i64);
@@ -886,27 +1103,23 @@ mod tests {
         assert_eq!(stored.user_defined.get("origin").map(String::as_str), Some("unit-test"));
         assert!(contains_key_str(&stored.user_defined, SUFFIX_ODM_SOURCE));
 
-        let aborted_upload_id = usecase
-            .internal_create_multipart_upload(&ctx)
+        let aborted_upload_id = Box::pin(usecase.internal_create_multipart_upload(&ctx))
             .await
             .expect("second internal multipart create must succeed");
-        usecase
-            .internal_upload_part(
-                &ctx,
-                &aborted_upload_id,
-                1,
-                last_part.len() as u64,
-                None,
-                body_stream(vec![Bytes::from(last_part.clone())]),
-            )
-            .await
-            .expect("part of the aborted upload must stage");
-        usecase
-            .internal_abort_multipart_upload(&bucket, &ctx.key, &aborted_upload_id)
+        Box::pin(usecase.internal_upload_part(
+            &ctx,
+            &aborted_upload_id,
+            1,
+            last_part.len() as u64,
+            None,
+            body_stream(vec![Bytes::from(last_part.clone())]),
+        ))
+        .await
+        .expect("part of the aborted upload must stage");
+        Box::pin(usecase.internal_abort_multipart_upload(&bucket, &ctx.key, &aborted_upload_id))
             .await
             .expect("internal abort must succeed");
-        let uploads = store
-            .list_multipart_uploads(&bucket, &ctx.key, None, None, None, 100)
+        let uploads = Box::pin(store.list_multipart_uploads(&bucket, &ctx.key, None, None, None, 100))
             .await
             .expect("list multipart uploads after abort");
         assert!(
@@ -918,8 +1131,135 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn internal_multipart_completion_recomputes_replication_admission_atomically() {
+        let (store, bucket) = Box::pin(internal_put_test_bucket("internal-mpu-replication")).await;
+        let usecase = DefaultObjectUsecase::from_global();
+        let target_a = "arn:aws:s3:::internal-target-a";
+        let target_b = "arn:aws:s3:::internal-target-b";
+        Box::pin(install_internal_replication_config(&bucket, Some(target_a))).await;
+
+        let payload = b"internal multipart replication body".to_vec();
+        let mut ctx = internal_context(&bucket, "multipart/replicated.bin", &[]);
+        ctx.size = None;
+        ctx.expected_md5_hex = None;
+        let foreign_generation = Uuid::from_u128(9002).to_string();
+        for (key, value) in [
+            ("X-Minio-Internal-Replication-Generation", foreign_generation.as_str()),
+            ("X-Minio-Internal-Replication-Timestamp", "foreign-multipart-time"),
+            ("X-Minio-Internal-Replication-Status", "arn:foreign=COMPLETED;"),
+            ("X-Minio-Internal-Replica-Status", "REPLICA"),
+            ("X-Minio-Internal-Replica-Timestamp", "foreign-replica-time"),
+        ] {
+            ctx.internal_metadata.insert(key.to_string(), value.to_string());
+        }
+        ctx.internal_metadata
+            .insert(AMZ_BUCKET_REPLICATION_STATUS.to_string(), "REPLICA".to_string());
+        let upload_id = Box::pin(usecase.internal_create_multipart_upload(&ctx))
+            .await
+            .expect("internal multipart create must succeed");
+        let staged = Box::pin(store.get_multipart_info(&bucket, &ctx.key, &upload_id, &ObjectOptions::default()))
+            .await
+            .expect("staged internal multipart metadata must be readable");
+        let staged_generation = get_str(&staged.user_defined, SUFFIX_REPLICATION_GENERATION)
+            .expect("replication-admitted internal create must persist a generation");
+        Uuid::parse_str(&staged_generation).expect("staged replication generation must be a UUID");
+        assert_ne!(staged_generation, foreign_generation);
+        let staged_status = get_str(&staged.user_defined, SUFFIX_REPLICATION_STATUS)
+            .expect("replication-admitted internal create must persist PENDING");
+        assert!(staged_status.contains(target_a));
+        for suffix in [SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP] {
+            assert!(!contains_key_str(&staged.user_defined, suffix), "staged foreign {suffix} must be removed");
+        }
+        assert!(
+            staged
+                .user_defined
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS))
+                .all(|(_, value)| value != "REPLICA")
+        );
+
+        let part = Box::pin(usecase.internal_upload_part(
+            &ctx,
+            &upload_id,
+            1,
+            payload.len() as u64,
+            Some(md5_hex(&payload)),
+            body_stream(vec![Bytes::from(payload)]),
+        ))
+        .await
+        .expect("internal multipart part must stage");
+
+        Box::pin(install_internal_replication_config(&bucket, Some(target_b))).await;
+        let completed = Box::pin(usecase.internal_complete_multipart_upload(&ctx, &upload_id, vec![part]))
+            .await
+            .expect("internal multipart completion must succeed");
+        let completion_generation = get_str(&completed.user_defined, SUFFIX_REPLICATION_GENERATION)
+            .expect("completion must persist a new replication generation");
+        Uuid::parse_str(&completion_generation).expect("completion replication generation must be a UUID");
+        assert_ne!(
+            completion_generation, staged_generation,
+            "completion must replace the create-time generation"
+        );
+        let completion_status = completed
+            .replication_status_internal
+            .as_deref()
+            .expect("completion must persist its PENDING target set");
+        assert!(completion_status.contains(target_b));
+        assert!(!completion_status.contains(target_a));
+        for suffix in [SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP] {
+            assert!(
+                !contains_key_str(&completed.user_defined, suffix),
+                "completed foreign {suffix} must remain removed"
+            );
+        }
+        assert!(
+            completed
+                .user_defined
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS))
+                .all(|(_, value)| value != "REPLICA")
+        );
+
+        let disabled_payload = b"internal multipart replication disabled".to_vec();
+        let mut disabled_ctx = internal_context(&bucket, "multipart/disabled.bin", &[]);
+        disabled_ctx.size = None;
+        disabled_ctx.expected_md5_hex = None;
+        Box::pin(install_internal_replication_config(&bucket, Some(target_a))).await;
+        let disabled_upload_id = Box::pin(usecase.internal_create_multipart_upload(&disabled_ctx))
+            .await
+            .expect("replication-admitted internal multipart create must succeed");
+        let disabled_part = Box::pin(usecase.internal_upload_part(
+            &disabled_ctx,
+            &disabled_upload_id,
+            1,
+            disabled_payload.len() as u64,
+            Some(md5_hex(&disabled_payload)),
+            body_stream(vec![Bytes::from(disabled_payload)]),
+        ))
+        .await
+        .expect("disabled-case internal multipart part must stage");
+        Box::pin(install_internal_replication_config(&bucket, None)).await;
+        let disabled =
+            Box::pin(usecase.internal_complete_multipart_upload(&disabled_ctx, &disabled_upload_id, vec![disabled_part]))
+                .await
+                .expect("internal multipart completion with replication disabled must succeed");
+        assert!(disabled.replication_status_internal.is_none());
+        for suffix in [
+            SUFFIX_REPLICATION_GENERATION,
+            SUFFIX_REPLICATION_TIMESTAMP,
+            SUFFIX_REPLICATION_STATUS,
+        ] {
+            assert!(
+                !contains_key_str(&disabled.user_defined, suffix),
+                "disabled completion must clear stale {suffix}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn internal_complete_multipart_upload_rejects_unordered_parts() {
-        let (_store, bucket) = internal_put_test_bucket("internal-mpu-order").await;
+        let (_store, bucket) = Box::pin(internal_put_test_bucket("internal-mpu-order")).await;
         let ctx = internal_context(&bucket, "unordered.bin", &[]);
         let parts = vec![
             CompletePart {
@@ -931,8 +1271,8 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let err = DefaultObjectUsecase::from_global()
-            .internal_complete_multipart_upload(&ctx, "upload", parts)
+        let usecase = DefaultObjectUsecase::from_global();
+        let err = Box::pin(usecase.internal_complete_multipart_upload(&ctx, "upload", parts))
             .await
             .expect_err("unordered parts must be rejected before touching the store");
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);

@@ -280,14 +280,14 @@ mod tests {
     use crate::app::storage_api::object_usecase::on_demand_migration::{PullFailureReason, SourceSse};
     use crate::app::storage_api::s3::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
-        ReplicationRule, ReplicationRuleStatus, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-        ServerSideEncryptionRule, VersioningConfiguration,
+        ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault,
+        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
     };
     use crate::app::storage_api::test::bucket::utils::serialize;
     use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
     use crate::app::storage_api::test::{get_global_bucket_metadata_sys, set_bucket_metadata};
     use http::Method;
-    use rustfs_utils::http::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, get_str};
+    use rustfs_utils::http::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, contains_key_str, get_str};
     use sha2::{Digest as Sha256Digest, Sha256};
     use std::time::SystemTime;
     use tokio::io::AsyncReadExt;
@@ -677,6 +677,10 @@ mod tests {
     }
 
     async fn install_replication_rule(bucket: &str) {
+        install_replication_rule_with_tag(bucket, None).await;
+    }
+
+    async fn install_replication_rule_with_tag(bucket: &str, required_tag: Option<(&str, &str)>) {
         let sys = get_global_bucket_metadata_sys().expect("bucket metadata system");
         let metadata = {
             let sys = sys.read().await;
@@ -700,7 +704,13 @@ mod tests {
                     ..Default::default()
                 },
                 existing_object_replication: None,
-                filter: None,
+                filter: required_tag.map(|(key, value)| ReplicationRuleFilter {
+                    tag: Some(Tag {
+                        key: Some(key.to_string()),
+                        value: Some(value.to_string()),
+                    }),
+                    ..Default::default()
+                }),
                 id: Some("odm".to_string()),
                 prefix: Some(String::new()),
                 priority: Some(1),
@@ -747,6 +757,75 @@ mod tests {
         assert!(
             status.contains("arn:aws:s3:::target-bucket=PENDING;") || status.contains("arn:aws:s3:::target-bucket=COMPLETED;"),
             "write-back must enter the replication queue: {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn write_back_namespaces_source_user_metadata_that_looks_like_replication_bookkeeping() {
+        let (store, bucket) = write_back_test_bucket("odm-wb-user-metadata", true).await;
+        let target = "arn:aws:s3:::target-bucket";
+        install_replication_rule_with_tag(&bucket, Some(("replicate", "yes"))).await;
+
+        let body = b"initially unadmitted ODM object".to_vec();
+        let mut head = source_head(&body);
+        let forged_status_key = "X-Minio-Internal-Replication-Status";
+        let forged_generation_key = "X-RuStFs-InTeRnAl-RePlIcAtIoN-GeNeRaTiOn";
+        let forged_replica_key = "X-Minio-Internal-Replica-Status";
+        let forged_status = format!("{target}=COMPLETED;");
+        let forged_generation = Uuid::from_u128(9003).to_string();
+        head.user_metadata
+            .insert(forged_status_key.to_string(), forged_status.clone());
+        head.user_metadata
+            .insert(forged_generation_key.to_string(), forged_generation.clone());
+        head.user_metadata
+            .insert(forged_replica_key.to_string(), ReplicationStatusType::Replica.as_str().to_string());
+
+        let mut write_request = request(&bucket, "unadmitted.txt", head);
+        write_request.tags = Some(HashMap::from([("replicate".to_string(), "no".to_string())]));
+        OnDemandMigrationWriteBack::new()
+            .put_object(&write_request, body_stream(&body))
+            .await
+            .expect("ODM write-back with reserved-looking user metadata must commit safely");
+
+        let stored = stored_object(&store, &bucket, "unadmitted.txt").await;
+        for suffix in [
+            SUFFIX_REPLICATION_STATUS,
+            SUFFIX_REPLICATION_GENERATION,
+            SUFFIX_REPLICA_STATUS,
+        ] {
+            assert!(
+                !contains_key_str(&stored.user_defined, suffix),
+                "source user metadata must not become trusted {suffix} bookkeeping"
+            );
+        }
+        for (key, value) in [
+            (forged_status_key, forged_status.as_str()),
+            (forged_generation_key, forged_generation.as_str()),
+            (forged_replica_key, ReplicationStatusType::Replica.as_str()),
+        ] {
+            let namespaced = format!("x-amz-meta-{key}");
+            assert!(
+                stored
+                    .user_defined
+                    .iter()
+                    .any(|(stored_key, stored_value)| stored_key.eq_ignore_ascii_case(&namespaced) && stored_value == value),
+                "reserved-looking source metadata must survive only in the user namespace: {namespaced}"
+            );
+        }
+
+        let later_matching = crate::app::storage_api::object_usecase::bucket::replication::must_replicate_metadata(
+            &bucket,
+            "unadmitted.txt",
+            &stored.user_defined,
+            "replicate=yes".to_string(),
+            stored.replication_status.clone(),
+            ObjectOptions::default(),
+        )
+        .await;
+        assert!(
+            !later_matching.replicate_any(),
+            "source user metadata must not forge historical target admission after a later matching tag"
         );
     }
 

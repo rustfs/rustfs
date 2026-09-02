@@ -146,8 +146,8 @@ use rustfs_utils::http::insert_header;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
     SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICA_STATUS,
-    SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID,
-    SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST, get_header,
+    SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_GENERATION, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
+    SUFFIX_RESTORE_OPERATION_ID, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST, get_header,
     headers::{
         AMZ_CONTENT_SHA256, AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS,
         AMZ_MINIO_SNOWBALL_PREFIX, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
@@ -184,6 +184,22 @@ fn object_s3_error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'stati
 
 fn object_s3_error_default(code: S3ErrorCode) -> S3Error {
     S3Error::new(code)
+}
+
+/// Remove replication history owned by another source object before a local
+/// object-creation decision is made. Compatibility keys are case-insensitive,
+/// so use the shared removers rather than deleting only canonical spellings.
+fn remove_source_replication_bookkeeping(user_defined: &mut HashMap<String, String>) {
+    user_defined.retain(|key, _| !key.eq_ignore_ascii_case(AMZ_BUCKET_REPLICATION_STATUS));
+    for suffix in [
+        SUFFIX_REPLICATION_GENERATION,
+        SUFFIX_REPLICATION_STATUS,
+        SUFFIX_REPLICATION_TIMESTAMP,
+        SUFFIX_REPLICA_STATUS,
+        SUFFIX_REPLICA_TIMESTAMP,
+    ] {
+        remove_str(user_defined, suffix);
+    }
 }
 
 mod copy;
