@@ -29,6 +29,7 @@ pub mod object_lock;
 pub mod on_demand_migration;
 pub mod policy_sys;
 pub mod quota;
+pub mod remote_s3_client;
 pub mod replication;
 pub mod tagging;
 pub mod target;

@@ -18,7 +18,7 @@ RustFS validates every operator-configured outbound destination to close a serve
 | Target configuration validation (startup and admin API) | Full policy | `crates/targets/src/config/common.rs` `validate_outbound_http_url`; `rustfs/src/admin/handlers/target_descriptor.rs` |
 | OIDC discovery, JWKS, and token requests | Full policy | A blocked provider logs `OIDC provider discovery blocked by outbound policy` naming the origin to allowlist (`crates/iam/src/oidc.rs`) |
 | Object Lambda targets | Full policy | `rustfs/src/admin/router.rs` `outbound_policy` |
-| Bucket replication targets | Literal check, relaxed | Private addresses are always allowed; loopback only with `RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET=true` (`crates/ecstore/src/bucket/bucket_target_sys.rs` `validate_replication_target_endpoint`) |
+| Bucket replication targets | Literal check, relaxed | Private addresses are always allowed; loopback only with `RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET=true` (`crates/ecstore/src/bucket/remote_s3_client.rs` `validate_remote_endpoint`, shared with on-demand migration sources) |
 | Site replication peers | Literal check | `rustfs/src/site_replication/mod.rs` |
 | Tiering warm backends (S3, MinIO, RustFS, Azure, GCS, Aliyun, Tencent, Huawei, R2) | Literal check | `crates/ecstore/src/services/tier/warm_backend.rs` `validate_endpoint`; the RustFS provider adds a debug-only, env-gated loopback exception for e2e tests |
 | Keystone `auth_url` | Literal check | `crates/keystone/src/config.rs` |

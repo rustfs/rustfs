@@ -25,3 +25,7 @@ pub use config::{
     OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy, SourceConfig,
     SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
 };
+//! On-demand migration (ODM): serve and back-fill objects from an external
+//! S3-compatible source bucket.
+
+pub mod source_client;
