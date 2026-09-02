@@ -48,8 +48,10 @@ cd "$(dirname "$0")/.."
 # new usecase dependency behind the app object-domain facade while main had
 # already shed two direct s3s-importing files. Retighten the file counter only;
 # s3_error! stays flat at 1616.
+# 1616 → 1613 on 2026-09-02: dependency refresh verified the current tree has
+# already shed three s3_error! invocation lines; retighten the line counter.
 S3S_IMPORT_FILES_BASELINE=213
-S3_ERROR_LINES_BASELINE=1616
+S3_ERROR_LINES_BASELINE=1613
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;
