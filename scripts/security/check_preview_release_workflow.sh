@@ -144,7 +144,7 @@ require_line "$build_workflow" "    needs: [ build-check, publish-release ]" "la
 # Preview releases are internal validation artifacts: once the deliverable
 # release is published they are deleted, while their tags stay behind.
 require_job_if "$build_workflow" "cleanup-preview-releases" "    if: $latest_guard"
-require_line "$build_workflow" "            gh release delete \"\$preview_tag\" --yes" "preview release cleanup after publication"
+require_line "$build_workflow" "            gh release delete \"\$preview_tag\" --repo \"\${GITHUB_REPOSITORY}\" --yes" "preview release cleanup after publication"
 require_line "$build_workflow" "              | select(.tag_name | startswith(\$tag + \"-preview.\"))" "cleanup must match the target's own preview tags"
 require_line "$build_workflow" "              | select(.tag_name | ltrimstr(\$tag + \"-preview.\") | test(\"^[0-9]+\$\"))" "cleanup must match a numeric preview iteration"
 require_absent "$build_workflow" "--cleanup-tag" "preview tags must survive their release cleanup"
