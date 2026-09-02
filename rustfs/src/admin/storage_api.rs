@@ -284,8 +284,10 @@ pub(crate) mod durability {
 }
 
 pub(crate) mod on_demand_migration {
+    pub(crate) type OdmBucketSnapshot = super::ecstore_bucket::on_demand_migration::OdmBucketSnapshot;
     pub(crate) type OnDemandMigrationConfig = super::ecstore_bucket::on_demand_migration::OnDemandMigrationConfig;
     pub(crate) type OnDemandMigrationConfigError = super::ecstore_bucket::on_demand_migration::OnDemandMigrationConfigError;
+    pub(crate) type OnDemandMigrationSys = super::ecstore_bucket::on_demand_migration::OnDemandMigrationSys;
     pub(crate) type PathStyle = super::ecstore_bucket::on_demand_migration::PathStyle;
     pub(crate) type Provider = super::ecstore_bucket::on_demand_migration::Provider;
     pub(crate) type ValidationContext<'a> = super::ecstore_bucket::on_demand_migration::ValidationContext<'a>;
