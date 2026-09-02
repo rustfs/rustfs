@@ -49,8 +49,8 @@ fn record_bucket_delete_blocker(bucket: &str, kind: BucketDeleteBlockerKind, res
     );
 }
 
-fn scanner_bucket_list_set_concurrency(set_count: usize) -> usize {
-    set_count.clamp(1, SCANNER_BUCKET_LIST_SET_CONCURRENCY)
+fn bucket_list_set_concurrency(set_count: usize, max_concurrency: usize) -> usize {
+    set_count.clamp(1, max_concurrency.max(1))
 }
 
 fn should_override_created_from_metadata(created: OffsetDateTime) -> bool {
@@ -654,8 +654,51 @@ impl ECStore {
     }
 
     #[instrument(skip(self))]
+    pub(crate) async fn get_bucket_info_from_sets(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        // One host may participate in several pools after expansion. Resolve the
+        // namespace against each erasure set so disks from different pools can
+        // never be combined into one bucket quorum.
+        let sets = self
+            .pools
+            .iter()
+            .flat_map(|pool| {
+                pool.disk_set
+                    .iter()
+                    .map(|set| (set.pool_index, set.set_index, Arc::clone(set)))
+            })
+            .collect::<Vec<_>>();
+        // Bucket validation is request-path IO. Keep the previous peer fanout's
+        // latency shape by probing every set concurrently; scanner listings use
+        // a separate bounded path below because they run continuously.
+        let mut scoped_results =
+            futures::future::join_all(sets.into_iter().map(|(pool_index, set_index, set)| async move {
+                (pool_index, set_index, set.get_bucket_info(bucket, opts).await)
+            }))
+            .await;
+        scoped_results.sort_unstable_by_key(|(pool_index, set_index, _)| (*pool_index, *set_index));
+
+        let mut first_info = None;
+        let mut first_error = None;
+        for (_, _, result) in scoped_results {
+            match result {
+                Ok(info) if first_info.is_none() => first_info = Some(info),
+                Ok(_) => {}
+                Err(err) if is_err_strict_volume_not_found(&err) => {}
+                Err(err) if first_error.is_none() => first_error = Some(err),
+                Err(_) => {}
+            }
+        }
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        first_info.ok_or(Error::VolumeNotFound)
+    }
+
+    #[instrument(skip(self))]
     pub(super) async fn handle_get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
-        let mut info = self.peer_sys.get_bucket_info(bucket, opts).await?;
+        let mut info = self.get_bucket_info_from_sets(bucket, opts).await?;
 
         if let Ok(sys) = metadata_sys::get_in(&self.ctx, bucket).await {
             if should_override_created_from_metadata(sys.created) {
@@ -671,22 +714,18 @@ impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         // TODO(backlog): support cached bucket listing via opts.cached
-
-        let mut buckets = self.peer_sys.list_bucket(opts).await?;
-
-        if !opts.no_metadata {
-            for bucket in buckets.iter_mut() {
-                if let Ok(created) = metadata_sys::created_at_in(&self.ctx, &bucket.name).await
-                    && should_override_created_from_metadata(created)
-                {
-                    bucket.created = Some(created);
-                }
-            }
-        }
-        Ok(buckets)
+        Ok(self.list_bucket_from_sets(opts, usize::MAX).await?.buckets)
     }
 
     pub async fn list_bucket_for_scanner(&self, opts: &BucketOptions) -> Result<crate::cluster::rpc::ScannerBucketListing> {
+        self.list_bucket_from_sets(opts, SCANNER_BUCKET_LIST_SET_CONCURRENCY).await
+    }
+
+    async fn list_bucket_from_sets(
+        &self,
+        opts: &BucketOptions,
+        max_concurrency: usize,
+    ) -> Result<crate::cluster::rpc::ScannerBucketListing> {
         let sets = self
             .pools
             .iter()
@@ -697,6 +736,7 @@ impl ECStore {
             })
             .collect::<Vec<_>>();
         let set_count = sets.len();
+        let concurrency = bucket_list_set_concurrency(set_count, max_concurrency);
         let deleted = opts.deleted;
         let cached = opts.cached;
         let no_metadata = opts.no_metadata;
@@ -712,7 +752,7 @@ impl ECStore {
                     .map(|(buckets, complete)| (pool_index, set_index, buckets, complete))
             }
         }))
-        .buffer_unordered(scanner_bucket_list_set_concurrency(set_count));
+        .buffer_unordered(concurrency);
         let mut topology_complete = set_count != 0;
         let mut bucket_map = BTreeMap::<String, BucketInfo>::new();
         let mut scoped_buckets = Vec::with_capacity(set_count);
@@ -905,8 +945,8 @@ mod tests {
         BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED, BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES,
         BucketDeleteBlockerKind, BucketDeleteDiagnosticBudget, SCANNER_BUCKET_LIST_SET_CONCURRENCY,
         await_bucket_namespace_operation, bucket_delete_metadata_cleanup_prefixes, bucket_deleted_marker_prefix,
-        bucket_deleted_marker_volume, run_bucket_usage_cleanup, run_physical_bucket_deletion, scan_metadata_less_residue,
-        scan_metadata_less_residue_with_budget, scanner_bucket_list_set_concurrency, should_override_created_from_metadata,
+        bucket_deleted_marker_volume, bucket_list_set_concurrency, run_bucket_usage_cleanup, run_physical_bucket_deletion,
+        scan_metadata_less_residue, scan_metadata_less_residue_with_budget, should_override_created_from_metadata,
         validate_table_bucket_delete_allowed,
     };
     use crate::bucket::metadata::table_bucket_catalog_metadata_prefix;
@@ -1217,8 +1257,8 @@ mod tests {
             .clone()
     }
 
-    async fn setup_multi_pool_scanner_listing_test_env() -> (tempfile::TempDir, Arc<ECStore>) {
-        let temp_dir = tempfile::tempdir().expect("multi-pool scanner test directory should be created");
+    async fn setup_multi_pool_bucket_test_env() -> (tempfile::TempDir, Arc<ECStore>) {
+        let temp_dir = tempfile::tempdir().expect("multi-pool bucket test directory should be created");
         let mut pools = Vec::new();
         for pool_index in 0..2 {
             let mut endpoints = Vec::new();
@@ -1226,7 +1266,7 @@ mod tests {
                 let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
                 tokio::fs::create_dir_all(&disk_path)
                     .await
-                    .expect("multi-pool scanner test disk should be created");
+                    .expect("multi-pool bucket test disk should be created");
                 let mut endpoint =
                     Endpoint::try_from(disk_path.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
                 endpoint.set_pool_index(pool_index);
@@ -1239,13 +1279,14 @@ mod tests {
                 set_count: 1,
                 drives_per_set: 4,
                 endpoints: Endpoints::from(endpoints),
-                cmd_line: format!("scanner-listing-pool-{pool_index}"),
+                cmd_line: format!("bucket-test-pool-{pool_index}"),
                 platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
             });
         }
 
         let endpoint_pools = EndpointServerPools(pools);
         let instance_ctx = Arc::new(InstanceContext::new());
+        instance_ctx.set_endpoints(endpoint_pools.clone());
         init_local_disks_with_instance_ctx(&instance_ctx, endpoint_pools.clone())
             .await
             .expect("multi-pool local disks should initialize");
@@ -1271,7 +1312,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_metadata_methods_fail_closed_before_instance_initialization() {
-        let (_temp_dir, store) = setup_multi_pool_scanner_listing_test_env().await;
+        let (_temp_dir, store) = setup_multi_pool_bucket_test_env().await;
 
         let expected = "bucket metadata sys not initialized for this instance";
         let errors = [
@@ -1405,10 +1446,14 @@ mod tests {
     }
 
     #[test]
-    fn scanner_bucket_listing_bounds_set_fanout() {
-        assert_eq!(scanner_bucket_list_set_concurrency(0), 1);
-        assert_eq!(scanner_bucket_list_set_concurrency(2), 2);
-        assert_eq!(scanner_bucket_list_set_concurrency(100), SCANNER_BUCKET_LIST_SET_CONCURRENCY);
+    fn bucket_listing_selects_request_and_scanner_fanout() {
+        assert_eq!(bucket_list_set_concurrency(0, SCANNER_BUCKET_LIST_SET_CONCURRENCY), 1);
+        assert_eq!(bucket_list_set_concurrency(2, SCANNER_BUCKET_LIST_SET_CONCURRENCY), 2);
+        assert_eq!(
+            bucket_list_set_concurrency(100, SCANNER_BUCKET_LIST_SET_CONCURRENCY),
+            SCANNER_BUCKET_LIST_SET_CONCURRENCY
+        );
+        assert_eq!(bucket_list_set_concurrency(100, usize::MAX), 100);
     }
 
     #[tokio::test]
@@ -1615,8 +1660,129 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn bucket_namespace_reads_keep_pre_expansion_bucket_visible() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("pre-expansion-{}", Uuid::new_v4().simple());
+        let object = "existing-object";
+        ecstore.pools[0].disk_set[0]
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in the original pool only");
+        let mut reader = PutObjReader::from_vec(b"object written before pool expansion".to_vec());
+        ecstore.pools[0]
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("object should be written in the original pool only");
+
+        let buckets = ecstore
+            .list_bucket(&BucketOptions::default())
+            .await
+            .expect("S3 bucket listing should remain available after adding an empty pool");
+        assert!(buckets.iter().any(|entry| entry.name == bucket));
+
+        let info = ecstore
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect("bucket validation should accept a bucket present in the original pool");
+        assert_eq!(info.name, bucket);
+
+        let object_info = ecstore
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("an object in the original pool should remain readable after expansion");
+        assert_eq!(object_info.name, object);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_metadata_init_recreates_pre_expansion_bucket_in_new_pool() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("metadata-expansion-{}", Uuid::new_v4().simple());
+        ecstore.pools[0].disk_set[0]
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in the original pool only");
+        assert_eq!(
+            ecstore.pools[1].disk_set[0]
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect_err("new pool should initially have no bucket volume"),
+            StorageError::VolumeNotFound
+        );
+
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+        ecstore.pools[1].disk_set[0]
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect("metadata initialization should recreate the bucket volume in the new pool");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_metadata_init_does_not_recreate_stale_bucket_name() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("stale-expansion-{}", Uuid::new_v4().simple());
+
+        metadata_sys::init_bucket_metadata_sys(ecstore.clone(), vec![bucket.clone()]).await;
+
+        for pool in &ecstore.pools {
+            let err = pool.disk_set[0]
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .expect_err("a stale startup listing must not recreate a deleted bucket");
+            assert_eq!(err, StorageError::VolumeNotFound);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_namespace_reads_report_missing_when_every_set_is_absent() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("absent-{}", Uuid::new_v4().simple());
+
+        let buckets = ecstore
+            .list_bucket(&BucketOptions::default())
+            .await
+            .expect("an empty healthy namespace should remain listable");
+        assert!(buckets.iter().all(|entry| entry.name != bucket));
+
+        let err = ecstore
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect_err("a bucket absent from every set must remain missing");
+        assert_eq!(err, StorageError::VolumeNotFound);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bucket_namespace_reads_fail_closed_when_any_set_loses_quorum() {
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
+        let bucket = format!("degraded-expansion-{}", Uuid::new_v4().simple());
+        ecstore.pools[0].disk_set[0]
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created in the original pool only");
+        ecstore.pools[1].disk_set[0].disks.write().await[0] = None;
+        ecstore.pools[1].disk_set[0].disks.write().await[1] = None;
+
+        let list_err = ecstore
+            .list_bucket(&BucketOptions::default())
+            .await
+            .expect_err("listing must not hide an unavailable expansion pool");
+        assert_eq!(list_err, StorageError::ErasureWriteQuorum);
+
+        let info_err = ecstore
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .expect_err("bucket validation must fail when an expansion pool is unavailable");
+        assert_eq!(info_err, StorageError::ErasureWriteQuorum);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn scanner_bucket_listing_unions_every_erasure_set() {
-        let (_temp_dir, ecstore) = setup_multi_pool_scanner_listing_test_env().await;
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
         let bucket = format!("second-pool-only-{}", Uuid::new_v4().simple());
         ecstore.pools[1].disk_set[0]
             .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -1652,7 +1818,7 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_bucket_listing_marks_degraded_set_incomplete() {
-        let (_temp_dir, ecstore) = setup_multi_pool_scanner_listing_test_env().await;
+        let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
         let bucket = format!("degraded-set-{}", Uuid::new_v4().simple());
         let set = &ecstore.pools[0].disk_set[0];
         set.make_bucket(&bucket, &MakeBucketOptions::default())
@@ -1674,7 +1840,7 @@ mod tests {
 
     #[tokio::test]
     async fn scanner_bucket_listing_marks_divergent_disk_views_incomplete() {
-        let (temp_dir, ecstore) = setup_multi_pool_scanner_listing_test_env().await;
+        let (temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
         let bucket = format!("divergent-set-{}", Uuid::new_v4().simple());
         ecstore.pools[0].disk_set[0]
             .make_bucket(&bucket, &MakeBucketOptions::default())

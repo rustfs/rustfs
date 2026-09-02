@@ -1364,12 +1364,11 @@ impl BucketMetadataSys {
         await_bucket_namespace_operation(Some(namespace_guard), bucket, operation, async {
             match self
                 .api
-                .peer_sys
-                .get_bucket_info(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
+                .get_bucket_info_from_sets(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
                 .await
             {
                 Ok(_) => Ok(true),
-                Err(crate::disk::error::Error::VolumeNotFound) => Ok(false),
+                Err(Error::VolumeNotFound) => Ok(false),
                 Err(err) => Err(err.into()),
             }
         })
@@ -1380,9 +1379,15 @@ impl BucketMetadataSys {
         let _ = self.init_internal(buckets).await;
     }
     async fn init_internal(&self, buckets: Vec<String>) -> Result<()> {
-        let count = runtime_sources::endpoint_erasure_set_count()
-            .map(|count| count * 10)
-            .ok_or_else(|| Error::other("endpoint pools not initialized"))?;
+        let count = self
+            .api
+            .pools
+            .iter()
+            .map(|pool| pool.disk_set.len())
+            .sum::<usize>()
+            .checked_mul(10)
+            .filter(|count| *count != 0)
+            .ok_or_else(|| Error::other("bucket metadata store has no erasure sets"))?;
 
         let mut failed_buckets: HashSet<String> = HashSet::new();
         let mut buckets = buckets.as_slice();
@@ -1479,14 +1484,6 @@ impl BucketMetadataSys {
         expected: Option<&Arc<BucketMetadata>>,
         namespace_guard: &rustfs_lock::NamespaceLockGuard,
     ) -> Result<()> {
-        await_bucket_namespace_operation(
-            Some(namespace_guard),
-            bucket,
-            "bucket metadata heal",
-            self.api.heal_bucket(bucket, &HealOpts::default()),
-        )
-        .await?;
-
         if !self
             .bucket_exists(bucket, namespace_guard, "bucket metadata existence check")
             .await?
@@ -1505,6 +1502,20 @@ impl BucketMetadataSys {
             }
             return Ok(());
         }
+
+        await_bucket_namespace_operation(
+            Some(namespace_guard),
+            bucket,
+            "bucket metadata heal",
+            self.api.heal_bucket(
+                bucket,
+                &HealOpts {
+                    recreate: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await?;
 
         let (bm, persisted) = await_bucket_namespace_operation(
             Some(namespace_guard),
