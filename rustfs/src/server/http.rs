@@ -155,10 +155,13 @@ static HTTP_STATUS_CLASS_METRICS: std::sync::LazyLock<[HttpStatusClassMetrics; 6
 static HTTP_TRANSPORT_FAILURES_COUNTER: std::sync::LazyLock<metrics::Counter> =
     std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_FAILURES_TOTAL, LABEL_HTTP_STATUS_CLASS => "transport"));
 
+const RUSTFS_S3_PUT_OBJECT_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024;
+
 fn rustfs_s3_config() -> S3Config {
     let mut s3_config = S3Config::default();
     s3_config.normalize_forward_slash_path = true;
     s3_config.enable_sig_v2 = true;
+    s3_config.put_object_max_size = Some(RUSTFS_S3_PUT_OBJECT_MAX_SIZE);
     s3_config.sig_v4_allowed_services.push("s3tables".to_string());
     s3_config
 }
@@ -3005,6 +3008,7 @@ mod tests {
         assert!(s3_config.normalize_forward_slash_path);
         assert!(s3_config.normalize_content_length);
         assert!(s3_config.enable_sig_v2);
+        assert_eq!(s3_config.put_object_max_size, Some(RUSTFS_S3_PUT_OBJECT_MAX_SIZE));
         assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "s3"));
         assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "sts"));
         assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "s3tables"));

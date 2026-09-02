@@ -4652,6 +4652,25 @@ mod tests {
     }
 
     #[test]
+    fn s3_route_claims_listen_notification_before_generated_s3_routes() {
+        let router: S3Router<StatusOperation> = S3Router::new(false);
+        let headers = HeaderMap::new();
+
+        for uri in [
+            "/?events=s3:ObjectRemoved:*&x-id=ListenNotification",
+            "/demo-bucket?events=s3:ObjectCreated:*&x-id=ListenBucketNotification",
+            "/demo-bucket/?events=s3:ObjectCreated:*&events=s3:ObjectRemoved:Delete",
+        ] {
+            let uri: Uri = uri.parse().expect("uri should parse");
+            let mut extensions = http::Extensions::new();
+            assert!(
+                router.is_match(&Method::GET, &uri, &headers, &mut extensions),
+                "listen notification custom route must claim {uri}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_misc_extension_request_rejects_invalid_paths_or_methods() {
         let bucket_without_object: Uri = "/demo-bucket?lambdaArn=arn%3Atarget".parse().expect("uri should parse");
         let wrong_method_lambda: Uri = "/demo-bucket/object?lambdaArn=arn%3Atarget"
