@@ -650,14 +650,14 @@ fn aggregate_replacement_recovery_cluster_status(
         reason.get_or_insert("peer_replacement_recovery_status_not_definitive");
     }
 
-    let first_records = snapshots
-        .first()
-        .map(|snapshot| canonical_replacement_records(&snapshot.records));
-    if let Some(first_records) = &first_records
-        && snapshots
-            .iter()
-            .skip(1)
-            .any(|snapshot| canonical_replacement_records(&snapshot.records) != *first_records)
+    // Replacement recovery state is anchored on one surviving disk. Nodes
+    // without that disk legitimately report a definitive empty snapshot, so
+    // only non-empty snapshots must agree with each other.
+    let mut non_empty_records = snapshots
+        .iter()
+        .filter_map(|snapshot| (!snapshot.records.is_empty()).then(|| canonical_replacement_records(&snapshot.records)));
+    if let Some(first_records) = non_empty_records.next()
+        && non_empty_records.any(|records| records != first_records)
     {
         reason.get_or_insert("peer_replacement_recovery_status_conflict");
     }
@@ -1625,6 +1625,22 @@ mod tests {
         assert!(!cluster.definitive);
         assert_eq!(cluster.reason.as_deref(), Some("peer_replacement_recovery_status_conflict"));
         assert_eq!(cluster.records.len(), 2);
+    }
+
+    #[test]
+    fn replacement_recovery_cluster_accepts_definitive_empty_peers() {
+        let local = rustfs_heal::ReplacementRecoverySnapshot {
+            records: Vec::new(),
+            definitive: true,
+            reason: None,
+        };
+        let peer = replacement_snapshot("11111111-1111-4111-8111-111111111111");
+        let cluster = aggregate_replacement_recovery_cluster_status(vec![local], vec![Ok(Some(peer))], 2, true);
+
+        assert!(cluster.definitive);
+        assert!(cluster.reason.is_none());
+        assert_eq!(cluster.records.len(), 1);
+        assert_eq!(cluster.records[0].state, rustfs_heal::ReplacementRecoveryState::Completed);
     }
 
     #[test]
