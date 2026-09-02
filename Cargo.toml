@@ -307,11 +307,11 @@ rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.4" }
 rust-embed = { version = "8.12.0" }
 rustc-hash = { version = "2.1.3" }
-s3s = { git = "https://github.com/rustfs/s3s.git", rev = "28e9ebb23dd2fb7d667084f34121b4aa4807a5c6", version = "0.15.0", features = ["minio"] }
+s3s = { git = "https://github.com/rustfs/s3s.git", rev = "bdcb6259339c41369f9f1c60e3a42b5ab8da607b", version = "0.15.0", features = ["minio"] }
 serial_test = "4.0.1"
 shadow-rs = { default-features = false, version = "2.0.0" }
 siphasher = "1.0.3"
-smallvec = { version = "1.15.2" }
+smallvec = { version = "1.16.0" }
 compact_str = "0.10.0"
 snap = "1.1.2"
 starshard = { version = "2.3.0" }

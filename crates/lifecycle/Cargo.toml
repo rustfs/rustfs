@@ -60,7 +60,6 @@ rustfs-storage-api.workspace = true
 s3s = { workspace = true, features = ["minio"] }
 time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 tracing.workspace = true
-url.workspace = true
 uuid = { workspace = true, features = ["v4", "serde", "fast-rng", "macro-diagnostics"] }
 
 [dev-dependencies]
