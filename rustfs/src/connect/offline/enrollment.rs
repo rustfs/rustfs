@@ -51,10 +51,9 @@ const HOSTED_ROOT: EnrollmentRoot = EnrollmentRoot {
 };
 
 #[cfg(feature = "offline-enrollment-e2e-root")]
-const E2E_ROOT: EnrollmentRoot = EnrollmentRoot {
-    key_id: env!("RUSTFS_E2E_OFFLINE_ENROLLMENT_ROOT_KEY_ID"),
-    public_key: env!("RUSTFS_E2E_OFFLINE_ENROLLMENT_ROOT_PUBLIC_KEY"),
-};
+const E2E_ROOT_KEY_ID: Option<&str> = option_env!("RUSTFS_E2E_OFFLINE_ENROLLMENT_ROOT_KEY_ID");
+#[cfg(feature = "offline-enrollment-e2e-root")]
+const E2E_ROOT_PUBLIC_KEY: Option<&str> = option_env!("RUSTFS_E2E_OFFLINE_ENROLLMENT_ROOT_PUBLIC_KEY");
 
 #[derive(Clone, Copy)]
 struct EnrollmentRoot {
@@ -348,7 +347,7 @@ impl OfflineEnrollment {
     #[cfg(feature = "offline-enrollment-e2e-root")]
     #[doc(hidden)]
     pub fn verify_e2e_challenge(document: &[u8], now_unix: i64) -> Result<VerifiedChallenge, EnrollmentError> {
-        Self::verify_challenge_with_root(document, now_unix, E2E_ROOT)
+        Self::verify_challenge_with_root(document, now_unix, e2e_root()?)
     }
 
     fn verify_challenge_with_root(
@@ -460,6 +459,18 @@ impl OfflineEnrollment {
 
         serde_json::to_vec(&envelope).map_err(|_| EnrollmentError::ResponseNotProduced)
     }
+}
+
+#[cfg(feature = "offline-enrollment-e2e-root")]
+fn e2e_root() -> Result<EnrollmentRoot, EnrollmentError> {
+    let key_id = E2E_ROOT_KEY_ID
+        .filter(|value| !value.is_empty())
+        .ok_or(EnrollmentError::EnrollmentRootUnknown)?;
+    let public_key = E2E_ROOT_PUBLIC_KEY
+        .filter(|value| !value.is_empty())
+        .ok_or(EnrollmentError::EnrollmentRootUnknown)?;
+
+    Ok(EnrollmentRoot { key_id, public_key })
 }
 
 /// Walk the chain from the pinned root to the signing key, returning the key
