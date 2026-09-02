@@ -1,59 +1,19 @@
 # RustFS Architecture Evolution
 
-This document set tracks the architecture migration from
-[`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660).
+**Use this when:** you need the historical framing of the architecture-migration program or the phase order that the migration contracts assume.
+**Source of truth:** [README.md](README.md) is the index of architecture documents; the per-topic contracts it lists are authoritative.
 
 ## Baseline
 
-- Baseline branch: `upstream/main`
-- Baseline commit: `61f0dfbc40f748be313be84d834d8259cf3e19c9`
-- Baseline title: `fix(ecstore): invalidate wiped disk id cache (#3251)`
-- First migration PR type: `docs-only`
+The architecture-migration program (`rustfs/backlog#660`) closed in 2026-07. Its original baseline commit predates the current `main` lineage and is no longer reachable from `main`; treat it as historical. The guardrails the program introduced remain enforced by `scripts/check_architecture_migration_rules.sh`.
 
 ## Core Principle
 
-Cut wrong dependency directions with directories and contracts first, migrate global
-state in small steps next, and split crates only after boundaries are stable. Storage
-hot-path behavior must not drift during this migration.
-
-## Architecture Documents
-
-- [`runtime-lifecycle.md`](runtime-lifecycle.md): runtime, AppContext,
-  startup/readiness, and shutdown contracts.
-- [`readiness-matrix.md`](readiness-matrix.md): request-surface behavior,
-  runtime dependency readiness, probe semantics, and preservation rules.
-- [`s3-tables-support-matrix.md`](s3-tables-support-matrix.md): supported,
-  preview, reference-only, and not-claimed S3 Tables and Iceberg REST Catalog
-  surfaces.
-- [`storage-control-data-plane.md`](storage-control-data-plane.md): boundaries
-  between StorageCore, ECStore, ClusterControlPlane, and BackgroundControllers.
-- [`background-services-inventory.md`](background-services-inventory.md): current
-  scanner, heal, lifecycle, replication, config reload, metrics, and shutdown
-  surface before BackgroundController work.
-- [`background-controller-contract.md`](background-controller-contract.md):
-  desired/current/status/reconcile vocabulary and lifecycle boundaries for
-  future read-only BackgroundController work.
-- [`crate-boundaries.md`](crate-boundaries.md): PR types, crate direction,
-  compatibility rules, and migration guardrails.
-- [`global-state-crate-split-plan.md`](global-state-crate-split-plan.md): late
-  global-state cleanup, runtime-source boundaries, fallback removal rules, and
-  crate-split evaluation criteria.
-- [`obs-ecstore-dependency-inventory.md`](obs-ecstore-dependency-inventory.md):
-  observability-to-ECStore dependency inventory, classification, and extraction
-  guardrails.
-- [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md):
-  current `ecstore::config::{Config, KV, KVS}` definitions, consumers,
-  migration risks, and do-not-change contract.
-- [`ecstore-api-facade-inventory.md`](ecstore-api-facade-inventory.md): current
-  `rustfs_ecstore::api` facade groups, external consumer boundaries, shrink
-  rules, and split dependency inventory.
-- [`config-model-boundary-adr.md`](config-model-boundary-adr.md): target crate,
-  module path, dependency rules, and verification gates for moving the pure
-  server-config model.
-- [`compat-cleanup-register.md`](compat-cleanup-register.md): temporary
-  compatibility code that must be removed later.
+Cut wrong dependency directions with directories and contracts first, migrate global state in small steps next, and split crates only after boundaries are stable. Storage hot-path behavior must not drift during this migration.
 
 ## Phase Order
+
+Historical sequencing of the migration phases. All phases are closed; the diagram is kept because later documents refer to phase names.
 
 ```mermaid
 flowchart LR
@@ -80,10 +40,4 @@ flowchart LR
     GS --> CR
 ```
 
-The first implementation sequence is conservative:
-
-1. Record baseline and migration context.
-2. Establish PR and compatibility rules.
-3. Add dependency and loss-prevention checks in a separate `ci-gate` PR.
-4. Inventory `ecstore::config::{Config, KV, KVS}` before moving any code.
-5. Decide the config model boundary before extracting or migrating consumers.
+The document index is [README.md](README.md). The ECStore facade boundary that the storage phases converged on is described in [ecstore-api-facade-inventory.md](ecstore-api-facade-inventory.md).

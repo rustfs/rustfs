@@ -1,44 +1,30 @@
 # S3 Compatibility Matrix
 
-This matrix records the user-facing S3 compatibility claim for RustFS and ties
-it to the executable Ceph s3tests lists under `scripts/s3-tests/`.
+**Use this when:** writing or checking a user-facing S3 compatibility claim, or moving a Ceph s3tests case between lists.
+**Source of truth:** the test lists under `scripts/s3-tests/` and the runner `scripts/s3-tests/run.sh`; counts are derived from those files and are not recorded here.
 
 ## Current Claim
 
-RustFS provides broad S3 API compatibility for supported features. It does not
-claim complete coverage of every standard or vendor-specific S3 behavior.
-
-The root README should use the same wording: supported S3-compatible clients and
-features are covered by the compatibility matrix and test lists.
+RustFS provides broad S3 API compatibility for supported features. It does not claim complete coverage of every standard or vendor-specific S3 behavior. The root README uses the same wording: supported S3-compatible clients and features are covered by the compatibility matrix and test lists.
 
 ## Test List Sources
 
-| List | Purpose | Current count | Source |
-|---|---:|---:|---|
-| Implemented tests | Standard S3 tests expected to pass and used by the default local s3tests run. | 452 | `scripts/s3-tests/implemented_tests.txt` |
-| Lifecycle behavior tests | Expiration behavior cases gated by the dedicated `s3-lifecycle-behavior-tests` lane (debug-accelerated day + scanner enabled). | 5 | `scripts/s3-tests/lifecycle_behavior_tests.txt` |
-| Unimplemented tests | Standard S3 features planned but not yet implemented. | 17 | `scripts/s3-tests/unimplemented_tests.txt` |
-| Excluded tests | Vendor-specific or intentionally unsupported behavior excluded from RustFS compatibility gating. | 273 | `scripts/s3-tests/excluded_tests.txt` |
+| List | Purpose | Source |
+|---|---|---|
+| Implemented tests | Standard S3 tests expected to pass; the default local s3tests run. | `scripts/s3-tests/implemented_tests.txt` |
+| Lifecycle behavior tests | Days-based expiration cases gated by the `s3-lifecycle-behavior-tests` lane in `.github/workflows/ci.yml`. | `scripts/s3-tests/lifecycle_behavior_tests.txt` |
+| Unimplemented tests | Standard S3 features not yet passing. | `scripts/s3-tests/unimplemented_tests.txt` |
+| Excluded tests | Vendor-specific or intentionally unsupported behavior excluded from RustFS gating. | `scripts/s3-tests/excluded_tests.txt` |
 
-Counts ignore blank lines and comments.
-
-The lifecycle behavior lane runs real Days-based expiration cases that need
-`RUSTFS_ILM_DEBUG_DAY_SECS` (Ceph `lc_debug_interval` equivalent) and an enabled
-background scanner; it cannot share the default single-server gate because a
-global debug day would also shrink the `x-amz-expiration` header asserted by the
-`test_lifecycle_expiration_header_*` cases. See `scripts/s3-tests/run.sh`
-(`IMPLEMENTED_TESTS_FILE` override) and the `s3-lifecycle-behavior-tests` job in
-`.github/workflows/ci.yml`.
+Counts ignore blank lines and comments; compute them from the files. The lifecycle lane runs separately because its cases need `RUSTFS_ILM_DEBUG_DAY_SECS` and an enabled scanner, and a global debug day would also shrink the `x-amz-expiration` header asserted by `test_lifecycle_expiration_header_*`; see `IMPLEMENTED_TESTS_FILE` in `scripts/s3-tests/run.sh`.
 
 ## Supported Coverage
-
-The implemented test list currently covers the common object-storage surface:
 
 | Area | Status | Evidence |
 |---|---|---|
 | Bucket create/delete/list/head | Supported | `implemented_tests.txt` |
 | Object put/get/delete/copy/head | Supported | `implemented_tests.txt` |
-| CopyObject checksums (CRC32, CRC32C, CRC64NVME, SHA1, SHA256, MD5, SHA512, XXHASH3, XXHASH64, XXHASH128), including source preservation and explicit override | Supported in the first RustFS release containing this change | `crates/e2e_test/src/copy_object_checksum_test.rs` |
+| CopyObject checksums (CRC32, CRC32C, CRC64NVME, SHA1, SHA256, MD5, SHA512, XXHASH3, XXHASH64, XXHASH128), including source preservation and explicit override | Supported | `crates/e2e_test/src/copy_object_checksum_test.rs` |
 | ListObjects/ListObjectsV2 prefix, delimiter, marker, max-keys | Supported | `implemented_tests.txt` |
 | Multipart upload create/upload/complete/abort and selected multipart copy/checksum/object-attribute behavior | Supported | `implemented_tests.txt` |
 | Bucket and object tagging | Supported | `implemented_tests.txt` |
@@ -50,33 +36,25 @@ The implemented test list currently covers the common object-storage surface:
 | SSE-C and selected SSE-KMS edge cases | Supported | `implemented_tests.txt` |
 | Selected versioning, object-lock, checksum, CORS, raw request, and conditional write behavior | Supported | `implemented_tests.txt` |
 
-"Supported" for the SSE row means RustFS encrypts and decrypts its own objects. It does not mean RustFS can read objects another implementation encrypted: objects MinIO wrote with SSE-S3, SSE-KMS, or SSE-C are not readable by RustFS today, which matters when migrating. See [MinIO file-format interoperability, Part C](minio-file-format-compat.md#part-c--server-side-encryption-sse) and rustfs/backlog#1638.
+"Supported" for the SSE row means RustFS encrypts and decrypts its own objects. MinIO SSE objects (SSE-S3, SSE-KMS, SSE-C) are not readable in default builds; see [minio-file-format-compat.md Part C](minio-file-format-compat.md#part-c--server-side-encryption-sse) for the `rio-v2` migration build.
 
-## Planned Standard Coverage
+## Not Yet Passing
 
-These are standard S3 areas that remain planned work and must not be described
-as already complete:
+Standard S3 areas that must not be described as complete:
 
 | Area | Status | Evidence |
 |---|---|---|
-| Bucket access logging | Planned | `unimplemented_tests.txt` |
-| POST Object form upload checksum handling | Planned | `unimplemented_tests.txt` |
-| Bucket ownership controls | Planned | `unimplemented_tests.txt` |
+| Bucket access logging | Handlers exist (`get_bucket_logging`, `put_bucket_logging` in `rustfs/src/storage/ecfs.rs`); the `test_*bucket_logging*` s3tests cases are still listed as unimplemented | `unimplemented_tests.txt` |
+| POST Object form upload checksum handling | Not yet passing | `unimplemented_tests.txt` |
+| Bucket ownership controls | No handler | `unimplemented_tests.txt` |
 | Multipart upload listing and part lookup compatibility edge cases | Not part of default gate | `excluded_tests.txt` |
 | IAM-account or multi-storage-class dependent cases | Not part of default gate | `unimplemented_tests.txt` |
 | Tenanted bucket policy edge cases | Needs investigation | `unimplemented_tests.txt` |
 
 ## Intentional Exclusions
 
-`excluded_tests.txt` contains tests that should not block the RustFS
-compatibility gate. They fall into two classes:
-
-- vendor-specific or non-portable behavior not required for RustFS S3
-  compatibility;
-- intentionally unsupported product behavior, such as ACL authorization.
+`excluded_tests.txt` holds tests that must not block the compatibility gate: vendor-specific or non-portable behavior, and intentionally unsupported product behavior such as ACL authorization.
 
 ## Update Rule
 
-When a planned S3 feature is implemented, move its passing test entries from
-`unimplemented_tests.txt` to `implemented_tests.txt`, update this matrix, and
-avoid changing README wording beyond the supported coverage.
+When a feature starts passing, move its test entries from `unimplemented_tests.txt` to `implemented_tests.txt` and update the row here in the same PR. Do not change README wording beyond the supported coverage. Handler-level status (missing, stubbed, or diverging endpoints) is tracked in [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md).

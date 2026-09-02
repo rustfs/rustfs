@@ -82,7 +82,7 @@ require_source_contains "docs/architecture/global-state-crate-split-plan.md" "ru
 require_source_contains "docs/architecture/global-state-crate-split-plan.md" "global-state-inventory.md" "global state inventory plan link"
 require_source_contains "docs/architecture/global-state-inventory.md" "## Global State Classification" "global state inventory classification section"
 require_source_contains "docs/architecture/global-state-inventory.md" "## Runtime Migration Inventory" "global state inventory migration section"
-require_source_contains "docs/architecture/global-state-inventory.md" "GLOBAL_EXPIRY_STATE" "global state inventory first candidate"
+require_source_contains "docs/architecture/global-state-inventory.md" "expiry_state_handle" "global state inventory lifecycle expiry-state runtime handle"
 require_source_contains "docs/architecture/global-state-inventory.md" "## RustFS Owner-Local Static Inventory" "global state inventory RustFS owner-local static section"
 require_source_contains "docs/architecture/global-state-inventory.md" "KEYSTONE_AUTH" "global state inventory RustFS auth static inventory"
 require_source_contains "docs/architecture/global-state-inventory.md" "DEADLOCK_DETECTOR" "global state inventory RustFS storage static inventory"

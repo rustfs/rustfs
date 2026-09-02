@@ -1,5 +1,8 @@
 # Replication object size and shape limits (generic S3 targets)
 
+**Use this when:** an object fails to replicate to an S3-compatible target with `EntityTooLarge`/`EntityTooSmall`, or you need to know whether a large or oddly-chunked object is replicable before relying on it.
+**Source of truth:** `crates/ecstore/src/bucket/replication/` (transport selection and part replay), `crates/replication/` (target client), `crates/config/src/constants/` (`RUSTFS_OBS_LOGGER_LEVEL`).
+
 What RustFS can and cannot replicate to a generic S3 target (AWS S3, Wasabi,
 MinIO, or any other S3-compatible endpoint configured as a bucket replication
 target), and how a rejected object shows up in the log.
@@ -97,5 +100,4 @@ underneath this summary.
 
 - [Replication target check](replication-check.md) — validate a target's
   configuration, versioning, and version fidelity before relying on it.
-- [Presigned PUT size limit](presigned-put-size-limit.md)
-- [Presigned multipart size limit](presigned-multipart-size-limit.md)
+- [Presigned size limits](presigned-size-limits.md) — per-request and per-upload caps a backend can put on presigned uploads.

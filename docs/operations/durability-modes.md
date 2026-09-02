@@ -1,5 +1,8 @@
 # Durability modes (drive sync tiers)
 
+**Use this when:** choosing or debugging the fsync tier (`strict|relaxed|none|legacy-off`) for a deployment or a single bucket, or changing any write-path sync behaviour.
+**Source of truth:** `crates/ecstore/src/disk/local.rs` (`ENV_RUSTFS_DURABILITY_MODE`, `ENV_RUSTFS_DRIVE_SYNC_ENABLE`, mode resolution and per-write-point sync decisions), `crates/ecstore/src/bucket/durability.rs` (`ENV_NEW_BUCKET_DURABILITY_MODE`, per-bucket override), `rustfs/src/admin/handlers/durability.rs` (admin API), `crates/ecstore/src/bucket/metadata_sys.rs` (`BUCKET_METADATA_REFRESH_INTERVAL`).
+
 RustFS lets operators choose how much fsync work runs on the object write
 path. The default (`strict`) preserves the fully synced behavior RustFS has
 always shipped; the relaxed tiers are **opt-in** trades of power-loss
@@ -81,13 +84,13 @@ failure:
   MinIO's default posture (no per-object fsync) but means small objects have
   the widest loss window.
 - Durability of acknowledged writes therefore rests on **erasure-coded
-  redundancy across other nodes** plus the unclean-shutdown heal introduced
-  in PR #4221 converging the affected drive afterwards.
+  redundancy across other nodes** plus the unclean-shutdown heal converging
+  the affected drive afterwards.
 
 Deployment rule for `relaxed`: only multi-node clusters whose nodes sit in
 **independent power domains** (separate feeds/UPS). If all nodes can lose
-power simultaneously — the exact incident class that motivated PR #4221 —
-`relaxed` can lose recently acknowledged objects cluster-wide. Single-node
+power simultaneously, `relaxed` can lose recently acknowledged objects
+cluster-wide. Single-node
 deployments must stay on `strict`.
 
 **`none`.** No fsync on the object data path at all; acknowledged objects can
@@ -119,7 +122,7 @@ staged in tmp still commits with full `strict` durability.
 The durability mode is server-side configuration only; it cannot be raised or
 lowered by any request header.
 
-## Per-bucket durability (phase 2)
+## Per-bucket durability
 
 A bucket can override the process-wide mode with its own tier. The override
 is stored in the bucket's metadata (a `durability.json` entry in
@@ -146,8 +149,8 @@ configuration plane.
 
 ### New-bucket default
 
-A bucket created after this feature ships gets a `relaxed` override **seeded
-into its own metadata** at creation time (rustfs/backlog#1811), so it opts
+A newly created bucket gets a `relaxed` override **seeded into its own
+metadata** at creation time, so it opts
 into MinIO's default posture (object data still fdatasynced; xl.meta and
 directory-entry fsyncs left to the page cache) without touching the
 process-wide default. This is a gradual migration:
@@ -226,20 +229,10 @@ bucket on power failure.
 
 ## Performance expectations
 
-The often-quoted 26x PUT throughput delta was measured on macOS with the old
-binary switch fully **off** (equivalent to `none`/`legacy-off`), where
-`F_FULLFSYNC` heavily amplifies sync cost. `relaxed` keeps the per-shard
-fdatasync, so its gain is necessarily smaller and must be measured on the
-target platform (Linux ext4/xfs) before being relied on. Do not use `none`
-numbers to size `relaxed`.
-
-## Scope
-
-Phase 1 (rustfs/backlog#926) shipped the global, per-process tier configured
-by environment variable. Phase 2 (rustfs/backlog#938) adds the per-bucket
-override described above, configured through the admin API and stored in
-bucket metadata. `mc admin` integration for the per-bucket tier is a
-follow-up.
+Measure `relaxed` on the target platform (Linux ext4/xfs) before relying on a
+number. Throughput deltas measured with sync fully **off** (`none` or
+`legacy-off`) do not transfer: `relaxed` keeps the per-shard fdatasync, so its
+gain is necessarily smaller. Do not use `none` numbers to size `relaxed`.
 
 ## Related Recovery Guides
 

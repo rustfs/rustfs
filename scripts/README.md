@@ -64,7 +64,8 @@ their issue closes.
 
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
-| `run_hotpath_warp_ab.sh` | ci-gate | Linux warp A/B rig for the hotpath series | performance-ab.yml (scheduled); `docs/operations/hotpath-warp-ab-runbook.md` |
+| `run_hotpath_warp_ab.sh` | dev-tool | Linux warp A/B rig for the hotpath series (quick local A/B) | `docs/operations/hotpath-warp-ab-runbook.md` |
+| `run_hotpath_warp_abba.sh` | ci-gate | Formal ABBA warp runner (baseline/candidate interleaved, `--rounds >= 3`); the runner performance-ab.yml executes | performance-ab.yml (scheduled); `docs/operations/hotpath-warp-ab-runbook.md` |
 | `hotpath_warp_ab_gate.sh` | dev-tool | Relative-budget gate evaluated over the warp A/B results | used by `run_hotpath_warp_ab.sh`; hotpath runbook |
 | `run_internode_grpc_ab_bench.sh` | dev-tool | One-click A/B driver for the internode gRPC optimization stages | `docs/operations/internode-grpc-benchmark-runbook.md` |
 | `run_internode_transport_baseline.sh` | dev-tool | Internode transport baseline runner | internode runbook; `crates/io-metrics/README.md` |
@@ -74,7 +75,8 @@ their issue closes.
 | `run_pinned_paired_abba_bench.sh` | dev-tool | Pinned RustFS/MinIO paired ABBA benchmark orchestrator for backlog#1432 | `test_pinned_paired_abba_bench.sh` |
 | `run_get_codec_streaming_smoke.sh` | dev-tool | Local GET benchmark harness for the codec streaming read path | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_get_1mib_abba_stage_metrics.sh` | dev-tool | Exact-1MiB isolated-host GET ABBA/stage-metrics harness for backlog#1434 | `test_get_1mib_abba_stage_metrics.sh` |
-| `issue_2007_coalescer_prometheus_report.py` | dev-tool | Read-only Prometheus report for GET metadata coalescer delay cost validation | `test_issue_2007_coalescer_prometheus_report.sh`; `docs/testing/issue-2007-coalescer-delay.md` |
+| `issue_2007_coalescer_prometheus_report.py` | dev-tool | Read-only Prometheus report for GET metadata coalescer delay cost validation; usage in the module docstring | `test_issue_2007_coalescer_prometheus_report.sh` |
+| `prometheus_metrics_1649_smoke.py` | dev-tool | Read-only Prometheus instant-query smoke check for the backlog#1649 metric dimensions, required labels, and retired series; usage in the module docstring | `--self-test` |
 | `run_gt1g_get_http_matrix.sh` | dev-tool | >1 GiB GET HTTP matrix | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_gt1g_multipart_put_matrix.sh` | dev-tool | >1 GiB multipart PUT matrix | `docs/testing/ecstore-validation-suite-design.md` |
 | `sample_remote_rustfs_rss.sh` | dev-tool | Remote RustFS PID CPU/RSS TSV sampler for hotpath profiling runs | `test_sample_remote_rustfs_rss.sh`; backlog#1647 |

@@ -747,8 +747,7 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
             return response_with_status(StatusCode::PAYLOAD_TOO_LARGE, message);
         }
     };
-    // RUSTFS_COMPAT_TODO(#4648): old clients retry terminal stream failures on an already-used writer.
-    // Remove after every supported peer version advertises walk-dir stream completion v1.
+    // RUSTFS_COMPAT_TODO(rustfs-4648): old clients retry terminal stream failures on an already-used writer. Remove after every supported peer version advertises walk-dir stream completion v1.
     let propagate_completion_errors = match validate_walk_dir_completion_request(&query, &body) {
         Some(propagate_completion_errors) => propagate_completion_errors,
         None => {

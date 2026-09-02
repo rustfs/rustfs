@@ -5,6 +5,19 @@ The harness queries Prometheus' instant-query API. It never writes to RustFS,
 Prometheus, or the scrape targets. A check is ``metric|label=value,...``;
 ``--require-labels`` accepts ``metric|label1,label2``. ``--retired`` checks
 that an exact label set is absent after the scheduler's retirement window.
+
+Examples::
+
+    python3 scripts/prometheus_metrics_1649_smoke.py --self-test
+    python3 scripts/prometheus_metrics_1649_smoke.py \
+      --query-url http://prometheus.example:9090 --profile backlog-1649 \
+      --server rustfs-node1 --server rustfs-node2
+    python3 scripts/prometheus_metrics_1649_smoke.py \
+      --query-url http://prometheus.example:9090 \
+      --retired 'rustfs_scanner_bucket_drive_result_total|server=node1,bucket=removed,drive=d1,result=success'
+
+Use ``--bearer`` or ``--basic user:pass`` for a protected Prometheus; never put
+credentials in committed commands, logs, or issue comments.
 """
 
 import argparse

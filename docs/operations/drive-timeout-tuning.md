@@ -1,5 +1,8 @@
 # Drive Timeout Tuning
 
+**Use this when:** `ListObjects`/`ListObjectsV2` on a large prefix fails with `Io error: timeout`, or RustFS runs on HDD-class, network, or throttled storage and you need to widen per-operation drive liveness budgets.
+**Source of truth:** `crates/config/src/constants/drive.rs` (`DEFAULT_DRIVE_*_TIMEOUT_SECS`, `DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS`), `crates/config/src/constants/object.rs` (`DEFAULT_OBJECT_DISK_READ_TIMEOUT`), `crates/config/src/constants/capacity.rs` (`DEFAULT_CAPACITY_MAX_TIMEOUT_SECS`), `crates/ecstore/src/cache_value/metacache_set.rs` (walk stall handling and `rustfs_list_path_raw_stall_total`).
+
 This document describes the per-operation drive timeout knobs and the
 drive-timeout profile. It is written for operators running RustFS on slow or
 high-latency storage (HDD-class disks, network block devices, throttled
@@ -79,10 +82,11 @@ for the full list and defaults.
 `ListObjects`/`ListObjectsV2` on a large prefix either:
 
 - returns `500 InternalError` with `Io error: timeout`; or
-- (on older builds) returns HTTP 200 with `IsTruncated=false` after fewer keys
-  than the bucket actually holds — a **silent** truncation that S3 clients
-  (`mc`, minio-go, SDK pagination loops) cannot detect, because
-  `IsTruncated=false` is the protocol's only end-of-listing signal.
+- on builds without the failure contract below, returns HTTP 200 with
+  `IsTruncated=false` after fewer keys than the bucket actually holds — a
+  **silent** truncation that S3 clients (`mc`, minio-go, SDK pagination loops)
+  cannot detect, because `IsTruncated=false` is the protocol's only
+  end-of-listing signal.
 
 Every "missing" object remains readable by exact key via `GetObject` /
 `StatObject`; only the listing is affected.
@@ -97,21 +101,10 @@ single `readdir` exceed the budget on a perfectly healthy disk, especially on
 HDD-class or throttled storage. That trips a drive timeout, which the listing
 path escalates and surfaces to the client.
 
-### The silent variant is fixed; the loud 500 is tuned away
+### Failure contract
 
-As of the walk-stall rework (merged to `main`, first released in **1.0.0-beta.9**):
-
-- **The silent variant is eliminated.** A walk that dies mid-stream can no
-  longer be consumed as a clean end-of-listing. Once a walk has streamed any
-  entries and then stalls, the failure is recorded as a hard drive timeout and
-  escalated on that erasure set, so the client always sees an error — never a
-  well-formed short page. This is locked by the
-  `list_path_raw_returns_timeout_when_producer_fails_after_partial_entry`
-  regression test in `crates/ecstore/src/cache_value/metacache_set.rs`.
-- **The remaining 500 is an operator-tunable, not a data-integrity bug.** A
-  genuinely wide flat directory can still exhaust the default 5s stall budget on
-  slow storage and fail the listing loudly. The supported mitigation is to widen
-  the budget.
+- A walk that stalls after streaming any entries fails as a hard drive timeout escalated on that erasure set; the client always sees an error, never a well-formed short page. Locked by `list_path_raw_returns_timeout_when_producer_fails_after_partial_entry` in `crates/ecstore/src/cache_value/metacache_set.rs`.
+- The remaining `500` on a genuinely wide flat directory is an operator tunable, not a data-integrity bug: widen the stall budget as below.
 
 ### Mitigation
 
@@ -128,12 +121,6 @@ Raise the walk stall budget, or select the high-latency profile:
 # or raise every profile-aware drive default at once
 -e RUSTFS_DRIVE_TIMEOUT_PROFILE=high_latency
 ```
-
-> Note: on releases at or before `1.0.0-beta.8`, the foreground listing path was
-> bounded by the *total* wall-clock knob `RUSTFS_DRIVE_WALKDIR_TIMEOUT_SECS`
-> instead of the stall budget. If you cannot upgrade, raise that knob — but
-> upgrading to `1.0.0-beta.9` or later is strongly preferred, because only the
-> newer builds convert the *silent* truncation into a detectable error.
 
 The most durable fix for pathologically wide directories is to shard keys under
 additional prefix levels so no single directory holds an enormous flat child

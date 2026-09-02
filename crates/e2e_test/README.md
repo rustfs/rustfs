@@ -233,8 +233,8 @@ spawn error. Install the pinned CI version before running their profiles.
   [`src/policy/README.md`](src/policy/README.md),
   [`src/protocols/README.md`](src/protocols/README.md),
   [`src/reliant/README.md`](src/reliant/README.md)
-- Authoritative per-module counts:
-  [`docs/testing/e2e-suite-inventory.md`](../../docs/testing/e2e-suite-inventory.md)
+- Per-module counts: `cargo nextest list -p e2e_test --profile <profile>`
+  (one-liner in [`docs/testing/README.md`](../../docs/testing/README.md))
 - Test pyramid & flake policy: [`docs/testing/README.md`](../../docs/testing/README.md)
 
 ## CI smoke subset (`--profile e2e-smoke`)
@@ -271,12 +271,12 @@ Note on `#[serial]`: nextest runs each test in its own process, so
 parallel-safe by construction (random port + isolated temp dir), which the
 current subset is.
 
-### Authoritative test inventory
+### Test inventory
 
-`docs/testing/e2e-suite-inventory.md` records the per-module test counts as
-listed by `cargo nextest list -p e2e_test`. Regenerate it when adding or
-moving e2e tests so acceptance numbers in the test-strategy issues
-(backlog#1147–#1155) stay auditable. When a profile membership change is
+Per-module counts are not committed; list them with
+`cargo nextest list -p e2e_test --profile <profile>` (the result is
+platform-dependent because some modules are linux-only; the `jq` one-liner is
+in `docs/testing/README.md`). When a profile membership change is
 intentional, review its JSON listing before updating the matching
 `.config/e2e-*-selection.txt` test-ID digest. Update only the platform that
 produced the listing:

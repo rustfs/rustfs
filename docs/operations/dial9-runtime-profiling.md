@@ -1,5 +1,8 @@
 # dial9 Tokio Runtime Profiling
 
+**Use this when:** you need Tokio runtime-level evidence (which task held a worker, long polls, park/unpark behaviour) that Prometheus metrics and `tracing` spans cannot provide, or you are building or running the opt-in `dial9` profiling binary.
+**Source of truth:** `crates/obs/src/telemetry/dial9/mod.rs` (session setup), `crates/obs/src/metrics/collectors/dial9.rs` (metrics), `crates/config/src/constants/runtime.rs` (`RUSTFS_RUNTIME_DIAL9_*` and defaults), `.config/make/build.mak` (`build-profiling`), `crates/obs/build.rs` (feature/cfg pairing check).
+
 `dial9-tokio-telemetry` records Tokio runtime-level events — poll start/end,
 worker park/unpark, task spawn/terminate, and optionally async backtraces of
 stalled tasks — into binary trace segments.
@@ -60,9 +63,8 @@ That is `cargo build --release --bin rustfs --features dial9` with
 dumps and S3 upload are both unavailable, for the reasons given above and below.
 
 `crates/obs/build.rs` fails the build if the `dial9` feature is enabled without
-`--cfg tokio_unstable`. This is deliberate: an environment `RUSTFLAGS` *replaces*
-the value from `.cargo/config.toml` rather than appending to it, so the flag used
-to disappear silently whenever anything else set `RUSTFLAGS`.
+`--cfg tokio_unstable`, so a mismatched `RUSTFLAGS` cannot produce a binary that
+silently records nothing.
 
 For CPU profiling with usable stacks, add `-C force-frame-pointers=yes`.
 

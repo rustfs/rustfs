@@ -1,98 +1,49 @@
 # No-Parity Bitrot Recovery Guide
 
-This guide covers historical objects written with erasure data shards but no
-parity shards, for example an object whose `xl.meta` reports `EcM=1` and
-`EcN=0`. PR #5179 prevents RustFS from committing new objects after it detects
-this class of no-parity bitrot failure, but operators may still find already
-committed objects on disk.
+**Use this when:** a GET or deep heal reports `FileCorrupt` / `bitrot hash mismatch` on an object whose `xl.meta` shows `EcN=0` (data shards, no parity), and the raw `part.N` file is still readable from the filesystem.
+**Source of truth:** `crates/ecstore/src/set_disk/ops/heal.rs` (heal returns `FileCorrupt` for confirmed no-parity bitrot, `ErasureReadQuorum` otherwise); `crates/filemeta/examples/dump_fileinfo.rs` (offline `xl.meta` decoder).
+
+This guide covers historical objects written with erasure data shards but no parity shards (for example `EcM=1`, `EcN=0`). The write path now self-verifies no-parity writes and refuses to commit an object whose shard fails bitrot verification, so new objects of this class cannot be created, but already committed ones may still exist on disk.
 
 ## Symptom
 
-An affected object can look surprising during incident response:
+- The raw shard file (`part.1`) is visible and readable from the local filesystem.
+- An S3 GET or deep heal reports an integrity failure: `FileCorrupt`, `bitrot hash mismatch`, an unrecoverable heal result, or a truncated streaming response.
+- No parity shards exist to reconstruct the corrupted data shard.
 
-- the raw shard file, such as `part.1`, is visible and readable from the local
-  filesystem;
-- an S3 GET or deep heal reports an integrity failure, commonly through
-  `FileCorrupt`, `bitrot hash mismatch`, or an unrecoverable heal result;
-- there are no parity shards available to reconstruct the corrupted data shard.
+The filesystem-readable `part.N` is evidence, not trusted object data: the stored hash no longer matches the bytes on disk, and RustFS must not bypass bitrot validation to serve it.
 
-The filesystem-readable `part.N` file is therefore evidence, not trusted object
-data. RustFS must not bypass bitrot validation to serve it through S3, because
-the stored hash no longer matches the bytes on disk.
-
-## What To Capture
+## What to capture
 
 Before deleting or moving anything, capture:
 
-- bucket name, object key, and version ID if versioning is enabled;
-- the RustFS version and whether the deployment was running with no parity
-  (`EcN=0`) at the time the object was written;
-- the heal or GET error, including any `FileCorrupt`, `bitrot hash mismatch`,
-  `ErasureReadQuorum`, or truncated streaming response message;
-- `xl.meta` from every shard disk that still has the object;
-- the raw `part.N` file from every shard disk that still has the object.
+1. Bucket name, object key, and version ID if versioning is enabled.
+2. The RustFS version, and whether the deployment ran with no parity (`EcN=0`) when the object was written.
+3. The heal or GET error text.
+4. `xl.meta` and the raw `part.N` file from every shard disk that still has the object.
 
-For local inspection, decode metadata with:
+Decode metadata locally and record the erasure geometry (`EcM`, `EcN`), object size, part number, part logical size, data directory, and checksum algorithm:
 
 ```bash
 cargo run -p rustfs-filemeta --example dump_fileinfo -- /path/to/disk/bucket/object/xl.meta
 ```
 
-Record the erasure geometry (`EcM`, `EcN`), object size, part number, part
-logical size, data directory, and checksum algorithm from the decoded metadata.
+## Size accounting
 
-## Size Accounting
+Erasure shard files include bitrot hash data in addition to object bytes: with the default `HighwayHash256S` checksum each protected block adds 32 bytes, so a raw `part.1` larger than the logical object size is normal (for example 8,250,370 logical bytes in 8 blocks → 8,250,626 raw bytes). The size relationship only shows the layout is plausible; the bitrot reader is the authority for integrity.
 
-RustFS erasure shard files include bitrot hash data in addition to object bytes.
-For the default HighwayHash256S checksum, each protected block adds 32 bytes of
-hash data to the shard file. A raw `part.1` size can therefore be larger than
-the object logical size and still be normal.
+## Recovery boundary
 
-Example:
+If `EcN=0` and a data shard fails bitrot verification, RustFS cannot reconstruct the object from the erasure set. The valid options are:
 
-```text
-logical object bytes: 8,250,370
-protected blocks: 8
-hash overhead: 8 * 32 = 256 bytes
-raw part.1 bytes: 8,250,626
-```
+- Restore the object from an external backup, replica, upstream source, or a known-good copy outside the affected erasure set.
+- Preserve the affected `xl.meta` and `part.N` files as incident evidence, then delete the object through the normal S3/admin path when retention policy allows.
+- Quarantine by copying evidence out of the live data path first; remove or isolate the live object path only after the incident owner confirms the evidence is no longer needed.
 
-This size relationship only proves that the file layout is plausible. It does
-not prove the bytes are valid. The bitrot reader is the authority for integrity.
+Do not edit `xl.meta`, rewrite `part.N`, or serve raw shard bytes to clients as the object. Those actions hide evidence and convert a detected integrity failure into silent data corruption.
 
-## Recovery Boundary
+If `EcN>0`, this guide is not the primary recovery path: run normal heal first, since parity may allow RustFS to reconstruct the missing or corrupt shard.
 
-If `EcN=0` and a data shard fails bitrot verification, RustFS cannot reconstruct
-the object from the erasure set. The valid recovery options are:
+## Expected diagnostics
 
-- restore the object from an external backup, replica, upstream source, or a
-  known-good copy outside the affected erasure set;
-- preserve the affected `xl.meta` and `part.N` files as incident evidence, then
-  delete the object through the normal S3/admin path when retention policy
-  allows it;
-- quarantine by copying evidence out of the live data path first, then remove
-  or isolate the live object path only after the incident owner confirms the
-  evidence is no longer needed.
-
-Do not edit `xl.meta`, rewrite `part.N`, or serve raw shard bytes to clients as
-the object. Those actions hide evidence and can convert a detected integrity
-failure into silent data corruption.
-
-If `EcN>0`, this guide is not the primary recovery path. Use normal heal first;
-parity may allow RustFS to reconstruct the missing or corrupt shard.
-
-## Expected Diagnostics
-
-Deep heal should report no-parity corruption as an unrecoverable integrity
-failure rather than only a generic read-quorum problem. The diagnostic context
-should include:
-
-- bucket, object, and version ID;
-- erasure data shard count and parity shard count;
-- part number;
-- whether the failing part had a bitrot failure;
-- the number of missing or corrupt shards.
-
-When the failure is confirmed bitrot on a no-parity object, the heal error is
-reported as `FileCorrupt`, and the heal result `detail` states that the
-no-parity object is unrecoverable.
+Deep heal reports no-parity corruption as an unrecoverable integrity failure rather than a generic read-quorum problem: the heal error is `FileCorrupt`, and the heal result `detail` states that the no-parity object is unrecoverable. The diagnostic context includes bucket, object, and version ID; data and parity shard counts; part number; whether the failing part had a bitrot failure; and the number of missing or corrupt shards.

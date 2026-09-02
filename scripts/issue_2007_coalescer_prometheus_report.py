@@ -4,6 +4,23 @@
 The script queries Prometheus' instant-query API and prints a Markdown summary
 for one already-completed workload window. It never writes to RustFS,
 Prometheus, or scrape targets.
+
+Benchmark both cells with the same build, object set, workload, and
+``RUSTFS_BATCH_READ_VERSION_SERVER_PARALLELISM``; switch only
+``RUSTFS_GET_METADATA_READ_VERSION_COALESCE_DELAY_MICROS`` (200 vs 50), then
+report each measured window::
+
+    scripts/issue_2007_coalescer_prometheus_report.py \
+      --query-url http://prometheus.example:9090 --profile delay-200us \
+      --window 180s --rustfs-selector 'server=~"node[5-8]"' \
+      --node-selector 'instance=~"node[5-8].*"'
+    scripts/issue_2007_coalescer_prometheus_report.py \
+      --query-url http://prometheus.example:9090 --profile delay-50us \
+      --window 180s --rustfs-selector 'server=~"node[5-8]"' \
+      --node-selector 'instance=~"node[5-8].*"'
+
+A section printed as ``UNAVAILABLE`` is missing evidence, not zero. Self-test:
+``scripts/test_issue_2007_coalescer_prometheus_report.sh``.
 """
 
 from __future__ import annotations

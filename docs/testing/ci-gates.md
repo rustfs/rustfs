@@ -1,154 +1,102 @@
 # CI gate matrix
 
-This file is the source of truth for which validation runs on each event, its
-configured wall-clock budget, and whether it can block a merge. Test taxonomy,
-naming, and nextest serialization rules remain in [README.md](README.md); e2e
-membership and counts remain in
-[e2e-suite-inventory.md](e2e-suite-inventory.md).
+**Use this when:** a check is red and you need to know whether it blocks the merge, which workflow and job produced it, and how to reproduce it locally.
+**Source of truth:** the live `main` ruleset (command below) for required status; `.github/workflows/<file>.yml` for triggers, `paths`, `timeout-minutes`, and cron; `.config/nextest.toml` for e2e profile filters; `.github/scheduled-validations.json` for the freshness-watchdog list.
 
-The distinction between **required** and **report-only** is load-bearing:
-a failing job blocks a merge only when its exact check name is present in the
-live `main` ruleset. A workflow name, a `merge_group` trigger, or a red PR check
-does not make a job required by itself.
+A job blocks a merge only when its exact check name is in the live `main` ruleset. A workflow name, a `merge_group` trigger, or a red PR check does not make a job required by itself.
 
 ## Required merge checks
 
-The live `main` ruleset (`6436880`) currently requires exactly these contexts:
+The `main` ruleset (`6436880`) requires exactly these contexts, with `strict_required_status_checks_policy=false`:
 
 | Required context | Producer | Validation |
 |---|---|---|
-| `CLA Check` | `.github/workflows/cla.yml` | Contributor agreement |
-| `Quick Checks` | `.github/workflows/ci.yml` | Formatting and repository guard scripts |
-| `Test and Lint` | `.github/workflows/ci.yml` | Clippy, workspace nextest excluding `e2e_test`, doctests, and migration proofs |
+| `CLA Check` | `cla.yml` | Contributor agreement |
+| `Quick Checks` | `ci.yml` job `quick-checks` | Formatting and repository guard scripts |
+| `Test and Lint` | `ci.yml` job `test-and-lint` | Clippy, workspace nextest (`ci` profile, excluding `e2e_test`), doctests, migration-gate count (`scripts/check_migration_gate_count.sh`) |
 
-For pull requests limited to the paths excluded by the main CI workflow,
-`.github/workflows/ci-docs-only.yml` reports `Quick Checks` and
-`Test and Lint` under the same names. It runs the real quick checks and the
-planning-document guard; it does not claim that Rust compilation or runtime
-tests ran. Despite the workflow name, these paths also include selected deploy,
-workflow, and lock files.
+For PRs limited to the `paths-ignore` list in `ci.yml`, `ci-docs-only.yml` reports `Quick Checks` and `Test and Lint` under the same names; it runs the quick checks and `scripts/check_no_planning_docs.sh`, not a Rust build or tests. `scripts/check_ci_paths_sync.sh` keeps the two path lists aligned.
 
-Verify the live rule rather than trusting this snapshot before changing merge
-policy:
+Verify the live rule before changing merge policy:
 
 ```bash
 gh api repos/rustfs/rustfs/rulesets/6436880 \
   --jq '.rules[] | select(.type == "required_status_checks") | .parameters'
 ```
 
-The ruleset currently has `strict_required_status_checks_policy=false`.
-`Continuous Integration` accepts `merge_group` events and runs `e2e-full` for
-them, but `End-to-End Tests (full merge gate)` is not currently a required
-context. Therefore the repository is prepared to test a merge-queue SHA, but
-the workflow alone does not prove that every merge passed that lane.
+Promotion rule: never promote a report-only lane to required from one green run. Require at least 14 days and 30 representative PRs with at least 99% complete execution, then update the ruleset and this file together.
 
 ## Pull request and merge matrix
 
-Budgets below are job `timeout-minutes`, not typical runtimes. “Report-only”
-means the result is visible and actionable but is not in the live required
-context list.
+"Report-only" means visible and actionable but not in the required list. Budgets are each job's `timeout-minutes` in the named workflow and are not copied here.
 
-| Event | Validation | Budget | Merge status | Reproduction |
-|---|---|---:|---|---|
-| PR, non-doc change | `Quick Checks` | 10 min | Required | `make pre-commit` (broader local umbrella) |
-| PR, non-doc change | `Test and Lint` | 90 min | Required | `cargo nextest run --profile ci --all --exclude e2e_test` |
-| PR, non-doc change | `Typos` | 10 min | Report-only | `typos` |
-| PR, non-doc change | `ILM Integration (serial)` | 90 min | Report-only | Use the exact command in `.github/workflows/ci.yml` |
-| PR, non-doc change | rio-v2 / swift / sftp test-and-lint variants | 90 min each | Report-only | `cargo nextest run` with the workflow's feature set |
-| PR, non-doc change | `Build RustFS Debug Binary` | 30 min | Report-only; prerequisite for black-box lanes | `cargo build -p rustfs --bins` |
-| PR, non-doc change | `io_uring Integration (real)` | 30 min | Report-only | `cargo test -p rustfs-ecstore --lib uring_ -- --test-threads=1 --nocapture` |
-| PR, non-doc change | `End-to-End Tests` (`e2e-smoke` plus `s3s-e2e`) | 30 min | Report-only | `cargo nextest run --profile e2e-smoke -p e2e_test`; then `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>` |
-| PR, non-doc change | `S3 Implemented Tests` | 60 min | Report-only | Build `rustfs`, then run `scripts/s3-tests/run.sh` with `DEPLOY_MODE=binary`, `TEST_MODE=single`, and `MAXFAIL=0` |
-| PR, non-doc change | `S3 Lifecycle Behavior Tests` | 30 min | Report-only | Use the accelerated scanner environment in `.github/workflows/ci.yml` with `scripts/s3-tests/run.sh` |
-| PR touching dependency or workflow inputs | Cargo Deny / Workflow Pin Report / Dependency Review | 20 / 5 / 30 min | Report-only | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
-| PR touching architecture rules or architecture docs | `Architecture Migration Rules` | 10 min | Report-only | `scripts/check_architecture_migration_rules.sh` |
-| PR touching Nix or workspace manifests | `Nix Build & Check` | 60 min | Report-only | `nix flake check` |
-| PR limited to main-CI-excluded paths | companion `Quick Checks` and `Test and Lint` | 10 min each | Required | `git diff --check`; `make doc-paths-check` when documentation paths changed |
-| `merge_group` | Standard CI plus `e2e-full` | 55 min for `e2e-full` | Standard required contexts only; `e2e-full` report-only | `cargo nextest run --profile e2e-full -p e2e_test` |
-| Push to `main` | Standard CI plus `e2e-full` | 55 min for `e2e-full` | Post-merge detection | Same as `merge_group` |
-| PR touching fuzz inputs or harness paths | Build plus five 60-second fuzz smoke targets | 60 min build; 30 min per target | Report-only | `MAX_TOTAL_TIME=60 ./scripts/fuzz/run.sh` |
-| PR touching selected ecstore disk/format paths | `Rename Safety` on Windows | 60 min | Report-only | Run the four `cargo test -p rustfs-ecstore --lib <filter>` commands in `windows-filesystem.yml` on Windows |
+| Event | Check name | Workflow / job | Merge status | Reproduce |
+|---|---|---|---|---|
+| PR, non-doc change | `Quick Checks` | `ci.yml` `quick-checks` | Required | `make pre-commit` |
+| PR, non-doc change | `Test and Lint` | `ci.yml` `test-and-lint` | Required | `cargo clippy --all-targets -- -D warnings`; `cargo nextest run --profile ci --all --exclude e2e_test`; `cargo test --all --doc`; `scripts/check_migration_gate_count.sh` |
+| PR, non-doc change | `Typos` | `ci.yml` `typos` | Report-only | `typos` |
+| PR, non-doc change | `ILM Integration (serial)` | `ci.yml` `test-ilm-integration-serial` | Report-only | exact command in the job |
+| PR, non-doc change | `Test and Lint (rio-v2)`, `Test and Lint (swift)`, `Test and Lint (sftp)` | `ci.yml` `test-and-lint-rio-v2`, `test-and-lint-protocols` | Report-only | `cargo nextest run` with the job's `--features` |
+| PR, non-doc change | `Connect Short Credential Boundary` | `ci.yml` `connect-short-credential-boundary` | Report-only | `cargo test -p rustfs --test connect_registration --features connect-e2e-short-credentials`; `cargo check -p rustfs --release --features connect-e2e-short-credentials` must fail |
+| PR, non-doc change | `Build RustFS Debug Binary` | `ci.yml` `build-rustfs-debug-binary` | Report-only; prerequisite for the black-box jobs | `cargo build -p rustfs --bins` |
+| PR, non-doc change | `io_uring Integration (real)` | `ci.yml` `uring-integration` | Report-only | `cargo test -p rustfs-ecstore --lib uring_ -- --test-threads=1 --nocapture` |
+| PR, non-doc change | `End-to-End Tests` | `ci.yml` `e2e-tests` | Report-only | `cargo nextest run --profile e2e-smoke -p e2e_test`, then `./scripts/e2e-run.sh ./target/debug/rustfs <data-dir>`; membership guards `scripts/check_test_wiring.py --check-profile e2e-smoke <listing.json>` and `scripts/check_security_smoke_count.sh check <listing.json>` |
+| PR, non-doc change | `S3 Implemented Tests` | `ci.yml` `s3-implemented-tests` | Report-only | build `rustfs`, then `scripts/s3-tests/run.sh` with the job's `DEPLOY_MODE` / `TEST_MODE` / `MAXFAIL` env |
+| PR, non-doc change | `S3 Lifecycle Behavior Tests` | `ci.yml` `s3-lifecycle-behavior-tests` | Report-only | `scripts/s3-tests/run.sh` with the job's accelerated-scanner env |
+| PR touching `paths` in `audit.yml` | `Cargo Deny`, `Workflow Pin Report`, `Dependency Review` | `audit.yml` `cargo-deny`, `workflow-pin-report`, `dependency-review` | Report-only | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
+| PR touching `paths` in `architecture-migration-rules.yml` | `Architecture Migration Rules` | `architecture-migration-rules.yml` `architecture-migration-rules` | Report-only | `scripts/check_architecture_migration_rules.sh` |
+| PR touching `paths` in `nix.yml` | `Nix Build & Check` | `nix.yml` `nix-validation` | Report-only | `nix flake check` |
+| PR touching `paths` in `fuzz.yml` | `Build Fuzz Harness`, `Smoke / <target>` | `fuzz.yml` `fuzz-build`, `pr-fuzz-smoke` | Report-only | `MAX_TOTAL_TIME=60 ./scripts/fuzz/run.sh` |
+| PR touching `paths` in `windows-filesystem.yml` | `Rename Safety` | `windows-filesystem.yml` `rename-safety` | Report-only | the `cargo test -p rustfs-ecstore --lib <filter>` commands in the job, on Windows |
+| PR touching `paths` in `coverage.yml` | `Workspace line coverage` | `coverage.yml` `coverage` | Report-only | `make coverage`; `python3 scripts/check_security_coverage.py target/llvm-cov/coverage.json` |
+| PR touching `paths` in `e2e-upgrade.yml` | `Direct upgrade from rc.2` | `e2e-upgrade.yml` `direct-upgrade` | Report-only | the `cargo test --locked -p e2e_test` command in the job with `RUSTFS_UPGRADE_SOURCE_BINARY` pointing at the pinned previous release |
+| PR touching `paths` in `oidc-keycloak.yml` | `OIDC Keycloak live gate` | `oidc-keycloak.yml` `oidc-keycloak-live` | Report-only | `cargo build --locked -p rustfs --bin rustfs`, then `bash scripts/test/oidc_keycloak_live.sh ./target/debug/rustfs` |
+| PR touching `paths` in `targets-integration.yml` | `PostgreSQL, MySQL, AMQP, and NATS` | `targets-integration.yml` `targets-live` | Report-only | start the containers as in the job, export the `RUSTFS_TEST_*` DSNs, then the job's `cargo test --locked -p rustfs-targets --test <name> -- --ignored --test-threads=1` commands |
+| PR limited to main-CI-excluded paths | `Quick Checks`, `Test and Lint` | `ci-docs-only.yml` `quick-checks`, `test-and-lint` | Required | `git diff --check`; `make doc-paths-check`; `scripts/check_no_planning_docs.sh` |
+| `merge_group`; push to `main` | `End-to-End Tests (full merge gate)` | `ci.yml` `e2e-full` | Report-only | `cargo nextest run --profile e2e-full -p e2e_test` |
 
-The authoritative e2e filters live in `.config/nextest.toml`; extend a profile
-instead of adding a second ad-hoc selector. Before a profile runs,
-`scripts/check_test_wiring.py` compares its exact membership to the committed
-digest so a silent test drop fails closed.
+e2e filters live in `.config/nextest.toml`; extend a profile instead of adding a second selector. Before a profile runs, `scripts/check_test_wiring.py` compares its listing to the committed digest in `.config/e2e-<profile>-selection.txt`, so a silent test drop fails closed.
 
-## Scheduled and manual validation
+## Scheduled validation
 
-Scheduled lanes are independent fault domains. They do not block a pull
-request, but their workflow-local gate can fail the run and scheduled failures
-are routed to the shared failure-issue action. The scheduled-validation
-watchdog and freshness workflow separately detect incomplete runs and missing
-schedules.
+Scheduled lanes never block a PR. Their workflow-local gate fails the run, scheduled failures route to the shared failure-issue action, and `scheduled-validation-freshness.yml` fails when a workflow listed in `.github/scheduled-validations.json` has not run within its `max_age_hours` (a `never_ran_grace_until` entry covers the window before a newly enabled cron's first slot). Cadence is qualitative here; the cron lives in each workflow's `on.schedule`.
 
-| Cadence (UTC unless noted) | Workflow / validation | Budget | Verdict and artifacts | Reproduction |
-|---|---|---:|---|---|
-| Daily 02:17 | Fuzz: five nightly corpus targets | 60 min build; 60 min per target | Gate; corpus/crash artifacts, scheduled failure alert | `MAX_TOTAL_TIME=<seconds> ./scripts/fuzz/run.sh` |
-| Dormant (cron 03:17 once re-enabled) | MinIO interop (EC + SSE read parity) | 40 min | Manually disabled in the Actions settings (backlog#1603) and therefore outside the freshness list; re-add it to `.github/scheduled-validations.json` when re-enabling | Follow the pinned Docker fixture steps in `minio-interop.yml` |
-| Daily 04:29 | Replication / cluster-fault / protocol e2e | 45 / 90 / 90 min | Three independent gates; JUnit, membership, and server logs | `cargo nextest run --profile e2e-repl-nightly -p e2e_test`; `--profile e2e-nightly`; `-j 1 --profile e2e-protocols` |
-| Daily 06:31 | Warp performance A/B | 180 min | Regression budget gate; A/B summaries and server logs | `bash scripts/run_hotpath_warp_abba.sh --help` |
-| Daily 00:07 Asia/Shanghai (16:07 UTC previous day) | Nightly GNU build and Vault lanes | 150 / 90 / 60 min | Build, live Vault, and HA failover gates | Use the commands and pinned Vault images in `nightly-gnu.yml` |
-| Daily 03:23 | Security Audit | 20 / 5 min, plus 30 min on PR dependency review | Cargo Deny and workflow-pin gates; scheduled failure alert | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
-| Daily 23:47 | Scheduled Validation Freshness | 10 min | Fails when a critical schedule was never created or is stale; an entry may carry `never_ran_grace_until` to cover the window before a newly enabled cron's first slot | Dispatch `scheduled-validation-freshness.yml` |
-| Sunday 00:11 | Full `Continuous Integration` matrix | Per-job budgets above | Weekly variant coverage, including dormant rio-v2 binary/e2e lanes | Dispatch `ci.yml` |
-| Sunday 01:13 | Seven-platform build matrix | 150 min per platform | Build/package integrity; scheduled failure alert | Dispatch `build.yml` with an exact platform set |
-| Sunday 02:19 | Ceph s3-tests full sweep: single and real four-node, four shards each | 180 min per shard | Compatibility gate; report, JUnit, exact node IDs, and server logs | `scripts/s3-tests/run.sh` against an existing single or distributed target |
-| Sunday 06:41 | Mint | 120 min | **Report-only by design**; per-suite PASS/FAIL/NA and raw `log.json` | Reproduce the pinned Docker sequence in `mint.yml` or dispatch it |
-| Sunday 07:43 | Workspace line coverage | 120 min | Report-only trend; lcov and JSON retained 90 days | `make coverage` |
-| Monthly, day 1 06:37 | Runner Hygiene | 15 min | Validates runner ephemerality; scheduled failure alert | Dispatch `runner-hygiene.yml` |
+| Workflow (cadence) | Jobs | Verdict and artifacts | In freshness list | Reproduce |
+|---|---|---|---|---|
+| `ci.yml` (weekly) | full matrix, including the schedule/dispatch-only rio-v2 jobs `build-rustfs-debug-binary-rio-v2` and `e2e-tests-rio-v2` | per-job | yes | dispatch `ci.yml` |
+| `build.yml` (weekly) | `build-rustfs` over the six-target platform matrix in `prepare-platform-matrix` (four Linux, macOS aarch64, Windows x86_64) | build/package integrity | yes | dispatch `build.yml` with an exact platform set |
+| `e2e-replication-nightly.yml` (nightly) | `repl-nightly`, `cluster-nightly`, `protocols-nightly` | three independent gates; JUnit, membership listing, server logs | yes | `cargo nextest run --profile e2e-repl-nightly -p e2e_test`; `--profile e2e-nightly`; `-j 1 --profile e2e-protocols` |
+| `e2e-s3tests.yml` (weekly) | `s3tests` (single and distributed, four shards each), `upstream-head-canary` | compatibility gate; report, JUnit, node IDs, server logs | yes | `scripts/s3-tests/run.sh` against an existing single or distributed target |
+| `fuzz.yml` (nightly) | `nightly-fuzz-corpus` per target | gate; corpus and crash artifacts | yes | `MAX_TOTAL_TIME=<seconds> ./scripts/fuzz/run.sh` |
+| `minio-interop.yml` (nightly) | `minio-interop` | EC + SSE read-parity gate | yes, with `never_ran_grace_until` | pinned Docker fixture steps in the workflow |
+| `performance-ab.yml` (nightly) | `warp-ab` | regression-budget gate; A/B summaries and server logs | yes | `bash scripts/run_hotpath_warp_abba.sh --help` |
+| `nightly-gnu.yml` (nightly) | `build`, `kms-vault-lane`, `kms-vault-ha-failover` | build, live Vault, and HA failover gates | yes | commands and pinned Vault images in the workflow |
+| `audit.yml` (nightly) | `cargo-deny`, `workflow-pin-report` | dependency and workflow-pin gates | yes | `cargo deny check`; `scripts/security/check_workflow_pins.sh` |
+| `mint.yml` (weekly) | `mint` | report-only by design; per-suite PASS/FAIL/NA and raw `log.json` | yes | pinned Docker sequence in the workflow |
+| `coverage.yml` (weekly) | `coverage` | report-only trend; lcov and JSON artifact | yes | `make coverage` |
+| `runner-hygiene.yml` (monthly) | `check-ephemerality` | runner ephemerality | yes | dispatch |
+| `e2e-upgrade.yml` (weekly) | `direct-upgrade` | upgrade gate; server logs | no | see the PR row |
+| `oidc-keycloak.yml` (weekly) | `oidc-keycloak-live` | live OIDC gate | no | see the PR row |
+| `targets-integration.yml` (nightly) | `targets-live` | live target gate; container logs | no | see the PR row |
+| `scheduled-validation-freshness.yml` (nightly) | `check-freshness` | fails on a never-created or stale schedule | n/a | dispatch |
 
-Manual `workflow_dispatch` exists for the scheduled workflows above. Manual
-runs are debugging evidence and intentionally do not open scheduled-failure
-issues. A manual performance run may explicitly allow a known regression; that
-override must not be treated as an ordinary passing baseline.
+Manual `workflow_dispatch` runs are debugging evidence and do not open scheduled-failure issues. A manual performance run may explicitly allow a known regression; that override is not a passing baseline.
 
 ## Release validation
 
-Release validation is post-merge and tag-driven; it does not substitute for a
-pull-request gate.
+Post-merge and tag-driven; not a substitute for a PR gate.
 
-| Event | Validation | Budget | Result |
-|---|---|---:|---|
-| Push to `main` or weekly schedule | `Build and Release` platform matrix | 150 min per platform | Build artifacts for all selected targets; no release publication on a main push |
-| Valid release or preview tag | `Build and Release` plus asset checks | 150 min per platform | Draft release, checksummed assets, and publish step |
-| Successful non-preview release-tag build | Docker image build and image scan | 60 min build; 30 min scan | Multi-architecture images plus vulnerability report |
-| Successful release-tag build | DEB/RPM packaging | 30 min per architecture | Packages and checksum files uploaded to the release |
-| Successful non-preview release-tag build | Helm template test and package | 30 min build; 30 min publish | Versioned chart and repository index |
+| Trigger | Workflow / job | Result |
+|---|---|---|
+| Push to `main`, weekly schedule, dispatch | `build.yml` `build-rustfs` (a development build on a main push restricts the matrix to the Linux targets) | build artifacts; no release publication |
+| Valid release or preview tag | `build.yml` `build-rustfs`, `create-release`, `upload-release-assets`, `publish-release` | draft release, checksummed assets, publish |
+| Successful non-preview release-tag build (`workflow_run`) | `docker.yml` `build-docker`, `scan-docker-image` | multi-architecture images and vulnerability report |
+| Successful release-tag build (`workflow_run`) | `package.yml` `package` | DEB/RPM packages and checksums uploaded to the release |
+| Successful non-preview release-tag build (`workflow_run`) | `helm-package.yml` `build-helm-package`, `publish-helm-package` | versioned chart and repository index |
+| Final tag's release published | `build.yml` `cleanup-preview-releases` | deletes every `<target>-preview.<N>` Release for that target; the tags are kept |
 
-Use an exact preview tag for end-to-end release rehearsal. Manual dispatches
-are backfill/debug paths and do not prove the automatic `workflow_run` chain.
-
-A preview Release is internal validation state, not a deliverable: after the
-final tag's release is published, `cleanup-preview-releases` deletes every
-`<target>-preview.<N>` Release for that target. The tags themselves are kept, so
-the validated commit stays traceable.
-
-## Evidence requirements
-
-A green check is useful only when it proves the intended behavior ran:
-
-- Record the exact commit SHA and run URL.
-- Separate product failure from runner prerequisites, service readiness, and
-  cancellation. Repair the precondition, then rerun the exact workload.
-- Preserve membership manifests, JUnit, raw compatibility logs, seeds, and
-  server logs where the workflow provides them.
-- For a bug fix or a new fault checker, provide sensitivity evidence: the old
-  behavior or an intentional mutation must fail the new oracle, and the fixed
-  behavior must pass it.
-- Never promote a report-only lane to required from one green run. Require at
-  least 14 days and 30 representative pull requests with at least 99% complete
-  execution, then update the ruleset and this table together.
+Use an exact preview tag for an end-to-end release rehearsal. Manual dispatches are backfill/debug paths and do not prove the automatic `workflow_run` chain.
 
 ## Change checklist
 
-Update this file in the same pull request when any of these change:
-
-- workflow triggers, job names, timeouts, or nextest profile ownership;
-- required status contexts or strict/merge-queue policy;
-- scheduled cadence, alert routing, artifact contract, or local reproduction;
-- report-only versus gating semantics.
-
-Do not copy per-module test counts here. Update
-[e2e-suite-inventory.md](e2e-suite-inventory.md) and its enforced membership
-digest instead.
+Update this file in the same PR when a job or check name changes, a workflow gains or loses a `pull_request` or `schedule` trigger, required contexts or strict/merge-queue policy change, report-only vs gating semantics change, or `.github/scheduled-validations.json` membership changes. Do not copy timeouts, crons, or test counts here.

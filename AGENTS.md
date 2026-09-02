@@ -86,6 +86,7 @@ This file contains repository-wide rules. Use the nearest subdirectory
 - CI gates: `.github/workflows/ci.yml`.
 - PR format: `.github/pull_request_template.md`.
 - Architecture routing: `ARCHITECTURE.md` and `docs/architecture/README.md`.
+- Knowledge-base index and documentation rules: `docs/README.md`.
 - Agent skills: `.agents/skills/*/SKILL.md`.
 
 Do not commit one-shot plans, trackers, migration ledgers, benchmark snapshots,

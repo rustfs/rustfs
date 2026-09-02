@@ -1,7 +1,7 @@
 # Crate Boundaries And Migration Guardrails
 
-These rules apply to architecture-migration PRs linked to
-[`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660).
+**Use this when:** you add a crate dependency, move code across crates, touch a `storage_api.rs` boundary file, or need the change-type vocabulary the architecture guard enforces.
+**Source of truth:** `scripts/check_architecture_migration_rules.sh` (the enumerated rules; this file is its boundary document) and `scripts/check_layer_dependencies.sh` (layer and edge checks). Extend those guards instead of adding a parallel system.
 
 ## PR Types
 
@@ -22,275 +22,51 @@ Do not mix directory movement, security tightening, and behavior changes in one 
 
 ## Dependency Direction
 
-Contract crates must stay below implementation crates. Initial forbidden edges:
+Contract crates stay below implementation crates. Forbidden edges:
 
-- `storage-api -> ecstore`
-- `security-governance -> rustfs`
-- `extension-schema -> rustfs`
-- `extension-schema -> ecstore`
-
-`rustfs-storage-api` may only expose storage-facing replication status/state
-contracts through `crates/storage-api/src/replication.rs` while the underlying
-wire types still live in `rustfs-filemeta`. This keeps the temporary dependency
-centralized until those wire contracts can move without introducing a
-`rustfs-replication` / `rustfs-storage-api` cycle.
-
-Leaf crates carry exactly one adjudicated allowed edge:
-`io-metrics -> rustfs-s3-ops` (transitively `rustfs-s3-types`). Both are pure
-contract crates — types and enums only, no I/O, no global state, no non-contract
-internal dependencies — so `io-metrics` reuses the `S3Operation` vocabulary
-instead of copying it. `madmin` is no longer counted a leaf: since #6166 it is
-the SigV4-signed admin SDK client and deliberately depends on `rustfs-signer`;
-the guard pins its internal dependency surface to exactly that edge so it cannot
-quietly grow storage-side dependencies. The leaf-crate allowlist in
-`scripts/check_architecture_migration_rules.sh` fails any other `rustfs-*`
-dependency in `config`, `credentials`, `crypto`, `io-metrics`, or `madmin`, in
-either TOML spelling (`rustfs-x = ...` or `rustfs-x.workspace = true`).
-Adjudicated in
-[`rustfs/backlog#1834`](https://github.com/rustfs/backlog/issues/1834); a further
-leaf exception must meet the pure-contract criterion — types and enums only, no
-I/O, no globals, no non-contract internal dependencies — and land its guard
-allowlist entry alongside the dependency.
-
-Dependency direction also applies to compile-time source reads:
-`include_str!`/`include!` of a `.rs` file must not resolve outside the
-including crate's own directory (`scripts/check_layer_dependencies.sh`
-enforces this). A source-text tripwire belongs in the crate that owns the
-asserted file; shared expectations move into a contract surface such as
-`rustfs_protos::compat_manifest` and are asserted by each owning crate.
-
-Existing migration checks live in:
-
-- `scripts/check_layer_dependencies.sh`
-- `scripts/check_architecture_migration_rules.sh`
-
-Extend these guardrails instead of adding a parallel system.
-
-## Required Architecture Documents
-
-The migration guard must keep these baseline documents present and anchored to
-their required sections:
-
-- `docs/architecture/overview.md`: Baseline, Core Principle, Phase Order.
-- `docs/architecture/runtime-lifecycle.md`: Startup And Readiness, Shutdown
-  Lifecycle Boundary, AppContext Foundation.
-- `docs/architecture/storage-control-data-plane.md`: Storage API Contracts,
-  Cluster Control Plane, Background Controllers.
-- `docs/architecture/crate-boundaries.md`: PR Types, Dependency Direction,
-  Required Architecture Documents.
-- `docs/architecture/readiness-matrix.md`: Request Behavior Matrix, Runtime
-  Dependency Matrix, Probe Semantics.
-- `docs/architecture/global-state-crate-split-plan.md`: Remaining Global
-  Owners, Runtime Source Boundaries, Fallback Removal Plan, Crate Split
-  Evaluation.
-
-## Pre-Push Expert Review
-
-Before pushing any PR branch, record three expert reviews in the task notes:
-
-| Expert | Required focus |
+| Edge | Why |
 |---|---|
-| Quality/architecture | Structure, naming, dependency direction, PR type, scope, and over-abstraction risk |
-| Migration preservation | Startup order, readiness, quorum, reader semantics, AppContext/global fallback, notify/audit lifecycle, IAM/KMS boundaries, and compatibility |
-| Testing/verification | Focused tests, regression tests, commands run, missing coverage, and whether tests are forcing business-logic drift |
+| `storage-api -> ecstore` | Storage contracts must not depend on the storage implementation |
+| `security-governance -> rustfs` | Governance contracts stay below the binary crate |
+| `extension-schema -> rustfs` | The extension schema is consumed by the binary, never the reverse |
+| `extension-schema -> ecstore` | The extension schema must not reach storage internals |
 
-Push is allowed only when all three experts return `pass` or
-`pass-with-nonblocking-follow-up`. Any `blocker` prevents push until the issue is
-fixed and the relevant review is repeated.
+- `rustfs-storage-api` exposes storage-facing replication status/state contracts only through `crates/storage-api/src/replication.rs`, so its temporary dependency on `rustfs-filemeta` wire types stays centralized and no `rustfs-replication` / `rustfs-storage-api` cycle appears.
+- Leaf crates (`config`, `credentials`, `crypto`, `io-metrics`, `madmin`) may not depend on other `rustfs-*` crates, in either TOML spelling, except the adjudicated edges pinned in the guard's leaf allowlist: `io-metrics -> rustfs-s3-ops` (pure contract crates sharing the `S3Operation` vocabulary) and `madmin -> rustfs-signer` (the SigV4-signed admin SDK client). A new leaf exception must be a pure contract dependency (types and enums only, no I/O, no globals, no non-contract internal dependencies) and land together with its allowlist entry.
+- Compile-time source reads follow the same direction: `include_str!` / `include!` of a `.rs` file must not resolve outside the including crate (`scripts/check_layer_dependencies.sh`). Shared source-text expectations belong in a contract surface such as `rustfs_protos::compat_manifest` (`crates/protos/src/compat_manifest.rs`) and are asserted by each owning crate.
 
-## Temporary Compatibility Code
+## ECStore Access Boundary
 
-Temporary compatibility code that must be removed later must include a searchable
-source comment and a cleanup-register entry.
+Outer crates reach ECStore only through `rustfs_ecstore::api`, and only from one local boundary file per owner (`storage_api.rs`). Boundary files and facade groups are inventoried in [ecstore-api-facade-inventory.md](ecstore-api-facade-inventory.md).
 
-Use this source-comment format:
-
-```rust
-// RUSTFS_COMPAT_TODO(API-005): keep old ecstore::store_api path during storage-api migration. Remove after all consumers use rustfs-storage-api.
-```
-
-Rules:
-
-- Add the marker only to temporary compatibility paths, not permanent APIs.
-- Include the task ID in the marker.
-- State why the compatibility path exists and when it can be removed.
-- Use this for temporary re-exports, wrappers, fallbacks, legacy action mappings,
-  and old endpoint compatibility layers.
-- Delete compatibility layers in their own cleanup PR.
-
-## Config Model First
-
-`ecstore::config::{Config, KV, KVS}` should move before extension config adapters
-or config-schema work. First inventory consumers, then decide whether existing
-`crates/config` is enough or whether a smaller model crate is required.
-
-The current decision is recorded in
-[`config-model-boundary-adr.md`](config-model-boundary-adr.md): use the existing
-`rustfs-config` package for the pure server-config model and global
-server-config snapshot accessors, while ECStore keeps config persistence,
-storage-class global state, default wiring, and startup initialization.
-
-The old `rustfs_ecstore::config::{Config, KV, KVS, register_default_kvs,
-get_global_server_config, set_global_server_config}` compatibility path must
-not be restored after the Phase 1a cleanup. Consumers use
-`rustfs_config::server_config` for the moved model and accessors; ECStore public
-facades must not re-export those symbols.
+- Inside a boundary file, raw `rustfs_ecstore::api::...` paths are centralized behind local `ecstore_*` module aliases; code outside the boundary sees local type aliases, constants, traits, or wrapper functions, never the raw facade path.
+- Non-trait ECStore surfaces (metadata, object-lock, lifecycle journal, monitor, notification types) stay behind local aliases; boundary function signatures do not expose raw ECStore facade types once narrowed. Object and error aliases anchor on storage-api associated object types and a local `StorageError`.
+- Outer consumers use `rustfs-storage-api` operation traits (`ObjectIO`, `ObjectOperations`, `ListOperations`, `MultipartOperations`, `HealOperations`, `NamespaceLocking`) and generic list responses (`ListObjectsV2Info`, `ListObjectVersionsInfo`, `ObjectInfoOrErr`) directly; ECStore keeps concrete aliases only for internal implementation and compatibility.
+- Bucket lifecycle, replication, versioning, object-lock, restore-request, disk, RPC peer client, and warm-backend trait methods are reached through owner-local compatibility traits or wrapper functions, not by importing ECStore traits outside the boundary.
+- The old `StorageAPI` aggregate facade must not reappear in production `crates/ecstore/src` or `rustfs/src` code.
+- Facade-covered ECStore root modules (layout, `endpoints`, `disks_layout`, bitrot, erasure, object DTO/reader, event, list, batch processor, `global`) stay crate-private; public access goes through the matching `rustfs_ecstore::api::*` group.
+- Cluster control-plane read models stay owned by the crate-private `cluster` module and are published through `rustfs_ecstore::api::cluster`; pool-state, local-node storage, and peer-health projections are read-only.
+- RustFS startup internals are crate-private: only `startup_entrypoint` is a public startup module of the `rustfs` library (`rustfs/src/lib.rs`), and items inside the other `startup_*` modules use crate visibility.
+- The observability dependency baseline is [obs-ecstore-dependency-inventory.md](obs-ecstore-dependency-inventory.md); observability extraction updates it together with the guard.
 
 ## Loss-Prevention Coverage
 
-Architecture migration checks must keep public contract re-exports and ECStore
-compatibility coverage from silently drifting during cleanup PRs.
+The guard pins specific public re-export lines (its `require_source_line` entries) so contract surfaces cannot silently disappear during cleanup. The canonical lists are the guard script and the owning files, not this page:
 
-Required `rustfs-storage-api` public re-exports:
+- `crates/storage-api/src/lib.rs`: admin, bucket, capability, error, multipart, observability, object, and topology contract re-exports;
+- `crates/concurrency/src/lib.rs`: workload admission contract re-exports;
+- `rustfs/src/lib.rs`: `pub mod startup_entrypoint;`.
 
-- `pub use admin::{DiskSetSelector, StorageAdminApi};`
-- `pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};`
-- `pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};`
-- `pub use error::{StorageErrorCode, StorageResult};`
-- `pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};`
-- `pub use observability::{MemorySamplingState, ObservabilitySnapshot, ObservabilitySnapshotProvider, PlatformSupport, UserspaceProfilingCapability};`
-- `pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};`
-- `pub use object::{ExpirationOptions, TransitionedObject};`
-- `pub use object::{HealOperations, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations};`
-- `pub use object::{ListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr};`
-- `pub use object::{ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState};`
-- `pub use object::{VersionMarker, WalkOptions, WalkVersionsSortOrder};`
-- `pub use topology::{DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet, TopologySnapshot, TopologySnapshotProvider};`
+ECStore keeps compile-time coverage for `StorageAdminApi`, `HealOperations`, and the separate `NamespaceLocking` operation group (`crates/ecstore/tests/ecstore_contract_compat_test.rs`), and its internal consumers use the `rustfs-storage-api` lifecycle DTOs `ExpirationOptions` and `TransitionedObject` directly.
 
-Required `rustfs-concurrency` public workload admission contract re-exports:
+## Temporary Compatibility Code
 
-- `pub use workload::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider, WorkloadClass};`
+Every temporary compatibility path carries a `RUSTFS_COMPAT_TODO(<id>)` source marker with a removal condition and a matching entry in [compat-cleanup-register.md](compat-cleanup-register.md); the guard enforces the match in both directions. Compatibility layers are deleted in their own cleanup change, never bundled with new migration logic.
 
-ECStore must keep compile-time coverage for `StorageAdminApi`, `HealOperations`,
-and the separate `NamespaceLocking` operation group.
+## Config Model
 
-The old `StorageAPI` aggregate facade must not reappear in production
-`crates/ecstore/src` or `rustfs/src` code after the storage operation groups
-have been made explicit.
+The server-config model (`Config`, `KV`, `KVS`) and the global server-config snapshot accessors are owned by `rustfs_config::server_config`; ECStore keeps persistence, storage-class state, and startup wiring, and its public facades must not re-export those symbols. See [config-model-boundary-adr.md](config-model-boundary-adr.md).
 
-Outer RustFS/IAM consumers must use `rustfs-storage-api` generic list response
-contracts directly for `ListObjectsV2Info`, `ListObjectVersionsInfo`, and
-`ObjectInfoOrErr`; ECStore keeps the concrete aliases only for internal
-implementation and compatibility.
+## Required Architecture Documents
 
-Outer RustFS/scanner consumers must use `rustfs-storage-api` operation traits
-directly for `ObjectIO`, `ObjectOperations`, `ListOperations`,
-`MultipartOperations`, `HealOperations`, and `NamespaceLocking`; ECStore keeps
-the concrete compatibility traits only for internal implementation and
-downstream compatibility.
-Outer consumers must not import ECStore directly outside compatibility
-boundaries except for temporary trait imports needed for method resolution or
-local test trait implementations. Non-trait ECStore surfaces must stay behind
-local aliases, constants, or wrapper functions.
-
-Outer compatibility boundary modules must use `rustfs_ecstore::api` for ECStore
-public facade surfaces such as layout, storage owner, admin, metrics,
-notification, capacity, bucket/config helpers, disk/error contracts, global
-state accessors, RPC constants/clients, reader helpers, tier helpers, and
-rebalance status contracts. Any non-ECStore `storage_compat.rs` import from
-`rustfs_ecstore` must route through the `rustfs_ecstore::api` facade.
-The legacy ECStore root `endpoints` and `disks_layout` compatibility modules
-must remain crate-private; public layout access goes through
-`rustfs_ecstore::api::layout`.
-Facade-covered ECStore root modules must remain crate-private after this
-boundary is established; outer crates should use `rustfs_ecstore::api::*`
-instead of legacy root module paths. This includes storage/layout surfaces as
-well as remaining bitrot, erasure coding, object DTO/reader, event, list, and
-batch processor root modules once their facade groups exist.
-ECStore root `global` re-exports must also stay removed once consumers use
-`rustfs_ecstore::api::global` or crate-internal `crate::global` paths.
-RustFS root `storage_compat.rs` must expose bucket metadata and quota contracts
-as explicit aliases only. Broad `metadata`, `metadata_sys`, and `quota` module
-passthroughs are reserved to narrower app/admin/storage compatibility
-boundaries that still need module-local owner cleanup.
-Root runtime storage config initialization and disk endpoint contracts must also
-stay explicit aliases. The root compatibility boundary must not restore `com`,
-bare `init`, or grouped `endpoint::Endpoint` passthroughs.
-RustFS root `storage_compat.rs` must not re-export ECStore API symbols directly;
-remaining root runtime compatibility symbols must be local type aliases,
-constants, traits, or wrapper functions so ownership stays visible at the
-boundary.
-RustFS admin `storage_compat.rs` must expose config IO and default
-initialization through explicit aliases. The admin compatibility boundary must
-not restore broad `com` or bare `init` passthroughs.
-RustFS admin and app `storage_compat.rs` bucket-facing compatibility contracts
-must stay explicitly whitelisted. They must not restore broad bucket module,
-client object API, client transition API, or storage-class module passthroughs
-once a local compatibility boundary has narrowed them to specific aliases.
-RustFS storage `storage_compat.rs` must expose bucket metadata, object-lock,
-policy, replication, tagging, versioning, object API, and test-only
-storage-class config contracts through explicit aliases. The storage
-compatibility boundary must not restore broad `metadata`, `metadata_sys`,
-`object_lock`, `policy_sys`, `replication`, `tagging`, `utils`, `versioning`,
-`versioning_sys`, `object_api_utils`, or `com` passthroughs.
-RustFS storage owner `storage_compat.rs` must not re-export ECStore API symbols
-directly except temporary trait imports needed for method resolution. Remaining
-storage-owner compatibility symbols must be local constants, type aliases, or
-wrapper functions so storage-owned global state and helper access stays visible
-at the boundary.
-RustFS app, admin, and storage outer `storage_compat.rs` object and error
-facade aliases must stay anchored on storage-api associated object types and
-local `StorageError` aliases. They must not reintroduce raw
-`rustfs_ecstore::api::object::{ObjectInfo,ObjectOptions}` or
-`rustfs_ecstore::api::error::{Error,Result}` references.
-Outer compatibility function signatures must also use local aliases for ECStore
-metadata, object-lock, lifecycle journal, monitor, and notification facade
-types. The boundary may define the local alias, but call signatures must not
-expose the raw ECStore facade path once narrowed.
-The RustFS storage owner compatibility boundary must keep raw ECStore facade
-paths centralized behind local `ecstore_*` module aliases rather than scattering
-`rustfs_ecstore::api::...` references through its aliases and wrappers.
-The RustFS app/admin storage compatibility boundaries must likewise route raw
-ECStore facade access through their local `ecstore_*` module aliases instead of
-scattering `rustfs_ecstore::api::...` paths through compatibility wrappers.
-Peripheral consumer storage compatibility boundaries must follow the same
-pattern. IAM, heal, scanner, notify, observability, Swift, S3 Select, test, and
-fuzz storage compatibility modules keep raw ECStore facade access centralized
-behind local `ecstore_*` module aliases.
-RustFS root runtime and e2e storage compatibility boundaries must follow the
-same pattern, keeping raw ECStore facade access centralized behind local
-`ecstore_*` module aliases.
-Outer bucket lifecycle, replication, versioning, object-lock, and
-restore-request trait method access must stay behind local compatibility traits
-or wrapper functions. Non-compat sources must not import those ECStore bucket
-API traits directly after the wrapper boundary is established. Disk, RPC peer
-client, and warm-backend method-resolution access must follow the same pattern:
-non-compat sources use owner-local compatibility traits or test aliases instead
-of importing ECStore traits directly.
-Scanner, notify, observability, and e2e `storage_compat.rs` boundaries must
-also stay narrow. Scanner must not restore grouped bucket compatibility exports
-for target, lifecycle, metadata, replication, or versioning modules. Notify
-must not restore broad `config`/`global` module imports. Observability must
-consume data usage through a local DTO projection instead of re-exporting the
-ECStore data-usage loader. The e2e harness must not restore grouped RPC
-passthroughs.
-Test and fuzz `storage_compat.rs` harnesses must also stay narrow. Heal and
-scanner test harnesses must expose ECStore contracts through direct aliases or
-local wrappers, and fuzz harnesses must wrap bucket utility entrypoints instead
-of restoring grouped ECStore passthrough exports.
-External ECStore API facade imports must stay inside local `storage_api`
-boundary files after the external runtime, test, and fuzz consumers have been
-narrowed. IAM, heal, scanner, notify, observability, Swift, S3 Select, e2e, and
-fuzz code must not reintroduce direct `rustfs_ecstore::api::...` references
-outside those boundary files.
-The observability ECStore dependency baseline is tracked in
-[`obs-ecstore-dependency-inventory.md`](obs-ecstore-dependency-inventory.md);
-future observability extraction PRs must update that inventory with the guard.
-
-ECStore ClusterControlPlane read models must stay owned by the crate-private
-`cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so
-outer crates cannot depend on ECStore root control-plane internals.
-Pool-state, local-node storage, and peer-health status projections are part of
-the same facade boundary and must remain read-only until a later controller
-slice explicitly wires dynamic health or membership behavior.
-
-RustFS startup internals must stay crate-private after the startup owner split.
-Only `startup_entrypoint` remains a public startup module for the binary
-entrypoint; IAM bootstrap, optional runtime, and profiling startup shims must
-not be re-exported as public library modules. Items inside crate-private
-startup modules must also use crate visibility rather than bare public
-visibility.
-
-ECStore internal consumers must use `rustfs-storage-api` lifecycle helper DTOs
-directly for `ExpirationOptions` and `TransitionedObject`; ECStore keeps the
-old lifecycle paths only as downstream compatibility re-exports.
+The guard requires the documents and section headings listed in its `require_source_contains` entries (`scripts/check_architecture_migration_rules.sh`); the directory index is [README.md](README.md).
