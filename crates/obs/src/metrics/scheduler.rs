@@ -33,6 +33,7 @@ use crate::metrics::collectors::{
     NotificationStats,
     NotificationTargetRuntimeStats,
     NotificationTargetStats,
+    OnDemandMigrationBucketStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
     ProcessAttributeError,
     ProcessCpuStats,
@@ -64,6 +65,7 @@ use crate::metrics::collectors::{
     collect_node_metrics,
     collect_notification_runtime_metrics,
     collect_notification_target_runtime_metrics,
+    collect_on_demand_migration_metrics,
     collect_process_attributes,
     collect_process_cpu_metrics,
     collect_process_disk_metrics,
@@ -118,6 +120,14 @@ use crate::metrics::schema::notification_target::{
     NOTIFICATION_TARGET_TOTAL_MESSAGES_BY_SERVER_MD, NOTIFICATION_TARGET_TOTAL_MESSAGES_MD, SERVER as NOTIFICATION_SERVER_LABEL,
     TARGET_ID as NOTIFICATION_TARGET_ID_LABEL, TARGET_TYPE as NOTIFICATION_TARGET_TYPE_LABEL,
 };
+use crate::metrics::schema::on_demand_migration::{
+    BUCKET_L as ODM_BUCKET_L, LE_L as ODM_LE_L, ODM_BREAKER_STATE_MD, ODM_INFLIGHT_PULLS_MD, ODM_PULL_FAILURES_TOTAL_MD,
+    ODM_PULLED_BYTES_TOTAL_MD, ODM_PULLED_OBJECTS_TOTAL_MD, ODM_QUEUE_DEPTH_MD, ODM_REQUESTS_TOTAL_MD,
+    ODM_SOURCE_LATENCY_SECONDS_COUNT_MD, ODM_SOURCE_LATENCY_SECONDS_DISTRIBUTION_MD, ODM_SOURCE_LATENCY_SECONDS_SUM_MD,
+    OP_L as ODM_OP_L, OUTCOME_L as ODM_OUTCOME_L, PATH_L as ODM_PATH_L, PULL_FAILURE_REASONS as ODM_PULL_FAILURE_REASONS,
+    PULL_PATHS as ODM_PULL_PATHS, REASON_L as ODM_REASON_L, REQUEST_OPS as ODM_REQUEST_OPS,
+    REQUEST_OUTCOMES as ODM_REQUEST_OUTCOMES, SOURCE_LATENCY_LE as ODM_SOURCE_LATENCY_LE,
+};
 use crate::metrics::schema::scanner::{
     BUCKET_LABEL as SCANNER_BUCKET_LABEL, CYCLE_SCOPE_LABEL as SCANNER_CYCLE_SCOPE_LABEL, DRIVE_LABEL as SCANNER_DRIVE_LABEL,
     RESULT_LABEL as SCANNER_RESULT_LABEL, SCANNER_ACTIVE_BUCKET_DRIVE_SCAN_AGE_SECONDS_MD, SCANNER_ACTIVE_BUCKET_DRIVE_SCANS_MD,
@@ -134,8 +144,9 @@ use crate::metrics::stats_collector::{
     collect_bucket_replication_stats_bundle, collect_bucket_stats, collect_cluster_and_health_stats,
     collect_cluster_config_stats, collect_cluster_usage_metric_stats, collect_compression_cluster_stats,
     collect_disk_and_system_drive_runtime_stats, collect_erasure_set_stats, collect_host_network_stats, collect_iam_stats,
-    collect_ilm_runtime_metric_stats, collect_internode_network_stats, collect_process_metric_bundle_with,
-    collect_replication_stats, collect_scanner_runtime_metric_stats, collect_system_cpu_and_memory_stats_with,
+    collect_ilm_runtime_metric_stats, collect_internode_network_stats, collect_on_demand_migration_stats,
+    collect_process_metric_bundle_with, collect_replication_stats, collect_scanner_runtime_metric_stats,
+    collect_system_cpu_and_memory_stats_with,
 };
 use crate::node_identity::{SERVER_LABEL, current_local_node_identity};
 use crate::telemetry::retire_metric_series;
@@ -298,6 +309,8 @@ static METRICS_RUNTIME_COLLECTOR_HEALTH: OnceLock<MetricsRuntimeCollectorHealth>
 
 type ReplBwKey = (String, String); // (bucket, target_arn)
 type BucketKey = String;
+/// `(full metric name, labels)` of one series.
+type MetricSeriesKey = (String, Vec<(&'static str, Cow<'static, str>)>);
 type BucketRangeKey = (String, String); // (bucket, range)
 type AuditLegacyTargetKey = String;
 type AuditTargetKey = (String, String); // (server, target_id)
@@ -895,6 +908,10 @@ fn repl_flow_live_keys(stats: &[BucketReplicationRuntimeStats]) -> HashSet<ReplB
 
 fn repl_proxy_bucket_live_keys(stats: &[BucketReplicationRuntimeStats]) -> HashSet<BucketKey> {
     stats.iter().map(|stat| stat.stats.bucket.clone()).collect()
+}
+
+fn on_demand_migration_bucket_live_keys(stats: &[OnDemandMigrationBucketStats]) -> HashSet<BucketKey> {
+    stats.iter().map(|stat| stat.bucket.clone()).collect()
 }
 
 fn update_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(
@@ -1577,6 +1594,58 @@ fn retire_bucket_replication_proxy_request_metric_series(bucket: &str) -> usize 
     retired
 }
 
+/// Every on-demand migration series a bucket can own, as `(name, labels)`:
+/// the fixed label sets of the runtime snapshot, in the collector's label
+/// order. Retirement walks this list once the bucket's config is gone.
+fn on_demand_migration_metric_series(bucket: &str) -> Vec<MetricSeriesKey> {
+    let bucket_label = || (ODM_BUCKET_L, Cow::Owned(bucket.to_string()));
+    let mut series = Vec::new();
+    for op in ODM_REQUEST_OPS {
+        for outcome in ODM_REQUEST_OUTCOMES {
+            series.push((
+                ODM_REQUESTS_TOTAL_MD.get_full_metric_name(),
+                vec![
+                    bucket_label(),
+                    (ODM_OP_L, Cow::Borrowed(op)),
+                    (ODM_OUTCOME_L, Cow::Borrowed(outcome)),
+                ],
+            ));
+        }
+    }
+    series.push((ODM_PULLED_BYTES_TOTAL_MD.get_full_metric_name(), vec![bucket_label()]));
+    for path in ODM_PULL_PATHS {
+        series.push((
+            ODM_PULLED_OBJECTS_TOTAL_MD.get_full_metric_name(),
+            vec![bucket_label(), (ODM_PATH_L, Cow::Borrowed(path))],
+        ));
+    }
+    for reason in ODM_PULL_FAILURE_REASONS {
+        series.push((
+            ODM_PULL_FAILURES_TOTAL_MD.get_full_metric_name(),
+            vec![bucket_label(), (ODM_REASON_L, Cow::Borrowed(reason))],
+        ));
+    }
+    series.push((ODM_INFLIGHT_PULLS_MD.get_full_metric_name(), vec![bucket_label()]));
+    series.push((ODM_QUEUE_DEPTH_MD.get_full_metric_name(), vec![bucket_label()]));
+    for le in ODM_SOURCE_LATENCY_LE {
+        series.push((
+            ODM_SOURCE_LATENCY_SECONDS_DISTRIBUTION_MD.get_full_metric_name(),
+            vec![bucket_label(), (ODM_LE_L, Cow::Borrowed(le))],
+        ));
+    }
+    series.push((ODM_SOURCE_LATENCY_SECONDS_SUM_MD.get_full_metric_name(), vec![bucket_label()]));
+    series.push((ODM_SOURCE_LATENCY_SECONDS_COUNT_MD.get_full_metric_name(), vec![bucket_label()]));
+    series.push((ODM_BREAKER_STATE_MD.get_full_metric_name(), vec![bucket_label()]));
+    series
+}
+
+fn retire_on_demand_migration_metric_series(bucket: &str) -> usize {
+    on_demand_migration_metric_series(bucket)
+        .iter()
+        .map(|(name, labels)| retire_metric_series(name, labels))
+        .sum()
+}
+
 fn retire_repl_backlog_target_metric_series(bucket: &str, target_arn: &str) -> usize {
     let labels = [
         (BUCKET_L, Cow::Owned(bucket.to_string())),
@@ -1966,6 +2035,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut has_seen_valid_flow_snapshot = false;
         let mut prev_proxy_bucket_live_keys: HashSet<BucketKey> = HashSet::new();
         let mut has_seen_proxy_bucket_snapshot = false;
+        let mut prev_on_demand_migration_live_keys: HashSet<BucketKey> = HashSet::new();
+        let mut has_seen_on_demand_migration_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -2039,6 +2110,21 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             metrics.extend(collect_repl_backlog_zero_tombstone_metrics(&backlog_zero_tombstones));
                             metrics.extend(collect_repl_backlog_target_zero_tombstone_metrics(&backlog_target_zero_tombstones));
                             metrics.extend(collect_repl_flow_zero_tombstone_metrics(&flow_zero_tombstones));
+                            // A bucket whose on-demand migration config is gone leaves the
+                            // snapshot; its series are retired after this cycle's report.
+                            let on_demand_migration = collect_on_demand_migration_stats();
+                            let current_on_demand_migration_live_keys = on_demand_migration_bucket_live_keys(&on_demand_migration);
+                            let retire_on_demand_migration_buckets = if has_seen_on_demand_migration_snapshot {
+                                prev_on_demand_migration_live_keys
+                                    .difference(&current_on_demand_migration_live_keys)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            };
+                            prev_on_demand_migration_live_keys = current_on_demand_migration_live_keys;
+                            has_seen_on_demand_migration_snapshot = true;
+                            metrics.extend(collect_on_demand_migration_metrics(&on_demand_migration));
                             let replication = collect_replication_stats().await;
                             metrics.extend(collect_replication_runtime_metrics(&ReplicationRuntimeStats {
                                 server: current_local_node_identity(),
@@ -2064,6 +2150,9 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             }
                             for bucket in retire_proxy_buckets {
                                 let _ = retire_bucket_replication_proxy_request_metric_series(&bucket);
+                            }
+                            for bucket in retire_on_demand_migration_buckets {
+                                let _ = retire_on_demand_migration_metric_series(&bucket);
                             }
                         },
                     ).await;
@@ -2828,6 +2917,67 @@ mod tests {
 
         assert_eq!(retired, bucket_keys(&["photos"]));
         assert_eq!(current, bucket_keys(&["logs"]));
+    }
+
+    #[test]
+    fn on_demand_migration_bucket_keys_detect_removed_buckets() {
+        let previous = on_demand_migration_bucket_live_keys(&[
+            OnDemandMigrationBucketStats {
+                bucket: "photos".to_string(),
+                ..Default::default()
+            },
+            OnDemandMigrationBucketStats {
+                bucket: "logs".to_string(),
+                ..Default::default()
+            },
+        ]);
+        let current = on_demand_migration_bucket_live_keys(&[OnDemandMigrationBucketStats {
+            bucket: "logs".to_string(),
+            ..Default::default()
+        }]);
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert_eq!(retired, bucket_keys(&["photos"]));
+        assert_eq!(current, bucket_keys(&["logs"]));
+        assert!(on_demand_migration_bucket_live_keys(&[]).is_empty());
+    }
+
+    /// Retirement must name exactly the series the collector emitted for the
+    /// bucket, with identical label order, or the recorder keeps them alive.
+    #[test]
+    fn on_demand_migration_retirement_covers_every_emitted_series() {
+        let stats = crate::metrics::collectors::on_demand_migration::tests::golden_stats("photos");
+        let emitted = collect_on_demand_migration_metrics(&[stats])
+            .into_iter()
+            .map(|metric| {
+                (
+                    metric.name.to_string(),
+                    metric
+                        .labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let retired = on_demand_migration_metric_series("photos")
+            .into_iter()
+            .map(|(name, labels)| {
+                (
+                    name,
+                    labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(retired, emitted);
+        // Without a process-global recorder there is nothing to retire; the
+        // walk itself must still cover every series.
+        assert_eq!(retire_on_demand_migration_metric_series("photos"), 0);
+        assert_eq!(on_demand_migration_metric_series("photos").len(), emitted.len());
     }
 
     #[test]

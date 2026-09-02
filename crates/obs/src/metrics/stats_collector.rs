@@ -26,14 +26,15 @@ use crate::metrics::collectors::{
     ClusterHealthStats, ClusterStats, ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats, DriveCountStats,
     DriveDetailedStats, DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats,
     IlmBackpressureStats, IlmQueueTaskStats, IlmRuntimeStats, IlmStats, IlmTaskEventStats, MemoryStats, NetworkStats,
-    ProcessStats, ProcessStatusType, ReplicationMetricsSnapshot, ResourceStats, ScannerRuntimeStats, ScannerStats,
+    OnDemandMigrationBucketStats, ProcessStats, ProcessStatusType, ReplicationMetricsSnapshot, ResourceStats,
+    ScannerRuntimeStats, ScannerStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
     BucketOperations, BucketOptions, ObsBucketReplicationStatsSnapshot, ObsEcstoreResult, ObsStore, StorageAdminApi,
     obs_bucket_replication_stats_snapshot, obs_get_quota_config, obs_get_total_usable_capacity,
     obs_get_total_usable_capacity_free, obs_load_compression_total_from_memory, obs_load_data_usage_from_backend,
-    obs_replication_site_stats_snapshot, obs_resolve_object_store_handle,
+    obs_on_demand_migration_snapshot, obs_replication_site_stats_snapshot, obs_resolve_object_store_handle,
 };
 use crate::node_identity::current_local_node_identity;
 use jiff::Timestamp;
@@ -659,6 +660,11 @@ pub async fn collect_bucket_replication_detail_stats() -> Vec<BucketReplicationM
 pub(crate) async fn collect_bucket_replication_stats_bundle()
 -> (Vec<BucketReplicationRuntimeStats>, Vec<BucketReplicationBacklogStats>) {
     obs_bucket_replication_stats_bundle().await
+}
+
+/// Collect per-bucket on-demand migration stats from the global runtime.
+pub fn collect_on_demand_migration_stats() -> Vec<OnDemandMigrationBucketStats> {
+    obs_on_demand_migration_snapshot()
 }
 
 /// Collect site-level replication stats from the global replication runtime.
