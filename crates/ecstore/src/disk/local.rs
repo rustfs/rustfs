@@ -6995,6 +6995,16 @@ impl LocalDisk {
                 }
             }
 
+            // The while-loop above may have just recursed into a pending
+            // subdirectory and hit the page limit there. `name` sorts after
+            // that subdirectory's entries, so emitting it now would hand the
+            // caller a continuation marker past the subdirectory's unscanned
+            // tail, permanently skipping those keys on the next page instead
+            // of just deferring them to it.
+            if opts.limit > 0 && *objs_returned >= opts.limit {
+                return Ok(());
+            }
+
             let mut meta = MetaCacheEntry {
                 name,
                 ..Default::default()
@@ -17028,6 +17038,92 @@ mod test {
         assert!(names.contains(&"foo/bar".to_string()));
         assert!(names.contains(&"foo/bar/xyzzy".to_string()));
         assert!(names.contains(&"quux/thud".to_string()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn scan_dir_does_not_emit_entries_past_a_limit_hit_inside_a_subdirectory() {
+        // Reproduces the rustfs 1.0.0-rc.5 recursive-listing data loss: a
+        // subdirectory ("subdir/") holds more objects than the page limit, and
+        // a sibling object ("zzz_after") sorts after that whole subdirectory.
+        // scan_dir must stop at the limit and never emit "zzz_after" once the
+        // recursive scan of "subdir/" has already exhausted it - emitting it
+        // anyway hands gather_results a continuation marker that skips past
+        // the still-unscanned tail of "subdir/" on the next page, losing those
+        // keys permanently.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should be created");
+
+        runtime.block_on(async {
+            use rustfs_filemeta::MetacacheReader;
+            use tempfile::tempdir;
+
+            let dir = tempdir().expect("tempdir should be created");
+            let bucket = "test-bucket";
+            let bucket_dir = dir.path().join(bucket);
+            const SUBDIR_OBJECTS: usize = 20;
+            const LIMIT: i32 = 15;
+
+            let subdir = bucket_dir.join("subdir");
+            for index in 0..SUBDIR_OBJECTS {
+                let object_dir = subdir.join(format!("object-{index:04}"));
+                fs::create_dir_all(&object_dir)
+                    .await
+                    .expect("object directory should be created");
+                fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                    .await
+                    .expect("object metadata should be written");
+            }
+
+            let after_dir = bucket_dir.join("zzz_after");
+            fs::create_dir_all(&after_dir)
+                .await
+                .expect("object directory should be created");
+            fs::write(after_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                .await
+                .expect("object metadata should be written");
+
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+            let (reader, mut writer) = tokio::io::duplex(1 << 20);
+            let mut out = MetacacheWriter::new(&mut writer);
+            let opts = WalkDirOptions {
+                bucket: bucket.to_string(),
+                base_dir: String::new(),
+                recursive: true,
+                limit: LIMIT,
+                ..Default::default()
+            };
+            let mut objs_returned = 0;
+
+            disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut objs_returned, false, None)
+                .await
+                .expect("scan_dir should succeed");
+            out.close().await.expect("metacache writer should close");
+            drop(out);
+            drop(writer);
+
+            let mut reader = MetacacheReader::new(reader);
+            let names: Vec<String> = reader
+                .read_all()
+                .await
+                .expect("scan output should decode")
+                .into_iter()
+                .filter(|entry| !entry.metadata.is_empty())
+                .map(|entry| entry.name)
+                .collect();
+
+            assert!(
+                !names.contains(&"zzz_after".to_string()),
+                "zzz_after sorts after the truncated subdir/ and must not be emitted \
+                 once the page limit was hit inside subdir/, or the continuation \
+                 marker built from it will skip subdir/'s unscanned tail forever: {names:?}"
+            );
+        });
     }
 
     #[test]
