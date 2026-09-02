@@ -84,6 +84,11 @@ impl SessionContext {
     pub fn access_key(&self) -> &str {
         self.principal.access_key()
     }
+
+    /// Get the authenticated credentials for this session.
+    pub fn credentials(&self) -> &Credentials {
+        &self.principal.user_identity.credentials
+    }
 }
 
 /// Build a SessionContext suitable for driver-level unit tests. The

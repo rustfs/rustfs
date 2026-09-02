@@ -12,10 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::module_switches::{on_demand_migration_enabled_from_env, set_on_demand_migration_module_enabled};
 use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
 use crate::storage_api::startup::bucket_metadata::{
-    ECStore, Error as StorageError, Result as StorageResult, get_global_replication_pool, init_bucket_metadata_sys,
-    reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
+    ECStore, Error as StorageError, OnDemandMigrationSys, Result as StorageResult, get_global_replication_pool,
+    init_bucket_metadata_sys, reconcile_bucket_resync_target_intents, try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use std::{
     io::{Error as IoError, Result as IoResult},
@@ -24,11 +25,13 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+const EVENT_ON_DEMAND_MIGRATION_RUNTIME_INITIALIZED: &str = "on_demand_migration_runtime_initialized";
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_CANCELED: &str = "replication_resync_startup_background_canceled";
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_COMPLETED: &str = "replication_resync_startup_background_completed";
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_FAILED: &str = "replication_resync_startup_background_failed";
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_STARTED: &str = "replication_resync_startup_background_started";
 const LOG_COMPONENT_STARTUP_BUCKET_METADATA: &str = "startup_bucket_metadata";
+const LOG_SUBSYSTEM_ON_DEMAND_MIGRATION: &str = "on_demand_migration";
 const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
 const METRIC_REPLICATION_RESYNC_STARTUP_BACKGROUND_DURATION_SECONDS: &str =
     "rustfs_replication_resync_startup_background_duration_seconds";
@@ -58,6 +61,7 @@ pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, c
     let buckets: Vec<String> = buckets_list.into_iter().map(|v| v.name).collect();
 
     try_migrate_bucket_metadata(store.clone()).await;
+    init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
     try_migrate_iam_config(store).await;
     spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx.clone(), false);
@@ -79,10 +83,31 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
     try_migrate_bucket_metadata(store.clone()).await;
 
     try_migrate_iam_config(store.clone()).await;
+    init_on_demand_migration_runtime();
     init_bucket_metadata_sys(store, buckets.clone()).await;
     spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx, true);
 
     Ok(buckets)
+}
+
+/// Publishes the on-demand migration module switch and registers the
+/// runtime's config hook before bucket metadata is loaded, so every cache
+/// install path (initial load included) reaches `OnDemandMigrationSys`
+/// (rustfs/backlog#2152). Idempotent across embedded and server startups.
+fn init_on_demand_migration_runtime() {
+    let enabled = on_demand_migration_enabled_from_env();
+    set_on_demand_migration_module_enabled(enabled);
+    let sys = OnDemandMigrationSys::get();
+    sys.set_module_enabled(enabled);
+    let hook_registered = sys.register_config_hook();
+    tracing::info!(
+        event = EVENT_ON_DEMAND_MIGRATION_RUNTIME_INITIALIZED,
+        component = LOG_COMPONENT_STARTUP_BUCKET_METADATA,
+        subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
+        state = if enabled { "enabled" } else { "disabled" },
+        hook_registered,
+        "On-demand migration runtime initialized"
+    );
 }
 
 fn spawn_bucket_resync_startup_reconcile(buckets: Vec<String>, ctx: CancellationToken, init_resync_after_reconcile: bool) {

@@ -46,11 +46,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // the body. These are cached on the handle so READ can detect EOF
         // and FSTAT can answer without another backend call.
         let head = self
-            .run_backend(
-                "head_object",
-                self.storage
-                    .head_object(&bucket, &object_key, self.access_key(), self.secret_key()),
-            )
+            .run_backend("head_object", self.storage.head_object(&bucket, &object_key, self.credentials()))
             .await?;
         let size = head.content_length.unwrap_or(0).max(0) as u64;
         let mtime = timestamp_to_mtime(head.last_modified);
@@ -166,7 +162,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             .run_backend(
                 "get_object_range",
                 self.storage
-                    .get_object_range(bucket, key, self.access_key(), self.secret_key(), offset, fetch_len),
+                    .get_object_range(bucket, key, self.credentials(), offset, fetch_len),
             )
             .await?;
 

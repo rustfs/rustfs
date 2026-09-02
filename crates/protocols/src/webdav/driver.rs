@@ -22,6 +22,7 @@ use dav_server::fs::{
 };
 use futures_util::{FutureExt, StreamExt, stream};
 use percent_encoding::percent_decode_str;
+use rustfs_credentials::Credentials;
 use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
 use s3s::S3ErrorCode;
@@ -198,15 +199,7 @@ where
         let key = self.key.clone();
 
         async move {
-            match storage
-                .head_object(
-                    &bucket,
-                    &key,
-                    &session_context.principal.user_identity.credentials.access_key,
-                    &session_context.principal.user_identity.credentials.secret_key,
-                )
-                .await
-            {
+            match storage.head_object(&bucket, &key, session_context.credentials()).await {
                 Ok(output) => {
                     let size = output.content_length.unwrap_or(0) as u64;
                     let modified = output
@@ -288,14 +281,7 @@ where
         async move {
             let start_pos = *position.read().await;
             match storage
-                .get_object_range(
-                    &bucket,
-                    &key,
-                    &session_context.principal.user_identity.credentials.access_key,
-                    &session_context.principal.user_identity.credentials.secret_key,
-                    start_pos,
-                    count as u64,
-                )
+                .get_object_range(&bucket, &key, session_context.credentials(), start_pos, count as u64)
                 .await
             {
                 Ok(output) => {
@@ -407,14 +393,7 @@ where
                 .build()
                 .map_err(|_| FsError::GeneralFailure)?;
 
-            match storage
-                .put_object(
-                    put_input,
-                    &session_context.principal.user_identity.credentials.access_key,
-                    &session_context.principal.user_identity.credentials.secret_key,
-                )
-                .await
-            {
+            match storage.put_object(put_input, session_context.credentials()).await {
                 Ok(_) => {
                     debug!(
                         event = EVENT_WEBDAV_OBJECT_WRITE_STATE,
@@ -522,11 +501,8 @@ where
         self
     }
 
-    fn credentials(&self) -> (&str, &str) {
-        (
-            &self.session_context.principal.user_identity.credentials.access_key,
-            &self.session_context.principal.user_identity.credentials.secret_key,
-        )
+    fn credentials(&self) -> &Credentials {
+        self.session_context.credentials()
     }
 
     fn is_missing_head_object_error(error: &str) -> bool {
@@ -538,7 +514,7 @@ where
     }
 
     async fn prefix_has_entries(&self, bucket: &str, prefix: &str) -> FsResult<bool> {
-        let (access_key, secret_key) = self.credentials();
+        let credentials = self.credentials();
         let list_input = ListObjectsV2Input::builder()
             .bucket(bucket.to_string())
             .prefix(Some(prefix.to_string()))
@@ -546,32 +522,28 @@ where
             .build()
             .map_err(|_| FsError::GeneralFailure)?;
 
-        let output = self
-            .storage
-            .list_objects_v2(list_input, access_key, secret_key)
-            .await
-            .map_err(|e| {
-                error!(
-                    event = EVENT_WEBDAV_LIST_FAILED,
-                    component = LOG_COMPONENT_PROTOCOLS,
-                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
-                    bucket = %bucket,
-                    prefix = %prefix,
-                    error = %e,
-                    "webdav list failed"
-                );
-                FsError::GeneralFailure
-            })?;
+        let output = self.storage.list_objects_v2(list_input, credentials).await.map_err(|e| {
+            error!(
+                event = EVENT_WEBDAV_LIST_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                bucket = %bucket,
+                prefix = %prefix,
+                error = %e,
+                "webdav list failed"
+            );
+            FsError::GeneralFailure
+        })?;
 
         Ok(output.contents.map(|c| !c.is_empty()).unwrap_or(false)
             || output.common_prefixes.map(|c| !c.is_empty()).unwrap_or(false))
     }
 
     async fn copy_object_streaming(&self, src_bucket: &str, src_key: &str, dst_bucket: &str, dst_key: &str) -> FsResult<()> {
-        let (access_key, secret_key) = self.credentials();
+        let credentials = self.credentials();
         let get_output = self
             .storage
-            .get_object(src_bucket, src_key, access_key, secret_key, None)
+            .get_object(src_bucket, src_key, credentials, None)
             .await
             .map_err(|e| {
                 error!(
@@ -625,24 +597,21 @@ where
 
         let put_input = put_builder.build().map_err(|_| FsError::GeneralFailure)?;
 
-        self.storage
-            .put_object(put_input, access_key, secret_key)
-            .await
-            .map_err(|e| {
-                error!(
-                    event = EVENT_WEBDAV_COPY_FAILED,
-                    component = LOG_COMPONENT_PROTOCOLS,
-                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
-                    state = "destination_write_failed",
-                    src_bucket = %src_bucket,
-                    src_object = %src_key,
-                    dst_bucket = %dst_bucket,
-                    dst_object = %dst_key,
-                    error = %e,
-                    "webdav copy failed"
-                );
-                FsError::GeneralFailure
-            })?;
+        self.storage.put_object(put_input, credentials).await.map_err(|e| {
+            error!(
+                event = EVENT_WEBDAV_COPY_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                state = "destination_write_failed",
+                src_bucket = %src_bucket,
+                src_object = %src_key,
+                dst_bucket = %dst_bucket,
+                dst_object = %dst_key,
+                error = %e,
+                "webdav copy failed"
+            );
+            FsError::GeneralFailure
+        })?;
 
         Ok(())
     }
@@ -653,7 +622,7 @@ where
         dst_bucket: &str,
         rename_pairs: &[(String, String)],
     ) -> FsResult<()> {
-        let (access_key, secret_key) = self.credentials();
+        let credentials = self.credentials();
 
         for (src_obj_key, dst_obj_key) in rename_pairs {
             self.copy_object_streaming(src_bucket, src_obj_key, dst_bucket, dst_obj_key)
@@ -662,7 +631,7 @@ where
 
         for (src_obj_key, _) in rename_pairs {
             self.storage
-                .delete_object(src_bucket, src_obj_key, access_key, secret_key)
+                .delete_object(src_bucket, src_obj_key, credentials)
                 .await
                 .map_err(|e| {
                     error!(
@@ -683,7 +652,7 @@ where
     }
 
     async fn probe_head_object(&self, bucket: &str, key: &str) -> FsResult<HeadObjectProbe> {
-        let (access_key, secret_key) = self.credentials();
+        let credentials = self.credentials();
 
         if authorize_operation(&self.session_context, &S3Action::HeadObject, bucket, Some(key))
             .await
@@ -692,7 +661,7 @@ where
             return Ok(HeadObjectProbe::Forbidden);
         }
 
-        match self.storage.head_object(bucket, key, access_key, secret_key).await {
+        match self.storage.head_object(bucket, key, credentials).await {
             Ok(output) => Ok(HeadObjectProbe::Found(Box::new(output))),
             Err(e) => {
                 let err_msg = e.to_string();
@@ -816,8 +785,8 @@ where
     async fn list_buckets(&self) -> FsResult<Vec<WebDavDirEntry>> {
         match authorize_operation(&self.session_context, &S3Action::ListBuckets, "", None).await {
             Ok(()) => {
-                let (access_key, secret_key) = self.credentials();
-                return match self.storage.list_buckets(access_key, secret_key).await {
+                let credentials = self.credentials();
+                return match self.storage.list_buckets(credentials).await {
                     Ok(output) => Ok(Self::bucket_entries(output)),
                     Err(error) => {
                         error!(
@@ -825,7 +794,7 @@ where
                             component = LOG_COMPONENT_PROTOCOLS,
                             subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
                             error = %error,
-                            access_key = %MaskedAccessKey(access_key),
+                            access_key = %MaskedAccessKey(credentials.access_key.as_str()),
                             "webdav bucket list failed"
                         );
                         Err(FsError::GeneralFailure)
@@ -908,15 +877,7 @@ where
             .build()
             .map_err(|_| FsError::GeneralFailure)?;
 
-        match self
-            .storage
-            .list_objects_v2(
-                list_input,
-                &self.session_context.principal.user_identity.credentials.access_key,
-                &self.session_context.principal.user_identity.credentials.secret_key,
-            )
-            .await
-        {
+        match self.storage.list_objects_v2(list_input, self.credentials()).await {
             Ok(output) => {
                 let mut entries = Vec::new();
 
@@ -1054,15 +1015,7 @@ where
 
             let list_input = list_input.build().map_err(|_| FsError::GeneralFailure)?;
 
-            if let Ok(output) = self
-                .storage
-                .list_objects_v2(
-                    list_input,
-                    &self.session_context.principal.user_identity.credentials.access_key,
-                    &self.session_context.principal.user_identity.credentials.secret_key,
-                )
-                .await
-            {
+            if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
                 // Delete all objects in this page
                 if let Some(objects) = output.contents {
                     for obj in objects {
@@ -1071,15 +1024,7 @@ where
                                 .await
                                 .map_err(|_| FsError::Forbidden)?;
 
-                            let _ = self
-                                .storage
-                                .delete_object(
-                                    bucket,
-                                    &obj_key,
-                                    &self.session_context.principal.user_identity.credentials.access_key,
-                                    &self.session_context.principal.user_identity.credentials.secret_key,
-                                )
-                                .await;
+                            let _ = self.storage.delete_object(bucket, &obj_key, self.credentials()).await;
                         }
                     }
                 }
@@ -1095,15 +1040,7 @@ where
         }
 
         // Then delete the bucket
-        match self
-            .storage
-            .delete_bucket(
-                bucket,
-                &self.session_context.principal.user_identity.credentials.access_key,
-                &self.session_context.principal.user_identity.credentials.secret_key,
-            )
-            .await
-        {
+        match self.storage.delete_bucket(bucket, self.credentials()).await {
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("NoSuchBucket") => Ok(()),
             Err(e) => {
@@ -1250,15 +1187,7 @@ where
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
-                match self
-                    .storage
-                    .head_bucket(
-                        &bucket,
-                        &self.session_context.principal.user_identity.credentials.access_key,
-                        &self.session_context.principal.user_identity.credentials.secret_key,
-                    )
-                    .await
-                {
+                match self.storage.head_bucket(&bucket, self.credentials()).await {
                     Ok(_) => Ok(Box::new(WebDavMetaData {
                         size: 0,
                         modified: SystemTime::now(),
@@ -1318,15 +1247,7 @@ where
                     .build()
                     .map_err(|_| FsError::GeneralFailure)?;
 
-                match self
-                    .storage
-                    .put_object(
-                        put_input,
-                        &self.session_context.principal.user_identity.credentials.access_key,
-                        &self.session_context.principal.user_identity.credentials.secret_key,
-                    )
-                    .await
-                {
+                match self.storage.put_object(put_input, self.credentials()).await {
                     Ok(_) => {
                         debug!(
                             event = EVENT_WEBDAV_DIRECTORY_STATE,
@@ -1360,15 +1281,7 @@ where
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
-            match self
-                .storage
-                .create_bucket(
-                    &bucket,
-                    &self.session_context.principal.user_identity.credentials.access_key,
-                    &self.session_context.principal.user_identity.credentials.secret_key,
-                )
-                .await
-            {
+            match self.storage.create_bucket(&bucket, self.credentials()).await {
                 Ok(_) => {
                     debug!(
                         event = EVENT_WEBDAV_DIRECTORY_STATE,
@@ -1438,15 +1351,7 @@ where
 
                     let list_input = list_input.build().map_err(|_| FsError::GeneralFailure)?;
 
-                    if let Ok(output) = self
-                        .storage
-                        .list_objects_v2(
-                            list_input,
-                            &self.session_context.principal.user_identity.credentials.access_key,
-                            &self.session_context.principal.user_identity.credentials.secret_key,
-                        )
-                        .await
-                    {
+                    if let Ok(output) = self.storage.list_objects_v2(list_input, self.credentials()).await {
                         if let Some(objects) = output.contents {
                             for obj in objects {
                                 if let Some(obj_key) = obj.key {
@@ -1454,15 +1359,7 @@ where
                                         .await
                                         .map_err(|_| FsError::Forbidden)?;
 
-                                    let _ = self
-                                        .storage
-                                        .delete_object(
-                                            &bucket,
-                                            &obj_key,
-                                            &self.session_context.principal.user_identity.credentials.access_key,
-                                            &self.session_context.principal.user_identity.credentials.secret_key,
-                                        )
-                                        .await;
+                                    let _ = self.storage.delete_object(&bucket, &obj_key, self.credentials()).await;
                                 }
                             }
                         }
@@ -1479,12 +1376,7 @@ where
                 // Also delete the directory marker itself
                 let _ = self
                     .storage
-                    .delete_object(
-                        &bucket,
-                        &prefix_with_slash,
-                        &self.session_context.principal.user_identity.credentials.access_key,
-                        &self.session_context.principal.user_identity.credentials.secret_key,
-                    )
+                    .delete_object(&bucket, &prefix_with_slash, self.credentials())
                     .await;
 
                 return Ok(());
@@ -1515,16 +1407,7 @@ where
                 .await
                 .map_err(|_| FsError::Forbidden)?;
 
-            match self
-                .storage
-                .delete_object(
-                    &bucket,
-                    &key,
-                    &self.session_context.principal.user_identity.credentials.access_key,
-                    &self.session_context.principal.user_identity.credentials.secret_key,
-                )
-                .await
-            {
+            match self.storage.delete_object(&bucket, &key, self.credentials()).await {
                 Ok(_) => {
                     debug!(
                         event = EVENT_WEBDAV_OBJECT_DELETE_STATE,
@@ -1566,7 +1449,7 @@ where
 
             let src_key = src_key.ok_or(FsError::Forbidden)?;
             let dst_key = dst_key.ok_or(FsError::Forbidden)?;
-            let (access_key, secret_key) = self.credentials();
+            let credentials = self.credentials();
             let resolved_src = self.resolve_path(&src_bucket, &src_key).await?;
             let (src_prefix, include_src_marker) = match resolved_src {
                 ResolvedPath::File(_) => {
@@ -1584,7 +1467,7 @@ where
                         .await?;
 
                     self.storage
-                        .delete_object(&src_bucket, &src_key, access_key, secret_key)
+                        .delete_object(&src_bucket, &src_key, credentials)
                         .await
                         .map_err(|e| {
                             error!(
@@ -1656,25 +1539,21 @@ where
                 }
 
                 let list_input = list_builder.build().map_err(|_| FsError::GeneralFailure)?;
-                let output = self
-                    .storage
-                    .list_objects_v2(list_input, access_key, secret_key)
-                    .await
-                    .map_err(|e| {
-                        error!(
-                            event = EVENT_WEBDAV_RENAME_STATE,
-                            component = LOG_COMPONENT_PROTOCOLS,
-                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
-                            state = "directory_list_failed",
-                            src_bucket = %src_bucket,
-                            src_prefix = %src_prefix,
-                            dst_bucket = %dst_bucket,
-                            dst_prefix = %dst_prefix,
-                            error = %e,
-                            "WebDAV rename directory listing failed"
-                        );
-                        FsError::GeneralFailure
-                    })?;
+                let output = self.storage.list_objects_v2(list_input, credentials).await.map_err(|e| {
+                    error!(
+                        event = EVENT_WEBDAV_RENAME_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "directory_list_failed",
+                        src_bucket = %src_bucket,
+                        src_prefix = %src_prefix,
+                        dst_bucket = %dst_bucket,
+                        dst_prefix = %dst_prefix,
+                        error = %e,
+                        "WebDAV rename directory listing failed"
+                    );
+                    FsError::GeneralFailure
+                })?;
 
                 let mut page_pairs: Vec<(String, String)> = Vec::new();
                 if let Some(objects) = output.contents {
@@ -1785,8 +1664,7 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
             _start_pos: Option<u64>,
         ) -> Result<GetObjectOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
@@ -1796,20 +1674,14 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
             _start_pos: u64,
             _length: u64,
         ) -> Result<GetObjectOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
 
-        async fn put_object(
-            &self,
-            _input: PutObjectInput,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<PutObjectOutput, Self::Error> {
+        async fn put_object(&self, _input: PutObjectInput, _credentials: &Credentials) -> Result<PutObjectOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
 
@@ -1817,8 +1689,7 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<DeleteObjectOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
@@ -1827,57 +1698,39 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<HeadObjectOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
 
-        async fn head_bucket(
-            &self,
-            _bucket: &str,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<HeadBucketOutput, Self::Error> {
+        async fn head_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<HeadBucketOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
 
         async fn list_objects_v2(
             &self,
             _input: ListObjectsV2Input,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<ListObjectsV2Output, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
 
-        async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
+        async fn list_buckets(&self, _credentials: &Credentials) -> Result<ListBucketsOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
 
-        async fn create_bucket(
-            &self,
-            _bucket: &str,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<CreateBucketOutput, Self::Error> {
+        async fn create_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
 
-        async fn delete_bucket(
-            &self,
-            _bucket: &str,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<DeleteBucketOutput, Self::Error> {
+        async fn delete_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<DeleteBucketOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
 
         async fn copy_object(
             &self,
             _input: CopyObjectInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<CopyObjectOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
@@ -1885,8 +1738,7 @@ mod tests {
         async fn create_multipart_upload(
             &self,
             _input: CreateMultipartUploadInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<CreateMultipartUploadOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
@@ -1894,8 +1746,7 @@ mod tests {
         async fn upload_part(
             &self,
             _input: UploadPartInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<UploadPartOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
@@ -1903,8 +1754,7 @@ mod tests {
         async fn complete_multipart_upload(
             &self,
             _input: CompleteMultipartUploadInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
@@ -1912,8 +1762,7 @@ mod tests {
         async fn abort_multipart_upload(
             &self,
             _input: AbortMultipartUploadInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<AbortMultipartUploadOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
@@ -1921,8 +1770,7 @@ mod tests {
         async fn upload_part_copy(
             &self,
             _input: UploadPartCopyInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<UploadPartCopyOutput, Self::Error> {
             unreachable!("parse_path tests should not hit storage")
         }
@@ -2099,8 +1947,7 @@ mod tests {
             &self,
             bucket: &str,
             key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
             _start_pos: Option<u64>,
         ) -> Result<GetObjectOutput, Self::Error> {
             let data = self
@@ -2127,8 +1974,7 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
             _start_pos: u64,
             _length: u64,
         ) -> Result<GetObjectOutput, Self::Error> {
@@ -2138,8 +1984,7 @@ mod tests {
         async fn put_object(
             &self,
             mut input: PutObjectInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<PutObjectOutput, Self::Error> {
             let bucket = input.bucket.clone();
             let key = input.key.clone();
@@ -2163,8 +2008,7 @@ mod tests {
             &self,
             bucket: &str,
             key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<DeleteObjectOutput, Self::Error> {
             let mut state = self.state.lock().expect("recording storage lock poisoned");
             state.delete_keys.push(key.to_string());
@@ -2179,26 +2023,19 @@ mod tests {
             &self,
             _bucket: &str,
             _key: &str,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<HeadObjectOutput, Self::Error> {
             unreachable!("head_object is not used in rename regression tests")
         }
 
-        async fn head_bucket(
-            &self,
-            _bucket: &str,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<HeadBucketOutput, Self::Error> {
+        async fn head_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<HeadBucketOutput, Self::Error> {
             unreachable!("head_bucket is not used in rename regression tests")
         }
 
         async fn list_objects_v2(
             &self,
             input: ListObjectsV2Input,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<ListObjectsV2Output, Self::Error> {
             let prefix = input.prefix.unwrap_or_default();
             let mut keys: Vec<String> = self
@@ -2226,25 +2063,15 @@ mod tests {
             })
         }
 
-        async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
+        async fn list_buckets(&self, _credentials: &Credentials) -> Result<ListBucketsOutput, Self::Error> {
             unreachable!("list_buckets is not used in rename regression tests")
         }
 
-        async fn create_bucket(
-            &self,
-            _bucket: &str,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<CreateBucketOutput, Self::Error> {
+        async fn create_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
             unreachable!("create_bucket is not used in rename regression tests")
         }
 
-        async fn delete_bucket(
-            &self,
-            bucket: &str,
-            _access_key: &str,
-            _secret_key: &str,
-        ) -> Result<DeleteBucketOutput, Self::Error> {
+        async fn delete_bucket(&self, bucket: &str, _credentials: &Credentials) -> Result<DeleteBucketOutput, Self::Error> {
             self.state
                 .lock()
                 .expect("recording storage lock poisoned")
@@ -2256,8 +2083,7 @@ mod tests {
         async fn copy_object(
             &self,
             _input: CopyObjectInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<CopyObjectOutput, Self::Error> {
             unreachable!("copy_object is not used in rename regression tests")
         }
@@ -2265,8 +2091,7 @@ mod tests {
         async fn create_multipart_upload(
             &self,
             _input: CreateMultipartUploadInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<CreateMultipartUploadOutput, Self::Error> {
             unreachable!("create_multipart_upload is not used in rename regression tests")
         }
@@ -2274,8 +2099,7 @@ mod tests {
         async fn upload_part(
             &self,
             _input: UploadPartInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<UploadPartOutput, Self::Error> {
             unreachable!("upload_part is not used in rename regression tests")
         }
@@ -2283,8 +2107,7 @@ mod tests {
         async fn complete_multipart_upload(
             &self,
             _input: CompleteMultipartUploadInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
             unreachable!("complete_multipart_upload is not used in rename regression tests")
         }
@@ -2292,8 +2115,7 @@ mod tests {
         async fn abort_multipart_upload(
             &self,
             _input: AbortMultipartUploadInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<AbortMultipartUploadOutput, Self::Error> {
             unreachable!("abort_multipart_upload is not used in rename regression tests")
         }
@@ -2301,8 +2123,7 @@ mod tests {
         async fn upload_part_copy(
             &self,
             _input: UploadPartCopyInput,
-            _access_key: &str,
-            _secret_key: &str,
+            _credentials: &Credentials,
         ) -> Result<UploadPartCopyOutput, Self::Error> {
             unreachable!("upload_part_copy is not used in rename regression tests")
         }

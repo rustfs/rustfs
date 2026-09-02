@@ -293,11 +293,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             // not-found error means the key is free. Any other error is
             // propagated rather than misinterpreted as "does not exist".
             match self
-                .run_backend_with_err(
-                    "head_object",
-                    self.storage
-                        .head_object(&bucket, &object_key, self.access_key(), self.secret_key()),
-                )
+                .run_backend_with_err("head_object", self.storage.head_object(&bucket, &object_key, self.credentials()))
                 .await?
             {
                 Ok(_) => return Err(SftpError::code(StatusCode::Failure)),
@@ -385,7 +381,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 .map_err(|e| s3_error_to_sftp("build_put_object", e))?;
 
             let outcome = self
-                .run_backend_with_err("put_object", self.storage.put_object(input, self.access_key(), self.secret_key()))
+                .run_backend_with_err("put_object", self.storage.put_object(input, self.credentials()))
                 .await?;
 
             let backend_err = match outcome {
@@ -448,7 +444,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             .map_err(|e| s3_error_to_sftp("build_upload_part", e))?;
 
         let out = self
-            .run_backend("upload_part", self.storage.upload_part(input, self.access_key(), self.secret_key()))
+            .run_backend("upload_part", self.storage.upload_part(input, self.credentials()))
             .await?;
 
         let e_tag = out.e_tag.ok_or_else(|| {
@@ -528,11 +524,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             .map_err(|e| s3_error_to_sftp("build_create_multipart_upload", e))?;
 
         let out = self
-            .run_backend(
-                "create_multipart_upload",
-                self.storage
-                    .create_multipart_upload(input, self.access_key(), self.secret_key()),
-            )
+            .run_backend("create_multipart_upload", self.storage.create_multipart_upload(input, self.credentials()))
             .await?;
 
         let upload_id = out.upload_id.ok_or_else(|| {
@@ -585,8 +577,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let result = self
             .run_backend(
                 "complete_multipart_upload",
-                self.storage
-                    .complete_multipart_upload(input, self.access_key(), self.secret_key()),
+                self.storage.complete_multipart_upload(input, self.credentials()),
             )
             .await;
         result?;
@@ -852,12 +843,8 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             .build()
             .map_err(|e| s3_error_to_sftp("build_abort_multipart_upload", e))?;
 
-        self.run_backend(
-            "abort_multipart_upload",
-            self.storage
-                .abort_multipart_upload(input, self.access_key(), self.secret_key()),
-        )
-        .await?;
+        self.run_backend("abort_multipart_upload", self.storage.abort_multipart_upload(input, self.credentials()))
+            .await?;
         Ok(())
     }
 
@@ -1066,10 +1053,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                     .map_err(|e| s3_error_to_sftp("build_upload_part_copy", e))?;
 
                 let out = self
-                    .run_backend(
-                        "upload_part_copy",
-                        self.storage.upload_part_copy(input, self.access_key(), self.secret_key()),
-                    )
+                    .run_backend("upload_part_copy", self.storage.upload_part_copy(input, self.credentials()))
                     .await?;
 
                 let e_tag = out.copy_part_result.and_then(|r| r.e_tag).ok_or_else(|| {
@@ -1125,6 +1109,7 @@ mod tests {
     use crate::common::dummy_storage::{AbortCall, DummyBackend, DummyError};
     use crate::common::gateway::with_test_auth_override;
     use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+    use rustfs_credentials::Credentials;
     use s3s::dto::ETag;
     use std::sync::Arc;
     use std::time::Duration;
@@ -2324,9 +2309,10 @@ mod tests {
         let backend = Arc::new(DummyBackend::new());
         backend.queue_head_object_err(DummyError::AccessDenied("pinned".to_string()));
         let driver = build_driver(backend, TEST_PART_SIZE);
+        let credentials = Credentials::default();
 
         let result = driver
-            .run_backend_with_err("head_object", driver.storage.head_object("b", "k", "ak", "sk"))
+            .run_backend_with_err("head_object", driver.storage.head_object("b", "k", &credentials))
             .await;
 
         match result {
