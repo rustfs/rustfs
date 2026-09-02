@@ -260,8 +260,15 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
             // the response path relies on). Keep the object's own multipart
             // flag so encrypted objects stay on the multipart route.
         } else {
-            let (checksum_meta, is_mp) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
-            is_multipart = is_mp;
+            let (checksum_meta, checksum_record_is_multipart) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
+            // The checksum record describes how the *checksum* is composed,
+            // not how the object is stored. A full-object checksum carries no
+            // MULTIPART flag even on a multipart upload, so trusting it here
+            // routed a 768-part object through a single PutObject and the
+            // target rejected the 6 GiB body with EntityTooLarge
+            // (rustfs#6825). The object's own shape is the authority: the
+            // record may only add multipart-ness, never take it away.
+            is_multipart = object_info.is_multipart() || checksum_record_is_multipart;
 
             for (key, value) in checksum_meta.iter() {
                 if key != AMZ_CHECKSUM_TYPE {
@@ -517,6 +524,109 @@ mod tests {
     use std::sync::Arc;
     use time::Duration;
     use uuid::Uuid;
+
+    /// Serialize an object-level checksum record the way
+    /// `complete_multipart_upload` persists it for a **full-object** checksum:
+    /// the record carries the plain algorithm type, without the MULTIPART
+    /// flags that a composite record gets.
+    fn full_object_multipart_checksum_record() -> bytes::Bytes {
+        let checksum_type = rustfs_rio::ChecksumType::from_string_with_obj_type("crc32", "FULL_OBJECT");
+        assert!(checksum_type.is_set(), "crc32 FULL_OBJECT must be a valid checksum type");
+        assert!(checksum_type.full_object_requested());
+
+        let mut combined = Vec::new();
+        let mut checksum = rustfs_rio::Checksum {
+            checksum_type,
+            ..Default::default()
+        };
+        for part in [b"part-one".as_slice(), b"part-two".as_slice()] {
+            let part_checksum = rustfs_rio::Checksum::new_from_data(checksum_type, part).expect("part checksum");
+            combined.extend_from_slice(part_checksum.raw.as_slice());
+            checksum.add_part(&part_checksum, part.len() as i64).expect("add part");
+        }
+
+        checksum.to_bytes(&combined)
+    }
+
+    #[test]
+    fn multipart_object_with_full_object_checksum_keeps_the_multipart_route() {
+        // rustfs#6825: a 768-part upload was replicated with a single
+        // PutObject and rejected by the target with EntityTooLarge. The
+        // object's storage shape says multipart; only the checksum record
+        // looked single-part, and the checksum record must not decide the
+        // transport.
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef-768".to_string()),
+            checksum: Some(full_object_multipart_checksum_record()),
+            size: 6 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        assert!(object_info.is_multipart(), "the fixture must be a multipart object");
+        let (_, checksum_says_multipart) = object_info
+            .decrypt_checksums(0, &HeaderMap::new())
+            .expect("checksum record must decode");
+        assert!(
+            !checksum_says_multipart,
+            "fixture precondition: a full-object record carries no MULTIPART flag, which is what used to \
+             downgrade the transport"
+        );
+
+        let (_, is_multipart) = replication_put_object_options("STANDARD", &object_info).expect("build put options");
+
+        assert!(
+            is_multipart,
+            "a multipart object must replicate over multipart whatever its checksum record looks like"
+        );
+    }
+
+    #[test]
+    fn checksum_record_never_changes_the_transport_a_single_part_object_needs() {
+        // The mirror of the rustfs#6825 guard: an object stored as one PUT
+        // must keep the single-PUT transport, or its replica's ETag would
+        // change shape and every ETag-based convergence check would re-copy it.
+        let checksum =
+            rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::CRC32, b"whole-object").expect("checksum fixture");
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+            checksum: Some(checksum.to_bytes(&[])),
+            ..Default::default()
+        };
+
+        assert!(!object_info.is_multipart(), "the fixture must be a single-part object");
+
+        let (_, is_multipart) = replication_put_object_options("STANDARD", &object_info).expect("build put options");
+
+        assert!(!is_multipart, "a single-part object must not be promoted onto the multipart transport");
+    }
+
+    #[test]
+    fn composite_checksum_multipart_object_keeps_the_multipart_route() {
+        // The checksum shape that already worked before rustfs#6825, pinned so
+        // the fix cannot regress it.
+        let mut checksum_type = rustfs_rio::ChecksumType::from_string("crc32");
+        checksum_type
+            .merge(rustfs_rio::ChecksumType::MULTIPART)
+            .merge(rustfs_rio::ChecksumType::INCLUDES_MULTIPART);
+
+        let mut combined = Vec::new();
+        for part in [b"part-one".as_slice(), b"part-two".as_slice()] {
+            let part_checksum =
+                rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::from_string("crc32"), part).expect("part checksum");
+            combined.extend_from_slice(part_checksum.raw.as_slice());
+        }
+        let checksum = rustfs_rio::Checksum::new_from_data(checksum_type, &combined).expect("composite checksum");
+
+        let object_info = ObjectInfo {
+            etag: Some("0123456789abcdef0123456789abcdef-2".to_string()),
+            checksum: Some(checksum.to_bytes(&combined)),
+            ..Default::default()
+        };
+
+        let (_, is_multipart) = replication_put_object_options("STANDARD", &object_info).expect("build put options");
+
+        assert!(is_multipart, "a composite-checksum multipart object must stay on the multipart transport");
+    }
 
     #[test]
     fn replication_action_for_target_head_existing_object_source_newer_null_version_requires_replication() {

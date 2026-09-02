@@ -24,6 +24,11 @@ because heal and delete convergence address the replica by that identity.
 This is why object size alone does not tell you whether an object is
 replicable — how it was uploaded does.
 
+The shape is read from the object's own ETag: a multipart ETag carries a
+`-<part count>` suffix. Nothing else selects the transport — in particular the
+checksum algorithm and checksum type (`COMPOSITE` or `FULL_OBJECT`) an object
+was uploaded with have no bearing on it.
+
 ## Limits
 
 ### Single-`PutObject` objects: 5 GiB
