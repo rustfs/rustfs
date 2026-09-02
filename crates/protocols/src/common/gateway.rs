@@ -288,12 +288,7 @@ pub async fn is_authorized(
         }
     };
 
-    // Create policy arguments
-    let mut claims = HashMap::new();
-    claims.insert(
-        "principal".to_string(),
-        serde_json::Value::String(session_context.principal.access_key().to_string()),
-    );
+    let claims = policy_claims_for_session(session_context);
 
     let policy_action: rustfs_policy::policy::action::Action = action.clone().into();
 
@@ -313,6 +308,21 @@ pub async fn is_authorized(
     };
 
     Ok(iam_sys.is_allowed(&args).await)
+}
+
+fn policy_claims_for_session(session_context: &SessionContext) -> HashMap<String, serde_json::Value> {
+    let mut claims = session_context
+        .principal
+        .user_identity
+        .credentials
+        .claims
+        .clone()
+        .unwrap_or_default();
+    claims.insert(
+        "principal".to_string(),
+        serde_json::Value::String(session_context.principal.access_key().to_string()),
+    );
+    claims
 }
 
 /// Authorize an operation and return an error if not authorized.
@@ -457,13 +467,53 @@ pub use test_auth_override::{with_test_auth_override, with_test_iam_unavailable}
 mod tests {
     use super::*;
     use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+    use rustfs_credentials::{IAM_POLICY_CLAIM_NAME_SA, INHERITED_POLICY_TYPE};
     use rustfs_policy::auth::UserIdentity;
+    use serde_json::Value;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
 
     fn test_session() -> SessionContext {
         let principal = ProtocolPrincipal::new(Arc::new(UserIdentity::default()));
         SessionContext::new(principal, Protocol::Sftp, IpAddr::V4(Ipv4Addr::LOCALHOST))
+    }
+
+    fn session_with_claims(access_key: &str, claims: HashMap<String, Value>) -> SessionContext {
+        let identity = UserIdentity::new(rustfs_credentials::Credentials {
+            access_key: access_key.to_string(),
+            secret_key: "secret".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        });
+        let principal = ProtocolPrincipal::new(Arc::new(identity));
+        SessionContext::new(principal, Protocol::WebDav, IpAddr::V4(Ipv4Addr::LOCALHOST))
+    }
+
+    #[test]
+    fn policy_claims_preserve_authenticated_service_account_claims() {
+        let parent = "parent-user";
+        let mut stored_claims = HashMap::new();
+        stored_claims.insert("parent".to_string(), Value::String(parent.to_string()));
+        stored_claims.insert(IAM_POLICY_CLAIM_NAME_SA.to_string(), Value::String(INHERITED_POLICY_TYPE.to_string()));
+        let session = session_with_claims("service-account", stored_claims);
+
+        let claims = policy_claims_for_session(&session);
+
+        assert_eq!(claims.get("parent").and_then(Value::as_str), Some(parent));
+        assert_eq!(claims.get(IAM_POLICY_CLAIM_NAME_SA).and_then(Value::as_str), Some(INHERITED_POLICY_TYPE));
+        assert_eq!(claims.get("principal").and_then(Value::as_str), Some("service-account"));
+    }
+
+    #[test]
+    fn policy_claims_overwrite_untrusted_principal_claim() {
+        let session = session_with_claims(
+            "authenticated-service-account",
+            HashMap::from([("principal".to_string(), Value::String("forged-principal".to_string()))]),
+        );
+
+        let claims = policy_claims_for_session(&session);
+
+        assert_eq!(claims.get("principal").and_then(Value::as_str), Some("authenticated-service-account"));
     }
 
     #[tokio::test]

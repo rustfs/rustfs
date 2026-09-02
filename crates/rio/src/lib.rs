@@ -118,6 +118,12 @@ pub use hardlimit_reader::HardLimitReader;
 
 mod hash_reader;
 pub use hash_reader::*;
+
+mod tee_reader;
+pub use tee_reader::{
+    DEFAULT_TEE_MAX_DRAIN_BYTES, TeeDrainLimitExceeded, TeeOptions, TeePrimary, TeeSecondary, TeeStream, tee_reader,
+    tee_reader_with_options,
+};
 mod checksum;
 pub use checksum::*;
 

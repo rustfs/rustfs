@@ -102,10 +102,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         let input = builder.build().map_err(|e| s3_error_to_sftp("build_list_objects", e))?;
 
         let out = self
-            .run_backend(
-                "list_objects_v2",
-                self.storage.list_objects_v2(input, self.access_key(), self.secret_key()),
-            )
+            .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
             .await?;
 
         let mut entries = Vec::new();
@@ -196,10 +193,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         // Issue list_objects_v2. On Err the destructive caller never
         // runs because validate_directory_empty returns the Err.
         let out = self
-            .run_backend(
-                "list_objects_v2",
-                self.storage.list_objects_v2(input, self.access_key(), self.secret_key()),
-            )
+            .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
             .await?;
 
         // Count content entries that are not the directory's own marker.
@@ -234,7 +228,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         self.authorize(&S3Action::ListBuckets, "", None).await?;
 
         let out = self
-            .run_backend("list_buckets", self.storage.list_buckets(self.access_key(), self.secret_key()))
+            .run_backend("list_buckets", self.storage.list_buckets(self.credentials()))
             .await?;
 
         let mut entries = Vec::new();
@@ -280,7 +274,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     /// MKDIR for a bucket-level path: authorise and issue CreateBucket.
     pub(super) async fn mkdir_bucket(&self, bucket: &str) -> Result<(), SftpError> {
         self.authorize(&S3Action::CreateBucket, bucket, None).await?;
-        self.run_backend("create_bucket", self.storage.create_bucket(bucket, self.access_key(), self.secret_key()))
+        self.run_backend("create_bucket", self.storage.create_bucket(bucket, self.credentials()))
             .await?;
         Ok(())
     }
@@ -302,7 +296,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             .body(Some(streaming))
             .build()
             .map_err(|e| s3_error_to_sftp("build_put_object", e))?;
-        self.run_backend("put_object", self.storage.put_object(input, self.access_key(), self.secret_key()))
+        self.run_backend("put_object", self.storage.put_object(input, self.credentials()))
             .await?;
         Ok(())
     }
@@ -312,7 +306,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     pub(super) async fn rmdir_bucket(&self, bucket: &str) -> Result<(), SftpError> {
         self.validate_directory_empty(bucket, "").await?;
         self.authorize(&S3Action::DeleteBucket, bucket, None).await?;
-        self.run_backend("delete_bucket", self.storage.delete_bucket(bucket, self.access_key(), self.secret_key()))
+        self.run_backend("delete_bucket", self.storage.delete_bucket(bucket, self.credentials()))
             .await?;
         Ok(())
     }
@@ -326,12 +320,8 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
 
         let marker_key = path::encode_dir_object(&prefix);
         self.authorize(&S3Action::DeleteObject, bucket, Some(&marker_key)).await?;
-        self.run_backend(
-            "delete_object",
-            self.storage
-                .delete_object(bucket, &marker_key, self.access_key(), self.secret_key()),
-        )
-        .await?;
+        self.run_backend("delete_object", self.storage.delete_object(bucket, &marker_key, self.credentials()))
+            .await?;
         Ok(())
     }
 
@@ -398,7 +388,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                 if prefix.is_empty() { None } else { Some(prefix.as_str()) },
             )
             .await?;
-            self.run_backend("head_bucket", self.storage.head_bucket(&bucket, self.access_key(), self.secret_key()))
+            self.run_backend("head_bucket", self.storage.head_bucket(&bucket, self.credentials()))
                 .await?;
             DirCursor::Listing {
                 bucket,
