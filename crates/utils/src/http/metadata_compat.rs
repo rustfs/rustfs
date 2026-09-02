@@ -88,6 +88,21 @@ pub const SUFFIX_TIER_SKIP_FV_ID: &str = "tier-skip-fvid";
 /// Per-target delete-marker version ids are stored one key per target ARN.
 pub const SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX: &str = "replication-delete-marker-version-";
 
+// On-demand migration provenance. Written by the migration write-back onto
+// every pulled object so operators and later tooling can tell a migrated
+// object from a client write and audit where it came from. Internal keys, so
+// the existing internal-key filter keeps them out of client-visible metadata.
+/// Source of a pulled object as `<provider>:<bucket>`.
+pub const SUFFIX_ODM_SOURCE: &str = "odm-source";
+/// ETag the source reported for the pulled object, verbatim.
+pub const SUFFIX_ODM_SOURCE_ETAG: &str = "odm-source-etag";
+/// Source `Last-Modified` of the pulled object, RFC 3339.
+pub const SUFFIX_ODM_SOURCE_LAST_MODIFIED: &str = "odm-source-last-modified";
+/// Source version id of the pulled object; empty for an unversioned source.
+pub const SUFFIX_ODM_SOURCE_VERSION_ID: &str = "odm-source-version-id";
+/// When the object was pulled from the source, RFC 3339.
+pub const SUFFIX_ODM_PULLED_AT: &str = "odm-pulled-at";
+
 /// Case-insensitive (ASCII) check that `s` begins with `prefix`. Equivalent to
 /// `s.to_lowercase().starts_with(prefix)` when `prefix` is ASCII (as both internal prefixes are),
 /// but without allocating.
@@ -589,6 +604,80 @@ mod tests {
         assert_eq!(get_bytes(&meta_sys, &long_suffix), Some(b"payload".to_vec()));
         remove_bytes(&mut meta_sys, &long_suffix);
         assert!(!contains_key_bytes(&meta_sys, &long_suffix));
+    }
+
+    const ODM_PROVENANCE_SUFFIXES: [&str; 5] = [
+        SUFFIX_ODM_SOURCE,
+        SUFFIX_ODM_SOURCE_ETAG,
+        SUFFIX_ODM_SOURCE_LAST_MODIFIED,
+        SUFFIX_ODM_SOURCE_VERSION_ID,
+        SUFFIX_ODM_PULLED_AT,
+    ];
+
+    #[test]
+    fn odm_provenance_suffixes_are_reserved_internal_keys_under_both_prefixes() {
+        for suffix in ODM_PROVENANCE_SUFFIXES {
+            for prefix in [RUSTFS_INTERNAL_PREFIX, MINIO_INTERNAL_PREFIX] {
+                let key = format!("{prefix}{suffix}");
+                assert!(is_internal_key(&key), "{key} must be an internal key");
+                assert!(has_internal_suffix(&key, suffix), "{key} must match its own suffix");
+                assert!(has_internal_suffix(&key.to_uppercase(), suffix), "{key} must match case-insensitively");
+                assert_eq!(strip_internal_prefix(&key).as_deref(), Some(suffix));
+            }
+            assert!(
+                !is_internal_key(&format!("x-amz-meta-{suffix}")),
+                "{suffix} must not leak as user metadata"
+            );
+            assert!(suffix.starts_with("odm-"), "{suffix} must stay in the odm- namespace");
+            assert!(
+                suffix.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+                "{suffix} must be lowercase-hyphenated"
+            );
+        }
+        let distinct: std::collections::HashSet<&str> = ODM_PROVENANCE_SUFFIXES.into_iter().collect();
+        assert_eq!(distinct.len(), ODM_PROVENANCE_SUFFIXES.len(), "provenance suffixes must be distinct");
+    }
+
+    #[test]
+    fn odm_provenance_values_round_trip_under_both_prefixes() {
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_ODM_SOURCE, "s3:legacy-bucket".to_string());
+        insert_str(&mut metadata, SUFFIX_ODM_SOURCE_ETAG, "0123456789abcdef0123456789abcdef-3".to_string());
+        insert_str(&mut metadata, SUFFIX_ODM_SOURCE_LAST_MODIFIED, "2026-01-02T03:04:05Z".to_string());
+        insert_str(&mut metadata, SUFFIX_ODM_SOURCE_VERSION_ID, String::new());
+        insert_str(&mut metadata, SUFFIX_ODM_PULLED_AT, "2026-09-02T00:00:00Z".to_string());
+
+        assert_eq!(
+            metadata.len(),
+            2 * ODM_PROVENANCE_SUFFIXES.len(),
+            "every marker is written under both prefixes"
+        );
+        for suffix in ODM_PROVENANCE_SUFFIXES {
+            assert!(metadata.contains_key(&internal_key_rustfs(suffix)), "missing RustFS key for {suffix}");
+            assert!(
+                metadata.contains_key(&format!("{MINIO_INTERNAL_PREFIX}{suffix}")),
+                "missing MinIO key for {suffix}"
+            );
+            assert!(contains_key_str(&metadata, suffix));
+        }
+        assert_eq!(get_str(&metadata, SUFFIX_ODM_SOURCE).as_deref(), Some("s3:legacy-bucket"));
+        assert_eq!(get_str(&metadata, SUFFIX_ODM_SOURCE_VERSION_ID).as_deref(), Some(""));
+        assert_eq!(
+            get_consistent_str(&metadata, SUFFIX_ODM_SOURCE_ETAG),
+            Some("0123456789abcdef0123456789abcdef-3")
+        );
+
+        // A MinIO-only reader must still find the marker.
+        let minio_only: HashMap<String, String> = metadata
+            .iter()
+            .filter(|(key, _)| starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert_eq!(get_str(&minio_only, SUFFIX_ODM_PULLED_AT).as_deref(), Some("2026-09-02T00:00:00Z"));
+
+        remove_str(&mut metadata, SUFFIX_ODM_SOURCE);
+        assert!(!contains_key_str(&metadata, SUFFIX_ODM_SOURCE));
+        assert!(contains_key_str(&metadata, SUFFIX_ODM_SOURCE_ETAG));
     }
 
     #[test]
