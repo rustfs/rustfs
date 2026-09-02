@@ -90,8 +90,15 @@ s3s = { workspace = true, features = ["minio"] }
 hex-simd.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tokio-test = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
+proptest = { workspace = true }
 axum = { workspace = true }
 hyper = { workspace = true, features = ["http2", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
+
+[[bench]]
+name = "tee_reader"
+harness = false

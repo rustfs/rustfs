@@ -12,27 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// #730: bucket subsystems still contain staged ECStore migration code.
+//! On-demand migration (ODM): serve and back-fill objects from an external
+//! S3-compatible source bucket.
 
-pub mod bandwidth;
-pub mod bucket_target_sys;
-pub mod durability;
-pub mod error;
-pub mod lifecycle;
-pub mod metadata;
-pub mod metadata_sys;
-#[cfg(test)]
-mod metadata_test;
-pub mod migration;
-mod msgp_decode;
-pub mod object_lock;
-pub mod on_demand_migration;
-pub mod policy_sys;
-pub mod quota;
-pub mod remote_s3_client;
-pub mod replication;
-pub mod tagging;
-pub mod target;
-pub mod utils;
-pub mod versioning;
-pub mod versioning_sys;
+pub mod source_client;

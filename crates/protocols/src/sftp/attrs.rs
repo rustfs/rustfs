@@ -137,7 +137,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             // on success. Size and mtime are not returned by HeadBucket.
             None => {
                 self.authorize(&S3Action::HeadBucket, &bucket, None).await?;
-                self.run_backend("head_bucket", self.storage.head_bucket(&bucket, self.access_key(), self.secret_key()))
+                self.run_backend("head_bucket", self.storage.head_bucket(&bucket, self.credentials()))
                     .await?;
                 Ok(s3_attrs_to_sftp(0, None, true))
             }
@@ -154,11 +154,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
             Some(object_key) => {
                 self.authorize(&S3Action::HeadObject, &bucket, Some(&object_key)).await?;
                 match self
-                    .run_backend_with_err(
-                        "head_object",
-                        self.storage
-                            .head_object(&bucket, &object_key, self.access_key(), self.secret_key()),
-                    )
+                    .run_backend_with_err("head_object", self.storage.head_object(&bucket, &object_key, self.credentials()))
                     .await?
                 {
                     Ok(out) => {
@@ -183,10 +179,7 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
                             .build()
                             .map_err(|e| s3_error_to_sftp("build_list_objects", e))?;
                         let out = self
-                            .run_backend(
-                                "list_objects_v2",
-                                self.storage.list_objects_v2(input, self.access_key(), self.secret_key()),
-                            )
+                            .run_backend("list_objects_v2", self.storage.list_objects_v2(input, self.credentials()))
                             .await?;
 
                         let has_contents = out.contents.map(|c| !c.is_empty()).unwrap_or(false);

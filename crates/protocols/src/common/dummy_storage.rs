@@ -35,6 +35,7 @@ use crate::common::session::SessionContext;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
+use rustfs_credentials::Credentials;
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
     CopyObjectInput, CopyObjectOutput, CopyPartResult, CreateBucketOutput, CreateMultipartUploadInput,
@@ -605,8 +606,7 @@ impl StorageBackend for DummyBackend {
         &self,
         bucket: &str,
         key: &str,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
         _start_pos: Option<u64>,
     ) -> Result<GetObjectOutput, Self::Error> {
         match self.inner.lock().expect("lock").get_object.pop_front() {
@@ -619,8 +619,7 @@ impl StorageBackend for DummyBackend {
         &self,
         bucket: &str,
         key: &str,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
         _start_pos: u64,
         _length: u64,
     ) -> Result<GetObjectOutput, Self::Error> {
@@ -630,7 +629,7 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn put_object(&self, input: PutObjectInput, _ak: &str, _sk: &str) -> Result<PutObjectOutput, Self::Error> {
+    async fn put_object(&self, input: PutObjectInput, _credentials: &Credentials) -> Result<PutObjectOutput, Self::Error> {
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across
         // an await point.
@@ -659,7 +658,12 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn delete_object(&self, bucket: &str, key: &str, _ak: &str, _sk: &str) -> Result<DeleteObjectOutput, Self::Error> {
+    async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        _credentials: &Credentials,
+    ) -> Result<DeleteObjectOutput, Self::Error> {
         let mut inner = self.inner.lock().expect("lock");
         inner.delete_object_calls.push(DeleteObjectCall {
             bucket: bucket.to_string(),
@@ -671,7 +675,7 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn head_object(&self, bucket: &str, key: &str, _ak: &str, _sk: &str) -> Result<HeadObjectOutput, Self::Error> {
+    async fn head_object(&self, bucket: &str, key: &str, _credentials: &Credentials) -> Result<HeadObjectOutput, Self::Error> {
         {
             let mut inner = self.inner.lock().expect("lock");
             inner.head_object_calls.push(HeadObjectCall {
@@ -685,7 +689,7 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn head_bucket(&self, bucket: &str, _ak: &str, _sk: &str) -> Result<HeadBucketOutput, Self::Error> {
+    async fn head_bucket(&self, bucket: &str, _credentials: &Credentials) -> Result<HeadBucketOutput, Self::Error> {
         match self.inner.lock().expect("lock").head_bucket.pop_front() {
             Some(r) => r,
             None => Err(DummyError::NoSuchBucket(bucket.to_string())),
@@ -695,8 +699,7 @@ impl StorageBackend for DummyBackend {
     async fn list_objects_v2(
         &self,
         _input: ListObjectsV2Input,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
     ) -> Result<ListObjectsV2Output, Self::Error> {
         // Decide control flow while holding the lock. Release before
         // awaiting so the stall path does not hold the Mutex across
@@ -721,7 +724,7 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
+    async fn list_buckets(&self, _credentials: &Credentials) -> Result<ListBucketsOutput, Self::Error> {
         match self.inner.lock().expect("lock").list_buckets.pop_front() {
             Some(r) => r,
             None => Ok(ListBucketsOutput::default()),
@@ -744,14 +747,14 @@ impl StorageBackend for DummyBackend {
             .unwrap_or_else(|| Ok(ListBucketsOutput::default()))
     }
 
-    async fn create_bucket(&self, _bucket: &str, _ak: &str, _sk: &str) -> Result<CreateBucketOutput, Self::Error> {
+    async fn create_bucket(&self, _bucket: &str, _credentials: &Credentials) -> Result<CreateBucketOutput, Self::Error> {
         match self.inner.lock().expect("lock").create_bucket.pop_front() {
             Some(r) => r,
             None => Err(DummyError::Unconfigured("create_bucket")),
         }
     }
 
-    async fn delete_bucket(&self, bucket: &str, _ak: &str, _sk: &str) -> Result<DeleteBucketOutput, Self::Error> {
+    async fn delete_bucket(&self, bucket: &str, _credentials: &Credentials) -> Result<DeleteBucketOutput, Self::Error> {
         let mut inner = self.inner.lock().expect("lock");
         inner.delete_bucket_calls.push(bucket.to_string());
         match inner.delete_bucket.pop_front() {
@@ -760,7 +763,7 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn copy_object(&self, _input: CopyObjectInput, _ak: &str, _sk: &str) -> Result<CopyObjectOutput, Self::Error> {
+    async fn copy_object(&self, _input: CopyObjectInput, _credentials: &Credentials) -> Result<CopyObjectOutput, Self::Error> {
         match self.inner.lock().expect("lock").copy_object.pop_front() {
             Some(r) => r,
             None => Err(DummyError::Unconfigured("copy_object")),
@@ -770,8 +773,7 @@ impl StorageBackend for DummyBackend {
     async fn create_multipart_upload(
         &self,
         input: CreateMultipartUploadInput,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
     ) -> Result<CreateMultipartUploadOutput, Self::Error> {
         {
             let mut inner = self.inner.lock().expect("lock");
@@ -787,7 +789,7 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn upload_part(&self, input: UploadPartInput, _ak: &str, _sk: &str) -> Result<UploadPartOutput, Self::Error> {
+    async fn upload_part(&self, input: UploadPartInput, _credentials: &Credentials) -> Result<UploadPartOutput, Self::Error> {
         // Record the call and decide the control flow while holding the
         // lock. Release the lock before awaiting so the stall path does
         // not hold the Mutex across an await point.
@@ -821,8 +823,7 @@ impl StorageBackend for DummyBackend {
     async fn complete_multipart_upload(
         &self,
         input: CompleteMultipartUploadInput,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
     ) -> Result<CompleteMultipartUploadOutput, Self::Error> {
         let part_count = input
             .multipart_upload
@@ -847,8 +848,7 @@ impl StorageBackend for DummyBackend {
     async fn abort_multipart_upload(
         &self,
         input: AbortMultipartUploadInput,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
     ) -> Result<AbortMultipartUploadOutput, Self::Error> {
         {
             let mut inner = self.inner.lock().expect("lock");
@@ -867,8 +867,7 @@ impl StorageBackend for DummyBackend {
     async fn upload_part_copy(
         &self,
         _input: UploadPartCopyInput,
-        _ak: &str,
-        _sk: &str,
+        _credentials: &Credentials,
     ) -> Result<UploadPartCopyOutput, Self::Error> {
         match self.inner.lock().expect("lock").upload_part_copy.pop_front() {
             Some(r) => r,
@@ -884,7 +883,8 @@ mod tests {
     #[tokio::test]
     async fn dummy_backend_reports_not_found_by_default() {
         let backend = DummyBackend::new();
-        let result = backend.head_object("b", "k", "ak", "sk").await;
+        let credentials = Credentials::default();
+        let result = backend.head_object("b", "k", &credentials).await;
         let Err(err) = result else {
             panic!("default head_object must return an error");
         };
@@ -897,21 +897,23 @@ mod tests {
     #[tokio::test]
     async fn dummy_backend_returns_queued_head_object_response() {
         let backend = DummyBackend::new();
+        let credentials = Credentials::default();
         backend.queue_head_object_ok(42, None);
-        let out = backend.head_object("b", "k", "ak", "sk").await.expect("queued Ok");
+        let out = backend.head_object("b", "k", &credentials).await.expect("queued Ok");
         assert_eq!(out.content_length, Some(42));
     }
 
     #[tokio::test]
     async fn dummy_backend_logs_abort_multipart_calls() {
         let backend = Arc::new(DummyBackend::new());
+        let credentials = Credentials::default();
         let input = AbortMultipartUploadInput::builder()
             .bucket("b".to_string())
             .key("k".to_string())
             .upload_id("UP-1".to_string())
             .build()
             .expect("build");
-        backend.abort_multipart_upload(input, "ak", "sk").await.expect("Ok");
+        backend.abort_multipart_upload(input, &credentials).await.expect("Ok");
         let calls = backend.abort_multipart_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].upload_id, "UP-1");
@@ -920,6 +922,7 @@ mod tests {
     #[tokio::test]
     async fn dummy_backend_unconfigured_errors_loudly() {
         let backend = DummyBackend::new();
+        let credentials = Credentials::default();
         let err = backend
             .create_multipart_upload(
                 CreateMultipartUploadInput::builder()
@@ -927,8 +930,7 @@ mod tests {
                     .key("k".to_string())
                     .build()
                     .expect("build"),
-                "ak",
-                "sk",
+                &credentials,
             )
             .await
             .expect_err("default create_multipart_upload must error");
