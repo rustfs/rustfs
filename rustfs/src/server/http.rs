@@ -28,6 +28,7 @@ use crate::server::{
         StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env},
+    strip_valid_port_suffix,
     tls_material::{
         TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline, build_acceptor_from_loaded,
         load_tls_material, spawn_reload_loop,
@@ -160,6 +161,25 @@ fn rustfs_s3_config() -> S3Config {
     s3_config.enable_sig_v2 = true;
     s3_config.sig_v4_allowed_services.push("s3tables".to_string());
     s3_config
+}
+
+fn s3_host_domains(config: &config::Config) -> Result<Option<Vec<String>>> {
+    if config.server_domains.is_empty() || config.console_enable {
+        return Ok(None);
+    }
+
+    let mut domains = Vec::with_capacity(config.server_domains.len());
+    let mut seen = std::collections::HashSet::with_capacity(config.server_domains.len());
+    for domain in &config.server_domains {
+        if seen.insert(strip_valid_port_suffix(domain).to_string()) {
+            domains.push(domain.clone());
+        }
+    }
+
+    MultiDomain::new(&domains)
+        .map_err(|err| Error::other(format!("invalid RUSTFS_SERVER_DOMAINS {:?}: {err}", config.server_domains)))?;
+
+    Ok(Some(domains))
 }
 
 const LOG_COMPONENT_SERVER: &str = "server";
@@ -1202,26 +1222,10 @@ pub async fn start_http_server(
         );
     }
 
-    // Expanded virtual-hosted-style domain set (with port variants); shared by
-    // the s3s host router below and the rate limit layer's bucket extraction.
-    let host_domain_sets = if !config.server_domains.is_empty() && !config.console_enable {
-        MultiDomain::new(&config.server_domains).map_err(Error::other)?; // validate domains
-
-        // add the default port number to the given server domains
-        let mut domain_sets = std::collections::HashSet::new();
-        for domain in &config.server_domains {
-            domain_sets.insert(domain.to_string());
-            if let Some((host, _)) = domain.split_once(':') {
-                domain_sets.insert(format!("{host}:{local_port}"));
-            } else {
-                domain_sets.insert(format!("{domain}:{local_port}"));
-            }
-        }
-
-        Some(domain_sets)
-    } else {
-        None
-    };
+    // Canonical virtual-hosted-style base domains for the S3 listener. s3s
+    // matching is port-agnostic, so synthesized listener-port variants would
+    // overlap with the bare domains they were generated from.
+    let host_domain_sets = s3_host_domains(config)?;
     let rate_limit_vh_domains: Vec<String> = host_domain_sets.iter().flatten().cloned().collect();
 
     // Setup S3 service
@@ -1256,7 +1260,7 @@ pub async fn start_http_server(
         let s3_config = rustfs_s3_config();
         b.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
 
-        // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
+        // Virtual-hosted-style requests are only set up for the S3 API listener when server domains are configured.
         if let Some(domain_sets) = host_domain_sets {
             info!(
                 event = EVENT_HTTP_HOST_ROUTING,
@@ -2951,6 +2955,47 @@ mod tests {
     #[tokio::test]
     async fn early_response_body_http1_transport_handles_expect_continue_upload() {
         assert_http1_early_response_accepts_streaming_body(true).await;
+    }
+
+    fn test_config_with_domains(domains: &[&str]) -> config::Config {
+        let mut config = config::Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-data".to_string()]);
+        config.server_domains = domains.iter().map(|domain| (*domain).to_string()).collect();
+        config.console_enable = false;
+        config
+    }
+
+    #[test]
+    fn s3_host_domains_accepts_bare_domain_without_listener_port_variant() {
+        let config = test_config_with_domains(&["oss.example.com"]);
+
+        let domains = s3_host_domains(&config)
+            .expect("bare domain should be valid")
+            .expect("domains");
+
+        assert_eq!(domains, vec!["oss.example.com"]);
+    }
+
+    #[test]
+    fn s3_host_domains_deduplicates_port_equivalent_domains() {
+        let config = test_config_with_domains(&["oss.example.com", "oss.example.com:9000", "logs.example.com:1234"]);
+
+        let domains = s3_host_domains(&config)
+            .expect("port-equivalent duplicates should collapse")
+            .expect("domains");
+
+        assert_eq!(domains, vec!["oss.example.com", "logs.example.com:1234"]);
+    }
+
+    #[test]
+    fn s3_host_domains_rejects_real_subdomain_overlap_with_context() {
+        let config = test_config_with_domains(&["example.com", "s3.example.com"]);
+
+        let err = s3_host_domains(&config).expect_err("real subdomain overlap must stay rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("RUSTFS_SERVER_DOMAINS"), "{message}");
+        assert!(message.contains("example.com"), "{message}");
+        assert!(message.contains("s3.example.com"), "{message}");
     }
 
     #[test]

@@ -83,6 +83,17 @@ pub(crate) use readiness::{collect_cluster_read_health_report, collect_cluster_w
 
 pub use crate::shared_types::RemoteAddr;
 
+pub(crate) fn strip_valid_port_suffix(host: &str) -> &str {
+    if host.ends_with(']') {
+        return host;
+    }
+
+    match host.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok() => host,
+        _ => host,
+    }
+}
+
 pub struct ShutdownHandle {
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
