@@ -440,6 +440,11 @@ pub mod object {
         PrepareSelectObjectSnapshotError, PreparedGetObjectReader, SelectObjectSnapshot, SelectObjectSnapshotReadError,
         SnapshotConsistencyError,
     };
+
+    #[cfg(feature = "test-util")]
+    pub mod test_util {
+        pub use crate::store::DeleteAfterObjectLockSnapshotBarrier;
+    }
 }
 
 pub mod rebalance {

@@ -217,7 +217,8 @@ use crate::bucket::lifecycle::{
 use crate::bucket::quota::reservation;
 use crate::bucket::replication::{
     DeleteReplicationConfigSnapshot, ReplicationLifecycleBridge, ReplicationStatusType, VersionPurgeStatusType,
-    replication_state_to_filemeta, replication_status_from_filemeta, version_purge_status_to_filemeta,
+    replication_state_to_filemeta, replication_status_from_filemeta, version_purge_status_from_filemeta,
+    version_purge_status_to_filemeta,
 };
 use crate::data_usage::quota_object_size;
 use crate::diagnostics::get::GetObjectFailureReason;
@@ -283,12 +284,95 @@ fn record_transitioned_delete_cleanup_owner(bucket: &str, object: &str, batch: b
     );
 }
 
-async fn acquire_single_tier_delete_lease(
+/// A causal free-version receipt is only valid when the delete request really
+/// removes the locked transitioned source. In particular, replication may turn
+/// an otherwise successful delete into a metadata-only purge-state update, and
+/// a versioned delete without a version ID writes a new delete marker instead
+/// of removing the source selected by `goi`.
+fn transitioned_delete_publishes_free_version(source: &ObjectInfo, delete_request: &FileInfo, skip_free_version: bool) -> bool {
+    if source.delete_marker
+        || source.transitioned_object.status != TRANSITION_COMPLETE
+        || skip_free_version
+        || delete_request.skip_tier_free_version()
+        || delete_request.expire_restored
+        || delete_request.transition_status == TRANSITION_COMPLETE
+        || delete_file_info_version_id(source.version_id) != delete_request.version_id
+    {
+        return false;
+    }
+
+    // Keep this predicate aligned with FileMeta::delete_version's Object
+    // branch: a non-delete-marker request with a nonterminal purge status (or
+    // mark_deleted with no purge status) updates replication metadata in place
+    // and never calls MetaObject::init_free_version.
+    let purge_status = version_purge_status_from_filemeta(delete_request.version_purge_status());
+    let metadata_only = !delete_request.deleted
+        && ((purge_status.is_empty() && delete_request.mark_deleted)
+            || (!purge_status.is_empty() && purge_status != VersionPurgeStatusType::Complete));
+
+    !metadata_only
+}
+
+fn record_committed_tier_free_version_receipt(
+    opts: &ObjectOptions,
     bucket: &str,
     object: &str,
-    opts: &ObjectOptions,
     source: &ObjectInfo,
-) -> Result<Option<TierOperationLease>> {
+    free_version_id: Uuid,
+    batch: bool,
+) {
+    if let Some(sink) = opts.tier_free_version_receipt_sink.as_ref()
+        && let Err(err) = sink.record(source, free_version_id)
+    {
+        warn!(
+            event = EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            bucket,
+            object,
+            batch,
+            error = ?err,
+            "Failed to retain the in-memory tier free-version scheduling receipt"
+        );
+    }
+    record_transitioned_delete_cleanup_owner(bucket, object, batch);
+}
+
+struct TierFreeVersionReceiptCandidate {
+    source: ObjectInfo,
+    free_version_id: Uuid,
+}
+
+fn committed_tier_free_version_receipt_indices(
+    versions: &[FileInfoVersions],
+    delete_errors: &[Option<Error>],
+    candidates: &HashMap<usize, TierFreeVersionReceiptCandidate>,
+) -> Vec<usize> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut committed = Vec::with_capacity(candidates.len());
+    for group in versions {
+        let should_rollback = group
+            .versions
+            .iter()
+            .any(|version| delete_errors.get(version.idx).is_none_or(|error| error.is_some()));
+        if should_rollback {
+            continue;
+        }
+        committed.extend(
+            group
+                .versions
+                .iter()
+                .map(|version| version.idx)
+                .filter(|idx| candidates.contains_key(idx)),
+        );
+    }
+    committed
+}
+
+async fn acquire_single_tier_delete_lease(opts: &ObjectOptions, source: &ObjectInfo) -> Result<Option<TierOperationLease>> {
     let Some(api) = opts.tier_delete_journal_api.as_ref() else {
         return Ok(None);
     };
@@ -308,7 +392,6 @@ async fn acquire_single_tier_delete_lease(
         None => TierConfigMgr::acquire_operation_lease(&api.tier_config_mgr(), &source.transitioned_object.tier).await,
     }
     .map_err(Error::other)?;
-    record_transitioned_delete_cleanup_owner(bucket, object, false);
     Ok(Some(lease))
 }
 
@@ -381,6 +464,168 @@ mod scanner_publication_lease_fence_tests {
             r#"{"http://node-a:9000":"not-a-uuid"}"#.to_string(),
         )]);
         assert!(take_scanner_publication_lease_tokens(&mut malformed).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tier_free_version_receipt_eligibility_tests {
+    use super::*;
+    use crate::bucket::replication::ReplicationState;
+
+    fn transitioned_source(version_id: Option<Uuid>) -> ObjectInfo {
+        let mut source = ObjectInfo {
+            version_id,
+            ..Default::default()
+        };
+        source.transitioned_object.status = TRANSITION_COMPLETE.to_string();
+        source.transitioned_object.tier = "WARM".to_string();
+        source.transitioned_object.name = "remote/object".to_string();
+        source
+    }
+
+    fn delete_request(version_id: Option<Uuid>) -> FileInfo {
+        let mut request = FileInfo {
+            version_id,
+            ..Default::default()
+        };
+        request.set_tier_free_version_id(&Uuid::new_v4().to_string());
+        request
+    }
+
+    #[test]
+    fn accepts_exact_transitioned_source_removal_and_suspended_null_replacement() {
+        let version_id = Uuid::new_v4();
+        assert!(transitioned_delete_publishes_free_version(
+            &transitioned_source(Some(version_id)),
+            &delete_request(Some(version_id)),
+            false,
+        ));
+
+        let mut suspended_null_delete = delete_request(None);
+        suspended_null_delete.deleted = true;
+        suspended_null_delete.mark_deleted = true;
+        assert!(transitioned_delete_publishes_free_version(
+            &transitioned_source(Some(Uuid::nil())),
+            &suspended_null_delete,
+            false,
+        ));
+    }
+
+    #[test]
+    fn rejects_new_marker_version_and_non_transitioned_or_delete_marker_sources() {
+        let source_id = Uuid::new_v4();
+        assert!(!transitioned_delete_publishes_free_version(
+            &transitioned_source(Some(source_id)),
+            &delete_request(Some(Uuid::new_v4())),
+            false,
+        ));
+
+        let mut ordinary = transitioned_source(Some(source_id));
+        ordinary.transitioned_object.status.clear();
+        assert!(!transitioned_delete_publishes_free_version(
+            &ordinary,
+            &delete_request(Some(source_id)),
+            false,
+        ));
+
+        let mut delete_marker = transitioned_source(Some(source_id));
+        delete_marker.delete_marker = true;
+        assert!(!transitioned_delete_publishes_free_version(
+            &delete_marker,
+            &delete_request(Some(source_id)),
+            false,
+        ));
+    }
+
+    #[test]
+    fn rejects_skip_restore_and_transition_metadata_updates() {
+        let version_id = Uuid::new_v4();
+        let source = transitioned_source(Some(version_id));
+
+        assert!(!transitioned_delete_publishes_free_version(
+            &source,
+            &delete_request(Some(version_id)),
+            true,
+        ));
+
+        let mut skip_request = delete_request(Some(version_id));
+        skip_request.set_skip_tier_free_version();
+        assert!(!transitioned_delete_publishes_free_version(&source, &skip_request, false));
+
+        let mut restore_request = delete_request(Some(version_id));
+        restore_request.expire_restored = true;
+        assert!(!transitioned_delete_publishes_free_version(&source, &restore_request, false));
+
+        let mut transition_update = delete_request(Some(version_id));
+        transition_update.transition_status = TRANSITION_COMPLETE.to_string();
+        assert!(!transitioned_delete_publishes_free_version(&source, &transition_update, false));
+    }
+
+    #[test]
+    fn rejects_nonterminal_replication_metadata_only_update_but_accepts_complete_purge() {
+        let version_id = Uuid::new_v4();
+        let source = transitioned_source(Some(version_id));
+
+        let mut pending = delete_request(Some(version_id));
+        pending.replication_state_internal = Some(replication_state_to_filemeta(&ReplicationState {
+            version_purge_status_internal: Some("PENDING".to_string()),
+            ..Default::default()
+        }));
+        assert!(!transitioned_delete_publishes_free_version(&source, &pending, false));
+
+        let mut mark_deleted = delete_request(Some(version_id));
+        mark_deleted.mark_deleted = true;
+        assert!(!transitioned_delete_publishes_free_version(&source, &mark_deleted, false));
+
+        let mut complete = delete_request(Some(version_id));
+        complete.replication_state_internal = Some(replication_state_to_filemeta(&ReplicationState {
+            version_purge_status_internal: Some("COMPLETE".to_string()),
+            ..Default::default()
+        }));
+        assert!(transitioned_delete_publishes_free_version(&source, &complete, false));
+    }
+
+    #[test]
+    fn whole_physical_object_group_must_commit_before_any_receipt_is_retained() {
+        let candidate = || TierFreeVersionReceiptCandidate {
+            source: transitioned_source(Some(Uuid::new_v4())),
+            free_version_id: Uuid::new_v4(),
+        };
+        let candidates = HashMap::from([(0, candidate()), (2, candidate())]);
+        let versions = vec![
+            FileInfoVersions {
+                versions: vec![
+                    FileInfo {
+                        idx: 0,
+                        ..Default::default()
+                    },
+                    FileInfo {
+                        idx: 1,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            FileInfoVersions {
+                versions: vec![FileInfo {
+                    idx: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        let one_sibling_failed = vec![None, Some(Error::other("injected quorum failure")), None];
+
+        assert_eq!(
+            committed_tier_free_version_receipt_indices(&versions, &one_sibling_failed, &candidates),
+            vec![2],
+            "a sibling failure must suppress every receipt from the rolled-back xl.meta group"
+        );
+        assert_eq!(
+            committed_tier_free_version_receipt_indices(&versions, &[None, None, None], &candidates),
+            vec![0, 2],
+            "independent fully committed groups should retain their sparse receipts"
+        );
     }
 }
 
@@ -6977,7 +7222,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
         let mut tier_reference_leases: Vec<(usize, String, Option<TierDestinationId>)> = Vec::new();
-        let mut transitioned_cleanup_items = vec![false; objects.len()];
+        let mut tier_free_version_receipt_candidates: HashMap<usize, TierFreeVersionReceiptCandidate> = HashMap::new();
 
         for (i, dobj) in objects.iter().enumerate() {
             if del_errs[i].is_some() {
@@ -7069,7 +7314,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             {
                 match tier_destination_id_from_metadata(&goi.user_defined) {
                     Ok(identity) => {
-                        transitioned_cleanup_items[i] = true;
                         tier_reference_leases.push((i, goi.transitioned_object.tier.clone(), identity));
                     }
                     Err(err) => {
@@ -7110,7 +7354,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 ..Default::default()
             };
 
-            vr.set_tier_free_version_id(&Uuid::new_v4().to_string());
+            let tier_free_version_id = Uuid::new_v4();
+            vr.set_tier_free_version_id(&tier_free_version_id.to_string());
 
             // Delete
             // del_objects[i].object_name.clone_from(&vr.name);
@@ -7195,6 +7440,19 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 });
             }
 
+            if opts.tier_free_version_receipt_sink.is_some()
+                && !dobj.synthetic_version_id
+                && transitioned_delete_publishes_free_version(&goi, &vr, opts.skip_free_version)
+            {
+                tier_free_version_receipt_candidates.insert(
+                    i,
+                    TierFreeVersionReceiptCandidate {
+                        source: goi,
+                        free_version_id: tier_free_version_id,
+                    },
+                );
+            }
+
             // Only add to vers_map if we hold the lock
             if locked_objects.contains(&dobj.object_name) {
                 vers_map.insert(&dobj.object_name, v);
@@ -7268,12 +7526,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         }
                     }
                 }
-            }
-        }
-
-        for (idx, transitioned) in transitioned_cleanup_items.into_iter().enumerate() {
-            if transitioned && del_errs[idx].is_none() {
-                record_transitioned_delete_cleanup_owner(bucket, &decode_dir_object(&objects[idx].object_name), true);
             }
         }
 
@@ -7388,6 +7640,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
 
         let mut rollback_futures = Vec::new();
+        let committed_receipt_indices =
+            committed_tier_free_version_receipt_indices(&vers, &del_errs, &tier_free_version_receipt_candidates);
         for fi_vers in &vers {
             // delete_versions commits one xl.meta per object group, so rollback must use the same boundary.
             let should_rollback = fi_vers.versions.iter().any(|fi| del_errs[fi.idx].is_some());
@@ -7461,6 +7715,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         join_all(rollback_futures).await;
+
+        for idx in committed_receipt_indices {
+            let Some(candidate) = tier_free_version_receipt_candidates.remove(&idx) else {
+                continue;
+            };
+            record_committed_tier_free_version_receipt(
+                &opts,
+                bucket,
+                &decode_dir_object(&objects[idx].object_name),
+                &candidate.source,
+                candidate.free_version_id,
+                true,
+            );
+        }
 
         // TODO(backlog): support partial object deletion for multi-part objects
 
@@ -7813,7 +8081,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
             begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
-            let _tier_delete_lease = acquire_single_tier_delete_lease(bucket, object, &opts, &goi).await?;
+            let _tier_delete_lease = acquire_single_tier_delete_lease(&opts, &goi).await?;
             if opts.skip_free_version {
                 fi.set_skip_tier_free_version();
             }
@@ -7822,6 +8090,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
             #[cfg(test)]
             pause_delete_object_commit_after_publish(bucket, object).await;
+
+            if opts.tier_free_version_receipt_sink.is_some()
+                && transitioned_delete_publishes_free_version(&goi, &fi, opts.skip_free_version)
+            {
+                record_committed_tier_free_version_receipt(&opts, bucket, object, &goi, find_vid, false);
+            }
 
             let disks = self.disk_inventory().await;
             self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);
@@ -7855,7 +8129,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
         begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
-        let _tier_delete_lease = acquire_single_tier_delete_lease(bucket, object, &opts, &goi).await?;
+        let _tier_delete_lease = acquire_single_tier_delete_lease(&opts, &goi).await?;
         if opts.skip_free_version {
             dfi.set_skip_tier_free_version();
         }
@@ -7864,6 +8138,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
         #[cfg(test)]
         pause_delete_object_commit_after_publish(bucket, object).await;
+
+        if opts.tier_free_version_receipt_sink.is_some()
+            && transitioned_delete_publishes_free_version(&goi, &dfi, opts.skip_free_version)
+        {
+            record_committed_tier_free_version_receipt(&opts, bucket, object, &goi, find_vid, false);
+        }
 
         let disks = self.disk_inventory().await;
         self.record_capacity_scope_if_needed(opts.capacity_scope_token, &disks);

@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::bucket::lifecycle::{
-    bucket_lifecycle_ops::eval_action_from_lifecycle,
+    bucket_lifecycle_ops::{enqueue_committed_free_versions, eval_action_from_lifecycle},
     get_expiry_configs,
     tier_delete_journal::{
         ActiveTierDeleteDispatch, EVENT_LIFECYCLE_TIER_DELETE_JOURNAL, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_LIFECYCLE,
@@ -39,6 +39,7 @@ use crate::core::pools::{DecommissionCapacityOwner, ensure_decommission_capacity
 use crate::disk::OldCurrentSize;
 use crate::object_api::{
     NamespaceLockFence, ObjectLockConfigSnapshot, ScannerPublicationCommitScopeGuard, ScannerPublicationCommitState,
+    TierFreeVersionReceiptSink,
 };
 use crate::services::notification_sys::acquire_tier_delete_journal_fleet_proof;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
@@ -70,6 +71,26 @@ use tokio::io::{AsyncRead, ReadBuf};
 const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 1000;
 #[cfg(test)]
 const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 2;
+
+fn install_tier_free_version_receipt_sink(opts: &mut ObjectOptions) -> Option<TierFreeVersionReceiptSink> {
+    if opts.tier_free_version_receipt_sink.is_some() || opts.skip_free_version || opts.delete_prefix {
+        return None;
+    }
+
+    let sink = TierFreeVersionReceiptSink::new();
+    opts.tier_free_version_receipt_sink = Some(sink.clone());
+    Some(sink)
+}
+
+async fn enqueue_recorded_tier_free_versions(store: &ECStore, sink: Option<TierFreeVersionReceiptSink>) -> usize {
+    let Some(sink) = sink else {
+        return 0;
+    };
+    let Ok(receipts) = sink.drain() else {
+        return 0;
+    };
+    enqueue_committed_free_versions(store, receipts).await
+}
 
 fn build_tier_delete_journal_entry(
     bucket: &str,
@@ -1293,7 +1314,7 @@ fn should_create_delete_marker_for_missing_object(opts: &ObjectOptions) -> bool 
     (opts.versioned || opts.version_suspended) && opts.version_id.is_none() && !opts.delete_marker && !opts.data_movement
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 struct DeleteAfterObjectLockSnapshotBarrierState {
     bucket: String,
     arrived: tokio::sync::Notify,
@@ -1302,19 +1323,19 @@ struct DeleteAfterObjectLockSnapshotBarrierState {
     namespace_acquired: AtomicBool,
 }
 
-#[cfg(test)]
-pub(crate) struct DeleteAfterObjectLockSnapshotBarrier {
+#[cfg(any(test, feature = "test-util"))]
+pub struct DeleteAfterObjectLockSnapshotBarrier {
     state: Arc<DeleteAfterObjectLockSnapshotBarrierState>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 static DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER: std::sync::OnceLock<
     std::sync::Mutex<Option<Arc<DeleteAfterObjectLockSnapshotBarrierState>>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl DeleteAfterObjectLockSnapshotBarrier {
-    pub(crate) fn install(bucket: &str) -> Self {
+    pub fn install(bucket: &str) -> Self {
         let state = Arc::new(DeleteAfterObjectLockSnapshotBarrierState {
             bucket: bucket.to_string(),
             arrived: tokio::sync::Notify::new(),
@@ -1331,15 +1352,15 @@ impl DeleteAfterObjectLockSnapshotBarrier {
         Self { state }
     }
 
-    pub(crate) async fn wait_until_paused(&self) {
+    pub async fn wait_until_paused(&self) {
         self.state.arrived.notified().await;
     }
 
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         self.state.release.notify_one();
     }
 
-    pub(crate) async fn release_and_wait_until_namespace_pending(&self) {
+    pub async fn release_and_wait_until_namespace_pending(&self) {
         let namespace_pending = self.state.namespace_pending.notified();
         self.release();
         tokio::time::timeout(Duration::from_secs(5), namespace_pending)
@@ -1347,12 +1368,12 @@ impl DeleteAfterObjectLockSnapshotBarrier {
             .expect("delete should proceed to its namespace lock after leaving the snapshot barrier");
     }
 
-    pub(crate) fn namespace_acquired(&self) -> bool {
+    pub fn namespace_acquired(&self) -> bool {
         self.state.namespace_acquired.load(Ordering::Acquire)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl Drop for DeleteAfterObjectLockSnapshotBarrier {
     fn drop(&mut self) {
         self.state.release.notify_one();
@@ -1365,7 +1386,7 @@ impl Drop for DeleteAfterObjectLockSnapshotBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
     let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -1377,11 +1398,24 @@ async fn pause_delete_after_object_lock_snapshot(bucket: &str) {
     if let Some(state) = state {
         state.arrived.notify_one();
         state.release.notified().await;
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+fn notify_delete_namespace_pending(bucket: &str) {
+    let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete snapshot barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket)
+        .cloned();
+    if let Some(state) = state {
         state.namespace_pending.notify_one();
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 fn notify_delete_namespace_acquired(bucket: &str) {
     let state = DELETE_AFTER_OBJECT_LOCK_SNAPSHOT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -2564,6 +2598,10 @@ impl ECStore {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
+        #[cfg(any(test, feature = "test-util"))]
+        if matches!(op, "delete_object" | "delete_objects") {
+            notify_delete_namespace_pending(bucket);
+        }
         let guard = ns_lock
             .get_write_lock(get_lock_acquire_timeout())
             .await
@@ -4155,7 +4193,16 @@ impl ECStore {
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> Result<ObjectInfo> {
-        Box::pin(self.handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api)).await
+        Box::pin(async move {
+            let mut opts = opts;
+            let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
+            let result = self
+                .handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api)
+                .await;
+            enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+            result
+        })
+        .await
     }
 
     async fn handle_delete_object_with_journal_inner(
@@ -4229,7 +4276,7 @@ impl ECStore {
         if opts.delete_prefix && opts.expected_bucket_incarnation_id.is_none() {
             opts.expected_bucket_incarnation_id = current_bucket_incarnation_id;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         pause_delete_after_object_lock_snapshot(bucket).await;
 
         if opts.delete_prefix && !opts.delete_prefix_object {
@@ -4243,7 +4290,7 @@ impl ECStore {
         } else {
             None
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if _object_lock_guard.is_some() {
             notify_delete_namespace_acquired(bucket);
         }
@@ -4534,6 +4581,25 @@ impl ECStore {
         opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        Box::pin(async move {
+            let mut opts = opts;
+            let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
+            let result = self
+                .handle_delete_objects_with_journal_and_accounting_inner(bucket, objects, opts, tier_journal_api)
+                .await;
+            enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+            result
+        })
+        .await
+    }
+
+    async fn handle_delete_objects_with_journal_and_accounting_inner(
+        &self,
+        bucket: &str,
+        objects: Vec<ObjectToDelete>,
+        opts: ObjectOptions,
+        tier_journal_api: Option<Arc<ECStore>>,
+    ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
         // encode object name
         let objects: Vec<ObjectToDelete> = objects
             .iter()
@@ -4617,7 +4683,7 @@ impl ECStore {
                 StorageError::BucketNotFound(bucket.to_string()),
             );
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if current_bucket_incarnation_id.is_some() {
             pause_delete_after_object_lock_snapshot(bucket).await;
         }
@@ -4625,7 +4691,7 @@ impl ECStore {
             Ok(guards) => guards,
             Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if !_object_lock_guards.is_empty() {
             notify_delete_namespace_acquired(bucket);
         }
@@ -7527,6 +7593,15 @@ mod tests {
             "unified delete handler future must remain stack-bounded; measured {unified_future_size} bytes"
         );
         drop(unified_future);
+
+        let batch_future =
+            store.handle_delete_objects_with_journal_and_accounting("bucket", Vec::new(), ObjectOptions::default(), None);
+        let batch_future_size = std::mem::size_of_val(&batch_future);
+        assert!(
+            batch_future_size <= 4 * 1024,
+            "batch delete handler future must remain stack-bounded; measured {batch_future_size} bytes"
+        );
+        drop(batch_future);
 
         let outer_future = store.handle_delete_object("bucket", "object", ObjectOptions::default());
         let outer_future_size = std::mem::size_of_val(&outer_future);

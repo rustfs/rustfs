@@ -19,6 +19,7 @@ use crate::storage_api_contracts::{
         HTTPPreconditions, ObjectLockRetentionOptions, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
     },
 };
+use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard};
 use tokio_util::sync::CancellationToken;
@@ -678,6 +679,196 @@ pub struct DecommissionCapacityOptions {
     pub(crate) mutation_id: Option<Uuid>,
 }
 
+/// Opaque storage-owned collection point for post-commit tier free-version
+/// cleanup receipts. This type is public only because workspace crates build
+/// [`ObjectOptions`] with struct literals; callers outside `ecstore` must leave
+/// the corresponding option unset.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TierFreeVersionReceiptSink {
+    inner: Arc<parking_lot::Mutex<TierFreeVersionReceiptSinkState>>,
+}
+
+struct TierFreeVersionReceiptSinkState {
+    receipts: Option<HashMap<TierFreeVersionReceiptIdentity, TierFreeVersionReceiptPayload>>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct TierFreeVersionReceiptIdentity {
+    bucket: String,
+    logical_name: String,
+    tier: String,
+    remote_name: String,
+    remote_version_state: TierFreeVersionReceiptVersionState,
+    remote_version: String,
+    backend_identity: crate::services::tier::tier::TierDestinationId,
+}
+
+struct TierFreeVersionReceiptPayload {
+    local_free_version_id: Uuid,
+    mod_time: Option<OffsetDateTime>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum TierFreeVersionReceiptVersionState {
+    KnownDisabled,
+    SuspendedNull,
+    Exact,
+}
+
+impl TierFreeVersionReceiptSink {
+    /// Only the delete wrapper may originate a sink. The public type exists so
+    /// workspace struct literals can carry it, but external crates cannot
+    /// create an undrainable collector accidentally.
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(TierFreeVersionReceiptSinkState {
+                receipts: Some(HashMap::new()),
+            })),
+        }
+    }
+}
+
+impl std::fmt::Debug for TierFreeVersionReceiptSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.inner.lock();
+        f.debug_struct("TierFreeVersionReceiptSink")
+            .field("drained", &state.receipts.is_none())
+            .field("receipt_count", &state.receipts.as_ref().map(HashMap::len).unwrap_or_default())
+            .finish()
+    }
+}
+
+impl TierFreeVersionReceiptVersionState {
+    fn persisted(self) -> rustfs_filemeta::TransitionVersionState {
+        match self {
+            Self::KnownDisabled => rustfs_filemeta::TransitionVersionState::KnownDisabled,
+            Self::SuspendedNull => rustfs_filemeta::TransitionVersionState::SuspendedNull,
+            Self::Exact => rustfs_filemeta::TransitionVersionState::Exact,
+        }
+    }
+}
+
+impl TierFreeVersionReceiptIdentity {
+    fn into_object_info(self, payload: TierFreeVersionReceiptPayload) -> ObjectInfo {
+        let mut metadata = HashMap::with_capacity(2);
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            rustfs_utils::crypto::hex(self.backend_identity),
+        );
+        ObjectInfo {
+            bucket: self.bucket,
+            name: self.logical_name,
+            mod_time: payload.mod_time,
+            user_defined: Arc::new(metadata),
+            version_id: Some(payload.local_free_version_id),
+            delete_marker: true,
+            transitioned_object: TransitionedObject {
+                name: self.remote_name,
+                version_id: self.remote_version,
+                tier: self.tier,
+                free_version: true,
+                status: String::new(),
+            },
+            transition_version_state: self.remote_version_state.persisted(),
+            ..Default::default()
+        }
+    }
+}
+
+fn tier_free_version_scheduling_receipt_from_source(
+    source: &ObjectInfo,
+    local_free_version_id: Uuid,
+) -> io::Result<Option<(TierFreeVersionReceiptIdentity, TierFreeVersionReceiptPayload)>> {
+    if source.transitioned_object.status != rustfs_filemeta::TRANSITION_COMPLETE
+        || source.transitioned_object.free_version
+        || source.delete_marker
+        || source.bucket.is_empty()
+        || source.name.is_empty()
+        || source.transitioned_object.tier.is_empty()
+        || source.transitioned_object.name.is_empty()
+    {
+        return Ok(None);
+    }
+    if local_free_version_id.is_nil() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tier free-version receipt has a nil local version identity",
+        ));
+    }
+
+    let remote_version = source.transitioned_object.version_id.as_str();
+    let remote_version_state = match source.transition_version_state {
+        rustfs_filemeta::TransitionVersionState::Unknown => return Ok(None),
+        rustfs_filemeta::TransitionVersionState::KnownDisabled if remote_version.is_empty() => {
+            TierFreeVersionReceiptVersionState::KnownDisabled
+        }
+        rustfs_filemeta::TransitionVersionState::SuspendedNull if remote_version == "null" => {
+            TierFreeVersionReceiptVersionState::SuspendedNull
+        }
+        rustfs_filemeta::TransitionVersionState::Exact if !remote_version.is_empty() && remote_version != "null" => {
+            TierFreeVersionReceiptVersionState::Exact
+        }
+        _ => return Ok(None),
+    };
+
+    let Some(backend_identity) = crate::services::tier::tier::tier_destination_id_from_metadata(&source.user_defined)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some((
+        TierFreeVersionReceiptIdentity {
+            bucket: source.bucket.clone(),
+            logical_name: decode_dir_object(&source.name),
+            tier: source.transitioned_object.tier.clone(),
+            remote_name: source.transitioned_object.name.clone(),
+            remote_version_state,
+            remote_version: source.transitioned_object.version_id.clone(),
+            backend_identity,
+        },
+        TierFreeVersionReceiptPayload {
+            local_free_version_id,
+            mod_time: source.mod_time,
+        },
+    )))
+}
+
+impl TierFreeVersionReceiptSink {
+    /// Record one committed free-version cleanup target. Cloned options share
+    /// this sink; tuple-equivalent physical copies collapse to one worker task.
+    /// `false` means the source cannot safely identify a destructive cleanup.
+    pub(crate) fn record(&self, source: &ObjectInfo, local_free_version_id: Uuid) -> io::Result<bool> {
+        let Some((identity, payload)) = tier_free_version_scheduling_receipt_from_source(source, local_free_version_id)? else {
+            return Ok(false);
+        };
+        let mut state = self.inner.lock();
+        let receipts = state
+            .receipts
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "tier free-version receipt sink was already drained"))?;
+        receipts.entry(identity).or_insert(payload);
+        Ok(true)
+    }
+
+    /// Consume every receipt exactly once. A second drain is a caller bug: it
+    /// could otherwise make two outer wrappers believe they own the same tasks.
+    pub(crate) fn drain(&self) -> io::Result<Vec<ObjectInfo>> {
+        let mut state = self.inner.lock();
+        let receipts = state
+            .receipts
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "tier free-version receipt sink was already drained"))?;
+        drop(state);
+        Ok(receipts
+            .into_iter()
+            .map(|(identity, payload)| identity.into_object_info(payload))
+            .collect())
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
     // Use the maximum parity (N/2), used when saving server configuration files
@@ -715,6 +906,12 @@ pub struct ObjectOptions {
     pub skip_decommissioned: bool,
     pub skip_rebalancing: bool,
     pub skip_free_version: bool,
+
+    /// Storage-owned, per-request hand-off for committed tier free-version
+    /// cleanup work. The outer delete wrapper installs and drains it; clones
+    /// below that boundary share the same opaque sink.
+    #[doc(hidden)]
+    pub tier_free_version_receipt_sink: Option<TierFreeVersionReceiptSink>,
 
     /// Cooperative cancellation for an owned PutObject before authoritative
     /// rename begins. Storage ignores it after entering the durable commit.
@@ -851,6 +1048,7 @@ impl std::fmt::Debug for ObjectOptions {
             .field("skip_decommissioned", &self.skip_decommissioned)
             .field("skip_rebalancing", &self.skip_rebalancing)
             .field("skip_free_version", &self.skip_free_version)
+            .field("tier_free_version_receipt_sink", &self.tier_free_version_receipt_sink)
             .field("put_object_cancellation", &self.put_object_cancellation.is_some())
             .field("scanner_publication_commit_scope", &self.scanner_publication_commit_scope)
             .field("data_movement", &self.data_movement)
@@ -2622,11 +2820,381 @@ mod tests {
         assert!(default_cloned.parts.is_empty());
     }
 
+    fn transitioned_receipt_source(
+        bucket: &str,
+        object: &str,
+        remote_version: &str,
+        version_state: rustfs_filemeta::TransitionVersionState,
+        identity_hex: Option<&str>,
+    ) -> ObjectInfo {
+        let mut metadata = HashMap::new();
+        if let Some(identity_hex) = identity_hex {
+            rustfs_utils::http::metadata_compat::insert_str(
+                &mut metadata,
+                rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+                identity_hex.to_string(),
+            );
+        }
+        ObjectInfo {
+            bucket: bucket.to_string(),
+            name: object.to_string(),
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH),
+            user_defined: Arc::new(metadata),
+            transitioned_object: TransitionedObject {
+                name: format!("remote/{object}"),
+                version_id: remote_version.to_string(),
+                tier: "WARM".to_string(),
+                status: TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            },
+            transition_version_state: version_state,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tier_free_version_receipt_matches_persisted_free_version_worker_fields() {
+        let bucket = "receipt-bucket";
+        let object = "archive/object.bin";
+        let source_version_id = Uuid::from_u128(1);
+        let local_free_version_id = Uuid::from_u128(2);
+        let remote_version_id = Uuid::from_u128(3);
+        let source_mod_time = OffsetDateTime::UNIX_EPOCH + time::Duration::hours(4);
+        let identity_hex = "ab".repeat(32);
+        let mut source_metadata = HashMap::from([
+            ("etag".to_string(), "source-etag".to_string()),
+            ("x-amz-meta-private".to_string(), "must-not-enter-receipt".to_string()),
+        ]);
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut source_metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            identity_hex.clone(),
+        );
+        let source_file_info = FileInfo {
+            volume: bucket.to_string(),
+            name: object.to_string(),
+            version_id: Some(source_version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/receipt-object".to_string(),
+            transition_tier: "WARM".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_version: Some(remote_version_id.to_string()),
+            transition_version_state: rustfs_filemeta::TransitionVersionState::Exact,
+            mod_time: Some(source_mod_time),
+            size: 8192,
+            data_dir: Some(Uuid::from_u128(4)),
+            metadata: source_metadata,
+            ..Default::default()
+        };
+        let source = ObjectInfo::from_file_info(&source_file_info, bucket, object, true);
+        let mut persisted = FileMeta::new();
+        persisted
+            .add_version(source_file_info)
+            .expect("transitioned receipt source should be persisted");
+        let mut delete_file_info = FileInfo {
+            volume: bucket.to_string(),
+            name: object.to_string(),
+            version_id: Some(source_version_id),
+            mod_time: Some(source_mod_time + time::Duration::minutes(1)),
+            ..Default::default()
+        };
+        delete_file_info.set_tier_free_version_id(&local_free_version_id.to_string());
+        persisted
+            .delete_version(&delete_file_info)
+            .expect("transitioned source delete should create a free-version");
+
+        let encoded = persisted.marshal_msg().expect("free-version metadata should encode");
+        let decoded = FileMeta::load(&encoded).expect("free-version metadata should decode");
+        let persisted_free_version = decoded
+            .get_all_file_info_versions(bucket, object, true)
+            .expect("decoded free-version should produce FileInfo")
+            .versions
+            .into_iter()
+            .find(|version| version.tier_free_version())
+            .expect("decoded metadata should contain the persisted free-version");
+        let persisted_object_info = ObjectInfo::from_file_info(&persisted_free_version, bucket, object, true);
+
+        let sink = TierFreeVersionReceiptSink::new();
+        assert!(
+            sink.record(&source, local_free_version_id)
+                .expect("valid transitioned source should produce a receipt")
+        );
+        let mut receipts = sink.drain().expect("receipt owner should drain exactly once");
+        assert_eq!(receipts.len(), 1);
+        let receipt = receipts.pop().expect("one receipt should be present");
+
+        assert_eq!(receipt.bucket, persisted_object_info.bucket);
+        assert_eq!(receipt.name, persisted_object_info.name);
+        assert_eq!(receipt.version_id, persisted_object_info.version_id);
+        assert_eq!(receipt.mod_time, persisted_object_info.mod_time);
+        assert_eq!(receipt.delete_marker, persisted_object_info.delete_marker);
+        assert_eq!(receipt.transitioned_object.name, persisted_object_info.transitioned_object.name);
+        assert_eq!(
+            receipt.transitioned_object.version_id,
+            persisted_object_info.transitioned_object.version_id
+        );
+        assert_eq!(receipt.transitioned_object.tier, persisted_object_info.transitioned_object.tier);
+        assert_eq!(
+            receipt.transitioned_object.free_version,
+            persisted_object_info.transitioned_object.free_version
+        );
+        assert_eq!(receipt.transitioned_object.status, persisted_object_info.transitioned_object.status);
+        assert_eq!(receipt.transition_version_state, persisted_object_info.transition_version_state);
+        assert_eq!(
+            crate::services::tier::tier::tier_destination_id_from_metadata(&receipt.user_defined)
+                .expect("receipt identity should decode"),
+            crate::services::tier::tier::tier_destination_id_from_metadata(&persisted_object_info.user_defined)
+                .expect("persisted identity should decode")
+        );
+        assert_eq!(
+            receipt.user_defined.len(),
+            2,
+            "receipt should carry only the two compatibility identity keys"
+        );
+        assert_eq!(
+            receipt.user_defined.get("x-rustfs-internal-transition-tier-destination-id"),
+            Some(&identity_hex)
+        );
+        assert_eq!(
+            receipt.user_defined.get("x-minio-internal-transition-tier-destination-id"),
+            Some(&identity_hex)
+        );
+        assert!(!receipt.user_defined.contains_key("x-amz-meta-private"));
+        assert_eq!(receipt.size, 0);
+        assert_eq!(receipt.actual_size, 0);
+        assert!(receipt.parts.is_empty());
+        assert!(receipt.etag.is_none());
+        assert!(receipt.checksum.is_none());
+        assert!(receipt.data_dir.is_none());
+    }
+
+    #[test]
+    fn tier_free_version_receipt_sink_deduplicates_remote_target_and_drains_once() {
+        let identity_hex = "11".repeat(32);
+        let source = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "remote-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        let other_object = transitioned_receipt_source(
+            "bucket",
+            "other-object",
+            "remote-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        let sink = TierFreeVersionReceiptSink::new();
+        let clone = sink.clone();
+
+        assert!(
+            sink.record(&source, Uuid::from_u128(10))
+                .expect("first physical receipt should record")
+        );
+        assert!(
+            clone
+                .record(&source, Uuid::from_u128(11))
+                .expect("tuple-equivalent physical receipt should be represented")
+        );
+        assert!(
+            clone
+                .record(&other_object, Uuid::from_u128(12))
+                .expect("a different logical key should retain its own task")
+        );
+
+        let mut receipts = sink.drain().expect("owner should drain shared receipts");
+        receipts.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].name, "object");
+        assert_eq!(receipts[0].version_id, Some(Uuid::from_u128(10)));
+        assert_eq!(receipts[1].name, "other-object");
+        assert_eq!(receipts[1].version_id, Some(Uuid::from_u128(12)));
+        assert_eq!(
+            clone.drain().expect_err("a shared sink must drain only once").kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            clone
+                .record(&source, Uuid::from_u128(13))
+                .expect_err("recording after drain must fail")
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn tier_free_version_receipt_identity_covers_every_destructive_dimension() {
+        let identity_hex = "44".repeat(32);
+        let baseline = transitioned_receipt_source(
+            "bucket",
+            "directory/",
+            "remote-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        let mut encoded_duplicate = baseline.clone();
+        encoded_duplicate.name = "directory__XLDIR__".to_string();
+
+        let mut variants = Vec::new();
+        let mut changed = baseline.clone();
+        changed.bucket = "other-bucket".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.name = "other-directory/".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.transitioned_object.tier = "COLD".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.transitioned_object.name = "remote/other-directory/".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.transitioned_object.version_id = "other-remote-version".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        changed.transition_version_state = rustfs_filemeta::TransitionVersionState::SuspendedNull;
+        changed.transitioned_object.version_id = "null".to_string();
+        variants.push(changed);
+        let mut changed = baseline.clone();
+        rustfs_utils::http::metadata_compat::insert_str(
+            Arc::make_mut(&mut changed.user_defined),
+            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            "55".repeat(32),
+        );
+        variants.push(changed);
+
+        let sink = TierFreeVersionReceiptSink::new();
+        assert!(
+            sink.record(&baseline, Uuid::from_u128(20))
+                .expect("baseline receipt should record")
+        );
+        assert!(
+            sink.record(&encoded_duplicate, Uuid::from_u128(21))
+                .expect("the encoded spelling of one logical key should deduplicate")
+        );
+        for (offset, variant) in variants.iter().enumerate() {
+            assert!(
+                sink.record(variant, Uuid::from_u128(30 + offset as u128))
+                    .expect("each distinct cleanup identity should record")
+            );
+        }
+
+        let receipts = sink.drain().expect("identity matrix should drain once");
+        assert_eq!(receipts.len(), 8, "every destructive identity dimension must prevent deduplication");
+        let baseline_receipt = receipts
+            .iter()
+            .find(|receipt| {
+                receipt.bucket == "bucket"
+                    && receipt.name == "directory/"
+                    && receipt.transitioned_object.tier == "WARM"
+                    && receipt.transitioned_object.name == "remote/directory/"
+                    && receipt.transitioned_object.version_id == "remote-version"
+                    && receipt.transition_version_state == rustfs_filemeta::TransitionVersionState::Exact
+                    && crate::services::tier::tier::tier_destination_id_from_metadata(&receipt.user_defined)
+                        .is_ok_and(|identity| identity == Some([0x44; 32]))
+            })
+            .expect("baseline cleanup identity should remain present");
+        assert_eq!(
+            baseline_receipt.version_id,
+            Some(Uuid::from_u128(20)),
+            "deduplication must retain the first UUID"
+        );
+    }
+
+    #[test]
+    fn tier_free_version_receipt_source_validation_fails_closed() {
+        let identity_hex = "22".repeat(32);
+        for (state, remote_version) in [
+            (rustfs_filemeta::TransitionVersionState::KnownDisabled, ""),
+            (rustfs_filemeta::TransitionVersionState::SuspendedNull, "null"),
+            (rustfs_filemeta::TransitionVersionState::Exact, "opaque-version"),
+        ] {
+            let source = transitioned_receipt_source("bucket", "object", remote_version, state, Some(&identity_hex));
+            assert!(
+                TierFreeVersionReceiptSink::new()
+                    .record(&source, Uuid::new_v4())
+                    .expect("canonical remote-version state should be eligible"),
+                "state={state:?} remote_version={remote_version:?}"
+            );
+        }
+
+        let unknown = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "opaque-version",
+            rustfs_filemeta::TransitionVersionState::Unknown,
+            Some(&identity_hex),
+        );
+        assert!(
+            !TierFreeVersionReceiptSink::new()
+                .record(&unknown, Uuid::new_v4())
+                .expect("unknown remote version state should defer to recovery")
+        );
+        let missing_identity = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "opaque-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            None,
+        );
+        assert!(
+            !TierFreeVersionReceiptSink::new()
+                .record(&missing_identity, Uuid::new_v4())
+                .expect("missing durable identity should defer to recovery")
+        );
+        let invalid_exact = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        assert!(
+            !TierFreeVersionReceiptSink::new()
+                .record(&invalid_exact, Uuid::new_v4())
+                .expect("conflicting remote state should defer to recovery")
+        );
+
+        let mut conflicting = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "opaque-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        Arc::make_mut(&mut conflicting.user_defined)
+            .insert("x-minio-internal-transition-tier-destination-id".to_string(), "33".repeat(32));
+        assert_eq!(
+            TierFreeVersionReceiptSink::new()
+                .record(&conflicting, Uuid::new_v4())
+                .expect_err("conflicting identity aliases must fail closed")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let valid = transitioned_receipt_source(
+            "bucket",
+            "object",
+            "opaque-version",
+            rustfs_filemeta::TransitionVersionState::Exact,
+            Some(&identity_hex),
+        );
+        assert_eq!(
+            TierFreeVersionReceiptSink::new()
+                .record(&valid, Uuid::nil())
+                .expect_err("nil local free-version identity must be rejected")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
     #[test]
     fn object_options_default_does_not_allocate_lifecycle_delete_all_journal() {
         let mut opts = ObjectOptions::default();
 
         assert!(opts.lifecycle_delete_all_journal().is_none());
+        assert!(opts.tier_free_version_receipt_sink.is_none());
         opts.ensure_lifecycle_delete_all_journal();
         assert!(opts.lifecycle_delete_all_journal().is_some());
     }
