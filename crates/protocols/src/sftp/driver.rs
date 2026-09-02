@@ -34,6 +34,7 @@ use crate::common::client::s3::StorageBackend;
 use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
 use crate::common::session::SessionContext;
 use russh_sftp::protocol::{Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status, StatusCode, Version};
+use rustfs_credentials::Credentials;
 use rustfs_utils::MaskedAccessKey;
 use s3s::dto::{AbortMultipartUploadInput, CopyObjectInput, CopySource};
 use std::collections::HashMap;
@@ -165,16 +166,14 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         super::read_cache::ReadCache::new(Arc::clone(&self.read_cache_in_use))
     }
 
-    /// Borrow the authenticated principal's S3 access key. Each StorageBackend
-    /// call needs this alongside the secret key for signing.
+    /// Borrow the authenticated principal's S3 access key for diagnostics.
     pub(super) fn access_key(&self) -> &str {
-        &self.session_context.principal.user_identity.credentials.access_key
+        &self.credentials().access_key
     }
 
-    /// Borrow the authenticated principal's S3 secret key. Used together with
-    /// access_key for signing every backend call.
-    pub(super) fn secret_key(&self) -> &str {
-        &self.session_context.principal.user_identity.credentials.secret_key
+    /// Borrow the authenticated principal credentials for backend calls.
+    pub(super) fn credentials(&self) -> &Credentials {
+        self.session_context.credentials()
     }
 
     /// Returns Err(PermissionDenied) when the driver is read-only,
@@ -787,12 +786,8 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
 
         self.authorize(&S3Action::DeleteObject, &bucket, Some(&object_key)).await?;
 
-        self.run_backend(
-            "delete_object",
-            self.storage
-                .delete_object(&bucket, &object_key, self.access_key(), self.secret_key()),
-        )
-        .await?;
+        self.run_backend("delete_object", self.storage.delete_object(&bucket, &object_key, self.credentials()))
+            .await?;
         Ok(ok_status(id))
     }
 
@@ -898,11 +893,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
         // single-shot vs multipart-copy branch below.
         self.authorize(&S3Action::HeadObject, &src_bucket, Some(&src_object)).await?;
         let head = self
-            .run_backend(
-                "head_object",
-                self.storage
-                    .head_object(&src_bucket, &src_object, self.access_key(), self.secret_key()),
-            )
+            .run_backend("head_object", self.storage.head_object(&src_bucket, &src_object, self.credentials()))
             .await?;
         let content_length = head.content_length.unwrap_or(0).max(0) as u64;
 
@@ -920,7 +911,7 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
                 .key(dst_object.clone())
                 .build()
                 .map_err(|e| s3_error_to_sftp("build_copy_object", e))?;
-            self.run_backend("copy_object", self.storage.copy_object(input, self.access_key(), self.secret_key()))
+            self.run_backend("copy_object", self.storage.copy_object(input, self.credentials()))
                 .await?;
         } else {
             self.multipart_copy(&src_bucket, &src_object, &dst_bucket, &dst_object, content_length)
@@ -932,12 +923,8 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
         // delete separately.
         self.authorize(&S3Action::DeleteObject, &src_bucket, Some(&src_object))
             .await?;
-        self.run_backend(
-            "delete_object",
-            self.storage
-                .delete_object(&src_bucket, &src_object, self.access_key(), self.secret_key()),
-        )
-        .await?;
+        self.run_backend("delete_object", self.storage.delete_object(&src_bucket, &src_object, self.credentials()))
+            .await?;
 
         Ok(ok_status(id))
     }
@@ -1029,14 +1016,12 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
 impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
     fn drop(&mut self) {
         // Snapshot credentials, peer IP, and the per-call backend
-        // timeout before draining the handle table. self.access_key()
-        // and self.secret_key() borrow self.session_context immutably,
-        // which conflicts with the mutable borrow of self.handles
-        // inside the loop. The timeout is copied into each spawned
-        // abort task so the deadline applies uniformly to inline calls
-        // and Drop-time aborts.
-        let access_key = self.session_context.principal.user_identity.credentials.access_key.clone();
-        let secret_key = self.session_context.principal.user_identity.credentials.secret_key.clone();
+        // timeout before draining the handle table. Borrowing
+        // self.session_context inside the loop would conflict with the
+        // mutable borrow of self.handles. The timeout is copied into each
+        // spawned abort task so the deadline applies uniformly to inline
+        // calls and Drop-time aborts.
+        let credentials = self.session_context.credentials().clone();
         let peer = self.session_context.source_ip;
         let backend_op_timeout_secs = self.backend_op_timeout_secs;
 
@@ -1056,7 +1041,7 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                             key = %key,
                             upload_id = %upload_id,
                             peer = %peer,
-                            access_key = %access_key,
+                            access_key = %MaskedAccessKey(&credentials.access_key),
                             "skipped abort of orphaned multipart upload on session drop, principal lacks s3:AbortMultipartUpload, bucket lifecycle rules must reclaim parts",
                         );
                     }
@@ -1065,8 +1050,7 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
             };
 
             let storage = Arc::clone(&self.storage);
-            let access_key = access_key.clone();
-            let secret_key = secret_key.clone();
+            let credentials = credentials.clone();
             let upload_id = upload_id_owned;
 
             // Cap the global abort fan-out so a burst of session
@@ -1122,7 +1106,7 @@ impl<S: StorageBackend + Send + Sync + 'static> Drop for SftpDriver<S> {
                     };
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(backend_op_timeout_secs),
-                        storage.abort_multipart_upload(input, &access_key, &secret_key),
+                        storage.abort_multipart_upload(input, &credentials),
                     )
                     .await
                     {
