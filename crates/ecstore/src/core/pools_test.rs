@@ -232,7 +232,13 @@ mod decommission_lock_order_tests {
         C: FnOnce() -> F + Send + 'static,
         F: Future<Output = ()> + 'static,
     {
-        const STACK_SIZE: usize = 32 * 1024 * 1024;
+        const STACK_SIZE: usize = if cfg!(debug_assertions) {
+            8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else if cfg!(target_os = "macos") {
+            2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else {
+            rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        };
         std::thread::Builder::new()
             .name(name.to_string())
             .stack_size(STACK_SIZE)
@@ -255,7 +261,13 @@ mod decommission_lock_order_tests {
         C: FnOnce() -> F + Send + 'static,
         F: Future<Output = ()> + 'static,
     {
-        const STACK_SIZE: usize = 32 * 1024 * 1024;
+        const STACK_SIZE: usize = if cfg!(debug_assertions) {
+            8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else if cfg!(target_os = "macos") {
+            2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else {
+            rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        };
         std::thread::Builder::new()
             .name(name.to_string())
             .stack_size(STACK_SIZE)
@@ -1496,7 +1508,7 @@ mod decommission_lock_order_tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn multipart_cleanup_proves_target_absence_after_acquiring_capacity_gate() {
+    async fn multipart_cleanup_rediscovers_uploads_and_proves_target_under_capacity_gate() {
         let (_temp_dirs, store, _other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
         let bucket = test_bucket("multipart-cleanup-target-race");
         let object = "published-between-cleanup-proof-and-finalize.bin";
@@ -1549,6 +1561,7 @@ mod decommission_lock_order_tests {
             upload_identity.clone(),
         );
         owner.apply_to(&mut upload_opts);
+        let concurrent_upload_opts = upload_opts.clone();
         let mut cleanup_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
@@ -1627,6 +1640,9 @@ mod decommission_lock_order_tests {
             result = &mut cleanup => panic!("cleanup finished before its target-gate proof point: {result:?}"),
         }
 
+        let concurrent_upload = new_multipart_upload(&store, target_pool_index, &bucket, object, concurrent_upload_opts)
+            .await
+            .expect("stage a same-identity upload after cleanup reaches its target-gate boundary");
         let mut target_data = PutObjReader::from_vec(body);
         let published = store.pools[target_pool_index]
             .put_object(
@@ -1655,6 +1671,17 @@ mod decommission_lock_order_tests {
             .expect("cleanup should preserve the now-published target intent");
         drop(barrier);
 
+        let remaining_uploads = store.pools[target_pool_index]
+            .get_disks_by_key(object)
+            .data_movement_multipart_upload_ids(&bucket, object, Some(incarnation), &upload_identity)
+            .await
+            .expect("check same-identity uploads after gated cleanup");
+        assert!(
+            remaining_uploads.is_empty(),
+            "gated cleanup must rediscover and remove the concurrent same-identity upload {}",
+            concurrent_upload.upload_id
+        );
+
         let pool_meta = store.pool_meta.read().await;
         let reservation = pool_meta.pools[0]
             .decommission
@@ -1672,7 +1699,7 @@ mod decommission_lock_order_tests {
     #[test]
     #[serial_test::serial]
     fn data_movement_multipart_restart_reconciles_published_capacity_before_new_upload() {
-        run_large_stack_async_test(
+        run_large_stack_current_thread_async_test(
             "multipart-published-capacity-restart",
             data_movement_multipart_restart_reconciles_published_capacity_before_new_upload_case,
         );
@@ -2009,7 +2036,7 @@ mod decommission_lock_order_tests {
     #[test]
     #[serial_test::serial]
     fn data_movement_multipart_restart_cleans_partial_upload_before_exact_fit_retry() {
-        run_large_stack_async_test(
+        run_large_stack_current_thread_async_test(
             "multipart-partial-upload-restart",
             data_movement_multipart_restart_cleans_partial_upload_before_exact_fit_retry_case,
         );
@@ -2311,18 +2338,22 @@ mod decommission_lock_order_tests {
             .await
             .expect("activate the abort fence reservation");
         let owner = decommission_capacity_owner(&*store.pool_meta.read().await).with_mutation_id(uuid::Uuid::new_v4());
+        let version_id = uuid::Uuid::new_v4().to_string();
+        let mod_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(83);
         let mut upload_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
             versioned: true,
-            version_id: Some(uuid::Uuid::new_v4().to_string()),
+            version_id: Some(version_id.clone()),
+            mod_time: Some(mod_time),
             expected_bucket_incarnation_id: Some(incarnation),
             ..Default::default()
         };
+        let upload_identity = data_movement::data_movement_upload_identity_from_options(&upload_opts);
         rustfs_utils::http::insert_str(
             &mut upload_opts.user_defined,
             rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
-            "v1:abort-fence:1".to_string(),
+            upload_identity,
         );
         let upload = new_multipart_upload(&store, 2, &bucket, object, upload_opts)
             .await
@@ -2333,6 +2364,9 @@ mod decommission_lock_order_tests {
         let mut abort_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
+            versioned: true,
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
             expected_bucket_incarnation_id: Some(incarnation),
             ..Default::default()
         };
@@ -2387,9 +2421,16 @@ mod decommission_lock_order_tests {
         assert!(upload_info.parts.is_empty());
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn data_movement_multipart_abort_restart_reconciles_inflight_after_release_save_loss() {
+    fn data_movement_multipart_abort_restart_reconciles_inflight_after_release_save_loss() {
+        run_large_stack_current_thread_async_test(
+            "multipart-abort-restart",
+            data_movement_multipart_abort_restart_reconciles_inflight_after_release_save_loss_case,
+        );
+    }
+
+    async fn data_movement_multipart_abort_restart_reconciles_inflight_after_release_save_loss_case() {
         let (_temp_dirs, store, other_store) = test_three_pool_stores_with_isolated_node_contexts(None).await;
         let bucket = test_bucket("multipart-abort-restart");
         let object = "deleted-upload-before-release-save.bin";
@@ -2418,15 +2459,18 @@ mod decommission_lock_order_tests {
             .await
             .expect("activate the abort restart reservation");
         let owner = decommission_capacity_owner(&*store.pool_meta.read().await).with_mutation_id(uuid::Uuid::new_v4());
-        let upload_identity = format!("v1:{}:{}", uuid::Uuid::new_v4(), 91);
+        let version_id = uuid::Uuid::new_v4().to_string();
+        let mod_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(91);
         let mut new_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
             versioned: true,
-            version_id: Some(uuid::Uuid::new_v4().to_string()),
+            version_id: Some(version_id.clone()),
+            mod_time: Some(mod_time),
             expected_bucket_incarnation_id: Some(incarnation),
             ..Default::default()
         };
+        let upload_identity = data_movement::data_movement_upload_identity_from_options(&new_opts);
         rustfs_utils::http::insert_str(
             &mut new_opts.user_defined,
             rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
@@ -2496,6 +2540,9 @@ mod decommission_lock_order_tests {
         let mut abort_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
+            versioned: true,
+            version_id: Some(version_id),
+            mod_time: Some(mod_time),
             expected_bucket_incarnation_id: Some(incarnation),
             ..Default::default()
         };

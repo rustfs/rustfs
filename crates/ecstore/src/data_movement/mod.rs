@@ -269,14 +269,19 @@ fn insert_data_movement_checksum(user_defined: &mut HashMap<String, String>, obj
     }
 }
 
-fn data_movement_upload_identity(object_info: &ObjectInfo) -> String {
-    let version_id = object_info
-        .version_id
-        .map_or_else(|| "none".to_string(), |version_id| version_id.to_string());
-    let mod_time = object_info
-        .mod_time
-        .map_or_else(|| "none".to_string(), |mod_time| mod_time.unix_timestamp_nanos().to_string());
+fn data_movement_upload_identity_parts(version_id: Option<&str>, mod_time: Option<time::OffsetDateTime>) -> String {
+    let version_id = version_id.unwrap_or("none");
+    let mod_time = mod_time.map_or_else(|| "none".to_string(), |mod_time| mod_time.unix_timestamp_nanos().to_string());
     format!("v1:{version_id}:{mod_time}")
+}
+
+fn data_movement_upload_identity(object_info: &ObjectInfo) -> String {
+    let version_id = object_info.version_id.map(|version_id| version_id.to_string());
+    data_movement_upload_identity_parts(version_id.as_deref(), object_info.mod_time)
+}
+
+pub(crate) fn data_movement_upload_identity_from_options(opts: &ObjectOptions) -> String {
+    data_movement_upload_identity_parts(opts.version_id.as_deref(), opts.mod_time)
 }
 
 fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usize) -> ObjectOptions {

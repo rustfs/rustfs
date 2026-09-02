@@ -787,8 +787,16 @@ impl ECStore {
         upload_id: &str,
         opts: &ObjectOptions,
     ) -> Result<()> {
-        self.abort_multipart_uploads_for_data_movement(target_pool_idx, bucket, object, &[upload_id.to_owned()], None, opts)
-            .await
+        let upload_identity = crate::data_movement::data_movement_upload_identity_from_options(opts);
+        self.abort_multipart_uploads_for_data_movement(
+            target_pool_idx,
+            bucket,
+            object,
+            &[upload_id.to_owned()],
+            &upload_identity,
+            opts,
+        )
+        .await
     }
 
     pub(crate) async fn reconcile_multipart_uploads_for_data_movement(
@@ -799,8 +807,7 @@ impl ECStore {
         upload_identity: &str,
         opts: &ObjectOptions,
     ) -> Result<()> {
-        let pool = self
-            .pools
+        self.pools
             .get(target_pool_idx)
             .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
         let owner = DecommissionCapacityOwner::from_options(opts)
@@ -830,11 +837,7 @@ impl ECStore {
                 .entry(self.id)
                 .or_default() += 1;
         }
-        let set = pool.get_disks_by_key(object);
-        let upload_ids = set
-            .data_movement_multipart_upload_ids(bucket, object, opts.expected_bucket_incarnation_id, upload_identity)
-            .await?;
-        self.abort_multipart_uploads_for_data_movement(target_pool_idx, bucket, object, &upload_ids, Some(upload_identity), opts)
+        self.abort_multipart_uploads_for_data_movement(target_pool_idx, bucket, object, &[], upload_identity, opts)
             .await
     }
 
@@ -844,7 +847,7 @@ impl ECStore {
         bucket: &str,
         object: &str,
         upload_ids: &[String],
-        expected_upload_identity: Option<&str>,
+        expected_upload_identity: &str,
         opts: &ObjectOptions,
     ) -> Result<()> {
         check_new_multipart_args(bucket, object)?;
@@ -861,32 +864,78 @@ impl ECStore {
             .pools
             .get(target_pool_idx)
             .ok_or_else(|| Error::other(format!("data movement target pool {target_pool_idx} is out of range")))?;
-        let set = pool.get_disks_by_key(object);
-        let mut guards = Vec::with_capacity(upload_ids.len());
-        for upload_id in upload_ids {
-            if let Some(guard) = set
-                .lock_data_movement_multipart_abort(bucket, object, upload_id, expected_upload_identity, &opts)
-                .await?
-            {
-                guard.add_namespace_lock_fence(&mut opts);
-                guards.push(guard);
-            }
-        }
         opts.no_lock = true;
-        // Keep every upload namespace guard alive through the final capacity progress save.
-        let cleanup_decision_error = self
+        let set = pool.get_disks_by_key(object);
+        // Discover and lock uploads only after the target capacity gate is held.
+        // Return the guards so they remain alive through the final capacity save.
+        let (cleanup_decision_error, guards) = self
             .run_decommission_capacity_temporary_release_with_capacity_lease(target_pool_idx, capacity_owner, |capacity_lease| {
                 let mut delete_opts = opts.clone();
-                let guards = &guards;
                 let set = &set;
                 let pool = &pool;
                 async move {
                     if let Some(capacity_lease) = capacity_lease.as_ref() {
                         delete_opts.add_namespace_lock_lost_signal(Arc::clone(capacity_lease));
                     }
-                    // The target capacity gate held by the surrounding
-                    // transaction makes this proof and its pending-ledger
-                    // decision one critical section with cleanup finalize.
+                    let mut candidate_upload_ids = upload_ids.to_vec();
+                    candidate_upload_ids.extend(
+                        set.data_movement_multipart_upload_ids(
+                            bucket,
+                            object,
+                            delete_opts.expected_bucket_incarnation_id,
+                            expected_upload_identity,
+                        )
+                        .await?,
+                    );
+                    candidate_upload_ids.sort_unstable();
+                    candidate_upload_ids.dedup();
+
+                    let mut guards = Vec::with_capacity(candidate_upload_ids.len());
+                    for upload_id in &candidate_upload_ids {
+                        match set
+                            .lock_data_movement_multipart_abort(
+                                bucket,
+                                object,
+                                upload_id,
+                                Some(expected_upload_identity),
+                                &delete_opts,
+                            )
+                            .await
+                        {
+                            Ok(Some(guard)) => {
+                                guard.add_namespace_lock_fence(&mut delete_opts);
+                                guards.push(guard);
+                            }
+                            Ok(None) => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    for guard in &guards {
+                        match guard.delete(set, bucket, object, &delete_opts).await {
+                            Ok(()) => {}
+                            Err(err) if is_err_invalid_upload_id(&err) => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+
+                    if !set
+                        .data_movement_multipart_upload_ids(
+                            bucket,
+                            object,
+                            delete_opts.expected_bucket_incarnation_id,
+                            expected_upload_identity,
+                        )
+                        .await?
+                        .is_empty()
+                    {
+                        return Err(Error::DecommissionCapacityBlocked {
+                            message: "multipart cleanup could not prove the exact staged uploads are absent".to_string(),
+                        });
+                    }
+
+                    // The target capacity gate makes the exact target proof,
+                    // upload absence proof, and pending-ledger decision one
+                    // critical section with cleanup finalize.
                     let (clear_pending, cleanup_decision_error) = if capacity_owner.is_some() {
                         let mut lookup_opts = ObjectOptions {
                             versioned: delete_opts.versioned,
@@ -911,14 +960,7 @@ impl ECStore {
                     } else {
                         (true, None)
                     };
-                    for guard in guards {
-                        match guard.delete(set, bucket, object, &delete_opts).await {
-                            Ok(()) => {}
-                            Err(err) if is_err_invalid_upload_id(&err) => {}
-                            Err(err) => return Err(err),
-                        }
-                    }
-                    Ok((cleanup_decision_error, clear_pending))
+                    Ok(((cleanup_decision_error, guards), clear_pending))
                 }
             })
             .await?;

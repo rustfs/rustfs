@@ -923,7 +923,13 @@ mod tests {
         C: FnOnce() -> F + Send + 'static,
         F: Future<Output = ()> + 'static,
     {
-        const STACK_SIZE: usize = 32 * 1024 * 1024;
+        const STACK_SIZE: usize = if cfg!(debug_assertions) {
+            8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else if cfg!(target_os = "macos") {
+            2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else {
+            rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        };
         std::thread::Builder::new()
             .name(name.to_string())
             .stack_size(STACK_SIZE)
@@ -2612,19 +2618,23 @@ mod tests {
         let capacity_owner = test_decommission_capacity_owner(store.as_ref(), 0)
             .await
             .with_mutation_id(Uuid::new_v4());
-        let mut upload_metadata = source.user_defined.as_ref().clone();
-        rustfs_utils::http::insert_str(
-            &mut upload_metadata,
-            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
-            "mpu-staging-test".to_string(),
-        );
+        let upload_metadata = source.user_defined.as_ref().clone();
         let mut staging_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
+            versioned: source.version_id.is_some(),
+            version_id: source.version_id.map(|version_id| version_id.to_string()),
+            mod_time: source.mod_time,
             user_defined: upload_metadata,
             expected_bucket_incarnation_id: Some(bucket_incarnation_id),
             ..Default::default()
         };
+        let upload_identity = crate::data_movement::data_movement_upload_identity_from_options(&staging_opts);
+        rustfs_utils::http::insert_str(
+            &mut staging_opts.user_defined,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            upload_identity,
+        );
         capacity_owner.apply_to(&mut staging_opts);
         let (upload, target_pool_idx, staged_incarnation_id) = store
             .handle_new_multipart_upload_with_pool_idx(&bucket, object, &staging_opts, None)
@@ -2694,6 +2704,9 @@ mod tests {
         let mut abort_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
+            versioned: source.version_id.is_some(),
+            version_id: source.version_id.map(|version_id| version_id.to_string()),
+            mod_time: source.mod_time,
             expected_bucket_incarnation_id: Some(bucket_incarnation_id),
             ..Default::default()
         };
