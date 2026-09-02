@@ -15,17 +15,13 @@
 use crate::bucket::metadata::BucketMetadata;
 use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::metadata_sys::get_replication_config;
+use crate::bucket::remote_s3_client::{PathStyle, RemoteCredentials, RemoteS3EndpointSpec, build_remote_s3_client};
 use crate::bucket::replication::{ReplicationStatusType, ReplicationTargetConfigBridge};
 use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::runtime::sources as runtime_sources;
-use aws_credential_types::Credentials as SdkCredentials;
-use aws_credential_types::provider::{ProvideCredentials, error::CredentialsError, future};
-use aws_sdk_s3::config::Region as SdkRegion;
-use aws_sdk_s3::config::RequestChecksumCalculation;
-use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
@@ -37,28 +33,17 @@ use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::operation::put_object_tagging::{PutObjectTaggingError, PutObjectTaggingOutput};
 use aws_sdk_s3::operation::upload_part::UploadPartOutput;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::BucketVersioningStatus;
 use aws_sdk_s3::types::Tagging as SdkTagging;
 use aws_sdk_s3::types::{
     ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
     ServerSideEncryption,
 };
-use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
-use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
-use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, tls as smithy_tls};
-use aws_smithy_runtime_api::box_error::BoxError;
-use aws_smithy_runtime_api::client::http::{
-    HttpConnector as SmithyHttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
-};
-use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
-use aws_smithy_runtime_api::client::result::ConnectorError;
-use aws_smithy_types::body::SdkBody;
+use aws_sdk_s3::{Client as S3Client, operation::head_object::HeadObjectOutput};
+use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
 use futures::{StreamExt, stream};
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
-use hyper_util::client::legacy::Client as HyperClient;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use reqwest::Client as HttpClient;
-use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
-use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
     AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_TAGGING_LOWER, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header,
@@ -70,12 +55,10 @@ use rustfs_utils::http::{
     SUFFIX_SOURCE_REPLICATION_RETENTION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_TAGGING_TIMESTAMP, SUFFIX_SOURCE_VERSION_ID,
     insert_header,
 };
-use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
-use std::path::Path;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -84,7 +67,6 @@ use std::time::{Duration, Instant, SystemTime};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use tower::Service;
 use tracing::error;
 use tracing::warn;
 use url::Url;
@@ -92,70 +74,48 @@ use uuid::Uuid;
 
 const MAX_CONCURRENT_TARGET_HEALTH_CHECKS: usize = 16;
 const REDACTED_CREDENTIAL: &str = "<redacted>";
-const EXPIRED_REMOTE_TARGET_CREDENTIALS: &str = "remote target credentials have expired";
 
-#[derive(Clone)]
-struct RemoteTargetCredentialsProvider {
-    credentials: SdkCredentials,
+fn remote_credentials(credentials: &Credentials, account_id: &str) -> RemoteCredentials {
+    RemoteCredentials {
+        access_key: credentials.access_key.clone(),
+        secret_key: credentials.secret_key.clone(),
+        session_token: credentials.effective_session_token().map(str::to_string),
+        expiration: credentials.effective_expiration().map(SystemTime::from),
+        account_id: account_id.to_string(),
+    }
 }
 
-impl RemoteTargetCredentialsProvider {
-    fn resolve_at(&self, now: SystemTime) -> aws_credential_types::provider::Result {
-        if self.credentials.expiry().is_some_and(|expiration| expiration <= now) {
-            return Err(CredentialsError::provider_error(std::io::Error::other(EXPIRED_REMOTE_TARGET_CREDENTIALS)));
+fn target_path_style(path: &str) -> PathStyle {
+    match path.trim().to_ascii_lowercase().as_str() {
+        // Explicit DNS/virtual-hosted-style requested by user.
+        "dns" | "off" | "false" => PathStyle::VirtualHost,
+        // Explicit path-style or legacy boolean-like values.
+        "path" | "on" | "true" => PathStyle::Path,
+        // `auto` and empty are defaulted to path-style for custom S3-compatible endpoints.
+        "auto" | "" => PathStyle::Auto,
+        // Unknown values: prefer compatibility with S3-compatible services.
+        _ => PathStyle::Path,
+    }
+}
+
+impl From<&BucketTarget> for RemoteS3EndpointSpec {
+    fn from(target: &BucketTarget) -> Self {
+        RemoteS3EndpointSpec {
+            endpoint: target.endpoint.clone(),
+            secure: target.secure,
+            region: target.region.clone(),
+            path_style: target_path_style(&target.path),
+            credentials: target
+                .credentials
+                .as_ref()
+                .map(|credentials| remote_credentials(credentials, &target.reset_id)),
+            skip_tls_verify: target.skip_tls_verify,
+            ca_cert_pem: (!target.ca_cert_pem.trim().is_empty()).then(|| target.ca_cert_pem.clone()),
+            connect_timeout: None,
+            read_timeout: None,
+            user_agent_suffix: "",
         }
-        Ok(self.credentials.clone())
     }
-}
-
-impl fmt::Debug for RemoteTargetCredentialsProvider {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RemoteTargetCredentialsProvider")
-            .field("temporary", &self.credentials.session_token().is_some())
-            .field("expiration", &self.credentials.expiry())
-            .finish()
-    }
-}
-
-impl ProvideCredentials for RemoteTargetCredentialsProvider {
-    fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
-    where
-        Self: 'a,
-    {
-        future::ProvideCredentials::ready(self.resolve_at(SystemTime::now()))
-    }
-
-    fn fallback_on_interrupt(&self) -> Option<SdkCredentials> {
-        self.resolve_at(SystemTime::now()).ok()
-    }
-}
-
-fn remote_target_sdk_credentials(
-    credentials: &Credentials,
-    account_id: &str,
-    now: SystemTime,
-) -> Result<SdkCredentials, &'static str> {
-    let session_token = credentials.effective_session_token();
-    let expiration = credentials.effective_expiration().map(SystemTime::from);
-    if expiration.is_some() && session_token.is_none() {
-        return Err("remote target credential expiration requires a session token");
-    }
-    if expiration.is_some_and(|expiration| expiration <= now) {
-        return Err(EXPIRED_REMOTE_TARGET_CREDENTIALS);
-    }
-
-    let mut builder = SdkCredentials::builder()
-        .access_key_id(credentials.access_key.clone())
-        .secret_access_key(credentials.secret_key.clone())
-        .account_id(account_id.to_string())
-        .provider_name("bucket_target_sys");
-    if let Some(session_token) = session_token {
-        builder = builder.session_token(session_token.to_string());
-    }
-    if let Some(expiration) = expiration {
-        builder = builder.expiry(expiration);
-    }
-    Ok(builder.build())
 }
 
 pub type HeadObjectSdkError = Box<SdkError<HeadObjectError>>;
@@ -1058,57 +1018,17 @@ impl BucketTargetSys {
             });
         };
 
-        let creds = remote_target_sdk_credentials(credentials, &target.reset_id, SystemTime::now()).map_err(|error| {
-            BucketTargetError::RemoteTargetConnectionErr {
+        let spec = RemoteS3EndpointSpec::from(target);
+        let client = build_remote_s3_client(&spec)
+            .await
+            .map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
                 bucket: target.target_bucket.clone(),
                 access_key: credentials.access_key.clone(),
-                error: error.to_string(),
-            }
-        })?;
-
-        let endpoint = if target.secure {
-            format!("https://{}", target.endpoint)
-        } else {
-            format!("http://{}", target.endpoint)
-        };
-        let parsed_endpoint = Url::parse(&endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
-            bucket: target.target_bucket.clone(),
-            access_key: credentials.access_key.clone(),
-            error: format!("invalid target endpoint: {err}"),
-        })?;
-        validate_replication_target_endpoint(&parsed_endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
-            bucket: target.target_bucket.clone(),
-            access_key: credentials.access_key.clone(),
-            error: format!("target endpoint is not allowed: {err}"),
-        })?;
-
-        let mut config_builder = S3Config::builder()
-            .endpoint_url(endpoint.clone())
-            .credentials_provider(SharedCredentialsProvider::new(RemoteTargetCredentialsProvider { credentials: creds }))
-            .region(SdkRegion::new(target.region.clone()))
-            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
-            .request_checksum_calculation(replication_request_checksum_calculation());
-
-        if should_force_path_style(target) {
-            config_builder = config_builder.force_path_style(true);
-        }
-
-        if let Some(http_client) =
-            build_aws_s3_http_client_for_target(target)
-                .await
-                .map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
-                    bucket: target.target_bucket.clone(),
-                    access_key: credentials.access_key.clone(),
-                    error: err.to_string(),
-                })?
-        {
-            config_builder = config_builder.http_client(http_client);
-        }
-
-        let config = config_builder.build();
+                error: err.to_string(),
+            })?;
 
         Ok(TargetClient {
-            endpoint,
+            endpoint: spec.endpoint_url(),
             credentials: target.credentials.clone(),
             bucket: target.target_bucket.clone(),
             storage_class: target.storage_class.clone(),
@@ -1118,7 +1038,7 @@ impl BucketTargetSys {
             secure: target.secure,
             health_check_duration: target.health_check_duration,
             replicate_sync: target.replication_sync,
-            client: Arc::new(S3Client::from_conf(config)),
+            client: Arc::new(client),
         })
     }
 
@@ -1278,327 +1198,6 @@ impl BucketTargetSys {
         }
         let arn = generate_arn(target, depl_id);
         (arn, false)
-    }
-}
-
-#[derive(Debug)]
-struct AcceptAnyServerCertVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls_pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
-        _server_name: &rustls_pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls_pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls_pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-#[derive(Clone)]
-struct TargetHyperHttpConnector<C> {
-    client: HyperClient<C, SdkBody>,
-}
-
-impl<C> fmt::Debug for TargetHyperHttpConnector<C> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TargetHyperHttpConnector")
-            .field("client", &"** hyper client **")
-            .finish()
-    }
-}
-
-impl<C> SmithyHttpConnector for TargetHyperHttpConnector<C>
-where
-    C: Clone + Send + Sync + 'static,
-    C: Service<Uri>,
-    C::Response:
-        hyper::rt::Read + hyper::rt::Write + hyper_util::client::legacy::connect::Connection + Send + Sync + Unpin + 'static,
-    C::Future: Unpin + Send + 'static,
-    C::Error: Into<BoxError>,
-{
-    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
-        let request = match request.try_into_http1x() {
-            Ok(request) => request,
-            Err(err) => return HttpConnectorFuture::ready(Err(ConnectorError::user(err.into()))),
-        };
-
-        let mut client = self.client.clone();
-        let fut = client.call(request);
-        HttpConnectorFuture::new(async move {
-            let response = fut
-                .await
-                .map_err(|err| ConnectorError::io(err.into()))?
-                .map(SdkBody::from_body_1_x);
-            HttpResponse::try_from(response).map_err(|err| ConnectorError::other(err.into(), None))
-        })
-    }
-}
-
-fn ensure_rustls_crypto_provider() {
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    }
-}
-
-fn has_custom_ca_pem(target: &BucketTarget) -> bool {
-    !target.ca_cert_pem.trim().is_empty()
-}
-
-/// Env opt-in that re-enables loopback replication targets. Loopback (`127.0.0.1`,
-/// `::1`, `localhost`) is a classic SSRF vector and stays rejected by default, but
-/// single-host multi-instance dev setups and the e2e harness legitimately replicate
-/// over loopback. Never set this in production.
-const ALLOW_LOOPBACK_REPLICATION_TARGET_ENV: &str = "RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET";
-
-fn loopback_replication_targets_allowed() -> bool {
-    std::env::var(ALLOW_LOOPBACK_REPLICATION_TARGET_ENV)
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false)
-}
-
-const REPLICATION_STREAMING_CHECKSUMS_ENV: &str = "RUSTFS_REPLICATION_STREAMING_CHECKSUMS";
-
-/// Streaming trailer checksums make the SDK frame request bodies as
-/// `aws-chunked`; a target that does not decode that framing stores the frames
-/// verbatim, silently corrupting every replica while the transfer itself
-/// succeeds (#6853). Plain signed payloads are the compatible default; the env
-/// knob restores trailer checksums for fleets whose targets are all known to
-/// decode them.
-fn replication_request_checksum_calculation() -> RequestChecksumCalculation {
-    if std::env::var(REPLICATION_STREAMING_CHECKSUMS_ENV)
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false)
-    {
-        RequestChecksumCalculation::WhenSupported
-    } else {
-        RequestChecksumCalculation::WhenRequired
-    }
-}
-
-fn validate_replication_target_endpoint(url: &Url) -> Result<(), OutboundUrlError> {
-    validate_replication_target_endpoint_inner(url, loopback_replication_targets_allowed())
-}
-
-fn validate_replication_target_endpoint_inner(url: &Url, allow_loopback: bool) -> Result<(), OutboundUrlError> {
-    match validate_outbound_url(url) {
-        Ok(()) => Ok(()),
-        // Replication targets are trusted infrastructure the operator configures, and
-        // legitimately live on private networks, so private addresses are always allowed.
-        Err(OutboundUrlError::ForbiddenHost {
-            reason: "private address",
-            ..
-        }) => Ok(()),
-        // Loopback is far higher SSRF risk, so it is allowed only under the explicit,
-        // off-by-default opt-in above (single-host multi-instance / the e2e harness).
-        Err(OutboundUrlError::ForbiddenHost {
-            reason: "loopback address" | "loopback host",
-            ..
-        }) if allow_loopback => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-fn build_insecure_aws_s3_http_client() -> SharedHttpClient {
-    ensure_rustls_crypto_provider();
-
-    let tls_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
-        .with_no_client_auth();
-
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    let mut client_builder = HyperClient::builder(TokioExecutor::new());
-    client_builder.pool_timer(TokioTimer::new());
-    let client = client_builder.build(https);
-    let connector = SharedHttpConnector::new(TargetHyperHttpConnector { client });
-
-    http_client_fn(move |_settings, _components| connector.clone())
-}
-
-fn validate_ca_pem_bundle(ca_cert_pem: &[u8]) -> Result<(), String> {
-    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(ca_cert_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("invalid PEM encoding: {err}"))?;
-
-    if certs.is_empty() {
-        return Err("no certificates found".to_string());
-    }
-
-    // Smithy's rustls adapter defers parsing custom certificates and assumes
-    // they are valid when the HTTPS connector is built. Validate every DER
-    // certificate first so malformed configuration is reported rather than
-    // reaching an `expect` in the dependency.
-    let mut validation_store = rustls::RootCertStore::empty();
-    for cert in certs {
-        validation_store
-            .add(cert)
-            .map_err(|err| format!("invalid X.509 certificate: {err}"))?;
-    }
-
-    Ok(())
-}
-
-fn validate_target_ca_pem(ca_cert_pem: &str) -> Result<(), BucketTargetError> {
-    validate_ca_pem_bundle(ca_cert_pem.as_bytes())
-        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))
-}
-
-fn compose_replication_trust_store(certificate_bundles: impl IntoIterator<Item = Vec<u8>>) -> (smithy_tls::TrustStore, usize) {
-    // `TrustStore::default()` keeps the platform-native roots enabled. Target
-    // and RUSTFS_TLS_PATH certificates extend that baseline instead of
-    // replacing it with a target-specific trust island.
-    let mut trust_store = smithy_tls::TrustStore::default();
-    let mut custom_bundle_count = 0;
-    for pem in certificate_bundles {
-        trust_store.add_pem_certificate(pem);
-        custom_bundle_count += 1;
-    }
-
-    (trust_store, custom_bundle_count)
-}
-
-fn build_aws_s3_http_client_with_trust_store(trust_store: smithy_tls::TrustStore) -> Result<SharedHttpClient, BucketTargetError> {
-    let tls_context = smithy_tls::TlsContext::builder()
-        .with_trust_store(trust_store)
-        .build()
-        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))?;
-
-    Ok(SmithyHttpClientBuilder::new()
-        .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
-        .tls_context(tls_context)
-        .build_https())
-}
-
-async fn load_tls_path_ca_bundles(tls_dir: &Path, trust_leaf_cert_as_ca: bool) -> Vec<Vec<u8>> {
-    let mut certificate_bundles = Vec::new();
-
-    let ca_path = tls_dir.join(RUSTFS_CA_CERT);
-    match tokio::fs::read(&ca_path).await {
-        Ok(pem) => match validate_ca_pem_bundle(&pem) {
-            Ok(()) => certificate_bundles.push(pem),
-            Err(err) => warn!("ignoring invalid custom CA bundle {:?} for replication client: {}", ca_path, err),
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => warn!("failed to read custom CA bundle {:?} for replication client: {}", ca_path, e),
-    }
-
-    if trust_leaf_cert_as_ca {
-        let leaf_cert_path = tls_dir.join(RUSTFS_TLS_CERT);
-        match tokio::fs::read(&leaf_cert_path).await {
-            Ok(pem) => match validate_ca_pem_bundle(&pem) {
-                Ok(()) => certificate_bundles.push(pem),
-                Err(err) => warn!(
-                    "ignoring invalid leaf certificate {:?} for replication client trust store: {}",
-                    leaf_cert_path, err
-                ),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!("failed to read leaf cert {:?} for replication client trust store: {}", leaf_cert_path, e),
-        }
-    }
-
-    certificate_bundles
-}
-
-async fn load_configured_tls_ca_bundles() -> Vec<Vec<u8>> {
-    let tls_path = rustfs_utils::get_env_str(rustfs_config::ENV_RUSTFS_TLS_PATH, rustfs_config::DEFAULT_RUSTFS_TLS_PATH);
-    if tls_path.is_empty() {
-        return Vec::new();
-    }
-
-    load_tls_path_ca_bundles(
-        Path::new(&tls_path),
-        rustfs_utils::get_env_bool(ENV_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_LEAF_CERT_AS_CA),
-    )
-    .await
-}
-
-async fn build_aws_s3_http_client_from_target_ca_pem(ca_cert_pem: &str) -> Result<SharedHttpClient, BucketTargetError> {
-    validate_target_ca_pem(ca_cert_pem)?;
-
-    let mut certificate_bundles = load_configured_tls_ca_bundles().await;
-    certificate_bundles.push(ca_cert_pem.as_bytes().to_vec());
-    let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
-
-    build_aws_s3_http_client_with_trust_store(trust_store)
-}
-
-async fn build_aws_s3_http_client_for_target(target: &BucketTarget) -> Result<Option<SharedHttpClient>, BucketTargetError> {
-    if !target.secure {
-        return Ok(None);
-    }
-
-    if target.skip_tls_verify {
-        return Ok(Some(build_insecure_aws_s3_http_client()));
-    }
-
-    if has_custom_ca_pem(target) {
-        return build_aws_s3_http_client_from_target_ca_pem(&target.ca_cert_pem)
-            .await
-            .map(Some);
-    }
-
-    Ok(build_aws_s3_http_client_from_tls_path().await)
-}
-
-async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::SharedHttpClient> {
-    let certificate_bundles = load_configured_tls_ca_bundles().await;
-    if certificate_bundles.is_empty() {
-        return None;
-    }
-
-    let (trust_store, _) = compose_replication_trust_store(certificate_bundles);
-    match build_aws_s3_http_client_with_trust_store(trust_store) {
-        Ok(client) => Some(client),
-        Err(e) => {
-            warn!("failed to build AWS SDK TLS context for replication client: {}", e);
-            None
-        }
-    }
-}
-
-fn should_force_path_style(target: &BucketTarget) -> bool {
-    match target.path.trim().to_ascii_lowercase().as_str() {
-        // Explicit DNS/virtual-hosted-style requested by user.
-        "dns" | "off" | "false" => false,
-        // Explicit path-style or legacy boolean-like values.
-        "path" | "on" | "true" => true,
-        // `auto` and empty are defaulted to path-style for custom S3-compatible endpoints.
-        "auto" | "" => true,
-        // Unknown values: prefer compatibility with S3-compatible services.
-        _ => true,
     }
 }
 
@@ -2707,7 +2306,24 @@ impl Error for BucketTargetError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::remote_s3_client::{
+        EXPIRED_REMOTE_TARGET_CREDENTIALS, RemoteTargetCredentialsProvider, build_aws_s3_http_client_for_spec,
+        build_aws_s3_http_client_from_target_ca_pem, build_aws_s3_http_client_with_trust_store,
+        build_insecure_aws_s3_http_client, compose_replication_trust_store, ensure_rustls_crypto_provider,
+        load_tls_path_ca_bundles, remote_sdk_credentials, replication_request_checksum_calculation,
+        validate_remote_endpoint_inner, validate_target_ca_pem,
+    };
+    use aws_credential_types::Credentials as SdkCredentials;
+    use aws_sdk_s3::Config as S3Config;
+    use aws_sdk_s3::config::{Region as SdkRegion, RequestChecksumCalculation, SharedCredentialsProvider, SharedHttpClient};
+    use aws_smithy_runtime_api::client::http::{
+        HttpConnector as SmithyHttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+    use aws_smithy_types::body::SdkBody;
     use rcgen::generate_simple_self_signed;
+    use rustfs_config::{RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
+    use rustfs_utils::egress::OutboundUrlError;
 
     // The startup panic fix for hosts without a CA bundle (issue #6734) rests
     // on two properties: the health-check client constructor never panics, and
@@ -2934,8 +2550,8 @@ mod tests {
             expiration: Some(jiff::Timestamp::try_from(expiration).expect("test expiration should convert")),
         };
 
-        let sdk_credentials =
-            remote_target_sdk_credentials(&credentials, "account", now).expect("unexpired temporary credentials should build");
+        let sdk_credentials = remote_sdk_credentials(&remote_credentials(&credentials, "account"), now)
+            .expect("unexpired temporary credentials should build");
 
         assert_eq!(sdk_credentials.session_token(), Some("temporary-session-token"));
         assert_eq!(sdk_credentials.expiry(), Some(expiration));
@@ -2951,7 +2567,7 @@ mod tests {
             expiration: Some("0001-01-01T00:00:00Z".parse().expect("Go zero time should parse")),
         };
 
-        let sdk_credentials = remote_target_sdk_credentials(&credentials, "", SystemTime::now())
+        let sdk_credentials = remote_sdk_credentials(&remote_credentials(&credentials, ""), SystemTime::now())
             .expect("Go zero expiration should remain compatible with static credentials");
 
         assert!(sdk_credentials.session_token().is_none());
@@ -2969,14 +2585,14 @@ mod tests {
         };
 
         assert_eq!(
-            remote_target_sdk_credentials(&credentials, "", SystemTime::UNIX_EPOCH + Duration::from_secs(1_000))
+            remote_sdk_credentials(&remote_credentials(&credentials, ""), SystemTime::UNIX_EPOCH + Duration::from_secs(1_000))
                 .expect_err("expiration without a session token must fail"),
             "remote target credential expiration requires a session token"
         );
 
         credentials.session_token = Some("temporary-session-token".to_string());
         assert_eq!(
-            remote_target_sdk_credentials(&credentials, "", expiration)
+            remote_sdk_credentials(&remote_credentials(&credentials, ""), expiration)
                 .expect_err("credentials expire at the exact expiration boundary"),
             EXPIRED_REMOTE_TARGET_CREDENTIALS
         );
@@ -3036,7 +2652,7 @@ mod tests {
             session_token: Some("temporary-session-token".to_string()),
             expiration: Some("2099-01-01T00:00:00Z".parse().expect("future expiration should parse")),
         };
-        let sdk_credentials = remote_target_sdk_credentials(&credentials, "", SystemTime::now())
+        let sdk_credentials = remote_sdk_credentials(&remote_credentials(&credentials, ""), SystemTime::now())
             .expect("unexpired temporary credentials should build");
         let client = S3Client::from_conf(
             S3Config::builder()
@@ -3211,6 +2827,46 @@ mod tests {
         assert!(!replication_target_versioning_enabled(None));
     }
 
+    #[test]
+    fn remote_endpoint_spec_from_target_keeps_legacy_path_style_and_trust_semantics() {
+        for (path, expected) in [
+            ("dns", PathStyle::VirtualHost),
+            ("OFF", PathStyle::VirtualHost),
+            ("false", PathStyle::VirtualHost),
+            ("path", PathStyle::Path),
+            ("on", PathStyle::Path),
+            ("true", PathStyle::Path),
+            (" auto ", PathStyle::Auto),
+            ("", PathStyle::Auto),
+            ("something-else", PathStyle::Path),
+        ] {
+            assert_eq!(target_path_style(path), expected, "path={path:?}");
+        }
+
+        let spec = RemoteS3EndpointSpec::from(&BucketTarget {
+            endpoint: "192.168.1.10:9000".to_string(),
+            secure: true,
+            region: "us-east-1".to_string(),
+            ca_cert_pem: "   ".to_string(),
+            reset_id: "reset-1".to_string(),
+            credentials: Some(Credentials {
+                access_key: "access".to_string(),
+                secret_key: "secret".to_string(),
+                session_token: Some("  ".to_string()),
+                expiration: Some("0001-01-01T00:00:00Z".parse().expect("Go zero time should parse")),
+            }),
+            ..Default::default()
+        });
+        assert_eq!(spec.endpoint_url(), "https://192.168.1.10:9000");
+        assert!(spec.ca_cert_pem.is_none(), "whitespace-only CA PEM means unset");
+        assert!(spec.connect_timeout.is_none() && spec.read_timeout.is_none());
+        assert_eq!(spec.user_agent_suffix, "");
+        let credentials = spec.credentials.expect("credentials carry over");
+        assert_eq!(credentials.account_id, "reset-1");
+        assert!(credentials.session_token.is_none(), "blank session token is absent");
+        assert!(credentials.expiration.is_none(), "Go zero expiration is absent");
+    }
+
     fn parse_url(raw: &str) -> Url {
         Url::parse(raw).expect("test URL should parse")
     }
@@ -3220,16 +2876,16 @@ mod tests {
         // Public hosts and private-network targets are allowed regardless of the
         // loopback opt-in — replication commonly runs across trusted private infra.
         for allow_loopback in [false, true] {
-            assert!(validate_replication_target_endpoint_inner(&parse_url("https://s3.example.com"), allow_loopback).is_ok());
-            assert!(validate_replication_target_endpoint_inner(&parse_url("http://10.0.0.5:9000"), allow_loopback).is_ok());
-            assert!(validate_replication_target_endpoint_inner(&parse_url("http://192.168.1.20"), allow_loopback).is_ok());
+            assert!(validate_remote_endpoint_inner(&parse_url("https://s3.example.com"), allow_loopback).is_ok());
+            assert!(validate_remote_endpoint_inner(&parse_url("http://10.0.0.5:9000"), allow_loopback).is_ok());
+            assert!(validate_remote_endpoint_inner(&parse_url("http://192.168.1.20"), allow_loopback).is_ok());
         }
     }
 
     #[test]
     fn replication_endpoint_rejects_loopback_without_opt_in() {
         // Default (production) behaviour: loopback IP and localhost host both rejected.
-        let err = validate_replication_target_endpoint_inner(&parse_url("http://127.0.0.1:9000"), false)
+        let err = validate_remote_endpoint_inner(&parse_url("http://127.0.0.1:9000"), false)
             .expect_err("loopback IP must be rejected by default");
         assert!(matches!(
             err,
@@ -3238,7 +2894,7 @@ mod tests {
                 ..
             }
         ));
-        let err = validate_replication_target_endpoint_inner(&parse_url("http://localhost:9000"), false)
+        let err = validate_remote_endpoint_inner(&parse_url("http://localhost:9000"), false)
             .expect_err("localhost must be rejected by default");
         assert!(matches!(
             err,
@@ -3253,15 +2909,15 @@ mod tests {
     fn replication_endpoint_allows_loopback_with_opt_in() {
         // e2e harness / single-host multi-instance: opt-in re-enables loopback in
         // both IP (127.0.0.1, ::1) and hostname (localhost) forms.
-        assert!(validate_replication_target_endpoint_inner(&parse_url("http://127.0.0.1:9000"), true).is_ok());
-        assert!(validate_replication_target_endpoint_inner(&parse_url("http://[::1]:9000"), true).is_ok());
-        assert!(validate_replication_target_endpoint_inner(&parse_url("http://localhost:9000"), true).is_ok());
+        assert!(validate_remote_endpoint_inner(&parse_url("http://127.0.0.1:9000"), true).is_ok());
+        assert!(validate_remote_endpoint_inner(&parse_url("http://[::1]:9000"), true).is_ok());
+        assert!(validate_remote_endpoint_inner(&parse_url("http://localhost:9000"), true).is_ok());
     }
 
     #[test]
     fn replication_endpoint_opt_in_does_not_open_other_ssrf_targets() {
         // The loopback opt-in must not widen into link-local / metadata endpoints.
-        let err = validate_replication_target_endpoint_inner(&parse_url("http://169.254.169.254/latest/meta-data"), true)
+        let err = validate_remote_endpoint_inner(&parse_url("http://169.254.169.254/latest/meta-data"), true)
             .expect_err("metadata endpoint must stay rejected even with loopback opt-in");
         assert!(matches!(
             err,
@@ -3270,7 +2926,7 @@ mod tests {
                 ..
             }
         ));
-        let err = validate_replication_target_endpoint_inner(&parse_url("http://[fe80::1]:9000"), true)
+        let err = validate_remote_endpoint_inner(&parse_url("http://[fe80::1]:9000"), true)
             .expect_err("link-local must stay rejected even with loopback opt-in");
         assert!(matches!(
             err,
@@ -4279,12 +3935,12 @@ mod tests {
 
     #[tokio::test]
     async fn skip_tls_verify_takes_priority_over_invalid_custom_ca_pem() {
-        let client = build_aws_s3_http_client_for_target(&BucketTarget {
+        let client = build_aws_s3_http_client_for_spec(&RemoteS3EndpointSpec::from(&BucketTarget {
             secure: true,
             skip_tls_verify: true,
             ca_cert_pem: "not a pem".to_string(),
             ..Default::default()
-        })
+        }))
         .await
         .expect("skip verification should bypass custom CA parsing");
 

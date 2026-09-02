@@ -199,6 +199,13 @@ pub mod bucket {
         }
     }
 
+    pub mod remote_s3_client {
+        pub use crate::bucket::remote_s3_client::{
+            PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, build_remote_s3_client,
+            validate_remote_endpoint,
+        };
+    }
+
     pub mod replication {
         pub use crate::bucket::replication::replication_pool::{
             DurableMrfBacklogSummary, DurableMrfBucketBacklog, DurableMrfTargetBacklog, MrfBacklogObservabilitySummary,
