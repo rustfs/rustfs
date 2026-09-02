@@ -41,7 +41,7 @@ mod storage_api;
 
 use storage_api::lifecycle::{
     BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskOption, ECStore,
-    EcstoreError, Endpoint, EndpointServerPools, Endpoints, IlmAction, LcEvent, LcEventSrc, ListOperations as _,
+    EcstoreError, Endpoint, EndpointServerPools, Endpoints, ExpiryState, IlmAction, LcEvent, LcEventSrc, ListOperations as _,
     MakeBucketOptions, MockWarmBackend, MultipartOperations as _, ObjectIO as _, ObjectOperations as _, PoolEndpoints,
     STORAGE_FORMAT_FILE, TRANSITION_PENDING, TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
     enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
@@ -1469,10 +1469,18 @@ mod serial_tests {
         let stale_remote_object = transitioned.transitioned_object.name.clone();
         assert!(backend.contains(&stale_remote_object).await);
 
-        ecstore
-            .delete_object(bucket_name.as_str(), object_name, ObjectOptions::default())
+        ExpiryState::resize_workers(1, ecstore.clone()).await;
+        let remove_barrier = backend.arm_failing_remove_barrier().await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ecstore.delete_object(bucket_name.as_str(), object_name, ObjectOptions::default()),
+        )
+        .await
+        .expect("DeleteObject must not wait for asynchronous remote-tier cleanup")
+        .expect("Failed to delete transitioned object before scanner fallback");
+        tokio::time::timeout(Duration::from_secs(5), remove_barrier.wait_until_paused())
             .await
-            .expect("Failed to delete transitioned object without expiry workers");
+            .expect("the immediate free-version worker should reach the injected remote DELETE barrier");
 
         assert!(
             free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await > 0,
@@ -1483,8 +1491,12 @@ mod serial_tests {
             "stale transitioned remote object should still exist before scanner fallback runs"
         );
 
-        init_background_expiry(ecstore.clone()).await;
+        // Queue the scanner fallback while the causal task is still blocked.
+        // Releasing the barrier fails only that first task, so the queued
+        // scanner task can prove durable-marker recovery on a healthy backend.
         scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
+        remove_barrier.release();
+        remove_barrier.wait_until_operation_dropped().await;
 
         assert!(
             backend
@@ -1531,10 +1543,18 @@ mod serial_tests {
         let stale_remote_object = transitioned.transitioned_object.name.clone();
         assert!(backend.contains(&stale_remote_object).await);
 
-        ecstore
-            .delete_object(bucket_name.as_str(), object_name, ObjectOptions::default())
+        ExpiryState::resize_workers(1, ecstore.clone()).await;
+        let remove_barrier = backend.arm_failing_remove_barrier().await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ecstore.delete_object(bucket_name.as_str(), object_name, ObjectOptions::default()),
+        )
+        .await
+        .expect("DeleteObject must not wait for asynchronous remote-tier cleanup")
+        .expect("Failed to delete transitioned object after compensation-driven transition");
+        tokio::time::timeout(Duration::from_secs(5), remove_barrier.wait_until_paused())
             .await
-            .expect("Failed to delete transitioned object after compensation-driven transition");
+            .expect("the immediate free-version worker should reach the injected remote DELETE barrier");
 
         assert!(
             free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await > 0,
@@ -1545,8 +1565,12 @@ mod serial_tests {
             "stale transitioned remote object should still exist before scanner cleanup runs"
         );
 
-        init_background_expiry(ecstore.clone()).await;
+        // Enqueue the scanner fallback before the first, causal cleanup task is
+        // released into its injected failure. This keeps attribution
+        // deterministic and proves the durable marker drives convergence.
         scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
+        remove_barrier.release();
+        remove_barrier.wait_until_operation_dropped().await;
 
         assert!(
             backend

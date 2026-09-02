@@ -4173,13 +4173,19 @@ impl ECStore {
         &self,
         bucket: &str,
         object: &str,
-        mut opts: ObjectOptions,
+        opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> Result<ObjectInfo> {
-        let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
-        let result = Box::pin(self.handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api)).await;
-        enqueue_recorded_tier_free_versions(self, receipt_sink).await;
-        result
+        Box::pin(async move {
+            let mut opts = opts;
+            let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
+            let result = self
+                .handle_delete_object_with_journal_inner(bucket, object, opts, tier_journal_api)
+                .await;
+            enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+            result
+        })
+        .await
     }
 
     async fn handle_delete_object_with_journal_inner(
@@ -4555,14 +4561,19 @@ impl ECStore {
         &self,
         bucket: &str,
         objects: Vec<ObjectToDelete>,
-        mut opts: ObjectOptions,
+        opts: ObjectOptions,
         tier_journal_api: Option<Arc<ECStore>>,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
-        let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
-        let result =
-            Box::pin(self.handle_delete_objects_with_journal_and_accounting_inner(bucket, objects, opts, tier_journal_api)).await;
-        enqueue_recorded_tier_free_versions(self, receipt_sink).await;
-        result
+        Box::pin(async move {
+            let mut opts = opts;
+            let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
+            let result = self
+                .handle_delete_objects_with_journal_and_accounting_inner(bucket, objects, opts, tier_journal_api)
+                .await;
+            enqueue_recorded_tier_free_versions(self, receipt_sink).await;
+            result
+        })
+        .await
     }
 
     async fn handle_delete_objects_with_journal_and_accounting_inner(
@@ -7565,6 +7576,15 @@ mod tests {
             "unified delete handler future must remain stack-bounded; measured {unified_future_size} bytes"
         );
         drop(unified_future);
+
+        let batch_future =
+            store.handle_delete_objects_with_journal_and_accounting("bucket", Vec::new(), ObjectOptions::default(), None);
+        let batch_future_size = std::mem::size_of_val(&batch_future);
+        assert!(
+            batch_future_size <= 4 * 1024,
+            "batch delete handler future must remain stack-bounded; measured {batch_future_size} bytes"
+        );
+        drop(batch_future);
 
         let outer_future = store.handle_delete_object("bucket", "object", ObjectOptions::default());
         let outer_future_size = std::mem::size_of_val(&outer_future);

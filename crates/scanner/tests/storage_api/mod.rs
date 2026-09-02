@@ -15,7 +15,9 @@
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::transition_transaction::recover_transition_transaction_records;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::{
     bucket_lifecycle_audit::LcEventSrc,
-    bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, expire_transitioned_object, init_background_expiry},
+    bucket_lifecycle_ops::{
+        ExpiryState, enqueue_transition_for_existing_objects, expire_transitioned_object, init_background_expiry,
+    },
     lifecycle::{Event as LcEvent, IlmAction, TRANSITION_PENDING, TransitionOptions},
 };
 pub(crate) use rustfs_ecstore::api::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
@@ -46,8 +48,8 @@ pub(crate) mod lifecycle {
 
     pub(crate) use super::{
         BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskOption, ECStore, EcstoreError, Endpoint, EndpointServerPools,
-        Endpoints, IlmAction, LcEvent, LcEventSrc, MockWarmBackend, PoolEndpoints, STORAGE_FORMAT_FILE, TRANSITION_PENDING,
-        TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
+        Endpoints, ExpiryState, IlmAction, LcEvent, LcEventSrc, MockWarmBackend, PoolEndpoints, STORAGE_FORMAT_FILE,
+        TRANSITION_PENDING, TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
         enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
         get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
         is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_transition_transaction_records,
