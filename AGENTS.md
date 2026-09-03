@@ -162,6 +162,12 @@ Risk and review shape:
   S3-visible semantics. Cover all applicable lenses using exactly two
   independent reviewers when delegation is explicitly authorized. Split the
   lenses between them. Otherwise perform two fresh sequential passes.
+- **Outbound client defaults:** what `TargetClient`, `PutObjectOptions`, or
+  the remote SDK configuration sends to every replication or migration target
+  is high risk for every target class even when the change fixes one. Follow
+  the SOP in `docs/postmortems/2026-09-03-replication-checksum-default-regression.md`:
+  run the outbound target matrix, document each new env knob in the same PR,
+  and list verified and unverified target classes in the PR Impact section.
 
 Available domain lenses are security, concurrency/durability, compatibility,
 and performance. Select `.agents/skills/adversarial-validation/SKILL.md` for an
