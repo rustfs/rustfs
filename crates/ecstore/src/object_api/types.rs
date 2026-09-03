@@ -19,6 +19,7 @@ use crate::storage_api_contracts::{
         HTTPPreconditions, ObjectLockRetentionOptions, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
     },
 };
+use sha2::{Digest, Sha256};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard};
@@ -285,7 +286,7 @@ pub struct QuotaAdmission {
 pub struct LifecycleDeleteAllRequest {
     pub(crate) version_id: Option<Uuid>,
     pub(crate) delete_marker: bool,
-    pub(crate) action: rustfs_scanner_contracts::metrics::IlmAction,
+    pub(crate) action: rustfs_scanner_metrics::metrics::IlmAction,
     pub(crate) rule_id: String,
     pub(crate) phase: LifecycleDeleteAllPhase,
 }
@@ -980,6 +981,13 @@ pub struct ObjectOptions {
     pub lifecycle_audit_event: LcAuditEvent,
 
     pub eval_metadata: Option<HashMap<String, String>>,
+    /// Internal compare-and-set condition for replication workers publishing
+    /// terminal status after remote I/O. Storage validates it while holding
+    /// the object write lock so an older worker cannot overwrite a newer
+    /// mutation's PENDING state. Keep the condition boxed because
+    /// `ObjectOptions` is passed by value through deep storage futures.
+    #[doc(hidden)]
+    pub replication_status_writeback: Option<Box<ReplicationStatusWritebackCondition>>,
     pub object_lock_retention: Option<ObjectLockRetentionOptions>,
     pub object_lock_delete: Option<crate::storage_api_contracts::object::ObjectLockDeleteOptions>,
     /// Authoritative bucket Object Lock snapshot installed inside `ECStore`
@@ -998,6 +1006,21 @@ pub struct ObjectOptions {
     /// publish is fenced namespace-first and then by decommission capacity.
     #[doc(hidden)]
     pub decommission_capacity_admission: Option<Arc<crate::store::ECStore>>,
+}
+
+#[derive(Clone, Debug, Default)]
+#[doc(hidden)]
+pub struct ReplicationStatusWritebackCondition {
+    pub(crate) expected_generation: ReplicationGenerationSnapshot,
+    pub(crate) mode: ReplicationStatusWritebackMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum ReplicationStatusWritebackMode {
+    #[default]
+    Update,
+    ValidateOnly,
 }
 
 impl ObjectOptions {
@@ -1086,6 +1109,7 @@ impl std::fmt::Debug for ObjectOptions {
                     || !self.lifecycle_audit_event.event.storage_class.is_empty()),
             )
             .field("eval_metadata_count", &self.eval_metadata.as_ref().map(HashMap::len))
+            .field("replication_status_writeback", &self.replication_status_writeback.is_some())
             .field("object_lock_retention", &self.object_lock_retention.is_some())
             .field("object_lock_delete", &self.object_lock_delete)
             .field("object_lock_config_snapshot", &self.object_lock_config_snapshot.is_some())
@@ -1281,6 +1305,32 @@ impl ObjectOptions {
     }
 }
 
+fn replication_snapshot_internal_value(
+    metadata: &HashMap<String, String>,
+    suffix: &str,
+) -> std::result::Result<Option<String>, ()> {
+    match rustfs_utils::http::get_consistent_str(metadata, suffix) {
+        Some(value) => Ok(Some(value.to_string())),
+        None if rustfs_utils::http::contains_key_str(metadata, suffix) => Err(()),
+        None => Ok(None),
+    }
+}
+
+fn update_replication_fingerprint_bytes(hasher: &mut Sha256, value: &[u8]) {
+    let len = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    hasher.update(len.to_le_bytes());
+    hasher.update(value);
+}
+
+fn update_replication_fingerprint_optional_str(hasher: &mut Sha256, value: Option<&str>) {
+    if let Some(value) = value {
+        hasher.update([1]);
+        update_replication_fingerprint_bytes(hasher, value.as_bytes());
+    } else {
+        hasher.update([0]);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ObjectInfo {
     pub bucket: String,
@@ -1369,6 +1419,144 @@ impl Clone for ObjectInfo {
 }
 
 impl ObjectInfo {
+    /// Capture the source mutation snapshot used by replication workers when
+    /// publishing terminal status. The semantic fingerprint is recomputed at
+    /// the storage CAS boundary, so an older writer that preserves an unknown
+    /// UUID and collides on the timestamp still cannot hide a payload change.
+    pub(crate) fn replication_generation_snapshot(&self) -> ReplicationGenerationSnapshot {
+        let timestamp = replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP);
+        let mutation_id =
+            replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_GENERATION);
+        let tagging_timestamp =
+            replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_TAGGING_TIMESTAMP);
+        let retention_timestamp =
+            replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP);
+        let legalhold_timestamp =
+            replication_snapshot_internal_value(&self.user_defined, rustfs_utils::http::SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP);
+
+        let invalid = timestamp.is_err()
+            || mutation_id.is_err()
+            || tagging_timestamp.is_err()
+            || retention_timestamp.is_err()
+            || legalhold_timestamp.is_err();
+        let timestamp = timestamp.unwrap_or_default();
+        let mutation_id = mutation_id.unwrap_or_default();
+        let tagging_timestamp = tagging_timestamp.unwrap_or_default();
+        let retention_timestamp = retention_timestamp.unwrap_or_default();
+        let legalhold_timestamp = legalhold_timestamp.unwrap_or_default();
+        let opaque_timestamp_is_invalid = [
+            timestamp.as_deref(),
+            tagging_timestamp.as_deref(),
+            retention_timestamp.as_deref(),
+            legalhold_timestamp.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(str::is_empty);
+        let mutation_id_is_invalid = mutation_id.as_deref().is_some_and(|value| {
+            Uuid::parse_str(value)
+                .ok()
+                .filter(|generation| !generation.is_nil())
+                .is_none()
+        });
+        let invalid =
+            invalid || opaque_timestamp_is_invalid || mutation_id_is_invalid || (mutation_id.is_some() && timestamp.is_none());
+
+        let payload_fingerprint = (!invalid).then(|| {
+            self.replication_payload_fingerprint(
+                tagging_timestamp.as_deref(),
+                retention_timestamp.as_deref(),
+                legalhold_timestamp.as_deref(),
+            )
+        });
+
+        ReplicationGenerationSnapshot {
+            timestamp,
+            mutation_id,
+            payload_fingerprint,
+            invalid,
+        }
+    }
+
+    fn replication_payload_fingerprint(
+        &self,
+        tagging_timestamp: Option<&str>,
+        retention_timestamp: Option<&str>,
+        legalhold_timestamp: Option<&str>,
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"rustfs-replication-payload-v1");
+
+        // A suspended bucket's current null version is represented as
+        // `Some(Uuid::nil())` at the request/queue boundary and as `None`
+        // when the same xl.meta is reread without versioning flags. They are
+        // one persisted identity, so do not let that representation detail
+        // make a worker permanently supersede its own terminal write-back.
+        if let Some(version_id) = self.version_id.filter(|version_id| !version_id.is_nil()) {
+            hasher.update([1]);
+            hasher.update(version_id.as_bytes());
+        } else {
+            hasher.update([0]);
+        }
+        if let Some(data_dir) = self.data_dir {
+            hasher.update([1]);
+            hasher.update(data_dir.as_bytes());
+        } else {
+            hasher.update([0]);
+        }
+        if let Some(mod_time) = self.mod_time {
+            hasher.update([1]);
+            hasher.update(mod_time.unix_timestamp_nanos().to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+
+        update_replication_fingerprint_optional_str(&mut hasher, self.content_type.as_deref());
+        update_replication_fingerprint_optional_str(&mut hasher, self.content_encoding.as_deref());
+        update_replication_fingerprint_optional_str(&mut hasher, self.storage_class.as_deref());
+        if let Some(expires) = self.expires {
+            hasher.update([1]);
+            hasher.update(expires.unix_timestamp_nanos().to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+        update_replication_fingerprint_bytes(&mut hasher, self.user_tags.as_bytes());
+        update_replication_fingerprint_optional_str(&mut hasher, tagging_timestamp);
+        update_replication_fingerprint_optional_str(&mut hasher, retention_timestamp);
+        update_replication_fingerprint_optional_str(&mut hasher, legalhold_timestamp);
+
+        let mut target_arns = self
+            .replication_status_internal
+            .as_deref()
+            .map(replication_statuses_map)
+            .unwrap_or_default()
+            .into_keys()
+            .collect::<Vec<_>>();
+        target_arns.sort_unstable();
+        hasher.update(u64::try_from(target_arns.len()).unwrap_or(u64::MAX).to_le_bytes());
+        for arn in target_arns {
+            update_replication_fingerprint_bytes(&mut hasher, arn.as_bytes());
+        }
+        update_replication_fingerprint_bytes(&mut hasher, self.replication_decision.as_bytes());
+
+        let mut user_metadata = self
+            .user_defined
+            .iter()
+            .filter(|(key, _)| {
+                !rustfs_utils::http::is_internal_key(key)
+                    && !key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS)
+            })
+            .collect::<Vec<_>>();
+        user_metadata.sort_unstable_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
+        hasher.update(u64::try_from(user_metadata.len()).unwrap_or(u64::MAX).to_le_bytes());
+        for (key, value) in user_metadata {
+            update_replication_fingerprint_bytes(&mut hasher, key.as_bytes());
+            update_replication_fingerprint_bytes(&mut hasher, value.as_bytes());
+        }
+
+        hasher.finalize().into()
+    }
+
     pub fn is_compressed(&self) -> bool {
         rustfs_utils::http::contains_key_str(&self.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
     }
@@ -2000,6 +2188,13 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_status_writeback_condition_remains_indirected() {
+        fn assert_indirected(_: &Option<Box<ReplicationStatusWritebackCondition>>) {}
+
+        assert_indirected(&ObjectOptions::default().replication_status_writeback);
+    }
 
     #[test]
     fn object_lock_config_snapshot_is_bound_to_store_bucket_and_incarnation() {

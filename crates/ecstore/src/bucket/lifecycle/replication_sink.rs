@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_scanner_contracts::metrics::IlmAction;
+use rustfs_scanner_metrics::metrics::IlmAction;
 
 use crate::bucket::lifecycle::lifecycle::ObjectOpts;
 use crate::bucket::replication::ReplicationLifecycleBridge;
@@ -77,7 +77,7 @@ mod tests {
     use crate::bucket::replication::{DeleteReplicationConfigSnapshot, ReplicationObjectBridge};
     use crate::object_api::{ObjectInfo, ObjectOptions};
     use crate::storage_api_contracts::object::ObjectToDelete;
-    use rustfs_scanner_contracts::metrics::IlmAction;
+    use rustfs_scanner_metrics::metrics::IlmAction;
     use s3s::dto::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteReplication,
         DeleteReplicationStatus, Destination, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,

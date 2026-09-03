@@ -14,7 +14,7 @@
 
 use crate::erasure::codec::workspace::RustfsCodecDecodeWorkspace;
 use crate::erasure::coding::Erasure;
-use reed_solomon_erasure::galois_8::ReedSolomon;
+use rustfs_erasure_codec::galois_8::ReedSolomon;
 use std::io;
 use std::sync::{Arc, OnceLock};
 

@@ -97,6 +97,63 @@ const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 512 * 1024;
 const EVENT_LIFECYCLE_TRANSITION_CLEANUP: &str = "lifecycle_transition_cleanup";
 const EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER: &str = "lifecycle_transitioned_delete_cleanup_owner";
 
+fn replication_status_writeback_is_current(object_info: &ObjectInfo, condition: &ReplicationStatusWritebackCondition) -> bool {
+    let current = object_info.replication_generation_snapshot();
+    !condition.expected_generation.invalid && !current.invalid && current == condition.expected_generation
+}
+
+/// Merge storage-authored evaluated metadata without leaving compatibility
+/// aliases from an older writer behind. Existing objects can contain a single
+/// mixed-case MinIO key; blindly inserting lowercase dual aliases would make
+/// strict generation reads observe conflicting values forever.
+fn merge_evaluated_metadata(metadata: &mut HashMap<String, String>, evaluated: &HashMap<String, String>) -> Result<bool> {
+    let mut internal_updates = std::collections::BTreeMap::<String, (String, String, bool)>::new();
+    let mut ordinary_updates = Vec::new();
+
+    for (key, value) in evaluated {
+        let Some(suffix) = rustfs_utils::http::strip_internal_prefix_preserving_case(key) else {
+            ordinary_updates.push((key, value));
+            continue;
+        };
+        let normalized_suffix = suffix.to_ascii_lowercase();
+        let rustfs_preferred = rustfs_utils::http::starts_with_ignore_ascii_case(key, rustfs_utils::http::RUSTFS_INTERNAL_PREFIX);
+        match internal_updates.entry(normalized_suffix) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((suffix.to_string(), value.clone(), rustfs_preferred));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().1 != *value {
+                    return Err(Error::other("conflicting evaluated internal metadata aliases"));
+                }
+                if rustfs_preferred && !entry.get().2 {
+                    entry.insert((suffix.to_string(), value.clone(), true));
+                }
+            }
+        }
+    }
+
+    for (key, value) in ordinary_updates {
+        metadata.insert(key.clone(), value.clone());
+    }
+    for (suffix, value, _) in internal_updates.values() {
+        rustfs_utils::http::remove_str(metadata, suffix);
+        // `remove_str` is optimized for canonical lowercase suffixes. Retain
+        // this exact fallback for dynamic suffixes whose identifier casing is
+        // significant (for example replication-reset target ARNs).
+        metadata.retain(|key, _| {
+            !rustfs_utils::http::strip_internal_prefix_preserving_case(key)
+                .is_some_and(|existing| existing.eq_ignore_ascii_case(suffix))
+        });
+        rustfs_utils::http::insert_str(metadata, suffix, value.clone());
+    }
+
+    Ok(!internal_updates.is_empty())
+}
+
+fn rebuild_file_info_replication_state(fi: &mut FileInfo) {
+    fi.replication_state_internal = rustfs_filemeta::get_internal_replication_state(&fi.metadata);
+}
+
 fn is_get_mid_size_streaming_enabled() -> bool {
     #[cfg(test)]
     {
@@ -239,7 +296,10 @@ use crate::disk::new_disk;
 use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
 use crate::error::is_err_invalid_upload_id;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
-use crate::object_api::{NamespaceLockFence, SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY};
+use crate::object_api::{
+    NamespaceLockFence, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode,
+    SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY,
+};
 use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
 use crate::set_disk::core::io_primitives::{RenameTailCleanup, finish_rename_tail_heal};
@@ -440,6 +500,253 @@ fn take_scanner_publication_lease_tokens(user_defined: &mut HashMap<String, Stri
         tokens.insert(host, token);
     }
     Ok(Some(tokens))
+}
+
+#[cfg(test)]
+mod replication_status_writeback_tests {
+    use super::*;
+
+    #[test]
+    fn replication_status_writeback_matches_exact_raw_generation() {
+        let mut metadata = HashMap::new();
+        let generation = "2026-09-02T12:34:56.123456789+08:00[Asia/Shanghai]";
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP, generation.to_string());
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+            Uuid::from_u128(1).to_string(),
+        );
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        let expected_generation = object_info.replication_generation_snapshot();
+
+        assert!(replication_status_writeback_is_current(
+            &object_info,
+            &ReplicationStatusWritebackCondition {
+                expected_generation: expected_generation.clone(),
+                ..Default::default()
+            }
+        ));
+        let mut stale_generation = expected_generation;
+        stale_generation.timestamp = Some("2026-09-02T04:34:56.123456789Z".to_string());
+        assert!(!replication_status_writeback_is_current(
+            &object_info,
+            &ReplicationStatusWritebackCondition {
+                expected_generation: stale_generation,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn replication_status_writeback_distinguishes_legacy_absence() {
+        let object_info = ObjectInfo::default();
+        let expected_generation = object_info.replication_generation_snapshot();
+        assert!(replication_status_writeback_is_current(
+            &object_info,
+            &ReplicationStatusWritebackCondition {
+                expected_generation: expected_generation.clone(),
+                ..Default::default()
+            }
+        ));
+        let mut newer = expected_generation;
+        newer.timestamp = Some("newer".to_string());
+        assert!(!replication_status_writeback_is_current(
+            &object_info,
+            &ReplicationStatusWritebackCondition {
+                expected_generation: newer,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn replication_status_writeback_normalizes_suspended_null_version_identity() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+            "opaque-null-version-time".to_string(),
+        );
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+            Uuid::from_u128(1).to_string(),
+        );
+        let queued = ObjectInfo {
+            version_id: Some(Uuid::nil()),
+            user_defined: Arc::new(metadata),
+            ..Default::default()
+        };
+        let expected_generation = queued.replication_generation_snapshot();
+
+        let mut reread = queued;
+        reread.version_id = None;
+        assert!(replication_status_writeback_is_current(
+            &reread,
+            &ReplicationStatusWritebackCondition {
+                expected_generation: expected_generation.clone(),
+                ..Default::default()
+            }
+        ));
+
+        reread.version_id = Some(Uuid::from_u128(2));
+        assert!(!replication_status_writeback_is_current(
+            &reread,
+            &ReplicationStatusWritebackCondition {
+                expected_generation,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn replication_status_writeback_rejects_conflicting_or_invalid_generation_aliases() {
+        let timestamp_key = format!(
+            "{}{}",
+            rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP
+        );
+        let timestamp_alias = format!(
+            "{}{}",
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP
+        );
+        let generation_key = format!(
+            "{}{}",
+            rustfs_utils::http::RUSTFS_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_GENERATION
+        );
+        let generation_alias = format!(
+            "{}{}",
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_GENERATION
+        );
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([
+                (timestamp_key, "same".to_string()),
+                (timestamp_alias, "different".to_string()),
+                (generation_key, Uuid::from_u128(1).to_string()),
+                (generation_alias, "not-a-uuid".to_string()),
+            ])),
+            ..Default::default()
+        };
+        let invalid = object_info.replication_generation_snapshot();
+        assert!(invalid.invalid);
+        assert!(!replication_status_writeback_is_current(
+            &object_info,
+            &ReplicationStatusWritebackCondition {
+                expected_generation: invalid,
+                ..Default::default()
+            }
+        ));
+    }
+
+    #[test]
+    fn replication_status_writeback_accepts_single_compatibility_alias_and_rejects_empty_values() {
+        let timestamp_alias = format!(
+            "{}{}",
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP
+        );
+        let generation_alias = format!(
+            "{}{}",
+            rustfs_utils::http::MINIO_INTERNAL_PREFIX,
+            rustfs_utils::http::SUFFIX_REPLICATION_GENERATION
+        );
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([
+                (timestamp_alias, "raw-minio-time".to_string()),
+                (generation_alias.clone(), Uuid::from_u128(1).to_string()),
+            ])),
+            ..Default::default()
+        };
+        let expected_generation = object_info.replication_generation_snapshot();
+        assert!(!expected_generation.invalid);
+        assert!(replication_status_writeback_is_current(
+            &object_info,
+            &ReplicationStatusWritebackCondition {
+                expected_generation,
+                ..Default::default()
+            }
+        ));
+
+        let invalid_object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([(generation_alias, String::new())])),
+            ..Default::default()
+        };
+        let invalid = invalid_object_info.replication_generation_snapshot();
+        assert!(invalid.invalid);
+        assert!(!replication_status_writeback_is_current(
+            &invalid_object_info,
+            &ReplicationStatusWritebackCondition {
+                expected_generation: invalid,
+                ..Default::default()
+            }
+        ));
+
+        for suffix in [
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+            rustfs_utils::http::SUFFIX_TAGGING_TIMESTAMP,
+            rustfs_utils::http::SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+            rustfs_utils::http::SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
+        ] {
+            let mut metadata = HashMap::new();
+            rustfs_utils::http::insert_str(&mut metadata, suffix, String::new());
+            let invalid_object_info = ObjectInfo {
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            };
+            let invalid = invalid_object_info.replication_generation_snapshot();
+            assert!(invalid.invalid, "empty {suffix} must fail closed");
+            assert!(!replication_status_writeback_is_current(
+                &invalid_object_info,
+                &ReplicationStatusWritebackCondition {
+                    expected_generation: invalid,
+                    ..Default::default()
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn replication_payload_fingerprint_tracks_target_admission_not_status_value() {
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP, "same".to_string());
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+            Uuid::from_u128(1).to_string(),
+        );
+        let pending = ObjectInfo {
+            user_defined: Arc::new(metadata),
+            replication_status_internal: Some("arn:a=PENDING;".to_string()),
+            ..Default::default()
+        };
+        let expected_generation = pending.replication_generation_snapshot();
+
+        let mut same_targets = pending.clone();
+        same_targets.replication_status_internal = Some("arn:a=FAILED;".to_string());
+        assert!(replication_status_writeback_is_current(
+            &same_targets,
+            &ReplicationStatusWritebackCondition {
+                expected_generation: expected_generation.clone(),
+                ..Default::default()
+            }
+        ));
+
+        let mut different_targets = pending;
+        different_targets.replication_status_internal = Some("arn:b=PENDING;".to_string());
+        assert!(!replication_status_writeback_is_current(
+            &different_targets,
+            &ReplicationStatusWritebackCondition {
+                expected_generation,
+                ..Default::default()
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -861,7 +1168,7 @@ mod lifecycle_delete_all_plan_tests {
         crate::object_api::LifecycleDeleteAllRequest {
             version_id: Some(version_id),
             delete_marker: true,
-            action: rustfs_scanner_contracts::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
+            action: rustfs_scanner_metrics::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
             rule_id: "rule".to_string(),
             phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
         }
@@ -1054,7 +1361,7 @@ mod lifecycle_delete_all_plan_tests {
         let request = crate::object_api::LifecycleDeleteAllRequest {
             version_id: None,
             delete_marker: false,
-            action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
+            action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
             rule_id: "rule".to_string(),
             phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
         };
@@ -3110,9 +3417,7 @@ impl SetDisks {
         let expected_restore_operation_id = restore_commit_operation_id_from_metadata(&opts.user_defined)?;
         let mut user_defined = opts.user_defined.clone();
         if let Some(eval_metadata) = &opts.eval_metadata {
-            for (key, value) in eval_metadata {
-                user_defined.insert(key.clone(), value.clone());
-            }
+            merge_evaluated_metadata(&mut user_defined, eval_metadata)?;
         }
         let scanner_publication_lease_tokens = take_scanner_publication_lease_tokens(&mut user_defined)?;
         if replication_lww_applicable(opts) {
@@ -6679,10 +6984,10 @@ impl SetDisks {
             .into_owned();
 
         fi.metadata.insert(AMZ_OBJECT_TAGGING.to_owned(), tags.to_owned());
-        if let Some(eval_metadata) = &opts.eval_metadata {
-            for (key, value) in eval_metadata {
-                fi.metadata.insert(key.clone(), value.clone());
-            }
+        if let Some(eval_metadata) = &opts.eval_metadata
+            && merge_evaluated_metadata(&mut fi.metadata, eval_metadata)?
+        {
+            rebuild_file_info_replication_state(&mut fi);
         }
         fi.acknowledge_data_movement();
 
@@ -8239,12 +8544,18 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
-        self.invalidate_get_object_metadata_cache(bucket, object).await;
+        let replication_validate_only = opts
+            .replication_status_writeback
+            .as_ref()
+            .is_some_and(|condition| condition.mode == ReplicationStatusWritebackMode::ValidateOnly);
+        if !replication_validate_only {
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
+        }
 
         // Guard lock for metadata update
         #[cfg(any(test, feature = "test-util"))]
         pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeMetadata).await;
-        let _lock_guard = if !opts.no_lock {
+        let _lock_guard = if !opts.no_lock || opts.replication_status_writeback.is_some() {
             Some(self.acquire_write_lock_diag("put_object_metadata", bucket, object).await?)
         } else {
             None
@@ -8263,6 +8574,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&metas, &errs, self.default_parity_count) {
             Ok((read_quorum, write_quorum)) => (read_quorum, write_quorum),
             Err(mut err) => {
+                // A replication terminal CAS is a validation/write-back
+                // attempt, never a heal operation. In particular,
+                // ValidateOnly must remain zero-write, and a worker whose
+                // outer replication lease is already lost must not delete the
+                // surviving xl.meta copies before the namespace fence below
+                // can reject it. Leave dangling cleanup to heal/scanner.
+                if opts.replication_status_writeback.is_some() {
+                    return Err(to_object_err(err.into(), vec![bucket, object]));
+                }
                 if err == DiskError::ErasureReadQuorum
                     && !bucket.starts_with(RUSTFS_META_BUCKET)
                     && self
@@ -8295,26 +8615,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
+        if opts
+            .replication_status_writeback
+            .as_ref()
+            .is_some_and(|condition| !replication_status_writeback_is_current(&obj_info, condition))
+        {
+            return Err(Error::PreconditionFailed);
+        }
+
         check_object_lock_retention_update(bucket, object, &obj_info, opts)?;
-
-        for (k, v) in obj_info.user_defined.iter() {
-            fi.metadata.insert(k.clone(), v.clone());
-        }
-
-        if let Some(mt) = &opts.eval_metadata {
-            for (k, v) in mt {
-                fi.metadata.insert(k.clone(), v.clone());
-            }
-        }
-
-        fi.acknowledge_data_movement();
-
-        if opts.mod_time.is_some() {
-            fi.mod_time = opts.mod_time;
-        }
-        if let Some(ref version_id) = opts.version_id {
-            fi.version_id = Uuid::parse_str(version_id).ok();
-        }
 
         if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id {
             self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
@@ -8336,6 +8645,29 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 required: 1,
                 achieved: 0,
             });
+        }
+
+        if replication_validate_only {
+            return Ok(obj_info);
+        }
+
+        for (k, v) in obj_info.user_defined.iter() {
+            fi.metadata.insert(k.clone(), v.clone());
+        }
+
+        if let Some(mt) = &opts.eval_metadata
+            && merge_evaluated_metadata(&mut fi.metadata, mt)?
+        {
+            rebuild_file_info_replication_state(&mut fi);
+        }
+
+        fi.acknowledge_data_movement();
+
+        if opts.mod_time.is_some() {
+            fi.mod_time = opts.mod_time;
+        }
+        if let Some(ref version_id) = opts.version_id {
+            fi.version_id = Uuid::parse_str(version_id).ok();
         }
 
         self.update_object_meta(bucket, object, fi.clone(), &online_disks)
@@ -11407,6 +11739,693 @@ mod metadata_mutation_generation_tests {
             set_disks.get_object_metadata_cache.get(key).await.is_none(),
             "the mutation must physically retire the prior metadata generation"
         );
+    }
+
+    fn replication_metadata(timestamp: Option<&str>, mutation_id: Option<&str>, status: &str) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        if let Some(timestamp) = timestamp {
+            rustfs_utils::http::insert_str(
+                &mut metadata,
+                rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+                timestamp.to_string(),
+            );
+        }
+        if let Some(mutation_id) = mutation_id {
+            rustfs_utils::http::insert_str(
+                &mut metadata,
+                rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+                mutation_id.to_string(),
+            );
+        }
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICATION_STATUS, status.to_string());
+        metadata
+    }
+
+    async fn seed_single_mixed_case_minio_generation(
+        set_disks: &Arc<SetDisks>,
+        bucket: &str,
+        object: &str,
+        category_suffix: &str,
+        category_key: &str,
+    ) {
+        let mut reader = PutObjReader::from_vec(format!("payload for {object}").into_bytes());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let (mut fi, _, disks) = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("source file metadata should be readable")
+            .into_owned();
+        for suffix in [
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            category_suffix,
+        ] {
+            rustfs_utils::http::remove_str(&mut fi.metadata, suffix);
+        }
+        fi.metadata
+            .insert("X-Minio-Internal-Replication-Timestamp".to_string(), "2026-09-03T00:00:00Z".to_string());
+        fi.metadata
+            .insert("X-Minio-Internal-Replication-Status".to_string(), "arn:test=PENDING;".to_string());
+        fi.metadata
+            .insert(category_key.to_string(), "2026-09-03T00:00:01Z".to_string());
+        rebuild_file_info_replication_state(&mut fi);
+        set_disks
+            .update_object_meta(bucket, object, fi, &disks)
+            .await
+            .expect("mixed-case legacy metadata should be persisted");
+        set_disks.invalidate_get_object_metadata_cache(bucket, object).await;
+
+        let seeded = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("mixed-case legacy object should remain readable");
+        assert!(!seeded.replication_generation_snapshot().invalid);
+    }
+
+    fn assert_dual_alias_value(metadata: &HashMap<String, String>, suffix: &str, expected: &str) {
+        let aliases = metadata
+            .iter()
+            .filter(|(key, _)| rustfs_utils::http::has_internal_suffix(key, suffix))
+            .collect::<Vec<_>>();
+        assert_eq!(aliases.len(), 2, "{suffix} must be rewritten as exactly two canonical aliases");
+        assert!(aliases.iter().all(|(_, value)| value.as_str() == expected));
+        assert!(metadata.contains_key(&format!("x-rustfs-internal-{suffix}")));
+        assert!(metadata.contains_key(&format!("x-minio-internal-{suffix}")));
+    }
+
+    #[tokio::test]
+    async fn replication_status_writeback_cas_accepts_suspended_null_version_snapshot() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "replication-suspended-null-version-cas";
+        let object = "object";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let timestamp = "opaque-suspended-null-version-time";
+        let mutation_id = Uuid::from_u128(700).to_string();
+        let mut reader = PutObjReader::from_vec(b"suspended null version".to_vec());
+        let queued = set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    version_suspended: true,
+                    user_defined: replication_metadata(Some(timestamp), Some(&mutation_id), "arn:test=PENDING;"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("suspended-bucket null version should be written");
+        assert_eq!(queued.version_id, Some(Uuid::nil()));
+        let expected_generation = queued.replication_generation_snapshot();
+
+        let reread = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("the same xl.meta should be readable without versioning flags");
+        assert_eq!(reread.version_id, None);
+        assert_eq!(reread.replication_generation_snapshot(), expected_generation);
+
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(Uuid::nil().to_string()),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: expected_generation.clone(),
+                        mode: ReplicationStatusWritebackMode::ValidateOnly,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("ValidateOnly must accept the same suspended null-version identity");
+
+        let completed = set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(Uuid::nil().to_string()),
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the queued null-version snapshot must match the storage reread");
+        assert_eq!(completed.replication_status_internal.as_deref(), Some("arn:test=COMPLETED;"));
+    }
+
+    #[tokio::test]
+    async fn replication_status_writeback_cas_applies_current_rejects_stale_and_supports_legacy_absence() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "replication-status-writeback-cas";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let object = "generation.txt";
+        let generation_a = "2026-09-02T12:34:56.123456789+08:00[Asia/Shanghai]";
+        let generation_b = generation_a;
+        let mutation_a = Uuid::from_u128(1).to_string();
+        let mutation_b = Uuid::from_u128(2).to_string();
+        let mut reader = PutObjReader::from_vec(b"generation-fenced".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(Some(generation_a), Some(&mutation_a), "arn:test=PENDING;")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("generation A should be installed");
+        let generation_a_snapshot = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("generation A snapshot should be readable")
+            .replication_generation_snapshot();
+
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: generation_a_snapshot.clone(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the worker that observed generation A should publish its terminal status");
+        let current = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("generation A terminal status should be readable");
+        assert_eq!(current.replication_status_internal.as_deref(), Some("arn:test=COMPLETED;"));
+        assert_eq!(
+            rustfs_utils::http::get_str(current.user_defined.as_ref(), rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,)
+                .as_deref(),
+            Some(generation_a)
+        );
+
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(Some(generation_b), Some(&mutation_b), "arn:test=PENDING;")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a newer metadata mutation should install generation B");
+        let generation_b_snapshot = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("generation B snapshot should be readable")
+            .replication_generation_snapshot();
+        let stale_error = set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: generation_a_snapshot,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("generation A must not overwrite generation B's PENDING status");
+        assert!(matches!(stale_error, Error::PreconditionFailed));
+        let after_stale = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("generation B should remain readable");
+        assert_eq!(after_stale.replication_status_internal.as_deref(), Some("arn:test=PENDING;"));
+        assert_eq!(
+            rustfs_utils::http::get_str(after_stale.user_defined.as_ref(), rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,)
+                .as_deref(),
+            Some(generation_b)
+        );
+
+        set_disks
+            .put_object_tags(
+                bucket,
+                object,
+                "stage=legacy-writer",
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(Some(generation_b), None, "arn:test=PENDING;")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a legacy metadata writer should preserve the unknown mutation id");
+        let legacy_writer_error = set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: generation_b_snapshot,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a preserved UUID and timestamp must not hide a legacy writer's payload change");
+        assert!(matches!(legacy_writer_error, Error::PreconditionFailed));
+
+        let legacy_object = "legacy-without-generation.txt";
+        let mut legacy_reader = PutObjReader::from_vec(b"legacy".to_vec());
+        set_disks
+            .put_object(bucket, legacy_object, &mut legacy_reader, &ObjectOptions::default())
+            .await
+            .expect("legacy source object should be written");
+        let legacy_snapshot = set_disks
+            .get_object_info(bucket, legacy_object, &ObjectOptions::default())
+            .await
+            .expect("legacy snapshot should be readable")
+            .replication_generation_snapshot();
+        set_disks
+            .put_object_metadata(
+                bucket,
+                legacy_object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: legacy_snapshot,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("legacy absence must compare as an exact generation value");
+        let legacy = set_disks
+            .get_object_info(bucket, legacy_object, &ObjectOptions::default())
+            .await
+            .expect("legacy terminal status should be readable");
+        assert_eq!(legacy.replication_status_internal.as_deref(), Some("arn:test=COMPLETED;"));
+        assert!(
+            rustfs_utils::http::get_str(legacy.user_defined.as_ref(), rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,)
+                .is_none()
+        );
+
+        let timestamp_only_object = "legacy-timestamp-only.txt";
+        let mut timestamp_only_reader = PutObjReader::from_vec(b"timestamp only".to_vec());
+        set_disks
+            .put_object(bucket, timestamp_only_object, &mut timestamp_only_reader, &ObjectOptions::default())
+            .await
+            .expect("timestamp-only source object should be written");
+        set_disks
+            .put_object_metadata(
+                bucket,
+                timestamp_only_object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(Some(generation_a), None, "arn:test=PENDING;")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("legacy timestamp-only generation should be installed");
+        let timestamp_only_snapshot = set_disks
+            .get_object_info(bucket, timestamp_only_object, &ObjectOptions::default())
+            .await
+            .expect("legacy timestamp-only snapshot should be readable")
+            .replication_generation_snapshot();
+        assert_eq!(timestamp_only_snapshot.timestamp.as_deref(), Some(generation_a));
+        assert_eq!(timestamp_only_snapshot.mutation_id, None);
+        set_disks
+            .put_object_metadata(
+                bucket,
+                timestamp_only_object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: timestamp_only_snapshot,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("legacy timestamp-only generation should remain writable through exact CAS");
+    }
+
+    #[tokio::test]
+    async fn metadata_mutations_canonicalize_mixed_case_minio_generation_aliases() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "replication-mixed-case-generation";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let tag_object = "tagging.txt";
+        seed_single_mixed_case_minio_generation(
+            &set_disks,
+            bucket,
+            tag_object,
+            rustfs_utils::http::SUFFIX_TAGGING_TIMESTAMP,
+            "X-Minio-Internal-Tagging-Timestamp",
+        )
+        .await;
+        let tag_timestamp = "2026-09-03T01:00:00Z";
+        let tag_mutation = Uuid::from_u128(101).to_string();
+        let mut tag_eval = replication_metadata(Some(tag_timestamp), Some(&tag_mutation), "arn:test=PENDING;");
+        rustfs_utils::http::insert_str(
+            &mut tag_eval,
+            rustfs_utils::http::SUFFIX_TAGGING_TIMESTAMP,
+            "2026-09-03T01:00:01Z".to_string(),
+        );
+        let tagged = set_disks
+            .put_object_tags(
+                bucket,
+                tag_object,
+                "stage=canonical",
+                &ObjectOptions {
+                    eval_metadata: Some(tag_eval),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("tag mutation should canonicalize legacy aliases");
+        assert_dual_alias_value(
+            tagged.user_defined.as_ref(),
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+            tag_timestamp,
+        );
+        assert_dual_alias_value(
+            tagged.user_defined.as_ref(),
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            "arn:test=PENDING;",
+        );
+        assert_dual_alias_value(
+            tagged.user_defined.as_ref(),
+            rustfs_utils::http::SUFFIX_TAGGING_TIMESTAMP,
+            "2026-09-03T01:00:01Z",
+        );
+        let tag_snapshot = tagged.replication_generation_snapshot();
+        assert!(!tag_snapshot.invalid);
+        let persisted_tag_snapshot = set_disks
+            .get_object_info(bucket, tag_object, &ObjectOptions::default())
+            .await
+            .expect("canonicalized tag metadata should be reread")
+            .replication_generation_snapshot();
+        assert_eq!(tag_snapshot, persisted_tag_snapshot);
+        set_disks
+            .put_object_metadata(
+                bucket,
+                tag_object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: tag_snapshot,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the canonicalized tag generation should accept terminal CAS");
+
+        let metadata_object = "retention-metadata.txt";
+        seed_single_mixed_case_minio_generation(
+            &set_disks,
+            bucket,
+            metadata_object,
+            rustfs_utils::http::SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+            "X-Minio-Internal-Objectlock-Retention-Timestamp",
+        )
+        .await;
+        let metadata_timestamp = "2026-09-03T02:00:00Z";
+        let metadata_mutation = Uuid::from_u128(102).to_string();
+        let mut metadata_eval = replication_metadata(Some(metadata_timestamp), Some(&metadata_mutation), "arn:test=PENDING;");
+        rustfs_utils::http::insert_str(
+            &mut metadata_eval,
+            rustfs_utils::http::SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+            "2026-09-03T02:00:01Z".to_string(),
+        );
+        metadata_eval.insert("x-amz-meta-proof".to_string(), "updated".to_string());
+        let updated = set_disks
+            .put_object_metadata(
+                bucket,
+                metadata_object,
+                &ObjectOptions {
+                    eval_metadata: Some(metadata_eval),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("generic metadata mutation should canonicalize legacy aliases");
+        assert_dual_alias_value(
+            updated.user_defined.as_ref(),
+            rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+            metadata_timestamp,
+        );
+        assert_dual_alias_value(
+            updated.user_defined.as_ref(),
+            rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            "arn:test=PENDING;",
+        );
+        assert_dual_alias_value(
+            updated.user_defined.as_ref(),
+            rustfs_utils::http::SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
+            "2026-09-03T02:00:01Z",
+        );
+        let metadata_snapshot = updated.replication_generation_snapshot();
+        assert!(!metadata_snapshot.invalid);
+        let failed = set_disks
+            .put_object_metadata(
+                bucket,
+                metadata_object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=FAILED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: metadata_snapshot,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the canonicalized generic metadata generation should accept terminal CAS");
+        assert_eq!(failed.replication_status_internal.as_deref(), Some("arn:test=FAILED;"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(metadata_cache_invalidation_probe)]
+    async fn replication_status_writeback_validate_only_is_zero_write_and_checks_fences() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "replication-status-validate-only";
+        let object = "failed-retry.txt";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(b"failed retry".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let timestamp = "2026-09-02T12:34:56.123456789+08:00[Asia/Shanghai]";
+        let mutation_id = Uuid::from_u128(10).to_string();
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(Some(timestamp), Some(&mutation_id), "arn:test=FAILED;")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed generation should be installed");
+        let snapshot = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("failed generation should be readable")
+            .replication_generation_snapshot();
+
+        let invalidations = MetadataCacheInvalidationProbe::install(bucket, object);
+        let validated = set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: snapshot.clone(),
+                        mode: ReplicationStatusWritebackMode::ValidateOnly,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the current FAILED generation should validate without a rewrite");
+        assert_eq!(validated.replication_status_internal.as_deref(), Some("arn:test=FAILED;"));
+        assert_eq!(
+            invalidations.count(),
+            0,
+            "validate-only must not invalidate metadata cache or enter a write path"
+        );
+
+        let mut stale = snapshot.clone();
+        stale.mutation_id = Some(Uuid::from_u128(11).to_string());
+        let stale_error = set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: stale,
+                        mode: ReplicationStatusWritebackMode::ValidateOnly,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a stale FAILED retry must be superseded during validate-only");
+        assert!(matches!(stale_error, Error::PreconditionFailed));
+        assert_eq!(invalidations.count(), 0, "a rejected validate-only CAS must not invalidate cache");
+
+        let lost_fence_error = set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                        expected_generation: snapshot,
+                        mode: ReplicationStatusWritebackMode::ValidateOnly,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("validate-only must not report success after its namespace fence is lost");
+        assert!(matches!(lost_fence_error, StorageError::NamespaceLockQuorumUnavailable { .. }));
+        assert_eq!(invalidations.count(), 0, "a fenced validate-only path must remain side-effect free");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replication_terminal_cas_quorum_failure_never_deletes_surviving_metadata() {
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("0"))], async {
+            let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "replication-terminal-quorum-failure";
+            let object = "survivor.txt";
+            for disk in &disk_stores {
+                disk.make_volume(bucket).await.expect("bucket volume should be created");
+            }
+
+            let mut reader = PutObjReader::from_vec(b"surviving metadata".to_vec());
+            set_disks
+                .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                .await
+                .expect("source object should be written");
+            let expected_generation = set_disks
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("source generation should be readable")
+                .replication_generation_snapshot();
+
+            let meta_paths = temp_dirs
+                .iter()
+                .map(|temp_dir| temp_dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                .collect::<Vec<_>>();
+            let surviving_before = tokio::fs::read(&meta_paths[3])
+                .await
+                .expect("the surviving xl.meta should exist before the terminal attempt");
+            for path in &meta_paths[..3] {
+                tokio::fs::remove_file(path)
+                    .await
+                    .expect("three xl.meta copies should be removed to force read-quorum failure");
+            }
+
+            set_disks
+                .put_object_metadata(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                            expected_generation: expected_generation.clone(),
+                            mode: ReplicationStatusWritebackMode::ValidateOnly,
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("terminal CAS must retry when current metadata lacks read quorum");
+
+            let surviving_after_validate = tokio::fs::read(&meta_paths[3])
+                .await
+                .expect("terminal CAS must not delete the final xl.meta copy");
+            assert_eq!(
+                surviving_after_validate, surviving_before,
+                "ValidateOnly must remain zero-write on quorum failure"
+            );
+
+            set_disks
+                .put_object_metadata(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
+                        replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+                            expected_generation,
+                            mode: ReplicationStatusWritebackMode::Update,
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("a lost-fence terminal update must retry when current metadata lacks read quorum");
+
+            let surviving_after_lost_fence = tokio::fs::read(&meta_paths[3])
+                .await
+                .expect("a lost-fence terminal update must not delete the final xl.meta copy");
+            assert_eq!(
+                surviving_after_lost_fence, surviving_before,
+                "a lost outer fence must remain zero-write on quorum failure"
+            );
+        })
+        .await;
     }
 
     async fn persist_part_checksum_sidecar(set_disks: &Arc<SetDisks>, bucket: &str, object: &str, value: &str) {
@@ -18344,7 +19363,7 @@ mod delete_objects_lock_gating_tests {
             lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
                 version_id: Some(trigger_version_id),
                 delete_marker: false,
-                action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
+                action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
                 rule_id: "rule".to_string(),
                 phase: crate::object_api::LifecycleDeleteAllPhase::History,
             }),

@@ -52,7 +52,8 @@ members = [
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
     "crates/scanner", # Scanner for data integrity checks and health monitoring
-    "crates/scanner-contracts", # Scanner metrics and cycle contracts
+    "crates/scanner-contracts", # Scanner storage and wire contracts
+    "crates/scanner-metrics", # Scanner metrics and cycle telemetry
     "crates/security-governance", # Security governance contracts
     "crates/extension-schema", # Extension schema contracts
     "crates/signer", # client signer
@@ -94,6 +95,7 @@ rustfs = { path = "./rustfs", version = "1.0.0-rc.5" }
 rustfs-heal = { path = "crates/heal", version = "1.0.0-rc.5" }
 rustfs-heal-contracts = { path = "crates/heal-contracts", version = "1.0.0-rc.5" }
 rustfs-scanner-contracts = { path = "crates/scanner-contracts", version = "1.0.0-rc.5" }
+rustfs-scanner-metrics = { path = "crates/scanner-metrics", version = "1.0.0-rc.5" }
 rustfs-audit = { path = "crates/audit", version = "1.0.0-rc.5" }
 rustfs-checksums = { path = "crates/checksums", version = "1.0.0-rc.5" }
 rustfs-common = { path = "crates/common", version = "1.0.0-rc.5" }
@@ -145,7 +147,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.0-rc.5" }
 async-channel = "2.5.0"
 async_zip = { default-features = false, version = "0.0.19" }
 mysql_async = { default-features = false, version = "0.37.1" }
-async-compression = { version = "0.4.43" }
+async-compression = { version = "0.4.44" }
 async-recursion = "1.1.1"
 async-trait = "0.1.92"
 async-nats = { version = "0.50.0", default-features = false }
@@ -298,7 +300,7 @@ pretty_assertions = "1.4.1"
 rand = { version = "0.10.2" }
 ratelimit = "2.0.0"
 rayon = "1.12.0"
-reed-solomon-erasure = { package = "rustfs-erasure-codec", version = "8.0.2" }
+rustfs-erasure-codec = { version = "8.0.2" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }
@@ -366,7 +368,7 @@ russh-sftp = "2.4.0"
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-rustfs-mimalloc = { version = "0.5.1" }
+rustfs-mimalloc = { version = "0.5.2" }
 hotpath = { version = "0.24.0", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.48" }

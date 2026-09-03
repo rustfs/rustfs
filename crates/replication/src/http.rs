@@ -85,6 +85,24 @@ pub(crate) fn get_internal_metadata(map: &HashMap<String, String>, suffix: &str)
         })
 }
 
+/// Return a non-empty internal value only when every RustFS/MinIO alias
+/// present for the suffix agrees. A single alias remains valid for rolling
+/// upgrade compatibility; conflicts fail closed at security boundaries.
+pub(crate) fn get_consistent_internal_metadata<'a>(map: &'a HashMap<String, String>, suffix: &str) -> Option<&'a str> {
+    let (rustfs_key, minio_key) = internal_keys(suffix);
+    let mut value: Option<&String> = None;
+    for (key, candidate) in map {
+        if !key.eq_ignore_ascii_case(&rustfs_key) && !key.eq_ignore_ascii_case(&minio_key) {
+            continue;
+        }
+        if candidate.is_empty() || value.is_some_and(|current| current != candidate) {
+            return None;
+        }
+        value = Some(candidate);
+    }
+    value.map(String::as_str)
+}
+
 pub(crate) fn get_header_metadata(map: &HashMap<String, String>, suffix: &str) -> Option<String> {
     let rustfs_key = rustfs_header_key(suffix);
     let minio_key = minio_header_key(suffix);
@@ -114,8 +132,8 @@ pub(crate) fn insert_internal_metadata(map: &mut HashMap<String, String>, suffix
 #[cfg(test)]
 mod tests {
     use super::{
-        SUFFIX_ACTUAL_SIZE, SUFFIX_REPLICATION_RESET_STATUS, get_header_metadata, get_internal_metadata, has_prefix_fold,
-        insert_internal_metadata, internal_key_rustfs, trim_etag,
+        SUFFIX_ACTUAL_SIZE, SUFFIX_REPLICATION_RESET_STATUS, get_consistent_internal_metadata, get_header_metadata,
+        get_internal_metadata, has_prefix_fold, insert_internal_metadata, internal_key_rustfs, trim_etag,
     };
     use std::collections::HashMap;
 
@@ -134,6 +152,38 @@ mod tests {
         let metadata = HashMap::from([("X-RustFS-Internal-Actual-Size".to_string(), "12".to_string())]);
 
         assert_eq!(get_internal_metadata(&metadata, SUFFIX_ACTUAL_SIZE).as_deref(), Some("12"));
+    }
+
+    #[test]
+    fn consistent_internal_metadata_accepts_single_or_matching_aliases_and_rejects_conflicts() {
+        for key in ["x-rustfs-internal-replication-status", "X-Minio-Internal-Replication-Status"] {
+            let metadata = HashMap::from([(key.to_string(), "arn:target=PENDING;".to_string())]);
+            assert_eq!(
+                get_consistent_internal_metadata(&metadata, "replication-status"),
+                Some("arn:target=PENDING;")
+            );
+        }
+
+        let matching = HashMap::from([
+            ("x-rustfs-internal-replication-status".to_string(), "arn:target=COMPLETED;".to_string()),
+            ("X-Minio-Internal-Replication-Status".to_string(), "arn:target=COMPLETED;".to_string()),
+        ]);
+        assert_eq!(
+            get_consistent_internal_metadata(&matching, "replication-status"),
+            Some("arn:target=COMPLETED;")
+        );
+
+        let conflicting = HashMap::from([
+            ("x-rustfs-internal-replication-status".to_string(), "arn:target=PENDING;".to_string()),
+            ("x-minio-internal-replication-status".to_string(), "arn:target=REPLICA;".to_string()),
+        ]);
+        assert!(get_consistent_internal_metadata(&conflicting, "replication-status").is_none());
+
+        let empty_alias = HashMap::from([
+            ("x-rustfs-internal-replication-status".to_string(), "arn:target=PENDING;".to_string()),
+            ("x-minio-internal-replication-status".to_string(), String::new()),
+        ]);
+        assert!(get_consistent_internal_metadata(&empty_alias, "replication-status").is_none());
     }
 
     #[test]

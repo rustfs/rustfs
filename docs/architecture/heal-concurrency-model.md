@@ -3,6 +3,8 @@
 **Use this when:** changing heal, PUT/multipart commit, delete, lifecycle expiry, or data-movement code that touches the same `(bucket, object)` commit surface; or evaluating whether RustFS needs a persistent per-object healing marker like MinIO's `x-minio-healing`.
 **Source of truth:** `crates/ecstore/src/set_disk/ops/heal.rs` (`heal_object_with_explicit_version_regen`, `HealObjectLockKind`, `HEAL_RENAME_INCOMPLETE`), `crates/ecstore/src/set_disk/ops/object.rs` (PUT/DELETE lock sections, `reconcile_old_data_cleanup_receipts`), `crates/ecstore/src/set_disk/core/io_primitives.rs` (`commit_rename_data_dir`, `report_old_data_dir_cleanup`, `reclaim_orphan_data_dirs`), `crates/filemeta/src/fileinfo.rs` (`FileInfo::set_healing`), `crates/heal/src/heal/manager/queue.rs` (dedup keys).
 
+For crate ownership, read [crate-boundaries.md](crate-boundaries.md): ECStore owns erasure-set repair primitives that share this lock and commit model, while `crates/heal` owns repair orchestration.
+
 ## Model
 
 Heal and every foreground or background write path serialize on the same object-level namespace write lock (a quorum lock RPC in distributed mode, the in-process lock manager on a single node; granularity is the object, the version component is always `None`), and heal holds its guard across the whole rename commit. MinIO's `x-minio-healing` marker is an out-of-lock defence against version-cleanup logic inside `RenameData` interleaving with a heal commit; RustFS's commit model has no such interleaving, so no persistent marker exists (`x-minio-healing` does not occur in `crates/` or `rustfs/`) and none is needed. Three layers replace it:

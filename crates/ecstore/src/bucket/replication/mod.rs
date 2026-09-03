@@ -53,12 +53,12 @@ pub use replication_config_boundary::{
     replication_target_arns, should_remove_replication_target, site_replication_rule_deployment_id,
     unsupported_replication_config_field, validate_replication_config_structure, validate_replication_config_target_arns,
 };
-pub(crate) use replication_filemeta_boundary::version_purge_statuses_map;
 pub use replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState,
     ReplicationStatusType, ReplicationType, VersionPurgeStatusType, replication_state_to_filemeta,
     replication_status_to_filemeta, replication_statuses_map, version_purge_status_to_filemeta,
 };
+pub(crate) use replication_filemeta_boundary::{ReplicationGenerationSnapshot, version_purge_statuses_map};
 pub(crate) use replication_filemeta_boundary::{
     replication_state_from_filemeta, replication_status_from_filemeta, version_purge_status_from_filemeta,
 };

@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Erasure coding implementation using reed-solomon-erasure (GF(2^8)).
+//! Erasure coding implementation using rustfs-erasure-codec (GF(2^8)).
 //! Supports legacy (reed-solomon-simd) for reading/healing old-version files.
 //!
 
 use bytes::{Bytes, BytesMut};
-use reed_solomon_erasure::galois_8::ReedSolomon;
 use reed_solomon_simd;
+use rustfs_erasure_codec::galois_8::ReedSolomon;
 use smallvec::SmallVec;
 use std::{
     collections::HashMap,
@@ -69,7 +69,7 @@ impl EncodedBlock {
     }
 }
 
-const MODERN_MAX_TOTAL_SHARDS: usize = <reed_solomon_erasure::galois_8::Field as reed_solomon_erasure::Field>::ORDER;
+const MODERN_MAX_TOTAL_SHARDS: usize = <rustfs_erasure_codec::galois_8::Field as rustfs_erasure_codec::Field>::ORDER;
 const MODERN_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 64;
 const LEGACY_REED_SOLOMON_CACHE_MAX_ENTRIES: usize = 16;
 // Vec growth may retain twice the requested logical length. Keeping the logical
@@ -109,7 +109,7 @@ pub enum ErasureConstructionError {
     #[error("failed to construct modern Reed-Solomon encoder")]
     ModernEncoder {
         #[source]
-        source: reed_solomon_erasure::Error,
+        source: rustfs_erasure_codec::Error,
     },
 
     /// The legacy encoder wrapper failed to initialize.
@@ -354,7 +354,7 @@ impl LegacyReedSolomonEncoder {
     }
 }
 
-/// Reed-Solomon encoder using reed-solomon-erasure
+/// Reed-Solomon encoder using rustfs-erasure-codec
 pub struct ReedSolomonEncoder {
     data_shards: usize,
     parity_shards: usize,
@@ -372,7 +372,7 @@ impl Clone for ReedSolomonEncoder {
 }
 
 impl ReedSolomonEncoder {
-    fn try_new_typed(data_shards: usize, parity_shards: usize) -> Result<Self, reed_solomon_erasure::Error> {
+    fn try_new_typed(data_shards: usize, parity_shards: usize) -> Result<Self, rustfs_erasure_codec::Error> {
         let encoder = if parity_shards > 0 {
             Some(cached_modern_reed_solomon(data_shards, parity_shards)?)
         } else {
@@ -445,7 +445,7 @@ impl ReedSolomonEncoder {
     }
 }
 
-fn cached_modern_reed_solomon(data_shards: usize, parity_shards: usize) -> Result<Arc<ReedSolomon>, reed_solomon_erasure::Error> {
+fn cached_modern_reed_solomon(data_shards: usize, parity_shards: usize) -> Result<Arc<ReedSolomon>, rustfs_erasure_codec::Error> {
     let key = (data_shards, parity_shards);
     let cache = MODERN_REED_SOLOMON_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
 
@@ -1407,11 +1407,11 @@ mod tests {
     #[test]
     fn construction_errors_preserve_encoder_sources() {
         let modern = ErasureConstructionError::ModernEncoder {
-            source: reed_solomon_erasure::Error::TooManyShards,
+            source: rustfs_erasure_codec::Error::TooManyShards,
         };
         assert!(
             std::error::Error::source(&modern)
-                .and_then(|source| source.downcast_ref::<reed_solomon_erasure::Error>())
+                .and_then(|source| source.downcast_ref::<rustfs_erasure_codec::Error>())
                 .is_some()
         );
 

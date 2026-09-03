@@ -30,7 +30,7 @@ use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo};
 use rustfs_filemeta::FileMeta;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{LockError, NamespaceLockGuard};
-use rustfs_scanner_contracts::metrics::{
+use rustfs_scanner_metrics::metrics::{
     Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics,
 };
 use rustfs_utils::path::path_join_buf;

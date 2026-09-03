@@ -17,6 +17,8 @@ use super::replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
+#[cfg(test)]
+use super::replication_filemeta_boundary::ReplicationGenerationSnapshot;
 use super::replication_filemeta_boundary::{
     REPLICATE_EXISTING, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
     ReplicationState, ReplicationStatusType, ReplicationType, VersionPurgeStatusType, get_replication_state,
@@ -47,12 +49,13 @@ use super::replication_resync_boundary::{
 };
 #[cfg(test)]
 use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX};
-#[cfg(test)]
-use super::replication_storage_boundary::ReplicationDeletedObject;
 use super::replication_storage_boundary::{
     AdvancedGetOptions, EcstoreObjectOperations, GetObjectReader, HTTPPreconditions, HTTPRangeSpec, ObjectInfo, ObjectOptions,
-    ObjectToDelete, ReplicationObjectIO, ReplicationStorage, StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
+    ObjectToDelete, ReplicationObjectIO, ReplicationStatusWritebackCondition, ReplicationStatusWritebackMode, ReplicationStorage,
+    StatObjectOptions, StorageObjectInfoOrErr, WalkOptions,
 };
+#[cfg(test)]
+use super::replication_storage_boundary::{NamespaceLockFence, NamespaceLockSignalTestFence, ReplicationDeletedObject};
 use super::replication_target_boundary::{
     ERR_REPLICATION_SSEC_PASSTHROUGH_UNSUPPORTED, HeadObjectSdkError, PutObjectOptions, PutObjectPartOptions,
     RemotePutObjectResponse, ReplicationTargetStore, S3ClientError, SsecPassthroughCapability, SsecPassthroughGate, TargetClient,
@@ -1625,6 +1628,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
     let mut replication_state = oi.replication_state();
     replication_state.replicate_decision_str = dsc.to_string();
     let actual_size = oi.get_actual_size_or_physical();
+    let replication_generation = oi.replication_generation_snapshot();
 
     Ok(ReplicateObjectInfo {
         name: oi.name.clone(),
@@ -1647,6 +1651,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         target_statuses,
         target_purge_statuses,
         replication_timestamp: None,
+        replication_generation,
         ssec: replication_object_is_ssec_encrypted(&user_defined),
         user_tags: (*oi.user_tags).clone(),
         checksum: oi.checksum.clone(),
@@ -2931,10 +2936,125 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     replicate_object_with_outcome(roi, storage).await.0
 }
 
+enum ReplicationStatePersistOutcome {
+    Updated,
+    Superseded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplicationAttemptDisposition {
+    Persisted,
+    Superseded,
+    Retry,
+}
+
+impl ReplicationAttemptDisposition {
+    pub(crate) fn consumes_mrf_entry(self) -> bool {
+        matches!(self, Self::Persisted | Self::Superseded)
+    }
+}
+
+fn replication_attempt_preflight(roi: &ReplicateObjectInfo) -> Option<(ReplicationState, ReplicationAttemptDisposition)> {
+    roi.replication_generation
+        .invalid
+        .then(|| (roi.replication_state.clone().unwrap_or_default(), ReplicationAttemptDisposition::Retry))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReplicationTerminalPublication {
+    emit_terminal_failure: bool,
+    emit_event: bool,
+    update_transition_stats: bool,
+    update_same_state_failure_stats: bool,
+}
+
+fn replication_terminal_publication(
+    suppress_terminal_publication: bool,
+    state_update_needed: bool,
+    attempt_status: ReplicationStatusType,
+    previous_internal_matches_attempt: bool,
+) -> ReplicationTerminalPublication {
+    if suppress_terminal_publication {
+        return ReplicationTerminalPublication::default();
+    }
+    ReplicationTerminalPublication {
+        emit_terminal_failure: true,
+        emit_event: true,
+        update_transition_stats: state_update_needed,
+        update_same_state_failure_stats: attempt_status != ReplicationStatusType::Completed && previous_internal_matches_attempt,
+    }
+}
+
+fn replication_status_writeback_mode(state_update_needed: bool) -> ReplicationStatusWritebackMode {
+    if state_update_needed {
+        ReplicationStatusWritebackMode::Update
+    } else {
+        ReplicationStatusWritebackMode::ValidateOnly
+    }
+}
+
+/// Publish a worker's status with a storage-enforced compare-and-set token.
+/// `put_object_metadata` checks the token while it owns the object write lock,
+/// avoiding both a read/write race and any need to hold a hot object lock
+/// across network I/O.
+fn replication_status_writeback_options(
+    roi: &ReplicateObjectInfo,
+    replication_lock_guard: &rustfs_lock::NamespaceLockGuard,
+    new_replication_internal: Option<&String>,
+    mode: ReplicationStatusWritebackMode,
+) -> ObjectOptions {
+    let mut eval_metadata = HashMap::new();
+    if let Some(status) = new_replication_internal {
+        insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, status.clone());
+    }
+    let mut write_opts = ObjectOptions {
+        version_id: roi.version_id.map(|version_id| version_id.to_string()),
+        eval_metadata: Some(eval_metadata),
+        replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
+            expected_generation: roi.replication_generation.clone(),
+            mode,
+        })),
+        ..Default::default()
+    };
+    // The remote transfer runs under a renewable replication namespace lock.
+    // Carry that guard's loss signal into the storage commit so a worker whose
+    // lease expired while it was doing remote I/O cannot publish over a newer
+    // worker for the same generation.
+    write_opts.add_namespace_lock_guard(replication_lock_guard);
+    write_opts
+}
+
+async fn persist_replication_state_if_current<S: ReplicationStorage>(
+    roi: &ReplicateObjectInfo,
+    storage: &Arc<S>,
+    replication_lock_guard: &rustfs_lock::NamespaceLockGuard,
+    new_replication_internal: Option<&String>,
+    mode: ReplicationStatusWritebackMode,
+    object_info: &mut ObjectInfo,
+) -> Result<ReplicationStatePersistOutcome> {
+    let write_opts = replication_status_writeback_options(roi, replication_lock_guard, new_replication_internal, mode);
+    match storage.put_object_metadata(&roi.bucket, &roi.name, &write_opts).await {
+        Ok(updated) => {
+            *object_info = updated;
+            Ok(ReplicationStatePersistOutcome::Updated)
+        }
+        Err(Error::PreconditionFailed) => Ok(ReplicationStatePersistOutcome::Superseded),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
     roi: ReplicateObjectInfo,
     storage: Arc<S>,
-) -> (ReplicationState, bool) {
+) -> (ReplicationState, ReplicationAttemptDisposition) {
+    // Conflicting compatibility aliases, empty opaque timestamps, and invalid
+    // mutation UUIDs are corruption, not evidence that another generation
+    // superseded this task. Fail before any target I/O and keep the MRF entry
+    // retryable instead of repeatedly transmitting and then acknowledging it.
+    if let Some(outcome) = replication_attempt_preflight(&roi) {
+        return outcome;
+    }
+
     let bucket = roi.bucket.clone();
     let object = roi.name.clone();
 
@@ -2963,10 +3083,10 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return (roi.replication_state.unwrap_or_default(), false);
+            return (roi.replication_state.unwrap_or_default(), ReplicationAttemptDisposition::Retry);
         }
     };
-    let _obj_lock_guard = match obj_ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
+    let obj_lock_guard = match obj_ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
         Ok(g) => g,
         Err(e) => {
             debug!(
@@ -2986,7 +3106,7 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
-            return (roi.replication_state.unwrap_or_default(), false);
+            return (roi.replication_state.unwrap_or_default(), ReplicationAttemptDisposition::Retry);
         }
     };
 
@@ -3057,72 +3177,98 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
     }
 
     let version_id = roi.version_id.map(|v| v.to_string());
-    note_replication_terminal_failure(&bucket, &object, version_id.as_deref(), &rinfos);
 
     let previous_state = roi.replication_state.clone().unwrap_or_default();
-    let merged_state = get_replication_state(&rinfos, &previous_state, version_id);
-    let replication_status = merged_state.composite_replication_status();
+    let mut merged_state = get_replication_state(&rinfos, &previous_state, version_id.clone());
+    let mut replication_status = merged_state.composite_replication_status();
     let new_replication_internal = merged_state.replication_status_internal.clone();
     let mut object_info = roi.to_object_info();
-    let mut state_persisted = true;
+    let mut disposition = ReplicationAttemptDisposition::Persisted;
+    let mut suppress_terminal_publication = false;
+    let state_update_needed = roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced();
+    let writeback_mode = replication_status_writeback_mode(state_update_needed);
 
-    if roi.replication_status_internal != new_replication_internal || rinfos.replication_resynced() {
-        let mut eval_metadata = HashMap::new();
-        if let Some(ref s) = new_replication_internal {
-            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, s.clone());
-        }
-        let popts = ObjectOptions {
-            version_id: roi.version_id.map(|v| v.to_string()),
-            eval_metadata: Some(eval_metadata),
-            ..Default::default()
-        };
-
-        match storage.put_object_metadata(&bucket, &object, &popts).await {
-            Ok(u) => object_info = u,
-            Err(e) => {
-                state_persisted = false;
-                // Persisting the resynced replication status failed. Don't swallow
-                // it silently — the object's on-disk status now disagrees with the
-                // resync result and needs operator visibility (backlog#799 B23).
-                warn!(
-                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                    bucket = %bucket,
-                    object = %object,
-                    error = %e,
-                    "Failed to persist resynced replication status metadata"
-                );
-            }
-        }
-
-        if let Some(stats) = runtime_sources::replication_stats() {
-            for tgt in &rinfos.targets {
-                if tgt.replication_status != tgt.prev_replication_status {
-                    stats
-                        .update(&bucket, tgt, tgt.replication_status.clone(), tgt.prev_replication_status.clone())
-                        .await;
+    match persist_replication_state_if_current(
+        &roi,
+        &storage,
+        &obj_lock_guard,
+        new_replication_internal.as_ref(),
+        writeback_mode,
+        &mut object_info,
+    )
+    .await
+    {
+        Ok(ReplicationStatePersistOutcome::Updated) => {}
+        Ok(ReplicationStatePersistOutcome::Superseded) => {
+            // A tag/retention/legal-hold mutation committed while this
+            // worker was in flight. Its PENDING state is authoritative and
+            // must remain discoverable by the queue/MRF/scanner after a
+            // crash or missed admission. Return that newer state to sync
+            // callers and leave its worker to publish the terminal status.
+            suppress_terminal_publication = true;
+            disposition = ReplicationAttemptDisposition::Superseded;
+            let read_opts = ObjectOptions {
+                version_id: roi.version_id.map(|version_id| version_id.to_string()),
+                ..Default::default()
+            };
+            match storage.get_object_info(&bucket, &object, &read_opts).await {
+                Ok(current) => {
+                    object_info = current;
+                    merged_state = object_info.replication_state();
+                    replication_status = merged_state.composite_replication_status();
+                }
+                Err(error) => {
+                    // The CAS result is authoritative: a best-effort refetch
+                    // failure must not turn a superseded task back into a
+                    // retry that can publish the stale generation later.
+                    debug!(
+                        event = EVENT_RESYNC_STATUS_UPDATE_SKIPPED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %bucket,
+                        object = %object,
+                        error = %error,
+                        reason = "source_snapshot_refetch_failed_after_superseded",
+                        "Could not refresh source state after skipping stale replication status update"
+                    );
                 }
             }
+            debug!(
+                event = EVENT_RESYNC_STATUS_UPDATE_SKIPPED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                object = %object,
+                reason = "source_replication_snapshot_superseded",
+                "Skipped stale replication status update"
+            );
+        }
+        Err(e) => {
+            disposition = ReplicationAttemptDisposition::Retry;
+            suppress_terminal_publication = true;
+            // Persisting the resynced replication status failed. Don't swallow
+            // it silently — the object's on-disk status now disagrees with the
+            // resync result and needs operator visibility (backlog#799 B23).
+            warn!(
+                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                object = %object,
+                error = %e,
+                "Failed to persist resynced replication status metadata"
+            );
         }
     }
 
-    let event_name = if replication_status == ReplicationStatusType::Completed {
-        EventName::ObjectReplicationComplete.to_string()
-    } else {
-        EventName::ObjectReplicationFailed.to_string()
-    };
+    let publication = replication_terminal_publication(
+        suppress_terminal_publication,
+        state_update_needed,
+        rinfos.replication_status(),
+        roi.replication_status_internal == rinfos.replication_status_internal(),
+    );
 
-    send_local_event(EventArgs {
-        event_name,
-        bucket_name: bucket.clone(),
-        object: object_info,
-        user_agent: "Internal: [Replication]".to_string(),
-        ..Default::default()
-    });
-
-    if rinfos.replication_status() != ReplicationStatusType::Completed
-        && roi.replication_status_internal == rinfos.replication_status_internal()
+    if publication.update_transition_stats
         && let Some(stats) = runtime_sources::replication_stats()
     {
         for tgt in &rinfos.targets {
@@ -3134,7 +3280,39 @@ pub(crate) async fn replicate_object_with_outcome<S: ReplicationStorage>(
         }
     }
 
-    (merged_state, state_persisted)
+    if publication.emit_terminal_failure {
+        note_replication_terminal_failure(&bucket, &object, version_id.as_deref(), &rinfos);
+    }
+
+    let event_name = if replication_status == ReplicationStatusType::Completed {
+        EventName::ObjectReplicationComplete.to_string()
+    } else {
+        EventName::ObjectReplicationFailed.to_string()
+    };
+
+    if publication.emit_event {
+        send_local_event(EventArgs {
+            event_name,
+            bucket_name: bucket.clone(),
+            object: object_info,
+            user_agent: "Internal: [Replication]".to_string(),
+            ..Default::default()
+        });
+    }
+
+    if publication.update_same_state_failure_stats
+        && let Some(stats) = runtime_sources::replication_stats()
+    {
+        for tgt in &rinfos.targets {
+            if tgt.replication_status != tgt.prev_replication_status {
+                stats
+                    .update(&bucket, tgt, tgt.replication_status.clone(), tgt.prev_replication_status.clone())
+                    .await;
+            }
+        }
+    }
+
+    (merged_state, disposition)
 }
 
 /// Emit the operator-visible record of a replication attempt that ended FAILED.
@@ -4566,6 +4744,105 @@ async fn replicate_multipart_parts_and_complete<S: ReplicationObjectIO>(
 #[cfg(test)]
 mod tests {
     use super::super::replication_filemeta_boundary::ReplicateTargetDecision;
+
+    #[test]
+    fn same_state_terminal_retry_uses_validate_only() {
+        assert_eq!(replication_status_writeback_mode(false), ReplicationStatusWritebackMode::ValidateOnly);
+        assert_eq!(replication_status_writeback_mode(true), ReplicationStatusWritebackMode::Update);
+    }
+
+    #[test]
+    fn superseded_attempt_has_no_terminal_publication_side_effects() {
+        assert!(ReplicationAttemptDisposition::Persisted.consumes_mrf_entry());
+        assert!(ReplicationAttemptDisposition::Superseded.consumes_mrf_entry());
+        assert!(!ReplicationAttemptDisposition::Retry.consumes_mrf_entry());
+        assert_eq!(
+            replication_terminal_publication(true, false, ReplicationStatusType::Failed, true),
+            ReplicationTerminalPublication::default()
+        );
+        assert_eq!(
+            replication_terminal_publication(true, true, ReplicationStatusType::Completed, false),
+            ReplicationTerminalPublication::default()
+        );
+
+        let current = replication_terminal_publication(false, false, ReplicationStatusType::Failed, true);
+        assert!(current.emit_terminal_failure);
+        assert!(current.emit_event);
+        assert!(!current.update_transition_stats);
+        assert!(current.update_same_state_failure_stats);
+
+        assert_eq!(
+            replication_terminal_publication(true, true, ReplicationStatusType::Failed, false),
+            ReplicationTerminalPublication::default(),
+            "a retryable status-persistence failure must not publish a terminal result"
+        );
+    }
+
+    #[test]
+    fn invalid_generation_retries_before_remote_replication() {
+        let mut preserved_state = ReplicationState::default();
+        preserved_state
+            .targets
+            .insert("arn:target".to_string(), ReplicationStatusType::Pending);
+        let invalid = ReplicateObjectInfo {
+            replication_generation: ReplicationGenerationSnapshot {
+                invalid: true,
+                ..Default::default()
+            },
+            replication_state: Some(preserved_state.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            replication_attempt_preflight(&invalid),
+            Some((preserved_state, ReplicationAttemptDisposition::Retry))
+        );
+        assert!(replication_attempt_preflight(&ReplicateObjectInfo::default()).is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_writeback_carries_replication_lock_loss_fence() {
+        let lock = rustfs_lock::NamespaceLock::new(
+            "replication-status-writeback-fence".to_string(),
+            Arc::new(rustfs_lock::LocalClient::new()),
+        );
+        let guard = lock
+            .get_write_lock(
+                rustfs_lock::ObjectKey::new("bucket", "/[replicate]/object"),
+                "worker-a",
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect("replication lock should be acquired");
+        let signal = guard
+            .lock_lost_signal()
+            .expect("distributed guard must expose its loss signal");
+        let forced_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _test_fence = NamespaceLockSignalTestFence::install_with_loss_handle(&signal, Arc::clone(&forced_lost));
+
+        // Build the writeback after remote work has acquired the guard, then
+        // lose the lease before storage reaches its commit fence.
+        let opts = replication_status_writeback_options(
+            &ReplicateObjectInfo::default(),
+            &guard,
+            None,
+            ReplicationStatusWritebackMode::ValidateOnly,
+        );
+        forced_lost.store(true, std::sync::atomic::Ordering::Release);
+
+        assert!(
+            opts.namespace_lock_fence
+                .as_ref()
+                .is_some_and(NamespaceLockFence::is_lock_lost),
+            "terminal CAS must observe a replication lease lost after remote I/O"
+        );
+        assert!(!ReplicationAttemptDisposition::Retry.consumes_mrf_entry());
+        assert_eq!(
+            replication_terminal_publication(true, true, ReplicationStatusType::Failed, false),
+            ReplicationTerminalPublication::default(),
+            "a fenced writeback retry must not publish terminal events or statistics"
+        );
+    }
 
     #[test]
     fn unavailable_object_target_is_persisted_as_failed() {

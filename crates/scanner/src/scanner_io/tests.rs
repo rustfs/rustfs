@@ -26,11 +26,31 @@ use crate::{
     ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
     init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
 };
+use rustfs_concurrency::{
+    AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
+    WorkloadClass,
+};
 use rustfs_filemeta::FileInfo;
 use serial_test::serial;
+use std::sync::Arc;
 use temp_env::with_var;
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+#[derive(Clone)]
+struct FixedWorkloadProvider {
+    snapshot: WorkloadAdmissionRegistrySnapshot,
+}
+
+impl WorkloadAdmissionSnapshotProvider for FixedWorkloadProvider {
+    fn workload_admission_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot {
+        self.snapshot.clone()
+    }
+}
+
+fn install_scanner_workload_provider(snapshot: WorkloadAdmissionRegistrySnapshot) {
+    crate::set_scanner_workload_admission_snapshot_provider(Arc::new(FixedWorkloadProvider { snapshot }));
+}
 
 fn bucket_info(name: &str) -> BucketInfo {
     BucketInfo {
@@ -1079,6 +1099,7 @@ async fn bucket_cache_pending_heal_reaches_cycle_maintenance_state() {
 #[serial]
 fn scanner_concurrency_limit_preserves_available_when_unconfigured() {
     crate::reset_foreground_read_activity_for_test();
+    crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
     assert_eq!(scanner_concurrency_limit(0, 4), 4);
 }
 
@@ -1086,6 +1107,7 @@ fn scanner_concurrency_limit_preserves_available_when_unconfigured() {
 #[serial]
 fn scanner_concurrency_limit_caps_to_configured_value() {
     crate::reset_foreground_read_activity_for_test();
+    crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
     assert_eq!(scanner_concurrency_limit(2, 4), 2);
 }
 
@@ -1093,6 +1115,7 @@ fn scanner_concurrency_limit_caps_to_configured_value() {
 #[serial]
 fn scanner_concurrency_limit_never_exceeds_available_work() {
     crate::reset_foreground_read_activity_for_test();
+    crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
     assert_eq!(scanner_concurrency_limit(8, 4), 4);
 }
 
@@ -1100,6 +1123,7 @@ fn scanner_concurrency_limit_never_exceeds_available_work() {
 #[serial]
 fn scanner_concurrency_limit_handles_no_available_work() {
     crate::reset_foreground_read_activity_for_test();
+    crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
     assert_eq!(scanner_concurrency_limit(2, 0), 0);
 }
 
@@ -1107,6 +1131,7 @@ fn scanner_concurrency_limit_handles_no_available_work() {
 #[serial]
 fn scanner_concurrency_limit_yields_to_foreground_reads() {
     crate::reset_foreground_read_activity_for_test();
+    crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
     crate::set_foreground_read_activity(8);
     assert_eq!(scanner_concurrency_limit(0, 4), 1);
     assert_eq!(scanner_concurrency_limit(3, 4), 1);
@@ -1115,8 +1140,24 @@ fn scanner_concurrency_limit_yields_to_foreground_reads() {
 
 #[test]
 #[serial]
+fn scanner_concurrency_limit_yields_to_shared_foreground_pressure() {
+    crate::reset_foreground_read_activity_for_test();
+    crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
+    install_scanner_workload_provider(WorkloadAdmissionRegistrySnapshot::new(vec![
+        WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Open).with_counts(Some(2), None, Some(16)),
+    ]));
+
+    assert_eq!(scanner_concurrency_limit(0, 4), 1);
+    assert_eq!(scanner_concurrency_limit(3, 4), 1);
+
+    crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
+}
+
+#[test]
+#[serial]
 fn scanner_concurrency_limit_yields_to_streaming_reads() {
     crate::reset_foreground_read_activity_for_test();
+    crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
     let _guard = crate::ForegroundReadGuard::new();
 
     assert_eq!(scanner_concurrency_limit(0, 4), 1);

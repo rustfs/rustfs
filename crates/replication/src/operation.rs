@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use crate::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
-    SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_STATUS, get_header_metadata, get_internal_metadata,
+    SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_STATUS, get_consistent_internal_metadata, get_header_metadata,
 };
 use s3s::dto::ReplicationConfiguration;
 use time::OffsetDateTime;
@@ -99,15 +99,34 @@ impl MustReplicateOptions {
             return true;
         }
 
-        get_internal_metadata(&self.meta, SUFFIX_REPLICATION_STATUS)
-            .as_deref()
-            .and_then(|statuses| {
-                statuses.split(';').find_map(|entry| {
-                    let (target_arn, status) = entry.split_once('=')?;
-                    (target_arn == arn).then(|| ReplicationStatusType::from(status))
-                })
-            })
-            == Some(ReplicationStatusType::Completed)
+        let Some(statuses) = get_consistent_internal_metadata(&self.meta, SUFFIX_REPLICATION_STATUS) else {
+            return false;
+        };
+        let mut admitted = None;
+        for entry in statuses.split(';').filter(|entry| !entry.is_empty()) {
+            let Some((target_arn, status)) = entry.split_once('=') else {
+                continue;
+            };
+            if target_arn != arn {
+                continue;
+            }
+            // Per-target admission is authoritative only when the target has
+            // exactly one unambiguous historical status record.
+            if admitted.is_some() {
+                return false;
+            }
+            admitted = Some(ReplicationStatusType::from(status));
+        }
+
+        matches!(
+            admitted,
+            Some(
+                ReplicationStatusType::Pending
+                    | ReplicationStatusType::Failed
+                    | ReplicationStatusType::Completed
+                    | ReplicationStatusType::CompletedLegacy
+            )
+        )
     }
 }
 
@@ -376,22 +395,72 @@ mod tests {
     }
 
     #[test]
-    fn metadata_replication_requires_completed_target_state() {
+    fn metadata_replication_requires_prior_target_admission() {
         let arn = "arn:rustfs:replication:target";
-        for status in ["PENDING", "FAILED"] {
+        for status in ["PENDING", "FAILED", "COMPLETED", "COMPLETE"] {
             let mut meta = HashMap::new();
             insert_internal_metadata(&mut meta, SUFFIX_REPLICATION_STATUS, format!("{arn}={status};"));
             let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Metadata, false);
 
-            assert!(!options.metadata_target_is_eligible(arn));
+            assert!(
+                options.metadata_target_is_eligible(arn),
+                "known target state {status} must remain eligible"
+            );
+            assert!(!options.metadata_target_is_eligible("arn:rustfs:replication:missing"));
         }
 
-        let mut meta = HashMap::new();
-        insert_internal_metadata(&mut meta, SUFFIX_REPLICATION_STATUS, format!("{arn}=COMPLETED;"));
-        let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Metadata, false);
+        for status in ["", "REPLICA", "UNKNOWN"] {
+            let mut meta = HashMap::new();
+            insert_internal_metadata(&mut meta, SUFFIX_REPLICATION_STATUS, format!("{arn}={status};"));
+            let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Metadata, false);
+            assert!(
+                !options.metadata_target_is_eligible(arn),
+                "unsupported target state {status:?} must fail closed"
+            );
+        }
 
-        assert!(options.metadata_target_is_eligible(arn));
-        assert!(!options.metadata_target_is_eligible("arn:rustfs:replication:missing"));
+        for key in ["x-rustfs-internal-replication-status", "X-Minio-Internal-Replication-Status"] {
+            let meta = HashMap::from([(key.to_string(), format!("{arn}=PENDING;"))]);
+            assert!(
+                MustReplicateOptions::new(&meta, String::new(), ReplicationType::Metadata, false)
+                    .metadata_target_is_eligible(arn),
+                "a single compatibility alias must preserve rolling-upgrade admission"
+            );
+        }
+
+        let matching_aliases = HashMap::from([
+            ("x-rustfs-internal-replication-status".to_string(), format!("{arn}=COMPLETED;")),
+            ("X-Minio-Internal-Replication-Status".to_string(), format!("{arn}=COMPLETED;")),
+        ]);
+        assert!(
+            MustReplicateOptions::new(&matching_aliases, String::new(), ReplicationType::Metadata, false)
+                .metadata_target_is_eligible(arn)
+        );
+
+        for conflicting in [
+            HashMap::from([
+                ("x-rustfs-internal-replication-status".to_string(), format!("{arn}=PENDING;")),
+                ("x-minio-internal-replication-status".to_string(), format!("{arn}=REPLICA;")),
+            ]),
+            HashMap::from([
+                ("x-rustfs-internal-replication-status".to_string(), format!("{arn}=PENDING;")),
+                ("x-minio-internal-replication-status".to_string(), String::new()),
+            ]),
+            HashMap::from([(
+                "x-rustfs-internal-replication-status".to_string(),
+                format!("{arn}=PENDING;{arn}=REPLICA;"),
+            )]),
+            HashMap::from([(
+                "x-rustfs-internal-replication-status".to_string(),
+                format!("{arn}=PENDING;{arn}=PENDING;"),
+            )]),
+        ] {
+            assert!(
+                !MustReplicateOptions::new(&conflicting, String::new(), ReplicationType::Metadata, false)
+                    .metadata_target_is_eligible(arn),
+                "conflicting, empty, or duplicate admission evidence must fail closed"
+            );
+        }
 
         // A replica-side metadata edit (active-active) has no per-target
         // internal status; eligibility is left to the ReplicaModifications rule.

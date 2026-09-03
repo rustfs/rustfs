@@ -45,7 +45,7 @@ use rustfs_io_metrics::{
     ProcessResourceSnapshot, ProcessSampler, ProcessStatusSnapshot, ProcessSystemSnapshot, s3_op_metrics_snapshot,
     snapshot_process_resource_and_system, snapshot_process_resource_and_system_with,
 };
-use rustfs_scanner_contracts::metrics::{
+use rustfs_scanner_metrics::metrics::{
     ScannerActiveBucketDriveSnapshot, ScannerBucketDriveResultSnapshot, ScannerMetricsReport, ScannerSourceWorkSnapshot,
     global_metrics,
 };
@@ -1679,7 +1679,7 @@ pub async fn collect_compression_cluster_stats() -> Option<CompressionClusterSta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_scanner_contracts::metrics::ScannerSourceWorkSnapshot;
+    use rustfs_scanner_metrics::metrics::ScannerSourceWorkSnapshot;
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
     use std::thread;
@@ -2134,7 +2134,7 @@ mod tests {
     #[test]
     fn ilm_detail_stats_keep_expiry_and_transition_results_separate() {
         let report = ScannerMetricsReport {
-            lifecycle_expiry: rustfs_scanner_contracts::metrics::ScannerLifecycleExpirySnapshot {
+            lifecycle_expiry: rustfs_scanner_metrics::metrics::ScannerLifecycleExpirySnapshot {
                 current_queued: 2,
                 current_active: 1,
                 scanner_queued: 10,
@@ -2142,7 +2142,7 @@ mod tests {
                 delete_failed: 4,
                 ..Default::default()
             },
-            lifecycle_transition: rustfs_scanner_contracts::metrics::ScannerLifecycleTransitionSnapshot {
+            lifecycle_transition: rustfs_scanner_metrics::metrics::ScannerLifecycleTransitionSnapshot {
                 current_queued: 5,
                 current_active: 6,
                 queue_full: 7,

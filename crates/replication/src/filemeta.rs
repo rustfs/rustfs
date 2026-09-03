@@ -849,6 +849,20 @@ pub fn parse_replicate_decision(_bucket: &str, s: &str) -> std::io::Result<Repli
     // }
 }
 
+/// Source snapshot used to fence replication terminal-status publication.
+///
+/// Timestamp and mutation id remain opaque because supported RustFS/MinIO
+/// writers may use different textual representations. `invalid` preserves the
+/// distinction between truly absent legacy metadata and corrupt/conflicting
+/// compatibility aliases.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationGenerationSnapshot {
+    pub timestamp: Option<String>,
+    pub mutation_id: Option<String>,
+    pub payload_fingerprint: Option<[u8; 32]>,
+    pub invalid: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicateObjectInfo {
     pub name: String,
@@ -871,6 +885,10 @@ pub struct ReplicateObjectInfo {
     pub target_statuses: HashMap<String, ReplicationStatusType>,
     pub target_purge_statuses: HashMap<String, VersionPurgeStatusType>,
     pub replication_timestamp: Option<OffsetDateTime>,
+    /// Exact persisted source snapshot used to fence terminal status
+    /// write-back after remote I/O.
+    #[serde(default)]
+    pub replication_generation: ReplicationGenerationSnapshot,
     pub ssec: bool,
     pub user_tags: String,
     pub checksum: Option<Bytes>,

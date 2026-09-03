@@ -2861,7 +2861,12 @@ impl From<FileInfo> for MetaObject {
     }
 }
 
-fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<ReplicationState> {
+/// Rebuild the structured replication state from its durable internal metadata.
+///
+/// Mutation paths that update internal replication keys on an existing
+/// [`FileInfo`] must use this parser before serializing xl.meta so the metadata
+/// map and the structured state cannot diverge.
+pub fn get_internal_replication_state(metadata: &HashMap<String, String>) -> Option<ReplicationState> {
     let mut rs = ReplicationState::default();
     let mut has = false;
 

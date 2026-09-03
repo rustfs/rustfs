@@ -12,9 +12,9 @@
 | Class | Provider (`impl WorkloadAdmissionSnapshotProvider`) | `active` / `queued` / `limit` source | Reports `Unknown` when |
 |---|---|---|---|
 | `ForegroundRead` | `ConcurrencyManager` in `rustfs/src/storage/concurrency/manager.rs` (source of truth); re-exposed unchanged by the RustFS runtime provider | disk-read permits in use / `None` (the semaphore exposes no waiter count) / configured max concurrent disk reads | the storage registry has no entry |
-| `ForegroundWrite` | none | none | always: no write-specific admission owner exposes a read-only surface yet |
+| `ForegroundWrite` | `ConcurrencyManager` in `rustfs/src/storage/concurrency/manager.rs` (source of truth); re-exposed unchanged by the RustFS runtime provider | foreground-write permits in use or legacy active-write counter / `None` / configured or derived write-admission limit | the storage registry has no entry |
 | `Metadata` | `RustFsWorkloadAdmissionSnapshotProvider` in `rustfs/src/workload_admission.rs` | `Open` once the bucket metadata runtime handle exists; no counts | bucket metadata runtime not initialized |
-| `Scanner` | same | scanner active work-unit counter / none / none | the counter is zero (idle and uninitialized are indistinguishable) |
+| `Scanner` | same | scanner active work-unit counter / none / configured set-scan limit when nonzero | scanner runtime not initialized |
 | `Repair` | same | heal active tasks / heal queue length / `None` (limits live behind the async heal manager state) | heal manager not initialized |
 | `Replication` | same | active regular + large-object + MRF workers / site replication queue count / `None` (limits owned by the async pool and resize policy) | replication runtime not initialized, or queue stats currently locked |
 
@@ -28,6 +28,7 @@ Consumers that read the snapshot to self-throttle exist, and they do not change 
 |---|---|---|
 | Data-movement backpressure (decommission, rebalance) | `crates/ecstore/src/data_movement/backpressure.rs` (`wait_for_data_movement_admission`, `foreground_pressure`) | Delays the next data-movement step while `ForegroundRead` or `ForegroundWrite` usage exceeds the configured high-water percent. ECStore receives the provider through `set_workload_admission_snapshot_provider` (`crates/ecstore/src/lib.rs`), published from `rustfs/src/startup_background.rs`; with no provider the step is admitted immediately. |
 | Heal manager mainline throttle | `crates/heal/src/heal/manager.rs` (`new_with_workload_provider`) | When `mainline_throttle_enable` is set, defers heal work while `ForegroundRead` or `ForegroundWrite` utilization exceeds the configured high-water percents; with no provider or the throttle disabled, heal pacing is unchanged. |
+| Scanner sleeper and scan fan-out | `crates/scanner/src/workload_admission.rs`, `crates/scanner/src/sleeper.rs`, and `crates/scanner/src/scanner_io/guards.rs` | Reads the same provider published from `rustfs/src/startup_background.rs` and combines it with scanner-local foreground read guards. Foreground activity increases scanner sleeps and reduces set/disk scan fan-out to one; cycle budgets still own object, directory, and duration limits. With no provider, scanner keeps the legacy local foreground-read behavior. |
 
 ## Boundary Rules
 

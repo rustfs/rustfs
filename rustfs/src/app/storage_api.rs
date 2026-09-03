@@ -30,8 +30,8 @@ pub(crate) mod s3 {
     #[cfg(test)]
     pub(crate) use s3s::dto::{
         BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
-        ReplicationRule, ReplicationRuleStatus, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-        ServerSideEncryptionRule, VersioningConfiguration,
+        ReplicationRule, ReplicationRuleFilter, ReplicationRuleStatus, ServerSideEncryptionByDefault,
+        ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, VersioningConfiguration,
     };
 }
 
@@ -148,7 +148,7 @@ pub(crate) mod runtime {
     pub(crate) type NotificationSys = crate::storage::storage_api::NotificationSys;
     pub(crate) type ObjectStoreResolver = crate::storage::storage_api::ObjectStoreResolver;
     pub(crate) type ReplicationStats = crate::storage::storage_api::ReplicationStats;
-    pub(crate) type ScannerMetricsReport = rustfs_scanner_contracts::metrics::ScannerMetricsReport;
+    pub(crate) type ScannerMetricsReport = rustfs_scanner_metrics::metrics::ScannerMetricsReport;
     pub(crate) type StorageClassConfig = crate::storage::storage_api::ecstore_config::storageclass::Config;
     pub(crate) type TierConfigMgr = crate::storage::storage_api::TierConfigMgr;
     pub(crate) type TransitionState = crate::storage::storage_api::TransitionState;
@@ -224,7 +224,7 @@ pub(crate) mod runtime {
     }
 
     pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {
-        rustfs_scanner_contracts::metrics::global_metrics().report().await
+        rustfs_scanner_metrics::metrics::global_metrics().report().await
     }
 
     #[cfg(test)]

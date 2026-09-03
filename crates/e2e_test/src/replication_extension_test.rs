@@ -69,7 +69,7 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::fs;
 use tokio::net::TcpListener;
@@ -2008,6 +2008,87 @@ fn proxy_error_response(error: impl std::fmt::Display) -> Response<Full<bytes::B
         .expect("static proxy response must be valid")
 }
 
+#[derive(Clone)]
+struct ReplicationResponseHoldRuntime {
+    armed: Arc<AtomicBool>,
+    backend_committed: watch::Sender<bool>,
+    release: watch::Receiver<bool>,
+}
+
+impl ReplicationResponseHoldRuntime {
+    fn try_claim(&self) -> bool {
+        self.armed
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+struct ReplicationResponseHold {
+    armed: Arc<AtomicBool>,
+    backend_committed_signal: watch::Sender<bool>,
+    backend_committed: watch::Receiver<bool>,
+    release: watch::Sender<bool>,
+}
+
+impl ReplicationResponseHold {
+    fn arm(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        if self.armed.load(Ordering::Acquire) {
+            return Err("replication response hold was already armed".into());
+        }
+        self.backend_committed_signal
+            .send(false)
+            .map_err(|_| "replication response hold closed before rearming")?;
+        self.release
+            .send(false)
+            .map_err(|_| "replication response hold closed before rearming")?;
+        self.armed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "replication response hold was already armed")?;
+        Ok(())
+    }
+
+    async fn wait_for_backend_commit(&mut self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let wait = async {
+            while !*self.backend_committed.borrow() {
+                self.backend_committed
+                    .changed()
+                    .await
+                    .map_err(|_| "replication response hold closed before the backend committed")?;
+            }
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        };
+        timeout(Duration::from_secs(60), wait)
+            .await
+            .map_err(|_| "timed out waiting for the replication backend to commit")?
+    }
+
+    fn release(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.release
+            .send(true)
+            .map_err(|_| "replication response hold closed before release")?;
+        Ok(())
+    }
+}
+
+fn replication_response_hold() -> (ReplicationResponseHoldRuntime, ReplicationResponseHold) {
+    let armed = Arc::new(AtomicBool::new(false));
+    let (backend_committed, backend_committed_rx) = watch::channel(false);
+    let (release, release_rx) = watch::channel(false);
+    (
+        ReplicationResponseHoldRuntime {
+            armed: armed.clone(),
+            backend_committed: backend_committed.clone(),
+            release: release_rx,
+        },
+        ReplicationResponseHold {
+            armed,
+            backend_committed_signal: backend_committed,
+            backend_committed: backend_committed_rx,
+            release,
+        },
+    )
+}
+
 async fn forward_replication_proxy_request(
     request: Request<Incoming>,
     backend_url: &str,
@@ -2015,6 +2096,7 @@ async fn forward_replication_proxy_request(
     request_count: &AtomicU64,
     mut replication_enabled: watch::Receiver<bool>,
     mut held_tagging: watch::Receiver<Option<String>>,
+    mut response_hold: ReplicationResponseHoldRuntime,
 ) -> Response<Full<bytes::Bytes>> {
     let (parts, body) = request.into_parts();
     let is_replication = parts
@@ -2040,6 +2122,7 @@ async fn forward_replication_proxy_request(
             }
         }
     }
+    let hold_response = is_replication && parts.method == http::Method::PUT && response_hold.try_claim();
 
     let Some(path_and_query) = parts.uri.path_and_query() else {
         return proxy_error_response("request URI omitted path");
@@ -2062,6 +2145,16 @@ async fn forward_replication_proxy_request(
         Ok(body) => body,
         Err(error) => return proxy_error_response(error),
     };
+    if hold_response && status.is_success() {
+        if response_hold.backend_committed.send(true).is_err() {
+            return proxy_error_response("replication response hold closed after the backend committed");
+        }
+        while !*response_hold.release.borrow() {
+            if response_hold.release.changed().await.is_err() {
+                return proxy_error_response("replication response hold closed before release");
+            }
+        }
+    }
     let mut proxied = Response::builder().status(status);
     for (name, value) in &headers {
         proxied = proxied.header(name, value);
@@ -2073,7 +2166,7 @@ async fn start_replication_counting_proxy(
     backend_url: &str,
     tasks: &mut JoinSet<()>,
 ) -> Result<(String, Arc<AtomicU64>, watch::Sender<bool>), Box<dyn Error + Send + Sync>> {
-    let (proxy_url, request_count, replication_enabled, _held_tagging) =
+    let (proxy_url, request_count, replication_enabled, _held_tagging, _response_hold) =
         start_replication_counting_proxy_with_tag_hold(backend_url, tasks).await?;
     Ok((proxy_url, request_count, replication_enabled))
 }
@@ -2085,7 +2178,16 @@ async fn start_replication_counting_proxy(
 async fn start_replication_counting_proxy_with_tag_hold(
     backend_url: &str,
     tasks: &mut JoinSet<()>,
-) -> Result<(String, Arc<AtomicU64>, watch::Sender<bool>, watch::Sender<Option<String>>), Box<dyn Error + Send + Sync>> {
+) -> Result<
+    (
+        String,
+        Arc<AtomicU64>,
+        watch::Sender<bool>,
+        watch::Sender<Option<String>>,
+        ReplicationResponseHold,
+    ),
+    Box<dyn Error + Send + Sync>,
+> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_url = format!("http://{}", listener.local_addr()?);
     let backend_url = backend_url.to_string();
@@ -2093,6 +2195,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
     let task_request_count = request_count.clone();
     let (replication_enabled, task_replication_enabled) = watch::channel(true);
     let (held_tagging, task_held_tagging) = watch::channel(None);
+    let (response_hold_runtime, response_hold) = replication_response_hold();
     tasks.spawn(async move {
         let client = local_http_client();
         let mut connections = JoinSet::new();
@@ -2105,6 +2208,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
                     let request_count = task_request_count.clone();
                     let replication_enabled = task_replication_enabled.clone();
                     let held_tagging = task_held_tagging.clone();
+                    let response_hold = response_hold_runtime.clone();
                     connections.spawn(async move {
                         let service = service_fn(move |request| {
                             let backend_url = backend_url.clone();
@@ -2112,6 +2216,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
                             let request_count = request_count.clone();
                             let replication_enabled = replication_enabled.clone();
                             let held_tagging = held_tagging.clone();
+                            let response_hold = response_hold.clone();
                             async move {
                                 Ok::<_, Infallible>(
                                     forward_replication_proxy_request(
@@ -2121,6 +2226,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
                                         &request_count,
                                         replication_enabled,
                                         held_tagging,
+                                        response_hold,
                                     )
                                     .await,
                                 )
@@ -2133,7 +2239,7 @@ async fn start_replication_counting_proxy_with_tag_hold(
             }
         }
     });
-    Ok((proxy_url, request_count, replication_enabled, held_tagging))
+    Ok((proxy_url, request_count, replication_enabled, held_tagging, response_hold))
 }
 
 async fn site_replication_remove(
@@ -3824,6 +3930,12 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
     let mut source_env = RustFSTestEnvironment::new().await?;
     let mut source_env_vars = replication_fast_env();
     source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+    // This matrix verifies request-time rule/admission behavior. Keep the
+    // background existing-object scanner outside the observation window: with
+    // ExistingObjectReplication enabled it may legitimately discover an
+    // object after its tags change, which is a separate data-replication path
+    // that PR #5696 intentionally did not alter.
+    source_env_vars.push(("RUSTFS_SCANNER_START_DELAY_SECS", "300"));
     source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
 
     let mut target_env_a = RustFSTestEnvironment::new().await?;
@@ -4050,6 +4162,13 @@ async fn test_bucket_replication_acceptance_matrix_local_dual_targets() -> TestR
         .body(ByteStream::from_static(b"not tagged"))
         .send()
         .await?;
+    assert_replication_key_absent(&target_client_b, target_bucket_b, "tagged/no-match.txt", Duration::from_secs(3)).await?;
+
+    // A metadata edit must not retroactively admit data that failed the tag
+    // filter at PUT time. This is the PR #5696 safety boundary: the target ARN
+    // has no persisted data-admission state for this version, so adding the
+    // matching tag later remains metadata-only and fails closed.
+    put_single_tag_current(&source_client, source_bucket, "tagged/no-match.txt", "route", "tagged").await?;
     assert_replication_key_absent(&target_client_b, target_bucket_b, "tagged/no-match.txt", Duration::from_secs(3)).await?;
 
     source_client
@@ -7155,6 +7274,27 @@ async fn put_single_tag(
     Ok(())
 }
 
+async fn put_single_tag_current(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    tag_key: &str,
+    tag_value: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    client
+        .put_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .tagging(
+            aws_sdk_s3::types::Tagging::builder()
+                .tag_set(aws_sdk_s3::types::Tag::builder().key(tag_key).value(tag_value).build()?)
+                .build()?,
+        )
+        .send()
+        .await?;
+    Ok(())
+}
+
 async fn get_single_tag(
     client: &Client,
     bucket: &str,
@@ -7197,6 +7337,28 @@ async fn wait_for_single_tag(
                 "{site}: {bucket}/{key}?versionId={version_id} tag {tag_key}={observed:?} never became {expected}"
             )
             .into());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll one site until `tag_key` is absent from the selected version.
+async fn wait_for_tag_absent(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    tag_key: &str,
+    site: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let observed = get_single_tag(client, bucket, key, version_id, tag_key).await?;
+        if observed.is_none() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{site}: {bucket}/{key}?versionId={version_id} tag {tag_key} remained {observed:?}").into());
         }
         sleep(Duration::from_millis(200)).await;
     }
@@ -7249,6 +7411,265 @@ async fn wait_for_proxy_replication_requests(
     }
 }
 
+/// rustfs/backlog#2099: metadata admission must not drop a tag edit made after
+/// the target has committed the initial object but before the source persists
+/// that replication as COMPLETED.
+#[tokio::test]
+async fn test_site_replication_tagging_during_initial_pending_window_converges() -> TestResult {
+    init_logging();
+
+    // `RustFSTestEnvironment::start_rustfs_server_with_env` resolves (and on a
+    // cold checkout builds) this binary synchronously. Keep that setup outside
+    // the scenario timeout so 180 seconds measures the runtime race rather
+    // than compilation latency.
+    let _rustfs_binary = rustfs_binary_path();
+
+    match timeout(Duration::from_secs(180), async {
+        const PAYLOAD: &str = "tagging during pending replication";
+        const TAG_KEY: &str = "window";
+        const TAG_VALUE: &str = "pending";
+        const DELETE_PAYLOAD: &str = "tag deletion during pending replication";
+        const DELETE_TAG_KEY: &str = "remove";
+        const DELETE_TAG_VALUE: &str = "while-pending";
+
+        let mut site_env = replication_fast_env();
+        site_env.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
+
+        let mut site_a_env = RustFSTestEnvironment::new().await?;
+        site_a_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let mut site_b_env = RustFSTestEnvironment::new().await?;
+        site_b_env.start_rustfs_server_with_env(vec![], &site_env).await?;
+
+        let site_a_client = site_a_env.create_s3_client();
+        let site_b_client = site_b_env.create_s3_client();
+        let mut proxy_tasks = JoinSet::new();
+        let (
+            site_b_proxy,
+            _site_b_replication_requests,
+            _site_b_replication_enabled,
+            _site_b_held_tagging,
+            mut site_b_response_hold,
+        ) = start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks).await?;
+
+        let add_status = site_replication_add(
+            &site_a_env,
+            &[
+                PeerSite {
+                    name: "pending-site-a".to_string(),
+                    endpoint: site_a_env.url.clone(),
+                    access_key: site_a_env.access_key.clone(),
+                    secret_key: site_a_env.secret_key.clone(),
+                    ..Default::default()
+                },
+                PeerSite {
+                    name: "pending-site-b".to_string(),
+                    endpoint: site_b_env.url.clone(),
+                    access_key: site_b_env.access_key.clone(),
+                    secret_key: site_b_env.secret_key.clone(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await?;
+        assert!(add_status.success, "unexpected site add result: {add_status:?}");
+
+        let site_info = wait_for_site_replication_enabled(&site_a_env, 2).await?;
+        wait_for_site_replication_enabled(&site_b_env, 2).await?;
+        let mut site_b_peer = site_info
+            .sites
+            .iter()
+            .find(|peer| peer.endpoint == site_b_env.url.as_str())
+            .ok_or("site B peer missing from replication info")?
+            .clone();
+        site_b_peer.endpoint = site_b_proxy.clone();
+        site_b_peer.sync_state = SyncStatus::Enable;
+        let edit = site_replication_edit(&site_a_env, "", &site_b_peer).await?;
+        assert!(edit.success, "unexpected site B endpoint edit: {edit:?}");
+        for env in [&site_a_env, &site_b_env] {
+            wait_for_site_replication_info(env, |info| info.sites.iter().any(|peer| peer.endpoint == site_b_proxy)).await?;
+        }
+
+        let bucket = "site-repl-tag-pending";
+        let key = "pending-window.txt";
+        site_a_client.create_bucket().bucket(bucket).send().await?;
+        wait_for_bucket_on_target(&site_b_client, bucket).await?;
+
+        site_b_response_hold.arm()?;
+        let put_task = {
+            let client = site_a_client.clone();
+            let bucket = bucket.to_string();
+            let key = key.to_string();
+            tokio::spawn(async move {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .body(ByteStream::from_static(PAYLOAD.as_bytes()))
+                    .send()
+                    .await
+            })
+        };
+
+        // The proxy reads B's complete successful response before parking it,
+        // so B's GET proves the object is committed while A's worker is still
+        // unable to persist COMPLETED.
+        site_b_response_hold.wait_for_backend_commit().await?;
+        wait_for_replicated_object(&site_b_client, bucket, key, PAYLOAD).await?;
+        let source_head = site_a_client.head_object().bucket(bucket).key(key).send().await?;
+        let version_id = source_head
+            .version_id()
+            .ok_or("source HEAD omitted the pending version ID")?
+            .to_string();
+        assert_eq!(
+            source_head.replication_status().map(|status| status.as_str()),
+            Some("PENDING"),
+            "source must still report PENDING while the initial replication response is held"
+        );
+
+        let tag_task = {
+            let client = site_a_client.clone();
+            let bucket = bucket.to_string();
+            let key = key.to_string();
+            // The original real-machine failure used the current-version S3
+            // API (no versionId). The delete phase below deliberately keeps an
+            // explicit versionId so both request shapes stay covered.
+            tokio::spawn(async move { put_single_tag_current(&client, &bucket, &key, TAG_KEY, TAG_VALUE).await })
+        };
+        wait_for_single_tag(&site_a_client, bucket, key, &version_id, TAG_KEY, TAG_VALUE, "site A").await?;
+        assert_eq!(
+            head_replication_status(&site_a_client, bucket, key, &version_id)
+                .await?
+                .as_deref(),
+            Some("PENDING"),
+            "tag update must be authored before the initial replication reaches COMPLETED"
+        );
+
+        site_b_response_hold.release()?;
+        let put_output = timeout(Duration::from_secs(60), put_task)
+            .await
+            .map_err(|_| "source PutObject remained blocked after releasing the replication response")???;
+        timeout(Duration::from_secs(60), tag_task)
+            .await
+            .map_err(|_| "PutObjectTagging remained blocked after releasing the replication response")???;
+        assert_eq!(put_output.version_id(), Some(version_id.as_str()));
+
+        wait_for_single_tag(&site_b_client, bucket, key, &version_id, TAG_KEY, TAG_VALUE, "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, key, &version_id, &["COMPLETED"], "site A").await?;
+        wait_for_version_replication_status(&site_b_client, bucket, key, &version_id, &["REPLICA"], "site B").await?;
+
+        let source_state = list_replication_state(&site_a_client, bucket).await?;
+        let target_state = list_replication_state(&site_b_client, bucket).await?;
+        assert_eq!(source_state, target_state, "tag replication must not fork the object version");
+        assert_eq!(source_state.len(), 1, "tag replication must leave exactly one object version");
+        assert_eq!(source_state[0].key, key);
+        assert_eq!(source_state[0].version_id, version_id);
+
+        // Re-arm the same response barrier for an initially tagged object.
+        // Deleting its tag while A is still PENDING proves the same admission
+        // rule covers DeleteObjectTagging rather than only the original PUT
+        // symptom.
+        let delete_key = "pending-delete-window.txt";
+        site_b_response_hold.arm()?;
+        let delete_put_task = {
+            let client = site_a_client.clone();
+            let bucket = bucket.to_string();
+            let key = delete_key.to_string();
+            tokio::spawn(async move {
+                client
+                    .put_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .tagging(format!("{DELETE_TAG_KEY}={DELETE_TAG_VALUE}"))
+                    .body(ByteStream::from_static(DELETE_PAYLOAD.as_bytes()))
+                    .send()
+                    .await
+            })
+        };
+
+        site_b_response_hold.wait_for_backend_commit().await?;
+        wait_for_replicated_object(&site_b_client, bucket, delete_key, DELETE_PAYLOAD).await?;
+        let delete_source_head = site_a_client.head_object().bucket(bucket).key(delete_key).send().await?;
+        let delete_version_id = delete_source_head
+            .version_id()
+            .ok_or("source HEAD omitted the pending tagged version ID")?
+            .to_string();
+        assert_eq!(
+            delete_source_head.replication_status().map(|status| status.as_str()),
+            Some("PENDING"),
+            "source tagged object must remain PENDING while its initial response is held"
+        );
+        wait_for_single_tag(
+            &site_b_client,
+            bucket,
+            delete_key,
+            &delete_version_id,
+            DELETE_TAG_KEY,
+            DELETE_TAG_VALUE,
+            "site B",
+        )
+        .await?;
+
+        let delete_tag_task = {
+            let client = site_a_client.clone();
+            let bucket = bucket.to_string();
+            let key = delete_key.to_string();
+            let version_id = delete_version_id.clone();
+            tokio::spawn(async move {
+                client
+                    .delete_object_tagging()
+                    .bucket(bucket)
+                    .key(key)
+                    .version_id(version_id)
+                    .send()
+                    .await
+            })
+        };
+        wait_for_tag_absent(&site_a_client, bucket, delete_key, &delete_version_id, DELETE_TAG_KEY, "site A").await?;
+        assert_eq!(
+            head_replication_status(&site_a_client, bucket, delete_key, &delete_version_id)
+                .await?
+                .as_deref(),
+            Some("PENDING"),
+            "tag deletion must be authored before the initial replication reaches COMPLETED"
+        );
+
+        site_b_response_hold.release()?;
+        let delete_put_output = timeout(Duration::from_secs(60), delete_put_task)
+            .await
+            .map_err(|_| "source tagged PutObject remained blocked after releasing the replication response")???;
+        timeout(Duration::from_secs(60), delete_tag_task)
+            .await
+            .map_err(|_| "DeleteObjectTagging remained blocked after releasing the replication response")???;
+        assert_eq!(delete_put_output.version_id(), Some(delete_version_id.as_str()));
+
+        wait_for_tag_absent(&site_b_client, bucket, delete_key, &delete_version_id, DELETE_TAG_KEY, "site B").await?;
+        wait_for_version_replication_status(&site_a_client, bucket, delete_key, &delete_version_id, &["COMPLETED"], "site A")
+            .await?;
+        wait_for_version_replication_status(&site_b_client, bucket, delete_key, &delete_version_id, &["REPLICA"], "site B")
+            .await?;
+
+        let source_state = list_replication_state(&site_a_client, bucket).await?;
+        let target_state = list_replication_state(&site_b_client, bucket).await?;
+        assert_eq!(source_state, target_state, "tag deletion must not fork the object version");
+        assert_eq!(source_state.len(), 2, "pending-window scenarios must leave exactly two object versions");
+        assert!(
+            source_state
+                .iter()
+                .any(|entry| entry.key == delete_key && entry.version_id == delete_version_id),
+            "tag deletion must preserve the original version identity"
+        );
+
+        proxy_tasks.abort_all();
+        Ok(())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("pending-window site-replication tagging test timed out".into()),
+    }
+}
+
 /// rustfs/backlog#1953 (audit A4/P1-6): receiver-side LWW for replicated
 /// metadata categories, exercised end to end over the real dual-node
 /// active-active site-replication control plane — sender, worker, status
@@ -7285,9 +7706,9 @@ async fn test_site_replication_tagging_lww_converges_active_active_real_dual_nod
         site_b_env.start_rustfs_server_with_env(vec![], &site_env).await?;
 
         let mut proxy_tasks = JoinSet::new();
-        let (site_a_proxy, site_a_replication_requests, _site_a_replication_enabled, site_a_held_tagging) =
+        let (site_a_proxy, site_a_replication_requests, _site_a_replication_enabled, site_a_held_tagging, _site_a_response_hold) =
             start_replication_counting_proxy_with_tag_hold(&site_a_env.url, &mut proxy_tasks).await?;
-        let (site_b_proxy, site_b_replication_requests, _site_b_replication_enabled, site_b_held_tagging) =
+        let (site_b_proxy, site_b_replication_requests, _site_b_replication_enabled, site_b_held_tagging, _site_b_response_hold) =
             start_replication_counting_proxy_with_tag_hold(&site_b_env.url, &mut proxy_tasks).await?;
 
         let site_a_client = site_a_env.create_s3_client();

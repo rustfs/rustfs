@@ -850,6 +850,11 @@ mod tests {
         metadata.insert(MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "DAREv2-HMAC-SHA256".to_string());
         metadata.insert(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER.to_string(), "sealed".to_string());
         metadata.insert(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER.to_string(), "true".to_string());
+        rustfs_utils::http::insert_str(
+            &mut metadata,
+            rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+            Uuid::from_u128(1).to_string(),
+        );
 
         let object_info = ObjectInfo {
             user_defined: Arc::new(metadata),
@@ -895,6 +900,13 @@ mod tests {
         assert!(!options.user_metadata.contains_key(AMZ_SERVER_SIDE_ENCRYPTION));
         assert!(!options.user_metadata.contains_key(SSEC_ALGORITHM_HEADER));
         assert!(!options.user_metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
+        assert!(
+            options
+                .user_metadata
+                .keys()
+                .all(|key| !key.contains(rustfs_utils::http::SUFFIX_REPLICATION_GENERATION)),
+            "source-local mutation generation must never cross the replication wire"
+        );
         assert!(
             !options
                 .user_metadata

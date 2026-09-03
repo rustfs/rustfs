@@ -20,8 +20,8 @@ use std::alloc::{GlobalAlloc, Layout};
 struct MiMallocAllocator;
 
 #[cfg(all(feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]
-// SAFETY: allocation operations are forwarded unchanged to MiMalloc, so
-// MiMalloc's GlobalAlloc guarantees apply to every returned pointer and layout.
+// SAFETY: allocation operations are forwarded to MiMalloc with the
+// corresponding GlobalAlloc size and alignment contracts.
 #[allow(unsafe_code)]
 unsafe impl GlobalAlloc for MiMallocAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -35,8 +35,8 @@ unsafe impl GlobalAlloc for MiMallocAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: ptr and layout came from this allocator and are forwarded unchanged.
-        unsafe { rustfs_mimalloc::MiMalloc.dealloc(ptr, layout) }
+        // SAFETY: ptr came from this allocator and layout.size() is the original allocation size.
+        unsafe { rustfs_mimalloc::MiMalloc::free_csize(ptr, layout.size()) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {

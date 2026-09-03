@@ -575,13 +575,22 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
         let mut sopts = opts.clone();
         sopts.target_arn = arn.clone();
 
-        let replicate = cfg.replicate(&sopts) && mopts.metadata_target_is_eligible(&arn);
+        let replicate = metadata_target_should_replicate(&cfg, &sopts, &mopts, &arn);
         let synchronous = if let Some(cli) = cli { cli.replicate_sync } else { false };
 
         dsc.set(ReplicateTargetDecision::new(arn, replicate, synchronous));
     }
 
     dsc
+}
+
+fn metadata_target_should_replicate(
+    cfg: &ReplicationConfiguration,
+    opts: &ObjectOpts,
+    mopts: &MustReplicateOptions,
+    arn: &str,
+) -> bool {
+    cfg.replicate(opts) && mopts.metadata_target_is_eligible(arn)
 }
 
 #[cfg(test)]
@@ -611,6 +620,46 @@ mod tests {
             source_selection_criteria: None,
             status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
         }
+    }
+
+    #[test]
+    fn metadata_replication_requires_both_current_rule_match_and_historical_admission() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let mut rule = replication_rule();
+        rule.destination.bucket = arn.to_string();
+        rule.filter = Some(ReplicationRuleFilter {
+            prefix: Some("admitted/".to_string()),
+            ..Default::default()
+        });
+        let cfg = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rule],
+        };
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_REPLICATION_STATUS, format!("{arn}=PENDING;"));
+        let admitted = MustReplicateOptions::new(&metadata, String::new(), ReplicationType::Metadata, false);
+        let matching = ObjectOpts {
+            name: "admitted/object".to_string(),
+            target_arn: arn.to_string(),
+            ..Default::default()
+        };
+        assert!(metadata_target_should_replicate(&cfg, &matching, &admitted, arn));
+
+        let rule_mismatch = ObjectOpts {
+            name: "outside/object".to_string(),
+            target_arn: arn.to_string(),
+            ..Default::default()
+        };
+        assert!(
+            !metadata_target_should_replicate(&cfg, &rule_mismatch, &admitted, arn),
+            "historical admission must not bypass the current replication rule"
+        );
+
+        let never_admitted = MustReplicateOptions::new(&HashMap::new(), String::new(), ReplicationType::Metadata, false);
+        assert!(
+            !metadata_target_should_replicate(&cfg, &matching, &never_admitted, arn),
+            "a current rule match must not create historical admission"
+        );
     }
 
     #[test]

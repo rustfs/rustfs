@@ -75,6 +75,8 @@ pub const SUFFIX_REPLICA_STATUS: &str = "replica-status";
 pub const SUFFIX_REPLICA_TIMESTAMP: &str = "replica-timestamp";
 pub const SUFFIX_REPLICATION_STATUS: &str = "replication-status";
 pub const SUFFIX_REPLICATION_TIMESTAMP: &str = "replication-timestamp";
+/// Source-local opaque mutation id fencing replication status write-back.
+pub const SUFFIX_REPLICATION_GENERATION: &str = "replication-generation";
 pub const SUFFIX_TAGGING_TIMESTAMP: &str = "tagging-timestamp";
 pub const SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP: &str = "objectlock-retention-timestamp";
 pub const SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP: &str = "objectlock-legalhold-timestamp";
