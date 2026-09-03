@@ -15924,7 +15924,7 @@ mod tests {
                         .expect("unknown transition metadata should be written");
                     }
                     let lifecycle_event = crate::bucket::lifecycle::lifecycle::Event {
-                        action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
+                        action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
                         rule_id: "delete-all-versions".to_string(),
                         ..Default::default()
                     };
@@ -16176,7 +16176,7 @@ mod tests {
                 lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
                     version_id: original.version_id,
                     delete_marker: false,
-                    action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
+                    action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
                     rule_id: "rule".to_string(),
                     phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
                 }),

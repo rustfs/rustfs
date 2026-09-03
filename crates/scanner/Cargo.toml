@@ -74,7 +74,7 @@ hotpath.workspace = true
 rustfs-config = { workspace = true, features = ["server-config-model"] }
 rustfs-common = { workspace = true }
 rustfs-heal-contracts = { workspace = true }
-rustfs-scanner-contracts = { workspace = true }
+rustfs-scanner-metrics = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["fs", "sync", "time", "macros", "rt-multi-thread"] }

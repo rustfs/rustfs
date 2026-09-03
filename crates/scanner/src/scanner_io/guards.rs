@@ -147,13 +147,13 @@ impl Drop for DiskBucketScanActiveGuard {
 
 pub(super) struct BucketDriveFailureGuard {
     failed: bool,
-    source: rustfs_scanner_contracts::metrics::ScannerWorkSource,
+    source: rustfs_scanner_metrics::metrics::ScannerWorkSource,
     bucket: String,
     drive: String,
 }
 
 impl BucketDriveFailureGuard {
-    pub(super) fn new(source: rustfs_scanner_contracts::metrics::ScannerWorkSource, bucket: &str, drive: &str) -> Self {
+    pub(super) fn new(source: rustfs_scanner_metrics::metrics::ScannerWorkSource, bucket: &str, drive: &str) -> Self {
         Self {
             failed: true,
             source,
@@ -285,7 +285,7 @@ pub(super) fn scanner_task_join_error(stage: &str, err: tokio::task::JoinError) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_scanner_contracts::metrics::{ScannerWorkSource, global_metrics};
+    use rustfs_scanner_metrics::metrics::{ScannerWorkSource, global_metrics};
     use tokio::sync::oneshot;
 
     fn active_bucket_drive_count(source: ScannerWorkSource, bucket: &str, drive: &str) -> u64 {

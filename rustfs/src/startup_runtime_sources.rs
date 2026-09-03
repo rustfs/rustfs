@@ -55,7 +55,7 @@ pub(crate) async fn publish_server_addr(addr: &str) {
 }
 
 pub(crate) async fn publish_init_time_now() {
-    rustfs_scanner_contracts::set_global_init_time_now().await;
+    rustfs_scanner_metrics::set_global_init_time_now().await;
 }
 
 pub(crate) fn init_kms_service_manager() -> Arc<KmsServiceManager> {

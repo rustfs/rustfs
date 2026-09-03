@@ -84,7 +84,7 @@ use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, TRANSITION_COMPLETE, get_file_info, is_restored_object_on_disk,
 };
-use rustfs_scanner_contracts::metrics::{
+use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
 use rustfs_utils::{
@@ -5596,7 +5596,7 @@ mod tests {
     use rustfs_filemeta::{FileInfo, FileMeta};
     #[cfg(feature = "test-util")]
     use rustfs_s3_client::transition_api::ReaderImpl;
-    use rustfs_scanner_contracts::metrics::{IlmAction, global_metrics};
+    use rustfs_scanner_metrics::metrics::{IlmAction, global_metrics};
     use s3s::dto::{
         BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry,
         ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, OutputLocation, RestoreRequest,

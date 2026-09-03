@@ -227,7 +227,7 @@ rustfs-heal = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
 rustfs-heal-contracts = { workspace = true }
-rustfs-scanner-contracts = { workspace = true }
+rustfs-scanner-metrics = { workspace = true }
 rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }

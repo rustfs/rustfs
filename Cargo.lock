@@ -9517,7 +9517,7 @@ dependencies = [
  "rustfs-s3select-api",
  "rustfs-s3select-query",
  "rustfs-scanner",
- "rustfs-scanner-contracts",
+ "rustfs-scanner-metrics",
  "rustfs-security-governance",
  "rustfs-signer",
  "rustfs-storage-api",
@@ -9763,7 +9763,7 @@ dependencies = [
  "rustfs-rio-v2",
  "rustfs-s3-client",
  "rustfs-s3-types",
- "rustfs-scanner-contracts",
+ "rustfs-scanner-metrics",
  "rustfs-storage-api",
  "rustfs-uring",
  "rustfs-utils",
@@ -10119,7 +10119,7 @@ dependencies = [
  "proptest",
  "rustfs-config",
  "rustfs-replication",
- "rustfs-scanner-contracts",
+ "rustfs-scanner-metrics",
  "rustfs-storage-api",
  "s3s",
  "serial_test",
@@ -10317,7 +10317,7 @@ dependencies = [
  "rustfs-iam",
  "rustfs-io-metrics",
  "rustfs-notify",
- "rustfs-scanner-contracts",
+ "rustfs-scanner-metrics",
  "rustfs-security-governance",
  "rustfs-storage-api",
  "rustfs-utils",
@@ -10682,7 +10682,7 @@ dependencies = [
  "rustfs-heal-contracts",
  "rustfs-lock",
  "rustfs-s3-types",
- "rustfs-scanner-contracts",
+ "rustfs-scanner-metrics",
  "rustfs-storage-api",
  "rustfs-utils",
  "s3s",
@@ -10703,6 +10703,10 @@ dependencies = [
 
 [[package]]
 name = "rustfs-scanner-contracts"
+version = "1.0.0-rc.5"
+
+[[package]]
+name = "rustfs-scanner-metrics"
 version = "1.0.0-rc.5"
 dependencies = [
  "chrono",

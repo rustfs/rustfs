@@ -1322,7 +1322,7 @@ mod tests {
             lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
                 version_id: Some(trigger_id),
                 delete_marker: false,
-                action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
+                action: rustfs_scanner_metrics::metrics::IlmAction::DeleteAllVersionsAction,
                 rule_id: "rule".to_string(),
                 phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
             }),
@@ -1492,7 +1492,7 @@ mod tests {
             lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
                 version_id: Some(marker_id),
                 delete_marker: true,
-                action: rustfs_scanner_contracts::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
+                action: rustfs_scanner_metrics::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
                 rule_id: "rule".to_string(),
                 phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
             }),

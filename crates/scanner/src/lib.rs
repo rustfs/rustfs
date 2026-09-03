@@ -80,7 +80,7 @@ pub use remote_scanner::{
     remote_scanner_request_matches_envelope, serve_remote_scanner_request, validate_remote_scanner_request_fence,
 };
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
-pub use rustfs_scanner_contracts::last_minute;
+pub use rustfs_scanner_metrics::last_minute;
 pub use scanner::{
     ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus, ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason,
     ScannerPauseBacklogPhase, ScannerPauseBacklogStatus, ScannerPauseBacklogThresholds, ScannerUsageStateResetResult,
