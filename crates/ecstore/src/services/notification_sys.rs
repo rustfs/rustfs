@@ -57,18 +57,24 @@ const REMOTE_VERSION_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROOF_TTL: Duration = Duration::from_secs(30);
 const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 2;
 const TIER_DELETE_JOURNAL_POLICY_SUPPORTED_VERSION: u32 = 3;
+const DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION: u32 = 4;
 type CrossPoolFencePolicyResult = Result<BTreeMap<String, Uuid>>;
 
 fn cross_pool_fence_policy_results(
     peer_epochs: BTreeMap<String, Uuid>,
     minimum_version: u32,
-) -> (CrossPoolFencePolicyResult, CrossPoolFencePolicyResult) {
+) -> (CrossPoolFencePolicyResult, CrossPoolFencePolicyResult, CrossPoolFencePolicyResult) {
     let journal_result = if minimum_version >= TIER_DELETE_JOURNAL_POLICY_SUPPORTED_VERSION {
         Ok(peer_epochs.clone())
     } else {
         Err(Error::other("tier delete journal v6 policy capability version is unsupported"))
     };
-    (Ok(peer_epochs), journal_result)
+    let decommission_target_fence_result = if minimum_version >= DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION {
+        Ok(peer_epochs.clone())
+    } else {
+        Err(Error::other("decommission target fence policy capability version is unsupported"))
+    };
+    (Ok(peer_epochs), journal_result, decommission_target_fence_result)
 }
 
 #[derive(Clone, Debug)]
@@ -231,6 +237,9 @@ pub(crate) struct RemoteVersionStateFleetProofToken(FleetCapabilityProofToken);
 #[derive(Clone, PartialEq, Eq)]
 pub struct CrossPoolFenceFleetProofToken(FleetCapabilityProofToken);
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct DecommissionTargetFenceFleetProofToken(FleetCapabilityProofToken);
+
 /// A point-in-time proof that every current storage member implements the v6
 /// dispatch-manifest policy. It intentionally has no `Clone` implementation:
 /// one acquisition authorizes one manifest construction attempt.
@@ -242,6 +251,7 @@ pub(crate) struct TierDeleteJournalFleetProofToken {
 static REMOTE_VERSION_STATE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static CROSS_POOL_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static TIER_DELETE_JOURNAL_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
+static DECOMMISSION_TARGET_FENCE_FLEET_PROOF: OnceLock<std::sync::RwLock<FleetCapabilityProofState>> = OnceLock::new();
 static REMOTE_VERSION_STATE_PROBE_TOPOLOGY: OnceLock<String> = OnceLock::new();
 
 fn cross_pool_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
@@ -254,6 +264,10 @@ fn remote_version_state_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCa
 
 fn tier_delete_journal_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
     TIER_DELETE_JOURNAL_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
+}
+
+fn decommission_target_fence_fleet_proof_slot() -> &'static std::sync::RwLock<FleetCapabilityProofState> {
+    DECOMMISSION_TARGET_FENCE_FLEET_PROOF.get_or_init(|| std::sync::RwLock::new(FleetCapabilityProofState::default()))
 }
 
 fn revoke_fleet_capability_proof_state(state: &mut FleetCapabilityProofState) {
@@ -368,6 +382,18 @@ pub fn cross_pool_fence_fleet_proof_matches(proof: &CrossPoolFenceFleetProofToke
     fleet_capability_proof_matches(cross_pool_fence_fleet_proof_slot(), &proof.0)
 }
 
+pub(crate) fn acquire_decommission_target_fence_fleet_proof() -> Option<DecommissionTargetFenceFleetProofToken> {
+    let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
+    let state = decommission_target_fence_fleet_proof_slot()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    acquire_fleet_capability_proof_from(&state, expected_topology, Instant::now()).map(DecommissionTargetFenceFleetProofToken)
+}
+
+pub(crate) fn decommission_target_fence_fleet_proof_matches(proof: &DecommissionTargetFenceFleetProofToken) -> bool {
+    fleet_capability_proof_matches(decommission_target_fence_fleet_proof_slot(), &proof.0)
+}
+
 pub(crate) fn acquire_tier_delete_journal_fleet_proof() -> Option<TierDeleteJournalFleetProofToken> {
     let expected_topology = REMOTE_VERSION_STATE_PROBE_TOPOLOGY.get()?;
     let state = tier_delete_journal_fleet_proof_slot()
@@ -468,6 +494,19 @@ pub(crate) fn install_cross_pool_fence_fleet_proof_for_test() {
     journal_state.topology_conflict = false;
     journal_state.draining_generation = None;
     journal_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
+    drop(journal_state);
+    let mut decommission_state = decommission_target_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    debug_assert!(
+        decommission_state
+            .proof
+            .as_ref()
+            .is_none_or(|current| current.generation.is_drained())
+    );
+    decommission_state.topology_conflict = false;
+    decommission_state.draining_generation = None;
+    decommission_state.proof = proof.as_ref().map(FleetCapabilityProof::with_fresh_generation);
 }
 
 #[cfg(test)]
@@ -476,6 +515,8 @@ pub(crate) struct CrossPoolFenceFleetProofGuard {
     previous_topology_conflict: bool,
     previous_journal_proof: Option<FleetCapabilityProof>,
     previous_journal_topology_conflict: bool,
+    previous_decommission_proof: Option<FleetCapabilityProof>,
+    previous_decommission_topology_conflict: bool,
 }
 
 #[cfg(test)]
@@ -502,6 +543,17 @@ impl Drop for CrossPoolFenceFleetProofGuard {
             .map(FleetCapabilityProof::with_fresh_generation);
         journal_state.draining_generation = None;
         journal_state.topology_conflict = self.previous_journal_topology_conflict;
+        drop(journal_state);
+        let mut decommission_state = decommission_target_fence_fleet_proof_slot()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        decommission_state.proof = self
+            .previous_decommission_proof
+            .take()
+            .as_ref()
+            .map(FleetCapabilityProof::with_fresh_generation);
+        decommission_state.draining_generation = None;
+        decommission_state.topology_conflict = self.previous_decommission_topology_conflict;
     }
 }
 
@@ -515,11 +567,16 @@ pub(crate) fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceF
     let mut journal_state = tier_delete_journal_fleet_proof_slot()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut decommission_state = decommission_target_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let guard = CrossPoolFenceFleetProofGuard {
         previous_proof: state.proof.clone(),
         previous_topology_conflict: state.topology_conflict,
         previous_journal_proof: journal_state.proof.clone(),
         previous_journal_topology_conflict: journal_state.topology_conflict,
+        previous_decommission_proof: decommission_state.proof.clone(),
+        previous_decommission_topology_conflict: decommission_state.topology_conflict,
     };
     if let Some(proof) = state.proof.take() {
         proof.generation.revoke();
@@ -535,6 +592,49 @@ pub(crate) fn without_cross_pool_fence_fleet_proof_for_test() -> CrossPoolFenceF
         }
     }
     journal_state.topology_conflict = true;
+    if let Some(proof) = decommission_state.proof.take() {
+        proof.generation.revoke();
+        if !proof.generation.is_drained() {
+            decommission_state.draining_generation = Some(proof.generation);
+        }
+    }
+    decommission_state.topology_conflict = true;
+    guard
+}
+
+#[cfg(test)]
+pub(crate) struct DecommissionTargetFenceFleetProofGuard {
+    previous_proof: Option<FleetCapabilityProof>,
+    previous_topology_conflict: bool,
+}
+
+#[cfg(test)]
+impl Drop for DecommissionTargetFenceFleetProofGuard {
+    fn drop(&mut self) {
+        let mut state = decommission_target_fence_fleet_proof_slot()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.proof = self
+            .previous_proof
+            .take()
+            .as_ref()
+            .map(FleetCapabilityProof::with_fresh_generation);
+        state.draining_generation = None;
+        state.topology_conflict = self.previous_topology_conflict;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn without_decommission_target_fence_fleet_proof_for_test() -> DecommissionTargetFenceFleetProofGuard {
+    let mut state = decommission_target_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = DecommissionTargetFenceFleetProofGuard {
+        previous_proof: state.proof.clone(),
+        previous_topology_conflict: state.topology_conflict,
+    };
+    revoke_fleet_capability_proof_state(&mut state);
+    state.topology_conflict = true;
     guard
 }
 
@@ -572,6 +672,15 @@ pub fn rotate_cross_pool_fence_fleet_proof_for_test() -> bool {
     }
     if journal_state.draining_generation.is_none() {
         journal_state.proof = Some(proof.with_fresh_generation());
+    }
+    drop(journal_state);
+    let mut decommission_state = decommission_target_fence_fleet_proof_slot()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    decommission_state.topology_conflict = false;
+    revoke_fleet_capability_proof_state(&mut decommission_state);
+    if decommission_state.draining_generation.is_none() {
+        decommission_state.proof = Some(proof.with_fresh_generation());
     }
     true
 }
@@ -652,6 +761,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 remote_version_state_fleet_proof_slot(),
                 cross_pool_fence_fleet_proof_slot(),
                 tier_delete_journal_fleet_proof_slot(),
+                decommission_target_fence_fleet_proof_slot(),
             ] {
                 mark_fleet_capability_topology_conflict(slot);
             }
@@ -684,11 +794,15 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 .unwrap_or_else(|_| Err(Error::other("cross-pool fence fleet capability probe timed out"))),
                 None => Err(Error::other("cross-pool fence fleet capability notification system is unavailable")),
             };
-            let (fence_result, journal_result) = match fence_probe {
+            let (fence_result, journal_result, decommission_target_fence_result) = match fence_probe {
                 Ok((peer_epochs, minimum_version)) => cross_pool_fence_policy_results(peer_epochs, minimum_version),
                 Err(err) => {
                     let message = err.to_string();
-                    (Err(Error::other(message.clone())), Err(Error::other(message)))
+                    (
+                        Err(Error::other(message.clone())),
+                        Err(Error::other(message.clone())),
+                        Err(Error::other(message)),
+                    )
                 }
             };
             let topology_conflict = remote_version_state_fleet_proof_slot()
@@ -699,6 +813,7 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                 revoke_fleet_capability_proof(remote_version_state_fleet_proof_slot());
                 revoke_fleet_capability_proof(cross_pool_fence_fleet_proof_slot());
                 revoke_fleet_capability_proof(tier_delete_journal_fleet_proof_slot());
+                revoke_fleet_capability_proof(decommission_target_fence_fleet_proof_slot());
             } else if let Some(err) = publish_fleet_capability_probe_result(
                 remote_version_state_fleet_proof_slot(),
                 &topology_fingerprint,
@@ -738,6 +853,24 @@ pub fn start_remote_version_state_fleet_probe(topology_fingerprint: String) {
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_NOTIFICATION,
                     capability = "tier_delete_journal_v6_policy",
+                    state = "failed_closed",
+                    error = %err,
+                    "notification capability probe"
+                );
+            }
+            if !topology_conflict
+                && let Some(err) = publish_fleet_capability_probe_result(
+                    decommission_target_fence_fleet_proof_slot(),
+                    &topology_fingerprint,
+                    decommission_target_fence_result,
+                    Instant::now(),
+                )
+            {
+                debug!(
+                    event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                    capability = "decommission_target_fence_v2",
                     state = "failed_closed",
                     error = %err,
                     "notification capability probe"
@@ -834,7 +967,7 @@ impl NotificationSys {
         // A single-node deployment has no remote member to lower the local
         // policy version advertised by this binary.
         if minimum_version == u32::MAX {
-            minimum_version = TIER_DELETE_JOURNAL_POLICY_SUPPORTED_VERSION;
+            minimum_version = DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION;
         }
         Ok((peer_epochs, minimum_version))
     }
@@ -2804,15 +2937,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cross_pool_v2_remains_generic_but_cannot_authorize_v6_journal() {
+    fn cross_pool_policy_versions_authorize_only_their_supported_protocols() {
         let peers = BTreeMap::from([("node-b:9000".to_string(), Uuid::new_v4())]);
-        let (generic_v2, journal_v2) = cross_pool_fence_policy_results(peers.clone(), 2);
+        let (generic_v2, journal_v2, decommission_v2) = cross_pool_fence_policy_results(peers.clone(), 2);
         assert!(generic_v2.is_ok(), "v2 remains valid for existing cross-pool fencing");
         assert!(journal_v2.is_err(), "a mixed v2/v3 fleet must fail closed for journal-v6 deletion");
+        assert!(decommission_v2.is_err(), "v2 cannot authorize the sticky per-target decommission fence");
 
-        let (generic_v3, journal_v3) = cross_pool_fence_policy_results(peers, 3);
+        let (generic_v3, journal_v3, decommission_v3) = cross_pool_fence_policy_results(peers.clone(), 3);
         assert!(generic_v3.is_ok());
         assert!(journal_v3.is_ok(), "an all-v3 fleet may authorize journal-v6 deletion");
+        assert!(decommission_v3.is_err(), "v3 members do not understand the per-target decommission fence");
+
+        let (generic_v4, journal_v4, decommission_v4) = cross_pool_fence_policy_results(peers, 4);
+        assert!(generic_v4.is_ok());
+        assert!(journal_v4.is_ok());
+        assert!(decommission_v4.is_ok(), "an all-v4 fleet may create sticky per-target reservations");
     }
 
     #[test]

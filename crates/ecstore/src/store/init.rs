@@ -580,7 +580,6 @@ impl ECStore {
             decommission_cancelers,
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::new(pool_meta_write_state),
-            decommission_capacity_entry_gate: Mutex::default(),
             // Adopt the caller's context (the process bootstrap one on the
             // legacy path) so startup writes (erasure type recorded before
             // this point) and later reads share one cell.
@@ -918,6 +917,35 @@ mod tests {
     use time::OffsetDateTime;
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
+
+    fn run_large_stack_async_test<C, F>(name: &str, case: C)
+    where
+        C: FnOnce() -> F + Send + 'static,
+        F: Future<Output = ()> + 'static,
+    {
+        const STACK_SIZE: usize = if cfg!(debug_assertions) {
+            8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else if cfg!(target_os = "macos") {
+            2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        } else {
+            rustfs_config::DEFAULT_THREAD_STACK_SIZE
+        };
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .stack_size(STACK_SIZE)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .thread_stack_size(STACK_SIZE)
+                    .build()
+                    .expect("large-stack store test runtime should build");
+                runtime.block_on(case());
+            })
+            .expect("large-stack store test thread should spawn")
+            .join()
+            .expect("large-stack store test thread should complete");
+    }
     use uuid::Uuid;
 
     #[test]
@@ -2500,9 +2528,17 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[test]
     #[serial_test::serial(storage_class_env)]
-    async fn data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease() {
+    fn data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease() {
+        run_large_stack_async_test(
+            "multipart-part-staging-publication-fence",
+            data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease_case,
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn data_movement_multipart_part_staging_holds_no_publication_lock_or_tier_lease_case() {
         let temp_dir = tempfile::tempdir().expect("create multipart staging-fence store dir");
         let (ctx, store, shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "mpu-staging-publication", &[4, 4])).await;
@@ -2582,19 +2618,23 @@ mod tests {
         let capacity_owner = test_decommission_capacity_owner(store.as_ref(), 0)
             .await
             .with_mutation_id(Uuid::new_v4());
-        let mut upload_metadata = source.user_defined.as_ref().clone();
-        rustfs_utils::http::insert_str(
-            &mut upload_metadata,
-            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
-            "mpu-staging-test".to_string(),
-        );
+        let upload_metadata = source.user_defined.as_ref().clone();
         let mut staging_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
+            versioned: source.version_id.is_some(),
+            version_id: source.version_id.map(|version_id| version_id.to_string()),
+            mod_time: source.mod_time,
             user_defined: upload_metadata,
             expected_bucket_incarnation_id: Some(bucket_incarnation_id),
             ..Default::default()
         };
+        let upload_identity = crate::data_movement::data_movement_upload_identity_from_options(&staging_opts);
+        rustfs_utils::http::insert_str(
+            &mut staging_opts.user_defined,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            upload_identity,
+        );
         capacity_owner.apply_to(&mut staging_opts);
         let (upload, target_pool_idx, staged_incarnation_id) = store
             .handle_new_multipart_upload_with_pool_idx(&bucket, object, &staging_opts, None)
@@ -2664,6 +2704,9 @@ mod tests {
         let mut abort_opts = ObjectOptions {
             data_movement: true,
             src_pool_idx: 0,
+            versioned: source.version_id.is_some(),
+            version_id: source.version_id.map(|version_id| version_id.to_string()),
+            mod_time: source.mod_time,
             expected_bucket_incarnation_id: Some(bucket_incarnation_id),
             ..Default::default()
         };
@@ -5166,8 +5209,9 @@ mod tests {
                     let ordinary_faults_for_hook = Arc::clone(&ordinary_faults);
                     let fault_bucket = other_bucket.clone();
                     let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
-                        move |stage, bucket, object, attempt| {
-                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
+                        move |stage, bucket, object, attempt, succeeded| {
+                            let injected = succeeded
+                                && stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
                                 && bucket == fault_bucket.as_str()
                                 && object == other_object
                                 && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
@@ -5436,8 +5480,9 @@ mod tests {
                     let fault_calls_for_hook = Arc::clone(&fault_calls);
                     let fault_bucket = bucket.clone();
                     let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
-                        move |stage, called_bucket, called_object, attempt| {
-                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER
+                        move |stage, called_bucket, called_object, attempt, succeeded| {
+                            let injected = succeeded
+                                && stage == DECOMMISSION_TEST_FAULT_STAGE_DELETE_MARKER
                                 && called_bucket == fault_bucket.as_str()
                                 && called_object == object
                                 && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
@@ -5556,8 +5601,9 @@ mod tests {
                     let fault_calls_for_hook = Arc::clone(&fault_calls);
                     let fault_bucket = bucket.clone();
                     let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
-                        move |stage, called_bucket, called_object, attempt| {
-                            let injected = stage == DECOMMISSION_TEST_FAULT_STAGE_TIERED
+                        move |stage, called_bucket, called_object, attempt, succeeded| {
+                            let injected = succeeded
+                                && stage == DECOMMISSION_TEST_FAULT_STAGE_TIERED
                                 && called_bucket == fault_bucket.as_str()
                                 && called_object == object
                                 && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
@@ -5662,9 +5708,16 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[test]
     #[serial_test::serial(storage_class_env)]
-    async fn decommission_outer_fence_loss_blocks_multipart_commits() {
+    fn decommission_outer_fence_loss_blocks_multipart_commits() {
+        run_large_stack_async_test(
+            "decommission-multipart-outer-fence-loss",
+            decommission_outer_fence_loss_blocks_multipart_commits_case,
+        );
+    }
+
+    async fn decommission_outer_fence_loss_blocks_multipart_commits_case() {
         for (object, pause) in [
             ("complete.bin", crate::set_disk::MultipartCommitPause::BeforeLockLost),
             ("new-upload.bin", crate::set_disk::MultipartCommitPause::NewUploadBeforeLockLost),
@@ -10213,6 +10266,29 @@ mod tests {
             .expect("the active decommission should own the checkpoint target");
         assert_eq!(targets.len(), 1);
         let target = targets[0].clone();
+        let consumed_before_checkpoint = store.pool_meta.read().await.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|info| info.capacity_reservation.as_ref())
+            .expect("checkpoint shutdown capacity reservation should exist")
+            .consumed_target_physical_bytes;
+        let precommit_error = store
+            .run_decommission_capacity_non_growing_replacement_with_capacity_lease(
+                target.target_pool_index,
+                Some(target.capacity_owner),
+                Some(aborting_data.len()),
+                |_| async { Err::<(), Error>(Error::other("injected checkpoint failure before commit")) },
+            )
+            .await
+            .expect_err("the first checkpoint attempt should fail before writing its target")
+            .to_string();
+        assert!(precommit_error.contains("injected checkpoint failure before commit"));
+        assert!(
+            store
+                .has_decommission_capacity_temporary_mutation_state(target.target_pool_index, target.capacity_owner)
+                .await,
+            "a failed checkpoint attempt must retain exact retry state"
+        );
         let barrier = crate::set_disk::PutObjectCommitBarrier::install(
             RUSTFS_META_BUCKET,
             &manifest_name,
@@ -10263,6 +10339,27 @@ mod tests {
                 .await,
             "the admitted target PUT must drain its capacity transaction before releasing the recovery fences"
         );
+        {
+            let pool_meta = store.pool_meta.read().await;
+            let reservation = pool_meta.pools[0]
+                .decommission
+                .as_ref()
+                .and_then(|info| info.capacity_reservation.as_ref())
+                .expect("checkpoint shutdown capacity reservation should remain active");
+            let capacity_target = reservation
+                .targets
+                .iter()
+                .find(|candidate| candidate.pool_index == target.target_pool_index)
+                .expect("checkpoint shutdown capacity target should remain allocated");
+            assert_eq!(
+                reservation.consumed_target_physical_bytes, consumed_before_checkpoint,
+                "a non-growing checkpoint replacement must not consume durable migration capacity"
+            );
+            assert_eq!(reservation.pending_target_physical_bytes, 0);
+            assert_eq!(reservation.inflight_target_physical_bytes, 0);
+            assert_eq!(capacity_target.pending_physical_bytes, 0);
+            assert!(capacity_target.temporary_mutations.is_empty());
+        }
         drop(barrier);
         let mut reloaded_pool_meta = PoolMeta::default();
         reloaded_pool_meta

@@ -1468,7 +1468,7 @@ async fn save_decommission_manifest_checkpoint_if_match(
         }
         let write_data = next_data.to_vec();
         let write = api
-            .run_decommission_capacity_temporary_mutation_with_capacity_lease(
+            .run_decommission_capacity_non_growing_replacement_with_capacity_lease(
                 target.target_pool_index,
                 Some(target.capacity_owner),
                 Some(next_data.len()),

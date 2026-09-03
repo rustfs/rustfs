@@ -181,10 +181,11 @@ fn remove_heal_control_replay(
 
 static HEAL_CONTROL_REPLAY_CACHE: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<HealControlReplayEntry>>>> = OnceLock::new();
 static NODE_CAPABILITY_SERVER_EPOCH: LazyLock<Uuid> = LazyLock::new(Uuid::new_v4);
-// v3 additionally promises the v6 tier-delete dispatch-manifest policy. The
+// v3 additionally promises the v6 tier-delete dispatch-manifest policy; v4
+// promises the sticky per-target decommission capacity fence. The
 // existing periodic topology probe carries both capabilities so normal object
 // operations do not add another peer RPC.
-const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 3;
+const CROSS_POOL_FENCE_SUPPORTED_VERSION: u32 = 4;
 
 fn admit_heal_control_replay(
     replay_cache: &mut HashMap<String, Arc<HealControlReplayEntry>>,
@@ -3770,7 +3771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_pool_fence_probe_authenticates_supported_v3_state() {
+    async fn cross_pool_fence_probe_authenticates_supported_v4_state() {
         let _ = rustfs_credentials::set_global_rpc_secret("cross-pool-fence-node-service-test-secret".to_string());
         let endpoints = heal_control_test_endpoints_with_coordinator("node-0", true);
         assert!(

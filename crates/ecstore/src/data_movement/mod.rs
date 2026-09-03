@@ -234,6 +234,7 @@ async fn pause_data_movement_multipart_before_abort(bucket: &str, object: &str) 
 }
 
 fn data_movement_abort_opts(
+    object_info: &ObjectInfo,
     src_pool_idx: usize,
     expected_bucket_incarnation_id: Option<uuid::Uuid>,
     lock_lost_signal: Option<&Arc<rustfs_lock::distributed_lock::LockLostSignal>>,
@@ -242,6 +243,9 @@ fn data_movement_abort_opts(
     let mut opts = ObjectOptions {
         data_movement: true,
         src_pool_idx,
+        versioned: object_info.version_id.is_some(),
+        version_id: object_info.version_id.map(|version_id| version_id.to_string()),
+        mod_time: object_info.mod_time,
         expected_bucket_incarnation_id,
         ..Default::default()
     };
@@ -265,14 +269,19 @@ fn insert_data_movement_checksum(user_defined: &mut HashMap<String, String>, obj
     }
 }
 
-fn data_movement_upload_identity(object_info: &ObjectInfo) -> String {
-    let version_id = object_info
-        .version_id
-        .map_or_else(|| "none".to_string(), |version_id| version_id.to_string());
-    let mod_time = object_info
-        .mod_time
-        .map_or_else(|| "none".to_string(), |mod_time| mod_time.unix_timestamp_nanos().to_string());
+fn data_movement_upload_identity_parts(version_id: Option<&str>, mod_time: Option<time::OffsetDateTime>) -> String {
+    let version_id = version_id.unwrap_or("none");
+    let mod_time = mod_time.map_or_else(|| "none".to_string(), |mod_time| mod_time.unix_timestamp_nanos().to_string());
     format!("v1:{version_id}:{mod_time}")
+}
+
+fn data_movement_upload_identity(object_info: &ObjectInfo) -> String {
+    let version_id = object_info.version_id.map(|version_id| version_id.to_string());
+    data_movement_upload_identity_parts(version_id.as_deref(), object_info.mod_time)
+}
+
+pub(crate) fn data_movement_upload_identity_from_options(opts: &ObjectOptions) -> String {
+    data_movement_upload_identity_parts(opts.version_id.as_deref(), opts.mod_time)
 }
 
 fn data_movement_new_multipart_opts(object_info: &ObjectInfo, src_pool_idx: usize) -> ObjectOptions {
@@ -486,7 +495,7 @@ pub(crate) fn data_movement_target_precondition() -> HTTPPreconditions {
     }
 }
 
-fn is_owned_data_movement_target(target: &ObjectInfo) -> bool {
+pub(crate) fn is_owned_data_movement_target(target: &ObjectInfo) -> bool {
     let rustfs_marker = rustfs_utils::http::internal_key_rustfs(SUFFIX_DATA_MOVED);
     let minio_marker = format!("{}{SUFFIX_DATA_MOVED}", rustfs_utils::http::MINIO_INTERNAL_PREFIX);
     if rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_DATA_MOVED) != Some("true")
@@ -560,9 +569,12 @@ fn resolve_data_movement_abort_result(
     primary_err: Error,
     abort_err: Error,
 ) -> Error {
-    Error::other(format!(
-        "{op_label}: abort_multipart_upload failed for {bucket}/{object} upload {upload_id} after error {primary_err}: {abort_err}"
-    ))
+    data_movement_context_error(
+        format!(
+            "{op_label}: abort_multipart_upload failed for {bucket}/{object} upload {upload_id} after error {primary_err}: {abort_err}"
+        ),
+        abort_err,
+    )
 }
 
 /// A data-movement stage failure that keeps the error it wrapped.
@@ -590,15 +602,21 @@ impl std::error::Error for DataMovementStageError {
     }
 }
 
-fn data_movement_stage_error<E>(op_label: &str, stage: &str, bucket: &str, object: &str, err: E) -> Error
+pub(crate) fn data_movement_context_error<E>(rendered: String, err: E) -> Error
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    let rendered = format!("{op_label}: {stage} failed for {bucket}/{object}: {err}");
     Error::other(DataMovementStageError {
         rendered,
         source: Box::new(err),
     })
+}
+
+fn data_movement_stage_error<E>(op_label: &str, stage: &str, bucket: &str, object: &str, err: E) -> Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    data_movement_context_error(format!("{op_label}: {stage} failed for {bucket}/{object}: {err}"), err)
 }
 
 #[cfg(test)]
@@ -1662,8 +1680,13 @@ async fn migrate_object_inner(
                 );
                 return Ok(());
             }
-            let mut cleanup_opts =
-                data_movement_abort_opts(pool_idx, source_bucket_incarnation_id, lock_lost_signal.as_ref(), capacity_owner);
+            let mut cleanup_opts = data_movement_abort_opts(
+                &object_info,
+                pool_idx,
+                source_bucket_incarnation_id,
+                lock_lost_signal.as_ref(),
+                capacity_owner,
+            );
             if let Some(anchor) = mutation_fence.as_ref() {
                 anchor.guard().add_namespace_lock_fence(&mut cleanup_opts);
             }
@@ -1865,8 +1888,13 @@ async fn migrate_object_inner(
         .await;
 
         if multipart_result.is_ok() && should_abort_multipart_upload(&abort_multipart_flag) {
-            let mut abort_opts =
-                data_movement_abort_opts(pool_idx, expected_bucket_incarnation_id, lock_lost_signal.as_ref(), capacity_owner);
+            let mut abort_opts = data_movement_abort_opts(
+                &object_info,
+                pool_idx,
+                expected_bucket_incarnation_id,
+                lock_lost_signal.as_ref(),
+                capacity_owner,
+            );
             if let Some(anchor) = mutation_fence.as_ref() {
                 anchor.guard().add_namespace_lock_fence(&mut abort_opts);
             }
@@ -1943,8 +1971,13 @@ async fn migrate_object_inner(
             if should_abort_multipart_upload(&abort_multipart_flag) {
                 #[cfg(all(test, feature = "test-util"))]
                 pause_data_movement_multipart_before_abort(&bucket, &object_info.name).await;
-                let mut abort_opts =
-                    data_movement_abort_opts(pool_idx, expected_bucket_incarnation_id, lock_lost_signal.as_ref(), capacity_owner);
+                let mut abort_opts = data_movement_abort_opts(
+                    &object_info,
+                    pool_idx,
+                    expected_bucket_incarnation_id,
+                    lock_lost_signal.as_ref(),
+                    capacity_owner,
+                );
                 if let Some(anchor) = mutation_fence.as_ref() {
                     anchor.guard().add_namespace_lock_fence(&mut abort_opts);
                 }
@@ -2325,6 +2358,7 @@ mod tests {
         assert!(message.contains("bucket-a/object-a"));
         assert!(message.contains("upload upload-1"));
         assert!(message.contains(Error::SlowDown.to_string().as_str()));
+        assert!(matches!(data_movement_stage_source(&err), Some(Error::OperationCanceled)));
     }
 
     #[test]
