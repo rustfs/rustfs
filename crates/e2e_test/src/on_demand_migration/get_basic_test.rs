@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Basic GET read-through scenarios (rustfs/backlog#2156): inline pull and
+//! Basic read-through scenarios (rustfs/backlog#2156): inline pull and
 //! local persistence, large-object passthrough with background backfill,
-//! Range passthrough, source 404, `versionId` reads, and a disabled bucket.
+//! Range passthrough, source 404, `versionId` reads, a disabled bucket, and
+//! the HEAD passthrough that stores nothing (rustfs/backlog#2155).
 //! Every source-side expectation is asserted on the fake source's journal.
 
 use super::common::{BoxError, OdmSourceSpec, OdmTestEnv, SeedObject};
@@ -259,6 +260,38 @@ async fn get_after_disable_does_not_consult_the_source() -> TestResult {
         .expect_err("a disabled bucket answers locally");
     assert_eq!(err.code(), Some("NoSuchKey"), "{err:?}");
     assert_eq!(env.source.count_requests(Operation::HeadObject, key), 0);
+    assert_eq!(env.source.count_requests(Operation::GetObject, key), 0);
+    env.assert_local_absent(bucket, key).await;
+    Ok(())
+}
+
+/// A HEAD miss is answered from the source but must not store anything: the
+/// key stays absent locally, so a second HEAD consults the source again. This
+/// is the smoke-lane guard for the HEAD passthrough (rustfs/backlog#2155).
+#[tokio::test]
+async fn head_miss_answers_from_the_source_without_persisting() -> TestResult {
+    let bucket = "odm-head-passthrough";
+    let env = configured_env(bucket, |_| {}).await?;
+    let key = "head/report.bin";
+    let body = payload(32 * 1024);
+    env.seed_source(SOURCE_BUCKET, &[SeedObject::new(key, body.clone())]);
+
+    let head = env.raw_object_request(http::Method::HEAD, bucket, key, &[]).await?;
+    assert_eq!(head.status, 200, "{}", String::from_utf8_lossy(&head.body));
+    assert_eq!(head.header(ODM_RESPONSE_HEADER), Some("source"), "a source answer is marked");
+    assert_eq!(head.header("content-length"), Some(body.len().to_string().as_str()));
+    assert!(head.body.is_empty(), "a HEAD answer carries no body");
+    assert_eq!(env.source.count_requests(Operation::HeadObject, key), 1);
+    assert_eq!(env.source.count_requests(Operation::GetObject, key), 0, "a HEAD must never pull the body");
+    env.assert_local_absent(bucket, key).await;
+
+    let again = env.raw_object_request(http::Method::HEAD, bucket, key, &[]).await?;
+    assert_eq!(again.status, 200, "{}", String::from_utf8_lossy(&again.body));
+    assert_eq!(
+        env.source.count_requests(Operation::HeadObject, key),
+        2,
+        "nothing was written back, so the second HEAD consults the source again"
+    );
     assert_eq!(env.source.count_requests(Operation::GetObject, key), 0);
     env.assert_local_absent(bucket, key).await;
     Ok(())
