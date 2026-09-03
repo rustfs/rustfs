@@ -876,6 +876,8 @@ pub use ops::multipart::{MultipartCommitBarrier, MultipartCommitPause};
 pub(crate) use ops::object::DeleteObjectCommitBarrier;
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
+#[cfg(test)]
+pub(crate) use ops::object::TransitionUploadedCommitBarrier as SetDiskTransitionUploadedCommitBarrier;
 pub(crate) use ops::object::body_cache_plaintext_len;
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) use ops::object::cleanup_rejected_transition_upload_durably;

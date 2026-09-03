@@ -78,6 +78,7 @@ pub mod bucket {
             #[cfg(feature = "test-util")]
             pub use crate::bucket::lifecycle::transition_transaction::{
                 TransitionTransactionRecoveryStats, recover_transition_transaction_records,
+                recover_transition_transaction_records_at,
             };
         }
 
