@@ -3010,10 +3010,10 @@ fn replication_status_writeback_options(
     let mut write_opts = ObjectOptions {
         version_id: roi.version_id.map(|version_id| version_id.to_string()),
         eval_metadata: Some(eval_metadata),
-        replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+        replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
             expected_generation: roi.replication_generation.clone(),
             mode,
-        }),
+        })),
         ..Default::default()
     };
     // The remote transfer runs under a renewable replication namespace lock.

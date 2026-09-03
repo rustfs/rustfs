@@ -11867,10 +11867,10 @@ mod metadata_mutation_generation_tests {
                 object,
                 &ObjectOptions {
                     version_id: Some(Uuid::nil().to_string()),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: expected_generation.clone(),
                         mode: ReplicationStatusWritebackMode::ValidateOnly,
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -11884,10 +11884,10 @@ mod metadata_mutation_generation_tests {
                 &ObjectOptions {
                     version_id: Some(Uuid::nil().to_string()),
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation,
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -11937,10 +11937,10 @@ mod metadata_mutation_generation_tests {
                 object,
                 &ObjectOptions {
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: generation_a_snapshot.clone(),
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -11979,10 +11979,10 @@ mod metadata_mutation_generation_tests {
                 object,
                 &ObjectOptions {
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: generation_a_snapshot,
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -12018,10 +12018,10 @@ mod metadata_mutation_generation_tests {
                 object,
                 &ObjectOptions {
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: generation_b_snapshot,
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -12046,10 +12046,10 @@ mod metadata_mutation_generation_tests {
                 legacy_object,
                 &ObjectOptions {
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: legacy_snapshot,
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -12095,10 +12095,10 @@ mod metadata_mutation_generation_tests {
                 timestamp_only_object,
                 &ObjectOptions {
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: timestamp_only_snapshot,
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -12172,10 +12172,10 @@ mod metadata_mutation_generation_tests {
                 tag_object,
                 &ObjectOptions {
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: tag_snapshot,
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -12234,10 +12234,10 @@ mod metadata_mutation_generation_tests {
                 metadata_object,
                 &ObjectOptions {
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=FAILED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: metadata_snapshot,
                         ..Default::default()
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -12288,10 +12288,10 @@ mod metadata_mutation_generation_tests {
                 &ObjectOptions {
                     no_lock: true,
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: snapshot.clone(),
                         mode: ReplicationStatusWritebackMode::ValidateOnly,
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -12312,10 +12312,10 @@ mod metadata_mutation_generation_tests {
                 object,
                 &ObjectOptions {
                     eval_metadata: Some(replication_metadata(None, None, "arn:test=COMPLETED;")),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: stale,
                         mode: ReplicationStatusWritebackMode::ValidateOnly,
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -12330,10 +12330,10 @@ mod metadata_mutation_generation_tests {
                 object,
                 &ObjectOptions {
                     namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
-                    replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                    replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                         expected_generation: snapshot,
                         mode: ReplicationStatusWritebackMode::ValidateOnly,
-                    }),
+                    })),
                     ..Default::default()
                 },
             )
@@ -12383,10 +12383,10 @@ mod metadata_mutation_generation_tests {
                     bucket,
                     object,
                     &ObjectOptions {
-                        replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                        replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                             expected_generation: expected_generation.clone(),
                             mode: ReplicationStatusWritebackMode::ValidateOnly,
-                        }),
+                        })),
                         ..Default::default()
                     },
                 )
@@ -12407,10 +12407,10 @@ mod metadata_mutation_generation_tests {
                     object,
                     &ObjectOptions {
                         namespace_lock_fence: Some(NamespaceLockFence::lost_for_test()),
-                        replication_status_writeback: Some(ReplicationStatusWritebackCondition {
+                        replication_status_writeback: Some(Box::new(ReplicationStatusWritebackCondition {
                             expected_generation,
                             mode: ReplicationStatusWritebackMode::Update,
-                        }),
+                        })),
                         ..Default::default()
                     },
                 )

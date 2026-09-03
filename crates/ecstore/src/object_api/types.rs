@@ -984,9 +984,10 @@ pub struct ObjectOptions {
     /// Internal compare-and-set condition for replication workers publishing
     /// terminal status after remote I/O. Storage validates it while holding
     /// the object write lock so an older worker cannot overwrite a newer
-    /// mutation's PENDING state.
+    /// mutation's PENDING state. Keep the condition boxed because
+    /// `ObjectOptions` is passed by value through deep storage futures.
     #[doc(hidden)]
-    pub replication_status_writeback: Option<ReplicationStatusWritebackCondition>,
+    pub replication_status_writeback: Option<Box<ReplicationStatusWritebackCondition>>,
     pub object_lock_retention: Option<ObjectLockRetentionOptions>,
     pub object_lock_delete: Option<crate::storage_api_contracts::object::ObjectLockDeleteOptions>,
     /// Authoritative bucket Object Lock snapshot installed inside `ECStore`
@@ -2187,6 +2188,13 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_status_writeback_condition_remains_indirected() {
+        fn assert_indirected(_: &Option<Box<ReplicationStatusWritebackCondition>>) {}
+
+        assert_indirected(&ObjectOptions::default().replication_status_writeback);
+    }
 
     #[test]
     fn object_lock_config_snapshot_is_bound_to_store_bucket_and_incarnation() {
