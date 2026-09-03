@@ -22,7 +22,9 @@
 //! not exercised by the harness self-test.
 
 use crate::common::{RustFSTestEnvironment, signed_request};
-use crate::fake_s3_target::{FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FakeS3TargetOptions, Operation, SeedMetadata};
+use crate::fake_s3_target::{
+    BucketMode, FAKE_ACCESS_KEY, FAKE_SECRET_KEY, FakeS3Target, FakeS3TargetOptions, Operation, SeedMetadata,
+};
 use aws_config::retry::RetryConfig;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, Region};
@@ -281,6 +283,21 @@ impl SeedObject {
     }
 }
 
+/// Process arguments and environment a scenario needs on top of the ODM
+/// defaults, plus the fake source's own limits.
+#[derive(Debug, Default)]
+pub struct OdmEnvOptions<'a> {
+    pub source: FakeS3TargetOptions,
+    pub args: Vec<&'a str>,
+    pub env: Vec<(&'a str, &'a str)>,
+    /// Start the server with the file-backed KMS and a default key, so
+    /// bucket default encryption (SSE-S3) can be configured.
+    pub local_kms: bool,
+}
+
+/// Default key id of the [`OdmEnvOptions::local_kms`] backend.
+pub const LOCAL_KMS_DEFAULT_KEY_ID: &str = "rustfs-odm-e2e-default-key";
+
 /// RustFS under test plus its fake S3 source.
 pub struct OdmTestEnv {
     pub rustfs: RustFSTestEnvironment,
@@ -297,9 +314,44 @@ impl OdmTestEnv {
     }
 
     pub async fn start_with_options(options: FakeS3TargetOptions) -> Result<Self, BoxError> {
-        let source = FakeS3Target::start_with_options(options).await?;
+        Self::start_with(OdmEnvOptions {
+            source: options,
+            ..OdmEnvOptions::default()
+        })
+        .await
+    }
+
+    /// Start the pair with extra process arguments and environment for the
+    /// server under test (KMS, the usage scanner, replication timing). The
+    /// ODM module switch and the loopback-source opt-in are always set; a
+    /// caller-supplied entry with the same name wins.
+    pub async fn start_with(options: OdmEnvOptions<'_>) -> Result<Self, BoxError> {
+        let source = FakeS3Target::start_with_options(options.source).await?;
         let mut rustfs = RustFSTestEnvironment::new().await?;
-        rustfs.start_rustfs_server_with_env(vec![], ODM_SERVER_ENV).await?;
+        let mut env: Vec<(&str, &str)> = ODM_SERVER_ENV.to_vec();
+        for (name, value) in &options.env {
+            match env.iter_mut().find(|(existing, _)| existing == name) {
+                Some(entry) => entry.1 = value,
+                None => env.push((name, value)),
+            }
+        }
+        let mut args: Vec<&str> = options.args;
+        let key_dir = format!("{}/kms-keys", rustfs.temp_dir);
+        if options.local_kms {
+            tokio::fs::create_dir_all(&key_dir).await?;
+            crate::kms::common::create_key_with_specific_id(&key_dir, LOCAL_KMS_DEFAULT_KEY_ID).await?;
+            args.extend_from_slice(&[
+                "--kms-enable",
+                "--kms-backend",
+                "local",
+                "--kms-key-dir",
+                &key_dir,
+                "--kms-default-key-id",
+                LOCAL_KMS_DEFAULT_KEY_ID,
+            ]);
+            env.push(("RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS", "true"));
+        }
+        rustfs.start_rustfs_server_with_env(args, &env).await?;
         let client = rustfs.create_s3_client();
         Ok(Self { rustfs, source, client })
     }
@@ -538,13 +590,15 @@ impl OdmTestEnv {
     /// Waits until the runtime consults the source for `bucket`: a config
     /// install is applied asynchronously after the admin call returns. The
     /// probe is a HEAD on a key that exists nowhere, so nothing is pulled and
-    /// only that key enters the negative cache.
+    /// only that key enters the negative cache. The probe key is per bucket,
+    /// so a second bucket, or a reinstalled configuration, waits for its own
+    /// state instead of observing an earlier journal entry.
     pub async fn wait_until_source_consulted(&self, bucket: &str) -> Result<(), BoxError> {
-        const PROBE_KEY: &str = "_odm-readiness-probe";
+        let probe_key = format!("_odm-readiness-probe-{bucket}-{}", uuid::Uuid::new_v4());
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let _ = self.client.head_object().bucket(bucket).key(PROBE_KEY).send().await;
-            if self.source.count_requests(Operation::HeadObject, PROBE_KEY) > 0 {
+            let _ = self.client.head_object().bucket(bucket).key(&probe_key).send().await;
+            if self.source.count_requests(Operation::HeadObject, &probe_key) > 0 {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -552,6 +606,124 @@ impl OdmTestEnv {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Creates `bucket` unless it already exists, installs `spec` on it and
+    /// returns once the runtime consults the source. Scenarios with a second
+    /// bucket, a bucket created with non-default options, or a reinstalled
+    /// configuration all go through this.
+    pub async fn configure_and_wait(&self, bucket: &str, spec: &OdmSourceSpec) -> Result<(), BoxError> {
+        if self.client.head_bucket().bucket(bucket).send().await.is_err() {
+            self.rustfs.create_test_bucket(bucket).await?;
+        }
+        let response = self.configure_source(bucket, spec).await?;
+        if response.status != 200 {
+            return Err(format!("configure on-demand migration for {bucket}: {} {}", response.status, response.body).into());
+        }
+        self.wait_until_source_consulted(bucket).await
+    }
+
+    /// Raw signed request against the RustFS under test with additional
+    /// request headers. `Range`, `If-None-Match` and the anti-loop marker are
+    /// not part of the SigV4 signed-header set, so they are attached after
+    /// signing exactly as a real client's would be.
+    pub async fn raw_object_request(
+        &self,
+        method: http::Method,
+        bucket: &str,
+        key: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<RawResponse, BoxError> {
+        let url = format!("{}/{bucket}/{key}", self.rustfs.url);
+        let uri = url.parse::<http::Uri>()?;
+        let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+        let request = http::Request::builder()
+            .method(method.clone())
+            .uri(uri)
+            .header(http::header::HOST, authority)
+            .header("x-amz-content-sha256", rustfs_signer::constants::UNSIGNED_PAYLOAD)
+            .body(s3s::Body::empty())?;
+        let signed = rustfs_signer::sign_v4(request, 0, &self.rustfs.access_key, &self.rustfs.secret_key, "", "us-east-1");
+
+        let mut builder =
+            crate::common::local_http_client().request(reqwest::Method::from_bytes(method.as_str().as_bytes())?, &url);
+        for (name, value) in signed.headers() {
+            builder = builder.header(name, value);
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = builder.send().await?;
+        Ok(RawResponse {
+            status: response.status().as_u16(),
+            headers: response.headers().clone(),
+            body: response.bytes().await?,
+        })
+    }
+
+    /// Parsed `GET .../{bucket}/status` body. Fails when the route does not
+    /// answer 200 so a scenario never asserts against an error document.
+    pub async fn status_json(&self, bucket: &str) -> Result<serde_json::Value, BoxError> {
+        let response = self.status(bucket).await?;
+        if response.status != 200 {
+            return Err(format!("status for {bucket}: {} {}", response.status, response.body).into());
+        }
+        response.json()
+    }
+
+    /// Reads one counter out of the status document by JSON pointer, e.g.
+    /// `/counters/pull_failures_total/queue_full`. Missing runtime state
+    /// reads as 0, which is what an operator sees too.
+    pub async fn status_counter(&self, bucket: &str, pointer: &str) -> Result<u64, BoxError> {
+        Ok(self
+            .status_json(bucket)
+            .await?
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0))
+    }
+
+    /// Polls [`Self::status_counter`] until it reaches `at_least`. Background
+    /// pulls and their failure counters land after the response that started
+    /// them, so every counter assertion about them has to wait.
+    pub async fn wait_for_status_counter(
+        &self,
+        bucket: &str,
+        pointer: &str,
+        at_least: u64,
+        timeout: Duration,
+    ) -> Result<u64, BoxError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let value = self.status_counter(bucket, pointer).await?;
+            if value >= at_least {
+                return Ok(value);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{pointer} for {bucket} stalled at {value}, expected at least {at_least}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Highest `inflight_pulls` the status route reported while `work` ran,
+    /// sampled every 5 ms. The concurrency ceiling is only observable from
+    /// outside while pulls are in flight.
+    pub async fn peak_inflight_pulls<F, T>(&self, bucket: &str, work: F) -> Result<(T, u64), BoxError>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let mut peak = 0;
+        tokio::pin!(work);
+        let output = loop {
+            tokio::select! {
+                output = &mut work => break output,
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    peak = peak.max(self.status_counter(bucket, "/inflight_pulls").await?);
+                }
+            }
+        };
+        Ok((output, peak))
     }
 
     /// Panics if `key` is listed locally.
@@ -591,4 +763,42 @@ pub async fn start_source_rustfs() -> Result<RustFSTestEnvironment, BoxError> {
     let mut source = RustFSTestEnvironment::new().await?;
     source.start_rustfs_server_without_cleanup(vec![]).await?;
     Ok(source)
+}
+
+/// Like [`start_source_rustfs`], but with on-demand migration enabled on the
+/// second server too, so it can be given a source of its own (the anti-loop
+/// scenario chains two migrating servers).
+pub async fn start_source_rustfs_with_odm() -> Result<RustFSTestEnvironment, BoxError> {
+    let mut source = RustFSTestEnvironment::new().await?;
+    source
+        .start_rustfs_server_without_cleanup_with_env(&[(ODM_MODULE_SWITCH_ENV, "true"), (ALLOW_LOOPBACK_SOURCE_ENV, "true")])
+        .await?;
+    Ok(source)
+}
+
+/// The full scenario fixture every behavior test starts from: a RustFS with
+/// `bucket`, an unversioned `source_bucket` on the fake source (a plain
+/// migration source), the configuration installed after `adjust` tweaked it,
+/// and the runtime proven to consult the source.
+pub async fn start_configured_env(
+    bucket: &str,
+    source_bucket: &str,
+    adjust: impl FnOnce(&mut OdmSourceSpec),
+) -> Result<OdmTestEnv, BoxError> {
+    start_configured_env_with(OdmEnvOptions::default(), bucket, source_bucket, adjust).await
+}
+
+/// [`start_configured_env`] with extra process arguments and environment.
+pub async fn start_configured_env_with(
+    options: OdmEnvOptions<'_>,
+    bucket: &str,
+    source_bucket: &str,
+    adjust: impl FnOnce(&mut OdmSourceSpec),
+) -> Result<OdmTestEnv, BoxError> {
+    let env = OdmTestEnv::start_with(options).await?;
+    env.source.create_bucket_with_mode(source_bucket, BucketMode::Unversioned);
+    let mut spec = env.fake_source_spec(source_bucket);
+    adjust(&mut spec);
+    env.configure_and_wait(bucket, &spec).await?;
+    Ok(env)
 }

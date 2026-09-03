@@ -475,10 +475,20 @@ path = "junit.xml"
 # loss, quorum, cleanup, notification fan-in, or admin-timeout behavior. The
 # consolidated nightly workflow runs them serially to avoid resource
 # starvation; failures are never retried.
+#
+# On-demand migration (backlog#2158 ODM-11) joins by the second clause: the
+# fault matrix waits out the 30 s circuit-breaker window, the concurrency
+# matrix drives 100-deep bursts, and the real-source cases start a second
+# (loop guard: a third) RustFS process. They are too slow or too heavy for
+# the merge budget; `on_demand_migration::{get_basic,interaction}_test` stay
+# in e2e-full, which excludes exactly these three modules.
 [profile.e2e-nightly]
 default-filter = """
     package(e2e_test)
-    & test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|degraded_listing_availability_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+    & (
+        test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|degraded_listing_availability_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+        | test(/^on_demand_migration::(concurrency_test|fault_test|real_source_test)::/)
+    )
 """
 fail-fast = false
 
@@ -536,6 +546,7 @@ default-filter = """
     & !test(/^protocols::/)
     & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|degraded_listing_availability_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
     & !test(/^replication_extension_test::/)
+    & !test(/^on_demand_migration::(concurrency_test|fault_test|real_source_test)::/)
 """
 fail-fast = false
 
