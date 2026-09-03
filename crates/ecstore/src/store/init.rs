@@ -832,11 +832,12 @@ mod tests {
             },
             transition_transaction::{
                 TRANSITION_TRANSACTION_RECORD_PREFIX, TransitionCleanupDecision, TransitionCleanupProof, TransitionOperatorError,
-                TransitionOperatorProbe, TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode,
-                TransitionTransaction, TransitionTransactionInit, TransitionTransactionState,
+                TransitionOperatorProbe, TransitionRecoveryClaimBarrier, TransitionRemoteVersion, TransitionSourceIdentity,
+                TransitionSourceVersionMode, TransitionTransaction, TransitionTransactionInit, TransitionTransactionState,
                 delete_transition_candidate_for_operator, finalize_missing_transition_transaction_for_operator,
                 inspect_transition_transaction_for_operator, load_transition_transaction_record,
-                recover_transition_transaction_records, save_transition_transaction_record,
+                recover_transition_transaction_records, recover_transition_transaction_records_at,
+                save_transition_transaction_record, save_transition_transaction_record_if_current,
                 transition_transaction_record_object_name,
             },
             validate_durable_ilm_record,
@@ -864,6 +865,7 @@ mod tests {
             tier_mutation_peer::{TierMutationPeerError, TierMutationPeerState, handle_tier_mutation_peer_request},
             warm_backend::{TransitionCandidateProbe, WarmBackend},
         },
+        set_disk::SetDiskTransitionUploadedCommitBarrier as TransitionUploadedCommitBarrier,
         storage_api_contracts::list::ListOperations as _,
     };
     #[cfg(feature = "test-util")]
@@ -17469,7 +17471,82 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn transition_transaction_recovery_deletes_uploaded_remote_candidate() {
+    async fn transition_transaction_recovery_retains_active_uploaded_candidate_until_commit() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-active-uploaded", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXACTIVEUPLOADED";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let bucket = "transition-transaction-active-uploaded-bucket";
+        let object = "object.bin";
+        let payload = b"active Uploaded ownership must survive recovery until local commit".repeat(1024);
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("source bucket should be created");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let source = store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let barrier = TransitionUploadedCommitBarrier::install(bucket, object);
+        let transition_store = store.clone();
+        let transition = tokio::spawn(async move {
+            transition_store
+                .transition_object(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        transition: TransitionOptions {
+                            status: TRANSITION_PENDING.to_string(),
+                            tier: tier_name.to_string(),
+                            etag: source.etag.clone().expect("source object should have an ETag"),
+                            ..Default::default()
+                        },
+                        version_id: source.version_id.map(|version_id| version_id.to_string()),
+                        mod_time: source.mod_time,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        barrier.wait_until_paused().await;
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("recovery should inspect the active Uploaded transaction");
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 0, 1, 0));
+        assert_eq!(backend.object_count().await, 1, "active ownership must retain the remote candidate");
+        assert_eq!(backend.remove_count().await, 0, "active ownership must fence remote DELETE");
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 1);
+
+        barrier.release();
+        transition
+            .await
+            .expect("transition task should join")
+            .expect("transition should commit after the barrier is released");
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        assert_eq!(backend.remove_count().await, 0);
+
+        let mut body = Vec::new();
+        store
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("committed tier object should remain readable")
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("tier object body should drain");
+        assert_eq!(body, payload);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_deletes_expired_uploaded_remote_candidate() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
         let (ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-recovery", &[4])).await;
@@ -17481,8 +17558,110 @@ mod tests {
             .await
             .expect("tier lease should resolve")
             .backend_identity();
+        let exact_version = uuid::Uuid::new_v4().to_string();
+        let cases = [
+            (
+                "exact",
+                exact_version.clone(),
+                TransitionRemoteVersion::versioned(exact_version),
+                TransitionSourceVersionMode::Versioned,
+            ),
+            (
+                "suspended-null",
+                "null".to_string(),
+                TransitionRemoteVersion::versioned("null"),
+                TransitionSourceVersionMode::VersionSuspended,
+            ),
+            (
+                "known-unversioned",
+                String::new(),
+                TransitionRemoteVersion::unversioned(),
+                TransitionSourceVersionMode::Unversioned,
+            ),
+        ];
+        let mut expected_removes = Vec::new();
+        for (case, put_version, remote_version, source_mode) in cases {
+            let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+                deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+                transaction_id: uuid::Uuid::new_v4(),
+                owner_epoch: uuid::Uuid::new_v4(),
+                write_id: uuid::Uuid::new_v4(),
+                source: TransitionSourceIdentity {
+                    bucket: "source-bucket".to_string(),
+                    object: format!("source-{case}"),
+                    version_id: (source_mode == TransitionSourceVersionMode::Versioned).then(uuid::Uuid::new_v4),
+                    data_dir: uuid::Uuid::new_v4(),
+                    mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                    size: 42,
+                    etag: "source-etag".to_string(),
+                    version_mode: source_mode,
+                },
+                tier_name: tier_name.to_string(),
+                backend_fingerprint: backend_identity,
+                not_after_unix_nanos: 1,
+            })
+            .expect("transaction should build");
+            transaction
+                .advance(transaction.fence(), TransitionTransactionState::Uploaded, Some(remote_version))
+                .expect("transaction should enter uploaded state");
+            backend.set_put_remote_version(Some(put_version.clone())).await;
+            let candidate = bytes::Bytes::from_static(b"orphan candidate");
+            backend
+                .put(
+                    &transaction.remote_object,
+                    ReaderImpl::Body(candidate.clone()),
+                    i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+                )
+                .await
+                .expect("mock backend should accept candidate");
+            save_transition_transaction_record(store.clone(), &transaction)
+                .await
+                .expect("transaction record should persist");
+            expected_removes.push((transaction.remote_object, put_version));
+        }
+
+        let stats = recover_transition_transaction_records(store.clone(), 100, None)
+            .await
+            .expect("transition transaction recovery should run");
+
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (3, 3, 0, 0));
+        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+        let mut actual_removes = backend.remove_versions().await;
+        actual_removes.sort();
+        expected_removes.sort();
+        assert_eq!(actual_removes, expected_removes, "recovery must preserve each remote version shape");
+        assert_eq!(backend.exact_remove_count(), 2);
+        assert_eq!(backend.object_count().await, 0);
+
+        let replay = recover_transition_transaction_records(store, 100, None)
+            .await
+            .expect("replayed recovery should remain idempotent");
+        assert_eq!((replay.scanned, replay.recovered, replay.retained, replay.failed), (0, 0, 0, 0));
+        assert_eq!(
+            backend.remove_versions().await.len(),
+            3,
+            "each expired candidate must be deleted only once"
+        );
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_cas_loses_to_active_state_advance() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "transition-transaction-recovery-cas", &[4]))
+                .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXRECOVERYCAS";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
         let remote_version = uuid::Uuid::new_v4().to_string();
-        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+        let mut uploaded = TransitionTransaction::new(TransitionTransactionInit {
             deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
             transaction_id: uuid::Uuid::new_v4(),
             owner_epoch: uuid::Uuid::new_v4(),
@@ -17499,7 +17678,97 @@ mod tests {
             },
             tier_name: tier_name.to_string(),
             backend_fingerprint: backend_identity,
-            not_after_unix_nanos: 1_780_000_000_000_000_000,
+            not_after_unix_nanos: 1,
+        })
+        .expect("transaction should build");
+        uploaded
+            .advance(
+                uploaded.fence(),
+                TransitionTransactionState::Uploaded,
+                Some(TransitionRemoteVersion::versioned(remote_version.clone())),
+            )
+            .expect("transaction should enter uploaded state");
+        backend.set_put_remote_version(Some(remote_version)).await;
+        let candidate = bytes::Bytes::from_static(b"CAS-owned transition remote candidate");
+        backend
+            .put(
+                &uploaded.remote_object,
+                ReaderImpl::Body(candidate.clone()),
+                i64::try_from(candidate.len()).expect("test candidate length should fit i64"),
+            )
+            .await
+            .expect("mock backend should accept candidate");
+        save_transition_transaction_record(store.clone(), &uploaded)
+            .await
+            .expect("transaction record should persist");
+
+        let barrier = TransitionRecoveryClaimBarrier::install(uploaded.transaction_id);
+        let recovery_store = store.clone();
+        let recovery = tokio::spawn(async move { recover_transition_transaction_records(recovery_store, 100, None).await });
+        barrier.wait_until_paused().await;
+
+        let mut active = uploaded.clone();
+        active
+            .advance(active.fence(), TransitionTransactionState::LocalCommitStarted, None)
+            .expect("active owner should advance to local commit");
+        save_transition_transaction_record_if_current(store.clone(), &uploaded, &active)
+            .await
+            .expect("active owner should win the persisted CAS");
+        barrier.release();
+
+        let stats = recovery
+            .await
+            .expect("recovery task should join")
+            .expect("recovery should treat the lost CAS as a retained transaction");
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 0, 1, 0));
+        assert_eq!(
+            load_transition_transaction_record(store, uploaded.transaction_id)
+                .await
+                .expect("newer transaction revision must remain"),
+            active
+        );
+        assert_eq!(backend.object_count().await, 1, "a stale recovery must not delete the candidate");
+        assert_eq!(backend.remove_count().await, 0);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn transition_transaction_recovery_quarantines_missing_required_fields() {
+        let temp_dir = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
+            temp_dir.path(),
+            "transition-transaction-recovery-corrupt",
+            &[4],
+        ))
+        .await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+
+        let tier_name = "TXRECOVERYCORRUPT";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("tier lease should resolve")
+            .backend_identity();
+        let remote_version = uuid::Uuid::new_v4().to_string();
+        let mut transaction = TransitionTransaction::new(TransitionTransactionInit {
+            deployment_id: ctx.deployment_id().expect("test store should initialize deployment id"),
+            transaction_id: uuid::Uuid::new_v4(),
+            owner_epoch: uuid::Uuid::new_v4(),
+            write_id: uuid::Uuid::new_v4(),
+            source: TransitionSourceIdentity {
+                bucket: "source-bucket".to_string(),
+                object: "source-object".to_string(),
+                version_id: None,
+                data_dir: uuid::Uuid::new_v4(),
+                mod_time_unix_nanos: 1_770_000_000_000_000_000,
+                size: 42,
+                etag: "source-etag".to_string(),
+                version_mode: TransitionSourceVersionMode::Unversioned,
+            },
+            tier_name: tier_name.to_string(),
+            backend_fingerprint: backend_identity,
+            not_after_unix_nanos: 1,
         })
         .expect("transaction should build");
         transaction
@@ -17509,8 +17778,8 @@ mod tests {
                 Some(TransitionRemoteVersion::versioned(remote_version.clone())),
             )
             .expect("transaction should enter uploaded state");
-        backend.set_put_remote_version(Some(remote_version.clone())).await;
-        let candidate = bytes::Bytes::from_static(b"orphan candidate");
+        backend.set_put_remote_version(Some(remote_version)).await;
+        let candidate = bytes::Bytes::from_static(b"corrupt journal candidate");
         backend
             .put(
                 &transaction.remote_object,
@@ -17519,23 +17788,34 @@ mod tests {
             )
             .await
             .expect("mock backend should accept candidate");
-        save_transition_transaction_record(store.clone(), &transaction)
-            .await
-            .expect("transaction record should persist");
+
+        let mut persisted: serde_json::Value = serde_json::from_slice(&transaction.encode().expect("transaction should encode"))
+            .expect("transaction should be JSON");
+        persisted["transaction"]
+            .as_object_mut()
+            .expect("transaction payload should be an object")
+            .remove("not_after_unix_nanos");
+        let path =
+            transition_transaction_record_object_name(transaction.transaction_id).expect("transaction path should be canonical");
+        com::save_config(
+            store.clone(),
+            &path,
+            serde_json::to_vec(&persisted).expect("corrupt fixture should encode"),
+        )
+        .await
+        .expect("corrupt transaction fixture should persist");
 
         let stats = recover_transition_transaction_records(store.clone(), 100, None)
             .await
-            .expect("transition transaction recovery should run");
-
-        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
-        assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+            .expect("recovery scan should isolate a corrupt record");
+        assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 0, 0, 1));
         assert_eq!(
-            backend.remove_versions().await,
-            vec![(transaction.remote_object.clone(), remote_version)],
-            "recovery must delete the exact uploaded candidate"
+            transition_transaction_record_count(store).await,
+            1,
+            "corrupt evidence must remain quarantined"
         );
-        assert_eq!(backend.exact_remove_count(), 1);
-        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.object_count().await, 1, "corrupt evidence must never authorize remote DELETE");
+        assert_eq!(backend.remove_count().await, 0);
     }
 
     #[cfg(feature = "test-util")]
@@ -18130,14 +18410,14 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn transition_transaction_recovery_deletes_provider_recovered_unknown_upload() {
+    async fn transition_transaction_recovery_handles_provider_recovered_unknown_upload() {
         let versioned_remote = uuid::Uuid::new_v4().to_string();
         let nil_remote = uuid::Uuid::nil().to_string();
-        for (case, tier_name, remote_version) in [
-            ("missing", "TXPROBEMISSING", None),
-            ("unversioned", "TXPROBEUNVERSIONED", Some(String::new())),
-            ("versioned", "TXPROBEVERSIONED", Some(versioned_remote)),
-            ("nil-version", "TXPROBENILVERSION", Some(nil_remote)),
+        for (case, tier_name, remote_version, should_recover) in [
+            ("missing", "TXPROBEMISSING", None, true),
+            ("unversioned", "TXPROBEUNVERSIONED", Some(String::new()), true),
+            ("versioned", "TXPROBEVERSIONED", Some(versioned_remote), true),
+            ("nil-version", "TXPROBENILVERSION", Some(nil_remote), false),
         ] {
             let temp_dir = tempfile::tempdir().expect("create temp store dir");
             let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store(
@@ -18170,7 +18450,7 @@ mod tests {
                 },
                 tier_name: tier_name.to_string(),
                 backend_fingerprint: backend_identity,
-                not_after_unix_nanos: 1_780_000_000_000_000_000,
+                not_after_unix_nanos: 1,
             })
             .expect("transaction should build");
             transaction
@@ -18197,14 +18477,18 @@ mod tests {
                 .await
                 .expect("transition transaction recovery should run");
 
-            assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
-            assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
+            assert_eq!(
+                (stats.scanned, stats.recovered, stats.retained, stats.failed),
+                if should_recover { (1, 1, 0, 0) } else { (1, 0, 1, 0) }
+            );
+            assert_eq!(transition_transaction_record_count(store.clone()).await, usize::from(!should_recover));
             assert_eq!(
                 backend.object_count().await,
-                0,
-                "case {case}: recovered unknown upload candidate must be absent"
+                usize::from(!should_recover),
+                "case {case}: only a valid provider version state may be recovered destructively"
             );
             let removed = remote_version
+                .filter(|_| should_recover)
                 .map(|version| vec![(transaction.remote_object.clone(), version)])
                 .unwrap_or_default();
             assert_eq!(
@@ -18478,9 +18762,10 @@ mod tests {
         assert_eq!(backend.remove_count().await, 0, "unsupported recovery must not attempt cleanup");
 
         backend.set_transition_candidate_probe_override(None).await;
-        let stats = recover_transition_transaction_records(store.clone(), 100, None)
-            .await
-            .expect("provider-authoritative recovery should run");
+        let stats =
+            recover_transition_transaction_records_at(store.clone(), 100, None, i128::from(transaction.not_after_unix_nanos) + 1)
+                .await
+                .expect("provider-authoritative recovery should run");
         assert_eq!((stats.scanned, stats.recovered, stats.retained, stats.failed), (1, 1, 0, 0));
         assert_eq!(transition_transaction_record_count(store.clone()).await, 0);
         assert_eq!(backend.object_count().await, 0, "recovery must delete the provider-confirmed candidate");

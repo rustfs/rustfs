@@ -266,9 +266,9 @@ use crate::bucket::lifecycle::{
         transitioned_force_delete_journal_entry,
     },
     transition_transaction::{
-        TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode, TransitionTransaction,
-        TransitionTransactionInit, TransitionTransactionState, delete_transition_transaction_record,
-        load_transition_transaction_record, save_transition_transaction_record,
+        TransitionCleanupDecision, TransitionRemoteVersion, TransitionSourceIdentity, TransitionSourceVersionMode,
+        TransitionTransaction, TransitionTransactionInit, TransitionTransactionState, delete_transition_transaction_record,
+        save_transition_transaction_record, save_transition_transaction_record_if_current,
     },
 };
 use crate::bucket::quota::reservation;
@@ -5513,6 +5513,7 @@ pub(crate) struct TransitionUploadCleanup {
     object: String,
     candidate: Option<TransitionUploadCandidate>,
     cleanup_api: Option<Arc<ECStore>>,
+    cleanup_transaction: Option<TransitionTransaction>,
     armed: bool,
 }
 
@@ -5523,8 +5524,18 @@ impl TransitionUploadCleanup {
             object: object.to_string(),
             candidate: None,
             cleanup_api: None,
+            cleanup_transaction: None,
             armed: true,
         }
+    }
+
+    fn set_cleanup_owner(&mut self, api: Option<Arc<ECStore>>, transaction: &TransitionTransaction) {
+        self.cleanup_api = api;
+        self.cleanup_transaction = Some(transaction.clone());
+    }
+
+    fn update_cleanup_transaction(&mut self, transaction: &TransitionTransaction) {
+        self.cleanup_transaction = Some(transaction.clone());
     }
 
     fn cleanup_candidate(&self) -> std::io::Result<&TransitionUploadCandidate> {
@@ -5559,11 +5570,13 @@ impl TransitionUploadCleanup {
         api: Option<Arc<ECStore>>,
         transaction: &mut TransitionTransaction,
     ) -> std::io::Result<()> {
+        let api = api.or_else(|| self.cleanup_api.clone());
         self.cleanup_api = api.clone();
         let candidate = self.cleanup_candidate()?.clone();
         let owner_error = persist_rejected_transition_cleanup_owner(api.as_ref(), transaction, &candidate)
             .await
             .err();
+        self.update_cleanup_transaction(transaction);
         let cleanup = cleanup_rejected_transition_upload_durably(
             &self.lease,
             &self.object,
@@ -5615,15 +5628,37 @@ impl Drop for TransitionUploadCleanup {
             }
         };
         let object = self.object.clone();
-        let cleanup_version = candidate.cleanup_version().to_string();
-        let version_id_exact = candidate.cleanup_version_is_exact();
+        let candidate = candidate.clone();
         let cleanup_api = self.cleanup_api.clone();
+        let mut cleanup_transaction = self.cleanup_transaction.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                if let Err(err) =
-                    cleanup_rejected_transition_upload_durably(&lease, &object, &cleanup_version, version_id_exact, cleanup_api)
-                        .await
-                {
+                let owner_error = match (cleanup_api.as_ref(), cleanup_transaction.as_mut()) {
+                    (Some(api), Some(transaction)) => {
+                        persist_rejected_transition_cleanup_owner(Some(api), transaction, &candidate)
+                            .await
+                            .err()
+                    }
+                    _ => None,
+                };
+                let cleanup_version = candidate.cleanup_version().to_string();
+                let cleanup = cleanup_rejected_transition_upload_durably(
+                    &lease,
+                    &object,
+                    &cleanup_version,
+                    candidate.cleanup_version_is_exact(),
+                    cleanup_api,
+                )
+                .await;
+                let result = match (owner_error, cleanup) {
+                    (_, Ok(())) => Ok(()),
+                    (None, Err(cleanup_error)) => Err(cleanup_error),
+                    (Some(owner_error), Err(cleanup_error)) => Err(crate::error::stable_io_error(
+                        "cancelled transition upload cleanup error followed a transaction owner update failure",
+                        format!("owner error: {owner_error}; cleanup error: {cleanup_error}"),
+                    )),
+                };
+                if let Err(err) = result {
                     warn!(
                         event = EVENT_LIFECYCLE_TRANSITION_CLEANUP,
                         component = LOG_COMPONENT_ECSTORE,
@@ -5646,25 +5681,36 @@ async fn persist_rejected_transition_cleanup_owner(
     transaction: &mut TransitionTransaction,
     candidate: &TransitionUploadCandidate,
 ) -> Result<()> {
-    match transaction.state {
-        TransitionTransactionState::UploadOutcomeUnknown => {
-            transaction
-                .advance(
-                    transaction.fence(),
-                    TransitionTransactionState::Uploaded,
-                    Some(TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string())),
-                )
-                .map_err(Error::other)?;
-        }
-        TransitionTransactionState::Uploaded => {}
+    let expected = transaction.clone();
+    let remote_version = TransitionRemoteVersion::known_from_put_response(candidate.remote_version().to_string());
+    let decision = match transaction.state {
+        TransitionTransactionState::UploadOutcomeUnknown => TransitionCleanupDecision::RemoteVersionRecoveredAfterCancellation,
+        TransitionTransactionState::Uploaded => TransitionCleanupDecision::UploadAbortedBeforeLocalCommit,
+        TransitionTransactionState::CleanupPending if transaction.remote_version == remote_version => return Ok(()),
         state => {
             return Err(Error::other_with_context(
                 "transition transaction state cannot own a rejected upload",
                 format!("state {state:?}"),
             ));
         }
-    }
-    save_transition_transaction_if_available(api, transaction).await
+    };
+    let mut cleanup = expected.clone();
+    cleanup
+        .mark_cleanup_pending(
+            expected.fence(),
+            crate::bucket::lifecycle::transition_transaction::TransitionCleanupProof {
+                transaction_id: expected.transaction_id,
+                write_id: expected.write_id,
+                remote_object: expected.remote_object.clone(),
+                remote_version,
+                backend_fingerprint: expected.backend_fingerprint,
+                decision,
+            },
+        )
+        .map_err(Error::other)?;
+    compare_and_save_transition_transaction_if_available(api, &expected, &cleanup).await?;
+    *transaction = cleanup;
+    Ok(())
 }
 
 pub(crate) async fn cleanup_rejected_transition_upload_durably(
@@ -5779,6 +5825,26 @@ async fn save_transition_transaction_if_available(api: Option<&Arc<ECStore>>, tr
     }
 }
 
+async fn compare_and_save_transition_transaction_if_available(
+    api: Option<&Arc<ECStore>>,
+    expected: &TransitionTransaction,
+    next: &TransitionTransaction,
+) -> Result<()> {
+    if let Some(api) = api {
+        // The transition worker already has a deep poll chain. Keep the CAS
+        // read/write/receipt future off Tokio's default worker stack.
+        return Box::pin(save_transition_transaction_record_if_current(api.clone(), expected, next)).await;
+    }
+    #[cfg(test)]
+    {
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        Err(Error::other("transition transaction store is unavailable"))
+    }
+}
+
 async fn advance_and_save_transition_transaction(
     api: Option<&Arc<ECStore>>,
     transaction: &mut TransitionTransaction,
@@ -5787,10 +5853,14 @@ async fn advance_and_save_transition_transaction(
 ) -> Result<()> {
     #[cfg(test)]
     record_transition_uploaded_save_attempt(transaction, next);
-    transaction
-        .advance(transaction.fence(), next, remote_version)
+    let expected = transaction.clone();
+    let mut advanced = expected.clone();
+    advanced
+        .advance(expected.fence(), next, remote_version)
         .map_err(Error::other)?;
-    save_transition_transaction_if_available(api, transaction).await
+    compare_and_save_transition_transaction_if_available(api, &expected, &advanced).await?;
+    *transaction = advanced;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5874,29 +5944,29 @@ fn record_transition_uploaded_save_attempt(transaction: &TransitionTransaction, 
     }
 }
 
-async fn delete_transition_transaction_if_available(api: Option<&Arc<ECStore>>, transaction_id: Uuid) -> Result<()> {
+async fn delete_transition_transaction_if_available(
+    api: Option<&Arc<ECStore>>,
+    transaction: &TransitionTransaction,
+) -> Result<()> {
     if let Some(api) = api {
-        let transaction = match load_transition_transaction_record(api.clone(), transaction_id).await {
-            Ok(transaction) => transaction,
-            Err(Error::ConfigNotFound) => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        return delete_transition_transaction_record(api.clone(), &transaction).await;
+        // Conditional delete now includes a read and terminal receipt; box it
+        // for the same transition-worker stack bound as the CAS path above.
+        return Box::pin(delete_transition_transaction_record(api.clone(), transaction)).await;
     }
     Ok(())
 }
 
 async fn delete_transition_transaction_after_remote_cleanup(
     api: Option<&Arc<ECStore>>,
-    transaction_id: Uuid,
+    transaction: &TransitionTransaction,
     bucket: &str,
     object: &str,
 ) {
-    if let Err(err) = delete_transition_transaction_if_available(api, transaction_id).await {
+    if let Err(err) = delete_transition_transaction_if_available(api, transaction).await {
         warn!(
             bucket = bucket,
             object = object,
-            transaction_id = %transaction_id,
+            transaction_id = %transaction.transaction_id,
             error = ?err,
             "transition remote candidate was cleaned but transaction record cleanup failed"
         );
@@ -6025,6 +6095,86 @@ async fn pause_after_transition_upload_candidate_recorded() {
         .lock()
         .expect("transition upload candidate barrier mutex should not poison")
         .take();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+struct TransitionUploadedCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+pub(crate) struct TransitionUploadedCommitBarrier {
+    state: Arc<TransitionUploadedCommitBarrierState>,
+}
+
+#[cfg(test)]
+static TRANSITION_UPLOADED_COMMIT_BARRIER: std::sync::OnceLock<
+    std::sync::Mutex<Option<Arc<TransitionUploadedCommitBarrierState>>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl TransitionUploadedCommitBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(TransitionUploadedCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = TRANSITION_UPLOADED_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition uploaded commit barrier mutex should not poison");
+        assert!(
+            slot.is_none(),
+            "transition uploaded commit barrier must be installed by one test at a time"
+        );
+        *slot = Some(Arc::clone(&state));
+        drop(slot);
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("transition should persist Uploaded before acquiring its commit lock");
+    }
+
+    pub(crate) fn release(&self) {
+        self.state.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+impl Drop for TransitionUploadedCommitBarrier {
+    fn drop(&mut self) {
+        self.state.release.notify_one();
+        let mut slot = TRANSITION_UPLOADED_COMMIT_BARRIER
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .expect("transition uploaded commit barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+    }
+}
+
+#[cfg(test)]
+async fn pause_after_transition_uploaded_persisted(bucket: &str, object: &str) {
+    let barrier = TRANSITION_UPLOADED_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("transition uploaded commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| barrier.bucket == bucket && barrier.object == object)
+        .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
         barrier.release.notified().await;
@@ -8841,6 +8991,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
 
         let mut upload_cleanup = TransitionUploadCleanup::new(tgt_client, &dest_obj);
+        upload_cleanup.set_cleanup_owner(transaction_api.clone(), &transaction);
         advance_and_save_transition_transaction(
             transaction_api.as_ref(),
             &mut transaction,
@@ -8848,6 +8999,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             None,
         )
         .await?;
+        upload_cleanup.update_cleanup_transaction(&transaction);
         let remote_upload = {
             let lease = &upload_cleanup.lease;
             let recorded_candidate = &mut upload_cleanup.candidate;
@@ -8872,7 +9024,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             failure.error
                         ))));
                     }
-                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object)
                         .await;
                 }
                 return Err(failure.error);
@@ -8886,7 +9038,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     "{err}; rejected remote upload cleanup failed: {cleanup_err}"
                 ))));
             }
-            delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
+            delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
             return Err(err.into());
         }
         let fleet_proof = remote_version_state_writer_fleet_proof();
@@ -8902,7 +9054,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             "{err}; rejected remote upload cleanup failed: {cleanup_err}"
                         ))));
                     }
-                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object)
                         .await;
                     return Err(err.into());
                 }
@@ -8921,9 +9073,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     "{err}; uploaded transition transaction persist failed and cleanup failed: {cleanup_err}"
                 ))));
             }
-            delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object).await;
+            delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
             return Err(err);
         }
+        upload_cleanup.update_cleanup_transaction(&transaction);
+
+        #[cfg(test)]
+        pause_after_transition_uploaded_persisted(bucket, object).await;
 
         let commit_opts = opts.as_commit_opts();
         // Note: Using clone() here is necessary because ObjectOptions has 124 fields.
@@ -8937,7 +9093,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     if upload_cleanup.cleanup().await.is_ok() {
                         delete_transition_transaction_after_remote_cleanup(
                             transaction_api.as_ref(),
-                            transaction_id,
+                            &transaction,
                             bucket,
                             object,
                         )
@@ -8954,7 +9110,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Err(err) => {
                 drop(transition_lock_guard);
                 if upload_cleanup.cleanup().await.is_ok() {
-                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
+                    delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object)
                         .await;
                 }
                 return Err(err);
@@ -8970,8 +9126,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             let already_transitioned = current_fi.transition_status == TRANSITION_COMPLETE;
             drop(transition_lock_guard);
             if upload_cleanup.cleanup().await.is_ok() {
-                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                    .await;
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
             }
             if already_transitioned {
                 return Ok(());
@@ -9000,8 +9155,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if transition_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
             drop(transition_lock_guard);
             if upload_cleanup.cleanup().await.is_ok() {
-                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                    .await;
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
             }
             return Err(StorageError::NamespaceLockQuorumUnavailable {
                 mode: "transition_object_commit",
@@ -9016,8 +9170,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if !upload_cleanup.lease.is_current_generation() {
             drop(transition_lock_guard);
             if upload_cleanup.cleanup().await.is_ok() {
-                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                    .await;
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
             }
             return Err(Error::other("remote tier configuration changed during transition"));
         }
@@ -9033,8 +9186,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         {
             drop(transition_lock_guard);
             if upload_cleanup.cleanup().await.is_ok() {
-                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                    .await;
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
             }
             return Err(Error::other("remote version state fleet capability changed during transition"));
         }
@@ -9048,8 +9200,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         {
             drop(transition_lock_guard);
             if upload_cleanup.cleanup().await.is_ok() {
-                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), transaction_id, bucket, object)
-                    .await;
+                delete_transition_transaction_after_remote_cleanup(transaction_api.as_ref(), &transaction, bucket, object).await;
             }
             return Err(err);
         }
@@ -9065,19 +9216,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             drop(transition_lock_guard);
             return Err(err);
         }
-        match transaction.advance(transaction.fence(), TransitionTransactionState::Committed, None) {
-            Ok(_) => {
-                if let Err(err) = save_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
-                    warn!(
-                        bucket = bucket,
-                        object = object,
-                        transaction_id = %transaction_id,
-                        error = ?err,
-                        "transition committed locally but transaction committed-state persist failed"
-                    );
-                } else if let Err(err) =
-                    delete_transition_transaction_if_available(transaction_api.as_ref(), transaction_id).await
-                {
+        match advance_and_save_transition_transaction(
+            transaction_api.as_ref(),
+            &mut transaction,
+            TransitionTransactionState::Committed,
+            None,
+        )
+        .await
+        {
+            Ok(()) => {
+                if let Err(err) = delete_transition_transaction_if_available(transaction_api.as_ref(), &transaction).await {
                     warn!(
                         bucket = bucket,
                         object = object,

@@ -11,9 +11,20 @@ on:
         description: 'Direct .deb URL (nightly/R2/dev). Overrides rustfs_version.'
         required: false
         type: string
-      rc_sha256:
-        description: 'Optional SHA-256 for the preinstalled rc binary; mismatch is an infrastructure failure.'
+      rc_archive_url:
+        description: 'Exact RustFS CLI Linux archive URL.'
         required: false
+        default: 'https://github.com/rustfs/cli/releases/download/v0.1.32/rustfs-cli-linux-amd64-v0.1.32.tar.gz'
+        type: string
+      rc_archive_sha256:
+        description: 'Expected SHA-256 of the RustFS CLI archive.'
+        required: false
+        default: 'ab00d937079dcb6f1c7b41d34bbfaad0eb0bd4f7218672cbcb7c33652d1c46df'
+        type: string
+      rc_sha256:
+        description: 'Expected SHA-256 of the extracted RustFS CLI binary.'
+        required: false
+        default: '320bdd4223a4d1986c1a098165f2198e92c35c4042b9a4d5e6fa33e9152477df'
         type: string
       force_case_failure:
         description: 'Diagnostic only: rewrite single-single/TIER-101 to FAIL after execution to verify artifact and final-gate behavior.'
@@ -41,7 +52,9 @@ env:
   RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES }}
   RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER }}
   RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
-  RUSTFS_EXPECTED_RC_SHA256: ${{ inputs.rc_sha256 || vars.RUSTFS_TIER_RC_SHA256 }}
+  RUSTFS_RC_ARCHIVE_URL: ${{ inputs.rc_archive_url || 'https://github.com/rustfs/cli/releases/download/v0.1.32/rustfs-cli-linux-amd64-v0.1.32.tar.gz' }}
+  RUSTFS_RC_ARCHIVE_SHA256: ${{ inputs.rc_archive_sha256 || 'ab00d937079dcb6f1c7b41d34bbfaad0eb0bd4f7218672cbcb7c33652d1c46df' }}
+  RUSTFS_EXPECTED_RC_SHA256: ${{ inputs.rc_sha256 || '320bdd4223a4d1986c1a098165f2198e92c35c4042b9a4d5e6fa33e9152477df' }}
   PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
   TIER_ARTIFACTS_DIR: /tmp/rustfs-tier-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
 
@@ -85,6 +98,111 @@ jobs:
           done
           echo "ERROR: unable to clone rustfs/auto-testing after 5 attempts" >&2
           exit 1
+
+      - name: Prepare pinned RustFS CLI
+        id: rc
+        run: |
+          set -euo pipefail
+          umask 077
+
+          case "${RUSTFS_RC_ARCHIVE_URL}" in
+            https://*) ;;
+            *)
+              echo "RustFS CLI archive URL must use HTTPS" >&2
+              exit 1
+              ;;
+          esac
+
+          EXPECTED_ARCHIVE_SHA256="$(printf '%s' "${RUSTFS_RC_ARCHIVE_SHA256}" | tr '[:upper:]' '[:lower:]')"
+          EXPECTED_RC_SHA256="$(printf '%s' "${RUSTFS_EXPECTED_RC_SHA256}" | tr '[:upper:]' '[:lower:]')"
+          if ! [[ "${EXPECTED_ARCHIVE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "invalid RustFS CLI archive SHA-256" >&2
+            exit 1
+          fi
+          if ! [[ "${EXPECTED_RC_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "invalid RustFS CLI binary SHA-256" >&2
+            exit 1
+          fi
+
+          RC_ROOT="${RUNNER_TEMP}/rustfs-tier-rc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RC_ARCHIVE="${RC_ROOT}/rustfs-cli.tar.gz"
+          RC_BIN="${RC_ROOT}/rc"
+          if ! mkdir -- "${RC_ROOT}"; then
+            echo "refusing to reuse RustFS CLI directory: ${RC_ROOT}" >&2
+            exit 1
+          fi
+
+          curl --fail --location --retry 3 --retry-all-errors \
+            --connect-timeout 15 --max-time 180 \
+            --proto '=https' --proto-redir '=https' \
+            --output "${RC_ARCHIVE}" "${RUSTFS_RC_ARCHIVE_URL}"
+          RC_ARCHIVE_SIZE="$(wc -c < "${RC_ARCHIVE}" | tr -d '[:space:]')"
+          if [ "${RC_ARCHIVE_SIZE}" -eq 0 ] || [ "${RC_ARCHIVE_SIZE}" -gt 33554432 ]; then
+            echo "RustFS CLI archive size is outside the accepted range: ${RC_ARCHIVE_SIZE}" >&2
+            exit 1
+          fi
+          if ! ACTUAL_ARCHIVE_SHA256="$(openssl dgst -sha256 -r "${RC_ARCHIVE}" | awk '{print $1}')"; then
+            echo "failed to calculate RustFS CLI archive SHA-256" >&2
+            exit 1
+          fi
+          if [ "${ACTUAL_ARCHIVE_SHA256}" != "${EXPECTED_ARCHIVE_SHA256}" ]; then
+            echo "RustFS CLI archive SHA-256 mismatch: expected ${EXPECTED_ARCHIVE_SHA256}, got ${ACTUAL_ARCHIVE_SHA256}" >&2
+            exit 1
+          fi
+
+          ARCHIVE_MEMBERS="$(tar -tzf "${RC_ARCHIVE}")"
+          if ! grep -Fxq 'rc' <<< "${ARCHIVE_MEMBERS}"; then
+            echo "RustFS CLI archive does not contain the rc entry" >&2
+            exit 1
+          fi
+          if ! tar -xOzf "${RC_ARCHIVE}" rc > "${RC_BIN}"; then
+            echo "failed to extract the RustFS CLI binary" >&2
+            exit 1
+          fi
+          chmod 0700 "${RC_BIN}"
+          if ! ACTUAL_RC_SHA256="$(openssl dgst -sha256 -r "${RC_BIN}" | awk '{print $1}')"; then
+            echo "failed to calculate RustFS CLI binary SHA-256" >&2
+            exit 1
+          fi
+          if [ "${ACTUAL_RC_SHA256}" != "${EXPECTED_RC_SHA256}" ]; then
+            echo "RustFS CLI binary SHA-256 mismatch: expected ${EXPECTED_RC_SHA256}, got ${ACTUAL_RC_SHA256}" >&2
+            exit 1
+          fi
+          if ! RC_VERSION_OUTPUT="$(timeout 30 "${RC_BIN}" --version 2>&1)"; then
+            echo "failed to execute the pinned RustFS CLI" >&2
+            exit 1
+          fi
+          RC_VERSION="${RC_VERSION_OUTPUT%%$'\n'*}"
+          if [ -z "${RC_VERSION}" ]; then
+            echo "pinned RustFS CLI returned an empty version" >&2
+            exit 1
+          fi
+
+          jq -n \
+            --arg schema_version '1' \
+            --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg archive_url "${RUSTFS_RC_ARCHIVE_URL}" \
+            --arg archive_sha256 "${ACTUAL_ARCHIVE_SHA256}" \
+            --arg archive_size "${RC_ARCHIVE_SIZE}" \
+            --arg path "${RC_BIN}" \
+            --arg version "${RC_VERSION}" \
+            --arg sha256 "${ACTUAL_RC_SHA256}" \
+            '{
+              schema_version: ($schema_version | tonumber),
+              generated_at: $generated_at,
+              archive: {
+                url: $archive_url,
+                sha256: $archive_sha256,
+                size: ($archive_size | tonumber)
+              },
+              binary: {
+                path: $path,
+                version: $version,
+                sha256: $sha256
+              }
+            }' > "${TIER_ARTIFACTS_DIR}/rc-bootstrap.json"
+          printf 'path=%s\n' "${RC_BIN}" >> "${GITHUB_OUTPUT}"
+          echo "RustFS CLI ready: ${RC_VERSION} (${ACTUAL_RC_SHA256})"
 
       - name: Show environment
         run: |
@@ -146,12 +264,12 @@ jobs:
         continue-on-error: true
         env:
           PACKAGE_URL_INPUT: ${{ inputs.package_url }}
+          RC_BIN: ${{ steps.rc.outputs.path }}
           RUSTFS_VERSION_INPUT: ${{ inputs.rustfs_version }}
         run: |
           set -euo pipefail
           LOG_FILE="${TIER_ARTIFACTS_DIR}/rustfs-tier.log"
           chmod +x auto-testing/rustfs-tier-test.sh
-          RC_BIN="$(command -v rc)"
           PACKAGE_URL="${PACKAGE_URL_INPUT}"
           RUSTFS_VERSION="${RUSTFS_VERSION_INPUT}"
           ARGS=(
@@ -208,6 +326,11 @@ jobs:
           else
             PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
+          if RC_BOOTSTRAP_SUMMARY="$(jq -r '.binary | "\(.version) / \(.sha256)"' "${TIER_ARTIFACTS_DIR}/rc-bootstrap.json" 2>/dev/null)"; then
+            :
+          else
+            RC_BOOTSTRAP_SUMMARY="missing or invalid"
+          fi
           set +e
           python3 auto-testing/rustfs_tier_report.py \
             --results-dir "${TIER_ARTIFACTS_DIR}/cases" \
@@ -229,6 +352,7 @@ jobs:
             echo "- Run: ${RUN_URL}"
             echo "- Trigger: ${TRIGGER_NAME}"
             echo "- Package: ${PACKAGE_SOURCE}"
+            echo "- Client bootstrap: ${RC_BOOTSTRAP_SUMMARY}"
             echo "- Test Step Outcome: ${TEST_OUTCOME}"
             echo "- Structured Gate Exit: ${CASE_GATE_RC}"
             echo ""
@@ -279,6 +403,7 @@ jobs:
             rustfs-tier-report.md \
             rustfs-tier-cases.md \
             rustfs-tier-gate.rc \
+            rc-bootstrap.json \
             provenance.json; do
             if [ ! -s "${TIER_ARTIFACTS_DIR}/${name}" ]; then
               echo "required tier evidence is missing or empty: ${name}" >&2
@@ -325,6 +450,16 @@ jobs:
               ${SUDO} rm -rf /var/log/rustfs /var/lib/rustfs/kms
             '
           done
+
+      - name: Cleanup pinned RustFS CLI
+        if: always()
+        run: |
+          set -euo pipefail
+          RC_ROOT="${RUNNER_TEMP}/rustfs-tier-rc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -f -- "${RC_ROOT}/rustfs-cli.tar.gz" "${RC_ROOT}/rc"
+          if [ -d "${RC_ROOT}" ]; then
+            rmdir -- "${RC_ROOT}"
+          fi
 
       - name: Enforce tier suite result
         id: gate
