@@ -86,7 +86,7 @@ type BacklogMetricPoints = Arc<Mutex<BTreeMap<String, BTreeMap<String, (u64, f64
 /// default. This suite opts its source servers into the loopback allowance explicitly
 /// so the shared harness (`RustFSTestEnvironment` / the cluster harness) stays
 /// fail-closed and every other e2e scenario keeps exercising the production SSRF policy.
-const LOOPBACK_REPLICATION_TARGET_ENV: &[(&str, &str)] = &[("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true")];
+pub(crate) const LOOPBACK_REPLICATION_TARGET_ENV: &[(&str, &str)] = &[("RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET", "true")];
 
 /// Short data-scanner cycle for the failure-recovery tests (backlog#1147 repl-5).
 ///
@@ -402,14 +402,14 @@ fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), 
     Ok((access_key, secret_key, session_token))
 }
 
-struct ReplicationTargetOptions<'a> {
-    endpoint: &'a str,
-    access_key: &'a str,
-    secret_key: &'a str,
-    target_bucket: &'a str,
-    secure: bool,
-    skip_tls_verify: bool,
-    ca_cert_pem: Option<&'a str>,
+pub(crate) struct ReplicationTargetOptions<'a> {
+    pub(crate) endpoint: &'a str,
+    pub(crate) access_key: &'a str,
+    pub(crate) secret_key: &'a str,
+    pub(crate) target_bucket: &'a str,
+    pub(crate) secure: bool,
+    pub(crate) skip_tls_verify: bool,
+    pub(crate) ca_cert_pem: Option<&'a str>,
 }
 
 async fn set_replication_target(
@@ -434,7 +434,7 @@ async fn set_replication_target(
     .await
 }
 
-async fn set_replication_target_with_options(
+pub(crate) async fn set_replication_target_with_options(
     source_env: &RustFSTestEnvironment,
     source_bucket: &str,
     options: ReplicationTargetOptions<'_>,
@@ -504,7 +504,7 @@ async fn send_set_replication_target_request(
     .await
 }
 
-async fn put_bucket_replication(
+pub(crate) async fn put_bucket_replication(
     env: &RustFSTestEnvironment,
     bucket: &str,
     target_arn: &str,
@@ -643,7 +643,10 @@ async fn get_bucket_replication(
     signed_request(http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await
 }
 
-async fn enable_bucket_versioning(env: &RustFSTestEnvironment, bucket: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+pub(crate) async fn enable_bucket_versioning(
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     set_bucket_versioning(env, bucket, BucketVersioningStatus::Enabled).await
 }
 

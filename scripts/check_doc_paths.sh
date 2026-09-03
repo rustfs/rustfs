@@ -21,7 +21,7 @@ cd "$ROOT_DIR"
 FAILURES=0
 
 doc_files() {
-  git ls-files 'AGENTS.md' '*/AGENTS.md' 'CLAUDE.md' 'ARCHITECTURE.md' 'docs/*.md' 'docs/architecture/*.md' 'docs/operations/*.md' 'docs/testing/*.md'
+  git ls-files 'AGENTS.md' '*/AGENTS.md' 'CLAUDE.md' 'ARCHITECTURE.md' 'docs/*.md' 'docs/architecture/*.md' 'docs/operations/*.md' 'docs/postmortems/*.md' 'docs/testing/*.md'
 }
 
 check_file() {

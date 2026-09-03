@@ -80,6 +80,12 @@ mod upgrade_compatibility_test;
 #[cfg(test)]
 mod replication_lww_receiver_test;
 
+// Outbound target matrix: every object shape against every remote-target
+// failure mode the fake target models (SOP:
+// docs/postmortems/2026-09-03-replication-checksum-default-regression.md).
+#[cfg(test)]
+mod replication_target_matrix_test;
+
 // Data usage regression tests
 #[cfg(test)]
 mod data_usage_test;
