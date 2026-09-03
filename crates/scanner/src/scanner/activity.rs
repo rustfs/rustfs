@@ -108,6 +108,22 @@ impl ScannerRetryBackoff {
     }
 }
 
+pub(super) fn scanner_superseded_retry_interval(
+    backoff: ScannerRetryBackoff,
+    runtime_config: &ScannerRuntimeConfig,
+) -> Option<Duration> {
+    let retry_interval = backoff.retry_interval(runtime_config.cycle_interval)?;
+    if runtime_config.cycle_interval_source == ScannerRuntimeConfigSource::Default {
+        return Some(retry_interval);
+    }
+
+    // An explicit cycle is an operator-selected duty-cycle floor. A
+    // superseded snapshot keeps its dirty work pending, but retrying that work
+    // sooner than the configured cadence would turn continuous writes into a
+    // repeated full-walk loop despite the override.
+    Some(retry_interval.max(runtime_config.cycle_interval))
+}
+
 const SCANNER_PUBLICATION_PROOF_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) fn scanner_publication_proof_retry_delay(consecutive_failures: u32) -> Duration {

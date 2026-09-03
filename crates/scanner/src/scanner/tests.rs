@@ -7197,6 +7197,40 @@ fn superseded_retry_backoff_grows_from_the_default_cycle() {
 }
 
 #[test]
+fn superseded_retry_preserves_explicit_cycle_cadence() {
+    let mut backoff = ScannerRetryBackoff::default();
+    backoff.record_retryable_cycle(true);
+
+    let default_config = ScannerRuntimeConfig {
+        cycle_interval: Duration::from_secs(6 * 60 * 60),
+        ..Default::default()
+    };
+    assert_eq!(
+        scanner_superseded_retry_interval(backoff, &default_config),
+        Some(SCANNER_RETRY_BASE_INTERVAL),
+        "the default adaptive cadence must retain fast convergence"
+    );
+
+    for source in [
+        ScannerRuntimeConfigSource::Env,
+        ScannerRuntimeConfigSource::Config,
+        ScannerRuntimeConfigSource::ScannerCompatConfig,
+    ] {
+        let runtime_config = ScannerRuntimeConfig {
+            cycle_interval: Duration::from_secs(6 * 60 * 60),
+            cycle_interval_source: source,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scanner_superseded_retry_interval(backoff, &runtime_config),
+            Some(runtime_config.cycle_interval),
+            "{source:?} cycle cadence must not be shortened by convergence retries"
+        );
+    }
+}
+
+#[test]
 fn publication_proof_retry_backoff_reaches_its_short_cap() {
     for (failures, expected) in [(1, 5), (2, 10), (3, 20), (4, 30), (20, 30)] {
         assert_eq!(scanner_publication_proof_retry_delay(failures), Duration::from_secs(expected));
