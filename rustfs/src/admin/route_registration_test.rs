@@ -248,6 +248,16 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/v3/on-demand-migration/{bucket}/status",
             "/v3/on-demand-migration/test-bucket/status",
         ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/on-demand-migration/{bucket}/backfill",
+            "/v3/on-demand-migration/test-bucket/backfill",
+        ),
+        admin_route_sample(
+            Method::GET,
+            "/v3/on-demand-migration/{bucket}/backfill",
+            "/v3/on-demand-migration/test-bucket/backfill",
+        ),
         admin_route(Method::GET, "/export-bucket-metadata"),
         admin_route(Method::GET, "/v3/export-bucket-metadata"),
         admin_route(Method::PUT, "/import-bucket-metadata"),
@@ -1286,6 +1296,8 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/on-demand-migration/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/on-demand-migration/test-bucket/backfill"));
+    assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket/backfill"));
 
     assert_route(&router, Method::GET, &admin_path("/export-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));
@@ -1419,6 +1431,8 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, compat_admin_alias_path("/v3/on-demand-migration/b")),
         (Method::DELETE, compat_admin_alias_path("/v3/on-demand-migration/b")),
         (Method::GET, compat_admin_alias_path("/v3/on-demand-migration/b/status")),
+        (Method::POST, compat_admin_alias_path("/v3/on-demand-migration/b/backfill")),
+        (Method::GET, compat_admin_alias_path("/v3/on-demand-migration/b/backfill")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),

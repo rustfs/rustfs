@@ -278,6 +278,10 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod background {
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::OnDemandMigrationSys;
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::backfill::{
+            BackfillRunner, SysBackfillContexts, install_global_backfill_runner, spawn_backfill_recovery_loop,
+        };
         pub(crate) use crate::storage::storage_api::{
             BitrotSelfTestError, ECStore, bitrot_self_test, set_workload_admission_snapshot_provider,
         };

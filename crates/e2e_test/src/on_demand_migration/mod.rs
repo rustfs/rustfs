@@ -17,13 +17,15 @@
 //! `common` is the shared environment: one RustFS under test, one programmable
 //! fake S3 source, admin-API wrappers, seeding and local-state assertions.
 //! `harness_self_test` proves the harness itself; `get_basic_test` covers the
-//! GET read-through (rustfs/backlog#2156). The fault, concurrency,
+//! GET read-through (rustfs/backlog#2156) and `backfill_test` the background
+//! backfill job (ODM-12, rustfs/backlog#2159). The fault, concurrency,
 //! interaction and real-source matrix is rustfs/backlog#2158; its lane split
 //! lives in `.config/nextest.toml` (fault / concurrency / real source run
 //! nightly, the rest in the merge lane).
 
 pub mod common;
 
+mod backfill_test;
 mod concurrency_test;
 mod fault_test;
 mod get_basic_test;

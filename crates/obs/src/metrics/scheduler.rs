@@ -33,6 +33,7 @@ use crate::metrics::collectors::{
     NotificationStats,
     NotificationTargetRuntimeStats,
     NotificationTargetStats,
+    OdmBackfillRuntimeStats,
     OnDemandMigrationBucketStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
     ProcessAttributeError,
@@ -65,6 +66,7 @@ use crate::metrics::collectors::{
     collect_node_metrics,
     collect_notification_runtime_metrics,
     collect_notification_target_runtime_metrics,
+    collect_on_demand_migration_backfill_metrics,
     collect_on_demand_migration_metrics,
     collect_process_attributes,
     collect_process_cpu_metrics,
@@ -121,12 +123,15 @@ use crate::metrics::schema::notification_target::{
     TARGET_ID as NOTIFICATION_TARGET_ID_LABEL, TARGET_TYPE as NOTIFICATION_TARGET_TYPE_LABEL,
 };
 use crate::metrics::schema::on_demand_migration::{
-    BUCKET_L as ODM_BUCKET_L, LE_L as ODM_LE_L, ODM_BREAKER_STATE_MD, ODM_INFLIGHT_PULLS_MD, ODM_PULL_FAILURES_TOTAL_MD,
+    BACKFILL_STATES as ODM_BACKFILL_STATES, BUCKET_L as ODM_BUCKET_L, LE_L as ODM_LE_L, ODM_BACKFILL_BYTES_MD,
+    ODM_BACKFILL_ENQUEUED_MD, ODM_BACKFILL_FAILED_MD, ODM_BACKFILL_JOBS_MD, ODM_BACKFILL_LISTED_MD, ODM_BACKFILL_PULLED_MD,
+    ODM_BACKFILL_SKIPPED_EXISTING_MD, ODM_BREAKER_STATE_MD, ODM_INFLIGHT_PULLS_MD, ODM_PULL_FAILURES_TOTAL_MD,
     ODM_PULLED_BYTES_TOTAL_MD, ODM_PULLED_OBJECTS_TOTAL_MD, ODM_QUEUE_DEPTH_MD, ODM_REQUESTS_TOTAL_MD,
     ODM_SOURCE_LATENCY_SECONDS_COUNT_MD, ODM_SOURCE_LATENCY_SECONDS_DISTRIBUTION_MD, ODM_SOURCE_LATENCY_SECONDS_SUM_MD,
     OP_L as ODM_OP_L, OUTCOME_L as ODM_OUTCOME_L, PATH_L as ODM_PATH_L, PULL_FAILURE_REASONS as ODM_PULL_FAILURE_REASONS,
     PULL_PATHS as ODM_PULL_PATHS, REASON_L as ODM_REASON_L, REQUEST_OPS as ODM_REQUEST_OPS,
-    REQUEST_OUTCOMES as ODM_REQUEST_OUTCOMES, SOURCE_LATENCY_LE as ODM_SOURCE_LATENCY_LE,
+    REQUEST_OUTCOMES as ODM_REQUEST_OUTCOMES, SERVER_L as ODM_SERVER_L, SOURCE_LATENCY_LE as ODM_SOURCE_LATENCY_LE,
+    STATE_L as ODM_STATE_L,
 };
 use crate::metrics::schema::scanner::{
     BUCKET_LABEL as SCANNER_BUCKET_LABEL, CYCLE_SCOPE_LABEL as SCANNER_CYCLE_SCOPE_LABEL, DRIVE_LABEL as SCANNER_DRIVE_LABEL,
@@ -144,9 +149,9 @@ use crate::metrics::stats_collector::{
     collect_bucket_replication_stats_bundle, collect_bucket_stats, collect_cluster_and_health_stats,
     collect_cluster_config_stats, collect_cluster_usage_metric_stats, collect_compression_cluster_stats,
     collect_disk_and_system_drive_runtime_stats, collect_erasure_set_stats, collect_host_network_stats, collect_iam_stats,
-    collect_ilm_runtime_metric_stats, collect_internode_network_stats, collect_on_demand_migration_stats,
-    collect_process_metric_bundle_with, collect_replication_stats, collect_scanner_runtime_metric_stats,
-    collect_system_cpu_and_memory_stats_with,
+    collect_ilm_runtime_metric_stats, collect_internode_network_stats, collect_on_demand_migration_backfill_stats,
+    collect_on_demand_migration_stats, collect_process_metric_bundle_with, collect_replication_stats,
+    collect_scanner_runtime_metric_stats, collect_system_cpu_and_memory_stats_with,
 };
 use crate::node_identity::{SERVER_LABEL, current_local_node_identity};
 use crate::telemetry::retire_metric_series;
@@ -914,6 +919,10 @@ fn on_demand_migration_bucket_live_keys(stats: &[OnDemandMigrationBucketStats]) 
     stats.iter().map(|stat| stat.bucket.clone()).collect()
 }
 
+fn on_demand_migration_backfill_bucket_live_keys(stats: &OdmBackfillRuntimeStats) -> HashSet<BucketKey> {
+    stats.buckets.iter().map(|stat| stat.bucket.clone()).collect()
+}
+
 fn update_series_zero_tombstones<T: Clone + Eq + std::hash::Hash>(
     has_seen_valid_snapshot: &mut bool,
     prev_live_keys: &mut HashSet<T>,
@@ -1646,6 +1655,42 @@ fn retire_on_demand_migration_metric_series(bucket: &str) -> usize {
         .sum()
 }
 
+/// Every on-demand migration backfill series one node's job can own. The
+/// `state` gauge is enumerated over the checkpoint's fixed lifecycle values
+/// because only one of them is emitted per cycle.
+fn on_demand_migration_backfill_metric_series(server: &str, bucket: &str) -> Vec<MetricSeriesKey> {
+    let job_labels = || {
+        vec![
+            (ODM_SERVER_L, Cow::Owned(server.to_string())),
+            (ODM_BUCKET_L, Cow::Owned(bucket.to_string())),
+        ]
+    };
+    let mut series = Vec::new();
+    for state in ODM_BACKFILL_STATES {
+        let mut labels = job_labels();
+        labels.push((ODM_STATE_L, Cow::Borrowed(state)));
+        series.push((ODM_BACKFILL_JOBS_MD.get_full_metric_name(), labels));
+    }
+    for descriptor in [
+        &*ODM_BACKFILL_LISTED_MD,
+        &*ODM_BACKFILL_ENQUEUED_MD,
+        &*ODM_BACKFILL_PULLED_MD,
+        &*ODM_BACKFILL_SKIPPED_EXISTING_MD,
+        &*ODM_BACKFILL_FAILED_MD,
+        &*ODM_BACKFILL_BYTES_MD,
+    ] {
+        series.push((descriptor.get_full_metric_name(), job_labels()));
+    }
+    series
+}
+
+fn retire_on_demand_migration_backfill_metric_series(server: &str, bucket: &str) -> usize {
+    on_demand_migration_backfill_metric_series(server, bucket)
+        .iter()
+        .map(|(name, labels)| retire_metric_series(name, labels))
+        .sum()
+}
+
 fn retire_repl_backlog_target_metric_series(bucket: &str, target_arn: &str) -> usize {
     let labels = [
         (BUCKET_L, Cow::Owned(bucket.to_string())),
@@ -2037,6 +2082,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut has_seen_proxy_bucket_snapshot = false;
         let mut prev_on_demand_migration_live_keys: HashSet<BucketKey> = HashSet::new();
         let mut has_seen_on_demand_migration_snapshot = false;
+        let mut prev_on_demand_migration_backfill_live_keys: HashSet<BucketKey> = HashSet::new();
+        let mut has_seen_on_demand_migration_backfill_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -2125,6 +2172,24 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             prev_on_demand_migration_live_keys = current_on_demand_migration_live_keys;
                             has_seen_on_demand_migration_snapshot = true;
                             metrics.extend(collect_on_demand_migration_metrics(&on_demand_migration));
+                            // Backfill jobs come and go independently of the bucket's config,
+                            // so their series are retired on their own key set.
+                            let on_demand_migration_backfill = collect_on_demand_migration_backfill_stats();
+                            let current_on_demand_migration_backfill_live_keys =
+                                on_demand_migration_backfill_bucket_live_keys(&on_demand_migration_backfill);
+                            let retire_on_demand_migration_backfill_buckets = if has_seen_on_demand_migration_backfill_snapshot
+                            {
+                                prev_on_demand_migration_backfill_live_keys
+                                    .difference(&current_on_demand_migration_backfill_live_keys)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                Vec::new()
+                            };
+                            prev_on_demand_migration_backfill_live_keys = current_on_demand_migration_backfill_live_keys;
+                            has_seen_on_demand_migration_backfill_snapshot = true;
+                            let on_demand_migration_backfill_server = on_demand_migration_backfill.server.clone();
+                            metrics.extend(collect_on_demand_migration_backfill_metrics(&on_demand_migration_backfill));
                             let replication = collect_replication_stats().await;
                             metrics.extend(collect_replication_runtime_metrics(&ReplicationRuntimeStats {
                                 server: current_local_node_identity(),
@@ -2153,6 +2218,12 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             }
                             for bucket in retire_on_demand_migration_buckets {
                                 let _ = retire_on_demand_migration_metric_series(&bucket);
+                            }
+                            for bucket in retire_on_demand_migration_backfill_buckets {
+                                let _ = retire_on_demand_migration_backfill_metric_series(
+                                    &on_demand_migration_backfill_server,
+                                    &bucket,
+                                );
                             }
                         },
                     ).await;
@@ -2978,6 +3049,66 @@ mod tests {
         // walk itself must still cover every series.
         assert_eq!(retire_on_demand_migration_metric_series("photos"), 0);
         assert_eq!(on_demand_migration_metric_series("photos").len(), emitted.len());
+    }
+
+    #[test]
+    fn on_demand_migration_backfill_bucket_keys_detect_finished_jobs() {
+        let stats = crate::metrics::collectors::on_demand_migration::tests::backfill_golden_stats("node1:9000");
+        let previous = on_demand_migration_backfill_bucket_live_keys(&stats);
+        let current = on_demand_migration_backfill_bucket_live_keys(&OdmBackfillRuntimeStats {
+            server: stats.server.clone(),
+            buckets: stats.buckets[..1].to_vec(),
+        });
+        let retired = previous.difference(&current).cloned().collect::<HashSet<_>>();
+
+        assert_eq!(retired, bucket_keys(&["docs"]));
+        assert_eq!(current, bucket_keys(&["photos"]));
+        assert!(on_demand_migration_backfill_bucket_live_keys(&OdmBackfillRuntimeStats::default()).is_empty());
+    }
+
+    /// Every emitted backfill series must be named by the retirement walk.
+    /// The walk is wider than one cycle's emission on purpose: only the
+    /// job's current `state` gauge is emitted, so retirement enumerates all
+    /// lifecycle values to clear whichever one is live.
+    #[test]
+    fn on_demand_migration_backfill_retirement_covers_every_emitted_series() {
+        let stats = crate::metrics::collectors::on_demand_migration::tests::backfill_golden_stats("node1:9000");
+        let emitted = collect_on_demand_migration_backfill_metrics(&stats)
+            .into_iter()
+            .map(|metric| {
+                (
+                    metric.name.to_string(),
+                    metric
+                        .labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+        let retired = stats
+            .buckets
+            .iter()
+            .flat_map(|bucket| on_demand_migration_backfill_metric_series(&stats.server, &bucket.bucket))
+            .map(|(name, labels)| {
+                (
+                    name,
+                    labels
+                        .into_iter()
+                        .map(|(key, value)| (key, value.to_string()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<HashSet<_>>();
+
+        assert!(emitted.is_subset(&retired), "emitted: {emitted:?}, retired: {retired:?}");
+        assert_eq!(
+            on_demand_migration_backfill_metric_series("node1:9000", "photos").len(),
+            ODM_BACKFILL_STATES.len() + 6
+        );
+        // Without a process-global recorder there is nothing to retire; the
+        // walk itself must still cover every series.
+        assert_eq!(retire_on_demand_migration_backfill_metric_series("node1:9000", "photos"), 0);
     }
 
     #[test]
