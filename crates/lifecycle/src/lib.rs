@@ -21,4 +21,4 @@ mod tagging;
 pub use core::*;
 pub use evaluator::Evaluator;
 pub use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
-pub use rustfs_scanner_contracts::metrics::IlmAction;
+pub use rustfs_scanner_metrics::metrics::IlmAction;

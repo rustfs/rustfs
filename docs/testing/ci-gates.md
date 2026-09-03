@@ -57,6 +57,14 @@ Promotion rule: never promote a report-only lane to required from one green run.
 
 e2e filters live in `.config/nextest.toml`; extend a profile instead of adding a second selector. Before a profile runs, `scripts/check_test_wiring.py` compares its listing to the committed digest in `.config/e2e-<profile>-selection.txt`, so a silent test drop fails closed.
 
+Scanner usage and heal rebuild coverage are intentionally split by risk and
+cost. `data_usage_test` runs in the PR `e2e-smoke` lane so changes that affect
+authoritative scanner usage publication, quota-visible usage, or admin usage
+snapshots get an end-to-end signal before merge review. `heal_erasure_disk_rebuild_test`
+runs in `e2e-full` so core erasure heal rebuild regressions are caught no later
+than the merge queue or `main` push lane; it also remains in `e2e-nightly` with
+the serialized cluster fault-domain suites for scheduled soak signal.
+
 ## Scheduled validation
 
 Scheduled lanes never block a PR. Their workflow-local gate fails the run, scheduled failures route to the shared failure-issue action, and `scheduled-validation-freshness.yml` fails when a workflow listed in `.github/scheduled-validations.json` has not run within its `max_age_hours` (a `never_ran_grace_until` entry covers the window before a newly enabled cron's first slot). Cadence is qualitative here; the cron lives in each workflow's `on.schedule`.
