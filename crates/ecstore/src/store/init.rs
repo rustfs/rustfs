@@ -6739,6 +6739,21 @@ mod tests {
             .await
             .expect("seed ordinary target version");
         let target_version = target.version_id.expect("target version must have an ID");
+        // A regular PUT may acknowledge write quorum while its rename tail still owns the
+        // target namespace lock. Drain that tail through a locked read before bypassing
+        // the namespace API with the per-disk crash-replay fixture writes below.
+        store.pools[1]
+            .get_object_info(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(target_version.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("target PUT tail should drain before per-disk fixture mutation");
         let target_disks = store.pools[1].get_disks_by_key(object).disks.read().await.clone();
         for disk in target_disks.iter().skip(1) {
             disk.as_ref()
@@ -6779,6 +6794,31 @@ mod tests {
         tokio::fs::write(&conflict_path, metadata.marshal_msg().expect("conflict metadata should encode"))
             .await
             .expect("write sub-quorum conflict metadata");
+
+        let mut expected_target_metadata = Vec::with_capacity(4);
+        for disk_index in 0..4 {
+            let target_path = temp_dir
+                .path()
+                .join(format!("pool1/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
+            let target_encoded = tokio::fs::read(&target_path)
+                .await
+                .expect("target fixture metadata should be readable before decommission");
+            let target_meta = FileMeta::load(&target_encoded).expect("target fixture metadata should decode");
+            let same_id = target_meta
+                .versions
+                .iter()
+                .filter(|version| version.header.version_id == Some(free_version))
+                .collect::<Vec<_>>();
+            if disk_index == 0 {
+                assert_eq!(same_id.len(), 2, "conflict fixture should contain both same-ID records");
+                assert!(same_id[0].header.free_version());
+                assert!(!same_id[1].header.free_version());
+            } else {
+                assert_eq!(same_id.len(), 1, "target fixture disk {disk_index} should contain one free version");
+                assert!(same_id[0].header.free_version());
+            }
+            expected_target_metadata.push(target_encoded);
+        }
 
         mark_test_pool_decommissioning(&store, 0).await;
         let source_set = store.pools[0].get_disks_by_key(object);
@@ -6832,13 +6872,17 @@ mod tests {
         assert_eq!(post_conflict_info.metadata, expected_conflict.metadata);
         assert_eq!(post_conflict_info.get_etag(), expected_conflict.get_etag());
 
-        for disk_index in 0..4 {
+        for (disk_index, expected_target_encoded) in expected_target_metadata.iter().enumerate() {
             let target_path = temp_dir
                 .path()
                 .join(format!("pool1/set0/disk{disk_index}/{bucket}/{object}/{STORAGE_FORMAT_FILE}"));
             let target_encoded = tokio::fs::read(&target_path)
                 .await
                 .expect("target metadata should remain readable");
+            assert_eq!(
+                &target_encoded, expected_target_encoded,
+                "conflicted decommission must not mutate target disk {disk_index}"
+            );
             let target_meta = FileMeta::load(&target_encoded).expect("target metadata should decode");
             let same_id = target_meta
                 .versions
