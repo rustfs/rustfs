@@ -1161,6 +1161,16 @@ pub async fn get_replication_config(bucket: &str) -> Result<(ReplicationConfigur
     bucket_meta_sys.get_replication_config(bucket).await
 }
 
+pub(crate) async fn get_replication_config_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+) -> Result<(ReplicationConfiguration, OffsetDateTime)> {
+    let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
+    let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+    bucket_meta_sys.get_replication_config(bucket).await
+}
+
 pub async fn get_notification_config(bucket: &str) -> Result<Option<NotificationConfiguration>> {
     let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await;

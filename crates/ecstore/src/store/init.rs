@@ -5210,15 +5210,25 @@ mod tests {
                     let fault_bucket = other_bucket.clone();
                     let _fault_guard = crate::core::pools::DecommissionTestFaultGuard::install(Arc::new(
                         move |stage, bucket, object, attempt, succeeded| {
-                            let injected = succeeded
+                            let candidate = succeeded
                                 && stage == DECOMMISSION_TEST_FAULT_STAGE_MIGRATE_OBJECT
                                 && bucket == fault_bucket.as_str()
-                                && object == other_object
-                                && attempt < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS;
-                            if injected {
-                                ordinary_faults_for_hook.fetch_add(1, Ordering::SeqCst);
+                                && object == other_object;
+                            if !candidate {
+                                return false;
                             }
-                            injected
+
+                            // Keep the fault budget global across any
+                            // entry-level re-list; its inner attempt counter
+                            // restarts after SourceChanged.
+                            ordinary_faults_for_hook
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
+                                    let next_fault = faults.saturating_add(1);
+                                    (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1)
+                                        && attempt == next_fault)
+                                        .then_some(next_fault)
+                                })
+                                .is_ok()
                         },
                     ));
 
