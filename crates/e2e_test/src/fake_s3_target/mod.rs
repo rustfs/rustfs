@@ -266,6 +266,12 @@ pub enum FaultAction {
     /// body bytes, then abort the connection so the client observes a short
     /// read. Ignored by every other operation.
     TruncateBodyAt(usize),
+    /// GetObject only: deliver the response body in `chunk_bytes` slices,
+    /// sleeping `delay` between them. The head and the first slice leave
+    /// immediately, so this is a mid-body stall rather than a first-byte one;
+    /// a `delay` above the reader's idle budget is what a source that stops
+    /// pushing bytes looks like. Ignored by every other operation.
+    SlowSendBody { chunk_bytes: usize, delay: Duration },
     /// Apply the request normally, then hold the complete response (status
     /// line included) for the duration before the first byte is written —
     /// the first-byte-timeout scenario. Error responses are not held.
@@ -994,6 +1000,9 @@ fn validate_fault_action(action: &FaultAction) {
     if let FaultAction::SlowDrain { chunk_bytes: 0, .. } = action {
         panic!("slow-drain chunk size must be non-zero");
     }
+    if let FaultAction::SlowSendBody { chunk_bytes: 0, .. } = action {
+        panic!("slow-send chunk size must be non-zero");
+    }
     match action {
         FaultAction::Delay(duration) if *duration > MAX_FAULT_DURATION => {
             panic!("fault delay must not exceed 30 seconds");
@@ -1003,6 +1012,9 @@ fn validate_fault_action(action: &FaultAction) {
         }
         FaultAction::SlowDrain { delay, .. } if *delay >= MAX_FAULT_DURATION => {
             panic!("slow-drain slice delay must be below 30 seconds");
+        }
+        FaultAction::SlowSendBody { delay, .. } if *delay >= MAX_FAULT_DURATION => {
+            panic!("slow-send slice delay must be below 30 seconds");
         }
         FaultAction::ResponseStatus(code) if !(400..=599).contains(code) => {
             panic!("scripted response status must be a 4xx or 5xx code");
@@ -1409,6 +1421,7 @@ async fn apply_non_body_fault(fault: Option<&RequestFault>, control: &Mutex<Cont
         | Some(FaultAction::WrongEtag)
         | Some(FaultAction::DisconnectAfterResponse)
         | Some(FaultAction::TruncateBodyAt(_))
+        | Some(FaultAction::SlowSendBody { .. })
         | Some(FaultAction::Stall(_))
         | None => Ok(()),
     }
@@ -1457,6 +1470,7 @@ async fn collect_stream(
             Some(FaultAction::WrongEtag)
             | Some(FaultAction::DisconnectAfterResponse)
             | Some(FaultAction::TruncateBodyAt(_))
+            | Some(FaultAction::SlowSendBody { .. })
             | Some(FaultAction::Stall(_))
             | None => {}
         }
@@ -1521,6 +1535,22 @@ fn truncated_body(body: Bytes, truncate_at: usize) -> StreamingBlob {
             }
             Step::Done => None,
         }
+    }))
+}
+
+/// GetObject body delivered in `chunk_bytes` slices with `delay` between
+/// them. The head and the first slice are written immediately, so the client
+/// starts reading and then observes the source going quiet mid-body.
+fn slow_sent_body(body: Bytes, chunk_bytes: usize, delay: Duration) -> StreamingBlob {
+    StreamingBlob::wrap(futures::stream::unfold((body, true), move |(mut rest, first)| async move {
+        if rest.is_empty() {
+            return None;
+        }
+        if !first {
+            sleep(delay).await;
+        }
+        let chunk = rest.split_to(chunk_bytes.min(rest.len()));
+        Some((Ok::<Bytes, io::Error>(chunk), (rest, false)))
     }))
 }
 
@@ -2225,6 +2255,7 @@ impl S3 for FakeBackend {
         let body = version.body.slice(served.range.clone());
         let body = match fault.as_ref().map(|fault| &fault.action) {
             Some(FaultAction::TruncateBodyAt(truncate_at)) => truncated_body(body, *truncate_at),
+            Some(FaultAction::SlowSendBody { chunk_bytes, delay }) => slow_sent_body(body, *chunk_bytes, *delay),
             _ => StreamingBlob::from(body),
         };
         let mut response = S3Response::new(GetObjectOutput {

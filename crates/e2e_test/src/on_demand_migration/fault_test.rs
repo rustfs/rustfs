@@ -14,8 +14,8 @@
 
 //! Source-failure scenarios for on-demand migration (rustfs/backlog#2158):
 //! access denied, the circuit breaker, first-byte and mid-body stream
-//! failures, ETag integrity, the negative cache, and an unsupported
-//! (SSE-C) source object.
+//! failures (a cut body and a stalled one), ETag integrity, the negative
+//! cache, and an unsupported (SSE-C) source object.
 //!
 //! Every case asserts what the source was asked for, not only what the
 //! client received: a fault that silently turned into a second source
@@ -162,10 +162,10 @@ async fn test_odm_source_access_denied_propagates_without_opening_the_breaker() 
 /// window closes it again. The open window is a compiled-in 30 s constant
 /// (`BREAKER_OPEN_DURATION`), so this case waits in real time.
 ///
-/// One ODM source call is several wire requests: the SDK retries a 503 on
-/// its own, and only the exhausted call counts as one breaker failure. The
-/// script is therefore deep enough to cover every retry, and the open state
-/// is waited for instead of being predicted from a request count.
+/// The source client disables SDK retries, so one logical source call is
+/// exactly one wire request: the script is exactly as deep as the number of
+/// breaker failures it has to produce, and the scripted fault count and the
+/// observed source request count must agree.
 #[tokio::test]
 async fn test_odm_repeated_source_errors_open_the_breaker_and_recover() -> TestResult {
     let bucket = "odm-fault-breaker";
@@ -175,9 +175,8 @@ async fn test_odm_repeated_source_errors_open_the_breaker_and_recover() -> TestR
     env.seed_source(SOURCE_BUCKET, &[SeedObject::new(key, body.clone())]);
 
     env.source
-        .inject_for_key(Operation::HeadObject, key, FaultAction::ResponseStatus(503), 200);
-    let mut opened = false;
-    for attempt in 1..=BREAKER_FAILURE_THRESHOLD * 2 {
+        .inject_for_key(Operation::HeadObject, key, FaultAction::ResponseStatus(503), BREAKER_FAILURE_THRESHOLD);
+    for attempt in 1..=BREAKER_FAILURE_THRESHOLD {
         let response = env.raw_get(bucket, key).await?;
         assert_eq!(
             response.status,
@@ -185,21 +184,19 @@ async fn test_odm_repeated_source_errors_open_the_breaker_and_recover() -> TestR
             "attempt {attempt}: {}",
             String::from_utf8_lossy(&response.body)
         );
-        if env
-            .status_json(bucket)
+    }
+    assert_eq!(
+        env.status_json(bucket)
             .await?
             .pointer("/breaker/state")
-            .and_then(|v| v.as_str())
-            == Some("open")
-        {
-            opened = true;
-            break;
-        }
-    }
-    assert!(opened, "consecutive source failures must open the breaker");
-    assert!(
-        env.source.count_requests(Operation::HeadObject, key) >= BREAKER_FAILURE_THRESHOLD,
-        "each counted failure is at least one source request"
+            .and_then(|v| v.as_str()),
+        Some("open"),
+        "the threshold of consecutive source failures must open the breaker"
+    );
+    assert_eq!(
+        env.source.count_requests(Operation::HeadObject, key),
+        BREAKER_FAILURE_THRESHOLD,
+        "every counted failure is exactly one source request"
     );
 
     // With the script cleared, the only thing that can still fail a read is
@@ -251,8 +248,8 @@ async fn test_odm_repeated_source_errors_open_the_breaker_and_recover() -> TestR
 }
 
 /// Case 3: a source that holds the response past `first_byte_ms` is a
-/// timeout, and the client never sees a 200 head. Every attempt the SDK
-/// makes on its own is stalled too, so the ODM call really does give up.
+/// timeout, and the client never sees a 200 head. One logical source call is
+/// one wire request, so a single scripted stall is enough to fail the read.
 #[tokio::test]
 async fn test_odm_source_stall_times_out_before_the_first_byte() -> TestResult {
     let bucket = "odm-fault-stall";
@@ -264,20 +261,19 @@ async fn test_odm_source_stall_times_out_before_the_first_byte() -> TestResult {
     env.seed_source(SOURCE_BUCKET, &[SeedObject::new(key, payload(4096))]);
 
     env.source
-        .inject_for_key(Operation::HeadObject, key, FaultAction::Stall(Duration::from_secs(5)), 8);
+        .inject_for_key(Operation::HeadObject, key, FaultAction::Stall(Duration::from_secs(5)), 1);
     let started = Instant::now();
     let response = env.raw_get(bucket, key).await?;
     let elapsed = started.elapsed();
     assert_eq!(response.status, SOURCE_UNAVAILABLE_STATUS, "{}", String::from_utf8_lossy(&response.body));
-    assert!(
-        elapsed < Duration::from_secs(30),
-        "the read timeout must cut every attempt short, took {elapsed:?}"
+    assert_eq!(
+        env.source.count_requests(Operation::HeadObject, key),
+        1,
+        "the stalled HEAD is the only source request"
     );
-    let attempts = env.source.count_requests(Operation::HeadObject, key);
-    assert!(attempts >= 1, "the stalled HEAD is the only source request");
     assert!(
-        elapsed < Duration::from_secs(5) * u32::try_from(attempts).unwrap_or(1),
-        "no attempt waited the stall out ({attempts} attempts in {elapsed:?})"
+        elapsed < Duration::from_secs(5),
+        "the read timeout must cut the attempt short, took {elapsed:?}"
     );
     assert_eq!(
         env.source.count_requests(Operation::GetObject, key),
@@ -336,7 +332,78 @@ async fn test_odm_inline_pull_aborts_when_the_source_body_is_cut() -> TestResult
     Ok(())
 }
 
-/// Case 5: the background pull of a large object hits a cut body, counts the
+/// Case 5: the source answers, sends part of the body and then goes quiet
+/// for longer than `source_timeout.idle_ms`. The inline tee must end both
+/// ends: the client gets a short read rather than a silently truncated 200,
+/// the pull is counted as a source timeout, and nothing (object or multipart
+/// upload) is left behind locally.
+#[tokio::test]
+async fn test_odm_inline_pull_aborts_when_the_source_body_stalls() -> TestResult {
+    let bucket = "odm-fault-inline-stall";
+    const IDLE_MS: u64 = 1_000;
+    let idle = Duration::from_millis(IDLE_MS);
+    let env = start_configured_env(bucket, SOURCE_BUCKET, |spec| {
+        spec.policy.source_timeout.idle_ms = IDLE_MS;
+    })
+    .await?;
+    let key = "stall/inline.bin";
+    let body = payload(256 * 1024);
+    env.seed_source(SOURCE_BUCKET, &[SeedObject::new(key, body.clone())]);
+
+    // The head and the first slice arrive at once; the source then pauses for
+    // four times the idle budget, which is what a stalled source looks like.
+    env.source.inject_for_key(
+        Operation::GetObject,
+        key,
+        FaultAction::SlowSendBody {
+            chunk_bytes: 32 * 1024,
+            delay: idle * 4,
+        },
+        1,
+    );
+    let started = Instant::now();
+    env.raw_get(bucket, key)
+        .await
+        .expect_err("a stalled source body must not read back as a complete object");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < idle * 4,
+        "the idle budget, not the source's own pause, must end the read (took {elapsed:?})"
+    );
+
+    assert_eq!(env.source.count_requests(Operation::HeadObject, key), 1);
+    assert_eq!(
+        env.source.count_requests(Operation::GetObject, key),
+        1,
+        "an aborted inline pull is not retried on the same request"
+    );
+    env.wait_for_status_counter(bucket, "/counters/pull_failures_total/source_timeout", 1, SETTLE)
+        .await?;
+    // The leader releases its slot just after it records the failure.
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        let inflight = env
+            .status_json(bucket)
+            .await?
+            .pointer("/inflight_pulls")
+            .and_then(|value| value.as_u64());
+        if inflight == Some(0) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the aborted pull never released its slot: {inflight:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    env.assert_local_absent(bucket, key).await;
+    let uploads = env.client.list_multipart_uploads().bucket(bucket).send().await?;
+    assert!(
+        uploads.uploads().is_empty(),
+        "a stalled pull leaves no multipart upload: {:?}",
+        uploads.uploads()
+    );
+    Ok(())
+}
+
+/// Case 6: the background pull of a large object hits a cut body, counts the
 /// failure, and the retry stores the object.
 #[tokio::test]
 async fn test_odm_background_pull_retries_a_truncated_source_body() -> TestResult {
@@ -387,7 +454,7 @@ async fn test_odm_background_pull_retries_a_truncated_source_body() -> TestResul
     Ok(())
 }
 
-/// Case 6: the source advertises an ETag its bytes do not match. The client
+/// Case 7: the source advertises an ETag its bytes do not match. The client
 /// still gets every byte; the write-back is discarded as an integrity
 /// failure and nothing is stored.
 #[tokio::test]
@@ -415,7 +482,7 @@ async fn test_odm_wrong_source_etag_discards_the_write_back() -> TestResult {
     Ok(())
 }
 
-/// Case 7: a source miss is remembered for `negative_cache_ttl_secs`, and
+/// Case 8: a source miss is remembered for `negative_cache_ttl_secs`, and
 /// re-checked once the entry expires.
 #[tokio::test]
 async fn test_odm_source_not_found_is_negative_cached_for_the_ttl() -> TestResult {
@@ -455,7 +522,7 @@ async fn test_odm_source_not_found_is_negative_cached_for_the_ttl() -> TestResul
     Ok(())
 }
 
-/// Case 8: an SSE-C source object cannot be migrated (the key belongs to the
+/// Case 9: an SSE-C source object cannot be migrated (the key belongs to the
 /// source's client), so the read fails as unsupported without a body read.
 #[tokio::test]
 async fn test_odm_ssec_source_object_is_unsupported() -> TestResult {
