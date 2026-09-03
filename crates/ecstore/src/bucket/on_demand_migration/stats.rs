@@ -123,6 +123,8 @@ pub enum PullFailureReason {
     EtagMismatch,
     /// The local write (internal PUT) failed.
     LocalWrite,
+    /// The bucket quota rejected the write-back.
+    Quota,
     /// The bucket state was removed or the process is shutting down.
     Canceled,
     /// The background pull queue was full.
@@ -130,7 +132,7 @@ pub enum PullFailureReason {
 }
 
 impl PullFailureReason {
-    pub const ALL: [PullFailureReason; 12] = [
+    pub const ALL: [PullFailureReason; 13] = [
         PullFailureReason::SourceNotFound,
         PullFailureReason::SourceAccessDenied,
         PullFailureReason::SourceThrottled,
@@ -141,6 +143,7 @@ impl PullFailureReason {
         PullFailureReason::SourceOther,
         PullFailureReason::EtagMismatch,
         PullFailureReason::LocalWrite,
+        PullFailureReason::Quota,
         PullFailureReason::Canceled,
         PullFailureReason::QueueFull,
     ];
@@ -157,6 +160,7 @@ impl PullFailureReason {
             PullFailureReason::SourceOther => "source_other",
             PullFailureReason::EtagMismatch => "etag_mismatch",
             PullFailureReason::LocalWrite => "local_write",
+            PullFailureReason::Quota => "quota",
             PullFailureReason::Canceled => "canceled",
             PullFailureReason::QueueFull => "queue_full",
         }
@@ -457,7 +461,7 @@ mod tests {
             "pulled_bytes_total": 4096,
             "pulled_objects_total": { "backfill": 0, "background": 0, "inline": 1 },
             "pull_failures_total": {
-                "canceled": 0, "etag_mismatch": 0, "local_write": 0, "queue_full": 0,
+                "canceled": 0, "etag_mismatch": 0, "local_write": 0, "queue_full": 0, "quota": 0,
                 "source_access_denied": 0, "source_connect": 0, "source_not_found": 0, "source_other": 0,
                 "source_server_error": 0, "source_throttled": 0, "source_timeout": 1, "source_unsupported": 0
             },

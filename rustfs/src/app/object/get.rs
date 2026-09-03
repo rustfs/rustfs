@@ -17,7 +17,7 @@
 use super::*;
 use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
     BucketOdmState, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, PullError, PullLeader, PullOutcome, PullReason, PullSlot,
-    RangeGetPolicy, SourceClient, SourceError, SourceGet, SourceHead, commit_inline,
+    RangeGetPolicy, SourceBody, SourceClient, SourceError, SourceGet, SourceHead, commit_inline, idle_guarded_body,
 };
 use crate::app::storage_api::object_usecase::on_demand_migration::WriteBackBody;
 use rustfs_rio::{TeeOptions, TeePrimary, tee_reader_with_options};
@@ -4703,7 +4703,17 @@ async fn odm_get_inline<S: OdmGetSource>(
         drain_on_primary_drop: true,
         max_drain_bytes: usize::try_from(policy.inline_max_bytes).unwrap_or(usize::MAX),
     };
-    let (primary, secondary) = tee_reader_with_options(Box::pin(body.into_async_read()), ODM_INLINE_TEE_BUFFER_BYTES, options);
+    // The inline path has no background pump, so `source_timeout.idle_ms` is
+    // applied to the teed body here; without it a stalled source would hold
+    // both the client stream and the write-back open until the SDK read
+    // timeout fires.
+    let source_body: SourceBody = Box::pin(tokio_util::io::ReaderStream::with_capacity(
+        body.into_async_read(),
+        ODM_SOURCE_BODY_CHUNK_BYTES,
+    ));
+    let guarded = idle_guarded_body(source_body, Duration::from_millis(policy.source_timeout.idle_ms));
+    let (primary, secondary) =
+        tee_reader_with_options(Box::pin(tokio_util::io::StreamReader::new(guarded)), ODM_INLINE_TEE_BUFFER_BYTES, options);
     let output = Box::new(odm_get_output(&head, content_length, content_range, odm_inline_client_body(primary)));
     let commit_state = Arc::clone(state);
     let commit_key = key.to_string();

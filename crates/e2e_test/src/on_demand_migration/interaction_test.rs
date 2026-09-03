@@ -238,9 +238,7 @@ async fn test_odm_write_back_respects_the_bucket_quota() -> TestResult {
     assert_eq!(response.header(ODM_RESPONSE_HEADER), Some("source"));
     assert_eq!(response.body, body, "a full bucket still serves the client from the source");
 
-    // ODM-05 fixed the failure-reason label set without a `quota` value, so a
-    // rejected admission is reported as a local write failure.
-    env.wait_for_status_counter(bucket, "/counters/pull_failures_total/local_write", 1, SETTLE)
+    env.wait_for_status_counter(bucket, "/counters/pull_failures_total/quota", 1, SETTLE)
         .await?;
     env.assert_local_absent(bucket, key).await;
     assert_eq!(

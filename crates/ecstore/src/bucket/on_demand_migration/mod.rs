@@ -42,7 +42,7 @@ pub use negative_cache::{NEGATIVE_CACHE_MAX_ENTRIES, NegativeCache};
 pub use pull::{
     EnqueueOutcome, LocalObject, MAX_MULTIPART_PARTS, OdmWriteBack, PULL_MAX_RETRIES, PULL_RETRY_BASE_DELAYS, PullCompletion,
     PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, WriteBackBody, WriteBackError, WriteBackOutcome,
-    WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with,
+    WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with, idle_guarded_body,
 };
 pub use stats::{
     GaugeGuard, LastSourceError, LatencyBucketSnapshot, OdmOp, OdmOutcome, OdmStats, OdmStatsSnapshot, PullFailureReason,
