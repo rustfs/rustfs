@@ -162,8 +162,9 @@ pub mod bucket {
         };
         pub use crate::bucket::on_demand_migration::{
             EnqueueOutcome, LocalObject, MAX_MULTIPART_PARTS, OdmWriteBack, PULL_MAX_RETRIES, PULL_RETRY_BASE_DELAYS,
-            PullCompletion, PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, WriteBackBody, WriteBackError,
-            WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with, idle_guarded_body,
+            PullCompletion, PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, SourceIdleGuard, WriteBackBody,
+            WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with,
+            idle_guarded_body,
         };
         pub mod backfill {
             pub use crate::bucket::on_demand_migration::backfill::{
@@ -241,7 +242,7 @@ pub mod bucket {
 
     pub mod remote_s3_client {
         pub use crate::bucket::remote_s3_client::{
-            PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, build_remote_s3_client,
+            PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_client,
             validate_remote_endpoint,
         };
     }

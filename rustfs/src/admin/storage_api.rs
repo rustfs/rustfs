@@ -315,6 +315,7 @@ pub(crate) mod remote_s3_client {
     pub(crate) type PathStyle = super::ecstore_bucket::remote_s3_client::PathStyle;
     pub(crate) type RemoteCredentials = super::ecstore_bucket::remote_s3_client::RemoteCredentials;
     pub(crate) type RemoteS3ClientError = super::ecstore_bucket::remote_s3_client::RemoteS3ClientError;
+    pub(crate) type RemoteS3RetryPolicy = super::ecstore_bucket::remote_s3_client::RemoteS3RetryPolicy;
 }
 
 pub(crate) mod metadata_sys {

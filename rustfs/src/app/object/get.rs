@@ -4706,12 +4706,13 @@ async fn odm_get_inline<S: OdmGetSource>(
     // The inline path has no background pump, so `source_timeout.idle_ms` is
     // applied to the teed body here; without it a stalled source would hold
     // both the client stream and the write-back open until the SDK read
-    // timeout fires.
+    // timeout fires. The guard wraps the source read, upstream of the tee, so
+    // a slow client throttles the tee instead of ageing the source's budget.
     let source_body: SourceBody = Box::pin(tokio_util::io::ReaderStream::with_capacity(
         body.into_async_read(),
         ODM_SOURCE_BODY_CHUNK_BYTES,
     ));
-    let guarded = idle_guarded_body(source_body, Duration::from_millis(policy.source_timeout.idle_ms));
+    let (guarded, idle) = idle_guarded_body(source_body, Duration::from_millis(policy.source_timeout.idle_ms));
     let (primary, secondary) =
         tee_reader_with_options(Box::pin(tokio_util::io::StreamReader::new(guarded)), ODM_INLINE_TEE_BUFFER_BYTES, options);
     let output = Box::new(odm_get_output(&head, content_length, content_range, odm_inline_client_body(primary)));
@@ -4719,7 +4720,7 @@ async fn odm_get_inline<S: OdmGetSource>(
     let commit_key = key.to_string();
     spawn_background_with_context(request_context, async move {
         let body: WriteBackBody = Box::pin(secondary.into_stream());
-        let result = commit_inline(&commit_state, &commit_key, head, tags, body).await;
+        let result = commit_inline(&commit_state, &commit_key, head, tags, body, &idle).await;
         leader.complete(result.map(|outcome| PullOutcome {
             etag: outcome.etag,
             size: outcome.size,
