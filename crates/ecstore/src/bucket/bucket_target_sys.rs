@@ -2505,11 +2505,15 @@ mod tests {
     }
 
     fn locked_put_options(source_etag: &str) -> PutObjectOptions {
-        let mut opts = PutObjectOptions::default();
-        opts.mode = Some(ObjectLockRetentionMode::Governance);
-        opts.retain_until_date = OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("valid timestamp");
-        opts.internal.source_etag = source_etag.to_string();
-        opts
+        PutObjectOptions {
+            mode: Some(ObjectLockRetentionMode::Governance),
+            retain_until_date: OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("valid timestamp"),
+            internal: AdvancedPutOptions {
+                source_etag: source_etag.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     /// rustfs#7082: a locked PUT of a plaintext single-part object carries a
@@ -2549,9 +2553,14 @@ mod tests {
     #[tokio::test]
     async fn legal_hold_put_object_carries_content_md5() {
         let (client, recorded) = header_recording_target_client(Vec::new());
-        let mut opts = PutObjectOptions::default();
-        opts.legalhold = Some(ObjectLockLegalHoldStatus::On);
-        opts.internal.source_etag = "8d777f385d3dfec8815d20f7496026dc".to_string();
+        let opts = PutObjectOptions {
+            legalhold: Some(ObjectLockLegalHoldStatus::On),
+            internal: AdvancedPutOptions {
+                source_etag: "8d777f385d3dfec8815d20f7496026dc".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         client
             .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
             .await
@@ -2617,8 +2626,13 @@ mod tests {
     #[tokio::test]
     async fn unlocked_put_object_adds_no_integrity_header() {
         let (client, recorded) = header_recording_target_client(Vec::new());
-        let mut opts = PutObjectOptions::default();
-        opts.internal.source_etag = "8d777f385d3dfec8815d20f7496026dc".to_string();
+        let opts = PutObjectOptions {
+            internal: AdvancedPutOptions {
+                source_etag: "8d777f385d3dfec8815d20f7496026dc".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         client
             .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
             .await
