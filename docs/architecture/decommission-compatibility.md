@@ -86,6 +86,8 @@ MinIO decommission ignores versions already expired by lifecycle rules. RustFS a
 
 ## Tier Free Versions During Decommission
 
+A durable ILM record is not an ordinary configuration object. [ilm-tiering-persistence-contracts.md](ilm-tiering-persistence-contracts.md) owns the cross-protocol state, cleanup-owner, receipt, recovery, and mixed-version invariants; this section owns only how decommission preserves those invariants while moving data between pools.
+
 A tier free version is an internal xl.meta record (`rustfs_filemeta::FREE_VERSION`, flagged `XL_FLAG_FREE_VERSION`) shaped like a delete marker. It is created by `MetaObject::init_free_version` when a version whose remote transition completed is deleted locally: the visible version is removed and the record keeps the remote-tier identity (tier, object name, version id, state, destination id) needed for an idempotent remote delete. Free versions are not user-visible versions; `num_versions` and all listing/GET paths exclude them.
 
 ### Lifecycle And Consumers
