@@ -75,6 +75,7 @@ rustfs-config = { workspace = true, features = ["server-config-model"] }
 rustfs-common = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-heal-contracts = { workspace = true }
+rustfs-lifecycle = { workspace = true }
 rustfs-scanner-metrics = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-utils = { workspace = true }

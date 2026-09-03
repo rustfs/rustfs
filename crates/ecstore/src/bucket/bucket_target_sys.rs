@@ -16,6 +16,7 @@ use crate::bucket::metadata::BucketMetadata;
 use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::remote_s3_client::{PathStyle, RemoteCredentials, RemoteS3EndpointSpec, build_remote_s3_client};
+use crate::bucket::replication::{ObjectLockIntegrity, object_lock_put_integrity};
 use crate::bucket::replication::{ReplicationStatusType, ReplicationTargetConfigBridge};
 use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
@@ -36,7 +37,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::BucketVersioningStatus;
 use aws_sdk_s3::types::Tagging as SdkTagging;
 use aws_sdk_s3::types::{
-    ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
+    ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, ObjectLockLegalHoldStatus, ObjectLockRetentionMode,
     ServerSideEncryption,
 };
 use aws_sdk_s3::{Client as S3Client, operation::head_object::HeadObjectOutput};
@@ -1380,6 +1381,25 @@ impl Default for AdvancedPutOptions {
     }
 }
 
+/// Decide how a replication PUT satisfies the Object Lock integrity rule from
+/// the headers it is about to send (the pure decision lives in the replication crate, re-exported through the replication boundary).
+fn object_lock_put_integrity_for(headers: &HeaderMap, opts: &PutObjectOptions) -> ObjectLockIntegrity {
+    let lock_params = opts.mode.is_some() || opts.retain_until_date.unix_timestamp() != 0 || opts.legalhold.is_some();
+    let has_integrity_header = headers.keys().any(|name| {
+        let name = name.as_str();
+        name.starts_with("x-amz-checksum-") || name == "x-amz-sdk-checksum-algorithm" || name == "content-md5"
+    });
+    let plaintext_end_to_end = !headers.contains_key("x-amz-server-side-encryption")
+        && !headers.contains_key("x-amz-server-side-encryption-customer-algorithm")
+        && !rustfs_utils::http::has_ssec_transport_headers(headers);
+    object_lock_put_integrity(
+        lock_params,
+        has_integrity_header,
+        plaintext_end_to_end,
+        Some(opts.internal.source_etag.as_str()),
+    )
+}
+
 /// The subset of the target's PutObject response replication audits.
 #[derive(Debug, Clone)]
 pub struct RemotePutObjectResponse {
@@ -1949,13 +1969,34 @@ impl TargetClient {
     ) -> Result<RemotePutObjectResponse, S3ClientError> {
         let mut headers = opts.header();
 
-        let builder = self.client.put_object();
+        let mut builder = self.client.put_object();
 
         let version_id = opts.internal.source_version_id.clone();
         if !version_id.is_empty() {
             insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
         }
         let api_version_id = resolve_put_api_version_id(&version_id).map(ToOwned::to_owned);
+
+        // A PUT carrying Object Lock parameters must also carry Content-MD5 or
+        // an x-amz-checksum-* header on AWS-compatible targets (rustfs#7082).
+        // The plain-payload default (rustfs#6853) sends neither, so supply one
+        // here: the source ETag when it is the MD5 of the wire bytes, else an
+        // SDK-computed checksum.
+        match object_lock_put_integrity_for(&headers, opts) {
+            ObjectLockIntegrity::NotRequired => {}
+            ObjectLockIntegrity::ContentMd5Hex(md5_hex) => {
+                let digest = hex_simd::decode_to_vec(md5_hex.as_bytes())
+                    .map_err(|err| S3ClientError::new(format!("source etag is not hex: {err}")))?;
+                let encoded = base64_simd::STANDARD.encode_to_string(digest);
+                headers.insert(
+                    http::header::HeaderName::from_static("content-md5"),
+                    HeaderValue::from_str(&encoded).map_err(|err| S3ClientError::new(format!("invalid Content-MD5: {err}")))?,
+                );
+            }
+            ObjectLockIntegrity::SdkChecksum => {
+                builder = builder.checksum_algorithm(ChecksumAlgorithm::Crc32);
+            }
+        }
 
         match builder
             .bucket(bucket)
@@ -2324,6 +2365,7 @@ mod tests {
     use rcgen::generate_simple_self_signed;
     use rustfs_config::{RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
     use rustfs_utils::egress::OutboundUrlError;
+    use rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION;
 
     // The startup panic fix for hosts without a CA bundle (issue #6734) rests
     // on two properties: the health-check client constructor never panics, and
@@ -2453,6 +2495,153 @@ mod tests {
         );
         assert_eq!(header("x-amz-decoded-content-length"), None);
         assert_eq!(header("content-length"), Some("4"));
+    }
+
+    fn recorded_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn locked_put_options(source_etag: &str) -> PutObjectOptions {
+        PutObjectOptions {
+            mode: Some(ObjectLockRetentionMode::Governance),
+            retain_until_date: OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("valid timestamp"),
+            internal: AdvancedPutOptions {
+                source_etag: source_etag.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// rustfs#7082: a locked PUT of a plaintext single-part object carries a
+    /// Content-MD5 derived from the source ETag, still as a plain payload.
+    #[tokio::test]
+    async fn locked_put_object_carries_content_md5_from_the_source_etag() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        client
+            .put_object(
+                "target-bucket",
+                "object",
+                4,
+                streaming_test_body(b"data"),
+                &locked_put_options("\"8d777f385d3dfec8815d20f7496026dc\""),
+            )
+            .await
+            .expect("recorded put_object should succeed");
+
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let headers = &recorded[0];
+        // base64 of the MD5 bytes of "data".
+        assert_eq!(recorded_header(headers, "content-md5"), Some("jXd/OF09/siBXSD3SWAm3A=="));
+        assert_eq!(recorded_header(headers, "x-amz-object-lock-mode"), Some("GOVERNANCE"));
+        assert_eq!(
+            recorded_header(headers, "x-amz-trailer"),
+            None,
+            "Content-MD5 must not change the payload framing"
+        );
+        assert!(
+            recorded_header(headers, "content-encoding").is_none_or(|v| !v.contains("aws-chunked")),
+            "locked uploads stay plain signed payloads"
+        );
+        assert_eq!(recorded_header(headers, "content-length"), Some("4"));
+    }
+
+    /// A legal hold is an Object Lock parameter too.
+    #[tokio::test]
+    async fn legal_hold_put_object_carries_content_md5() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        let opts = PutObjectOptions {
+            legalhold: Some(ObjectLockLegalHoldStatus::On),
+            internal: AdvancedPutOptions {
+                source_etag: "8d777f385d3dfec8815d20f7496026dc".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
+            .await
+            .expect("recorded put_object should succeed");
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        assert_eq!(recorded_header(&recorded[0], "content-md5"), Some("jXd/OF09/siBXSD3SWAm3A=="));
+        assert_eq!(recorded_header(&recorded[0], "x-amz-object-lock-legal-hold"), Some("ON"));
+    }
+
+    /// When the source ETag is not the MD5 of the wire bytes (multipart
+    /// layout, or an encrypted object) the SDK computes the checksum instead;
+    /// with a streaming body that is a CRC32 trailer.
+    #[tokio::test]
+    async fn locked_put_object_without_a_usable_etag_uses_an_sdk_checksum() {
+        for (label, opts) in [
+            ("multipart etag", locked_put_options("8d777f385d3dfec8815d20f7496026dc-3")),
+            ("managed sse", {
+                let mut opts = locked_put_options("8d777f385d3dfec8815d20f7496026dc");
+                opts.user_metadata
+                    .insert(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string());
+                opts
+            }),
+        ] {
+            let (client, recorded) = header_recording_target_client(Vec::new());
+            client
+                .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
+                .await
+                .expect("recorded put_object should succeed");
+            let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+            let headers = &recorded[0];
+            assert_eq!(
+                recorded_header(headers, "content-md5"),
+                None,
+                "{label}: the source etag is not the wire MD5"
+            );
+            assert!(
+                recorded_header(headers, "x-amz-sdk-checksum-algorithm").is_some_and(|v| v.eq_ignore_ascii_case("CRC32"))
+                    || recorded_header(headers, "x-amz-checksum-crc32").is_some(),
+                "{label}: the SDK must announce a CRC32 checksum; headers: {headers:?}"
+            );
+        }
+    }
+
+    /// A forwarded source checksum already satisfies the rule; nothing is added.
+    #[tokio::test]
+    async fn locked_put_object_keeps_a_forwarded_source_checksum() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        let mut opts = locked_put_options("8d777f385d3dfec8815d20f7496026dc");
+        opts.user_metadata
+            .insert("x-amz-checksum-crc32".to_string(), "rfPzYw==".to_string());
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
+            .await
+            .expect("recorded put_object should succeed");
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let headers = &recorded[0];
+        assert_eq!(recorded_header(headers, "x-amz-checksum-crc32"), Some("rfPzYw=="));
+        assert_eq!(recorded_header(headers, "content-md5"), None);
+        assert_eq!(recorded_header(headers, "x-amz-trailer"), None);
+    }
+
+    /// Without Object Lock parameters the plain-payload default is untouched.
+    #[tokio::test]
+    async fn unlocked_put_object_adds_no_integrity_header() {
+        let (client, recorded) = header_recording_target_client(Vec::new());
+        let opts = PutObjectOptions {
+            internal: AdvancedPutOptions {
+                source_etag: "8d777f385d3dfec8815d20f7496026dc".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        client
+            .put_object("target-bucket", "object", 4, streaming_test_body(b"data"), &opts)
+            .await
+            .expect("recorded put_object should succeed");
+        let recorded = recorded.lock().expect("recorded header lock should not be poisoned");
+        let headers = &recorded[0];
+        assert_eq!(recorded_header(headers, "content-md5"), None);
+        assert_eq!(recorded_header(headers, "x-amz-trailer"), None);
+        assert_eq!(recorded_header(headers, "x-amz-sdk-checksum-algorithm"), None);
     }
 
     #[tokio::test]

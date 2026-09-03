@@ -635,7 +635,8 @@ pub(crate) mod bucket {
         };
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
             BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OdmStateError, OnDemandMigrationSys, PolicyConfig,
-            PullError, PullLeader, PullOutcome, PullReason, PullSlot, RangeGetPolicy, SourceErrorPolicy, commit_inline,
+            PullError, PullLeader, PullOutcome, PullReason, PullSlot, RangeGetPolicy, SourceBody, SourceErrorPolicy,
+            commit_inline, idle_guarded_body,
         };
     }
 

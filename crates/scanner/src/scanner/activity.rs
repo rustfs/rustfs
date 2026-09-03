@@ -13,6 +13,7 @@
 // limitations under the License.
 /// Cycle wake/backoff policy and scanner activity observation (probing, generations, topology digest).
 use super::*;
+use crate::storage_api::ScannerStorage;
 use crate::storage_api::scan::SCANNER_ACTIVITY_V6_PROTOCOL_VERSION;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -884,14 +885,17 @@ pub(super) fn apply_scanner_activity_probe_result(
     }
 }
 
-pub(super) async fn observe_scanner_activity(
-    storeapi: &Arc<ECStore>,
+pub(super) async fn observe_scanner_activity<S>(
+    storeapi: &Arc<S>,
     distributed: bool,
     activity_seen: &mut Option<ScannerActivitySnapshot>,
-) -> ScannerActivityObservation {
+) -> ScannerActivityObservation
+where
+    S: ScannerStorage,
+{
     let had_baseline = activity_seen.is_some();
     let (observation, probe_error) =
-        apply_scanner_activity_probe_result(activity_seen, probe_scanner_activity(storeapi, distributed).await);
+        apply_scanner_activity_probe_result(activity_seen, probe_scanner_activity(storeapi.as_ref(), distributed).await);
     if let Some(err) = probe_error {
         log_scanner_activity_probe_error(had_baseline, &err);
     }
@@ -994,8 +998,11 @@ pub(super) fn record_scanner_activity_instance(
     Ok(())
 }
 
-pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool) -> Result<ScannerActivitySnapshot, String> {
-    let topology_digest = scanner_topology_digest(storeapi);
+pub(crate) async fn probe_scanner_activity<S>(storeapi: &S, distributed: bool) -> Result<ScannerActivitySnapshot, String>
+where
+    S: ScannerStorage,
+{
+    let topology_digest = storeapi.scanner_topology_digest();
     let (data_movement_active, publication_blocked, movement_generation) = storeapi.scanner_data_movement_activity().await;
     let namespace_generation = storeapi.scanner_namespace_mutation_generation();
     let maintenance_generation = scanner_maintenance_generation();
@@ -1029,7 +1036,7 @@ pub(crate) async fn probe_scanner_activity(storeapi: &ECStore, distributed: bool
     }
 
     let notification_system = storeapi
-        .notification_system()
+        .scanner_notification_system()
         .ok_or_else(|| "notification system is not initialized".to_string())?;
     let peers = notification_system
         .scanner_activity_snapshots()

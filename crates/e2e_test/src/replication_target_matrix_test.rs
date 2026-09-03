@@ -202,19 +202,21 @@ enum Expectation {
     KnownFailing(&'static str),
 }
 
-/// The single source of truth for what every cell must do today. A fix that
-/// turns a `KnownFailing` cell green must flip it here in the same PR; the
-/// test refuses an unexpected pass so the table cannot go stale silently.
+/// The cells that are red today, each pinned to the open issue that owns it.
+/// This is the single source of truth: a fix that turns a cell green must
+/// remove its entry in the same PR, and [`check_known_failing_cell`] refuses
+/// an unexpected pass so the table cannot go stale silently. rustfs#7082
+/// (Retention and LegalHold against the checksum-requiring target) lived
+/// here until the replication PUT started carrying a Content-MD5 derived
+/// from the source ETag.
+const KNOWN_FAILING_CELLS: &[(TargetMode, ObjectShape, &str)] = &[];
+
 fn expectation(mode: TargetMode, shape: ObjectShape) -> Expectation {
-    match (mode, shape) {
-        // rustfs#7082: the replication PUT carries the lock headers but no
-        // Content-MD5 / x-amz-checksum-* since rustfs#6895 switched the SDK
-        // to plain payloads; AWS-compatible Object Lock targets reject it.
-        (TargetMode::RequireChecksumWithObjectLock, ObjectShape::Retention | ObjectShape::LegalHold) => {
-            Expectation::KnownFailing("rustfs#7082")
-        }
-        _ => Expectation::Completed,
-    }
+    KNOWN_FAILING_CELLS
+        .iter()
+        .find(|(known_mode, known_shape, _)| *known_mode == mode && *known_shape == shape)
+        .map(|(_, _, issue)| Expectation::KnownFailing(issue))
+        .unwrap_or(Expectation::Completed)
 }
 
 #[tokio::test]
@@ -237,28 +239,27 @@ async fn matrix_mint_own_version_ids_target() -> TestResult {
     run_row(TargetMode::MintOwnVersionIds).await
 }
 
-/// The expectation table must name every mode and shape exactly once, so a
-/// new row or column cannot be added without deciding what it does.
+/// Every known-red entry must name a real cell and an issue, and the lookup
+/// must round-trip, so a stale or mistyped entry cannot silently pin nothing.
 #[test]
-fn expectation_table_covers_every_cell() {
-    for mode in TargetMode::ALL {
-        for shape in ObjectShape::ALL {
-            let _ = expectation(mode, shape);
-        }
+fn known_failing_table_names_real_cells() {
+    for (mode, shape, issue) in KNOWN_FAILING_CELLS {
+        assert!(
+            TargetMode::ALL.contains(mode) && ObjectShape::ALL.contains(shape),
+            "{mode:?}/{shape:?} is not a matrix cell"
+        );
+        assert!(
+            issue.starts_with("rustfs#") || issue.starts_with("rustfs/backlog#"),
+            "{issue} must name an open issue"
+        );
+        assert_eq!(expectation(*mode, *shape), Expectation::KnownFailing(issue));
     }
-    let known_failing: Vec<_> = TargetMode::ALL
+    let red_cells = TargetMode::ALL
         .iter()
         .flat_map(|mode| ObjectShape::ALL.iter().map(move |shape| (*mode, *shape)))
         .filter(|(mode, shape)| matches!(expectation(*mode, *shape), Expectation::KnownFailing(_)))
-        .collect();
-    assert_eq!(
-        known_failing,
-        vec![
-            (TargetMode::RequireChecksumWithObjectLock, ObjectShape::Retention),
-            (TargetMode::RequireChecksumWithObjectLock, ObjectShape::LegalHold),
-        ],
-        "every known-red cell is listed here on purpose; update this list together with the expectation table"
-    );
+        .count();
+    assert_eq!(red_cells, KNOWN_FAILING_CELLS.len());
 }
 
 async fn run_row(mode: TargetMode) -> TestResult {
@@ -388,6 +389,17 @@ async fn check_completed_cell(
             shape.carries_object_lock_params()
         )
         .into());
+    }
+    // rustfs#7082 contract: every PutObject that carries Object Lock
+    // parameters also carries Content-MD5 or an x-amz-checksum-* header,
+    // whatever the target's own policy is.
+    if let Some(bare) = uploads.iter().find(|record| {
+        record.operation == FakeTargetOperation::PutObject
+            && record.transport.object_lock_params
+            && record.transport.content_md5.is_none()
+            && record.transport.checksum_headers.is_empty()
+    }) {
+        return Err(format!("a locked PutObject went out without any integrity header (rustfs#7082): {bare:?}").into());
     }
     Ok(())
 }

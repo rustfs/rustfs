@@ -30,7 +30,7 @@ use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_DATA_MOV, SUFFIX_HEALING,
     SUFFIX_PURGESTATUS, SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX,
     SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID,
-    contains_key_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
+    SUFFIX_RESTORE_WORKER_LOCK, contains_key_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
 };
 use s3s::header::X_AMZ_RESTORE;
 use serde::{Deserialize, Serialize};
@@ -358,8 +358,10 @@ impl FileMeta {
                         if let Some(ref mut obj) = ver.object {
                             if replace_user_metadata {
                                 obj.meta_user.clear();
-                                if !contains_key_str(&fi.metadata, SUFFIX_RESTORE_OPERATION_ID) {
-                                    remove_bytes(&mut obj.meta_sys, SUFFIX_RESTORE_OPERATION_ID);
+                                for suffix in [SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK] {
+                                    if !contains_key_str(&fi.metadata, suffix) {
+                                        remove_bytes(&mut obj.meta_sys, suffix);
+                                    }
                                 }
                             }
 
@@ -1780,6 +1782,12 @@ mod test {
         fi.metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), "1".to_string());
         fi.metadata
             .insert(AMZ_RESTORE_REQUEST_DATE.to_string(), "Thu, 16 Jul 2026 00:00:00 GMT".to_string());
+        rustfs_utils::http::insert_str(&mut fi.metadata, SUFFIX_RESTORE_OPERATION_ID, Uuid::from_u128(1).to_string());
+        rustfs_utils::http::insert_str(
+            &mut fi.metadata,
+            SUFFIX_RESTORE_WORKER_LOCK,
+            rustfs_utils::http::RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string(),
+        );
         fm.add_version(fi).unwrap();
 
         let expire_fi = FileInfo {
@@ -1796,6 +1804,14 @@ mod test {
         assert!(!after.metadata.contains_key(AMZ_RESTORE), "x-amz-restore must be stripped");
         assert!(!after.metadata.contains_key(AMZ_RESTORE_EXPIRY_DAYS));
         assert!(!after.metadata.contains_key(AMZ_RESTORE_REQUEST_DATE));
+        assert!(
+            rustfs_utils::http::get_str(&after.metadata, SUFFIX_RESTORE_OPERATION_ID).is_none(),
+            "expired restore must not retain its operation generation"
+        );
+        assert!(
+            rustfs_utils::http::get_str(&after.metadata, SUFFIX_RESTORE_WORKER_LOCK).is_none(),
+            "expired restore must not retain the worker-liveness protocol marker"
+        );
         assert_eq!(after.transition_status, TRANSITION_COMPLETE);
         assert_eq!(after.transitioned_objname, "remote/obj");
         assert_eq!(after.transition_tier, "COLDTIER");

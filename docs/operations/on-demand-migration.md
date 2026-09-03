@@ -115,10 +115,10 @@ The persisted blob is `on-demand-migration.json` in the bucket's metadata. Unkno
 | `policy.pull_queue_capacity` | integer | `1024` | `1..=65536`; a full queue drops the *background* job, never the client response |
 | `policy.source_timeout.connect_ms` | integer | `5000` | `100..=600000` |
 | `policy.source_timeout.first_byte_ms` | integer | `15000` | `100..=600000`; also the window a follower waits for the singleflight leader before streaming through |
-| `policy.source_timeout.idle_ms` | integer | `30000` | `100..=600000`; enforced by the background pump only (see Known limitations) |
+| `policy.source_timeout.idle_ms` | integer | `30000` | `100..=600000`; enforced per body chunk on both the background pump and the inline tee |
 | `policy.bandwidth_limit_bytes_per_sec` | integer \| null | `null` | When set, at least `65536` |
 
-Values that are **not** configurable: the breaker opens after 5 consecutive counted failures inside a 30 s window, stays open for 30 s and then admits one probe (`breaker.rs`); the negative cache holds at most 100 000 keys per bucket with LRU eviction (`negative_cache.rs`); a background pull retries a retryable source failure at most 3 times with 1 s / 4 s / 16 s base delays plus up to 25 % jitter (`pull.rs`).
+Values that are **not** configurable: the breaker opens after 5 consecutive counted failures inside a 30 s window, stays open for 30 s and then admits one probe (`breaker.rs`); the negative cache holds at most 100 000 keys per bucket with LRU eviction (`negative_cache.rs`); a background pull retries a retryable source failure at most 3 times with 1 s / 4 s / 16 s base delays plus up to 25 % jitter (`pull.rs`). The SDK's own retry policy is disabled on the source client, so one logical source call is exactly one wire request and the retry budget above is the only one.
 
 Validation also rejects two shapes outright: a source whose endpoint and bucket name **this** bucket on this deployment (`SelfReference`), and a source that matches one of the bucket's own replication targets (`ReplicationLoop`) — that pairing would amplify a write-back into a loop.
 
@@ -167,7 +167,7 @@ Behaviour a client can observe. The "Test" column names the case that pins it: `
 | Repeated source 5xx / timeouts | The breaker opens, GETs answer per `source_error` and HEADs answer 404; a probe closes it again after the open window | `fault_test.rs::test_odm_repeated_source_errors_open_the_breaker_and_recover`, `head.rs::odm_head_source_errors_follow_policy_and_open_the_breaker` |
 | Bucket default SSE | The pulled object is stored encrypted and reads back in plaintext; the ETag override is dropped, and the source ETag is kept in metadata | `interaction_test.rs::test_odm_pulled_object_uses_bucket_default_encryption`, `on_demand_migration_put.rs::write_back_under_bucket_default_sse_stores_ciphertext_and_records_source_etag` |
 | Object Lock bucket | The pulled object inherits the bucket's default retention | `interaction_test.rs::test_odm_pulled_object_inherits_object_lock_retention` |
-| Bucket quota exceeded | The client is still served from the source; the write-back is rejected, nothing is stored, and the failure counts under `local_write` | `interaction_test.rs::test_odm_write_back_respects_the_bucket_quota`, `on_demand_migration_put.rs::write_back_reports_a_full_bucket_quota` |
+| Bucket quota exceeded | The client is still served from the source; the write-back is rejected, nothing is stored, and the failure counts under `quota` | `interaction_test.rs::test_odm_write_back_respects_the_bucket_quota`, `on_demand_migration_put.rs::write_back_reports_a_full_bucket_quota` |
 | Notifications | A write-back emits `ObjectCreated` with principal `rustfs-on-demand-migration`, unless `emit_events` is `false` | `interaction_test.rs::test_odm_pull_emits_object_created_events_unless_disabled` |
 | Replication configured on the local bucket | A pulled object replicates like any other write; configuring one of the bucket's replication targets as the source is rejected | `interaction_test.rs::test_odm_pulled_object_replicates_and_target_as_source_is_rejected`, `on_demand_migration_put.rs::write_back_schedules_replication_and_names_the_migration_principal` |
 | Source is itself a RustFS/MinIO deployment with its own source | The anti-loop marker stops the chain at the first hop; mutual configurations still terminate | `real_source_test.rs::test_odm_chained_sources_stop_at_the_loop_guard_real_single_node` |
@@ -247,7 +247,7 @@ All series are bucket-scoped under `rustfs_on_demand_migration_*` and appear onl
 | `requests_total` | counter | `bucket`, `op` (`get`, `head`), `outcome` (`source_hit`, `source_miss`, `source_error`, `breaker_open`, `negative_cached`, `filtered`, `unsupported`) |
 | `pulled_bytes_total` | counter | `bucket` |
 | `pulled_objects_total` | counter | `bucket`, `path` (`inline`, `background`, `backfill`) |
-| `pull_failures_total` | counter | `bucket`, `reason` (`source_not_found`, `source_access_denied`, `source_throttled`, `source_timeout`, `source_connect`, `source_server_error`, `source_unsupported`, `source_other`, `etag_mismatch`, `local_write`, `canceled`, `queue_full`) |
+| `pull_failures_total` | counter | `bucket`, `reason` (`source_not_found`, `source_access_denied`, `source_throttled`, `source_timeout`, `source_connect`, `source_server_error`, `source_unsupported`, `source_other`, `etag_mismatch`, `local_write`, `quota`, `canceled`, `queue_full`) |
 | `inflight_pulls` | gauge | `bucket` |
 | `queue_depth` | gauge | `bucket` |
 | `source_latency_seconds_distribution` / `_sum` / `_count` | counter | `bucket`, plus `le` on the distribution |
@@ -291,7 +291,7 @@ sum by (bucket, reason) (rate(rustfs_on_demand_migration_pull_failures_total[5m]
 
 **`NoSuchBucket` from the source, or a 301/307 redirect.** The addressing style is wrong: a virtual-host request against a path-style-only server looks like a missing bucket, and a path-style request against AWS gets redirected. Set `source.path_style` explicitly instead of relying on `auto`.
 
-**Large objects are served but never stored.** Check `pull_failures_total`: `queue_full` means bursts exceed `pull_queue_capacity` (raise it, or raise `max_concurrent_pulls`); `local_write` covers both a genuine local write failure and a bucket quota rejection; `etag_mismatch` means the source body did not match the ETag the source advertised. The client response is served in all three cases — only the local copy is missing.
+**Large objects are served but never stored.** Check `pull_failures_total`: `queue_full` means bursts exceed `pull_queue_capacity` (raise it, or raise `max_concurrent_pulls`); `quota` means the bucket quota rejected the write-back and `local_write` a genuine local write failure; `etag_mismatch` means the source body did not match the ETag the source advertised. The client response is served in all three cases — only the local copy is missing.
 
 **The first read of a key is slow, later ones are fast.** Expected: the first read pays a source HEAD plus a source GET. Watch `source_latency_seconds_*` for the source's contribution and lower `inline_max_bytes` if teeing large objects is hurting first-byte latency.
 
@@ -306,10 +306,7 @@ sum by (bucket, reason) (rate(rustfs_on_demand_migration_pull_failures_total[5m]
 - **Azure Blob is not a supported source** (rustfs/backlog#2166). GCS is supported only through its XML interoperability API with HMAC keys.
 - **LIST does not merge the source** (rustfs/backlog#2164). Only local objects are listed, so a client that lists before reading will not see un-migrated keys.
 - **Write-through is undecided** (rustfs/backlog#2165). PUT and DELETE never reach the source in this version.
-- **The source client inherits the SDK's default retry policy.** The standard smithy strategy retries up to 3 times, so one logical source call can be up to three wire requests; every breaker count therefore sits on top of a threefold request amplification against an already-struggling source.
 - **`pull_failures_total` counts abandoned pulls, not attempts.** A pull that failed twice and then succeeded contributes nothing; attempt-level failure needs a new counter.
-- **A quota rejection is reported as `local_write`.** The failure-reason label set has no `quota` value, so a full bucket is indistinguishable from another local write failure in the metrics; the log line and the bucket's usage tell them apart.
-- **`policy.source_timeout.idle_ms` applies to background pulls only.** The inline tee path does not enforce it, so an inline pull that stalls mid-body is bounded only by the SDK read timeout.
 - **The breaker's 30 s open window is a compile-time constant** with no environment override, which is why breaker-related tests have to wait it out.
 - **`breaker.opened_at` and `served_by_source_ratio` are always `null`** in the status response (see Observability).
 

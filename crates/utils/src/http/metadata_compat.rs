@@ -65,6 +65,10 @@ pub const SUFFIX_TRANSITION_TIER: &str = "transition-tier";
 pub const SUFFIX_TRANSITION_TIER_DESTINATION_ID: &str = "transition-tier-destination-id";
 pub const SUFFIX_TRANSITION_TRANSACTION_ID: &str = "transition-transaction-id";
 pub const SUFFIX_RESTORE_OPERATION_ID: &str = "restore-operation-id";
+/// Marks restore generations whose worker owns the matching distributed
+/// liveness lock for the duration of the asynchronous copy-back.
+pub const SUFFIX_RESTORE_WORKER_LOCK: &str = "restore-worker-lock";
+pub const RESTORE_WORKER_LOCK_PROTOCOL_V1: &str = "v1";
 pub const SUFFIX_BUCKET_INCARNATION_ID: &str = "bucket-incarnation-id";
 pub const SUFFIX_OBJECT_TRANSACTION_EPOCH: &str = "object-transaction-epoch";
 /// Active rebalance run id mirrored onto `rebalance.bin` object metadata.

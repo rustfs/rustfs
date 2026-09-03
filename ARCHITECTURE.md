@@ -92,7 +92,7 @@ refactors.
 
 | Domain | Current workspace crates | Responsibility |
 |--------|--------------------------|----------------|
-| Foundation | `checksums`, `common`, `config`, `data-usage`, `heal-contracts`, `scanner-contracts`, `scanner-metrics`, `utils` | Shared configuration, data-usage models, heal/scanner domain contracts and telemetry types, utilities, and checksums. |
+| Foundation | `checksums`, `common`, `config`, `data-usage`, `heal-contracts`, `scanner-metrics`, `utils` | Shared configuration, data-usage models, heal domain contracts, scanner telemetry types, utilities, and checksums. |
 | I/O and storage | `concurrency`, `ecstore`, `filemeta`, `heal`, `io-core`, `io-metrics`, `lifecycle`, `lock`, `object-capacity`, `object-data-cache`, `replication`, `rio`, `rio-v2`, `s3-client`, `scanner`, `storage-api` | Erasure-coded object storage, metadata, recovery, lifecycle, replication, locking, cache, I/O pipelines, and the engine-side S3 client for remote tier/transition targets. |
 | Security and identity | `credentials`, `crypto`, `iam`, `keystone`, `kms`, `policy`, `security-governance`, `signer`, `tls-runtime`, `trusted-proxies` | Credentials, authentication, authorization, encryption, key management, TLS, and security contracts. |
 | Protocols and contracts | `extension-schema`, `madmin`, `protos`, `protocols`, `s3-ops`, `s3-types`, `s3select-api`, `s3select-query` | Admin, inter-node, S3, S3 Select, and optional protocol contracts. |

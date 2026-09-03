@@ -33,9 +33,8 @@ use crate::runtime_config::{
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
 use crate::scanner_io::{
-    ScannerCycleDeferReason, ScannerCycleResult, ScannerCycleStatus, ScannerIOCycle, dirty_usage_bucket_notified,
-    dirty_usage_buckets_pending, dirty_usage_generation, scanner_dirty_usage_state, scanner_maintenance_changed,
-    scanner_maintenance_generation,
+    ScannerCycleDeferReason, ScannerCycleResult, ScannerCycleStatus, dirty_usage_bucket_notified, dirty_usage_buckets_pending,
+    dirty_usage_generation, scanner_dirty_usage_state, scanner_maintenance_changed, scanner_maintenance_generation,
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError, ScannerRuntimeGuard};
@@ -66,17 +65,18 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
+use crate::storage_api::ScannerStorage;
 use crate::storage_api::scan::{
-    BucketOperations, BucketOptions, NamespaceLocking as _, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
-    SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
+    BucketOptions, NamespaceLocking as _, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+    SCANNER_ACTIVITY_PROTOCOL_VERSION,
 };
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, SCANNER_PUBLICATION_EPOCH_CHANGED, ScannerLifecycleConfigExt as _,
     ScannerReplicationConfigExt as _, delete_config_with_publication_admission_for_epoch, get_lifecycle_config,
     get_replication_config, invalidate_admin_data_usage_snapshot_cache, invalidate_data_usage_snapshot_cache, read_config,
     replace_bucket_usage_memory_from_info, save_config, save_config_shared_with_preconditions_and_lease_fence_and_scope,
-    save_config_with_preconditions, save_config_with_publication_admission_for_epoch, scanner_is_erasure_sd,
-    scanner_publication_admission_for_epoch, scanner_publication_epoch, scanner_publication_epoch_changed,
+    save_config_with_preconditions, save_config_with_publication_admission_for_epoch, scanner_publication_admission_for_epoch,
+    scanner_publication_epoch, scanner_publication_epoch_changed,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -211,12 +211,18 @@ async fn notify_scanner_startup_observed_for_test() {
 }
 
 #[cfg(test)]
-fn scanner_observed_probe_store_key(storeapi: &Arc<ECStore>) -> usize {
-    Arc::as_ptr(storeapi).cast::<()>() as usize
+fn scanner_observed_probe_store_key<S>(storeapi: &Arc<S>) -> usize
+where
+    S: ScannerStorage,
+{
+    storeapi.scanner_observed_probe_store_key()
 }
 
 #[cfg(test)]
-fn notify_scanner_runtime_observed_for_test(storeapi: &Arc<ECStore>, observation: ScannerPauseBacklogObservation) {
+fn notify_scanner_runtime_observed_for_test<S>(storeapi: &Arc<S>, observation: ScannerPauseBacklogObservation)
+where
+    S: ScannerStorage,
+{
     if let Some(probe) = SCANNER_RUNTIME_OBSERVED_PROBE
         .lock()
         .expect("scanner runtime observed probe should not be poisoned")
@@ -788,7 +794,10 @@ async fn sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_and_s
     ))
 }
 
-async fn persisted_usage_cache_is_cold_for_startup(storeapi: &Arc<ECStore>) -> bool {
+async fn persisted_usage_cache_is_cold_for_startup<S>(storeapi: &Arc<S>) -> bool
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
     let Some(data) = (match read_data_usage_config_for_startup(storeapi).await {
         Ok(data) => data,
         Err(err) => {
@@ -862,7 +871,10 @@ async fn persisted_usage_cache_is_cold_for_startup(storeapi: &Arc<ECStore>) -> b
     }
 }
 
-async fn initial_scanner_startup_usage_state(storeapi: &Arc<ECStore>) -> (bool, bool) {
+async fn initial_scanner_startup_usage_state<S>(storeapi: &Arc<S>) -> (bool, bool)
+where
+    S: ScannerStorage,
+{
     let has_buckets = match storeapi
         .list_bucket(&BucketOptions {
             no_metadata: true,
@@ -933,6 +945,13 @@ fn prepare_cycle_for_usage_floor_bootstrap(
 }
 
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
+    init_data_scanner_with_storage(ctx, storeapi).await;
+}
+
+async fn init_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>)
+where
+    S: ScannerStorage,
+{
     let (startup_features, startup_maintenance_generation) = configure_scanner_defaults(&ctx, &storeapi).await;
     // Force init global sleeper so config is read once at startup.
     let _ = &*SCANNER_SLEEPER;
@@ -1114,7 +1133,10 @@ fn single_disk_default_speed() -> ScannerSpeed {
     ScannerSpeed::Default
 }
 
-async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
+async fn detect_scanner_maintenance_features<S>(storeapi: &Arc<S>) -> ScannerMaintenanceFeatures
+where
+    S: ScannerStorage,
+{
     let mut features = ScannerMaintenanceFeatures::default();
     let buckets = match storeapi
         .list_bucket(&BucketOptions {
@@ -1194,7 +1216,7 @@ async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> Scanner
 
 async fn detect_stable_scanner_maintenance_features(
     ctx: &CancellationToken,
-    storeapi: &Arc<ECStore>,
+    storeapi: &Arc<impl ScannerStorage>,
 ) -> Option<(ScannerMaintenanceFeatures, u64)> {
     detect_stable_scanner_maintenance_features_with(
         ctx,
@@ -1259,7 +1281,7 @@ where
 
 async fn configure_scanner_defaults(
     ctx: &CancellationToken,
-    storeapi: &Arc<ECStore>,
+    storeapi: &Arc<impl ScannerStorage>,
 ) -> (ScannerMaintenanceFeatures, Option<u64>) {
     if storeapi.setup_is_erasure_sd().await {
         let (features, maintenance_generation) = detect_stable_scanner_maintenance_features(ctx, storeapi)
@@ -1531,27 +1553,33 @@ async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle, cycle_metrics_guard
 }
 
 #[cfg(test)]
-async fn run_data_scanner_cycle(
+async fn run_data_scanner_cycle<S>(
     ctx: &CancellationToken,
-    storeapi: &Arc<ECStore>,
+    storeapi: &Arc<S>,
     cycle_info: &mut CurrentCycle,
     cycle_revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
-) -> ScannerCycleOutcome {
+) -> ScannerCycleOutcome
+where
+    S: ScannerStorage,
+{
     let cycle_budget = ScannerCycleBudget::new(ctx, scanner_cycle_budget_config());
     run_data_scanner_cycle_with_budget(ctx, storeapi, cycle_info, cycle_revision, leader_epoch, cycle_budget).await
 }
 
 #[instrument(skip_all)]
 #[hotpath::measure]
-async fn run_data_scanner_cycle_with_budget(
+async fn run_data_scanner_cycle_with_budget<S>(
     ctx: &CancellationToken,
-    storeapi: &Arc<ECStore>,
+    storeapi: &Arc<S>,
     cycle_info: &mut CurrentCycle,
     cycle_revision: &mut DataUsageCacheRevision,
     leader_epoch: u64,
     cycle_budget: Arc<ScannerCycleBudget>,
-) -> ScannerCycleOutcome {
+) -> ScannerCycleOutcome
+where
+    S: ScannerStorage,
+{
     let _activity_guard = ScannerActivityGuard::new();
     if let Err(err) = refresh_scanner_runtime_config_from_global() {
         warn!(
@@ -1646,12 +1674,11 @@ async fn run_data_scanner_cycle_with_budget(
     // scanner aggregate. Hold only the short storage-owned admission guard
     // across this metadata read; the full bucket scan runs after it is
     // released and carries the captured epoch forward.
-    let Some((baseline_publication_guard, baseline_publication_epoch)) =
-        storeapi.scanner_data_usage_publication_admission_guard().await
-    else {
+    let Some(baseline_publication_guard) = storeapi.scanner_data_usage_publication_admission().await else {
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
     };
+    let baseline_publication_epoch = baseline_publication_guard.epoch();
     let usage_persist_baseline_result = read_data_usage_persist_baseline(storeapi.clone()).await;
     drop(baseline_publication_guard);
     let usage_persist_baseline = match usage_persist_baseline_result {
@@ -1676,17 +1703,16 @@ async fn run_data_scanner_cycle_with_budget(
     let (sender, receiver) = mpsc::channel::<DataUsageInfo>(1);
 
     let done_cycle = Metrics::time(Metric::ScanCycle);
-    let scan_result = storeapi
-        .clone()
-        .nsscanner_with_status(
-            cycle_budget.token(),
-            cycle_budget.clone(),
-            sender,
-            cycle_info.current,
-            leader_epoch,
-            scan_mode,
-        )
-        .await;
+    let scan_result = crate::scanner_io::nsscanner_with_storage_status(
+        storeapi.as_ref(),
+        cycle_budget.token(),
+        cycle_budget.clone(),
+        sender,
+        cycle_info.current,
+        leader_epoch,
+        scan_mode,
+    )
+    .await;
     let publication_defer_reason = match &scan_result {
         Ok(result)
             if result
@@ -1725,7 +1751,7 @@ async fn run_data_scanner_cycle_with_budget(
     let mut remote_publication_leases = None;
     let remote_lease_defer_reason = if remote_publication_lease_targets.is_empty() {
         None
-    } else if let Some(notification_system) = storeapi.notification_system() {
+    } else if let Some(notification_system) = storeapi.scanner_notification_system() {
         let publication_proof_ctx = cycle_budget.token();
         let lease_result = await_scanner_publication_proof(
             &publication_proof_ctx,
@@ -2089,7 +2115,7 @@ async fn run_data_scanner_cycle_with_budget(
         finalize_scanner_cycle_result(scan_cycle_result, usage_persist_outcome);
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
         false
-    } else if let Some(notification_system) = storeapi.notification_system() {
+    } else if let Some(notification_system) = storeapi.scanner_notification_system() {
         let acknowledgement_count = remote_dirty_usage_acknowledgements.len();
         let acknowledgements = remote_dirty_usage_acknowledgements
             .into_iter()
@@ -2330,11 +2356,21 @@ impl Drop for ScannerCycleMetricsGuard {
 }
 
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
+    run_data_scanner_with_storage(ctx, storeapi).await
+}
+
+async fn run_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>) -> Result<(), ScannerError>
+where
+    S: ScannerStorage,
+{
     let (maintenance_features, maintenance_generation) = configure_scanner_defaults(&ctx, &storeapi).await;
     run_data_scanner_with_maintenance_state(ctx, storeapi, maintenance_features, maintenance_generation).await
 }
 
-async fn current_scanner_pause_backlog_observation(storeapi: &Arc<ECStore>) -> ScannerPauseBacklogObservation {
+async fn current_scanner_pause_backlog_observation<S>(storeapi: &Arc<S>) -> ScannerPauseBacklogObservation
+where
+    S: ScannerStorage,
+{
     let now_unix_secs = scanner_pause_backlog_now();
     let pause = storeapi.scanner_data_movement_pause_status().await;
     let metrics = global_metrics().report().await;
@@ -2358,12 +2394,15 @@ async fn current_scanner_pause_backlog_observation(storeapi: &Arc<ECStore>) -> S
     }
 }
 
-async fn wait_for_scanner_data_movement_resume(
+async fn wait_for_scanner_data_movement_resume<S>(
     ctx: &CancellationToken,
-    storeapi: &Arc<ECStore>,
+    storeapi: &Arc<S>,
     guard: &NamespaceLockGuard,
-    pause_backlog: &mut ScannerPauseBacklogController,
-) -> bool {
+    pause_backlog: &mut ScannerPauseBacklogController<S>,
+) -> bool
+where
+    S: ScannerStorage,
+{
     loop {
         let observation = current_scanner_pause_backlog_observation(storeapi).await;
         pause_backlog.observe(observation).await;
@@ -2386,12 +2425,14 @@ async fn wait_for_scanner_data_movement_resume(
     }
 }
 
-async fn finish_scanner_pause_backlog_cycle(
-    pause_backlog: &mut ScannerPauseBacklogController,
-    storeapi: &Arc<ECStore>,
+async fn finish_scanner_pause_backlog_cycle<S>(
+    pause_backlog: &mut ScannerPauseBacklogController<S>,
+    storeapi: &Arc<S>,
     attempt: ScannerPauseBacklogAttemptDecision,
     outcome: ScannerCycleOutcome,
-) {
+) where
+    S: ScannerStorage,
+{
     let observation = current_scanner_pause_backlog_observation(storeapi).await;
     if let ScannerPauseBacklogAttemptDecision::Tracked(serial) = attempt {
         pause_backlog.finish_attempt(serial, outcome, observation).await;
@@ -2402,12 +2443,15 @@ async fn finish_scanner_pause_backlog_cycle(
     notify_scanner_runtime_observed_for_test(storeapi, observation);
 }
 
-async fn run_data_scanner_with_maintenance_state(
+async fn run_data_scanner_with_maintenance_state<S>(
     ctx: CancellationToken,
-    storeapi: Arc<ECStore>,
+    storeapi: Arc<S>,
     mut maintenance_features: ScannerMaintenanceFeatures,
     mut maintenance_generation_seen: Option<u64>,
-) -> Result<(), ScannerError> {
+) -> Result<(), ScannerError>
+where
+    S: ScannerStorage,
+{
     reset_scanner_cycle_schedule();
     // Acquire leader lock (write lock) to ensure only one scanner runs
     let mut guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
@@ -3162,10 +3206,10 @@ impl Drop for ScannerScanModeGuard {
     }
 }
 
-async fn final_data_usage_publication_defer_reason(
-    storeapi: &ECStore,
-    status: ScannerCycleStatus,
-) -> Option<ScannerCycleDeferReason> {
+async fn final_data_usage_publication_defer_reason<S>(storeapi: &S, status: ScannerCycleStatus) -> Option<ScannerCycleDeferReason>
+where
+    S: ScannerStorage,
+{
     match status {
         ScannerCycleStatus::Complete | ScannerCycleStatus::Superseded => {
             if storeapi.scanner_data_usage_publication_blocked().await {

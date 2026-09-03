@@ -153,8 +153,8 @@ use rustfs_utils::http::headers::{
 };
 use rustfs_utils::http::{
     SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_BUCKET_INCARNATION_ID, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE,
-    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, contains_key_str, get_header_map, get_str, insert_str,
-    is_object_encryption_marker, remove_header_map,
+    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, contains_key_str, get_header_map,
+    get_str, insert_str, is_object_encryption_marker, remove_header_map,
 };
 use rustfs_utils::{
     HashAlgorithm,

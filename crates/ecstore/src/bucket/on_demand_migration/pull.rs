@@ -149,6 +149,30 @@ pub enum EnqueueOutcome {
 /// Body a source read produces; consumed inside the pump task only.
 pub type SourceBody = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send + 'static>>;
 
+/// Applies `source_timeout.idle_ms` to a source body chunk by chunk: a chunk
+/// that does not arrive within `idle_timeout` ends the stream with a timeout
+/// error. The background pump enforces the same budget itself; the inline tee
+/// path in the app layer has no pump and wraps its body with this instead, so
+/// a stalled source cannot hold an inline pull open past the configured
+/// budget.
+pub fn idle_guarded_body(body: SourceBody, idle_timeout: Duration) -> SourceBody {
+    Box::pin(futures::stream::unfold(Some(body), move |state| async move {
+        let mut body = state?;
+        match tokio::time::timeout(idle_timeout, body.next()).await {
+            Err(_elapsed) => Some((
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("source body stalled for more than {}ms", idle_timeout.as_millis()),
+                )),
+                None,
+            )),
+            Ok(None) => None,
+            Ok(Some(Err(err))) => Some((Err(err), None)),
+            Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(body))),
+        }
+    }))
+}
+
 /// Body handed to the write-back; `Sync` because the app-layer put path
 /// wraps it into an S3 streaming blob.
 pub type WriteBackBody = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send + Sync + 'static>>;
@@ -262,7 +286,8 @@ impl WriteBackError {
         match self {
             WriteBackError::Integrity => PullFailureReason::EtagMismatch,
             WriteBackError::Unsupported(_) => PullFailureReason::SourceUnsupported,
-            WriteBackError::Quota(_) | WriteBackError::Local(_) => PullFailureReason::LocalWrite,
+            WriteBackError::Quota(_) => PullFailureReason::Quota,
+            WriteBackError::Local(_) => PullFailureReason::LocalWrite,
         }
     }
 }
@@ -1488,6 +1513,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn idle_guarded_body_ends_a_stalled_stream_and_passes_chunks_through() {
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
+        let body: SourceBody = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx));
+        let mut guarded = idle_guarded_body(body, Duration::from_secs(2));
+
+        tx.send(Ok(Bytes::from_static(b"chunk"))).await.expect("send a chunk");
+        assert_eq!(guarded.next().await.expect("a chunk").expect("chunk is ok"), Bytes::from_static(b"chunk"));
+
+        // The producer never sends again: the guard ends the stream itself.
+        let started = tokio::time::Instant::now();
+        let err = guarded
+            .next()
+            .await
+            .expect("the guard yields the timeout")
+            .expect_err("a stalled body must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(guarded.next().await.is_none(), "the stream ends after the timeout");
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn stalled_source_body_hits_the_idle_timeout() {
         let sys = OnDemandMigrationSys::new();
         let mut cfg = config();
@@ -1744,7 +1791,7 @@ mod tests {
         assert_eq!(PullReason::Backfill.path(), PullPath::Backfill);
         assert_eq!(PullReason::RangeGet.as_str(), "range_get");
         assert_eq!(WriteBackError::Integrity.reason(), PullFailureReason::EtagMismatch);
-        assert_eq!(WriteBackError::Quota("full".into()).reason(), PullFailureReason::LocalWrite);
+        assert_eq!(WriteBackError::Quota("full".into()).reason(), PullFailureReason::Quota);
         assert_eq!(WriteBackError::Local("x".into()).reason(), PullFailureReason::LocalWrite);
         assert_eq!(WriteBackError::Unsupported("x".into()).reason(), PullFailureReason::SourceUnsupported);
         for (retry, base) in PULL_RETRY_BASE_DELAYS.iter().enumerate() {

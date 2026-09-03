@@ -30,6 +30,7 @@ use crate::bucket::remote_s3_client::{
 };
 use crate::storage_api_contracts::range::HTTPRangeSpec;
 use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
@@ -579,7 +580,18 @@ impl SourceClient {
     }
 
     fn from_config_builder(config: aws_sdk_s3::config::Builder, endpoint: String, spec: &SourceClientSpec) -> Self {
-        let client = S3Client::from_conf(config.interceptor(SourceProxyMarkerInterceptor::new()).build());
+        // The pull pipeline and the backfill job own the retry budget for a
+        // source call (`pull.rs` PULL_MAX_RETRIES, `backfill.rs`
+        // LIST_MAX_RETRIES), and the breaker counts logical calls. Leaving the
+        // smithy standard policy on top would turn one counted failure into
+        // three wire requests against a source that is already struggling, so
+        // keep one logical call equal to one wire request.
+        let client = S3Client::from_conf(
+            config
+                .retry_config(RetryConfig::disabled())
+                .interceptor(SourceProxyMarkerInterceptor::new())
+                .build(),
+        );
         Self {
             client,
             endpoint,
@@ -736,7 +748,6 @@ impl SourceClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_s3::config::retry::RetryConfig;
     use aws_smithy_runtime_api::client::http::{HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn};
     use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
     use aws_smithy_runtime_api::client::result::ConnectorError;
@@ -867,8 +878,7 @@ mod tests {
         let config = build_remote_s3_config(&endpoint)
             .await
             .expect("test spec should build")
-            .http_client(http_client)
-            .retry_config(RetryConfig::disabled());
+            .http_client(http_client);
         (SourceClient::from_config_builder(config, endpoint.endpoint_url(), spec), requests)
     }
 

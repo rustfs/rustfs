@@ -16,6 +16,137 @@
 
 use super::*;
 
+// RUSTFS_COMPAT_TODO(backlog-1337): legacy restores lack a liveness marker. Remove after the minimum supported release writes v1 on every restore.
+const LEGACY_RESTORE_ORPHAN_GRACE: time::Duration = time::Duration::hours(24);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OngoingRestoreRecovery {
+    ActiveOrUnsafe,
+    ProbeWorker(Uuid),
+    SupersedeLegacy,
+}
+
+fn consistent_metadata_value_case_insensitive<'a>(metadata: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    let mut value = None;
+    for (candidate_key, candidate_value) in metadata {
+        if !candidate_key.eq_ignore_ascii_case(key) {
+            continue;
+        }
+        if candidate_value.is_empty() || value.is_some_and(|current| current != candidate_value) {
+            return None;
+        }
+        value = Some(candidate_value.as_str());
+    }
+    value
+}
+
+fn restore_request_date(metadata: &HashMap<String, String>) -> Option<OffsetDateTime> {
+    let raw = consistent_metadata_value_case_insensitive(metadata, AMZ_RESTORE_REQUEST_DATE)?;
+    OffsetDateTime::parse(raw, &Rfc3339)
+        .or_else(|_| OffsetDateTime::parse(raw, &Rfc2822))
+        .ok()
+}
+
+fn restore_operation_id(metadata: &HashMap<String, String>) -> Option<Uuid> {
+    let raw = get_consistent_str(metadata, SUFFIX_RESTORE_OPERATION_ID)?;
+    Uuid::parse_str(raw).ok().filter(|operation_id| !operation_id.is_nil())
+}
+
+fn classify_ongoing_restore(metadata: &HashMap<String, String>, now: OffsetDateTime) -> OngoingRestoreRecovery {
+    let Some(operation_id) = restore_operation_id(metadata) else {
+        return OngoingRestoreRecovery::ActiveOrUnsafe;
+    };
+
+    match get_consistent_str(metadata, SUFFIX_RESTORE_WORKER_LOCK) {
+        Some(RESTORE_WORKER_LOCK_PROTOCOL_V1) => OngoingRestoreRecovery::ProbeWorker(operation_id),
+        Some(_) => OngoingRestoreRecovery::ActiveOrUnsafe,
+        None if contains_key_str(metadata, SUFFIX_RESTORE_WORKER_LOCK) => OngoingRestoreRecovery::ActiveOrUnsafe,
+        None => {
+            let Some(requested_at) = restore_request_date(metadata) else {
+                return OngoingRestoreRecovery::ActiveOrUnsafe;
+            };
+            if requested_at
+                .checked_add(LEGACY_RESTORE_ORPHAN_GRACE)
+                .is_some_and(|reap_after| now >= reap_after)
+            {
+                OngoingRestoreRecovery::SupersedeLegacy
+            } else {
+                OngoingRestoreRecovery::ActiveOrUnsafe
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+struct RestoreStatusCommitBarrierState {
+    bucket: String,
+    object: String,
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static RESTORE_STATUS_COMMIT_BARRIER: OnceLock<Mutex<Option<Arc<RestoreStatusCommitBarrierState>>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct RestoreStatusCommitBarrier {
+    state: Arc<RestoreStatusCommitBarrierState>,
+}
+
+#[cfg(test)]
+impl RestoreStatusCommitBarrier {
+    pub(crate) fn install(bucket: &str, object: &str) -> Self {
+        let state = Arc::new(RestoreStatusCommitBarrierState {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let mut slot = RESTORE_STATUS_COMMIT_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("restore status commit barrier mutex should not poison");
+        assert!(slot.is_none(), "restore status commit barrier must be installed by one test at a time");
+        *slot = Some(Arc::clone(&state));
+        Self { state }
+    }
+
+    pub(crate) async fn wait_until_paused(&self) {
+        tokio::time::timeout(Duration::from_secs(30), self.state.arrived.notified())
+            .await
+            .expect("restore accept should reach the post-commit barrier");
+    }
+}
+
+#[cfg(test)]
+impl Drop for RestoreStatusCommitBarrier {
+    fn drop(&mut self) {
+        let mut slot = RESTORE_STATUS_COMMIT_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("restore status commit barrier mutex should not poison");
+        if slot.as_ref().is_some_and(|state| Arc::ptr_eq(state, &self.state)) {
+            *slot = None;
+        }
+        self.state.release.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+async fn maybe_pause_after_restore_status_commit(bucket: &str, object: &str) {
+    let state = RESTORE_STATUS_COMMIT_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("restore status commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|state| state.bucket == bucket && state.object == object)
+        .cloned();
+    if let Some(state) = state {
+        state.arrived.notify_one();
+        state.release.notified().await;
+    }
+}
+
 impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
@@ -65,6 +196,17 @@ impl DefaultObjectUsecase {
         // write below, so the accept guard would protect nothing for them —
         // they keep the plain (read-locked) accept path.
         let is_select = rreq.type_.as_ref().is_some_and(|t| t.as_str() == "SELECT");
+        let restore_operation_id = (!is_select).then(Uuid::new_v4);
+        let mut restore_worker_guard = if let Some(operation_id) = restore_operation_id {
+            Some(
+                store
+                    .acquire_restore_worker_guard(operation_id)
+                    .await
+                    .map_err(|_| S3Error::with_message(S3ErrorCode::SlowDown, "restore object failed."))?,
+            )
+        } else {
+            None
+        };
 
         // Hold the restore-accept guard across the restore-status read, the
         // ongoing/already-restored decision, and the metadata write below, so
@@ -76,11 +218,11 @@ impl DefaultObjectUsecase {
         // in-flight commit on the same object) is transient — answer 503
         // SlowDown so SDK clients back off and retry instead of treating it
         // as a hard failure.
-        let restore_bucket_lifecycle_guard = Some(acquire_copy_bucket_lifecycle_lock(store.as_ref(), &bucket).await?);
+        let mut restore_bucket_lifecycle_guard = Some(acquire_copy_bucket_lifecycle_lock(store.as_ref(), &bucket).await?);
         if store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)? != restore_bucket_incarnation_id {
             return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
         }
-        let accept_guard = if is_select {
+        let mut accept_guard = if is_select {
             None
         } else {
             let guard = store
@@ -112,14 +254,64 @@ impl DefaultObjectUsecase {
             ));
         }
 
-        // Check if restore is already in progress. AWS answers this with
-        // 409 RestoreAlreadyInProgress; a Custom code would serialize as a
-        // retryable 500 and make SDK clients retry the conflict (backlog#1304).
+        // A v1 generation owns a distributed worker-liveness lock. Probe that
+        // lock only after releasing the object/bucket guards: the worker holds
+        // worker-lock -> object-commit-lock, so probing in the opposite order
+        // would create an ABBA cycle. If the probe succeeds, reacquire and
+        // re-read the object before replacing the exact orphan generation.
+        let mut superseded_worker_guard = None;
         if obj_info.restore_ongoing && !is_select {
-            return Err(S3Error::with_message(
-                S3ErrorCode::RestoreAlreadyInProgress,
-                "Object restore is already in progress.",
-            ));
+            match classify_ongoing_restore(obj_info.user_defined.as_ref(), OffsetDateTime::now_utc()) {
+                OngoingRestoreRecovery::ActiveOrUnsafe => {
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::RestoreAlreadyInProgress,
+                        "Object restore is already in progress.",
+                    ));
+                }
+                OngoingRestoreRecovery::SupersedeLegacy => {}
+                OngoingRestoreRecovery::ProbeWorker(previous_operation_id) => {
+                    drop(accept_guard.take());
+                    drop(restore_bucket_lifecycle_guard.take());
+                    let previous_worker_guard = store
+                        .try_acquire_restore_worker_guard(previous_operation_id)
+                        .await
+                        .map_err(|_| S3Error::with_message(S3ErrorCode::SlowDown, "restore object failed."))?
+                        .ok_or_else(|| {
+                            S3Error::with_message(S3ErrorCode::RestoreAlreadyInProgress, "Object restore is already in progress.")
+                        })?;
+
+                    restore_bucket_lifecycle_guard = Some(acquire_copy_bucket_lifecycle_lock(store.as_ref(), &bucket).await?);
+                    if store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)?
+                        != restore_bucket_incarnation_id
+                    {
+                        return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
+                    }
+                    accept_guard = Some(
+                        store
+                            .acquire_restore_accept_guard(&bucket, &object)
+                            .await
+                            .map_err(|_| S3Error::with_message(S3ErrorCode::SlowDown, "restore object failed."))?,
+                    );
+                    opts.no_lock = true;
+                    obj_info = store.get_object_info(&bucket, &object, &opts).await.map_err(|_| {
+                        S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "restore object failed.")
+                    })?;
+                    if obj_info.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::Custom("ErrInvalidTransitionedState".into()),
+                            "restore object failed.",
+                        ));
+                    }
+                    if obj_info.restore_ongoing {
+                        if classify_ongoing_restore(obj_info.user_defined.as_ref(), OffsetDateTime::now_utc())
+                            != OngoingRestoreRecovery::ProbeWorker(previous_operation_id)
+                        {
+                            return Err(S3Error::with_message(S3ErrorCode::SlowDown, "restore object failed."));
+                        }
+                        superseded_worker_guard = Some(previous_worker_guard);
+                    }
+                }
+            }
         }
 
         let mut already_restored = false;
@@ -132,7 +324,8 @@ impl DefaultObjectUsecase {
 
         let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), *rreq.days.as_ref().unwrap_or(&1));
         let mut metadata = (*obj_info.user_defined).clone();
-        let restore_operation_id = (!is_select && !already_restored).then(Uuid::new_v4);
+        remove_str(&mut metadata, SUFFIX_RESTORE_OPERATION_ID);
+        remove_str(&mut metadata, SUFFIX_RESTORE_WORKER_LOCK);
 
         let mut header = HeaderMap::new();
 
@@ -165,6 +358,7 @@ impl DefaultObjectUsecase {
                 );
                 if let Some(id) = restore_operation_id {
                     insert_str(&mut metadata, SUFFIX_RESTORE_OPERATION_ID, id.to_string());
+                    insert_str(&mut metadata, SUFFIX_RESTORE_WORKER_LOCK, RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string());
                 }
             }
             obj_info.user_defined = Arc::new(metadata);
@@ -173,7 +367,9 @@ impl DefaultObjectUsecase {
             // (lock-service degradation), another node may have concurrently
             // accepted this restore — back off instead of committing a second
             // ongoing flag and double-starting the copy-back.
-            if accept_guard.as_ref().is_some_and(|g| g.is_lock_lost()) {
+            if accept_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                || restore_worker_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            {
                 return Err(S3Error::with_message(S3ErrorCode::SlowDown, "restore object failed."));
             }
 
@@ -209,6 +405,9 @@ impl DefaultObjectUsecase {
                 .await
                 .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed."))?;
             rustfs_scanner::record_dirty_usage_bucket(&bucket);
+            #[cfg(test)]
+            maybe_pause_after_restore_status_commit(&bucket, &object).await;
+            drop(superseded_worker_guard.take());
 
             if already_restored {
                 let output = RestoreObjectOutput {
@@ -262,7 +461,9 @@ impl DefaultObjectUsecase {
             insert_str(&mut restore_operation_metadata, SUFFIX_RESTORE_OPERATION_ID, id.to_string());
         }
 
+        let restore_worker_guard = restore_worker_guard.take();
         spawn_traced(async move {
+            let _restore_worker_guard = restore_worker_guard;
             let opts = ObjectOptions {
                 transition: TransitionOptions {
                     restore_request: rreq_clone,
@@ -309,6 +510,124 @@ mod tests {
     use super::*;
     use http::Method;
     use s3s::dto::RestoreRequest;
+
+    fn ongoing_metadata(operation_id: Uuid) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_RESTORE_OPERATION_ID, operation_id.to_string());
+        metadata
+    }
+
+    #[test]
+    fn ongoing_restore_v1_requires_consistent_nonempty_protocol_and_generation() {
+        let operation_id = Uuid::from_u128(1);
+        let now = OffsetDateTime::parse("2026-02-02T00:00:00Z", &Rfc3339).unwrap();
+
+        let mut dual = ongoing_metadata(operation_id);
+        insert_str(&mut dual, SUFFIX_RESTORE_WORKER_LOCK, RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string());
+        assert_eq!(classify_ongoing_restore(&dual, now), OngoingRestoreRecovery::ProbeWorker(operation_id));
+
+        let mut single = HashMap::new();
+        single.insert(
+            rustfs_utils::http::internal_key_rustfs(SUFFIX_RESTORE_OPERATION_ID),
+            operation_id.to_string(),
+        );
+        single.insert(
+            rustfs_utils::http::internal_key_rustfs(SUFFIX_RESTORE_WORKER_LOCK),
+            RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string(),
+        );
+        assert_eq!(classify_ongoing_restore(&single, now), OngoingRestoreRecovery::ProbeWorker(operation_id));
+
+        let mut minio_only = HashMap::new();
+        minio_only.insert(
+            format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, SUFFIX_RESTORE_OPERATION_ID),
+            operation_id.to_string(),
+        );
+        minio_only.insert(
+            format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, SUFFIX_RESTORE_WORKER_LOCK),
+            RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string(),
+        );
+        assert_eq!(
+            classify_ongoing_restore(&minio_only, now),
+            OngoingRestoreRecovery::ProbeWorker(operation_id)
+        );
+
+        let mut unknown_protocol = dual.clone();
+        insert_str(&mut unknown_protocol, SUFFIX_RESTORE_WORKER_LOCK, "v2".to_string());
+        assert_eq!(classify_ongoing_restore(&unknown_protocol, now), OngoingRestoreRecovery::ActiveOrUnsafe);
+
+        let mut empty_protocol = dual.clone();
+        insert_str(&mut empty_protocol, SUFFIX_RESTORE_WORKER_LOCK, String::new());
+        assert_eq!(classify_ongoing_restore(&empty_protocol, now), OngoingRestoreRecovery::ActiveOrUnsafe);
+
+        let mut conflicting_protocol = dual.clone();
+        conflicting_protocol.insert(
+            format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, SUFFIX_RESTORE_WORKER_LOCK),
+            "v2".to_string(),
+        );
+        assert_eq!(
+            classify_ongoing_restore(&conflicting_protocol, now),
+            OngoingRestoreRecovery::ActiveOrUnsafe
+        );
+
+        for invalid_generation in [String::new(), Uuid::nil().to_string(), "not-a-uuid".to_string()] {
+            let mut metadata = dual.clone();
+            insert_str(&mut metadata, SUFFIX_RESTORE_OPERATION_ID, invalid_generation);
+            assert_eq!(classify_ongoing_restore(&metadata, now), OngoingRestoreRecovery::ActiveOrUnsafe);
+        }
+
+        let mut conflicting_generation = dual;
+        conflicting_generation.insert(
+            format!("{}{}", rustfs_utils::http::MINIO_INTERNAL_PREFIX, SUFFIX_RESTORE_OPERATION_ID),
+            Uuid::from_u128(2).to_string(),
+        );
+        assert_eq!(
+            classify_ongoing_restore(&conflicting_generation, now),
+            OngoingRestoreRecovery::ActiveOrUnsafe
+        );
+    }
+
+    #[test]
+    fn legacy_ongoing_restore_is_superseded_only_after_a_valid_stale_request_date() {
+        let operation_id = Uuid::from_u128(1);
+        let now = OffsetDateTime::parse("2026-02-02T00:00:00Z", &Rfc3339).unwrap();
+
+        for stale_date in [
+            "2026-02-01T00:00:00Z",
+            "2026-01-31T23:59:59Z",
+            "Sun, 1 Feb 2026 00:00:00 GMT",
+            "Sat, 31 Jan 2026 23:59:59 GMT",
+        ] {
+            let mut metadata = ongoing_metadata(operation_id);
+            metadata.insert(AMZ_RESTORE_REQUEST_DATE.to_string(), stale_date.to_string());
+            assert_eq!(
+                classify_ongoing_restore(&metadata, now),
+                OngoingRestoreRecovery::SupersedeLegacy,
+                "legacy date {stale_date} should be stale"
+            );
+        }
+
+        for unsafe_date in [
+            None,
+            Some("2026-02-01T00:00:01Z"),
+            Some("2026-02-03T00:00:00Z"),
+            Some("invalid"),
+        ] {
+            let mut metadata = ongoing_metadata(operation_id);
+            if let Some(date) = unsafe_date {
+                metadata.insert(AMZ_RESTORE_REQUEST_DATE.to_string(), date.to_string());
+            }
+            assert_eq!(
+                classify_ongoing_restore(&metadata, now),
+                OngoingRestoreRecovery::ActiveOrUnsafe,
+                "legacy date {unsafe_date:?} must fail closed"
+            );
+        }
+
+        let mut conflicting_date = ongoing_metadata(operation_id);
+        conflicting_date.insert(AMZ_RESTORE_REQUEST_DATE.to_string(), "2026-01-01T00:00:00Z".to_string());
+        conflicting_date.insert(AMZ_RESTORE_REQUEST_DATE.to_ascii_lowercase(), "2025-01-01T00:00:00Z".to_string());
+        assert_eq!(classify_ongoing_restore(&conflicting_date, now), OngoingRestoreRecovery::ActiveOrUnsafe);
+    }
 
     #[tokio::test]
     async fn execute_restore_object_rejects_missing_restore_request() {
