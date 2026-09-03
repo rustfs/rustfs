@@ -145,9 +145,10 @@ use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_K
 use rustfs_utils::http::insert_header;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_CHECKSUM_MODE, AMZ_CHECKSUM_TYPE, AMZ_WEBSITE_REDIRECT_LOCATION, CONTENT_TYPE,
-    SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICA_STATUS,
-    SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_GENERATION, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP,
-    SUFFIX_RESTORE_OPERATION_ID, SUFFIX_SOURCE_REPLICATION_CHECK, SUFFIX_SOURCE_REPLICATION_REQUEST, get_header,
+    RESTORE_WORKER_LOCK_PROTOCOL_V1, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_PLAINTEXT_CHECKSUM,
+    SUFFIX_REPLICA_STATUS, SUFFIX_REPLICA_TIMESTAMP, SUFFIX_REPLICATION_GENERATION, SUFFIX_REPLICATION_STATUS,
+    SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SUFFIX_SOURCE_REPLICATION_CHECK,
+    SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_consistent_str, get_header,
     headers::{
         AMZ_CONTENT_SHA256, AMZ_DECODED_CONTENT_LENGTH, AMZ_MINIO_SNOWBALL_IGNORE_DIRS, AMZ_MINIO_SNOWBALL_IGNORE_ERRORS,
         AMZ_MINIO_SNOWBALL_PREFIX, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE,
@@ -224,6 +225,8 @@ pub(crate) use self::internal_put::*;
 pub(crate) use self::on_demand_migration_put::*;
 use self::put::*;
 pub(crate) use self::put::{guard_put_object_body_read_timeout, put_object_body_read_timeout};
+#[cfg(test)]
+pub(crate) use self::restore::RestoreStatusCommitBarrier;
 pub(crate) use self::shared::*;
 #[cfg(test)]
 use self::test_support::*;
@@ -241,7 +244,10 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{
+    OffsetDateTime,
+    format_description::well_known::{Rfc2822, Rfc3339},
+};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, RwLock};
 use tokio_tar::Archive;

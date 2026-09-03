@@ -213,6 +213,12 @@ impl SetDisks {
             }
             .to_string(),
         );
+        for suffix in [
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+        ] {
+            rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, suffix);
+        }
         self.invalidate_get_object_metadata_cache(bucket, object).await;
         ensure_restore_metadata_lock_held(bucket, object, opts, "restore_finalize_metadata")?;
         if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
@@ -291,11 +297,8 @@ impl SetDisks {
             .get_object_fileinfo_gated(bucket, object, &read_opts, false, false)
             .await?
             .into_owned();
-        if let Some(expected_operation_id) = expected_operation_id {
-            match restore_operation_id_from_metadata(&fi.metadata)? {
-                Some(actual_operation_id) if actual_operation_id == expected_operation_id => {}
-                _ => return Ok(()),
-            }
+        if restore_operation_id_from_metadata(&fi.metadata)? != expected_operation_id {
+            return Ok(());
         }
         if !expected.matches_file_info(&fi, &expected_etag) {
             return Ok(());
@@ -307,6 +310,10 @@ impl SetDisks {
         rustfs_utils::http::metadata_compat::remove_str(
             &mut fi.metadata,
             rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_OPERATION_ID,
+        );
+        rustfs_utils::http::metadata_compat::remove_str(
+            &mut fi.metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
         );
         if lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
             || decommission_object_lock_guard
