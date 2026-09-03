@@ -52,6 +52,7 @@ pub enum MetricSubsystem {
     Notification,
     Scanner,
     Compression,
+    OnDemandMigration,
 
     // Custom paths
     Custom(String),
@@ -95,6 +96,7 @@ impl MetricSubsystem {
             Self::Notification => "/notification",
             Self::Scanner => "/scanner",
             Self::Compression => "/compression",
+            Self::OnDemandMigration => "/on-demand-migration",
 
             // Custom paths
             Self::Custom(path) => path,
@@ -143,6 +145,7 @@ impl MetricSubsystem {
             "/notification" => Self::Notification,
             "/scanner" => Self::Scanner,
             "/compression" => Self::Compression,
+            "/on-demand-migration" => Self::OnDemandMigration,
 
             // Treat other paths as custom subsystems
             _ => Self::Custom(path.to_string()),
@@ -204,6 +207,7 @@ pub mod subsystems {
     pub const NOTIFICATION: MetricSubsystem = MetricSubsystem::Notification;
     pub const SCANNER: MetricSubsystem = MetricSubsystem::Scanner;
     pub const COMPRESSION: MetricSubsystem = MetricSubsystem::Compression;
+    pub const ON_DEMAND_MIGRATION: MetricSubsystem = MetricSubsystem::OnDemandMigration;
 }
 
 #[cfg(test)]
@@ -218,6 +222,8 @@ mod tests {
         assert_eq!(MetricSubsystem::SystemNetworkHost.as_str(), "system_network_host");
         assert_eq!(MetricSubsystem::BucketApi.as_str(), "bucket_api");
         assert_eq!(MetricSubsystem::ClusterHealth.as_str(), "cluster_health");
+        assert_eq!(MetricSubsystem::OnDemandMigration.as_str(), "on_demand_migration");
+        assert_eq!(MetricSubsystem::from_path("/on-demand-migration"), MetricSubsystem::OnDemandMigration);
 
         // Test custom paths
         let custom = MetricSubsystem::new("/custom/path-test");

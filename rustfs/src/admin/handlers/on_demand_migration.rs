@@ -18,8 +18,12 @@
 //! pulled on first access. This module is the management plane only:
 //! `PUT`/`GET`/`DELETE /v3/on-demand-migration/{bucket}` configure, read and
 //! clear the source, `?dry-run=true` validates and probes without saving, and
-//! `GET .../status` reports the switch state. The data plane, counters and
-//! backfill live in later ODM tasks and extend the same routes.
+//! `GET .../status` reports the switch state, this node's runtime snapshot
+//! of the bucket (breaker, counters, last source error) and a summary of the
+//! backfill job. `POST .../backfill?op=start|cancel` and `GET .../backfill`
+//! drive the background backfill job (ODM-12, rustfs/backlog#2159) through
+//! the process-wide `BackfillRunner`; the checkpoint document is the wire
+//! shape.
 //!
 //! Credentials in the request body are never echoed: every response carries
 //! the `redacted()` config, probe failures name only the error class, and no
@@ -34,11 +38,14 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
 use crate::admin::storage_api::bucket::metadata_sys;
+use crate::admin::storage_api::bucket::on_demand_migration::backfill::{
+    BackfillCheckpoint, BackfillError, BackfillRequest, BackfillState, SkipExisting, global_backfill_runner,
+};
 use crate::admin::storage_api::bucket::on_demand_migration::source_client::{
     SourceClient, SourceClientSpec, SourceError, SourceProbe, SourceProvider, SourceTimeouts,
 };
 use crate::admin::storage_api::bucket::on_demand_migration::{
-    OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, ValidationContext,
+    OdmBucketSnapshot, OnDemandMigrationConfig, OnDemandMigrationConfigError, OnDemandMigrationSys, PathStyle, ValidationContext,
 };
 use crate::admin::storage_api::bucket::remote_s3_client::{PathStyle as RemotePathStyle, RemoteCredentials, RemoteS3ClientError};
 use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketOptions};
@@ -53,7 +60,8 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,7 +75,12 @@ const EVENT_ADMIN_ON_DEMAND_MIGRATION_CONFIG: &str = "admin_bucket_on_demand_mig
 
 const ROUTE_PATH: &str = "/v3/on-demand-migration/{bucket}";
 const STATUS_ROUTE_PATH: &str = "/v3/on-demand-migration/{bucket}/status";
+const BACKFILL_ROUTE_PATH: &str = "/v3/on-demand-migration/{bucket}/backfill";
 const DRY_RUN_QUERY: &str = "dry-run";
+/// `POST .../backfill?op=` selector.
+const BACKFILL_OP_QUERY: &str = "op";
+const BACKFILL_OP_START: &str = "start";
+const BACKFILL_OP_CANCEL: &str = "cancel";
 
 /// Error code returned when the module switch is off and a write is attempted.
 pub(crate) const ERR_CODE_MODULE_DISABLED: &str = "OnDemandMigrationDisabled";
@@ -75,6 +88,10 @@ pub(crate) const ERR_CODE_MODULE_DISABLED: &str = "OnDemandMigrationDisabled";
 pub(crate) const ERR_CODE_SOURCE_UNREACHABLE: &str = "OnDemandMigrationSourceUnreachable";
 /// Error code returned by `GET` when the bucket has no configuration.
 pub(crate) const ERR_CODE_NO_SUCH_CONFIGURATION: &str = "NoSuchConfiguration";
+/// Error code (409) returned by `start` while a backfill job holds the lease.
+pub(crate) const ERR_CODE_BACKFILL_RUNNING: &str = "OnDemandMigrationBackfillRunning";
+/// Error code (404) returned when the bucket never had a backfill job.
+pub(crate) const ERR_CODE_NO_SUCH_BACKFILL_JOB: &str = "NoSuchBackfillJob";
 
 /// The published switch is `RUSTFS_ON_DEMAND_MIGRATION_ENABLED`, owned by
 /// ODM-05 in `module_switches.rs`. This is the only read of it in the admin
@@ -123,17 +140,200 @@ pub(crate) struct GetBucketOnDemandMigrationResponse {
     pub updated_at: String,
 }
 
+/// `GET .../status` body. Field order and `null` handling are pinned by the
+/// `rustfs-madmin` fixture. Runtime fields are `null` while the bucket has no
+/// live state on this node; `provider` and `endpoint_host` then fall back to
+/// the saved config so a disabled module still shows what is configured.
 #[derive(Debug, Serialize)]
 pub(crate) struct BucketOnDemandMigrationStatus {
     pub configured: bool,
     pub enabled: bool,
     pub module_enabled: bool,
+    pub provider: Option<String>,
+    pub endpoint_host: Option<String>,
+    pub breaker: Option<BreakerStatus>,
+    pub counters: Option<RuntimeCounters>,
+    pub last_source_error: Option<LastSourceErrorStatus>,
+    pub inflight_pulls: u64,
+    pub queue_depth: u64,
+    /// `source_hit / (source_hit + local GETs)`. The API request metrics
+    /// count per operation, not per bucket, and the runtime only sees
+    /// misses, so there is no per-bucket GET total to divide by: this stays
+    /// `null` rather than reporting a made-up 0.
+    pub served_by_source_ratio: Option<f64>,
+    /// RFC 3339 save time of the config; `null` when not configured.
+    pub updated_at: Option<String>,
+    /// Latest backfill job of the bucket, absent when none was ever started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill: Option<BackfillSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BreakerStatus {
+    pub state: &'static str,
+    /// The runtime snapshot does not carry the breaker's open instant yet
+    /// (it is a monotonic clock reading inside ecstore), so this is `null`.
+    pub opened_at: Option<String>,
+}
+
+/// Lifetime counters of the bucket's runtime on this node, keyed by the
+/// fixed label values of the Prometheus series with the same names.
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeCounters {
+    pub requests_total: BTreeMap<String, BTreeMap<String, u64>>,
+    pub pulled_bytes_total: u64,
+    pub pulled_objects_total: BTreeMap<String, u64>,
+    pub pull_failures_total: BTreeMap<String, u64>,
+    pub source_latency: SourceLatencyStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SourceLatencyStatus {
+    pub buckets: Vec<LatencyBucketStatus>,
+    pub count: u64,
+    pub sum_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct LatencyBucketStatus {
+    pub le_ms: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct LastSourceErrorStatus {
+    pub class: String,
+    pub at: String,
+}
+
+/// Host of the configured source endpoint, matching the runtime's
+/// `endpoint_host` so the status reads the same with or without live state.
+fn config_endpoint_host(config: &OnDemandMigrationConfig) -> Option<String> {
+    url::Url::parse(&config.source.effective_endpoint())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+fn bucket_status(
+    config: Option<(&OnDemandMigrationConfig, OffsetDateTime)>,
+    runtime: Option<OdmBucketSnapshot>,
+    module_enabled: bool,
+) -> S3Result<BucketOnDemandMigrationStatus> {
+    let updated_at = config.map(|(_, updated_at)| format_updated_at(updated_at)).transpose()?;
+    let mut status = BucketOnDemandMigrationStatus {
+        configured: config.is_some(),
+        enabled: config.is_some_and(|(config, _)| config.enabled),
+        module_enabled,
+        provider: config.map(|(config, _)| config.source.provider.as_str().to_string()),
+        endpoint_host: config.and_then(|(config, _)| config_endpoint_host(config)),
+        breaker: None,
+        counters: None,
+        last_source_error: None,
+        inflight_pulls: 0,
+        queue_depth: 0,
+        served_by_source_ratio: None,
+        updated_at,
+        backfill: None,
+    };
+    let Some(runtime) = runtime else {
+        return Ok(status);
+    };
+    let stats = runtime.stats;
+    status.provider = Some(runtime.provider);
+    status.endpoint_host = Some(runtime.endpoint_host);
+    status.breaker = Some(BreakerStatus {
+        state: stats.breaker_state.as_str(),
+        opened_at: None,
+    });
+    status.counters = Some(RuntimeCounters {
+        requests_total: stats.requests_total,
+        pulled_bytes_total: stats.pulled_bytes_total,
+        pulled_objects_total: stats.pulled_objects_total,
+        pull_failures_total: stats.pull_failures_total,
+        source_latency: SourceLatencyStatus {
+            buckets: stats
+                .source_latency
+                .buckets
+                .into_iter()
+                .map(|bucket| LatencyBucketStatus {
+                    le_ms: bucket.le_ms,
+                    count: bucket.count,
+                })
+                .collect(),
+            count: stats.source_latency.count,
+            sum_ms: stats.source_latency.sum_ms,
+        },
+    });
+    status.last_source_error = stats
+        .last_source_error
+        .map(|error| {
+            Ok::<_, S3Error>(LastSourceErrorStatus {
+                class: error.class,
+                at: format_updated_at(error.at)?,
+            })
+        })
+        .transpose()?;
+    status.inflight_pulls = stats.inflight_pulls;
+    status.queue_depth = stats.queue_depth;
+    Ok(status)
+}
+
+/// Counters of the bucket's backfill job for the status endpoint.
+#[derive(Debug, Serialize)]
+pub(crate) struct BackfillSummary {
+    pub job_id: String,
+    pub state: BackfillState,
+    pub listed: u64,
+    pub enqueued: u64,
+    pub pulled: u64,
+    pub skipped_existing: u64,
+    pub failed: u64,
+    pub bytes: u64,
+    pub updated_at: String,
+}
+
+impl BackfillSummary {
+    fn from_checkpoint(checkpoint: &BackfillCheckpoint) -> S3Result<Self> {
+        Ok(Self {
+            job_id: checkpoint.job_id.to_string(),
+            state: checkpoint.state,
+            listed: checkpoint.listed,
+            enqueued: checkpoint.enqueued,
+            pulled: checkpoint.pulled,
+            skipped_existing: checkpoint.skipped_existing,
+            failed: checkpoint.failed,
+            bytes: checkpoint.bytes,
+            updated_at: format_updated_at(checkpoint.updated_at)?,
+        })
+    }
+}
+
+/// Body of `POST .../backfill?op=start`; every field is optional.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BackfillStartRequest {
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// `always` (default) or `etag_or_size`.
+    #[serde(default)]
+    pub skip_existing: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST`/`GET .../backfill` response: the checkpoint document as stored.
+#[derive(Debug, Serialize)]
+pub(crate) struct BackfillJobResponse {
+    pub bucket: String,
+    pub job: BackfillCheckpoint,
 }
 
 pub struct SetBucketOnDemandMigrationHandler;
 pub struct GetBucketOnDemandMigrationHandler;
 pub struct DeleteBucketOnDemandMigrationHandler;
 pub struct GetBucketOnDemandMigrationStatusHandler;
+pub struct ControlBucketOnDemandMigrationBackfillHandler;
+pub struct GetBucketOnDemandMigrationBackfillHandler;
 
 pub fn register_on_demand_migration_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -155,6 +355,16 @@ pub fn register_on_demand_migration_route(r: &mut S3Router<AdminOperation>) -> s
         Method::GET,
         format!("{ADMIN_PREFIX}{STATUS_ROUTE_PATH}").as_str(),
         AdminOperation(&GetBucketOnDemandMigrationStatusHandler {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{ADMIN_PREFIX}{BACKFILL_ROUTE_PATH}").as_str(),
+        AdminOperation(&ControlBucketOnDemandMigrationBackfillHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}{BACKFILL_ROUTE_PATH}").as_str(),
+        AdminOperation(&GetBucketOnDemandMigrationBackfillHandler {}),
     )?;
     Ok(())
 }
@@ -226,6 +436,87 @@ fn is_dry_run(req: &S3Request<Body>) -> bool {
     extract_query_params(&req.uri)
         .get(DRY_RUN_QUERY)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+/// What `POST .../backfill` was asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackfillOp {
+    Start,
+    Cancel,
+}
+
+fn backfill_op(req: &S3Request<Body>) -> S3Result<BackfillOp> {
+    match extract_query_params(&req.uri).get(BACKFILL_OP_QUERY).map(String::as_str) {
+        Some(BACKFILL_OP_START) => Ok(BackfillOp::Start),
+        Some(BACKFILL_OP_CANCEL) => Ok(BackfillOp::Cancel),
+        _ => Err(admin_s3_error(
+            S3ErrorCode::InvalidArgument,
+            format!("query parameter {BACKFILL_OP_QUERY} must be {BACKFILL_OP_START} or {BACKFILL_OP_CANCEL}"),
+        )),
+    }
+}
+
+/// An empty body means "defaults"; unknown fields and unknown
+/// `skip_existing` labels are input errors.
+fn parse_backfill_request(body: &[u8]) -> S3Result<BackfillRequest> {
+    let request: BackfillStartRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        BackfillStartRequest::default()
+    } else {
+        serde_json::from_slice(body)
+            .map_err(|err| admin_s3_error(S3ErrorCode::InvalidArgument, format!("invalid backfill request: {err}")))?
+    };
+    let skip_existing = match request.skip_existing.as_deref() {
+        None => SkipExisting::default(),
+        Some(label) => SkipExisting::parse(label).ok_or_else(|| {
+            admin_s3_error(
+                S3ErrorCode::InvalidArgument,
+                format!("skip_existing must be always or etag_or_size, got {label}"),
+            )
+        })?,
+    };
+    let prefix = request.prefix.filter(|prefix| !prefix.is_empty());
+    Ok(BackfillRequest {
+        prefix,
+        skip_existing,
+        dry_run: request.dry_run,
+    })
+}
+
+/// Runner errors onto HTTP: a held lease is a 409, a missing job a 404, a
+/// missing or disabled config the same codes the config routes use.
+fn backfill_error(bucket: &str, err: BackfillError) -> S3Error {
+    match err {
+        BackfillError::AlreadyRunning { job_id, owner, .. } => custom_error(
+            ERR_CODE_BACKFILL_RUNNING,
+            StatusCode::CONFLICT,
+            format!("a backfill job is already running for bucket {bucket} (job {job_id}, owner {owner})"),
+        ),
+        BackfillError::LeaseBusy(_) | BackfillError::Conflict(_) => custom_error(
+            ERR_CODE_BACKFILL_RUNNING,
+            StatusCode::CONFLICT,
+            format!("the backfill job of bucket {bucket} is being started or updated elsewhere; retry"),
+        ),
+        BackfillError::NotFound(_) => custom_error(
+            ERR_CODE_NO_SUCH_BACKFILL_JOB,
+            StatusCode::NOT_FOUND,
+            format!("no backfill job recorded for bucket {bucket}"),
+        ),
+        BackfillError::NotConfigured(_) => custom_error(
+            ERR_CODE_NO_SUCH_CONFIGURATION,
+            StatusCode::NOT_FOUND,
+            format!("on-demand migration is not configured for bucket {bucket}"),
+        ),
+        BackfillError::Unavailable(_) => custom_error(
+            ERR_CODE_MODULE_DISABLED,
+            StatusCode::BAD_REQUEST,
+            format!("bucket {bucket} has no enabled on-demand migration source on this node"),
+        ),
+        BackfillError::RunnerNotInstalled => admin_s3_error(S3ErrorCode::InternalError, "backfill runner is not installed"),
+        BackfillError::Malformed(_) | BackfillError::UnsupportedFormatVersion { .. } => {
+            admin_s3_error(S3ErrorCode::InternalError, format!("backfill checkpoint unreadable: {err}"))
+        }
+        BackfillError::Storage(_) => admin_s3_error(S3ErrorCode::InternalError, format!("backfill checkpoint failed: {err}")),
+    }
 }
 
 /// Every endpoint of this deployment, as `scheme://host:port`, so a source
@@ -540,13 +831,99 @@ impl Operation for GetBucketOnDemandMigrationStatusHandler {
         let config = metadata_sys::get_on_demand_migration_config(&bucket).await.map_err(|err| {
             admin_s3_error(S3ErrorCode::InternalError, format!("failed to read on-demand migration config: {err}"))
         })?;
+        let runtime = OnDemandMigrationSys::get().bucket_snapshot(&bucket);
 
-        let status = BucketOnDemandMigrationStatus {
-            configured: config.is_some(),
-            enabled: config.is_some_and(|(config, _)| config.enabled),
-            module_enabled: module_enabled(),
+        let backfill = match global_backfill_runner() {
+            Some(runner) => runner
+                .status(&bucket)
+                .await
+                .map_err(|err| backfill_error(&bucket, err))?
+                .map(|checkpoint| BackfillSummary::from_checkpoint(&checkpoint))
+                .transpose()?,
+            None => None,
         };
+
+        let mut status = bucket_status(
+            config.as_ref().map(|(config, updated_at)| (config, *updated_at)),
+            runtime,
+            module_enabled(),
+        )?;
+        status.backfill = backfill;
         admin_json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &status)
+    }
+}
+
+#[async_trait::async_trait]
+impl Operation for ControlBucketOnDemandMigrationBackfillHandler {
+    #[tracing::instrument(skip_all)]
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let bucket = bucket_from_params(&params)?;
+        let cred = authorize_for_bucket(&req, AdminAction::SetBucketOnDemandMigrationAction, &bucket).await?;
+        let op = backfill_op(&req)?;
+        let path = req.uri.path().to_string();
+        let runner = global_backfill_runner().ok_or_else(|| backfill_error(&bucket, BackfillError::RunnerNotInstalled))?;
+
+        let job = match op {
+            BackfillOp::Start => {
+                if !module_enabled() {
+                    return Err(custom_error(
+                        ERR_CODE_MODULE_DISABLED,
+                        StatusCode::BAD_REQUEST,
+                        format!("on-demand migration is disabled: set {ENV_ON_DEMAND_MIGRATION_ENABLED}=true"),
+                    ));
+                }
+                license_gate()?;
+                let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &cred.secret_key).await?;
+                let request = parse_backfill_request(&body)?;
+                let job = runner
+                    .start(&bucket, request)
+                    .await
+                    .map_err(|err| backfill_error(&bucket, err))?;
+                info!(
+                    event = EVENT_ADMIN_ON_DEMAND_MIGRATION_CONFIG,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
+                    bucket = %bucket,
+                    job_id = %job.job_id,
+                    dry_run = job.dry_run,
+                    skip_existing = job.skip_existing.as_str(),
+                    "on-demand migration backfill started"
+                );
+                job
+            }
+            BackfillOp::Cancel => {
+                let job = runner.cancel(&bucket).await.map_err(|err| backfill_error(&bucket, err))?;
+                info!(
+                    event = EVENT_ADMIN_ON_DEMAND_MIGRATION_CONFIG,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
+                    bucket = %bucket,
+                    job_id = %job.job_id,
+                    state = job.state.as_str(),
+                    "on-demand migration backfill cancel requested"
+                );
+                job
+            }
+        };
+        let response = BackfillJobResponse { bucket, job };
+        admin_json_response(&path, &cred.secret_key, StatusCode::OK, &response)
+    }
+}
+
+#[async_trait::async_trait]
+impl Operation for GetBucketOnDemandMigrationBackfillHandler {
+    #[tracing::instrument(skip_all)]
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let bucket = bucket_from_params(&params)?;
+        let cred = authorize_for_bucket(&req, AdminAction::GetBucketOnDemandMigrationAction, &bucket).await?;
+        let runner = global_backfill_runner().ok_or_else(|| backfill_error(&bucket, BackfillError::RunnerNotInstalled))?;
+        let job = runner
+            .status(&bucket)
+            .await
+            .map_err(|err| backfill_error(&bucket, err))?
+            .ok_or_else(|| backfill_error(&bucket, BackfillError::NotFound(bucket.clone())))?;
+        let response = BackfillJobResponse { bucket, job };
+        admin_json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -569,6 +946,9 @@ mod tests {
     const SET_RESPONSE_FIXTURE: &str = include_str!("../../../../crates/madmin/fixtures/on_demand_migration/set_response.json");
     const GET_RESPONSE_FIXTURE: &str = include_str!("../../../../crates/madmin/fixtures/on_demand_migration/get_response.json");
     const STATUS_FIXTURE: &str = include_str!("../../../../crates/madmin/fixtures/on_demand_migration/status.json");
+    const STATUS_WITH_BACKFILL_FIXTURE: &str =
+        include_str!("../../../../crates/madmin/fixtures/on_demand_migration/status_with_backfill.json");
+    const BACKFILL_JOB_FIXTURE: &str = include_str!("../../../../crates/madmin/fixtures/on_demand_migration/backfill_job.json");
     const FIXTURE_UPDATED_AT: &str = "2026-09-02T10:00:00Z";
 
     fn fixture_config() -> OnDemandMigrationConfig {
@@ -633,14 +1013,208 @@ mod tests {
         assert_eq!(serde_json::to_string(&response).expect("serialize"), GET_RESPONSE_FIXTURE.trim());
     }
 
+    /// The runtime snapshot the ecstore golden test (`snapshot_matches_golden_json`)
+    /// produces, as this node would hand it to the status route.
+    fn fixture_runtime_snapshot() -> OdmBucketSnapshot {
+        let fixture: serde_json::Value = serde_json::from_str(STATUS_FIXTURE.trim()).expect("status fixture parses");
+        let counters = &fixture["counters"];
+        let snapshot = serde_json::json!({
+            "bucket": "photos",
+            "provider": fixture["provider"],
+            "endpoint_host": fixture["endpoint_host"],
+            "applied_at": FIXTURE_UPDATED_AT,
+            "client_error": null,
+            "negative_cache_entries": 0,
+            "inflight_keys": 1,
+            "max_concurrent_pulls": 8,
+            "stats": {
+                "requests_total": counters["requests_total"],
+                "pulled_bytes_total": counters["pulled_bytes_total"],
+                "pulled_objects_total": counters["pulled_objects_total"],
+                "pull_failures_total": counters["pull_failures_total"],
+                "inflight_pulls": fixture["inflight_pulls"],
+                "queue_depth": fixture["queue_depth"],
+                "source_latency": counters["source_latency"],
+                "last_source_error": fixture["last_source_error"],
+                "breaker_state": fixture["breaker"]["state"],
+            }
+        });
+        serde_json::from_value(snapshot).expect("runtime snapshot decodes")
+    }
+
     #[test]
     fn status_matches_madmin_golden_fixture() {
-        let status = BucketOnDemandMigrationStatus {
-            configured: true,
-            enabled: true,
-            module_enabled: false,
+        let config = fixture_config();
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_788_343_200).expect("timestamp");
+        let status = bucket_status(Some((&config, updated_at)), Some(fixture_runtime_snapshot()), true).expect("status");
+        let json = serde_json::to_string(&status).expect("serialize");
+        assert_eq!(json, STATUS_FIXTURE.trim());
+        assert!(json.contains(r#""served_by_source_ratio":null"#), "the ratio field is present as null");
+        assert!(status.backfill.is_none(), "a bucket without a job carries no summary");
+    }
+
+    #[test]
+    fn status_without_runtime_state_describes_the_config_and_nulls_the_runtime() {
+        let config = fixture_config();
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_788_343_200).expect("timestamp");
+        let status = bucket_status(Some((&config, updated_at)), None, false).expect("status");
+        assert_eq!(
+            serde_json::to_value(&status).expect("serialize"),
+            serde_json::json!({
+                "configured": true,
+                "enabled": true,
+                "module_enabled": false,
+                "provider": "minio",
+                "endpoint_host": "source.example.com",
+                "breaker": null,
+                "counters": null,
+                "last_source_error": null,
+                "inflight_pulls": 0,
+                "queue_depth": 0,
+                "served_by_source_ratio": null,
+                "updated_at": FIXTURE_UPDATED_AT,
+            })
+        );
+
+        let status = bucket_status(None, None, true).expect("status");
+        assert_eq!(
+            serde_json::to_value(&status).expect("serialize"),
+            serde_json::json!({
+                "configured": false,
+                "enabled": false,
+                "module_enabled": true,
+                "provider": null,
+                "endpoint_host": null,
+                "breaker": null,
+                "counters": null,
+                "last_source_error": null,
+                "inflight_pulls": 0,
+                "queue_depth": 0,
+                "served_by_source_ratio": null,
+                "updated_at": null,
+            })
+        );
+    }
+
+    #[test]
+    fn config_endpoint_host_matches_the_runtime_host_rule() {
+        let mut config = fixture_config();
+        assert_eq!(config_endpoint_host(&config).as_deref(), Some("source.example.com"));
+        config.source.endpoint = Some("https://Bucket.S3.Example:9000/base".to_string());
+        assert_eq!(config_endpoint_host(&config).as_deref(), Some("bucket.s3.example"));
+    }
+
+    fn fixture_job() -> BackfillCheckpoint {
+        let value: serde_json::Value = serde_json::from_str(BACKFILL_JOB_FIXTURE.trim()).expect("fixture parses");
+        BackfillCheckpoint::from_json(value["job"].to_string().as_bytes()).expect("fixture job decodes")
+    }
+
+    #[test]
+    fn backfill_job_response_matches_madmin_golden_fixture() {
+        let response = BackfillJobResponse {
+            bucket: "photos".to_string(),
+            job: fixture_job(),
         };
-        assert_eq!(serde_json::to_string(&status).expect("serialize"), STATUS_FIXTURE.trim());
+        assert_eq!(serde_json::to_string(&response).expect("serialize"), BACKFILL_JOB_FIXTURE.trim());
+    }
+
+    #[test]
+    fn status_with_backfill_summary_matches_madmin_golden_fixture() {
+        let config = fixture_config();
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_788_343_200).expect("timestamp");
+        let mut status = bucket_status(Some((&config, updated_at)), Some(fixture_runtime_snapshot()), true).expect("status");
+        status.backfill = Some(BackfillSummary::from_checkpoint(&fixture_job()).expect("summary"));
+        assert_eq!(serde_json::to_string(&status).expect("serialize"), STATUS_WITH_BACKFILL_FIXTURE.trim());
+    }
+
+    #[test]
+    fn backfill_request_defaults_validates_skip_existing_and_rejects_unknown_fields() {
+        assert_eq!(parse_backfill_request(b"").expect("empty body"), BackfillRequest::default());
+        assert_eq!(parse_backfill_request(b"  \n").expect("blank body"), BackfillRequest::default());
+        assert_eq!(parse_backfill_request(b"{}").expect("empty object"), BackfillRequest::default());
+        let full = parse_backfill_request(br#"{"prefix":"photos/","skip_existing":"etag_or_size","dry_run":true}"#)
+            .expect("full request");
+        assert_eq!(
+            full,
+            BackfillRequest {
+                prefix: Some("photos/".to_string()),
+                skip_existing: SkipExisting::EtagOrSize,
+                dry_run: true,
+            }
+        );
+        assert_eq!(
+            parse_backfill_request(br#"{"prefix":""}"#).expect("empty prefix").prefix,
+            None,
+            "an empty prefix means no prefix"
+        );
+        let err = parse_backfill_request(br#"{"skip_existing":"never"}"#).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert!(err.message().unwrap_or_default().contains("etag_or_size"));
+        let err = parse_backfill_request(br#"{"bogus":1}"#).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert!(err.message().unwrap_or_default().contains("bogus"));
+    }
+
+    #[test]
+    fn backfill_op_requires_start_or_cancel() {
+        let request = |uri: &'static str| S3Request {
+            input: Body::empty(),
+            method: Method::POST,
+            uri: Uri::from_static(uri),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        assert_eq!(
+            backfill_op(&request("/rustfs/admin/v3/on-demand-migration/b/backfill?op=start")).expect("start"),
+            BackfillOp::Start
+        );
+        assert_eq!(
+            backfill_op(&request("/rustfs/admin/v3/on-demand-migration/b/backfill?op=cancel")).expect("cancel"),
+            BackfillOp::Cancel
+        );
+        for uri in [
+            "/rustfs/admin/v3/on-demand-migration/b/backfill",
+            "/rustfs/admin/v3/on-demand-migration/b/backfill?op=pause",
+            "/rustfs/admin/v3/on-demand-migration/b/backfill?op=START",
+        ] {
+            assert_eq!(backfill_op(&request(uri)).unwrap_err().code(), &S3ErrorCode::InvalidArgument, "{uri}");
+        }
+    }
+
+    #[test]
+    fn backfill_errors_map_to_conflict_not_found_and_config_codes() {
+        let running = backfill_error(
+            "b",
+            BackfillError::AlreadyRunning {
+                bucket: "b".to_string(),
+                job_id: fixture_job().job_id,
+                owner: "node-a:9000".to_string(),
+            },
+        );
+        assert_eq!(running.status_code(), Some(StatusCode::CONFLICT));
+        assert_eq!(running.code(), &S3ErrorCode::Custom(ERR_CODE_BACKFILL_RUNNING.into()));
+        assert!(running.message().unwrap_or_default().contains("node-a:9000"));
+
+        let busy = backfill_error("b", BackfillError::LeaseBusy("b".to_string()));
+        assert_eq!(busy.status_code(), Some(StatusCode::CONFLICT));
+
+        let missing = backfill_error("b", BackfillError::NotFound("b".to_string()));
+        assert_eq!(missing.status_code(), Some(StatusCode::NOT_FOUND));
+        assert_eq!(missing.code(), &S3ErrorCode::Custom(ERR_CODE_NO_SUCH_BACKFILL_JOB.into()));
+
+        let unconfigured = backfill_error("b", BackfillError::NotConfigured("b".to_string()));
+        assert_eq!(unconfigured.code(), &S3ErrorCode::Custom(ERR_CODE_NO_SUCH_CONFIGURATION.into()));
+
+        let unavailable = backfill_error("b", BackfillError::Unavailable("b".to_string()));
+        assert_eq!(unavailable.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(unavailable.code(), &S3ErrorCode::Custom(ERR_CODE_MODULE_DISABLED.into()));
+
+        let broken = backfill_error("b", BackfillError::UnsupportedFormatVersion { found: 9, supported: 1 });
+        assert_eq!(broken.code(), &S3ErrorCode::InternalError);
     }
 
     #[test]
@@ -903,6 +1477,12 @@ mod store_tests {
         Ok(response_json(response).await)
     }
 
+    fn assert_status_switches(status: &Value, configured: bool, enabled: bool, module_enabled: bool) {
+        assert_eq!(status["configured"], Value::Bool(configured), "{status}");
+        assert_eq!(status["enabled"], Value::Bool(enabled), "{status}");
+        assert_eq!(status["module_enabled"], Value::Bool(module_enabled), "{status}");
+    }
+
     async fn status() -> Value {
         let router = bucket_router();
         let response = GetBucketOnDemandMigrationStatusHandler {}
@@ -1057,10 +1637,11 @@ mod store_tests {
             let err = get_config().await.expect_err("nothing is configured yet");
             assert_eq!(err.code(), &S3ErrorCode::Custom(ERR_CODE_NO_SUCH_CONFIGURATION.into()));
             assert_eq!(err.status_code(), Some(StatusCode::NOT_FOUND));
-            assert_eq!(
-                status().await,
-                serde_json::json!({"configured": false, "enabled": false, "module_enabled": false})
-            );
+            let body = status().await;
+            assert_status_switches(&body, false, false, false);
+            assert_eq!(body["provider"], Value::Null);
+            assert_eq!(body["counters"], Value::Null);
+            assert_eq!(body["updated_at"], Value::Null);
         })
         .await;
 
@@ -1147,10 +1728,14 @@ mod store_tests {
                 assert_eq!(body["config"]["source"]["credentials"]["secret_key"], Value::String("REDACTED".into()));
                 assert_eq!(body["config"]["source"]["credentials"]["access_key"], Value::String("AKIASOURCE".into()));
                 assert_eq!(body["updated_at"], Value::String(first_updated_at.clone()));
-                assert_eq!(
-                    status().await,
-                    serde_json::json!({"configured": true, "enabled": true, "module_enabled": true})
-                );
+                let body = status().await;
+                assert_status_switches(&body, true, true, true);
+                assert_eq!(body["provider"], Value::String("minio".into()));
+                assert_eq!(body["endpoint_host"], Value::String("127.0.0.1".into()));
+                assert_eq!(body["updated_at"], Value::String(first_updated_at.clone()));
+                assert_eq!(body["served_by_source_ratio"], Value::Null, "no per-bucket GET total exists");
+                assert_eq!(body["inflight_pulls"], Value::from(0));
+                assert_eq!(body["queue_depth"], Value::from(0));
 
                 // The peer fan-out ran: the single unreachable peer is reported.
                 let context = crate::admin::runtime_sources::current_app_context();
@@ -1215,10 +1800,11 @@ mod store_tests {
                 let metadata = metadata_sys::get(BUCKET).await.expect("bucket metadata");
                 assert!(metadata.on_demand_migration_config_json.is_empty());
                 assert!(metadata.on_demand_migration_config_updated_at > OffsetDateTime::UNIX_EPOCH);
-                assert_eq!(
-                    status().await,
-                    serde_json::json!({"configured": false, "enabled": false, "module_enabled": true})
-                );
+                let body = status().await;
+                assert_status_switches(&body, false, false, true);
+                assert_eq!(body["provider"], Value::Null);
+                assert_eq!(body["breaker"], Value::Null);
+                assert_eq!(body["updated_at"], Value::Null);
 
                 let response = DeleteBucketOnDemandMigrationHandler {}
                     .call(root_request(Method::DELETE, config_uri(""), Vec::new()), bucket_params(&router))

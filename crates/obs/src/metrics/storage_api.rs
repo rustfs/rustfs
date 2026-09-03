@@ -17,6 +17,13 @@ use std::time::Duration;
 
 pub(crate) use rustfs_ecstore::api::bucket::bandwidth::monitor::Monitor as ObsBucketBandwidthMonitor;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::get_quota_config as obs_get_quota_config;
+use rustfs_ecstore::api::bucket::on_demand_migration::backfill::{
+    BackfillCheckpoint as SourceBackfillCheckpoint, global_backfill_runner as source_global_backfill_runner,
+};
+use rustfs_ecstore::api::bucket::on_demand_migration::{
+    BreakerState as SourceOdmBreakerState, OdmBucketSnapshot as SourceOdmBucketSnapshot,
+    OnDemandMigrationSys as SourceOnDemandMigrationSys,
+};
 use rustfs_ecstore::api::bucket::replication::{
     BucketReplicationStats as SourceBucketReplicationStats, DurableMrfBucketBacklog, DurableMrfTargetBacklog,
     MrfBucketBacklogObservability, RuntimeReplicationTargetBacklog, durable_mrf_backlog_summary_snapshot,
@@ -36,6 +43,10 @@ pub(crate) use rustfs_ecstore::api::runtime::{
 };
 pub(crate) use rustfs_ecstore::api::storage::ECStore as ObsStore;
 use rustfs_storage_api as storage_contracts;
+
+use crate::metrics::collectors::{
+    OdmBackfillBucketStats, OdmBackfillRuntimeStats, OnDemandMigrationBreakerState, OnDemandMigrationBucketStats,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ObsBucketReplicationTargetStatsSnapshot {
@@ -454,6 +465,74 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
     buckets
 }
 
+fn on_demand_migration_stats_from_snapshot(snapshot: SourceOdmBucketSnapshot) -> OnDemandMigrationBucketStats {
+    let stats = snapshot.stats;
+    OnDemandMigrationBucketStats {
+        bucket: snapshot.bucket,
+        requests_total: stats.requests_total,
+        pulled_bytes_total: stats.pulled_bytes_total,
+        pulled_objects_total: stats.pulled_objects_total,
+        pull_failures_total: stats.pull_failures_total,
+        inflight_pulls: stats.inflight_pulls,
+        queue_depth: stats.queue_depth,
+        source_latency_buckets: stats
+            .source_latency
+            .buckets
+            .into_iter()
+            .map(|bucket| (bucket.le_ms, bucket.count))
+            .collect(),
+        source_latency_count: stats.source_latency.count,
+        source_latency_sum_ms: stats.source_latency.sum_ms,
+        breaker_state: match stats.breaker_state {
+            SourceOdmBreakerState::Closed => OnDemandMigrationBreakerState::Closed,
+            SourceOdmBreakerState::HalfOpen => OnDemandMigrationBreakerState::HalfOpen,
+            SourceOdmBreakerState::Open => OnDemandMigrationBreakerState::Open,
+        },
+    }
+}
+
+/// Every bucket with live on-demand migration state on this node, sorted by
+/// name. Empty while the module switch is off.
+pub(crate) fn obs_on_demand_migration_snapshot() -> Vec<OnDemandMigrationBucketStats> {
+    SourceOnDemandMigrationSys::get()
+        .snapshot()
+        .into_iter()
+        .map(on_demand_migration_stats_from_snapshot)
+        .collect()
+}
+
+fn on_demand_migration_backfill_stats_from_checkpoint(
+    bucket: String,
+    checkpoint: SourceBackfillCheckpoint,
+) -> OdmBackfillBucketStats {
+    OdmBackfillBucketStats {
+        bucket,
+        state: checkpoint.state.as_str().to_string(),
+        listed: checkpoint.listed,
+        enqueued: checkpoint.enqueued,
+        pulled: checkpoint.pulled,
+        skipped_existing: checkpoint.skipped_existing,
+        failed: checkpoint.failed,
+        bytes: checkpoint.bytes,
+    }
+}
+
+/// Backfill jobs running on this node, sorted by bucket. Empty until the
+/// runner is installed, and empty again once a job finishes: the series are
+/// per-node job progress, not a cluster-wide history.
+pub(crate) fn obs_on_demand_migration_backfill_snapshot(server: String) -> OdmBackfillRuntimeStats {
+    let buckets = source_global_backfill_runner()
+        .map(|runner| {
+            runner
+                .local_job_snapshots()
+                .into_iter()
+                .map(|(bucket, checkpoint)| on_demand_migration_backfill_stats_from_checkpoint(bucket, checkpoint))
+                .collect()
+        })
+        .unwrap_or_default();
+    OdmBackfillRuntimeStats { server, buckets }
+}
+
 pub(crate) async fn obs_replication_site_stats_snapshot(current_data_transfer_rate: f64) -> ObsReplicationSiteStatsSnapshot {
     let Some(stats) = get_global_replication_stats() else {
         return ObsReplicationSiteStatsSnapshot::default();
@@ -694,6 +773,51 @@ mod tests {
     }
 
     #[test]
+    fn on_demand_migration_snapshot_projects_counters_and_breaker_state() {
+        // Built from JSON: the snapshot's timestamps use `time`, which obs does not depend on.
+        let snapshot: SourceOdmBucketSnapshot = serde_json::from_value(serde_json::json!({
+            "bucket": "photos",
+            "provider": "minio",
+            "endpoint_host": "source.example.com",
+            "applied_at": "2026-09-02T10:00:00Z",
+            "client_error": null,
+            "negative_cache_entries": 0,
+            "inflight_keys": 1,
+            "max_concurrent_pulls": 8,
+            "stats": {
+                "requests_total": {"get": {"source_hit": 2}},
+                "pulled_bytes_total": 4096,
+                "pulled_objects_total": {"inline": 1},
+                "pull_failures_total": {"source_timeout": 1},
+                "inflight_pulls": 1,
+                "queue_depth": 2,
+                "source_latency": {
+                    "buckets": [{"le_ms": 5, "count": 1}, {"le_ms": 10, "count": 2}],
+                    "count": 3,
+                    "sum_ms": 90753
+                },
+                "last_source_error": {"class": "server_error", "at": "2026-09-02T10:00:00Z"},
+                "breaker_state": "open"
+            }
+        }))
+        .expect("runtime snapshot decodes");
+
+        let stats = on_demand_migration_stats_from_snapshot(snapshot);
+
+        assert_eq!(stats.bucket, "photos");
+        assert_eq!(stats.requests_total["get"]["source_hit"], 2);
+        assert_eq!(stats.pulled_bytes_total, 4096);
+        assert_eq!(stats.pulled_objects_total["inline"], 1);
+        assert_eq!(stats.pull_failures_total["source_timeout"], 1);
+        assert_eq!(stats.inflight_pulls, 1);
+        assert_eq!(stats.queue_depth, 2);
+        assert_eq!(stats.source_latency_buckets, vec![(5, 1), (10, 2)]);
+        assert_eq!(stats.source_latency_count, 3);
+        assert_eq!(stats.source_latency_sum_ms, 90_753);
+        assert_eq!(stats.breaker_state, OnDemandMigrationBreakerState::Open);
+    }
+
+    #[test]
     fn bucket_replication_snapshot_preserves_durable_mrf_unavailable_state() {
         let snapshot = bucket_replication_stats_snapshot_from_parts(
             "runtime-only".to_string(),
@@ -721,7 +845,8 @@ pub(crate) mod metrics {
         ObsBucketBandwidthMonitor, ObsBucketReplicationStatsSnapshot, ObsEcstoreResult, ObsStore,
         obs_bucket_replication_stats_snapshot, obs_expiry_state_handle, obs_get_global_bucket_monitor, obs_get_quota_config,
         obs_get_total_usable_capacity, obs_get_total_usable_capacity_free, obs_is_disk_compression_enabled,
-        obs_load_compression_total_from_memory, obs_load_data_usage_from_backend, obs_replication_site_stats_snapshot,
-        obs_resolve_object_store_handle, obs_transition_state_handle,
+        obs_load_compression_total_from_memory, obs_load_data_usage_from_backend, obs_on_demand_migration_backfill_snapshot,
+        obs_on_demand_migration_snapshot, obs_replication_site_stats_snapshot, obs_resolve_object_store_handle,
+        obs_transition_state_handle,
     };
 }

@@ -20,9 +20,11 @@
 //! clients guarded by a breaker, a negative cache, singleflight and a pull
 //! concurrency limit (rustfs/backlog#2147).
 
+pub mod backfill;
 pub mod breaker;
 pub mod config;
 pub mod negative_cache;
+pub mod pull;
 pub mod source_client;
 pub mod stats;
 pub mod sys;
@@ -37,6 +39,11 @@ pub use config::{
     SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
 };
 pub use negative_cache::{NEGATIVE_CACHE_MAX_ENTRIES, NegativeCache};
+pub use pull::{
+    EnqueueOutcome, LocalObject, MAX_MULTIPART_PARTS, OdmWriteBack, PULL_MAX_RETRIES, PULL_RETRY_BASE_DELAYS, PullCompletion,
+    PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, WriteBackBody, WriteBackError, WriteBackOutcome,
+    WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with,
+};
 pub use stats::{
     GaugeGuard, LastSourceError, LatencyBucketSnapshot, OdmOp, OdmOutcome, OdmStats, OdmStatsSnapshot, PullFailureReason,
     PullPath, SOURCE_LATENCY_BUCKET_BOUNDS_MS, SourceLatencySnapshot,

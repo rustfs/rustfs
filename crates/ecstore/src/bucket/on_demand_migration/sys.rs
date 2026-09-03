@@ -35,12 +35,17 @@
 //! The module switch (`RUSTFS_ON_DEMAND_MIGRATION_ENABLED`, default off) is
 //! injected by the `rustfs` binary through [`OnDemandMigrationSys::set_module_enabled`]
 //! before bucket metadata loads; this crate never reads the environment.
+//! The same startup step injects the [`OdmWriteBack`] the pull pipeline
+//! (`pull.rs`) stores objects with; each bucket state captures it at build
+//! time together with its lazily started [`PullQueue`].
 
+use super::backfill::{PriorityPullPermits, PullPermit, PullPriority};
 use super::breaker::{Breaker, BreakerState, BreakerTransition, BreakerVerdict};
 use super::config::{
     ON_DEMAND_MIGRATION_CONFIG_HOOK, OnDemandMigrationConfig, PathStyle as ConfigPathStyle, Provider, SourceConfig,
 };
 use super::negative_cache::NegativeCache;
+use super::pull::{OdmWriteBack, PullQueue};
 use super::source_client::{SourceClient, SourceClientSpec, SourceError, SourceProvider, SourceTimeouts};
 use super::stats::{GaugeGuard, OdmStats, OdmStatsSnapshot, PullFailureReason};
 use crate::bucket::remote_s3_client::{PathStyle as ClientPathStyle, RemoteCredentials, RemoteS3ClientError};
@@ -53,7 +58,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -178,7 +183,7 @@ pub struct PullLeader {
     state: Arc<BucketOdmState>,
     key: String,
     tx: watch::Sender<Option<PullResult>>,
-    _permit: OwnedSemaphorePermit,
+    _permit: PullPermit,
     _inflight: GaugeGuard,
     completed: bool,
 }
@@ -265,10 +270,14 @@ pub struct BucketOdmState {
     breaker: Breaker,
     negative_cache: NegativeCache,
     inflight: Mutex<HashMap<String, watch::Receiver<Option<PullResult>>>>,
-    pull_semaphore: Arc<Semaphore>,
+    /// Online misses first, backfill pulls when nobody waits (ODM-12).
+    pull_permits: Arc<PriorityPullPermits>,
     stats: Arc<OdmStats>,
     cancel: CancellationToken,
     last_source_error_logged_at: Mutex<Option<Instant>>,
+    write_back: Option<Arc<dyn OdmWriteBack>>,
+    /// Started by `pull::BucketOdmState::pull_queue` on first enqueue.
+    pub(super) pull_queue: OnceLock<Arc<PullQueue>>,
 }
 
 impl fmt::Debug for BucketOdmState {
@@ -286,7 +295,12 @@ impl fmt::Debug for BucketOdmState {
 }
 
 impl BucketOdmState {
-    async fn build(bucket: &str, config: &OnDemandMigrationConfig, stats: Arc<OdmStats>) -> Arc<Self> {
+    async fn build(
+        bucket: &str,
+        config: &OnDemandMigrationConfig,
+        stats: Arc<OdmStats>,
+        write_back: Option<Arc<dyn OdmWriteBack>>,
+    ) -> Arc<Self> {
         let spec = source_client_spec(config);
         let client = if config.source.credentials.is_none() {
             Err(OdmStateError::AnonymousUnsupported)
@@ -306,10 +320,12 @@ impl BucketOdmState {
             breaker: Breaker::new(),
             negative_cache: NegativeCache::new(Duration::from_secs(policy.negative_cache_ttl_secs)),
             inflight: Mutex::new(HashMap::new()),
-            pull_semaphore: Arc::new(Semaphore::new(policy.max_concurrent_pulls.max(1) as usize)),
+            pull_permits: PriorityPullPermits::new(policy.max_concurrent_pulls.max(1) as usize),
             stats,
             cancel: CancellationToken::new(),
             last_source_error_logged_at: Mutex::new(None),
+            write_back,
+            pull_queue: OnceLock::new(),
         })
     }
 
@@ -344,6 +360,11 @@ impl BucketOdmState {
 
     pub fn stats(&self) -> &Arc<OdmStats> {
         &self.stats
+    }
+
+    /// The write-back injected by the binary when this state was built.
+    pub fn write_back(&self) -> Option<&Arc<dyn OdmWriteBack>> {
+        self.write_back.as_ref()
     }
 
     /// Fires when this state is replaced or removed; background pulls
@@ -458,6 +479,16 @@ impl BucketOdmState {
     /// later callers for the same key become followers and never touch the
     /// semaphore. Fails with `Canceled` when the state is torn down.
     pub async fn acquire_pull_slot(self: &Arc<Self>, key: &str) -> Result<PullSlot, PullError> {
+        self.acquire_pull_slot_with_priority(key, PullPriority::Online).await
+    }
+
+    /// [`Self::acquire_pull_slot`] at the given permit priority; the pull
+    /// queue passes `Backfill` for backfill jobs.
+    pub async fn acquire_pull_slot_with_priority(
+        self: &Arc<Self>,
+        key: &str,
+        priority: PullPriority,
+    ) -> Result<PullSlot, PullError> {
         if self.cancel.is_cancelled() {
             return Err(PullError::canceled("bucket on-demand migration state was removed"));
         }
@@ -480,7 +511,7 @@ impl BucketOdmState {
         let permit = {
             let _queued = self.stats.queue_guard();
             tokio::select! {
-                permit = Arc::clone(&self.pull_semaphore).acquire_owned() => permit,
+                permit = self.pull_permits.acquire(priority) => permit,
                 _ = self.cancel.cancelled() => {
                     return Err(PullError::canceled("bucket on-demand migration state was removed"));
                 }
@@ -503,6 +534,10 @@ impl BucketOdmState {
     /// Keys currently being pulled (leader registered).
     pub fn inflight_keys(&self) -> usize {
         self.inflight.lock().len()
+    }
+
+    pub fn pull_permits(&self) -> &Arc<PriorityPullPermits> {
+        &self.pull_permits
     }
 
     pub fn snapshot(&self) -> OdmBucketSnapshot {
@@ -601,6 +636,7 @@ pub struct OnDemandMigrationSys {
     module_enabled: AtomicBool,
     buckets: RwLock<HashMap<String, BucketSlot>>,
     generation: AtomicU64,
+    write_back: RwLock<Option<Arc<dyn OdmWriteBack>>>,
 }
 
 impl fmt::Debug for OnDemandMigrationSys {
@@ -625,6 +661,7 @@ impl OnDemandMigrationSys {
             module_enabled: AtomicBool::new(false),
             buckets: RwLock::new(HashMap::new()),
             generation: AtomicU64::new(0),
+            write_back: RwLock::new(None),
         }
     }
 
@@ -639,6 +676,17 @@ impl OnDemandMigrationSys {
 
     pub fn is_module_enabled(&self) -> bool {
         self.module_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Installs the local write path used by every bucket state built from
+    /// now on (states built earlier keep what they captured). The binary
+    /// calls this before bucket metadata loads.
+    pub fn set_write_back(&self, write_back: Arc<dyn OdmWriteBack>) {
+        *self.write_back.write() = Some(write_back);
+    }
+
+    pub fn write_back(&self) -> Option<Arc<dyn OdmWriteBack>> {
+        self.write_back.read().clone()
     }
 
     /// Registers `publish` as the bucket-metadata publish hook. Returns
@@ -701,7 +749,7 @@ impl OnDemandMigrationSys {
             return ApplyOutcome::Unchanged;
         }
         let stats = self.state(bucket).map(|state| Arc::clone(&state.stats)).unwrap_or_default();
-        let state = BucketOdmState::build(bucket, config, stats).await;
+        let state = BucketOdmState::build(bucket, config, stats, self.write_back()).await;
 
         let (outcome, previous) = {
             let mut buckets = self.buckets.write();

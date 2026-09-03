@@ -159,6 +159,22 @@ pub mod bucket {
             OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, PolicyConfig, Provider, RangeGetPolicy,
             SourceConfig, SourceCredentials, SourceErrorPolicy, SourceTimeout, TlsConfig, ValidationContext,
         };
+        pub use crate::bucket::on_demand_migration::{
+            EnqueueOutcome, LocalObject, MAX_MULTIPART_PARTS, OdmWriteBack, PULL_MAX_RETRIES, PULL_RETRY_BASE_DELAYS,
+            PullCompletion, PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, WriteBackBody, WriteBackError,
+            WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with,
+        };
+        pub mod backfill {
+            pub use crate::bucket::on_demand_migration::backfill::{
+                BACKFILL_CHECKPOINT_FILE, BACKFILL_CHECKPOINT_FORMAT_VERSION, BACKFILL_FAILED_KEYS_CAPACITY, BACKFILL_LEASE,
+                BACKFILL_LEASE_LOCK_PREFIX, BACKFILL_LIST_PAGE_SIZE, BACKFILL_RECOVERY_INTERVAL, BACKFILL_SAVE_EVERY_KEYS,
+                BACKFILL_SAVE_INTERVAL, BackfillCheckpoint, BackfillContext, BackfillContextFactory, BackfillError,
+                BackfillLastError, BackfillOwner, BackfillRecoveryStats, BackfillRequest, BackfillRunner, BackfillState,
+                BucketBackfillContext, LocalBackfillObject, PriorityPullPermits, PullPermit, PullPriority, SkipExisting,
+                StoredCheckpoint, SysBackfillContexts, global_backfill_runner, install_global_backfill_runner, key_hash,
+                read_checkpoint, run_backfill_recovery_loop, spawn_backfill_recovery_loop,
+            };
+        }
         pub mod source_client {
             pub use crate::bucket::on_demand_migration::source_client::{
                 SourceClient, SourceClientSpec, SourceError, SourceGet, SourceHead, SourceObject, SourcePage, SourceProbe,

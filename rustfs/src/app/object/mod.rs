@@ -191,10 +191,8 @@ mod delete;
 mod extract;
 mod get;
 mod head;
-// Consumed by the on-demand migration write-back (rustfs/backlog#2153); until
-// that lands only tests construct the internal entry points.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired by the on-demand migration write-back"))]
 mod internal_put;
+mod on_demand_migration_put;
 mod put;
 mod restore;
 mod shared;
@@ -207,6 +205,7 @@ pub(crate) use self::delete::*;
 pub(crate) use self::extract::*;
 pub(crate) use self::get::*;
 pub(crate) use self::internal_put::*;
+pub(crate) use self::on_demand_migration_put::*;
 use self::put::*;
 pub(crate) use self::put::{guard_put_object_body_read_timeout, put_object_body_read_timeout};
 pub(crate) use self::shared::*;
