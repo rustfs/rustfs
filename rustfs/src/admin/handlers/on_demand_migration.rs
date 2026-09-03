@@ -18,9 +18,12 @@
 //! pulled on first access. This module is the management plane only:
 //! `PUT`/`GET`/`DELETE /v3/on-demand-migration/{bucket}` configure, read and
 //! clear the source, `?dry-run=true` validates and probes without saving, and
-//! `GET .../status` reports the switch state plus this node's runtime
-//! snapshot of the bucket (breaker, counters, last source error). The data
-//! plane and backfill live in other ODM tasks.
+//! `GET .../status` reports the switch state, this node's runtime snapshot
+//! of the bucket (breaker, counters, last source error) and a summary of the
+//! backfill job. `POST .../backfill?op=start|cancel` and `GET .../backfill`
+//! drive the background backfill job (ODM-12, rustfs/backlog#2159) through
+//! the process-wide `BackfillRunner`; the checkpoint document is the wire
+//! shape.
 //!
 //! Credentials in the request body are never echoed: every response carries
 //! the `redacted()` config, probe failures name only the error class, and no
@@ -35,6 +38,9 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::bucket::metadata::BUCKET_ON_DEMAND_MIGRATION_CONFIG;
 use crate::admin::storage_api::bucket::metadata_sys;
+use crate::admin::storage_api::bucket::on_demand_migration::backfill::{
+    BackfillCheckpoint, BackfillError, BackfillRequest, BackfillState, SkipExisting, global_backfill_runner,
+};
 use crate::admin::storage_api::bucket::on_demand_migration::source_client::{
     SourceClient, SourceClientSpec, SourceError, SourceProbe, SourceProvider, SourceTimeouts,
 };
@@ -54,7 +60,7 @@ use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -69,7 +75,12 @@ const EVENT_ADMIN_ON_DEMAND_MIGRATION_CONFIG: &str = "admin_bucket_on_demand_mig
 
 const ROUTE_PATH: &str = "/v3/on-demand-migration/{bucket}";
 const STATUS_ROUTE_PATH: &str = "/v3/on-demand-migration/{bucket}/status";
+const BACKFILL_ROUTE_PATH: &str = "/v3/on-demand-migration/{bucket}/backfill";
 const DRY_RUN_QUERY: &str = "dry-run";
+/// `POST .../backfill?op=` selector.
+const BACKFILL_OP_QUERY: &str = "op";
+const BACKFILL_OP_START: &str = "start";
+const BACKFILL_OP_CANCEL: &str = "cancel";
 
 /// Error code returned when the module switch is off and a write is attempted.
 pub(crate) const ERR_CODE_MODULE_DISABLED: &str = "OnDemandMigrationDisabled";
@@ -77,6 +88,10 @@ pub(crate) const ERR_CODE_MODULE_DISABLED: &str = "OnDemandMigrationDisabled";
 pub(crate) const ERR_CODE_SOURCE_UNREACHABLE: &str = "OnDemandMigrationSourceUnreachable";
 /// Error code returned by `GET` when the bucket has no configuration.
 pub(crate) const ERR_CODE_NO_SUCH_CONFIGURATION: &str = "NoSuchConfiguration";
+/// Error code (409) returned by `start` while a backfill job holds the lease.
+pub(crate) const ERR_CODE_BACKFILL_RUNNING: &str = "OnDemandMigrationBackfillRunning";
+/// Error code (404) returned when the bucket never had a backfill job.
+pub(crate) const ERR_CODE_NO_SUCH_BACKFILL_JOB: &str = "NoSuchBackfillJob";
 
 /// The published switch is `RUSTFS_ON_DEMAND_MIGRATION_ENABLED`, owned by
 /// ODM-05 in `module_switches.rs`. This is the only read of it in the admin
@@ -148,6 +163,9 @@ pub(crate) struct BucketOnDemandMigrationStatus {
     pub served_by_source_ratio: Option<f64>,
     /// RFC 3339 save time of the config; `null` when not configured.
     pub updated_at: Option<String>,
+    /// Latest backfill job of the bucket, absent when none was ever started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill: Option<BackfillSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +233,7 @@ fn bucket_status(
         queue_depth: 0,
         served_by_source_ratio: None,
         updated_at,
+        backfill: None,
     };
     let Some(runtime) = runtime else {
         return Ok(status);
@@ -259,10 +278,62 @@ fn bucket_status(
     Ok(status)
 }
 
+/// Counters of the bucket's backfill job for the status endpoint.
+#[derive(Debug, Serialize)]
+pub(crate) struct BackfillSummary {
+    pub job_id: String,
+    pub state: BackfillState,
+    pub listed: u64,
+    pub enqueued: u64,
+    pub pulled: u64,
+    pub skipped_existing: u64,
+    pub failed: u64,
+    pub bytes: u64,
+    pub updated_at: String,
+}
+
+impl BackfillSummary {
+    fn from_checkpoint(checkpoint: &BackfillCheckpoint) -> S3Result<Self> {
+        Ok(Self {
+            job_id: checkpoint.job_id.to_string(),
+            state: checkpoint.state,
+            listed: checkpoint.listed,
+            enqueued: checkpoint.enqueued,
+            pulled: checkpoint.pulled,
+            skipped_existing: checkpoint.skipped_existing,
+            failed: checkpoint.failed,
+            bytes: checkpoint.bytes,
+            updated_at: format_updated_at(checkpoint.updated_at)?,
+        })
+    }
+}
+
+/// Body of `POST .../backfill?op=start`; every field is optional.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BackfillStartRequest {
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// `always` (default) or `etag_or_size`.
+    #[serde(default)]
+    pub skip_existing: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// `POST`/`GET .../backfill` response: the checkpoint document as stored.
+#[derive(Debug, Serialize)]
+pub(crate) struct BackfillJobResponse {
+    pub bucket: String,
+    pub job: BackfillCheckpoint,
+}
+
 pub struct SetBucketOnDemandMigrationHandler;
 pub struct GetBucketOnDemandMigrationHandler;
 pub struct DeleteBucketOnDemandMigrationHandler;
 pub struct GetBucketOnDemandMigrationStatusHandler;
+pub struct ControlBucketOnDemandMigrationBackfillHandler;
+pub struct GetBucketOnDemandMigrationBackfillHandler;
 
 pub fn register_on_demand_migration_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -284,6 +355,16 @@ pub fn register_on_demand_migration_route(r: &mut S3Router<AdminOperation>) -> s
         Method::GET,
         format!("{ADMIN_PREFIX}{STATUS_ROUTE_PATH}").as_str(),
         AdminOperation(&GetBucketOnDemandMigrationStatusHandler {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{ADMIN_PREFIX}{BACKFILL_ROUTE_PATH}").as_str(),
+        AdminOperation(&ControlBucketOnDemandMigrationBackfillHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{ADMIN_PREFIX}{BACKFILL_ROUTE_PATH}").as_str(),
+        AdminOperation(&GetBucketOnDemandMigrationBackfillHandler {}),
     )?;
     Ok(())
 }
@@ -355,6 +436,87 @@ fn is_dry_run(req: &S3Request<Body>) -> bool {
     extract_query_params(&req.uri)
         .get(DRY_RUN_QUERY)
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+/// What `POST .../backfill` was asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackfillOp {
+    Start,
+    Cancel,
+}
+
+fn backfill_op(req: &S3Request<Body>) -> S3Result<BackfillOp> {
+    match extract_query_params(&req.uri).get(BACKFILL_OP_QUERY).map(String::as_str) {
+        Some(BACKFILL_OP_START) => Ok(BackfillOp::Start),
+        Some(BACKFILL_OP_CANCEL) => Ok(BackfillOp::Cancel),
+        _ => Err(admin_s3_error(
+            S3ErrorCode::InvalidArgument,
+            format!("query parameter {BACKFILL_OP_QUERY} must be {BACKFILL_OP_START} or {BACKFILL_OP_CANCEL}"),
+        )),
+    }
+}
+
+/// An empty body means "defaults"; unknown fields and unknown
+/// `skip_existing` labels are input errors.
+fn parse_backfill_request(body: &[u8]) -> S3Result<BackfillRequest> {
+    let request: BackfillStartRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        BackfillStartRequest::default()
+    } else {
+        serde_json::from_slice(body)
+            .map_err(|err| admin_s3_error(S3ErrorCode::InvalidArgument, format!("invalid backfill request: {err}")))?
+    };
+    let skip_existing = match request.skip_existing.as_deref() {
+        None => SkipExisting::default(),
+        Some(label) => SkipExisting::parse(label).ok_or_else(|| {
+            admin_s3_error(
+                S3ErrorCode::InvalidArgument,
+                format!("skip_existing must be always or etag_or_size, got {label}"),
+            )
+        })?,
+    };
+    let prefix = request.prefix.filter(|prefix| !prefix.is_empty());
+    Ok(BackfillRequest {
+        prefix,
+        skip_existing,
+        dry_run: request.dry_run,
+    })
+}
+
+/// Runner errors onto HTTP: a held lease is a 409, a missing job a 404, a
+/// missing or disabled config the same codes the config routes use.
+fn backfill_error(bucket: &str, err: BackfillError) -> S3Error {
+    match err {
+        BackfillError::AlreadyRunning { job_id, owner, .. } => custom_error(
+            ERR_CODE_BACKFILL_RUNNING,
+            StatusCode::CONFLICT,
+            format!("a backfill job is already running for bucket {bucket} (job {job_id}, owner {owner})"),
+        ),
+        BackfillError::LeaseBusy(_) | BackfillError::Conflict(_) => custom_error(
+            ERR_CODE_BACKFILL_RUNNING,
+            StatusCode::CONFLICT,
+            format!("the backfill job of bucket {bucket} is being started or updated elsewhere; retry"),
+        ),
+        BackfillError::NotFound(_) => custom_error(
+            ERR_CODE_NO_SUCH_BACKFILL_JOB,
+            StatusCode::NOT_FOUND,
+            format!("no backfill job recorded for bucket {bucket}"),
+        ),
+        BackfillError::NotConfigured(_) => custom_error(
+            ERR_CODE_NO_SUCH_CONFIGURATION,
+            StatusCode::NOT_FOUND,
+            format!("on-demand migration is not configured for bucket {bucket}"),
+        ),
+        BackfillError::Unavailable(_) => custom_error(
+            ERR_CODE_MODULE_DISABLED,
+            StatusCode::BAD_REQUEST,
+            format!("bucket {bucket} has no enabled on-demand migration source on this node"),
+        ),
+        BackfillError::RunnerNotInstalled => admin_s3_error(S3ErrorCode::InternalError, "backfill runner is not installed"),
+        BackfillError::Malformed(_) | BackfillError::UnsupportedFormatVersion { .. } => {
+            admin_s3_error(S3ErrorCode::InternalError, format!("backfill checkpoint unreadable: {err}"))
+        }
+        BackfillError::Storage(_) => admin_s3_error(S3ErrorCode::InternalError, format!("backfill checkpoint failed: {err}")),
+    }
 }
 
 /// Every endpoint of this deployment, as `scheme://host:port`, so a source
@@ -671,12 +833,97 @@ impl Operation for GetBucketOnDemandMigrationStatusHandler {
         })?;
         let runtime = OnDemandMigrationSys::get().bucket_snapshot(&bucket);
 
-        let status = bucket_status(
+        let backfill = match global_backfill_runner() {
+            Some(runner) => runner
+                .status(&bucket)
+                .await
+                .map_err(|err| backfill_error(&bucket, err))?
+                .map(|checkpoint| BackfillSummary::from_checkpoint(&checkpoint))
+                .transpose()?,
+            None => None,
+        };
+
+        let mut status = bucket_status(
             config.as_ref().map(|(config, updated_at)| (config, *updated_at)),
             runtime,
             module_enabled(),
         )?;
+        status.backfill = backfill;
         admin_json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &status)
+    }
+}
+
+#[async_trait::async_trait]
+impl Operation for ControlBucketOnDemandMigrationBackfillHandler {
+    #[tracing::instrument(skip_all)]
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let bucket = bucket_from_params(&params)?;
+        let cred = authorize_for_bucket(&req, AdminAction::SetBucketOnDemandMigrationAction, &bucket).await?;
+        let op = backfill_op(&req)?;
+        let path = req.uri.path().to_string();
+        let runner = global_backfill_runner().ok_or_else(|| backfill_error(&bucket, BackfillError::RunnerNotInstalled))?;
+
+        let job = match op {
+            BackfillOp::Start => {
+                if !module_enabled() {
+                    return Err(custom_error(
+                        ERR_CODE_MODULE_DISABLED,
+                        StatusCode::BAD_REQUEST,
+                        format!("on-demand migration is disabled: set {ENV_ON_DEMAND_MIGRATION_ENABLED}=true"),
+                    ));
+                }
+                license_gate()?;
+                let body = read_compatible_admin_body(req.input, MAX_ADMIN_REQUEST_BODY_SIZE, &path, &cred.secret_key).await?;
+                let request = parse_backfill_request(&body)?;
+                let job = runner
+                    .start(&bucket, request)
+                    .await
+                    .map_err(|err| backfill_error(&bucket, err))?;
+                info!(
+                    event = EVENT_ADMIN_ON_DEMAND_MIGRATION_CONFIG,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
+                    bucket = %bucket,
+                    job_id = %job.job_id,
+                    dry_run = job.dry_run,
+                    skip_existing = job.skip_existing.as_str(),
+                    "on-demand migration backfill started"
+                );
+                job
+            }
+            BackfillOp::Cancel => {
+                let job = runner.cancel(&bucket).await.map_err(|err| backfill_error(&bucket, err))?;
+                info!(
+                    event = EVENT_ADMIN_ON_DEMAND_MIGRATION_CONFIG,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_ON_DEMAND_MIGRATION,
+                    bucket = %bucket,
+                    job_id = %job.job_id,
+                    state = job.state.as_str(),
+                    "on-demand migration backfill cancel requested"
+                );
+                job
+            }
+        };
+        let response = BackfillJobResponse { bucket, job };
+        admin_json_response(&path, &cred.secret_key, StatusCode::OK, &response)
+    }
+}
+
+#[async_trait::async_trait]
+impl Operation for GetBucketOnDemandMigrationBackfillHandler {
+    #[tracing::instrument(skip_all)]
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let bucket = bucket_from_params(&params)?;
+        let cred = authorize_for_bucket(&req, AdminAction::GetBucketOnDemandMigrationAction, &bucket).await?;
+        let runner = global_backfill_runner().ok_or_else(|| backfill_error(&bucket, BackfillError::RunnerNotInstalled))?;
+        let job = runner
+            .status(&bucket)
+            .await
+            .map_err(|err| backfill_error(&bucket, err))?
+            .ok_or_else(|| backfill_error(&bucket, BackfillError::NotFound(bucket.clone())))?;
+        let response = BackfillJobResponse { bucket, job };
+        admin_json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &response)
     }
 }
 
@@ -699,6 +946,9 @@ mod tests {
     const SET_RESPONSE_FIXTURE: &str = include_str!("../../../../crates/madmin/fixtures/on_demand_migration/set_response.json");
     const GET_RESPONSE_FIXTURE: &str = include_str!("../../../../crates/madmin/fixtures/on_demand_migration/get_response.json");
     const STATUS_FIXTURE: &str = include_str!("../../../../crates/madmin/fixtures/on_demand_migration/status.json");
+    const STATUS_WITH_BACKFILL_FIXTURE: &str =
+        include_str!("../../../../crates/madmin/fixtures/on_demand_migration/status_with_backfill.json");
+    const BACKFILL_JOB_FIXTURE: &str = include_str!("../../../../crates/madmin/fixtures/on_demand_migration/backfill_job.json");
     const FIXTURE_UPDATED_AT: &str = "2026-09-02T10:00:00Z";
 
     fn fixture_config() -> OnDemandMigrationConfig {
@@ -800,6 +1050,7 @@ mod tests {
         let json = serde_json::to_string(&status).expect("serialize");
         assert_eq!(json, STATUS_FIXTURE.trim());
         assert!(json.contains(r#""served_by_source_ratio":null"#), "the ratio field is present as null");
+        assert!(status.backfill.is_none(), "a bucket without a job carries no summary");
     }
 
     #[test]
@@ -851,6 +1102,119 @@ mod tests {
         assert_eq!(config_endpoint_host(&config).as_deref(), Some("source.example.com"));
         config.source.endpoint = Some("https://Bucket.S3.Example:9000/base".to_string());
         assert_eq!(config_endpoint_host(&config).as_deref(), Some("bucket.s3.example"));
+    }
+
+    fn fixture_job() -> BackfillCheckpoint {
+        let value: serde_json::Value = serde_json::from_str(BACKFILL_JOB_FIXTURE.trim()).expect("fixture parses");
+        BackfillCheckpoint::from_json(value["job"].to_string().as_bytes()).expect("fixture job decodes")
+    }
+
+    #[test]
+    fn backfill_job_response_matches_madmin_golden_fixture() {
+        let response = BackfillJobResponse {
+            bucket: "photos".to_string(),
+            job: fixture_job(),
+        };
+        assert_eq!(serde_json::to_string(&response).expect("serialize"), BACKFILL_JOB_FIXTURE.trim());
+    }
+
+    #[test]
+    fn status_with_backfill_summary_matches_madmin_golden_fixture() {
+        let config = fixture_config();
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_788_343_200).expect("timestamp");
+        let mut status = bucket_status(Some((&config, updated_at)), Some(fixture_runtime_snapshot()), true).expect("status");
+        status.backfill = Some(BackfillSummary::from_checkpoint(&fixture_job()).expect("summary"));
+        assert_eq!(serde_json::to_string(&status).expect("serialize"), STATUS_WITH_BACKFILL_FIXTURE.trim());
+    }
+
+    #[test]
+    fn backfill_request_defaults_validates_skip_existing_and_rejects_unknown_fields() {
+        assert_eq!(parse_backfill_request(b"").expect("empty body"), BackfillRequest::default());
+        assert_eq!(parse_backfill_request(b"  \n").expect("blank body"), BackfillRequest::default());
+        assert_eq!(parse_backfill_request(b"{}").expect("empty object"), BackfillRequest::default());
+        let full = parse_backfill_request(br#"{"prefix":"photos/","skip_existing":"etag_or_size","dry_run":true}"#)
+            .expect("full request");
+        assert_eq!(
+            full,
+            BackfillRequest {
+                prefix: Some("photos/".to_string()),
+                skip_existing: SkipExisting::EtagOrSize,
+                dry_run: true,
+            }
+        );
+        assert_eq!(
+            parse_backfill_request(br#"{"prefix":""}"#).expect("empty prefix").prefix,
+            None,
+            "an empty prefix means no prefix"
+        );
+        let err = parse_backfill_request(br#"{"skip_existing":"never"}"#).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert!(err.message().unwrap_or_default().contains("etag_or_size"));
+        let err = parse_backfill_request(br#"{"bogus":1}"#).unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert!(err.message().unwrap_or_default().contains("bogus"));
+    }
+
+    #[test]
+    fn backfill_op_requires_start_or_cancel() {
+        let request = |uri: &'static str| S3Request {
+            input: Body::empty(),
+            method: Method::POST,
+            uri: Uri::from_static(uri),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        assert_eq!(
+            backfill_op(&request("/rustfs/admin/v3/on-demand-migration/b/backfill?op=start")).expect("start"),
+            BackfillOp::Start
+        );
+        assert_eq!(
+            backfill_op(&request("/rustfs/admin/v3/on-demand-migration/b/backfill?op=cancel")).expect("cancel"),
+            BackfillOp::Cancel
+        );
+        for uri in [
+            "/rustfs/admin/v3/on-demand-migration/b/backfill",
+            "/rustfs/admin/v3/on-demand-migration/b/backfill?op=pause",
+            "/rustfs/admin/v3/on-demand-migration/b/backfill?op=START",
+        ] {
+            assert_eq!(backfill_op(&request(uri)).unwrap_err().code(), &S3ErrorCode::InvalidArgument, "{uri}");
+        }
+    }
+
+    #[test]
+    fn backfill_errors_map_to_conflict_not_found_and_config_codes() {
+        let running = backfill_error(
+            "b",
+            BackfillError::AlreadyRunning {
+                bucket: "b".to_string(),
+                job_id: fixture_job().job_id,
+                owner: "node-a:9000".to_string(),
+            },
+        );
+        assert_eq!(running.status_code(), Some(StatusCode::CONFLICT));
+        assert_eq!(running.code(), &S3ErrorCode::Custom(ERR_CODE_BACKFILL_RUNNING.into()));
+        assert!(running.message().unwrap_or_default().contains("node-a:9000"));
+
+        let busy = backfill_error("b", BackfillError::LeaseBusy("b".to_string()));
+        assert_eq!(busy.status_code(), Some(StatusCode::CONFLICT));
+
+        let missing = backfill_error("b", BackfillError::NotFound("b".to_string()));
+        assert_eq!(missing.status_code(), Some(StatusCode::NOT_FOUND));
+        assert_eq!(missing.code(), &S3ErrorCode::Custom(ERR_CODE_NO_SUCH_BACKFILL_JOB.into()));
+
+        let unconfigured = backfill_error("b", BackfillError::NotConfigured("b".to_string()));
+        assert_eq!(unconfigured.code(), &S3ErrorCode::Custom(ERR_CODE_NO_SUCH_CONFIGURATION.into()));
+
+        let unavailable = backfill_error("b", BackfillError::Unavailable("b".to_string()));
+        assert_eq!(unavailable.status_code(), Some(StatusCode::BAD_REQUEST));
+        assert_eq!(unavailable.code(), &S3ErrorCode::Custom(ERR_CODE_MODULE_DISABLED.into()));
+
+        let broken = backfill_error("b", BackfillError::UnsupportedFormatVersion { found: 9, supported: 1 });
+        assert_eq!(broken.code(), &S3ErrorCode::InternalError);
     }
 
     #[test]

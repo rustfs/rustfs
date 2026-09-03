@@ -21,10 +21,12 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::on_demand_migration::{
-    BREAKER_STATE_CLOSED, BREAKER_STATE_HALF_OPEN, BREAKER_STATE_OPEN, BUCKET_L, LE_L, ODM_BREAKER_STATE_MD,
-    ODM_INFLIGHT_PULLS_MD, ODM_PULL_FAILURES_TOTAL_MD, ODM_PULLED_BYTES_TOTAL_MD, ODM_PULLED_OBJECTS_TOTAL_MD,
-    ODM_QUEUE_DEPTH_MD, ODM_REQUESTS_TOTAL_MD, ODM_SOURCE_LATENCY_SECONDS_COUNT_MD, ODM_SOURCE_LATENCY_SECONDS_DISTRIBUTION_MD,
-    ODM_SOURCE_LATENCY_SECONDS_SUM_MD, OP_L, OUTCOME_L, PATH_L, REASON_L,
+    BREAKER_STATE_CLOSED, BREAKER_STATE_HALF_OPEN, BREAKER_STATE_OPEN, BUCKET_L, LE_L, ODM_BACKFILL_BYTES_MD,
+    ODM_BACKFILL_ENQUEUED_MD, ODM_BACKFILL_FAILED_MD, ODM_BACKFILL_JOBS_MD, ODM_BACKFILL_LISTED_MD, ODM_BACKFILL_PULLED_MD,
+    ODM_BACKFILL_SKIPPED_EXISTING_MD, ODM_BREAKER_STATE_MD, ODM_INFLIGHT_PULLS_MD, ODM_PULL_FAILURES_TOTAL_MD,
+    ODM_PULLED_BYTES_TOTAL_MD, ODM_PULLED_OBJECTS_TOTAL_MD, ODM_QUEUE_DEPTH_MD, ODM_REQUESTS_TOTAL_MD,
+    ODM_SOURCE_LATENCY_SECONDS_COUNT_MD, ODM_SOURCE_LATENCY_SECONDS_DISTRIBUTION_MD, ODM_SOURCE_LATENCY_SECONDS_SUM_MD, OP_L,
+    OUTCOME_L, PATH_L, REASON_L, SERVER_L, STATE_L,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -167,6 +169,48 @@ pub fn collect_on_demand_migration_metrics(stats: &[OnDemandMigrationBucketStats
         );
     }
 
+    metrics
+}
+
+/// Counters of one bucket's latest backfill job (ODM-12,
+/// rustfs/backlog#2159).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OdmBackfillBucketStats {
+    pub bucket: String,
+    /// Checkpoint state label (`running`, `completed`, ...).
+    pub state: String,
+    pub listed: u64,
+    pub enqueued: u64,
+    pub pulled: u64,
+    pub skipped_existing: u64,
+    pub failed: u64,
+    pub bytes: u64,
+}
+
+/// Backfill stats of every bucket with a checkpoint, labelled by node.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OdmBackfillRuntimeStats {
+    pub server: String,
+    pub buckets: Vec<OdmBackfillBucketStats>,
+}
+
+/// Seven series per bucket: the state gauge and six counters.
+pub fn collect_on_demand_migration_backfill_metrics(stats: &OdmBackfillRuntimeStats) -> Vec<PrometheusMetric> {
+    let mut metrics = Vec::with_capacity(stats.buckets.len() * 7);
+    for bucket in &stats.buckets {
+        let labelled = |descriptor: &'static std::sync::LazyLock<crate::MetricDescriptor>, value: u64| {
+            PrometheusMetric::from_descriptor(descriptor, value as f64)
+                .with_label_owned(SERVER_L, stats.server.clone())
+                .with_label_owned(BUCKET_L, bucket.bucket.clone())
+        };
+        metrics.push(labelled(&ODM_BACKFILL_JOBS_MD, 1).with_label_owned(STATE_L, bucket.state.clone()));
+        metrics.push(labelled(&ODM_BACKFILL_LISTED_MD, bucket.listed));
+        metrics.push(labelled(&ODM_BACKFILL_ENQUEUED_MD, bucket.enqueued));
+        metrics.push(labelled(&ODM_BACKFILL_PULLED_MD, bucket.pulled));
+        metrics.push(labelled(&ODM_BACKFILL_SKIPPED_EXISTING_MD, bucket.skipped_existing));
+        metrics.push(labelled(&ODM_BACKFILL_FAILED_MD, bucket.failed));
+        metrics.push(labelled(&ODM_BACKFILL_BYTES_MD, bucket.bytes));
+    }
     metrics
 }
 
@@ -353,5 +397,82 @@ pub(crate) mod tests {
     #[test]
     fn empty_snapshot_emits_nothing() {
         assert!(collect_on_demand_migration_metrics(&[]).is_empty());
+    }
+
+    /// One running and one completed job, as the scheduler would see them
+    /// from the local backfill runner.
+    pub(crate) fn backfill_golden_stats(server: &str) -> OdmBackfillRuntimeStats {
+        OdmBackfillRuntimeStats {
+            server: server.to_string(),
+            buckets: vec![
+                OdmBackfillBucketStats {
+                    bucket: "photos".to_string(),
+                    state: "running".to_string(),
+                    listed: 2000,
+                    enqueued: 1500,
+                    pulled: 1400,
+                    skipped_existing: 500,
+                    failed: 3,
+                    bytes: 73_400_320,
+                },
+                OdmBackfillBucketStats {
+                    bucket: "docs".to_string(),
+                    state: "completed".to_string(),
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    fn backfill_series<'a>(metrics: &'a [PrometheusMetric], name: &str, bucket: &str) -> Option<&'a PrometheusMetric> {
+        metrics.iter().find(|metric| {
+            metric.name == name
+                && metric
+                    .labels
+                    .iter()
+                    .any(|(label, value)| *label == BUCKET_L && value.as_ref() == bucket)
+        })
+    }
+
+    #[test]
+    fn backfill_collects_seven_series_per_bucket_with_the_odm_subsystem_prefix() {
+        let stats = backfill_golden_stats("node1:9000");
+        let metrics = collect_on_demand_migration_backfill_metrics(&stats);
+        assert_eq!(metrics.len(), 14);
+        assert!(
+            metrics
+                .iter()
+                .all(|metric| metric.name.starts_with("rustfs_on_demand_migration_backfill_"))
+        );
+        assert!(metrics.iter().all(|metric| {
+            metric
+                .labels
+                .iter()
+                .any(|(label, value)| *label == SERVER_L && value.as_ref() == "node1:9000")
+        }));
+
+        let jobs = backfill_series(&metrics, &ODM_BACKFILL_JOBS_MD.get_full_metric_name(), "photos").expect("jobs gauge");
+        assert_eq!(jobs.value, 1.0);
+        assert!(
+            jobs.labels
+                .iter()
+                .any(|(label, value)| *label == STATE_L && value.as_ref() == "running")
+        );
+        let listed = backfill_series(&metrics, &ODM_BACKFILL_LISTED_MD.get_full_metric_name(), "photos").expect("listed");
+        assert_eq!(listed.value, 2000.0);
+        let bytes = backfill_series(&metrics, &ODM_BACKFILL_BYTES_MD.get_full_metric_name(), "photos").expect("bytes");
+        assert_eq!(bytes.value, 73_400_320.0);
+        let docs_failed = backfill_series(&metrics, &ODM_BACKFILL_FAILED_MD.get_full_metric_name(), "docs").expect("docs failed");
+        assert_eq!(docs_failed.value, 0.0);
+        assert_eq!(
+            ODM_BACKFILL_LISTED_MD.get_full_metric_name(),
+            "rustfs_on_demand_migration_backfill_listed_total"
+        );
+    }
+
+    #[test]
+    fn backfill_no_buckets_means_no_series() {
+        let metrics = collect_on_demand_migration_backfill_metrics(&OdmBackfillRuntimeStats::default());
+        assert!(metrics.is_empty());
     }
 }

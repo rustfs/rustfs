@@ -70,7 +70,8 @@ pub use notification::{NotificationStats, collect_notification_metrics};
 pub(crate) use notification_target::{NotificationTargetRuntimeStats, collect_notification_target_runtime_metrics};
 pub use notification_target::{NotificationTargetStats, collect_notification_target_metrics};
 pub use on_demand_migration::{
-    OnDemandMigrationBreakerState, OnDemandMigrationBucketStats, collect_on_demand_migration_metrics, source_latency_le_label,
+    OdmBackfillBucketStats, OdmBackfillRuntimeStats, OnDemandMigrationBreakerState, OnDemandMigrationBucketStats,
+    collect_on_demand_migration_backfill_metrics, collect_on_demand_migration_metrics, source_latency_le_label,
 };
 pub use replication::{ReplicationMetricsSnapshot, collect_replication_metrics};
 pub(crate) use replication::{ReplicationRuntimeStats, collect_replication_runtime_metrics};

@@ -40,6 +40,7 @@
 //! oversized body therefore fails the local write before it can commit,
 //! independently of the digest check the write-back performs.
 
+use super::backfill::PullPriority;
 use super::source_client::{SourceClient, SourceError, SourceHead};
 use super::stats::{PullFailureReason, PullPath};
 use super::sys::{BucketOdmState, OnDemandMigrationSys, PullError, PullOutcome, PullSlot};
@@ -57,7 +58,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
@@ -108,6 +109,27 @@ impl PullReason {
             PullReason::Backfill => PullPath::Backfill,
         }
     }
+
+    /// Backfill pulls yield pull permits to online requests.
+    pub fn priority(self) -> PullPriority {
+        match self {
+            PullReason::RangeGet | PullReason::LargeObject => PullPriority::Online,
+            PullReason::Backfill => PullPriority::Backfill,
+        }
+    }
+}
+
+/// How one queued pull ended, delivered to the requester that asked for a
+/// report (the backfill job counts these).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueuedPullOutcome {
+    /// A new local object of `size` bytes was written.
+    Stored {
+        size: u64,
+    },
+    /// A current local version already existed; nothing was pulled.
+    AlreadyPresent,
+    Failed(PullError),
 }
 
 /// Result of [`PullQueue::enqueue`].
@@ -731,6 +753,8 @@ pub async fn commit_inline_with(
 struct PullJob {
     key: String,
     reason: PullReason,
+    /// Dropped without a send when the job is cancelled before it runs.
+    report: Option<oneshot::Sender<QueuedPullOutcome>>,
 }
 
 /// Bounded per-bucket queue of background pulls. Keys are unique while
@@ -809,26 +833,39 @@ impl PullQueue {
     }
 
     pub fn enqueue(&self, key: &str, reason: PullReason) -> EnqueueOutcome {
+        self.enqueue_with_report(key, reason).0
+    }
+
+    /// [`Self::enqueue`] that also hands back the job's report channel when
+    /// a new job was queued (`Coalesced` pulls report to their first
+    /// requester only).
+    pub fn enqueue_with_report(
+        &self,
+        key: &str,
+        reason: PullReason,
+    ) -> (EnqueueOutcome, Option<oneshot::Receiver<QueuedPullOutcome>>) {
         if self.cancel.is_cancelled() {
-            return EnqueueOutcome::Unavailable;
+            return (EnqueueOutcome::Unavailable, None);
         }
         let mut pending = self.pending.lock();
         if pending.contains(key) {
-            return EnqueueOutcome::Coalesced;
+            return (EnqueueOutcome::Coalesced, None);
         }
+        let (report_tx, report_rx) = oneshot::channel();
         match self.tx.try_send(PullJob {
             key: key.to_string(),
             reason,
+            report: Some(report_tx),
         }) {
             Ok(()) => {
                 pending.insert(key.to_string());
-                EnqueueOutcome::Enqueued
+                (EnqueueOutcome::Enqueued, Some(report_rx))
             }
             Err(TrySendError::Full(_)) => {
                 self.stats.record_pull_failure(PullFailureReason::QueueFull);
-                EnqueueOutcome::QueueFull
+                (EnqueueOutcome::QueueFull, None)
             }
-            Err(TrySendError::Closed(_)) => EnqueueOutcome::Unavailable,
+            Err(TrySendError::Closed(_)) => (EnqueueOutcome::Unavailable, None),
         }
     }
 }
@@ -860,7 +897,7 @@ async fn dispatch(
             queue: Arc::clone(&queue),
             key: job.key.clone(),
         };
-        let slot = match state.acquire_pull_slot(&job.key).await {
+        let slot = match state.acquire_pull_slot_with_priority(&job.key, job.reason.priority()).await {
             Ok(slot) => slot,
             Err(err) => {
                 let result: Result<PullCompletion, PullError> = Err(err);
@@ -905,11 +942,14 @@ async fn run_job(
 ) {
     let _pending = pending;
     let cancel = state.cancel_token();
-    match slot {
+    let report = match slot {
         PullSlot::Follower(follower) => {
             // Someone else (inline GET or an earlier job) is pulling the key;
             // its result makes this job redundant.
-            let _ = follower.wait().await;
+            match follower.wait().await {
+                Ok(outcome) => QueuedPullOutcome::Stored { size: outcome.size },
+                Err(err) => QueuedPullOutcome::Failed(err),
+            }
         }
         PullSlot::Leader(leader) => {
             let ctx = PullContext {
@@ -921,8 +961,17 @@ async fn run_job(
             };
             let result = pull_object(&ctx).await;
             record_completion(&state, &job.key, job.reason.path(), &result);
+            let report = match &result {
+                Ok(PullCompletion::Stored(outcome)) => QueuedPullOutcome::Stored { size: outcome.size },
+                Ok(PullCompletion::AlreadyPresent(_)) => QueuedPullOutcome::AlreadyPresent,
+                Err(err) => QueuedPullOutcome::Failed(err.clone()),
+            };
             leader.complete(result.map(|completion| completion.outcome()));
+            report
         }
+    };
+    if let Some(tx) = job.report {
+        let _ = tx.send(report);
     }
 }
 
@@ -948,9 +997,18 @@ impl BucketOdmState {
 
     /// Queues a background pull of `key`; see [`EnqueueOutcome`].
     pub fn enqueue_pull(self: &Arc<Self>, key: &str, reason: PullReason) -> EnqueueOutcome {
+        self.enqueue_pull_with_report(key, reason).0
+    }
+
+    /// [`Self::enqueue_pull`] with the job's report channel.
+    pub fn enqueue_pull_with_report(
+        self: &Arc<Self>,
+        key: &str,
+        reason: PullReason,
+    ) -> (EnqueueOutcome, Option<oneshot::Receiver<QueuedPullOutcome>>) {
         match self.pull_queue() {
-            Some(queue) => queue.enqueue(key, reason),
-            None => EnqueueOutcome::Unavailable,
+            Some(queue) => queue.enqueue_with_report(key, reason),
+            None => (EnqueueOutcome::Unavailable, None),
         }
     }
 }

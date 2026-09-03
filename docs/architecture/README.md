@@ -41,6 +41,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | [runtime-capability-contracts.md](runtime-capability-contracts.md) | changing the read-only observability or topology snapshot contracts in `rustfs-storage-api`, their providers, or the `storage_classes` payload of `GET /rustfs/admin/v4/runtime/capabilities` |
 | [workload-admission-contracts.md](workload-admission-contracts.md) | adding a workload class or snapshot provider, or consuming admission state from a background job |
 | [background-controller-contract.md](background-controller-contract.md) | adding a status snapshot or reconcile surface for a background service, or being tempted to fold several services into a generic controller |
+| [background-services-inventory.md](background-services-inventory.md) | you need one audited background service's desired source, current-status inputs, status surface, and declared side effects |
 | [config-model-boundary-adr.md](config-model-boundary-adr.md) | touching the server-config model (`Config`, `KV`, `KVS`) or its persistence, or asking which crate owns which part of server configuration |
 | [admin-route-action-snapshot.md](admin-route-action-snapshot.md) | adding, moving, or re-authorizing an admin route and needing to know where the route → handler → `AdminAction` contract is enforced |
 | [kms-bulk-rekey-contract.md](kms-bulk-rekey-contract.md) | changing the bulk envelope re-wrap sweep, its admin endpoints, the re-wrap primitive, or which objects a rekey may touch |

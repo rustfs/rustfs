@@ -14,9 +14,13 @@
 
 use crate::bitrot_selftest::run_startup_bitrot_self_test;
 use crate::module_switches::{
-    bitrot_selftest_enabled_from_env, bitrot_selftest_strict_from_env, heal_enabled_from_env, scanner_enabled_from_env,
+    bitrot_selftest_enabled_from_env, bitrot_selftest_strict_from_env, heal_enabled_from_env,
+    is_on_demand_migration_module_enabled, scanner_enabled_from_env,
 };
-use crate::storage_api::startup::background::{ECStore, set_workload_admission_snapshot_provider};
+use crate::storage_api::startup::background::{
+    BackfillRunner, ECStore, OnDemandMigrationSys, SysBackfillContexts, install_global_backfill_runner,
+    set_workload_admission_snapshot_provider, spawn_backfill_recovery_loop,
+};
 use crate::workload_admission::RustFsWorkloadAdmissionSnapshotProvider;
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_heal::{
@@ -28,6 +32,7 @@ use tracing::{debug, info};
 const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
+const EVENT_ODM_BACKFILL_RECOVERY_CONFIGURED: &str = "odm_backfill_recovery_configured";
 
 pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Result<bool> {
     // Pin the bitrot algorithms before anything can write or verify a shard:
@@ -56,7 +61,7 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
     let _ = set_workload_admission_snapshot_provider(workload_provider.clone());
 
     if enable_heal || enable_scanner {
-        let heal_storage = Arc::new(ECStoreHealStorage::new(store));
+        let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));
         init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider)).await?;
     }
 
@@ -74,5 +79,45 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
         );
     }
 
+    init_on_demand_migration_backfill_runtime(store).await;
+
     Ok(enable_scanner)
+}
+
+/// Installs the backfill runner (admin start/cancel/status need it even
+/// while the module switch is off, to read checkpoints) and, with the switch
+/// on, the recovery loop that takes over expired leases (rustfs/backlog#2159).
+async fn init_on_demand_migration_backfill_runtime(store: Arc<ECStore>) {
+    let contexts = Arc::new(SysBackfillContexts::new(store.clone(), OnDemandMigrationSys::get()));
+    let runner = BackfillRunner::for_local_node(store.clone(), contexts).await;
+    if !install_global_backfill_runner(runner.clone()) {
+        debug!(
+            target: "rustfs::main::run",
+            event = EVENT_ODM_BACKFILL_RECOVERY_CONFIGURED,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "already_installed",
+            "On-demand migration backfill runner already installed"
+        );
+        return;
+    }
+    let module_enabled = is_on_demand_migration_module_enabled();
+    let node = runner.node().to_string();
+    let state = if !module_enabled {
+        "skipped_module_disabled"
+    } else if spawn_backfill_recovery_loop(runner) {
+        "started"
+    } else {
+        "skipped_no_cancel_token"
+    };
+    info!(
+        target: "rustfs::main::run",
+        event = EVENT_ODM_BACKFILL_RECOVERY_CONFIGURED,
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = state,
+        module_enabled = module_enabled,
+        node = %node,
+        "On-demand migration backfill recovery configured"
+    );
 }
