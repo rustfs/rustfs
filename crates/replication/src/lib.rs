@@ -64,9 +64,9 @@ pub use multipart::{
     replication_single_put_size_error,
 };
 pub use object::{
-    ReplicationSourceObject, ReplicationTargetObject, SsecPassthroughCapability, SsecPassthroughGate, content_matches_by_etag,
-    is_replication_target_offline_error, replication_action_for_target, replication_etags_match,
-    single_part_replica_etag_mismatch, ssec_passthrough_evidence_present, ssec_passthrough_gate,
+    ObjectLockIntegrity, ReplicationSourceObject, ReplicationTargetObject, SsecPassthroughCapability, SsecPassthroughGate,
+    content_matches_by_etag, is_replication_target_offline_error, object_lock_put_integrity, replication_action_for_target,
+    replication_etags_match, single_part_replica_etag_mismatch, ssec_passthrough_evidence_present, ssec_passthrough_gate,
     target_is_newer_than_source_null_version, version_identity_drifted,
 };
 pub use operation::{

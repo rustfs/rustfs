@@ -207,12 +207,9 @@ enum Expectation {
 /// test refuses an unexpected pass so the table cannot go stale silently.
 fn expectation(mode: TargetMode, shape: ObjectShape) -> Expectation {
     match (mode, shape) {
-        // rustfs#7082: the replication PUT carries the lock headers but no
-        // Content-MD5 / x-amz-checksum-* since rustfs#6895 switched the SDK
-        // to plain payloads; AWS-compatible Object Lock targets reject it.
-        (TargetMode::RequireChecksumWithObjectLock, ObjectShape::Retention | ObjectShape::LegalHold) => {
-            Expectation::KnownFailing("rustfs#7082")
-        }
+        // rustfs#7082 (Retention and LegalHold against a checksum-requiring
+        // target) was red here until the replication PUT started carrying a
+        // Content-MD5 derived from the source ETag.
         _ => Expectation::Completed,
     }
 }
@@ -253,10 +250,7 @@ fn expectation_table_covers_every_cell() {
         .collect();
     assert_eq!(
         known_failing,
-        vec![
-            (TargetMode::RequireChecksumWithObjectLock, ObjectShape::Retention),
-            (TargetMode::RequireChecksumWithObjectLock, ObjectShape::LegalHold),
-        ],
+        Vec::<(TargetMode, ObjectShape)>::new(),
         "every known-red cell is listed here on purpose; update this list together with the expectation table"
     );
 }
@@ -388,6 +382,17 @@ async fn check_completed_cell(
             shape.carries_object_lock_params()
         )
         .into());
+    }
+    // rustfs#7082 contract: every PutObject that carries Object Lock
+    // parameters also carries Content-MD5 or an x-amz-checksum-* header,
+    // whatever the target's own policy is.
+    if let Some(bare) = uploads.iter().find(|record| {
+        record.operation == FakeTargetOperation::PutObject
+            && record.transport.object_lock_params
+            && record.transport.content_md5.is_none()
+            && record.transport.checksum_headers.is_empty()
+    }) {
+        return Err(format!("a locked PutObject went out without any integrity header (rustfs#7082): {bare:?}").into());
     }
     Ok(())
 }

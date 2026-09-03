@@ -88,4 +88,5 @@ pub use replication_state::{ReplicationStats, RuntimeReplicationTargetBacklog};
 pub use replication_stats_boundary::{BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, XferStats};
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub use replication_target_boundary::SsecPassthroughCapability;
+pub use replication_target_boundary::{ObjectLockIntegrity, object_lock_put_integrity};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;

@@ -75,6 +75,47 @@ fn is_plain_single_part_md5(etag: &str) -> bool {
     etag.len() == 32 && etag.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// How a replication PutObject that carries Object Lock parameters satisfies
+/// the target-side rule that such a request must also carry `Content-MD5` or
+/// an `x-amz-checksum-*` header (AWS S3, MinIO and most compatible stores
+/// enforce it; rustfs#7082).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectLockIntegrity {
+    /// No Object Lock parameters, or an integrity header is already present.
+    NotRequired,
+    /// Send `Content-MD5` computed from this hex MD5: the source ETag is the
+    /// MD5 of exactly the bytes going on the wire, so no body pass and no
+    /// change of payload framing is needed.
+    ContentMd5Hex(String),
+    /// The source ETag is not the MD5 of the wire bytes (multipart layout,
+    /// or an encrypted object whose ETag does not describe the plaintext);
+    /// let the SDK compute a checksum instead.
+    SdkChecksum,
+}
+
+/// Decide the integrity header for a locked replication PUT.
+///
+/// `plaintext_end_to_end` is false when the request announces any server-side
+/// encryption or carries SSE-C ciphertext passthrough headers: the source
+/// ETag then does not describe the bytes on the wire and must not be turned
+/// into a `Content-MD5` the target would reject with `BadDigest`.
+pub fn object_lock_put_integrity(
+    lock_params: bool,
+    has_integrity_header: bool,
+    plaintext_end_to_end: bool,
+    source_etag: Option<&str>,
+) -> ObjectLockIntegrity {
+    if !lock_params || has_integrity_header {
+        return ObjectLockIntegrity::NotRequired;
+    }
+    match source_etag.map(trim_etag) {
+        Some(etag) if plaintext_end_to_end && is_plain_single_part_md5(&etag) => {
+            ObjectLockIntegrity::ContentMd5Hex(etag.to_ascii_lowercase())
+        }
+        _ => ObjectLockIntegrity::SdkChecksum,
+    }
+}
+
 /// Whether the ETag the target returned for a single-part replica proves the
 /// stored bytes differ from what the source sent — e.g. a target that does not
 /// decode `aws-chunked` framing stores the frames verbatim and returns their
@@ -302,6 +343,8 @@ pub fn ssec_passthrough_evidence_present(sse_customer_algorithm: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
+    use super::{ObjectLockIntegrity, object_lock_put_integrity};
+
     const SOURCE_MD5: &str = "9a0364b9e99bb480dd25e1f0284c8555";
     const FRAMED_MD5: &str = "0f343b0931126a20f133d67c2b018a3b";
 
@@ -554,6 +597,42 @@ mod tests {
         assert_eq!(
             replication_action_for_target(&source, &target, ReplicationType::Metadata),
             ReplicationAction::Metadata
+        );
+    }
+
+    #[test]
+    fn locked_put_uses_the_plain_source_md5_as_content_md5() {
+        assert_eq!(
+            object_lock_put_integrity(true, false, true, Some("\"9A0364B9E99BB480DD25E1F0284C8555\"")),
+            ObjectLockIntegrity::ContentMd5Hex("9a0364b9e99bb480dd25e1f0284c8555".to_string())
+        );
+    }
+
+    #[test]
+    fn locked_put_without_a_usable_etag_falls_back_to_the_sdk_checksum() {
+        // Multipart layout: the ETag is not the MD5 of the body.
+        assert_eq!(
+            object_lock_put_integrity(true, false, true, Some("9a0364b9e99bb480dd25e1f0284c8555-2")),
+            ObjectLockIntegrity::SdkChecksum
+        );
+        // Encrypted end to end: the ETag does not describe the wire bytes.
+        assert_eq!(
+            object_lock_put_integrity(true, false, false, Some("9a0364b9e99bb480dd25e1f0284c8555")),
+            ObjectLockIntegrity::SdkChecksum
+        );
+        assert_eq!(object_lock_put_integrity(true, false, true, None), ObjectLockIntegrity::SdkChecksum);
+        assert_eq!(object_lock_put_integrity(true, false, true, Some("")), ObjectLockIntegrity::SdkChecksum);
+    }
+
+    #[test]
+    fn integrity_is_not_added_without_lock_params_or_when_already_present() {
+        assert_eq!(
+            object_lock_put_integrity(false, false, true, Some("9a0364b9e99bb480dd25e1f0284c8555")),
+            ObjectLockIntegrity::NotRequired
+        );
+        assert_eq!(
+            object_lock_put_integrity(true, true, true, Some("9a0364b9e99bb480dd25e1f0284c8555")),
+            ObjectLockIntegrity::NotRequired
         );
     }
 }

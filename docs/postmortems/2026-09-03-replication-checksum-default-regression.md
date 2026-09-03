@@ -42,8 +42,8 @@ The same thing was missing at every layer: an inventory of what remote targets m
 | Compatibility lens gains an outbound target section. | `.agents/skills/adversarial-validation/references/compatibility.md` |
 | `AGENTS.md` names outbound client defaults as high risk and requires the matrix plus documented escape hatches. | `AGENTS.md`, Adversarial Validation |
 | The two escape hatches from rustfs#6895 are documented. | `docs/operations/replication-outbound-transport.md` |
-| Product fix for rustfs#7082: derive `Content-MD5` from the source ETag on locked PUTs. | tracked in rustfs#7082 |
-| `replication-check` probe PUT carries retention headers when the target bucket has Object Lock. | tracked in rustfs#7082 |
+| Product fix for rustfs#7082: a locked PUT carries `Content-MD5` derived from the source ETag when that ETag is the MD5 of the wire bytes, and an SDK CRC32 checksum otherwise; the two matrix cells flipped to `Completed` in the same change. | `crates/ecstore/src/bucket/bucket_target_sys.rs` (`object_lock_put_integrity_for`), `crates/replication/src/object.rs` (`object_lock_put_integrity`) |
+| `replication-check` probe PUT with retention headers: deliberately not done. A retained probe object cannot be cleaned up on targets that deny `s3:BypassGovernanceRetention`, leaving locked residue; the matrix pins the contract instead. | `crates/e2e_test/src/replication_target_matrix_test.rs` |
 
 ## SOP: changing an outbound client default
 
