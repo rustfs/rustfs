@@ -27,7 +27,7 @@ use crate::metrics::collectors::{
     DriveDetailedStats, DriveRuntimeDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmActionTaskStats,
     IlmBackpressureStats, IlmQueueTaskStats, IlmRuntimeStats, IlmStats, IlmTaskEventStats, MemoryStats, NetworkStats,
     OdmBackfillRuntimeStats, OnDemandMigrationBucketStats, ProcessStats, ProcessStatusType, ReplicationMetricsSnapshot,
-    ResourceStats, ScannerRuntimeStats, ScannerStats,
+    ResourceStats, ScannerRuntimeStats, ScannerStats, TierRequestStats,
 };
 use crate::metrics::runtime_sources::{ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot};
 use crate::metrics::{
@@ -1394,6 +1394,23 @@ fn ilm_backpressure_stats(metrics: &ScannerMetricsReport) -> Vec<IlmBackpressure
             value: metrics.lifecycle_transition.queue_send_timeout,
         },
     ]
+}
+
+/// Collect the remote tier request counters from the lifecycle runtime.
+///
+/// Every operation/outcome cell is reported, including zero ones, so the
+/// series set is stable from the first scrape rather than appearing one label
+/// combination at a time.
+pub fn collect_tier_request_metric_stats() -> Vec<TierRequestStats> {
+    global_metrics()
+        .tier_request_counts()
+        .into_iter()
+        .map(|count| TierRequestStats {
+            operation: count.operation.as_label(),
+            outcome: count.outcome.as_label(),
+            count: count.count,
+        })
+        .collect()
 }
 
 /// Collect ILM metrics from the current lifecycle runtime state.

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bucket::lifecycle::tier_last_day_stats::DailyAllTierStats;
 use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity, ScannerPublicationLease, TierConfigReloadOutcome};
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::disk::DiskAPI;
@@ -50,6 +51,7 @@ const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
 const EVENT_NOTIFICATION_PEER_PROPAGATION: &str = "notification_peer_propagation";
 const EVENT_NOTIFICATION_CAPABILITY_PROBE: &str = "notification_capability_probe";
 const SCANNER_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const TIER_DAILY_STATS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TIER_CONFIG_RELOAD_RETRY_BASE: Duration = Duration::from_millis(100);
 const TIER_CONFIG_RELOAD_RETRY_CAP: Duration = Duration::from_secs(5);
 const REMOTE_VERSION_STATE_PROBE_INTERVAL: Duration = Duration::from_secs(10);
@@ -970,6 +972,120 @@ impl NotificationSys {
             minimum_version = DECOMMISSION_TARGET_FENCE_POLICY_SUPPORTED_VERSION;
         }
         Ok((peer_epochs, minimum_version))
+    }
+}
+
+/// Rolling tier activity summed over every cluster member that answered, with
+/// the reporting coverage behind the sum.
+///
+/// The coverage is part of the result rather than a log line: a sum over a
+/// subset of the cluster is not a cluster total, and a caller that renders it
+/// as one is the defect this type exists to prevent.
+pub struct ClusterTierDailyStats {
+    pub stats: DailyAllTierStats,
+    /// Members whose rolling day is included, always at least this node.
+    pub nodes_reporting: usize,
+    /// Members this deployment expects to hear from, including this node.
+    pub nodes_expected: usize,
+    /// Members that could not be asked, could not answer, or answered with a
+    /// ring this build refuses to merge. Sorted, and named by grid host.
+    pub unavailable_nodes: Vec<String>,
+}
+
+impl ClusterTierDailyStats {
+    pub fn is_complete(&self) -> bool {
+        self.unavailable_nodes.is_empty() && self.nodes_reporting == self.nodes_expected
+    }
+}
+
+/// Fold one member's rolling day into the running cluster total.
+///
+/// Merging (rather than adding totals) ages each member's ring to the newer
+/// clock first, so a member that stopped transitioning yesterday contributes
+/// only the hours still inside the rolling day.
+fn merge_tier_daily_stats(into: &mut DailyAllTierStats, from: DailyAllTierStats) {
+    for (tier, stats) in from {
+        match into.remove(&tier) {
+            Some(existing) => {
+                into.insert(tier, existing.merge(stats));
+            }
+            None => {
+                into.insert(tier, stats);
+            }
+        }
+    }
+}
+
+impl NotificationSys {
+    /// Sum this node's rolling tier activity with every reachable peer's.
+    ///
+    /// Each node records only the transitions it completed itself, so the sum
+    /// is a cluster total and a retried transition is counted once, by the
+    /// node that finally committed it. Peers are probed concurrently under a
+    /// per-peer deadline so one black-holed member cannot hold the admin
+    /// request open.
+    pub async fn tier_daily_stats(&self, local: DailyAllTierStats) -> ClusterTierDailyStats {
+        let mut stats = local;
+        let nodes_expected = self.peer_clients.len() + 1;
+        let mut nodes_reporting = 1;
+        let mut unavailable_nodes = Vec::new();
+
+        let mut probes = Vec::with_capacity(self.peer_clients.len());
+        for (idx, client) in self.peer_clients.iter().enumerate() {
+            let host = self.tier_daily_stats_peer_host(idx, client.as_ref());
+            probes.push(async move {
+                let Some(client) = client.as_ref() else {
+                    return (host, Err(Error::other("peer is not reachable")));
+                };
+                // The peer is already named by the caller's `peer` log field
+                // and by `unavailable_nodes`, so the deadline is reported as
+                // the typed variant rather than a formatted fragment.
+                let result = timeout(TIER_DAILY_STATS_PROBE_TIMEOUT, client.tier_daily_stats())
+                    .await
+                    .unwrap_or(Err(Error::Timeout));
+                (host, result)
+            });
+        }
+
+        for (host, result) in join_all(probes).await {
+            match result {
+                Ok(peer_stats) => {
+                    nodes_reporting += 1;
+                    merge_tier_daily_stats(&mut stats, peer_stats);
+                }
+                Err(err) => {
+                    warn!(
+                        event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                        peer = host,
+                        error = %err,
+                        "tier daily stats peer did not report"
+                    );
+                    unavailable_nodes.push(host);
+                }
+            }
+        }
+
+        unavailable_nodes.sort();
+        ClusterTierDailyStats {
+            stats,
+            nodes_reporting,
+            nodes_expected,
+            unavailable_nodes,
+        }
+    }
+
+    /// Name a peer slot even when no client was ever built for it, so an
+    /// unreachable member is reported by host instead of disappearing.
+    fn tier_daily_stats_peer_host(&self, idx: usize, client: Option<&PeerRestClient>) -> String {
+        if let Some(client) = client {
+            return client.grid_host.clone();
+        }
+        self.peer_topology_hosts
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| format!("peer[{idx}]"))
     }
 }
 
@@ -2935,6 +3051,65 @@ fn aggregate_scanner_dirty_usage_acknowledgement_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
+    use rustfs_data_usage::TierStats;
+
+    fn ring(total_size: u64) -> LastDayTierStats {
+        let mut stats = LastDayTierStats::default();
+        stats.add_stats(TierStats {
+            total_size,
+            num_versions: 1,
+            num_objects: 1,
+        });
+        stats
+    }
+
+    #[test]
+    fn merging_peer_rings_sums_each_tier_without_double_counting() {
+        let mut cluster = DailyAllTierStats::from([("WARM".to_string(), ring(10))]);
+
+        merge_tier_daily_stats(
+            &mut cluster,
+            DailyAllTierStats::from([("WARM".to_string(), ring(20)), ("COLD".to_string(), ring(5))]),
+        );
+
+        assert_eq!(
+            cluster.get("WARM").expect("the shared tier must survive the merge").total(),
+            TierStats {
+                total_size: 30,
+                num_versions: 2,
+                num_objects: 2,
+            },
+            "both nodes' completions belong in the cluster total"
+        );
+        assert_eq!(
+            cluster.get("COLD").expect("a tier only one node saw must be kept").total(),
+            TierStats {
+                total_size: 5,
+                num_versions: 1,
+                num_objects: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_single_member_result_is_complete_and_a_missing_peer_is_not() {
+        let complete = ClusterTierDailyStats {
+            stats: DailyAllTierStats::new(),
+            nodes_reporting: 1,
+            nodes_expected: 1,
+            unavailable_nodes: Vec::new(),
+        };
+        assert!(complete.is_complete(), "a single-member deployment reports its whole cluster");
+
+        let partial = ClusterTierDailyStats {
+            stats: DailyAllTierStats::new(),
+            nodes_reporting: 1,
+            nodes_expected: 2,
+            unavailable_nodes: vec!["node-b:9000".to_string()],
+        };
+        assert!(!partial.is_complete(), "a silent member must make the sum partial");
+    }
 
     #[test]
     fn cross_pool_policy_versions_authorize_only_their_supported_protocols() {

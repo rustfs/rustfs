@@ -77,6 +77,7 @@ use crate::metrics::collectors::{
     collect_request_metrics,
     collect_resource_metrics,
     collect_scanner_runtime_metrics,
+    collect_tier_request_metrics,
 };
 use crate::metrics::config::{
     DEFAULT_AUDIT_METRICS_INTERVAL, DEFAULT_BUCKET_METRICS_INTERVAL, DEFAULT_BUCKET_REPLICATION_BANDWIDTH_METRICS_INTERVAL,
@@ -151,7 +152,7 @@ use crate::metrics::stats_collector::{
     collect_disk_and_system_drive_runtime_stats, collect_erasure_set_stats, collect_host_network_stats, collect_iam_stats,
     collect_ilm_runtime_metric_stats, collect_internode_network_stats, collect_on_demand_migration_backfill_stats,
     collect_on_demand_migration_stats, collect_process_metric_bundle_with, collect_replication_stats,
-    collect_scanner_runtime_metric_stats, collect_system_cpu_and_memory_stats_with,
+    collect_scanner_runtime_metric_stats, collect_system_cpu_and_memory_stats_with, collect_tier_request_metric_stats,
 };
 use crate::node_identity::{SERVER_LABEL, current_local_node_identity};
 use crate::telemetry::retire_metric_series;
@@ -2396,6 +2397,8 @@ pub fn init_metrics_runtime(token: CancellationToken) {
                             if let Some(stats) = collect_ilm_runtime_metric_stats().await {
                                 metrics.extend(collect_ilm_runtime_metrics(&stats));
                             }
+
+                            metrics.extend(collect_tier_request_metrics(&collect_tier_request_metric_stats()));
 
                             let mut retire_scanner_cycle_bucket_drive_result_keys = Vec::new();
                             let mut retire_scanner_bucket_drive_result_keys = Vec::new();

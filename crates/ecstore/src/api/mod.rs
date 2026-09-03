@@ -118,7 +118,7 @@ pub mod bucket {
         }
 
         pub mod tier_last_day_stats {
-            pub use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
+            pub use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats, TierDailyStatsWire};
         }
 
         pub mod tier_sweeper {
@@ -466,7 +466,7 @@ pub mod notification {
     #[cfg(any(test, feature = "test-util"))]
     pub use crate::services::notification_sys::rotate_cross_pool_fence_fleet_proof_for_test;
     pub use crate::services::notification_sys::{
-        CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
+        ClusterTierDailyStats, CrossPoolFenceFleetProofToken, NotificationPeerErr, NotificationSys, ScannerPublicationLeaseGrant,
         acquire_cross_pool_fence_fleet_proof, cross_pool_fence_fleet_proof_matches, get_global_notification_sys,
         new_global_notification_sys, scanner_peer_transport_error_message_is_retryable, start_remote_version_state_fleet_probe,
     };

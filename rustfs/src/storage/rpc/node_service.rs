@@ -2497,6 +2497,13 @@ impl Node for NodeService {
         }
     }
 
+    async fn tier_daily_stats(
+        &self,
+        request: Request<TierDailyStatsRequest>,
+    ) -> Result<Response<TierDailyStatsResponse>, Status> {
+        self.handle_tier_daily_stats(request).await
+    }
+
     async fn load_transition_tier_config(
         &self,
         request: Request<LoadTransitionTierConfigRequest>,
