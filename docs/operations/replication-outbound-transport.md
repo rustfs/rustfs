@@ -1,0 +1,33 @@
+# Replication outbound transport
+
+**Use this when:** a bucket-replication or site-replication target rejects, corrupts, or silently transforms uploads from RustFS, or you need to know which integrity headers RustFS sends to a remote target and how to change them.
+**Source of truth:** `crates/ecstore/src/bucket/remote_s3_client.rs` (`replication_request_checksum_calculation`), `crates/ecstore/src/bucket/bucket_target_sys.rs` (`TargetClient::put_object`, `PutObjectOptions::header`), `crates/ecstore/src/bucket/replication/replication_resyncer.rs` (`verify_single_part_replica`).
+
+## What a replication PUT carries by default
+
+- A plain signed body with an exact `Content-Length`. The SDK does not add a streaming trailer checksum, so the body is never wrapped in `aws-chunked` framing (rustfs#6853: a target that does not decode that framing stored the frames verbatim while RustFS recorded COMPLETED).
+- Any object-level checksum the source object was uploaded with, forwarded as its `x-amz-checksum-*` header.
+- The source ETag, mtime and version id on `x-rustfs-source-*` headers (with `x-minio-source-*` twins), and the Object Lock mode, retain-until date and legal hold of the source version when present.
+- After the PUT, the target's ETag is compared with the source ETag when both are plain single-part MD5s; a mismatch fails the replication instead of reporting a corrupted replica as COMPLETED.
+
+## Target classes and their known requirements
+
+| Target behavior | Effect on RustFS replication | Detected by |
+| --- | --- | --- |
+| Rejects or mis-stores `aws-chunked` bodies (SeaweedFS 3.97) | Handled by the plain-payload default above. | Outbound target matrix, `RejectAwsChunked` mode |
+| Requires `Content-MD5` or `x-amz-checksum-*` on a PutObject with Object Lock parameters (AWS S3, MinIO, Impossible Cloud, most compatible stores) | Objects with a retention period or legal hold fail until rustfs#7082 lands. Set `RUSTFS_REPLICATION_STREAMING_CHECKSUMS=true` as a workaround when the target also decodes `aws-chunked`. | Outbound target matrix, `RequireChecksumWithObjectLock` mode |
+| Mints its own version ids (AWS S3, Wasabi, Impossible Cloud) | Data lands; version-addressed convergence does not. See rustfs/backlog#2085 and `docs/operations/replication-check.md` (VersionFidelity). | `replication-check`, outbound target matrix, `MintOwnVersionIds` mode |
+| Returns an ETag that is not the content MD5 without announcing SSE | Every single-part object fails ETag verification. Set `RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY=false`. | Replication status FAILED with `replica etag mismatch` |
+
+## Environment knobs
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RUSTFS_REPLICATION_STREAMING_CHECKSUMS` | unset (plain payloads) | `true` or `1` restores SDK trailer checksums (`RequestChecksumCalculation::WhenSupported`). Every streaming upload is then `aws-chunked` with an `x-amz-trailer`; use only when every target decodes that framing. |
+| `RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY` | enabled | `false` or `0` disables the post-PUT ETag comparison for targets whose 32-hex ETags are legitimately not the content MD5. |
+
+Both knobs are read by the RustFS process that owns the replication target, at client build time; restart the server after changing them.
+
+## Before changing any of this
+
+Follow the SOP in `docs/postmortems/2026-09-03-replication-checksum-default-regression.md`: inventory the target-side rules the current default satisfies, run the outbound target matrix, and document any new knob here in the same PR.

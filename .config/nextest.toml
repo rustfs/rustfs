@@ -454,6 +454,10 @@ slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 # until it is explicitly promoted to the fast PR subset — no replication test
 # is ever silently left out of CI.
 #
+# replication_target_matrix_test (the outbound target matrix: every object
+# shape against every remote-target failure mode the fake target models) runs
+# here in full; its expectation table pins known-red cells to open issues.
+#
 # #[serial] does NOT serialize under nextest (process-per-test; see the file
 # header). These tests need no cross-test serialization: each spawns its own
 # server(s) on random ports with isolated temp dirs, so they are parallel-safe
@@ -471,7 +475,7 @@ slow-timeout = { period = "60s", terminate-after = 2, grace-period = "10s" }
 [profile.e2e-repl-nightly]
 default-filter = """
     package(e2e_test)
-    & test(/^replication_extension_test::/)
+    & (test(/^replication_extension_test::/) | test(/^replication_target_matrix_test::/))
     & !test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
 """
 fail-fast = false
@@ -560,6 +564,7 @@ default-filter = """
     & !test(/^protocols::/)
     & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|degraded_listing_availability_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
     & !test(/^replication_extension_test::/)
+    & !test(/^replication_target_matrix_test::/)
     & !test(/^on_demand_migration::(concurrency_test|fault_test|real_source_test)::/)
 """
 fail-fast = false

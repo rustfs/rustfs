@@ -18,6 +18,7 @@
 //! See [`README.md`](README.md) for the supported protocol and fault surface.
 
 use async_trait::async_trait;
+use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use http::header::{CONTENT_LENGTH, ETAG, LAST_MODIFIED, RANGE, USER_AGENT};
@@ -33,10 +34,12 @@ use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CommonPrefix, CompleteMultipartUploadInput,
     CompleteMultipartUploadOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteMarkerEntry, DeleteObjectInput,
     DeleteObjectOutput, DeleteObjectTaggingInput, DeleteObjectTaggingOutput, ETag, GetBucketVersioningInput,
-    GetBucketVersioningOutput, GetObjectInput, GetObjectOutput, GetObjectTaggingInput, GetObjectTaggingOutput, HeadBucketInput,
-    HeadBucketOutput, HeadObjectInput, HeadObjectOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input,
-    ListObjectsV2Output, Object, ObjectStorageClass, ObjectVersionId, PutObjectInput, PutObjectOutput, PutObjectTaggingInput,
-    PutObjectTaggingOutput, Range, StreamingBlob, Tag, TagSet, Timestamp, TimestampFormat, UploadPartInput, UploadPartOutput,
+    GetBucketVersioningOutput, GetObjectInput, GetObjectLockConfigurationInput, GetObjectLockConfigurationOutput,
+    GetObjectOutput, GetObjectTaggingInput, GetObjectTaggingOutput, HeadBucketInput, HeadBucketOutput, HeadObjectInput,
+    HeadObjectOutput, ListObjectVersionsInput, ListObjectVersionsOutput, ListObjectsV2Input, ListObjectsV2Output, Object,
+    ObjectLockConfiguration, ObjectLockEnabled, ObjectStorageClass, ObjectVersionId, PutObjectInput, PutObjectOutput,
+    PutObjectTaggingInput, PutObjectTaggingOutput, Range, StreamingBlob, Tag, TagSet, Timestamp, TimestampFormat,
+    UploadPartInput, UploadPartOutput,
 };
 use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::validation::{AwsNameValidation, NameValidation};
@@ -116,6 +119,7 @@ pub const FAKE_SECRET_KEY: &str = "fake-secret";
 pub enum Operation {
     HeadBucket,
     GetBucketVersioning,
+    GetObjectLockConfiguration,
     PutObject,
     GetObject,
     HeadObject,
@@ -350,6 +354,9 @@ pub struct RequestRecord {
     pub consumed_bytes: Option<usize>,
     pub replication_timestamps: ReplicationTimestampHeaders,
     pub proxy_headers: ProxyHeaderSnapshot,
+    /// Integrity and framing headers of the request, so outbound-transport
+    /// tests can pin what the sender actually put on the wire.
+    pub transport: TransportSnapshot,
     /// Verbatim `Range` request header, so range-forwarding tests can pin the
     /// exact wire syntax a migrating server sent to its source.
     pub range: Option<String>,
@@ -362,6 +369,50 @@ pub struct RequestRecord {
     pub fault: Option<FaultAction>,
 }
 
+/// Integrity and framing headers of an upload. A remote target's acceptance
+/// rules key off exactly these (rustfs#6853: `aws-chunked` framing stored
+/// verbatim; rustfs#7082: Object Lock PUTs need `Content-MD5` or
+/// `x-amz-checksum-*`), so the journal records them for every request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransportSnapshot {
+    /// The body was announced as `aws-chunked`: `Content-Encoding` names it,
+    /// an `x-amz-trailer` is declared, or the payload hash is `STREAMING-*`.
+    pub aws_chunked: bool,
+    /// Verbatim `Content-MD5` request header.
+    pub content_md5: Option<String>,
+    /// Sorted names of every `x-amz-checksum-*` header, plus
+    /// `x-amz-sdk-checksum-algorithm` when present (the header a trailer
+    /// checksum announces itself with).
+    pub checksum_headers: Vec<String>,
+    /// Any `x-amz-object-lock-*` header was present.
+    pub object_lock_params: bool,
+}
+
+impl TransportSnapshot {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        let content_encoding_chunked = headers.get_all("content-encoding").iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| value.split(',').any(|token| token.trim().eq_ignore_ascii_case("aws-chunked")))
+        });
+        let streaming_payload_hash = header_value(headers, &["x-amz-content-sha256"])
+            .is_some_and(|value| value.to_ascii_uppercase().starts_with("STREAMING-"));
+        let mut checksum_headers: Vec<String> = headers
+            .keys()
+            .map(|name| name.as_str().to_string())
+            .filter(|name| name.starts_with("x-amz-checksum-") || name == "x-amz-sdk-checksum-algorithm")
+            .collect();
+        checksum_headers.sort();
+        checksum_headers.dedup();
+        Self {
+            aws_chunked: content_encoding_chunked || streaming_payload_hash || headers.contains_key("x-amz-trailer"),
+            content_md5: header_value(headers, &["content-md5"]).map(bounded_journal_value),
+            checksum_headers,
+            object_lock_params: headers.keys().any(|name| name.as_str().starts_with("x-amz-object-lock-")),
+        }
+    }
+}
+
 /// Request headers journaled with every record, captured before the fault
 /// script is consulted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -369,6 +420,7 @@ struct JournaledHeaders {
     content_length: Option<u64>,
     replication_timestamps: ReplicationTimestampHeaders,
     proxy_headers: ProxyHeaderSnapshot,
+    transport: TransportSnapshot,
     range: Option<String>,
     user_agent: Option<String>,
 }
@@ -382,6 +434,7 @@ impl JournaledHeaders {
                 .and_then(|value| value.parse().ok()),
             replication_timestamps: ReplicationTimestampHeaders::from_headers(headers),
             proxy_headers: ProxyHeaderSnapshot::from_headers(headers),
+            transport: TransportSnapshot::from_headers(headers),
             range: header_value(headers, &[RANGE.as_str()]).map(bounded_journal_value),
             user_agent: header_value(headers, &[USER_AGENT.as_str()]).map(bounded_journal_value),
         }
@@ -404,6 +457,14 @@ struct StoreState {
     /// transport headers instead of storing them (see
     /// [`REPLICATION_SSE_TRANSPORT_PREFIX`]).
     drop_unlisted_replication_headers: bool,
+    /// Models a target that cannot decode `aws-chunked` request bodies
+    /// (SeaweedFS 3.97, rustfs#6853): a PutObject or UploadPart announcing that
+    /// framing is refused with `InvalidRequest` before its body is read.
+    reject_aws_chunked_uploads: bool,
+    /// Models AWS S3 / MinIO / most compatible stores (rustfs#7082): a
+    /// PutObject carrying any `x-amz-object-lock-*` header must also carry
+    /// `Content-MD5` or an `x-amz-checksum-*` header.
+    require_checksum_for_object_lock: bool,
     limits: StoreLimits,
     buckets: HashMap<String, BucketState>,
     uploads: HashMap<String, MultipartState>,
@@ -414,6 +475,8 @@ struct StoreState {
 
 struct BucketState {
     versioned: bool,
+    /// Object Lock enabled at creation; reported by GetObjectLockConfiguration.
+    object_lock: bool,
     /// Versions per key, newest first (see `upsert_version`); an unversioned
     /// bucket holds exactly one version per key.
     objects: HashMap<String, Vec<ObjectVersion>>,
@@ -498,6 +561,7 @@ struct FakeBackend {
 struct FaultAccess {
     control: Arc<Mutex<ControlState>>,
     body_limit: Arc<Semaphore>,
+    store: Arc<Mutex<StoreState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -580,6 +644,7 @@ impl FakeS3Target {
             builder.set_access(FaultAccess {
                 control: Arc::clone(&control),
                 body_limit,
+                store: Arc::clone(&backend.store),
             });
             builder.build()
         };
@@ -681,11 +746,25 @@ impl FakeS3Target {
                     bucket,
                     BucketState {
                         versioned,
+                        object_lock: false,
                         objects: HashMap::new(),
                     },
                 );
             }
         }
+    }
+
+    /// Pre-create a versioned bucket with Object Lock enabled, the shape a
+    /// RustFS source with Object Lock requires of its replication target
+    /// (`replication-check` probes GetObjectLockConfiguration for it).
+    pub fn create_bucket_with_object_lock(&self, bucket: impl Into<String>) {
+        let bucket = bucket.into();
+        self.create_bucket_with_mode(bucket.clone(), BucketMode::Versioned);
+        lock(&self.backend.store)
+            .buckets
+            .get_mut(&bucket)
+            .expect("bucket was just created")
+            .object_lock = true;
     }
 
     /// Store an object directly, bypassing the wire, the fault script, and
@@ -789,6 +868,22 @@ impl FakeS3Target {
     /// HEAD/GET of the replica.
     pub fn drop_unlisted_replication_headers(&self, enabled: bool) {
         lock(&self.backend.store).drop_unlisted_replication_headers = enabled;
+    }
+
+    /// Refuse every PutObject / UploadPart whose body is announced as
+    /// `aws-chunked` (SeaweedFS-like target, rustfs#6853). The refusal is an
+    /// `InvalidRequest` issued before the body is read, so a sender that
+    /// frames its uploads sees a hard failure instead of a corrupted replica.
+    pub fn reject_aws_chunked_uploads(&self, enabled: bool) {
+        lock(&self.backend.store).reject_aws_chunked_uploads = enabled;
+    }
+
+    /// Require `Content-MD5` or an `x-amz-checksum-*` header on every
+    /// PutObject that carries Object Lock parameters (AWS S3 / MinIO rule,
+    /// rustfs#7082). `Content-MD5`, when present, is always verified against
+    /// the body regardless of this mode.
+    pub fn require_checksum_for_object_lock(&self, enabled: bool) {
+        lock(&self.backend.store).require_checksum_for_object_lock = enabled;
     }
 
     pub fn assign_own_multipart_version_ids(&self, enabled: bool) {
@@ -942,9 +1037,19 @@ impl S3Access for FaultAccess {
         let parsed = parse_request(context.method(), context.uri());
         let operation = operation_from_s3_name(context.s3_op().name());
         let journaled = JournaledHeaders::from_headers(context.headers());
+        let aws_chunked = journaled.transport.aws_chunked;
         let fault = record_request(&self.control, operation, context.method().clone(), parsed, journaled);
         if let Some(status) = fault.as_ref().and_then(|fault| scripted_status(&fault.action)) {
             return Err(scripted_status_error(status));
+        }
+        if aws_chunked
+            && matches!(operation, Operation::PutObject | Operation::UploadPart)
+            && lock(&self.store).reject_aws_chunked_uploads
+        {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "this target does not decode aws-chunked request bodies; send a plain signed payload with an exact Content-Length"
+            ));
         }
         let prebody_permit = if operation == Operation::CompleteMultipartUpload {
             Some(
@@ -973,6 +1078,7 @@ fn operation_from_s3_name(name: &str) -> Operation {
     match name {
         "HeadBucket" => Operation::HeadBucket,
         "GetBucketVersioning" => Operation::GetBucketVersioning,
+        "GetObjectLockConfiguration" => Operation::GetObjectLockConfiguration,
         "PutObject" => Operation::PutObject,
         "GetObject" => Operation::GetObject,
         "HeadObject" => Operation::HeadObject,
@@ -1021,6 +1127,7 @@ fn record_request(
         consumed_bytes: None,
         replication_timestamps: headers.replication_timestamps,
         proxy_headers: headers.proxy_headers,
+        transport: headers.transport,
         range: headers.range,
         user_agent: headers.user_agent,
         prefix: parsed.prefix.map(bounded_journal_value),
@@ -1846,6 +1953,34 @@ impl S3 for FakeBackend {
         ))
     }
 
+    async fn get_object_lock_configuration(
+        &self,
+        req: S3Request<GetObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<GetObjectLockConfigurationOutput>> {
+        let fault = request_fault(&req);
+        apply_non_body_fault(fault.as_ref(), &self.control).await?;
+        let object_lock = lock(&self.store)
+            .buckets
+            .get(&req.input.bucket)
+            .map(|bucket| bucket.object_lock)
+            .ok_or_else(|| s3s::s3_error!(NoSuchBucket, "bucket does not exist"))?;
+        if !object_lock {
+            return Err(s3s::s3_error!(
+                ObjectLockConfigurationNotFoundError,
+                "Object Lock configuration does not exist for this bucket"
+            ));
+        }
+        Ok(apply_response_fault(
+            S3Response::new(GetObjectLockConfigurationOutput {
+                object_lock_configuration: Some(ObjectLockConfiguration {
+                    object_lock_enabled: Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)),
+                    ..Default::default()
+                }),
+            }),
+            fault.as_ref(),
+        ))
+    }
+
     /// Current versions only (a key whose newest version is a delete marker
     /// is hidden), keys in byte order, `delimiter` folding into common
     /// prefixes that count toward `max-keys`, and `start-after` /
@@ -1996,17 +2131,37 @@ impl S3 for FakeBackend {
             .map_err(|_| s3s::s3_error!(ServiceUnavailable, "fake target body limiter closed"))?;
         let headers = req.headers;
         let input = req.input;
-        let (assign_own, drop_unlisted, limits, versioned) = {
+        let (assign_own, drop_unlisted, require_checksum, limits, versioned) = {
             let state = lock(&self.store);
             (
                 state.assign_own_version_ids,
                 state.drop_unlisted_replication_headers,
+                state.require_checksum_for_object_lock,
                 state.limits,
                 bucket_versioned(&state, &input.bucket),
             )
         };
+        let transport = TransportSnapshot::from_headers(&headers);
+        if require_checksum
+            && transport.object_lock_params
+            && transport.content_md5.is_none()
+            && transport.checksum_headers.is_empty()
+        {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters"
+            ));
+        }
         let body =
             collect_stream(input.body, input.content_length, fault.as_ref(), &self.control, limits.max_object_bytes).await?;
+        let mut body_permit = _body_permit;
+        if let Some(expected) = &transport.content_md5 {
+            let (digest, permit) = md5_digest(body.clone(), body_permit).await?;
+            body_permit = permit;
+            if BASE64_STANDARD.encode_to_string(digest) != expected.trim() {
+                return Err(s3s::s3_error!(BadDigest, "The Content-MD5 you specified did not match what we received."));
+            }
+        }
         validate_stored_metadata(&input.content_type, &input.metadata)?;
         let standard_headers = StandardHeaders {
             cache_control: input.cache_control,
@@ -2024,10 +2179,13 @@ impl S3 for FakeBackend {
         let e_tag = match source_etag(&headers)? {
             Some(value) => value,
             None => {
-                let (digest, _body_permit) = md5_digest(body.clone(), _body_permit).await?;
+                let (digest, permit) = md5_digest(body.clone(), body_permit).await?;
+                body_permit = permit;
                 hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower)
             }
         };
+        // Held until the version is stored, like every other body-bearing op.
+        let _body_permit = body_permit;
         let version = ObjectVersion {
             version_id: version_id.clone(),
             body,
@@ -2681,6 +2839,217 @@ mod tests {
             })
             .send()
             .await?)
+    }
+
+    /// A client that sends no SDK-computed checksum, the shape RustFS's
+    /// replication client has had since rustfs#6895.
+    fn client_without_sdk_checksums(target: &FakeS3Target) -> Client {
+        let credentials = Credentials::new(FAKE_ACCESS_KEY, FAKE_SECRET_KEY, None, None, "fake-target");
+        Client::from_conf(
+            aws_sdk_s3::Config::builder()
+                .credentials_provider(credentials)
+                .region(Region::new("us-east-1"))
+                .endpoint_url(target.endpoint())
+                .force_path_style(true)
+                .behavior_version_latest()
+                .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired)
+                .retry_config(RetryConfig::standard().with_max_attempts(1))
+                .http_client(SmithyHttpClientBuilder::new().build_http())
+                .build(),
+        )
+    }
+
+    fn retain_until() -> aws_sdk_s3::primitives::DateTime {
+        aws_sdk_s3::primitives::DateTime::from_secs(4_102_444_800)
+    }
+
+    #[tokio::test]
+    async fn object_lock_target_requires_a_checksum_on_locked_puts() -> Result<(), BoxError> {
+        use aws_sdk_s3::error::ProvideErrorMetadata;
+        use aws_sdk_s3::types::ObjectLockMode;
+
+        let target = FakeS3Target::start().await?;
+        target.create_bucket_with_object_lock("locked");
+        target.require_checksum_for_object_lock(true);
+        let client = client_without_sdk_checksums(&target);
+        let locked_put = |key: &'static str| {
+            client
+                .put_object()
+                .bucket("locked")
+                .key(key)
+                .body(ByteStream::from_static(b"locked payload"))
+                .object_lock_mode(ObjectLockMode::Governance)
+                .object_lock_retain_until_date(retain_until())
+        };
+
+        // The rustfs#7082 shape: lock headers, no integrity header.
+        let err = locked_put("no-checksum")
+            .send()
+            .await
+            .expect_err("a locked PUT without Content-MD5 / x-amz-checksum-* must be rejected")
+            .into_service_error();
+        assert_eq!(err.code(), Some("InvalidRequest"));
+        assert!(
+            err.message().unwrap_or_default().contains("Object Lock parameters"),
+            "unexpected message: {:?}",
+            err.message()
+        );
+        assert!(!target.has_object("locked", "no-checksum"));
+
+        // A wrong Content-MD5 is caught even though the header is present.
+        let err = locked_put("wrong-md5")
+            .customize()
+            .map_request(|mut request| {
+                request
+                    .headers_mut()
+                    .insert("content-md5", BASE64_STANDARD.encode_to_string(md5_bytes(b"other payload")));
+                Ok::<_, std::convert::Infallible>(request)
+            })
+            .send()
+            .await
+            .expect_err("a mismatching Content-MD5 must be rejected")
+            .into_service_error();
+        assert_eq!(err.code(), Some("BadDigest"));
+
+        // The correct Content-MD5 is accepted and the body is stored intact.
+        locked_put("good-md5")
+            .customize()
+            .map_request(|mut request| {
+                request
+                    .headers_mut()
+                    .insert("content-md5", BASE64_STANDARD.encode_to_string(md5_bytes(b"locked payload")));
+                Ok::<_, std::convert::Infallible>(request)
+            })
+            .send()
+            .await?;
+        assert_eq!(
+            get_bytes(&client, "locked", "good-md5", None).await?,
+            Bytes::from_static(b"locked payload")
+        );
+
+        // The rule is scoped to Object Lock parameters: an unlocked PUT
+        // without any checksum still lands.
+        client
+            .put_object()
+            .bucket("locked")
+            .key("unlocked")
+            .body(ByteStream::from_static(b"plain payload"))
+            .send()
+            .await?;
+        assert!(target.has_object("locked", "unlocked"));
+
+        let journal = target.requests();
+        let rejected = journal
+            .iter()
+            .find(|record| record.operation == Operation::PutObject && record.key.as_deref() == Some("no-checksum"))
+            .expect("the rejected PUT is journaled");
+        assert!(rejected.transport.object_lock_params);
+        assert!(rejected.transport.checksum_headers.is_empty());
+        assert_eq!(rejected.transport.content_md5, None);
+        assert!(!rejected.transport.aws_chunked);
+        let accepted = journal
+            .iter()
+            .find(|record| record.operation == Operation::PutObject && record.key.as_deref() == Some("good-md5"))
+            .expect("the accepted PUT is journaled");
+        assert_eq!(
+            accepted.transport.content_md5.as_deref(),
+            Some(BASE64_STANDARD.encode_to_string(md5_bytes(b"locked payload")).as_str())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aws_chunked_rejecting_target_refuses_framed_uploads() -> Result<(), BoxError> {
+        use aws_sdk_s3::error::ProvideErrorMetadata;
+
+        let target = FakeS3Target::start().await?;
+        target.create_bucket("plain");
+        target.reject_aws_chunked_uploads(true);
+        let client = client_without_sdk_checksums(&target);
+
+        // An upload announcing a trailer is refused before its body is read.
+        let err = client
+            .put_object()
+            .bucket("plain")
+            .key("framed")
+            .body(ByteStream::from_static(b"framed payload"))
+            .customize()
+            .map_request(|mut request| {
+                request.headers_mut().insert("x-amz-trailer", "x-amz-checksum-crc32");
+                Ok::<_, std::convert::Infallible>(request)
+            })
+            .send()
+            .await
+            .expect_err("an aws-chunked upload must be refused")
+            .into_service_error();
+        assert_eq!(err.code(), Some("InvalidRequest"));
+        assert!(
+            err.message().unwrap_or_default().contains("aws-chunked"),
+            "unexpected message: {:?}",
+            err.message()
+        );
+        assert!(!target.has_object("plain", "framed"));
+
+        // A plain signed payload still lands.
+        client
+            .put_object()
+            .bucket("plain")
+            .key("unframed")
+            .body(ByteStream::from_static(b"plain payload"))
+            .send()
+            .await?;
+        assert!(target.has_object("plain", "unframed"));
+
+        let journal = target.requests();
+        let framed = journal
+            .iter()
+            .find(|record| record.key.as_deref() == Some("framed"))
+            .expect("the refused upload is journaled");
+        assert!(framed.transport.aws_chunked);
+        let unframed = journal
+            .iter()
+            .find(|record| record.key.as_deref() == Some("unframed"))
+            .expect("the accepted upload is journaled");
+        assert!(!unframed.transport.aws_chunked);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_lock_configuration_reports_bucket_mode() -> Result<(), BoxError> {
+        use aws_sdk_s3::error::ProvideErrorMetadata;
+
+        let target = FakeS3Target::start().await?;
+        target.create_bucket_with_object_lock("locked");
+        target.create_bucket("plain");
+        let client = client(&target);
+
+        let locked = client.get_object_lock_configuration().bucket("locked").send().await?;
+        assert_eq!(
+            locked
+                .object_lock_configuration()
+                .and_then(|config| config.object_lock_enabled())
+                .map(|state| state.as_str()),
+            Some("Enabled")
+        );
+
+        // The code RustFS's replication-check classifies as "not enabled".
+        let err = client
+            .get_object_lock_configuration()
+            .bucket("plain")
+            .send()
+            .await
+            .expect_err("a bucket without Object Lock has no configuration")
+            .into_service_error();
+        assert_eq!(err.code(), Some("ObjectLockConfigurationNotFoundError"));
+        assert_eq!(
+            target
+                .requests()
+                .iter()
+                .filter(|record| record.operation == Operation::GetObjectLockConfiguration)
+                .count(),
+            2
+        );
+        Ok(())
     }
 
     #[tokio::test]

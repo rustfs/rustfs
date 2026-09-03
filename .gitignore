@@ -55,6 +55,8 @@ docs/*
 !docs/architecture/**
 !docs/operations/
 !docs/operations/**
+!docs/postmortems/
+!docs/postmortems/**
 !docs/testing/
 !docs/testing/**
 .codegraph/*

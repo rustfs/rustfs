@@ -1,3 +1,4 @@
+| Outbound target matrix | Replication of every object shape (empty, plain, retention, legal hold, multipart) against every remote-target failure mode the fake target models; an explicit expectation table pins known-red cells to an open issue | `cargo nextest run -p e2e_test -E 'test(/^replication_target_matrix_test::/)'` (build `target/debug/rustfs` first) | With `e2e-repl-nightly`; required locally for any change to outbound client defaults (SOP: [`docs/postmortems/2026-09-03-replication-checksum-default-regression.md`](../postmortems/2026-09-03-replication-checksum-default-regression.md)) |
 # RustFS Testing
 
 **Use this when:** you need to pick a test layer for a change, name a test so a gate keeps selecting it, understand why `#[serial]` does nothing under nextest, or handle a flaky test.
