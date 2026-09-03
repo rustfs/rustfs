@@ -71,6 +71,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 1000;
 #[cfg(test)]
 const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 2;
+const RESTORE_WORKER_LOCK_PREFIX: &str = "ilm/restore-worker-locks";
+const RESTORE_WORKER_LOCK_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
 
 fn install_tier_free_version_receipt_sink(opts: &mut ObjectOptions) -> Option<TierFreeVersionReceiptSink> {
     if opts.tier_free_version_receipt_sink.is_some() || opts.skip_free_version || opts.delete_prefix {
@@ -931,6 +933,17 @@ impl RestoreAcceptGuard {
 
     pub fn add_namespace_lock_fence(&self, opts: &mut ObjectOptions) {
         self.0.add_namespace_lock_fence(opts);
+    }
+}
+
+/// Liveness proof for one asynchronous restore generation. Unlike the object
+/// accept/commit locks, this lock lives in the reserved metadata namespace and
+/// never blocks reads or unrelated writes of the restored object.
+pub struct RestoreWorkerGuard(rustfs_lock::NamespaceLockGuard);
+
+impl RestoreWorkerGuard {
+    pub fn is_lock_lost(&self) -> bool {
+        self.0.is_lock_lost()
     }
 }
 
@@ -2668,6 +2681,32 @@ impl ECStore {
             .acquire_object_write_lock("restore_object_accept", bucket, &object)
             .await?;
         Ok(RestoreAcceptGuard(guard))
+    }
+
+    /// Acquire the liveness lock for a newly generated restore UUID using the
+    /// normal namespace-lock timeout. New generations cannot legitimately
+    /// contend, but a distributed quorum can take longer than the short orphan
+    /// probe window under load.
+    pub async fn acquire_restore_worker_guard(&self, operation_id: Uuid) -> Result<RestoreWorkerGuard> {
+        let object = format!("{RESTORE_WORKER_LOCK_PREFIX}/{operation_id}");
+        let lock = self.handle_new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+        lock.get_write_lock_quiet(get_lock_acquire_timeout())
+            .await
+            .map(RestoreWorkerGuard)
+            .map_err(|err| Self::map_namespace_lock_error(RUSTFS_META_BUCKET, &object, "restore_worker", err))
+    }
+
+    /// Probe the liveness lock for an already-persisted restore UUID.
+    /// Contention is returned as `None`; infrastructure/quorum failures remain
+    /// typed errors so callers fail closed instead of reaping an active worker.
+    pub async fn try_acquire_restore_worker_guard(&self, operation_id: Uuid) -> Result<Option<RestoreWorkerGuard>> {
+        let object = format!("{RESTORE_WORKER_LOCK_PREFIX}/{operation_id}");
+        let lock = self.handle_new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+        match lock.get_write_lock_quiet(RESTORE_WORKER_LOCK_PROBE_TIMEOUT).await {
+            Ok(guard) => Ok(Some(RestoreWorkerGuard(guard))),
+            Err(rustfs_lock::LockError::Timeout { .. } | rustfs_lock::LockError::AlreadyLocked { .. }) => Ok(None),
+            Err(err) => Err(Self::map_namespace_lock_error(RUSTFS_META_BUCKET, &object, "restore_worker", err)),
+        }
     }
 
     async fn acquire_delete_objects_write_locks(
@@ -8868,6 +8907,36 @@ mod tests {
         .await;
 
         assert!(matches!(err, StorageError::Lock(rustfs_lock::LockError::Timeout { .. })));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_worker_guard_proves_generation_liveness_until_drop() {
+        let store = Arc::new(new_read_lock_test_store().await);
+        let operation_id = Uuid::from_u128(1);
+
+        let first = store
+            .acquire_restore_worker_guard(operation_id)
+            .await
+            .expect("first worker must own its newly generated lock");
+        assert!(
+            store
+                .try_acquire_restore_worker_guard(operation_id)
+                .await
+                .expect("a contended liveness probe should remain typed")
+                .is_none(),
+            "the same generation must remain live while its worker guard is held"
+        );
+
+        drop(first);
+        assert!(
+            store
+                .try_acquire_restore_worker_guard(operation_id)
+                .await
+                .expect("post-drop liveness probe should not fail")
+                .is_some(),
+            "dropping the worker guard must make the orphan generation recoverable"
+        );
     }
 
     #[tokio::test]

@@ -30,11 +30,12 @@ use crate::{ChecksumInfo, TransitionVersionState};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::http::{
     RUSTFS_INTERNAL_PREFIX, SUFFIX_CRC, SUFFIX_FREE_VERSION, SUFFIX_INLINE_DATA, SUFFIX_PART_CHECKSUMS, SUFFIX_PURGESTATUS,
-    SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, SUFFIX_REPLICATION_RESET_ARN_PREFIX, SUFFIX_TIER_FV_ID,
-    SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER, SUFFIX_TRANSITION_TIER_DESTINATION_ID,
-    SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID, SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_bytes,
-    get_bytes, get_consistent_bytes, get_str, has_internal_suffix, insert_bytes, is_internal_key, remove_bytes,
-    strip_internal_prefix, strip_internal_prefix_preserving_case, target_delete_marker_versions,
+    SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX, SUFFIX_REPLICATION_RESET_ARN_PREFIX, SUFFIX_RESTORE_OPERATION_ID,
+    SUFFIX_RESTORE_WORKER_LOCK, SUFFIX_TIER_FV_ID, SUFFIX_TIER_FV_MARKER, SUFFIX_TRANSITION_STATUS, SUFFIX_TRANSITION_TIER,
+    SUFFIX_TRANSITION_TIER_DESTINATION_ID, SUFFIX_TRANSITIONED_OBJECTNAME, SUFFIX_TRANSITIONED_VERSION_ID,
+    SUFFIX_TRANSITIONED_VERSION_STATE, contains_key_bytes, get_bytes, get_consistent_bytes, get_str, has_internal_suffix,
+    insert_bytes, is_internal_key, remove_bytes, strip_internal_prefix, strip_internal_prefix_preserving_case,
+    target_delete_marker_versions,
 };
 
 const MSGPACK_EXT8: u8 = 0xc7;
@@ -2699,6 +2700,8 @@ impl MetaObject {
         self.meta_user.remove(X_AMZ_RESTORE.as_str());
         self.meta_user.remove(AMZ_RESTORE_EXPIRY_DAYS);
         self.meta_user.remove(AMZ_RESTORE_REQUEST_DATE);
+        remove_bytes(&mut self.meta_sys, SUFFIX_RESTORE_OPERATION_ID);
+        remove_bytes(&mut self.meta_sys, SUFFIX_RESTORE_WORKER_LOCK);
     }
 
     pub fn uses_data_dir(&self) -> bool {

@@ -3168,6 +3168,10 @@ impl TierConfigMgr {
         lease
     }
 
+    pub(crate) fn operation_lease_blocked_by_mutation(err: &AdminError) -> bool {
+        err.message == TIER_MUTATION_BLOCK_MESSAGE
+    }
+
     async fn admin_update_lock(handle: &Arc<RwLock<Self>>) -> tokio::sync::OwnedMutexGuard<()> {
         let update_lock = {
             let manager = handle.read().await;
@@ -5895,6 +5899,24 @@ mod tests {
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleRule, NoncurrentVersionTransition, Transition,
         TransitionStorageClass,
     };
+
+    #[test]
+    fn restore_retry_classifier_matches_only_the_exact_mutation_block() {
+        assert!(TierConfigMgr::operation_lease_blocked_by_mutation(&AdminError::msg(
+            TIER_MUTATION_BLOCK_MESSAGE,
+        )));
+        for message in [
+            "Remote tier configuration is being replaced: COLD",
+            "remote tier configuration is being replaced",
+            "Remote tier configuration is unavailable",
+            "",
+        ] {
+            assert!(
+                !TierConfigMgr::operation_lease_blocked_by_mutation(&AdminError::msg(message)),
+                "unrelated error must not consume the restore retry budget: {message}"
+            );
+        }
+    }
 
     struct SetupTypeGuard {
         previous: SetupType,

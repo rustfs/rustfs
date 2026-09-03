@@ -36,10 +36,10 @@ use super::super::{
     ObjectLockConfigSnapshot, ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime, Ordering, Pin,
     PutObjReader, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReadPathPlan, ReaderImpl, ReplicateDecision,
     ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
-    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_OPERATION_ID, SetDisks, SmallWritePath, StorageError,
-    TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE,
-    X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE, adaptive_duplex_buffer_size, build_get_object_info,
-    build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
+    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
+    SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, X_AMZ_OBJECT_LOCK_LEGAL_HOLD,
+    X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE, adaptive_duplex_buffer_size,
+    build_get_object_info, build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
     check_object_lock_delete, check_object_lock_for_deletion_with_state, check_object_lock_retention_update,
     classify_get_codec_streaming_object_class, classify_put_write_path, classify_storage_error,
     collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer, debug, delete_file_info_version_id,
@@ -96,6 +96,7 @@ const GET_MID_SIZE_STREAMING_MIN_SIZE: usize = 128 * 1024 + 1;
 const GET_MID_SIZE_STREAMING_MAX_SIZE: usize = 512 * 1024;
 const EVENT_LIFECYCLE_TRANSITION_CLEANUP: &str = "lifecycle_transition_cleanup";
 const EVENT_LIFECYCLE_TRANSITIONED_DELETE_CLEANUP_OWNER: &str = "lifecycle_transitioned_delete_cleanup_owner";
+const EVENT_LIFECYCLE_RESTORE_CLEANUP: &str = "lifecycle_restore_cleanup";
 
 fn replication_status_writeback_is_current(object_info: &ObjectInfo, condition: &ReplicationStatusWritebackCondition) -> bool {
     let current = object_info.replication_generation_snapshot();
@@ -321,7 +322,6 @@ use rustfs_utils::path::decode_dir_object;
 use rustfs_utils::path::encode_dir_object;
 use std::future::Future;
 use std::task::{Context, Poll};
-#[cfg(any(test, feature = "test-util"))]
 use std::time::Duration;
 #[cfg(test)]
 use tokio::io::AsyncReadExt;
@@ -1834,6 +1834,8 @@ fn is_restore_control_metadata(key: &str) -> bool {
         || key.eq_ignore_ascii_case(rustfs_utils::http::headers::AMZ_RESTORE_REQUEST_DATE)
         || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_OPERATION_ID)
             .is_some_and(|remainder| remainder.is_empty())
+        || rustfs_utils::http::internal_key_strip_suffix_prefix(key, SUFFIX_RESTORE_WORKER_LOCK)
+            .is_some_and(|remainder| remainder.is_empty())
 }
 
 fn restore_metadata_update_preserves_protected_metadata(
@@ -1870,6 +1872,11 @@ mod restore_metadata_update_tests {
             &mut replacement,
             SUFFIX_RESTORE_OPERATION_ID,
             Uuid::new_v4().to_string(),
+        );
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut replacement,
+            SUFFIX_RESTORE_WORKER_LOCK,
+            rustfs_utils::http::metadata_compat::RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string(),
         );
         assert!(restore_metadata_update_preserves_protected_metadata(&existing, &replacement));
 
@@ -2107,6 +2114,42 @@ fn full_object_plaintext_len(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions
 }
 
 const RESTORE_MULTIPART_ABORT_FAILURES_TOTAL: &str = "rustfs_restore_multipart_abort_failures_total";
+const RESTORE_TIER_MUTATION_RETRY_BUDGET: Duration = Duration::from_secs(30);
+const RESTORE_TIER_MUTATION_RETRY_BASE: Duration = Duration::from_millis(250);
+const RESTORE_TIER_MUTATION_RETRY_CAP: Duration = Duration::from_secs(5);
+
+fn restore_tier_mutation_retry_delay(attempt: u32) -> Duration {
+    RESTORE_TIER_MUTATION_RETRY_BASE
+        .saturating_mul(1_u32 << attempt.min(5))
+        .min(RESTORE_TIER_MUTATION_RETRY_CAP)
+}
+
+async fn acquire_restore_tier_lease(
+    manager: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+    tier_name: &str,
+    expected_backend_identity: Option<TierDestinationId>,
+) -> Result<TierOperationLease> {
+    let deadline = Instant::now() + RESTORE_TIER_MUTATION_RETRY_BUDGET;
+    let mut attempt = 0_u32;
+    loop {
+        let result = match expected_backend_identity {
+            Some(identity) => TierConfigMgr::acquire_operation_lease_for_backend_identity(manager, tier_name, identity).await,
+            None => TierConfigMgr::acquire_operation_lease(manager, tier_name).await,
+        };
+        match result {
+            Ok(lease) => return Ok(lease),
+            Err(err) if TierConfigMgr::operation_lease_blocked_by_mutation(&err) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(Error::other(err));
+                }
+                tokio::time::sleep(restore_tier_mutation_retry_delay(attempt).min(remaining)).await;
+                attempt = attempt.saturating_add(1);
+            }
+            Err(err) => return Err(Error::other(err)),
+        }
+    }
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3430,6 +3473,7 @@ impl SetDisks {
         }
         if expected_restore_operation_id.is_some() {
             rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_OPERATION_ID);
+            rustfs_utils::http::metadata_compat::remove_str(&mut user_defined, SUFFIX_RESTORE_WORKER_LOCK);
         }
         let WriteLayout {
             data_drives,
@@ -9147,15 +9191,6 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         //     _lock_guard = guard_opt;
         // }
         let self_ = self.clone();
-        let restore_header_self = self_.clone();
-        let set_restore_header_fn = async move |oi: &mut ObjectInfo, rerr: Option<Error>| -> Result<()> {
-            if rerr.is_none() {
-                return Ok(());
-            }
-            restore_header_self.update_restore_metadata(bucket, object, oi, opts).await?;
-            Err(rerr.unwrap())
-        };
-        let mut oi = ObjectInfo::default();
         let bucket_lifecycle_guard = if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
             && opts.bucket_lifecycle_lock_fence.is_none()
         {
@@ -9183,247 +9218,251 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
         let mut restore_read_opts = opts.clone();
         restore_read_opts.include_part_checksums = true;
-        let fi = self
+        let actual = self
             .clone()
             .get_object_fileinfo(bucket, object, &restore_read_opts, true, false)
-            .await;
+            .await
+            .map_err(|err| to_object_err(err, vec![bucket, object]))?;
         drop(bucket_lifecycle_guard);
-        if let Err(err) = fi {
-            return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
-        }
-        let actual = fi?;
         let actual_fi = actual.fi();
 
-        oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
-        // The tier reader releases its own lease at EOF, before PUT or
-        // CompleteMultipartUpload necessarily reaches metadata quorum. Keep a
-        // second exact-generation lease for the whole restore so the final
-        // same-key write lock and this lease together fence remote-tuple
-        // publication through commit.
-        let expected_backend_identity = tier_destination_id_from_metadata(&oi.user_defined).map_err(Error::other)?;
-        let tier_config_mgr = self.ctx.tier_config_mgr();
-        let _remote_tuple_publication_lease = match expected_backend_identity {
-            Some(identity) => {
-                TierConfigMgr::acquire_operation_lease_for_backend_identity(
-                    &tier_config_mgr,
-                    &oi.transitioned_object.tier,
-                    identity,
-                )
-                .await
+        let oi = ObjectInfo::from_file_info(actual_fi, bucket, object, opts.versioned || opts.version_suspended);
+        let restore_result: Result<()> = async {
+            // The tier reader releases its own lease at EOF, before PUT or
+            // CompleteMultipartUpload necessarily reaches metadata quorum. Keep a
+            // second exact-generation lease for the whole restore so the final
+            // same-key write lock and this lease together fence remote-tuple
+            // publication through commit.
+            let expected_backend_identity = tier_destination_id_from_metadata(&oi.user_defined).map_err(Error::other)?;
+            let tier_config_mgr = self.ctx.tier_config_mgr();
+            let _remote_tuple_publication_lease =
+                acquire_restore_tier_lease(&tier_config_mgr, &oi.transitioned_object.tier, expected_backend_identity).await?;
+            let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
+            if let Some(expected_operation_id) = expected_operation_id {
+                require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
             }
-            None => TierConfigMgr::acquire_operation_lease(&tier_config_mgr, &oi.transitioned_object.tier).await,
-        }
-        .map_err(Error::other)?;
-        let expected_operation_id = restore_operation_id_from_metadata(&opts.user_defined)?;
-        if let Some(expected_operation_id) = expected_operation_id {
-            require_restore_operation_id(oi.user_defined.as_ref(), expected_operation_id)?;
-        }
-        let mut ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
-        if let Some(expected_operation_id) = expected_operation_id {
-            rustfs_utils::http::metadata_compat::insert_str(
-                &mut ropts.user_defined,
-                SUFFIX_RESTORE_OPERATION_ID,
-                expected_operation_id.to_string(),
-            );
-        }
-        let mut restore_commit_metadata = if let Some(expected_operation_id) = expected_operation_id {
-            let mut metadata = HashMap::new();
-            metadata.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"false\"".to_string());
-            rustfs_utils::http::metadata_compat::insert_str(
-                &mut metadata,
-                SUFFIX_RESTORE_OPERATION_ID,
-                expected_operation_id.to_string(),
-            );
-            metadata
-        } else {
-            HashMap::new()
-        };
-        if let Some(part_checksums) =
-            rustfs_utils::http::get_consistent_str(&actual_fi.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS)
-        {
-            rustfs_utils::http::insert_str(
-                &mut restore_commit_metadata,
-                rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
-                part_checksums.to_string(),
-            );
-        }
-        // Keep the public ECStore capacity admission attached to each local
-        // commit. The tier reads below must remain outside the object write
-        // lock so HEAD/GET do not wait for a slow remote copy-back. Restore
-        // does not hold an outer object write lock while copying bytes, so a
-        // caller-supplied boolean is not transferable lock authority: PUT and
-        // Complete must acquire their own commit-late write locks.
-        ropts.no_lock = false;
-        ropts.expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
-        ropts.bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.clone();
-        ropts.namespace_lock_fence = opts.namespace_lock_fence.clone();
-        ropts.object_lock_config_snapshot = opts.object_lock_config_snapshot.clone();
-        ropts.decommission_capacity_admission = opts.decommission_capacity_admission.clone();
-        if oi.parts.len() == 1 {
-            let mut opts = opts.clone();
-            opts.part_number = Some(1);
-            let rs: Option<HTTPRangeSpec> = None;
-            let gr = get_transitioned_object_reader_with_tier_manager(
-                bucket,
-                object,
-                &rs,
-                &HeaderMap::new(),
-                &oi,
-                &opts,
-                &self_.ctx.tier_config_mgr(),
-                self_.ctx.object_encryption_resolver(),
-            )
-            .await;
-            if let Err(err) = gr {
-                return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
+            let mut ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
+            if let Some(expected_operation_id) = expected_operation_id {
+                rustfs_utils::http::metadata_compat::insert_str(
+                    &mut ropts.user_defined,
+                    SUFFIX_RESTORE_OPERATION_ID,
+                    expected_operation_id.to_string(),
+                );
             }
-            let gr = gr?;
-            let reader = BufReader::new(gr.stream);
-            let hash_reader = HashReader::from_stream(reader, gr.object_info.size, oi.get_actual_size()?, None, None, false)?;
-            let mut p_reader = PutObjReader::new(hash_reader);
-            return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
-                Ok(restored_info) => {
-                    let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, &opts).await?;
-                    send_event(EventArgs {
-                        event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
-                        bucket_name: bucket.to_string(),
-                        object: restored_info,
-                        user_agent: "Internal: [Restore-Completed]".to_string(),
-                        host: runtime_sources::default_local_node_name(),
-                        ..Default::default()
-                    });
-                    Ok(())
-                }
-                Err(err) => set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await,
+            let mut restore_commit_metadata = if let Some(expected_operation_id) = expected_operation_id {
+                let mut metadata = HashMap::new();
+                metadata.insert(X_AMZ_RESTORE.as_str().to_string(), "ongoing-request=\"false\"".to_string());
+                rustfs_utils::http::metadata_compat::insert_str(
+                    &mut metadata,
+                    SUFFIX_RESTORE_OPERATION_ID,
+                    expected_operation_id.to_string(),
+                );
+                metadata
+            } else {
+                HashMap::new()
             };
-        }
-
-        let res = self_.clone().new_multipart_upload(bucket, object, &ropts).await?;
-        #[cfg(test)]
-        {
-            *RESTORE_MULTIPART_UPLOAD_ID
-                .lock()
-                .expect("restore multipart upload-id lock must not be poisoned") = Some(res.upload_id.clone());
-        }
-        let mut upload_cleanup = RestoreMultipartUploadCleanup::new(self_.clone(), bucket, object, &res.upload_id);
-        let restore_result: Result<ObjectInfo> = async {
-            let mut uploaded_parts: Vec<CompletePart> = vec![];
-            let parts = Arc::clone(&oi.parts);
-            let mut part_offset: i64 = 0;
-            for part_info in parts.iter() {
-                let mut part_opts = opts.clone();
-                part_opts.part_number = Some(part_info.number);
-                #[cfg(test)]
-                fail_restore_multipart_at(RestoreMultipartFailurePoint::InvalidPartSize)?;
-                if part_info.actual_size <= 0 {
-                    return Err(Error::other(format!("invalid multipart restore part size {}", part_info.actual_size)));
-                }
-                #[cfg(test)]
-                fail_restore_multipart_at(RestoreMultipartFailurePoint::RangeOverflow)?;
-                let part_end = part_offset
-                    .checked_add(part_info.actual_size - 1)
-                    .ok_or_else(|| Error::other("multipart restore part range overflow".to_string()))?;
-                let rs = Some(HTTPRangeSpec {
-                    is_suffix_length: false,
-                    start: part_offset,
-                    end: part_end,
-                });
-                part_offset = part_end
-                    .checked_add(1)
-                    .ok_or_else(|| Error::other("multipart restore part offset overflow".to_string()))?;
-                #[cfg(test)]
-                fail_restore_multipart_at(RestoreMultipartFailurePoint::TierGet)?;
+            if let Some(part_checksums) =
+                rustfs_utils::http::get_consistent_str(&actual_fi.metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS)
+            {
+                rustfs_utils::http::insert_str(
+                    &mut restore_commit_metadata,
+                    rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
+                    part_checksums.to_string(),
+                );
+            }
+            // Keep the public ECStore capacity admission attached to each local
+            // commit. The tier reads below must remain outside the object write
+            // lock so HEAD/GET do not wait for a slow remote copy-back. Restore
+            // does not hold an outer object write lock while copying bytes, so a
+            // caller-supplied boolean is not transferable lock authority: PUT and
+            // Complete must acquire their own commit-late write locks.
+            ropts.no_lock = false;
+            ropts.expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
+            ropts.bucket_lifecycle_lock_fence = opts.bucket_lifecycle_lock_fence.clone();
+            ropts.namespace_lock_fence = opts.namespace_lock_fence.clone();
+            ropts.object_lock_config_snapshot = opts.object_lock_config_snapshot.clone();
+            ropts.decommission_capacity_admission = opts.decommission_capacity_admission.clone();
+            if oi.parts.len() == 1 {
+                let mut opts = opts.clone();
+                opts.part_number = Some(1);
+                let rs: Option<HTTPRangeSpec> = None;
                 let gr = get_transitioned_object_reader_with_tier_manager(
                     bucket,
                     object,
                     &rs,
                     &HeaderMap::new(),
                     &oi,
-                    &part_opts,
+                    &opts,
                     &self_.ctx.tier_config_mgr(),
                     self_.ctx.object_encryption_resolver(),
                 )
                 .await
-                .map_err(StorageError::Io)?;
+                .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
                 let reader = BufReader::new(gr.stream);
-                #[cfg(test)]
-                fail_restore_multipart_at(RestoreMultipartFailurePoint::HashReader)?;
-                let hash_reader =
-                    HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
+                let hash_reader = HashReader::from_stream(reader, gr.object_info.size, oi.get_actual_size()?, None, None, false)?;
                 let mut p_reader = PutObjReader::new(hash_reader);
-                #[cfg(test)]
-                fail_restore_multipart_at(RestoreMultipartFailurePoint::PutPart)?;
-                let p_info = self_
+                let restored_info = self_
                     .clone()
-                    .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ropts)
-                    .await?;
-                #[cfg(test)]
-                let p_info = if restore_multipart_failure_is(RestoreMultipartFailurePoint::SizeMismatch) {
-                    let mut injected = p_info;
-                    injected.size = 0;
-                    injected
-                } else {
-                    p_info
-                };
-                if p_info.size as i64 != part_info.actual_size {
-                    return Err(Error::other(ObjectApiError::InvalidObjectState(GenericError {
-                        bucket: bucket.to_string(),
-                        object: object.to_string(),
-                        ..Default::default()
-                    })));
-                }
-                uploaded_parts.push(CompletePart {
-                    part_num: p_info.part_num,
-                    etag: p_info.etag,
-                    checksum_crc32: None,
-                    checksum_crc32c: None,
-                    checksum_sha1: None,
-                    checksum_sha256: None,
-                    checksum_crc64nvme: None,
+                    .put_object(bucket, object, &mut p_reader, &ropts)
+                    .await
+                    .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+                let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, &opts).await?;
+                send_event(EventArgs {
+                    event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+                    bucket_name: bucket.to_string(),
+                    object: restored_info,
+                    user_agent: "Internal: [Restore-Completed]".to_string(),
+                    host: runtime_sources::default_local_node_name(),
+                    ..Default::default()
                 });
+                return Ok(());
             }
+
+            let res = self_.clone().new_multipart_upload(bucket, object, &ropts).await?;
             #[cfg(test)]
-            if restore_multipart_failure_is(RestoreMultipartFailurePoint::Complete) {
-                uploaded_parts
-                    .first_mut()
-                    .expect("multipart restore must contain at least one uploaded part")
-                    .etag = Some("injected-invalid-complete-etag".to_string());
+            {
+                *RESTORE_MULTIPART_UPLOAD_ID
+                    .lock()
+                    .expect("restore multipart upload-id lock must not be poisoned") = Some(res.upload_id.clone());
             }
-            let complete_opts = ObjectOptions {
-                mod_time: oi.mod_time,
-                version_id: oi.version_id.map(|version| version.to_string()),
-                expected_bucket_incarnation_id: opts.expected_bucket_incarnation_id,
-                bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
-                user_defined: restore_commit_metadata,
-                no_lock: false,
-                decommission_capacity_admission: opts.decommission_capacity_admission.clone(),
-                ..Default::default()
+            let mut upload_cleanup = RestoreMultipartUploadCleanup::new(self_.clone(), bucket, object, &res.upload_id);
+            let restore_result: Result<ObjectInfo> = async {
+                let mut uploaded_parts: Vec<CompletePart> = vec![];
+                let parts = Arc::clone(&oi.parts);
+                let mut part_offset: i64 = 0;
+                for part_info in parts.iter() {
+                    let mut part_opts = opts.clone();
+                    part_opts.part_number = Some(part_info.number);
+                    #[cfg(test)]
+                    fail_restore_multipart_at(RestoreMultipartFailurePoint::InvalidPartSize)?;
+                    if part_info.actual_size <= 0 {
+                        return Err(Error::other(format!("invalid multipart restore part size {}", part_info.actual_size)));
+                    }
+                    #[cfg(test)]
+                    fail_restore_multipart_at(RestoreMultipartFailurePoint::RangeOverflow)?;
+                    let part_end = part_offset
+                        .checked_add(part_info.actual_size - 1)
+                        .ok_or_else(|| Error::other("multipart restore part range overflow".to_string()))?;
+                    let rs = Some(HTTPRangeSpec {
+                        is_suffix_length: false,
+                        start: part_offset,
+                        end: part_end,
+                    });
+                    part_offset = part_end
+                        .checked_add(1)
+                        .ok_or_else(|| Error::other("multipart restore part offset overflow".to_string()))?;
+                    #[cfg(test)]
+                    fail_restore_multipart_at(RestoreMultipartFailurePoint::TierGet)?;
+                    let gr = get_transitioned_object_reader_with_tier_manager(
+                        bucket,
+                        object,
+                        &rs,
+                        &HeaderMap::new(),
+                        &oi,
+                        &part_opts,
+                        &self_.ctx.tier_config_mgr(),
+                        self_.ctx.object_encryption_resolver(),
+                    )
+                    .await
+                    .map_err(StorageError::Io)?;
+                    let reader = BufReader::new(gr.stream);
+                    #[cfg(test)]
+                    fail_restore_multipart_at(RestoreMultipartFailurePoint::HashReader)?;
+                    let hash_reader =
+                        HashReader::from_stream(reader, part_info.actual_size, part_info.actual_size, None, None, false)?;
+                    let mut p_reader = PutObjReader::new(hash_reader);
+                    #[cfg(test)]
+                    fail_restore_multipart_at(RestoreMultipartFailurePoint::PutPart)?;
+                    let p_info = self_
+                        .clone()
+                        .put_object_part(bucket, object, &res.upload_id, part_info.number, &mut p_reader, &ropts)
+                        .await?;
+                    #[cfg(test)]
+                    let p_info = if restore_multipart_failure_is(RestoreMultipartFailurePoint::SizeMismatch) {
+                        let mut injected = p_info;
+                        injected.size = 0;
+                        injected
+                    } else {
+                        p_info
+                    };
+                    if p_info.size as i64 != part_info.actual_size {
+                        return Err(Error::other(ObjectApiError::InvalidObjectState(GenericError {
+                            bucket: bucket.to_string(),
+                            object: object.to_string(),
+                            ..Default::default()
+                        })));
+                    }
+                    uploaded_parts.push(CompletePart {
+                        part_num: p_info.part_num,
+                        etag: p_info.etag,
+                        checksum_crc32: None,
+                        checksum_crc32c: None,
+                        checksum_sha1: None,
+                        checksum_sha256: None,
+                        checksum_crc64nvme: None,
+                    });
+                }
+                #[cfg(test)]
+                if restore_multipart_failure_is(RestoreMultipartFailurePoint::Complete) {
+                    uploaded_parts
+                        .first_mut()
+                        .expect("multipart restore must contain at least one uploaded part")
+                        .etag = Some("injected-invalid-complete-etag".to_string());
+                }
+                let complete_opts = ObjectOptions {
+                    mod_time: oi.mod_time,
+                    version_id: oi.version_id.map(|version| version.to_string()),
+                    expected_bucket_incarnation_id: opts.expected_bucket_incarnation_id,
+                    bucket_lifecycle_lock_fence: opts.bucket_lifecycle_lock_fence.clone(),
+                    user_defined: restore_commit_metadata,
+                    no_lock: false,
+                    decommission_capacity_admission: opts.decommission_capacity_admission.clone(),
+                    ..Default::default()
+                };
+                self_
+                    .clone()
+                    .complete_multipart_upload(bucket, object, &res.upload_id, uploaded_parts, &complete_opts)
+                    .await
+            }
+            .await;
+            let restored_info = match restore_result {
+                Ok(info) => {
+                    upload_cleanup.disarm();
+                    info
+                }
+                Err(err) => {
+                    upload_cleanup.abort().await;
+                    return Err(err);
+                }
             };
-            self_
-                .clone()
-                .complete_multipart_upload(bucket, object, &res.upload_id, uploaded_parts, &complete_opts)
-                .await
+            let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, opts).await?;
+            send_event(EventArgs {
+                event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+                bucket_name: bucket.to_string(),
+                object: restored_info,
+                user_agent: "Internal: [Restore-Completed]".to_string(),
+                host: runtime_sources::default_local_node_name(),
+                ..Default::default()
+            });
+            Ok(())
         }
         .await;
-        let restored_info = match restore_result {
-            Ok(info) => {
-                upload_cleanup.disarm();
-                info
+        if let Err(primary_error) = restore_result {
+            if let Err(cleanup_error) = self_.update_restore_metadata(bucket, object, &oi, opts).await {
+                warn!(
+                    event = EVENT_LIFECYCLE_RESTORE_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "failed",
+                    bucket,
+                    object,
+                    primary_error = %primary_error,
+                    cleanup_error = %cleanup_error,
+                    "restore metadata cleanup failed"
+                );
             }
-            Err(err) => {
-                upload_cleanup.abort().await;
-                return set_restore_header_fn(&mut oi, Some(err)).await;
-            }
-        };
-        let restored_info = self_.finalize_restore_metadata(bucket, object, &restored_info, opts).await?;
-        send_event(EventArgs {
-            event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
-            bucket_name: bucket.to_string(),
-            object: restored_info,
-            user_agent: "Internal: [Restore-Completed]".to_string(),
-            host: runtime_sources::default_local_node_name(),
-            ..Default::default()
-        });
+            return Err(primary_error);
+        }
         Ok(())
     }
 
@@ -12671,8 +12710,22 @@ mod transition_commit_failure_tests {
 
     pub(super) fn restore_metadata(operation_id: Uuid, ongoing: bool) -> HashMap<String, String> {
         let mut metadata = restore_operation_id_metadata(operation_id);
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_RESTORE_WORKER_LOCK,
+            rustfs_utils::http::metadata_compat::RESTORE_WORKER_LOCK_PROTOCOL_V1.to_string(),
+        );
         metadata.insert(s3s::header::X_AMZ_RESTORE.as_str().to_string(), format!("ongoing-request=\"{ongoing}\""));
         metadata
+    }
+
+    #[test]
+    fn restore_tier_mutation_retry_backoff_is_bounded() {
+        assert_eq!(restore_tier_mutation_retry_delay(0), Duration::from_millis(250));
+        assert_eq!(restore_tier_mutation_retry_delay(1), Duration::from_millis(500));
+        assert_eq!(restore_tier_mutation_retry_delay(4), Duration::from_secs(4));
+        assert_eq!(restore_tier_mutation_retry_delay(5), RESTORE_TIER_MUTATION_RETRY_CAP);
+        assert_eq!(restore_tier_mutation_retry_delay(u32::MAX), RESTORE_TIER_MUTATION_RETRY_CAP);
     }
 
     #[tokio::test]
@@ -12813,8 +12866,21 @@ mod transition_commit_failure_tests {
             *RESTORE_MULTIPART_UPLOAD_ID
                 .lock()
                 .expect("restore multipart upload-id lock must not be poisoned") = None;
+            let operation_id = Uuid::new_v4();
+            set_disks
+                .put_object_metadata(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        eval_metadata: Some(restore_metadata(operation_id, true)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the injected restore generation should be installed");
             let mut opts = ObjectOptions::default();
             opts.transition.restore_request.days = Some(1);
+            opts.user_defined = restore_operation_id_metadata(operation_id);
             set_disks
                 .clone()
                 .restore_transitioned_object(bucket, object, &opts)
@@ -12837,6 +12903,24 @@ mod transition_commit_failure_tests {
                     "{point:?}: failed restore must remove staged multipart data"
                 );
             }
+            let cleaned = set_disks
+                .get_object_info(bucket, object, &ObjectOptions::default())
+                .await
+                .expect("failed restore cleanup should leave the transitioned object readable");
+            assert!(
+                !cleaned.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()),
+                "{point:?}: every post-snapshot failure must clean the public ongoing marker"
+            );
+            assert!(
+                rustfs_utils::http::get_str(cleaned.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_OPERATION_ID,)
+                    .is_none(),
+                "{point:?}: every post-snapshot failure must clean its operation generation"
+            );
+            assert!(
+                rustfs_utils::http::get_str(cleaned.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_WORKER_LOCK,)
+                    .is_none(),
+                "{point:?}: every post-snapshot failure must clean its liveness marker"
+            );
         }
         assert_eq!(
             RESTORE_MULTIPART_ABORT_ATTEMPTS.load(Ordering::Relaxed),
@@ -12846,8 +12930,21 @@ mod transition_commit_failure_tests {
         *RESTORE_MULTIPART_FAILURE_POINT
             .lock()
             .expect("restore multipart failure-point lock must not be poisoned") = None;
+        let operation_id = Uuid::new_v4();
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    eval_metadata: Some(restore_metadata(operation_id, true)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the successful restore generation should be installed");
         let mut opts = ObjectOptions::default();
         opts.transition.restore_request.days = Some(1);
+        opts.user_defined = restore_operation_id_metadata(operation_id);
         set_disks
             .clone()
             .restore_transitioned_object(bucket, object, &opts)
@@ -12894,6 +12991,106 @@ mod transition_commit_failure_tests {
         assert!(
             restore_status.expiry().is_some(),
             "successful multipart restore must retain its expiry date"
+        );
+        assert!(
+            rustfs_utils::http::get_str(restored.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_WORKER_LOCK,)
+                .is_none(),
+            "successful multipart restore must consume the worker-liveness marker"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restore_failure_after_snapshot_cleans_exact_generation_and_returns_primary_error() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "restore-post-snapshot-cleanup-bucket";
+        let object = "object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let mut reader = PutObjReader::from_vec(b"post-snapshot cleanup source".repeat(1024));
+        let original = set_disks
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("source object should be written");
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
+        set_disks
+            .transition_object(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    transition: TransitionOptions {
+                        status: TRANSITION_PENDING.to_string(),
+                        tier: tier_name,
+                        etag: original.etag.clone().unwrap_or_default(),
+                        ..Default::default()
+                    },
+                    version_id: original.version_id.map(|version| version.to_string()),
+                    mod_time: original.mod_time,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("source object should transition before restore");
+
+        let operation_id = Uuid::new_v4();
+        let (mut source_fi, _, online_disks) = set_disks
+            .get_object_fileinfo(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    metadata_cache_safe: false,
+                    ..Default::default()
+                },
+                true,
+                false,
+            )
+            .await
+            .expect("transitioned metadata should be readable")
+            .into_owned();
+        source_fi.metadata.extend(restore_metadata(operation_id, true));
+        rustfs_utils::http::insert_str(
+            &mut source_fi.metadata,
+            rustfs_utils::http::SUFFIX_TRANSITION_TIER_DESTINATION_ID,
+            "invalid".to_string(),
+        );
+        set_disks
+            .update_object_meta(bucket, object, source_fi, &online_disks)
+            .await
+            .expect("invalid backend identity fixture should be persisted");
+        set_disks.invalidate_get_object_metadata_cache(bucket, object).await;
+
+        let mut opts = ObjectOptions::default();
+        opts.transition.restore_request.days = Some(1);
+        opts.user_defined = restore_operation_id_metadata(operation_id);
+        let error = set_disks
+            .clone()
+            .restore_transitioned_object(bucket, object, &opts)
+            .await
+            .expect_err("invalid backend identity must fail before the tier read");
+        assert!(
+            error
+                .to_string()
+                .contains("transition tier backend identity has an invalid length"),
+            "cleanup must preserve the primary validation error: {error}"
+        );
+
+        let cleaned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("cleanup should leave the transitioned object readable");
+        assert_eq!(cleaned.transitioned_object.status, TRANSITION_COMPLETE);
+        assert!(!cleaned.user_defined.contains_key(s3s::header::X_AMZ_RESTORE.as_str()));
+        assert!(
+            rustfs_utils::http::get_str(cleaned.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_OPERATION_ID,)
+                .is_none()
+        );
+        assert!(
+            rustfs_utils::http::get_str(cleaned.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_WORKER_LOCK,).is_none()
         );
     }
 
@@ -14119,6 +14316,11 @@ mod transition_commit_failure_tests {
             .is_none(),
             "completed restore PUT must not persist the internal operation id"
         );
+        assert!(
+            rustfs_utils::http::get_str(restored.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_WORKER_LOCK,)
+                .is_none(),
+            "completed restore PUT must not persist the worker-liveness marker"
+        );
     }
 
     #[tokio::test]
@@ -14266,6 +14468,11 @@ mod transition_commit_failure_tests {
             )
             .is_none(),
             "completed multipart restore must not persist the internal operation id"
+        );
+        assert!(
+            rustfs_utils::http::get_str(restored.user_defined.as_ref(), rustfs_utils::http::SUFFIX_RESTORE_WORKER_LOCK,)
+                .is_none(),
+            "completed multipart restore must not persist the worker-liveness marker"
         );
     }
 
