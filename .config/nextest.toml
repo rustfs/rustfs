@@ -394,6 +394,19 @@ test-group = 'ecstore-serial-flaky'
 # rustfs/rustfs#5169 disabled them) have PR-lane signal, not just merge-gate.
 # Single-node servers on random ports with isolated temp dirs — meets the
 # admission criteria unchanged.
+#
+# On-demand migration GA (backlog#2163 ODM-16): three named cases join the
+# lane, one per user-visible contract of the feature — a GET miss that pulls
+# the object and persists it locally, a HEAD miss that answers from the source
+# and stores nothing, and the admin config/status pair that must redact the
+# source secret. Each spawns one single-node rustfs server plus the in-process
+# fake S3 source (`fake_s3_target`, already in the first clause), so they meet
+# the admission criteria unchanged; measured at 15.8 s / 15.8 s / 15.9 s, which
+# is entirely the shared server startup and overlaps the lane's other tests.
+# The rest of `on_demand_migration::{get_basic,interaction,backfill,
+# harness_self}_test` stays in e2e-full and the fault / concurrency /
+# real-source modules stay in e2e-nightly; this is an allowlist, not a module
+# clause, so a new ODM test never lands here silently.
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
@@ -401,6 +414,7 @@ default-filter = """
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
         | test(/^reliant::tiering::/)
+        | test(/^on_demand_migration::(get_basic_test::(get_miss_pulls_inline_and_serves_locally_afterwards|head_miss_answers_from_the_source_without_persisting)|interaction_test::test_odm_admin_config_is_redacted_and_status_counts_match_the_source)$/)
     )
 """
 fail-fast = false

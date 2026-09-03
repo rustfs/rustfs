@@ -54,6 +54,7 @@ use crate::admin::storage_api::s3::{Body, S3Error, S3ErrorCode, S3Request, S3Res
 use crate::admin::utils::{extract_query_params, read_compatible_admin_body};
 use crate::error::ApiError;
 use crate::license::license_check;
+use crate::module_switches::{ENV_ON_DEMAND_MIGRATION_ENABLED, on_demand_migration_enabled_from_env};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -93,13 +94,12 @@ pub(crate) const ERR_CODE_BACKFILL_RUNNING: &str = "OnDemandMigrationBackfillRun
 /// Error code (404) returned when the bucket never had a backfill job.
 pub(crate) const ERR_CODE_NO_SUCH_BACKFILL_JOB: &str = "NoSuchBackfillJob";
 
-/// The published switch is `RUSTFS_ON_DEMAND_MIGRATION_ENABLED`, owned by
-/// ODM-05 in `module_switches.rs`. This is the only read of it in the admin
-/// plane so the orchestrator can swap the call for the published predicate.
-const ENV_ON_DEMAND_MIGRATION_ENABLED: &str = "RUSTFS_ON_DEMAND_MIGRATION_ENABLED";
-
+/// The switch is `RUSTFS_ON_DEMAND_MIGRATION_ENABLED`, owned by ODM-05 in
+/// `module_switches.rs`. The admin plane resolves it from the environment on
+/// every call rather than from the published cell, so an admin request answers
+/// the switch the process was started with even before startup published it.
 fn module_enabled() -> bool {
-    rustfs_utils::get_env_bool(ENV_ON_DEMAND_MIGRATION_ENABLED, false)
+    on_demand_migration_enabled_from_env()
 }
 
 /// What the source answered during `PUT` validation.
@@ -1278,8 +1278,8 @@ mod tests {
     }
 
     #[test]
-    fn module_switch_defaults_off_and_reads_the_env() {
-        temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, None::<&str>, || assert!(!module_enabled()));
+    fn module_switch_defaults_on_and_reads_the_env() {
+        temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, None::<&str>, || assert!(module_enabled()));
         temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, Some("true"), || assert!(module_enabled()));
         temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, Some("false"), || assert!(!module_enabled()));
     }
