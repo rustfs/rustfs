@@ -197,6 +197,27 @@ pub const DEFAULT_POOL_META_V3_FLEET_CONFIRMED: bool = false;
 const _: () = assert!(!DEFAULT_POOL_META_V3_WRITE);
 const _: () = assert!(!DEFAULT_POOL_META_V3_FLEET_CONFIRMED);
 
+/// Maximum unpacked size accepted for one Snowball archive member.
+///
+/// The value is expressed in bytes. Invalid values use the default, while
+/// valid values are clamped to [`MAX_SNOWBALL_ENTRY_BYTES`].
+pub const ENV_SNOWBALL_MAX_ENTRY_BYTES: &str = "RUSTFS_SNOWBALL_MAX_ENTRY_BYTES";
+pub const DEFAULT_SNOWBALL_MAX_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
+pub const MAX_SNOWBALL_ENTRY_BYTES: u64 = 1024 * DEFAULT_SNOWBALL_MAX_ENTRY_BYTES;
+
+/// Maximum cumulative unpacked object bytes accepted from one Snowball
+/// archive request.
+///
+/// This does not include tar headers or bounded PAX metadata. The value is
+/// expressed in bytes and is clamped to
+/// [`MAX_SNOWBALL_UNPACKED_BYTES`].
+pub const ENV_SNOWBALL_MAX_UNPACKED_BYTES: &str = "RUSTFS_SNOWBALL_MAX_UNPACKED_BYTES";
+pub const DEFAULT_SNOWBALL_MAX_UNPACKED_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+pub const MAX_SNOWBALL_UNPACKED_BYTES: u64 = 10 * 1024 * DEFAULT_SNOWBALL_MAX_ENTRY_BYTES;
+
+const _: () = assert!(DEFAULT_SNOWBALL_MAX_ENTRY_BYTES <= MAX_SNOWBALL_ENTRY_BYTES);
+const _: () = assert!(DEFAULT_SNOWBALL_MAX_UNPACKED_BYTES <= MAX_SNOWBALL_UNPACKED_BYTES);
+
 // =============================================================================
 // Concurrent Request Fix - Timeout and Backpressure Configuration
 // =============================================================================
@@ -819,5 +840,11 @@ mod remote_version_state_tests {
     fn pool_meta_v3_gate_uses_stable_environment_names() {
         assert_eq!(super::ENV_POOL_META_V3_WRITE, "RUSTFS_POOL_META_V3_WRITE");
         assert_eq!(super::ENV_POOL_META_V3_FLEET_CONFIRMED, "RUSTFS_POOL_META_V3_FLEET_CONFIRMED");
+    }
+
+    #[test]
+    fn snowball_limit_environment_names_are_stable() {
+        assert_eq!(super::ENV_SNOWBALL_MAX_ENTRY_BYTES, "RUSTFS_SNOWBALL_MAX_ENTRY_BYTES");
+        assert_eq!(super::ENV_SNOWBALL_MAX_UNPACKED_BYTES, "RUSTFS_SNOWBALL_MAX_UNPACKED_BYTES");
     }
 }

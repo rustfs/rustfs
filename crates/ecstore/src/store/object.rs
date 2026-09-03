@@ -1531,6 +1531,10 @@ fn data_movement_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> Object
     writer_pool_lookup_opts(opts, no_lock)
 }
 
+fn uses_data_movement_pool_selection(opts: &ObjectOptions) -> bool {
+    opts.data_movement && (opts.version_id.is_some() || DecommissionCapacityOwner::from_options(opts).is_some())
+}
+
 fn writer_pool_lookup_opts(opts: &ObjectOptions, no_lock: bool) -> ObjectOptions {
     let mut lookup_opts = version_aware_lookup_opts(opts, no_lock);
     lookup_opts.skip_decommissioned = true;
@@ -3467,7 +3471,12 @@ impl ECStore {
     }
 
     fn resolve_decommission_tiered_object_result(result: Result<()>, bucket: &str, object: &str) -> Result<()> {
-        result.map_err(|err| Error::other(format!("failed to decommission tiered object for {bucket}/{object}: {err}")))
+        result.map_err(|err| {
+            crate::data_movement::data_movement_context_error(
+                format!("failed to decommission tiered object for {bucket}/{object}: {err}"),
+                err,
+            )
+        })
     }
 
     #[instrument(skip(self, fi, opts))]
@@ -3515,7 +3524,7 @@ impl ECStore {
             );
         }
 
-        let idx = if opts.data_movement && opts.version_id.is_some() {
+        let idx = if uses_data_movement_pool_selection(&opts) {
             Self::resolve_decommission_target_pool_idx_result(
                 self.select_data_movement_pool_idx(bucket, &object, fi.size, &opts, true)
                     .await,
@@ -3713,7 +3722,7 @@ impl ECStore {
             return Ok(0);
         }
 
-        let idx = if opts.data_movement && opts.version_id.is_some() {
+        let idx = if uses_data_movement_pool_selection(opts) {
             self.select_data_movement_pool_idx(bucket, object, size, opts, false).await?
         } else if opts.no_lock {
             self.get_pool_idx_no_lock(bucket, object, size).await?
@@ -7278,6 +7287,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_decommission_tiered_object_result_preserves_typed_capacity_error() {
+        let err = ECStore::resolve_decommission_tiered_object_result(
+            Err(Error::DecommissionCapacityBlocked {
+                message: "target gate busy".to_string(),
+            }),
+            "bucket",
+            "object",
+        )
+        .expect_err("expected contextual error");
+
+        assert!(matches!(
+            crate::data_movement::data_movement_stage_source(&err),
+            Some(Error::DecommissionCapacityBlocked { message }) if message == "target gate busy"
+        ));
+    }
+
+    #[test]
     fn version_aware_lookup_opts_enables_version_aware_lookup() {
         let opts = ObjectOptions {
             version_id: Some("vid-1".to_string()),
@@ -7503,6 +7529,26 @@ mod tests {
     }
 
     #[test]
+    fn capacity_owned_unversioned_move_uses_data_movement_pool_selection() {
+        let mut opts = ObjectOptions {
+            data_movement: true,
+            ..Default::default()
+        };
+        assert!(!uses_data_movement_pool_selection(&opts));
+
+        DecommissionCapacityOwner {
+            source_pool_index: 1,
+            operation_id: Uuid::new_v4(),
+            generation: 2,
+            owner_nonce: Uuid::new_v4(),
+            mutation_id: None,
+        }
+        .apply_to(&mut opts);
+
+        assert!(uses_data_movement_pool_selection(&opts));
+    }
+
+    #[test]
     fn transition_restore_pool_opts_skips_decommissioned_and_preserves_locking() {
         let lookup_opts = transition_restore_pool_opts(&ObjectOptions {
             no_lock: false,
@@ -7576,7 +7622,6 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
-            decommission_capacity_entry_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -7669,7 +7714,6 @@ mod tests {
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
             pool_meta_save_gate: Mutex::default(),
-            decommission_capacity_entry_gate: Mutex::default(),
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }

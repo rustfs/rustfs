@@ -373,10 +373,10 @@ const EXTRACT_MAX_EFFECTIVE_PAX_HEADER_BYTES: usize = 8 * 1024;
 const EXTRACT_MAX_EFFECTIVE_PAX_USER_METADATA_BYTES: usize = 2 * 1024;
 const EXTRACT_MAX_EFFECTIVE_PAX_FIELDS: usize = 4096;
 const EXTRACT_MAX_EXPANDED_PAX_METADATA_BYTES: u64 = 128 * 1024 * 1024;
-const EXTRACT_SMALL_MEMBER_MAX_BYTES: usize = 64 * 1024;
-const EXTRACT_DEFAULT_MAX_INFLIGHT: usize = 1;
+const EXTRACT_SMALL_MEMBER_MAX_BYTES: usize = 128 * 1024;
+const EXTRACT_DEFAULT_MAX_INFLIGHT: usize = 16;
 const EXTRACT_BATCH_MAX_MEMBERS: usize = 16;
-const EXTRACT_BATCH_MAX_STAGING_BYTES: usize = 2 * 1024 * 1024;
+const EXTRACT_BATCH_MAX_STAGING_BYTES: usize = 3 * 1024 * 1024;
 const EXTRACT_MEMBER_CONTEXT_OVERHEAD_BYTES: usize = 512;
 const EXTRACT_METADATA_ENTRY_OVERHEAD_BYTES: usize = 64;
 const ENV_RUSTFS_SNOWBALL_EXTRACT_MAX_INFLIGHT: &str = "RUSTFS_SNOWBALL_EXTRACT_MAX_INFLIGHT";
@@ -1864,7 +1864,34 @@ fn resolve_put_object_extract_options(headers: &HeaderMap) -> S3Result<PutObject
 }
 
 fn put_object_extract_limits() -> ArchiveLimits {
-    ArchiveLimits::default()
+    static LIMITS: OnceLock<ArchiveLimits> = OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        normalize_put_object_extract_limits(
+            rustfs_utils::get_env_u64(
+                rustfs_config::ENV_SNOWBALL_MAX_ENTRY_BYTES,
+                rustfs_config::DEFAULT_SNOWBALL_MAX_ENTRY_BYTES,
+            ),
+            rustfs_utils::get_env_u64(
+                rustfs_config::ENV_SNOWBALL_MAX_UNPACKED_BYTES,
+                rustfs_config::DEFAULT_SNOWBALL_MAX_UNPACKED_BYTES,
+            ),
+        )
+    })
+}
+
+fn normalize_put_object_extract_limits(max_entry_bytes: u64, max_unpacked_bytes: u64) -> ArchiveLimits {
+    let defaults = ArchiveLimits::default();
+    let max_total_unpacked_size = max_unpacked_bytes.clamp(1, rustfs_config::MAX_SNOWBALL_UNPACKED_BYTES);
+    let max_entry_size = max_entry_bytes
+        .clamp(1, rustfs_config::MAX_SNOWBALL_ENTRY_BYTES)
+        .min(max_total_unpacked_size);
+
+    ArchiveLimits {
+        max_entry_size,
+        max_total_unpacked_size,
+        max_decoded_size: max_total_unpacked_size.saturating_add(max_entry_size),
+        ..defaults
+    }
 }
 
 fn build_put_object_extract_archive<R>(decoder: R, limits: ArchiveLimits) -> Archive<R>
@@ -2175,12 +2202,13 @@ impl DefaultObjectUsecase {
             .is_some_and(|result| result.uses_durable_reservations);
         // Without ignore-errors, the legacy contract stops before attempting a
         // later member after the first storage failure. Parallel commits cannot
-        // preserve that boundary, so concurrency requires both ignore-errors
-        // and an explicit max-inflight value above the serial default. Quota
-        // accounting can fail after storage commit, so quota-enabled imports
-        // also remain serial. An opted-in micro-batch is always drained; a
-        // fatal outcome stops later batches but cannot roll back peers that
-        // already committed in the current batch.
+        // preserve that boundary, so only ignore-errors requests use the
+        // configured micro-batch. Quota accounting can fail after storage
+        // commit, so quota-enabled imports also remain serial. Setting
+        // RUSTFS_SNOWBALL_EXTRACT_MAX_INFLIGHT=1 restores serial behavior. A
+        // micro-batch is always drained; a fatal outcome stops later batches
+        // but cannot roll back peers that already committed in the current
+        // batch.
         let max_inflight = select_put_object_extract_max_inflight(
             put_object_extract_max_inflight(),
             extract_options.ignore_errors,
@@ -2857,7 +2885,7 @@ mod tests {
 
     #[test]
     fn snowball_max_inflight_has_a_serial_compatibility_floor_and_bounded_ceiling() {
-        assert_eq!(EXTRACT_DEFAULT_MAX_INFLIGHT, 1);
+        assert_eq!(EXTRACT_DEFAULT_MAX_INFLIGHT, EXTRACT_BATCH_MAX_MEMBERS);
         assert_eq!(normalize_put_object_extract_max_inflight(0), 1);
         assert_eq!(normalize_put_object_extract_max_inflight(1), 1);
         assert_eq!(normalize_put_object_extract_max_inflight(usize::MAX), EXTRACT_BATCH_MAX_MEMBERS);
@@ -2876,6 +2904,35 @@ mod tests {
             1,
             "quota accounting can fail after storage commit and must remain serial"
         );
+    }
+
+    #[test]
+    fn snowball_archive_limits_preserve_defaults_and_clamp_operator_overrides() {
+        let defaults = ArchiveLimits::default();
+        assert_eq!(
+            normalize_put_object_extract_limits(
+                rustfs_config::DEFAULT_SNOWBALL_MAX_ENTRY_BYTES,
+                rustfs_config::DEFAULT_SNOWBALL_MAX_UNPACKED_BYTES,
+            ),
+            defaults
+        );
+
+        let minimum = normalize_put_object_extract_limits(0, 0);
+        assert_eq!(minimum.max_entry_size, 1);
+        assert_eq!(minimum.max_total_unpacked_size, 1);
+        assert_eq!(minimum.max_decoded_size, 2);
+
+        let bounded = normalize_put_object_extract_limits(u64::MAX, u64::MAX);
+        assert_eq!(bounded.max_entry_size, rustfs_config::MAX_SNOWBALL_ENTRY_BYTES);
+        assert_eq!(bounded.max_total_unpacked_size, rustfs_config::MAX_SNOWBALL_UNPACKED_BYTES);
+        assert_eq!(
+            bounded.max_decoded_size,
+            rustfs_config::MAX_SNOWBALL_UNPACKED_BYTES + rustfs_config::MAX_SNOWBALL_ENTRY_BYTES
+        );
+
+        let entry_is_bounded_by_the_request_total = normalize_put_object_extract_limits(1024, 512);
+        assert_eq!(entry_is_bounded_by_the_request_total.max_entry_size, 512);
+        assert_eq!(entry_is_bounded_by_the_request_total.max_total_unpacked_size, 512);
     }
 
     #[test]

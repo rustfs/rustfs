@@ -5,7 +5,7 @@
 
 On-Demand Migration (ODM) attaches an external S3-compatible **source bucket** to a local RustFS bucket. When a client GETs a key that does not exist locally, RustFS fetches it from the source, streams it to the client, and stores it locally in the same pass; every later read is served locally. It is a pull-style, lazy migration path — the RustFS equivalent of Cloudflare R2 Sippy, Tigris shadow buckets, and Alibaba Cloud OSS / Tencent COS mirror-back-to-origin.
 
-The module is off by default. Set `RUSTFS_ON_DEMAND_MIGRATION_ENABLED=true` on every node before configuring a bucket (`rustfs/src/module_switches.rs`); with the switch off, the runtime never intervenes on a read and the admin `PUT` route refuses with `OnDemandMigrationDisabled`. Reads of the configuration and of the status endpoint keep working while the switch is off, so a disabled deployment can still be inspected.
+The module is on by default (rustfs/backlog#2163); set `RUSTFS_ON_DEMAND_MIGRATION_ENABLED=false` on every node to turn it off (`rustfs/src/module_switches.rs`). With the switch off, the runtime never intervenes on a read and the admin `PUT` route refuses with `OnDemandMigrationDisabled`. Reads of the configuration and of the status endpoint keep working while the switch is off, so a disabled deployment can still be inspected. The switch only decides whether the module may act at all: a bucket with no `on-demand-migration.json` is never resolved by the runtime and makes no source call, so turning the module on changes nothing for buckets you have not configured.
 
 ## Positioning
 

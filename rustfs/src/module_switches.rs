@@ -35,10 +35,11 @@ pub(crate) const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 pub(crate) const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 pub(crate) const ENV_BITROT_SELFTEST_ENABLE: &str = "RUSTFS_BITROT_SELFTEST_ENABLE";
 pub(crate) const ENV_BITROT_SELFTEST_STRICT: &str = "RUSTFS_BITROT_SELFTEST_STRICT";
-/// On-demand migration module switch (rustfs/backlog#2152). Off until GA
-/// (rustfs/backlog#2163) so every intermediate PR ships dark.
+/// On-demand migration module switch (rustfs/backlog#2152). On since GA
+/// (rustfs/backlog#2163); set it to `false` to keep the module out of the
+/// read path entirely.
 pub(crate) const ENV_ON_DEMAND_MIGRATION_ENABLED: &str = "RUSTFS_ON_DEMAND_MIGRATION_ENABLED";
-pub(crate) const DEFAULT_ON_DEMAND_MIGRATION_ENABLED: bool = false;
+pub(crate) const DEFAULT_ON_DEMAND_MIGRATION_ENABLED: bool = true;
 
 static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_AUDIT_ENABLE);
 static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
@@ -86,7 +87,7 @@ pub(crate) fn set_notify_module_enabled(enabled: bool) {
     NOTIFY_MODULE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// Whether the on-demand migration module is enabled, defaulting to off.
+/// Whether the on-demand migration module is enabled, defaulting to on.
 /// Read once at startup by `startup_bucket_metadata` and published below.
 pub(crate) fn on_demand_migration_enabled_from_env() -> bool {
     rustfs_utils::get_env_bool(ENV_ON_DEMAND_MIGRATION_ENABLED, DEFAULT_ON_DEMAND_MIGRATION_ENABLED)
@@ -110,15 +111,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn on_demand_migration_switch_defaults_off_and_follows_env() {
+    fn on_demand_migration_switch_defaults_on_and_follows_env() {
         temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, None::<&str>, || {
-            assert!(!on_demand_migration_enabled_from_env());
+            assert!(on_demand_migration_enabled_from_env());
+        });
+        temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, Some("false"), || {
+            assert!(!on_demand_migration_enabled_from_env(), "the off switch still works");
         });
         temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, Some("true"), || {
             assert!(on_demand_migration_enabled_from_env());
         });
         temp_env::with_var(ENV_ON_DEMAND_MIGRATION_ENABLED, Some("not-a-bool"), || {
-            assert!(!on_demand_migration_enabled_from_env(), "unparsable values keep the default");
+            assert!(on_demand_migration_enabled_from_env(), "unparsable values keep the default");
         });
     }
 

@@ -837,7 +837,7 @@ impl SetDisks {
         orig_bucket: &str,
         error_path: &str,
         root_prefix: &str,
-    ) -> Result<(Vec<Option<DiskStore>>, Vec<String>, usize)> {
+    ) -> Result<(Vec<Option<DiskStore>>, Vec<String>, usize, bool)> {
         let disks = self.disks.read().await.clone();
         if disks.is_empty() {
             return Err(Error::ErasureReadQuorum);
@@ -882,16 +882,24 @@ impl SetDisks {
             return Err(to_object_err(err.into(), vec![orig_bucket, error_path]));
         }
 
+        let mut has_minority_candidate = false;
         let mut candidate_paths = candidate_counts
             .into_iter()
-            .filter_map(|(path, count)| (count >= discovery_quorum).then_some(path))
+            .filter_map(|(path, count)| {
+                if count >= discovery_quorum {
+                    Some(path)
+                } else {
+                    has_minority_candidate = true;
+                    None
+                }
+            })
             .collect::<Vec<_>>();
         candidate_paths.sort_unstable();
-        Ok((disks, candidate_paths, discovery_quorum))
+        Ok((disks, candidate_paths, discovery_quorum, has_minority_candidate))
     }
 
     pub(crate) async fn first_multipart_upload_path_for_decommission(&self, bucket: &str) -> Result<Option<String>> {
-        let (_, paths, _) = self
+        let (_, paths, _, _) = self
             .discover_multipart_upload_paths(bucket, RUSTFS_META_MULTIPART_BUCKET, "")
             .await?;
         Ok(paths.into_iter().next())
@@ -905,7 +913,14 @@ impl SetDisks {
         upload_identity: &str,
     ) -> Result<Vec<String>> {
         let expected_parent = format!("{DATA_MOVEMENT_MULTIPART_PREFIX}/{}", Self::get_multipart_sha_dir(bucket, object));
-        let (_, candidate_paths, _) = self.discover_multipart_upload_paths(bucket, object, &expected_parent).await?;
+        let (_, candidate_paths, _, has_minority_candidate) =
+            self.discover_multipart_upload_paths(bucket, object, &expected_parent).await?;
+        if has_minority_candidate {
+            return Err(Error::DecommissionCapacityBlocked {
+                message: "data movement multipart cleanup found an upload path on fewer than the discovery quorum of disks"
+                    .to_string(),
+            });
+        }
         let mut upload_ids = Vec::new();
         for upload_path in candidate_paths {
             let Some((parent, raw_upload_id)) = upload_path.rsplit_once('/') else {
@@ -921,7 +936,11 @@ impl SetDisks {
             {
                 Ok((file_info, _)) => file_info,
                 Err(err) if crate::error::is_err_invalid_upload_id(&err) || crate::error::is_err_object_not_found(&err) => {
-                    continue;
+                    return Err(Error::DecommissionCapacityBlocked {
+                        message: format!(
+                            "data movement multipart cleanup found quorum-visible upload path {upload_path} without verifiable metadata: {err}"
+                        ),
+                    });
                 }
                 Err(err) => return Err(err),
             };
@@ -1190,7 +1209,7 @@ impl SetDisks {
         max_uploads: usize,
         expected_incarnation_id: Option<Uuid>,
     ) -> Result<ListMultipartsInfo> {
-        let (disks, candidate_paths, discovery_quorum) = self.discover_multipart_upload_paths(bucket, prefix, "").await?;
+        let (disks, candidate_paths, discovery_quorum, _) = self.discover_multipart_upload_paths(bucket, prefix, "").await?;
         let listed_uploads = stream::iter(candidate_paths)
             .map(|upload_path| {
                 let disks = &disks;
@@ -7514,6 +7533,101 @@ mod tests {
             .expect("bucket-wide listing must also skip other buckets' uploads");
         assert_eq!(bucket_wide.uploads.len(), 1);
         assert_eq!(bucket_wide.uploads[0].object, "blobs/data/layer.bin");
+    }
+
+    #[tokio::test]
+    async fn data_movement_cleanup_discovery_rejects_quorum_visible_upload_without_metadata() {
+        let (temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "data-movement-unverifiable-upload";
+        let object = "staged/object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        let upload_identity = format!("v1:{}:{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp_nanos());
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD, upload_identity.clone());
+        let opts = ObjectOptions {
+            data_movement: true,
+            user_defined: metadata,
+            ..Default::default()
+        };
+        let upload = set_disks
+            .new_multipart_upload(bucket, object, &opts)
+            .await
+            .expect("data movement upload should be created");
+        let upload_path = SetDisks::get_multipart_upload_dir(bucket, object, &upload.upload_id, true);
+        for temp_dir in &temp_dirs {
+            tokio::fs::remove_file(
+                temp_dir
+                    .path()
+                    .join(RUSTFS_META_MULTIPART_BUCKET)
+                    .join(&upload_path)
+                    .join("xl.meta"),
+            )
+            .await
+            .expect("upload metadata should be removable while preserving its quorum-visible directory");
+        }
+
+        let err = set_disks
+            .data_movement_multipart_upload_ids(bucket, object, None, &upload_identity)
+            .await
+            .expect_err("cleanup discovery must fail closed on an unverifiable upload path");
+        assert!(matches!(err, Error::DecommissionCapacityBlocked { .. }));
+    }
+
+    #[tokio::test]
+    async fn data_movement_cleanup_discovery_rejects_minority_upload_until_disks_recover() {
+        let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "data-movement-minority-upload";
+        let object = "staged/object.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("bucket volume should be created");
+        }
+
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[3] = None;
+        }
+        let upload_identity = format!("v1:{}:{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp_nanos());
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD, upload_identity.clone());
+        let upload = set_disks
+            .new_multipart_upload(
+                bucket,
+                object,
+                &ObjectOptions {
+                    data_movement: true,
+                    user_defined: metadata,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write quorum should create the upload while one disk is offline");
+
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[1] = None;
+            disks[2] = None;
+            disks[3] = Some(disk_stores[3].clone());
+        }
+        let err = set_disks
+            .data_movement_multipart_upload_ids(bucket, object, None, &upload_identity)
+            .await
+            .expect_err("a minority-observed upload must block a destructive absence proof");
+        assert!(matches!(err, Error::DecommissionCapacityBlocked { .. }));
+
+        {
+            let mut disks = set_disks.disks.write().await;
+            disks[1] = Some(disk_stores[1].clone());
+            disks[2] = Some(disk_stores[2].clone());
+        }
+        let recovered = set_disks
+            .data_movement_multipart_upload_ids(bucket, object, None, &upload_identity)
+            .await
+            .expect("recovered quorum should make the staged upload verifiable");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(upload_uuid_suffix(&recovered[0]), upload_uuid_suffix(&upload.upload_id));
     }
 
     /// Regression (issue #5716): a single upload directory whose `xl.meta` was
