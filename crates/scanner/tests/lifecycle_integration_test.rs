@@ -47,8 +47,8 @@ use storage_api::lifecycle::{
     TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent, enqueue_transition_for_existing_objects,
     expire_transitioned_object, free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry,
     init_bucket_metadata_sys, init_local_disks, is_err_object_not_found, is_err_version_not_found, new_disk,
-    path2_bucket_object_with_base_path, recover_transition_transaction_records, register_mock_tier_util, update_bucket_metadata,
-    wait_for_free_version_absence,
+    path2_bucket_object_with_base_path, recover_transition_transaction_records, recover_transition_transaction_records_at,
+    register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
 };
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
@@ -944,6 +944,14 @@ mod serial_tests {
                 .is_cancelled()
         );
 
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while backend.exact_remove_count() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Drop must persist cleanup ownership before attempting the exact remote delete");
+
         let retained = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let recovery = recover_transition_transaction_records(ecstore.clone(), 100, None)
@@ -1088,7 +1096,7 @@ mod serial_tests {
                 .expect_err("a versioned candidate must not commit to an unversioned tier");
 
             match case {
-                CleanupCase::Persisted | CleanupCase::DeleteFallback => {
+                CleanupCase::Persisted => {
                     assert_eq!(backend.remove_versions().await, backend.put_versions().await);
                     assert_eq!(backend.object_count().await, 0, "cleanup must remove the exact candidate");
                     let recovery = recover_transition_transaction_records(ecstore.clone(), 100, None)
@@ -1100,6 +1108,25 @@ mod serial_tests {
                     let empty = recover_transition_transaction_records(ecstore.clone(), 100, None)
                         .await
                         .expect("successful reconciliation must remove every transition transaction");
+                    assert_eq!(empty.scanned, 0);
+                }
+                CleanupCase::DeleteFallback => {
+                    assert_eq!(backend.remove_versions().await, backend.put_versions().await);
+                    assert_eq!(backend.object_count().await, 0, "cleanup must remove the exact candidate");
+                    let retained = recover_transition_transaction_records(ecstore.clone(), 100, None)
+                        .await
+                        .expect("active unknown ownership must remain fenced after the transaction store was offline");
+                    assert_eq!((retained.scanned, retained.recovered, retained.retained, retained.failed), (1, 0, 1, 0));
+                    let recovered = recover_transition_transaction_records_at(ecstore.clone(), 100, None, i128::MAX)
+                        .await
+                        .expect("expired unknown ownership may use the provider's missing proof");
+                    assert_eq!(
+                        (recovered.scanned, recovered.recovered, recovered.retained, recovered.failed),
+                        (1, 1, 0, 0)
+                    );
+                    let empty = recover_transition_transaction_records(ecstore.clone(), 100, None)
+                        .await
+                        .expect("expired missing-candidate reconciliation must remove the transaction");
                     assert_eq!(empty.scanned, 0);
                 }
                 CleanupCase::RetryPersisted => {
@@ -1139,9 +1166,9 @@ mod serial_tests {
                     assert_eq!(retained.recovered, 0);
                     assert_eq!(retained.retained + retained.failed, 1);
                     backend.set_remove_failure(false);
-                    let recovered = recover_transition_transaction_records(ecstore.clone(), 100, None)
+                    let recovered = recover_transition_transaction_records_at(ecstore.clone(), 100, None, i128::MAX)
                         .await
-                        .expect("recovery should delete the candidate after the backend becomes available");
+                        .expect("expired recovery should delete the candidate after the backend becomes available");
                     assert_eq!(
                         (recovered.scanned, recovered.recovered, recovered.retained, recovered.failed),
                         (1, 1, 0, 0)
