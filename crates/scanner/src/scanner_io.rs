@@ -54,15 +54,16 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, warn};
 
 use crate::ScannerObjectInfo as ObjectInfo;
+use crate::storage_api::ScannerStorage;
 use crate::storage_api::scan::NamespaceLocking as _;
 use crate::storage_api::scanner_io::{BucketInfo, BucketOptions};
 use crate::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
-    RUSTFS_META_BUCKET, ReplicationConfig, STORAGE_FORMAT_FILE, ScannerConfigObjectDelete as _, ScannerDiskExt as _,
-    ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError,
-    begin_tier_registry_cycle, complete_tier_registry_cycle, enqueue_runtime_free_version, get_lifecycle_config,
-    get_object_lock_config, get_replication_config, runtime_tier_names, runtime_tier_registry_for_cycle,
-    scanner_publication_admission_for_epoch, scanner_publication_epoch, storageclass,
+    RUSTFS_META_BUCKET, ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
+    ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, begin_tier_registry_cycle,
+    complete_tier_registry_cycle, enqueue_runtime_free_version, get_lifecycle_config, get_object_lock_config,
+    get_replication_config, runtime_tier_names, runtime_tier_registry_for_cycle, scanner_publication_admission_for_epoch,
+    scanner_publication_epoch, storageclass,
 };
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
@@ -315,11 +316,14 @@ enum ScannerCycleActivityStatus {
     Unverified,
 }
 
-async fn scanner_cycle_activity_status(
-    store: &ECStore,
+async fn scanner_cycle_activity_status<S>(
+    store: &S,
     distributed: bool,
     before: &crate::scanner::ScannerActivitySnapshot,
-) -> (ScannerCycleActivityStatus, Vec<(String, String, u64)>) {
+) -> (ScannerCycleActivityStatus, Vec<(String, String, u64)>)
+where
+    S: ScannerStorage,
+{
     match crate::scanner::probe_scanner_activity(store, distributed).await {
         Ok(after) => {
             let status = if after == *before {
@@ -728,6 +732,7 @@ mod dirty_usage;
 mod guards;
 mod io_cache;
 mod io_cycle;
+pub(crate) use io_cycle::nsscanner_with_storage_status;
 mod io_disk;
 #[cfg(test)]
 mod publish_gate_tests;

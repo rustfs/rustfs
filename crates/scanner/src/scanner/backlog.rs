@@ -21,6 +21,7 @@
 
 use super::ScannerCycleOutcome;
 use crate::data_usage_define::DataUsageCacheRevision;
+use crate::storage_api::ScannerStorage;
 use crate::storage_api::owner::ObjectIO as _;
 use crate::{
     BUCKET_META_PREFIX, ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerObjectOptions, SetDisks, save_config_with_preconditions,
@@ -1141,7 +1142,10 @@ fn select_scanner_pause_backlog_replicas(replicas: Vec<ScannerPauseBacklogReplic
     })
 }
 
-async fn load_scanner_pause_backlog(storeapi: Arc<ECStore>) -> Result<LoadedScannerPauseBacklog, String> {
+async fn load_scanner_pause_backlog<S>(storeapi: Arc<S>) -> Result<LoadedScannerPauseBacklog, String>
+where
+    S: ScannerStorage,
+{
     let writable = storeapi.scanner_pause_backlog_writable_set_disks().await;
     if writable.is_empty() {
         return Err("scanner pause backlog has no surviving storage replicas".to_string());
@@ -1150,11 +1154,14 @@ async fn load_scanner_pause_backlog(storeapi: Arc<ECStore>) -> Result<LoadedScan
     select_scanner_pause_backlog_replicas(replicas)
 }
 
-async fn write_scanner_pause_backlog_record(
-    storeapi: Arc<ECStore>,
+async fn write_scanner_pause_backlog_record<S>(
+    storeapi: Arc<S>,
     loaded: &LoadedScannerPauseBacklog,
     record: ScannerPauseBacklogReplicaRecord,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    S: ScannerStorage,
+{
     let data = serde_json::to_vec(&record).map_err(|err| format!("failed to encode scanner pause backlog: {err}"))?;
     if data.len() > usize::try_from(MAX_SCANNER_PAUSE_BACKLOG_BYTES).unwrap_or(usize::MAX) {
         return Err("scanner pause backlog exceeds its size bound".to_string());
@@ -1219,10 +1226,13 @@ async fn write_scanner_pause_backlog_record(
     Ok(())
 }
 
-async fn stabilize_scanner_pause_backlog(
-    storeapi: Arc<ECStore>,
+async fn stabilize_scanner_pause_backlog<S>(
+    storeapi: Arc<S>,
     loaded: &LoadedScannerPauseBacklog,
-) -> Result<LoadedScannerPauseBacklog, String> {
+) -> Result<LoadedScannerPauseBacklog, String>
+where
+    S: ScannerStorage,
+{
     let committed = loaded.authoritative_commit.clone().unwrap_or_else(|| {
         ScannerPauseBacklogCommitRecord::new(loaded.ledger.clone(), scanner_pause_backlog_replica_ids(&loaded.replicas))
     });
@@ -1253,11 +1263,14 @@ fn committed_scanner_pause_backlog_pending_reload(
     }
 }
 
-async fn persist_scanner_pause_backlog(
-    storeapi: Arc<ECStore>,
+async fn persist_scanner_pause_backlog<S>(
+    storeapi: Arc<S>,
     loaded: &LoadedScannerPauseBacklog,
     ledger: ScannerPauseBacklogLedger,
-) -> Result<LoadedScannerPauseBacklog, String> {
+) -> Result<LoadedScannerPauseBacklog, String>
+where
+    S: ScannerStorage,
+{
     let mut base = if loaded.requires_reload {
         let reloaded = load_scanner_pause_backlog(storeapi.clone()).await?;
         if reloaded.ledger != loaded.ledger {
@@ -1288,15 +1301,18 @@ async fn persist_scanner_pause_backlog(
     }
 }
 
-pub(super) struct ScannerPauseBacklogController {
-    storeapi: Arc<ECStore>,
+pub(super) struct ScannerPauseBacklogController<S: ScannerStorage> {
+    storeapi: Arc<S>,
     loaded: LoadedScannerPauseBacklog,
     persistence_disabled: bool,
     persistence_retry_at_unix_secs: u64,
 }
 
-impl ScannerPauseBacklogController {
-    pub(super) async fn claim(storeapi: Arc<ECStore>, now: u64) -> Result<Self, String> {
+impl<S> ScannerPauseBacklogController<S>
+where
+    S: ScannerStorage,
+{
+    pub(super) async fn claim(storeapi: Arc<S>, now: u64) -> Result<Self, String> {
         let loaded = load_scanner_pause_backlog(storeapi.clone()).await?;
         let mut ledger = loaded.ledger.clone();
         ledger.claim_writer(now)?;
@@ -1313,7 +1329,7 @@ impl ScannerPauseBacklogController {
         Ok(controller)
     }
 
-    pub(super) fn unavailable(storeapi: Arc<ECStore>, error: String, now: u64) -> Self {
+    pub(super) fn unavailable(storeapi: Arc<S>, error: String, now: u64) -> Self {
         set_runtime_error(Some(error));
         let loaded = LoadedScannerPauseBacklog {
             ledger: ScannerPauseBacklogLedger::default(),

@@ -15,6 +15,7 @@
 use super::heal_info::{classify_background_heal_read_error, decode_background_heal_info};
 use super::*;
 use crate::EcstoreResult;
+use crate::storage_api::scan::BucketOperations as _;
 use crate::{
     DATA_USAGE_BLOOM_RECOVERY_PATH, DATA_USAGE_CACHE_KEY_FORMAT, DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT,
     DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntry, DataUsageScanPlanDigest, Endpoint, EndpointServerPools,
@@ -232,7 +233,7 @@ async fn restarted_main_loop_completes_durable_pause_backlog_catch_up() {
 }
 
 #[tokio::test]
-#[serial_test::serial(scanner_runtime_env)]
+#[serial]
 async fn running_main_loop_catches_up_pause_cleared_after_startup_observe() {
     temp_env::async_with_vars([(ENV_SCANNER_CYCLE, Some("1")), (ENV_SCANNER_START_DELAY_SECS, Some("0"))], async {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();

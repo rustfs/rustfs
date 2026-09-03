@@ -10681,6 +10681,7 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-filemeta",
  "rustfs-heal-contracts",
+ "rustfs-lifecycle",
  "rustfs-lock",
  "rustfs-s3-types",
  "rustfs-scanner-metrics",
@@ -10701,10 +10702,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
-
-[[package]]
-name = "rustfs-scanner-contracts"
-version = "1.0.0-rc.5"
 
 [[package]]
 name = "rustfs-scanner-metrics"
