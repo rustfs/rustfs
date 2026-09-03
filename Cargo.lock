@@ -10674,6 +10674,7 @@ dependencies = [
  "rand 0.10.2",
  "rmp-serde",
  "rustfs-common",
+ "rustfs-concurrency",
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-data-usage",

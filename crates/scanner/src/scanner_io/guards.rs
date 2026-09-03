@@ -245,7 +245,7 @@ pub(super) fn scanner_concurrency_limit(configured: usize, available: usize) -> 
         return 0;
     }
 
-    if crate::current_foreground_read_activity() > 0 {
+    if crate::workload_admission::foreground_workload_activity() > 0 {
         return 1;
     }
 
