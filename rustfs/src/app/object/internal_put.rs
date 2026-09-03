@@ -1050,9 +1050,16 @@ mod tests {
         assert_eq!(err.code, S3ErrorCode::InvalidRequest);
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn internal_multipart_roundtrip_completes_and_abort_leaves_nothing() {
+    fn internal_multipart_roundtrip_completes_and_abort_leaves_nothing() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "internal-multipart-roundtrip",
+            internal_multipart_roundtrip_completes_and_abort_leaves_nothing_inner,
+        );
+    }
+
+    async fn internal_multipart_roundtrip_completes_and_abort_leaves_nothing_inner() {
         const FIRST_PART_SIZE: usize = 5 * 1024 * 1024;
         let (store, bucket) = Box::pin(internal_put_test_bucket("internal-mpu")).await;
         let usecase = DefaultObjectUsecase::from_global();

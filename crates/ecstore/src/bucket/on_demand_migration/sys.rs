@@ -39,6 +39,7 @@
 //! (`pull.rs`) stores objects with; each bucket state captures it at build
 //! time together with its lazily started [`PullQueue`].
 
+use super::backfill::{PriorityPullPermits, PullPermit, PullPriority};
 use super::breaker::{Breaker, BreakerState, BreakerTransition, BreakerVerdict};
 use super::config::{
     ON_DEMAND_MIGRATION_CONFIG_HOOK, OnDemandMigrationConfig, PathStyle as ConfigPathStyle, Provider, SourceConfig,
@@ -57,7 +58,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -182,7 +183,7 @@ pub struct PullLeader {
     state: Arc<BucketOdmState>,
     key: String,
     tx: watch::Sender<Option<PullResult>>,
-    _permit: OwnedSemaphorePermit,
+    _permit: PullPermit,
     _inflight: GaugeGuard,
     completed: bool,
 }
@@ -269,7 +270,8 @@ pub struct BucketOdmState {
     breaker: Breaker,
     negative_cache: NegativeCache,
     inflight: Mutex<HashMap<String, watch::Receiver<Option<PullResult>>>>,
-    pull_semaphore: Arc<Semaphore>,
+    /// Online misses first, backfill pulls when nobody waits (ODM-12).
+    pull_permits: Arc<PriorityPullPermits>,
     stats: Arc<OdmStats>,
     cancel: CancellationToken,
     last_source_error_logged_at: Mutex<Option<Instant>>,
@@ -318,7 +320,7 @@ impl BucketOdmState {
             breaker: Breaker::new(),
             negative_cache: NegativeCache::new(Duration::from_secs(policy.negative_cache_ttl_secs)),
             inflight: Mutex::new(HashMap::new()),
-            pull_semaphore: Arc::new(Semaphore::new(policy.max_concurrent_pulls.max(1) as usize)),
+            pull_permits: PriorityPullPermits::new(policy.max_concurrent_pulls.max(1) as usize),
             stats,
             cancel: CancellationToken::new(),
             last_source_error_logged_at: Mutex::new(None),
@@ -477,6 +479,16 @@ impl BucketOdmState {
     /// later callers for the same key become followers and never touch the
     /// semaphore. Fails with `Canceled` when the state is torn down.
     pub async fn acquire_pull_slot(self: &Arc<Self>, key: &str) -> Result<PullSlot, PullError> {
+        self.acquire_pull_slot_with_priority(key, PullPriority::Online).await
+    }
+
+    /// [`Self::acquire_pull_slot`] at the given permit priority; the pull
+    /// queue passes `Backfill` for backfill jobs.
+    pub async fn acquire_pull_slot_with_priority(
+        self: &Arc<Self>,
+        key: &str,
+        priority: PullPriority,
+    ) -> Result<PullSlot, PullError> {
         if self.cancel.is_cancelled() {
             return Err(PullError::canceled("bucket on-demand migration state was removed"));
         }
@@ -499,7 +511,7 @@ impl BucketOdmState {
         let permit = {
             let _queued = self.stats.queue_guard();
             tokio::select! {
-                permit = Arc::clone(&self.pull_semaphore).acquire_owned() => permit,
+                permit = self.pull_permits.acquire(priority) => permit,
                 _ = self.cancel.cancelled() => {
                     return Err(PullError::canceled("bucket on-demand migration state was removed"));
                 }
@@ -522,6 +534,10 @@ impl BucketOdmState {
     /// Keys currently being pulled (leader registered).
     pub fn inflight_keys(&self) -> usize {
         self.inflight.lock().len()
+    }
+
+    pub fn pull_permits(&self) -> &Arc<PriorityPullPermits> {
+        &self.pull_permits
     }
 
     pub fn snapshot(&self) -> OdmBucketSnapshot {

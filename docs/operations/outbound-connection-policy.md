@@ -19,11 +19,14 @@ RustFS validates every operator-configured outbound destination to close a serve
 | OIDC discovery, JWKS, and token requests | Full policy | A blocked provider logs `OIDC provider discovery blocked by outbound policy` naming the origin to allowlist (`crates/iam/src/oidc.rs`) |
 | Object Lambda targets | Full policy | `rustfs/src/admin/router.rs` `outbound_policy` |
 | Bucket replication targets | Literal check, relaxed | Private addresses are always allowed; loopback only with `RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET=true` (`crates/ecstore/src/bucket/remote_s3_client.rs` `validate_remote_endpoint`, shared with on-demand migration sources) |
+| On-demand migration sources | Literal check, relaxed | Same guard and same escape hatch as replication targets (see below) |
 | Site replication peers | Literal check | `rustfs/src/site_replication/mod.rs` |
 | Tiering warm backends (S3, MinIO, RustFS, Azure, GCS, Aliyun, Tencent, Huawei, R2) | Literal check | `crates/ecstore/src/services/tier/warm_backend.rs` `validate_endpoint`; the RustFS provider adds a debug-only, env-gated loopback exception for e2e tests |
 | Keystone `auth_url` | Literal check | `crates/keystone/src/config.rs` |
 
 The allowlist affects only the "Full policy" rows. A literal-check subsystem rejects a hostname that is itself a restricted IP literal, does not re-check what a hostname resolves to, and cannot be widened by `RUSTFS_OUTBOUND_ALLOW_ORIGINS`.
+
+On-demand migration sources share the replication egress guard exactly: the source endpoint an operator saves through `PUT /rustfs/admin/v3/on-demand-migration/{bucket}` goes through the same `validate_remote_endpoint` in `crates/ecstore/src/bucket/remote_s3_client.rs`, so private addresses are accepted (a source on the same private network is the normal migration case), loopback is refused unless `RUSTFS_REPLICATION_ALLOW_LOOPBACK_TARGET=true`, and metadata, link-local and unspecified addresses stay blocked. The variable is named for replication because it is one switch over one shared guard; setting it for a single-host migration also relaxes loopback for replication targets, so prefer a real hostname or private address for the source and keep the switch for lab and e2e hosts. `RUSTFS_OUTBOUND_ALLOW_ORIGINS` does not apply here. Two migration-specific rules sit on top of the endpoint guard and are enforced by the config validator, not by the egress layer: a source that names this bucket on this deployment is rejected as a self-reference, and a source matching one of the bucket's own replication targets is rejected as a replication loop. See [on-demand-migration.md](on-demand-migration.md).
 
 ## Symptoms
 

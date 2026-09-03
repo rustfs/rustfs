@@ -14,8 +14,9 @@
 
 //! On-Demand Migration admin API contract (ODM-07, rustfs/backlog#2154).
 //!
-//! Wire types for `PUT`/`GET`/`DELETE /v3/on-demand-migration/{bucket}` and
-//! `GET .../status`, mirroring the server's config model
+//! Wire types for `PUT`/`GET`/`DELETE /v3/on-demand-migration/{bucket}`,
+//! `GET .../status`, `POST .../backfill?op=start|cancel` and
+//! `GET .../backfill` (ODM-12), mirroring the server's config model
 //! (`crates/ecstore/src/bucket/on_demand_migration/config.rs`) and handler
 //! responses (`rustfs/src/admin/handlers/on_demand_migration.rs`). The SDK
 //! owns its own copies, madmin-go style; the fixtures under
@@ -34,6 +35,8 @@ pub const ON_DEMAND_MIGRATION_CONFIG_VERSION: u32 = 1;
 
 /// Query flag that validates and probes a config without saving it.
 const DRY_RUN_QUERY: &str = "dry-run";
+/// `POST .../backfill?op=` selector.
+const BACKFILL_OP_QUERY: &str = "op";
 
 /// Bucket-level on-demand migration configuration (request body of the
 /// `PUT`, redacted copy in every response).
@@ -300,7 +303,7 @@ pub struct OnDemandMigrationGetResponse {
 /// snapshot of the bucket. The runtime fields are `null` while the bucket has
 /// no live state on the answering node (module off, config absent or
 /// disabled); `provider` and `endpoint_host` then still describe the saved
-/// config, if any.
+/// config, if any. `backfill` is present once the bucket had a backfill job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OnDemandMigrationStatus {
     pub configured: bool,
@@ -328,6 +331,10 @@ pub struct OnDemandMigrationStatus {
     /// RFC 3339 save time of the config; `None` when not configured.
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// Counters of the bucket's latest backfill job; absent until the bucket
+    /// has had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill: Option<OnDemandMigrationBackfillSummary>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +392,124 @@ pub struct OnDemandMigrationSourceError {
     pub at: String,
 }
 
+/// Lifecycle of a backfill job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDemandMigrationBackfillState {
+    Pending,
+    Running,
+    Paused,
+    Cancelled,
+    Completed,
+    CompletedWithFailures,
+    Failed,
+}
+
+impl OnDemandMigrationBackfillState {
+    /// Whether the job still runs (or is about to).
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Pending | Self::Running)
+    }
+}
+
+/// What to do with a listed key that already exists locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDemandMigrationSkipExisting {
+    #[default]
+    Always,
+    EtagOrSize,
+}
+
+/// Body of `POST .../backfill?op=start`; every field is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationBackfillRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_existing: Option<OnDemandMigrationSkipExisting>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Last failure recorded by a backfill job; `key_hash` is a hash, never the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationBackfillError {
+    pub class: String,
+    #[serde(default)]
+    pub key_hash: Option<String>,
+    pub at: String,
+}
+
+/// Node running a backfill job and the lease it holds (RFC 3339).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationBackfillOwner {
+    pub node: String,
+    pub lease_until: String,
+}
+
+/// The backfill checkpoint as the server stores it. Field order is the
+/// on-disk and on-wire contract; unknown fields from newer servers are
+/// tolerated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationBackfillJob {
+    pub format_version: u32,
+    pub job_id: String,
+    pub state: OnDemandMigrationBackfillState,
+    pub config_updated_at: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub skip_existing: OnDemandMigrationSkipExisting,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub continuation_token: Option<String>,
+    #[serde(default)]
+    pub listed: u64,
+    #[serde(default)]
+    pub enqueued: u64,
+    #[serde(default)]
+    pub pulled: u64,
+    #[serde(default)]
+    pub skipped_existing: u64,
+    #[serde(default)]
+    pub failed: u64,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub last_key: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<OnDemandMigrationBackfillError>,
+    #[serde(default)]
+    pub failed_keys: Vec<String>,
+    pub started_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub owner: Option<OnDemandMigrationBackfillOwner>,
+}
+
+/// `POST`/`GET .../backfill` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationBackfillResponse {
+    pub bucket: String,
+    pub job: OnDemandMigrationBackfillJob,
+}
+
+/// Counters of the latest backfill job, embedded in the status response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationBackfillSummary {
+    pub job_id: String,
+    pub state: OnDemandMigrationBackfillState,
+    pub listed: u64,
+    pub enqueued: u64,
+    pub pulled: u64,
+    pub skipped_existing: u64,
+    pub failed: u64,
+    pub bytes: u64,
+    pub updated_at: String,
+}
+
 fn config_path(bucket: &str) -> String {
     format!("/v3/on-demand-migration/{}", percent_encode_path_segment(bucket))
 }
@@ -428,6 +553,43 @@ impl AdminClient {
     pub async fn on_demand_migration_status(&self, bucket: &str) -> Result<OnDemandMigrationStatus, AdminClientError> {
         self.get_json(&format!("{}/status", config_path(bucket))).await
     }
+
+    /// Start the backfill job of `bucket`. A job that still holds its lease
+    /// answers HTTP 409 `OnDemandMigrationBackfillRunning`.
+    pub async fn start_on_demand_migration_backfill(
+        &self,
+        bucket: &str,
+        request: &OnDemandMigrationBackfillRequest,
+    ) -> Result<OnDemandMigrationBackfillResponse, AdminClientError> {
+        let body = serde_json::to_vec(request).map_err(|err| AdminClientError::Decode {
+            message: err.to_string(),
+        })?;
+        self.post_json(&backfill_path(bucket), &[(BACKFILL_OP_QUERY, "start".to_string())], body)
+            .await
+    }
+
+    /// Cancel the backfill job of `bucket`; idempotent on a finished job. A
+    /// bucket that never had a job answers HTTP 404 `NoSuchBackfillJob`.
+    pub async fn cancel_on_demand_migration_backfill(
+        &self,
+        bucket: &str,
+    ) -> Result<OnDemandMigrationBackfillResponse, AdminClientError> {
+        self.post_json(&backfill_path(bucket), &[(BACKFILL_OP_QUERY, "cancel".to_string())], Vec::new())
+            .await
+    }
+
+    /// Read the backfill checkpoint of `bucket` (404 `NoSuchBackfillJob`
+    /// when none was ever started).
+    pub async fn on_demand_migration_backfill(
+        &self,
+        bucket: &str,
+    ) -> Result<OnDemandMigrationBackfillResponse, AdminClientError> {
+        self.get_json(&backfill_path(bucket)).await
+    }
+}
+
+fn backfill_path(bucket: &str) -> String {
+    format!("{}/backfill", config_path(bucket))
 }
 
 #[cfg(test)]
@@ -439,6 +601,8 @@ mod tests {
     const SET_RESPONSE_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/set_response.json");
     const GET_RESPONSE_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/get_response.json");
     const STATUS_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/status.json");
+    const STATUS_WITH_BACKFILL_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/status_with_backfill.json");
+    const BACKFILL_JOB_FIXTURE: &str = include_str!("../fixtures/on_demand_migration/backfill_job.json");
 
     fn round_trip<T: Serialize + for<'de> Deserialize<'de>>(fixture: &str) -> T {
         let value: T = serde_json::from_str(fixture.trim()).expect("fixture decodes");
@@ -505,6 +669,7 @@ mod tests {
         assert_eq!(status.queue_depth, 1);
         assert_eq!(status.served_by_source_ratio, None, "the ratio is null, never a fabricated 0");
         assert_eq!(status.updated_at.as_deref(), Some("2026-09-02T10:00:00Z"));
+        assert!(status.backfill.is_none(), "a bucket without a job carries no summary");
     }
 
     #[test]
@@ -519,6 +684,108 @@ mod tests {
         assert_eq!(status.counters, None);
         assert_eq!(status.served_by_source_ratio, None);
         assert_eq!(status.updated_at, None);
+    }
+
+    #[test]
+    fn backfill_fixtures_round_trip_byte_for_byte() {
+        let response: OnDemandMigrationBackfillResponse = round_trip(BACKFILL_JOB_FIXTURE);
+        assert_eq!(response.bucket, "photos");
+        let job = &response.job;
+        assert_eq!(job.format_version, 1);
+        assert_eq!(job.state, OnDemandMigrationBackfillState::Running);
+        assert!(job.state.is_active());
+        assert_eq!(job.skip_existing, OnDemandMigrationSkipExisting::Always);
+        assert_eq!(job.continuation_token.as_deref(), Some("cGhvdG9zLzEwMDA="));
+        assert_eq!((job.listed, job.enqueued, job.pulled, job.failed), (2000, 1500, 1400, 3));
+        assert_eq!(job.failed_keys, vec!["9f2c3b0a1d4e5f60".to_string()]);
+        assert_eq!(job.last_error.as_ref().map(|e| e.class.as_str()), Some("source_timeout"));
+        assert_eq!(job.owner.as_ref().map(|o| o.node.as_str()), Some("node-a:9000"));
+
+        let status: OnDemandMigrationStatus = round_trip(STATUS_WITH_BACKFILL_FIXTURE);
+        let summary = status.backfill.expect("summary present");
+        assert_eq!(summary.job_id, job.job_id);
+        assert_eq!(summary.state, OnDemandMigrationBackfillState::Running);
+        assert_eq!(summary.bytes, 73_400_320);
+
+        // A newer server may add checkpoint fields; the client keeps decoding.
+        let newer =
+            BACKFILL_JOB_FIXTURE
+                .trim()
+                .replacen("\"listed\":2000", "\"listed\":2000,\"throttle_hint\":{\"mode\":\"soft\"}", 1);
+        let decoded: OnDemandMigrationBackfillResponse = serde_json::from_str(&newer).expect("unknown fields tolerated");
+        assert_eq!(decoded.job.listed, 2000);
+    }
+
+    #[test]
+    fn backfill_request_serializes_only_what_was_set() {
+        let minimal = serde_json::to_string(&OnDemandMigrationBackfillRequest::default()).expect("serialize");
+        assert_eq!(minimal, r#"{"dry_run":false}"#);
+        let full = serde_json::to_string(&OnDemandMigrationBackfillRequest {
+            prefix: Some("photos/".to_string()),
+            skip_existing: Some(OnDemandMigrationSkipExisting::EtagOrSize),
+            dry_run: true,
+        })
+        .expect("serialize");
+        assert_eq!(full, r#"{"prefix":"photos/","skip_existing":"etag_or_size","dry_run":true}"#);
+    }
+
+    #[tokio::test]
+    async fn backfill_start_cancel_and_get_use_the_registered_route() {
+        let server = TestServer::spawn(BACKFILL_JOB_FIXTURE, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+        let response = client
+            .start_on_demand_migration_backfill(
+                "photos",
+                &OnDemandMigrationBackfillRequest {
+                    prefix: Some("photos/".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("start decodes");
+        assert_eq!(response.job.state, OnDemandMigrationBackfillState::Running);
+        let request = server.recorded();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/rustfs/admin/v3/on-demand-migration/photos/backfill");
+        assert_eq!(request.query, "op=start");
+        assert_eq!(request.header("content-type").as_deref(), Some("application/json"));
+        assert_eq!(request.body, r#"{"prefix":"photos/","dry_run":false}"#);
+
+        let server = TestServer::spawn(BACKFILL_JOB_FIXTURE, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+        client
+            .cancel_on_demand_migration_backfill("photos")
+            .await
+            .expect("cancel decodes");
+        let request = server.recorded();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.query, "op=cancel");
+        assert_eq!(request.body, "", "cancel sends no body");
+
+        let server = TestServer::spawn(BACKFILL_JOB_FIXTURE, 200).await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+        client.on_demand_migration_backfill("photos").await.expect("get decodes");
+        let request = server.recorded();
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/rustfs/admin/v3/on-demand-migration/photos/backfill");
+
+        let server = TestServer::spawn(
+            r#"{"code":"OnDemandMigrationBackfillRunning","message":"a backfill job is already running"}"#,
+            409,
+        )
+        .await;
+        let client = AdminClient::new(&format!("http://{}", server.addr), "ak", "sk").unwrap();
+        match client
+            .start_on_demand_migration_backfill("photos", &OnDemandMigrationBackfillRequest::default())
+            .await
+            .unwrap_err()
+        {
+            AdminClientError::HttpStatus { status, body } => {
+                assert_eq!(status, 409);
+                assert!(body.contains("OnDemandMigrationBackfillRunning"));
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
     }
 
     #[test]

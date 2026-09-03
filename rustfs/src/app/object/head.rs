@@ -1003,9 +1003,16 @@ mod tests {
     /// runtime configured as `head = local_only`: any HEAD that wrongly
     /// enters the runtime shows up as a `filtered` count, so a zero counter
     /// proves the gate held.
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn execute_head_object_odm_gate_against_real_store() {
+    fn execute_head_object_odm_gate_against_real_store() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "execute-head-object-odm-gate",
+            execute_head_object_odm_gate_against_real_store_inner,
+        );
+    }
+
+    async fn execute_head_object_odm_gate_against_real_store_inner() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;

@@ -292,6 +292,15 @@ pub(crate) mod on_demand_migration {
     pub(crate) type Provider = super::ecstore_bucket::on_demand_migration::Provider;
     pub(crate) type ValidationContext<'a> = super::ecstore_bucket::on_demand_migration::ValidationContext<'a>;
 
+    pub(crate) mod backfill {
+        pub(crate) type BackfillCheckpoint = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillCheckpoint;
+        pub(crate) type BackfillError = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillError;
+        pub(crate) type BackfillRequest = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillRequest;
+        pub(crate) type BackfillState = super::super::ecstore_bucket::on_demand_migration::backfill::BackfillState;
+        pub(crate) type SkipExisting = super::super::ecstore_bucket::on_demand_migration::backfill::SkipExisting;
+        pub(crate) use super::super::ecstore_bucket::on_demand_migration::backfill::global_backfill_runner;
+    }
+
     pub(crate) mod source_client {
         pub(crate) type SourceClient = super::super::ecstore_bucket::on_demand_migration::source_client::SourceClient;
         pub(crate) type SourceClientSpec = super::super::ecstore_bucket::on_demand_migration::source_client::SourceClientSpec;

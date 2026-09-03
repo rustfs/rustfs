@@ -35,6 +35,10 @@ pub const PATH_L: &str = "path";
 pub const REASON_L: &str = "reason";
 /// Upper bound (seconds) of a source latency bucket.
 pub const LE_L: &str = "le";
+/// Node the backfill job runs on.
+pub const SERVER_L: &str = "server";
+/// Lifecycle state of a backfill job.
+pub const STATE_L: &str = "state";
 
 /// Fixed `op` label values.
 pub const REQUEST_OPS: [&str; 2] = ["get", "head"];
@@ -70,6 +74,17 @@ pub const PULL_FAILURE_REASONS: [&str; 12] = [
 /// 14 millisecond bounds rendered in seconds, plus the overflow bucket.
 pub const SOURCE_LATENCY_LE: [&str; 15] = [
     "0.005", "0.01", "0.02", "0.05", "0.1", "0.2", "0.5", "1", "2", "5", "10", "20", "30", "60", "+Inf",
+];
+/// Fixed `state` label values of `backfill_jobs`; mirrors the checkpoint's
+/// `BackfillState` variants in ecstore.
+pub const BACKFILL_STATES: [&str; 7] = [
+    "pending",
+    "running",
+    "paused",
+    "cancelled",
+    "completed",
+    "completed_with_failures",
+    "failed",
 ];
 
 /// `breaker_state` gauge value: the breaker admits every request.
@@ -183,8 +198,80 @@ pub static ODM_BREAKER_STATE_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     )
 });
 
-// backfill_* descriptors (`listed_total`, `pulled_total`, `skipped_total`,
-// `failed_total`, `state`) are added here by ODM-12 (rustfs/backlog#2159).
+// backfill_* descriptors (ODM-12, rustfs/backlog#2159). Unlike the request
+// path above, a backfill job runs on exactly one node at a time, so every
+// backfill series carries the owning node in `server` on top of `bucket`.
+
+const BACKFILL_JOBS: &str = "backfill_jobs";
+const BACKFILL_LISTED_TOTAL: &str = "backfill_listed_total";
+const BACKFILL_ENQUEUED_TOTAL: &str = "backfill_enqueued_total";
+const BACKFILL_PULLED_TOTAL: &str = "backfill_pulled_total";
+const BACKFILL_SKIPPED_EXISTING_TOTAL: &str = "backfill_skipped_existing_total";
+const BACKFILL_FAILED_TOTAL: &str = "backfill_failed_total";
+const BACKFILL_BYTES_TOTAL: &str = "backfill_bytes_total";
+
+pub static ODM_BACKFILL_JOBS_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_gauge_md(
+        MetricName::from(BACKFILL_JOBS),
+        "On-demand migration backfill jobs by server, bucket and state (1 for the bucket's current state)",
+        &[SERVER_L, BUCKET_L, STATE_L],
+        subsystems::ON_DEMAND_MIGRATION,
+    )
+});
+
+pub static ODM_BACKFILL_LISTED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(BACKFILL_LISTED_TOTAL),
+        "Source keys listed by the on-demand migration backfill job, by server and bucket",
+        &[SERVER_L, BUCKET_L],
+        subsystems::ON_DEMAND_MIGRATION,
+    )
+});
+
+pub static ODM_BACKFILL_ENQUEUED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(BACKFILL_ENQUEUED_TOTAL),
+        "Keys queued for pulling by the on-demand migration backfill job, by server and bucket",
+        &[SERVER_L, BUCKET_L],
+        subsystems::ON_DEMAND_MIGRATION,
+    )
+});
+
+pub static ODM_BACKFILL_PULLED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(BACKFILL_PULLED_TOTAL),
+        "Objects stored locally by the on-demand migration backfill job, by server and bucket",
+        &[SERVER_L, BUCKET_L],
+        subsystems::ON_DEMAND_MIGRATION,
+    )
+});
+
+pub static ODM_BACKFILL_SKIPPED_EXISTING_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(BACKFILL_SKIPPED_EXISTING_TOTAL),
+        "Keys the on-demand migration backfill job skipped because a local object already existed, by server and bucket",
+        &[SERVER_L, BUCKET_L],
+        subsystems::ON_DEMAND_MIGRATION,
+    )
+});
+
+pub static ODM_BACKFILL_FAILED_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(BACKFILL_FAILED_TOTAL),
+        "Keys the on-demand migration backfill job could not pull, by server and bucket",
+        &[SERVER_L, BUCKET_L],
+        subsystems::ON_DEMAND_MIGRATION,
+    )
+});
+
+pub static ODM_BACKFILL_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
+    new_counter_md(
+        MetricName::from(BACKFILL_BYTES_TOTAL),
+        "Bytes stored locally by the on-demand migration backfill job, by server and bucket",
+        &[SERVER_L, BUCKET_L],
+        subsystems::ON_DEMAND_MIGRATION,
+    )
+});
 
 #[cfg(test)]
 mod tests {
@@ -208,6 +295,13 @@ mod tests {
             (&*ODM_SOURCE_LATENCY_SECONDS_SUM_MD, "source_latency_seconds_sum"),
             (&*ODM_SOURCE_LATENCY_SECONDS_COUNT_MD, "source_latency_seconds_count"),
             (&*ODM_BREAKER_STATE_MD, "breaker_state"),
+            (&*ODM_BACKFILL_JOBS_MD, "backfill_jobs"),
+            (&*ODM_BACKFILL_LISTED_MD, "backfill_listed_total"),
+            (&*ODM_BACKFILL_ENQUEUED_MD, "backfill_enqueued_total"),
+            (&*ODM_BACKFILL_PULLED_MD, "backfill_pulled_total"),
+            (&*ODM_BACKFILL_SKIPPED_EXISTING_MD, "backfill_skipped_existing_total"),
+            (&*ODM_BACKFILL_FAILED_MD, "backfill_failed_total"),
+            (&*ODM_BACKFILL_BYTES_MD, "backfill_bytes_total"),
         ] {
             assert_eq!(descriptor.get_full_metric_name(), format!("rustfs_on_demand_migration_{suffix}"));
             assert_eq!(descriptor.subsystem, subsystems::ON_DEMAND_MIGRATION);
@@ -260,6 +354,23 @@ mod tests {
     }
 
     #[test]
+    fn backfill_series_are_server_and_bucket_scoped() {
+        assert_eq!(ODM_BACKFILL_JOBS_MD.metric_type, MetricType::Gauge);
+        assert_eq!(labels(&ODM_BACKFILL_JOBS_MD), vec!["server", "bucket", "state"]);
+        for descriptor in [
+            &*ODM_BACKFILL_LISTED_MD,
+            &*ODM_BACKFILL_ENQUEUED_MD,
+            &*ODM_BACKFILL_PULLED_MD,
+            &*ODM_BACKFILL_SKIPPED_EXISTING_MD,
+            &*ODM_BACKFILL_FAILED_MD,
+            &*ODM_BACKFILL_BYTES_MD,
+        ] {
+            assert_eq!(descriptor.metric_type, MetricType::Counter);
+            assert_eq!(labels(descriptor), vec!["server", "bucket"]);
+        }
+    }
+
+    #[test]
     fn fixed_label_values_are_unique() {
         for values in [
             REQUEST_OPS.as_slice(),
@@ -267,6 +378,7 @@ mod tests {
             PULL_PATHS.as_slice(),
             PULL_FAILURE_REASONS.as_slice(),
             SOURCE_LATENCY_LE.as_slice(),
+            BACKFILL_STATES.as_slice(),
         ] {
             let unique: std::collections::BTreeSet<_> = values.iter().collect();
             assert_eq!(unique.len(), values.len(), "{values:?}");
