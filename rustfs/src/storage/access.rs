@@ -4277,9 +4277,16 @@ mod tests {
             .expect_err("the new-generation source object must not be copied");
     }
 
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn restore_object_access_keeps_authorized_bucket_incarnation_across_recreation() {
+    fn restore_object_access_keeps_authorized_bucket_incarnation_across_recreation() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "restore-object-generation-guard",
+            restore_object_access_keeps_authorized_bucket_incarnation_across_recreation_inner,
+        );
+    }
+
+    async fn restore_object_access_keeps_authorized_bucket_incarnation_across_recreation_inner() {
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         let server_ctx = ServerContextSlot::new();
         let app_context = Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)));
@@ -4361,10 +4368,10 @@ mod tests {
         apply_bucket_generation_guard(&req, &bucket, &mut opts).expect("apply the RestoreObject authorization guard");
         assert_eq!(opts.expected_bucket_incarnation_id, Some(authorized_incarnation_id));
 
-        // The RestoreObject usecase future is large enough that, inlined into
-        // this test body, the test thread's 2 MiB stack sits within a few KiB
-        // of overflowing on Linux; heap-pin it so unrelated growth in bucket
-        // metadata futures cannot tip the test over.
+        // The RestoreObject usecase future is large enough that heap-pinning a
+        // single future was not enough on Linux: the whole scenario runs on a
+        // dedicated large stack (see the `#[test]` wrapper above) so unrelated
+        // growth in bucket metadata futures cannot tip the test over.
         let err = Box::pin(
             crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(app_context)).execute_restore_object(req),
         )
