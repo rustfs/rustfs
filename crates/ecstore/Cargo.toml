@@ -163,7 +163,7 @@ http-body = { workspace = true }
 http-body-util.workspace = true
 url.workspace = true
 uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnostics"] }
-reed-solomon-erasure = { workspace = true, features = ["simd-accel"] }
+rustfs-erasure-codec = { workspace = true, features = ["simd-accel"] }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
 moka = { workspace = true, features = ["future", "sync"] }

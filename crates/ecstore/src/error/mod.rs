@@ -1221,7 +1221,7 @@ mod tests {
         use std::error::Error as _;
 
         let error = StorageError::from(ErasureConstructionError::ModernEncoder {
-            source: reed_solomon_erasure::Error::TooManyShards,
+            source: rustfs_erasure_codec::Error::TooManyShards,
         });
         let io_source = error.source().expect("StorageError::Io must expose its io::Error source");
         assert!(io_source.is::<std::io::Error>());
@@ -1232,7 +1232,7 @@ mod tests {
         let encoder_source = construction_source
             .source()
             .expect("construction error must expose the encoder error");
-        assert!(encoder_source.is::<reed_solomon_erasure::Error>());
+        assert!(encoder_source.is::<rustfs_erasure_codec::Error>());
     }
 
     // The lifecycle transition worker relies on this arm alone to suppress the

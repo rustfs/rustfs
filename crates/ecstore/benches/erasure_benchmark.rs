@@ -122,10 +122,10 @@ fn bench_encode_performance(c: &mut Criterion) {
         });
         group.finish();
 
-        // Test direct reed-solomon-erasure implementation for large shards (>= 512 bytes)
+        // Test direct rustfs-erasure-codec implementation for large shards (>= 512 bytes)
         let shard_size = calc_shard_size(config.data_size, config.data_shards);
         if shard_size >= 512 && config.parity_shards > 0 {
-            use reed_solomon_erasure::galois_8::ReedSolomon;
+            use rustfs_erasure_codec::galois_8::ReedSolomon;
 
             let mut rse_group = c.benchmark_group("encode_rse_direct");
             rse_group.throughput(Throughput::Bytes(config.data_size as u64));
@@ -204,10 +204,10 @@ fn bench_decode_performance(c: &mut Criterion) {
         );
         group.finish();
 
-        // Test direct reed-solomon-erasure decoding for large shards
+        // Test direct rustfs-erasure-codec decoding for large shards
         let shard_size = calc_shard_size(config.data_size, config.data_shards);
         if shard_size >= 512 && config.parity_shards > 0 {
-            use reed_solomon_erasure::galois_8::ReedSolomon;
+            use rustfs_erasure_codec::galois_8::ReedSolomon;
 
             if let Ok(rs) = ReedSolomon::new(config.data_shards, config.parity_shards) {
                 let mut rse_group = c.benchmark_group("decode_rse_direct");
