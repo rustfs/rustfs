@@ -13504,7 +13504,9 @@ impl ECStore {
             }
             return Ok(());
         }
-        let result = self.decommission_in_background(rx.clone(), idx, entry_budget).await;
+        let result = self
+            .decommission_in_background(rx.clone(), idx, generation, entry_budget)
+            .await;
 
         if let Err(err) = &result
             && (is_decommission_capacity_blocked_error(err) || is_decommission_target_capacity_error(err))
@@ -13989,8 +13991,10 @@ impl ECStore {
         self: &Arc<Self>,
         rx: CancellationToken,
         idx: usize,
+        generation: OffsetDateTime,
         entry_budget: Arc<Semaphore>,
     ) -> Result<()> {
+        self.ensure_decommission_runtime_capacity_available(idx, generation).await?;
         let pool = get_by_index(self.pools.as_slice(), idx, "load decommission background pool")?.clone();
 
         let pending = {
@@ -17248,6 +17252,44 @@ mod tests {
         assert!(
             persisted_info
                 .capacity_reservation
+                .as_ref()
+                .is_some_and(DecommissionCapacityReservation::active)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_worker_rechecks_runtime_capacity_before_empty_background_completion() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let enough = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 30, 30),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0),
+        ];
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![enough.clone()]);
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("the initial reservation should be activated");
+
+        let shortage = vec![enough[0], DecommissionPoolCapacityInfo::for_test(1, layout, 59, 60, 1)];
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![shortage]);
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+        store
+            .do_decommission_in_routine(canceler, 0, Arc::new(Semaphore::new(1)))
+            .await
+            .expect("runtime capacity shortage should pause the worker before background completion");
+
+        let local = store.pool_meta.read().await;
+        let info = local.pools[0]
+            .decommission
+            .as_ref()
+            .expect("the blocked decommission state should remain present");
+        assert!(!info.complete && !info.failed && !info.canceled);
+        assert!(info.capacity_blocked_reason.is_some());
+        assert!(
+            info.capacity_reservation
                 .as_ref()
                 .is_some_and(DecommissionCapacityReservation::active)
         );
