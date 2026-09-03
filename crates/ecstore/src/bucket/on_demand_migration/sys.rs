@@ -32,7 +32,7 @@
 //! spawns `apply` for installs, and a per-call generation number makes sure
 //! a slower, older install can never overwrite a newer one.
 //!
-//! The module switch (`RUSTFS_ON_DEMAND_MIGRATION_ENABLED`, default off) is
+//! The module switch (`RUSTFS_ON_DEMAND_MIGRATION_ENABLED`, default on) is
 //! injected by the `rustfs` binary through [`OnDemandMigrationSys::set_module_enabled`]
 //! before bucket metadata loads; this crate never reads the environment.
 //! The same startup step injects the [`OdmWriteBack`] the pull pipeline
