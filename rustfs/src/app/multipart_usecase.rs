@@ -2526,9 +2526,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn authorized_replica_only_multipart_complete_preserves_persisted_anti_cascade_state() {
+    fn authorized_replica_only_multipart_complete_preserves_persisted_anti_cascade_state() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "authorized-replica-only-multipart-complete",
+            authorized_replica_only_multipart_complete_preserves_persisted_anti_cascade_state_inner,
+        );
+    }
+
+    async fn authorized_replica_only_multipart_complete_preserves_persisted_anti_cascade_state_inner() {
         let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("replica-only-complete", 16_384).await;
         let object = "object";
         let usecase = DefaultMultipartUsecase::from_global();

@@ -614,9 +614,16 @@ mod tests {
             .expect("install bucket default SSE");
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn write_back_under_bucket_default_sse_stores_ciphertext_and_records_source_etag() {
+    fn write_back_under_bucket_default_sse_stores_ciphertext_and_records_source_etag() {
+        crate::app::gating_test_env::run_large_stack_test(
+            "odm-write-back-under-bucket-default-sse",
+            write_back_under_bucket_default_sse_stores_ciphertext_and_records_source_etag_inner,
+        );
+    }
+
+    async fn write_back_under_bucket_default_sse_stores_ciphertext_and_records_source_etag_inner() {
         let local_sse_master_key = base64_simd::STANDARD.encode_to_string([0x42u8; 32]);
         temp_env::async_with_vars([("RUSTFS_SSE_S3_MASTER_KEY", Some(local_sse_master_key))], async {
             let (store, bucket) = write_back_test_bucket("odm-wb-sse", false).await;
