@@ -677,9 +677,7 @@ mod tests {
             .await
             .expect_err("a full quota must reject the write-back");
         assert!(matches!(err, WriteBackError::Quota(_)), "{err}");
-        // ODM-05 fixed the failure label set without a quota label; quota
-        // failures are accounted as local writes until it grows one.
-        assert_eq!(err.reason(), PullFailureReason::LocalWrite);
+        assert_eq!(err.reason(), PullFailureReason::Quota);
         assert_nothing_left(&store, &bucket, "over.bin").await;
     }
 

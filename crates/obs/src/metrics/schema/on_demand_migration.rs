@@ -56,7 +56,7 @@ pub const REQUEST_OUTCOMES: [&str; 7] = [
 /// Fixed `path` label values.
 pub const PULL_PATHS: [&str; 3] = ["inline", "background", "backfill"];
 /// Fixed `reason` label values.
-pub const PULL_FAILURE_REASONS: [&str; 12] = [
+pub const PULL_FAILURE_REASONS: [&str; 13] = [
     "source_not_found",
     "source_access_denied",
     "source_throttled",
@@ -67,6 +67,7 @@ pub const PULL_FAILURE_REASONS: [&str; 12] = [
     "source_other",
     "etag_mismatch",
     "local_write",
+    "quota",
     "canceled",
     "queue_full",
 ];

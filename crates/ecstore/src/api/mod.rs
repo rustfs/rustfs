@@ -163,7 +163,7 @@ pub mod bucket {
         pub use crate::bucket::on_demand_migration::{
             EnqueueOutcome, LocalObject, MAX_MULTIPART_PARTS, OdmWriteBack, PULL_MAX_RETRIES, PULL_RETRY_BASE_DELAYS,
             PullCompletion, PullQueue, PullReason, PullSource, QueuedPullOutcome, SourceBody, WriteBackBody, WriteBackError,
-            WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with,
+            WriteBackOutcome, WriteBackPart, WriteBackRequest, commit_inline, commit_inline_with, idle_guarded_body,
         };
         pub mod backfill {
             pub use crate::bucket::on_demand_migration::backfill::{
