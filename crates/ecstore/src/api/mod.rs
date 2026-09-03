@@ -49,7 +49,7 @@ pub mod bucket {
                 apply_transition_rule, enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects,
                 enqueue_transition_for_existing_objects_scoped, enqueue_transition_for_existing_objects_scoped_with_cancel,
                 enqueue_transition_immediate, expire_transitioned_object, get_global_expiry_state, get_global_transition_state,
-                init_background_expiry, manual_transition_queue_snapshot, post_restore_opts,
+                init_background_expiry, lifecycle_version_delete_target, manual_transition_queue_snapshot, post_restore_opts,
                 run_stale_multipart_upload_cleanup_once, validate_transition_tier,
             };
         }

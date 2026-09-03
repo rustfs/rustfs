@@ -86,6 +86,7 @@ pub use error::{StorageErrorCode, StorageResult};
 pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
 pub use object::DeleteAccounting;
 pub use object::ObjectLockDeleteOptions;
+pub use object::ObjectToDeleteIdentity;
 pub use object::{DeletedObject, ObjectToDelete};
 pub use object::{ExpirationOptions, TransitionedObject};
 pub use object::{HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, ObjectLockRetentionOptions};

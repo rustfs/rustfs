@@ -65,9 +65,9 @@ use crate::{
     Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts, ReplicationConfig,
     ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, STORAGE_FORMAT_FILE, ScannerDiskExt as _,
     ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, TierRegistrySnapshot, apply_expiry_rule,
-    apply_transition_rule, enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
-    path2_bucket_object_with_base_path, queue_replication_heal, runtime_tier_registry_for_cycle, scanner_is_erasure,
-    scanner_replication_config_for_lifecycle_eval,
+    apply_transition_rule, ecstore_lifecycle_version_delete_target, enqueue_runtime_newer_noncurrent,
+    is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object, path2_bucket_object_with_base_path,
+    queue_replication_heal, runtime_tier_registry_for_cycle, scanner_is_erasure, scanner_replication_config_for_lifecycle_eval,
 };
 use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
 

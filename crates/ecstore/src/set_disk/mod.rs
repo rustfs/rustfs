@@ -14560,11 +14560,65 @@ mod tests {
             .expect("suspended-version object should be written");
 
         let marker = set_disks
-            .delete_object(bucket, object, opts.clone())
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    mod_time: Some(OffsetDateTime::now_utc()),
+                    ..opts.clone()
+                },
+            )
             .await
             .expect("version-suspended delete should create a null marker");
         assert!(marker.delete_marker);
         assert_eq!(marker.version_id, Some(Uuid::nil()));
+
+        let stale_target = crate::bucket::lifecycle::bucket_lifecycle_ops::lifecycle_version_delete_target(&marker)
+            .expect("the observed null marker should produce an exact lifecycle target");
+        let replacement_mod_time =
+            marker.mod_time.expect("the first null marker must have a modification time") + time::Duration::seconds(1);
+
+        let mut replacement_reader = PutObjReader::from_vec(b"replacement suspended version body".to_vec());
+        set_disks
+            .put_object(bucket, object, &mut replacement_reader, &opts)
+            .await
+            .expect("a suspended-version PUT should replace the first null marker");
+        let replacement_marker = set_disks
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    mod_time: Some(replacement_mod_time),
+                    ..opts.clone()
+                },
+            )
+            .await
+            .expect("a second suspended-version delete should create a replacement null marker");
+        assert!(replacement_marker.delete_marker);
+        assert_eq!(replacement_marker.version_id, Some(Uuid::nil()));
+        assert_eq!(replacement_marker.mod_time, Some(replacement_mod_time));
+
+        let (_deleted, stale_errors) = set_disks.delete_objects(bucket, vec![stale_target], opts.clone()).await;
+        assert!(
+            matches!(stale_errors.as_slice(), [Some(StorageError::PreconditionFailed)]),
+            "a stale null-marker lifecycle target must not delete its replacement: {stale_errors:?}"
+        );
+
+        let (current_marker, _, current_error) = set_disks
+            .get_object_info_and_quorum(
+                bucket,
+                object,
+                &ObjectOptions {
+                    version_id: Some(Uuid::nil().to_string()),
+                    version_suspended: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(current_error, Some(StorageError::MethodNotAllowed)));
+        assert!(current_marker.delete_marker);
+        assert_eq!(current_marker.mod_time, Some(replacement_mod_time));
 
         let (_deleted, errs) = set_disks
             .delete_objects(
