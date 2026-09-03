@@ -575,6 +575,7 @@ pub(crate) async fn delete_confirmed_transition_candidate_exact_with_lease_idemp
 #[cfg(test)]
 static CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
 pub(crate) async fn delete_confirmed_transition_candidate_exact_with_manager_and_identity(
     obj_name: &str,
     rv_id: &str,
