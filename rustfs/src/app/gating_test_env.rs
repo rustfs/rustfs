@@ -29,6 +29,7 @@ use super::storage_api::test::contract::bucket::MakeBucketOptions;
 use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions};
 use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 use super::{context::AppContext, object_traffic_health::ObjectTrafficHealth};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use tempfile::TempDir;
@@ -37,6 +38,27 @@ use tokio_util::sync::CancellationToken;
 
 static SHARED_GATING_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, TempDir)> = OnceLock::new();
 static SHARED_GATING_INIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub(crate) fn run_large_stack_test<F, Fut>(name: &'static str, test: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("large-stack test runtime should build");
+
+            runtime.block_on(test());
+        })
+        .expect("large-stack test thread should spawn")
+        .join()
+        .expect("large-stack test thread should finish");
+}
 
 /// Return a shared 4-disk `ECStore` with bucket metadata initialized.
 ///
