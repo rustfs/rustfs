@@ -1,0 +1,20 @@
+# Background Services Inventory
+
+**Use this when:** you add, move, or audit a background worker and need its declared desired source, current-status inputs, status surface, and side effects in one row — the per-service data the vocabulary in [background-controller-contract.md](background-controller-contract.md) is defined over.
+**Source of truth:** the service implementations cited per row. The contract page owns the vocabulary (desired / current / status / reconcile / side effects) and the state model; this page owns the per-service rows.
+
+Scope: services get a row here when they are audited. This inventory currently covers the on-demand migration workers (rustfs/backlog#2147); the scanner, heal, lifecycle, replication, notification, capacity, and config-reload services are described in the "Coupling Notes" of [background-controller-contract.md](background-controller-contract.md) and gain rows as they are audited. A missing row means "not yet inventoried", never "no side effects".
+
+Rules a row must respect, inherited from the contract: status collection is side-effect-free, a missing surface is reported as `unknown` rather than guessed, and side effects are declared before any controller touches the service.
+
+## On-Demand Migration
+
+Operator-facing behaviour, configuration, and troubleshooting for these services live in [../operations/on-demand-migration.md](../operations/on-demand-migration.md).
+
+| Service | Desired source | Current-status inputs | Status surface | Side effects |
+|---|---|---|---|---|
+| Write-back pull pipeline (`crates/ecstore/src/bucket/on_demand_migration/pull.rs`; the local write is delegated to the app layer in `rustfs/src/app/object/on_demand_migration_put.rs`) | The bucket's `on-demand-migration.json` (`enabled`, `policy.max_concurrent_pulls`, `pull_queue_capacity`, `multipart_part_size_bytes`, `bandwidth_limit_bytes_per_sec`) together with the process switch `RUSTFS_ON_DEMAND_MIGRATION_ENABLED` | Per-bucket runtime state in `crates/ecstore/src/bucket/on_demand_migration/sys.rs`: whether a state is installed, whether its source client built, its cancellation token, queue depth, in-flight pull permits | `GET /rustfs/admin/v3/on-demand-migration/{bucket}/status` (`inflight_pulls`, `queue_depth`, `counters.pulled_*`, `counters.pull_failures_total`) and the `rustfs_on_demand_migration_*` series | Source GET/HEAD/GetObjectTagging traffic; local object writes through the internal put path, hence quota consumption, bucket default SSE, versioning, Object Lock defaults, `ObjectCreated` notifications, and outbound replication scheduling |
+| Backfill job (module under `crates/ecstore/src/bucket/on_demand_migration/`, rustfs/backlog#2159 — not yet in the tree) | An admin `start` request plus the bucket config; invalidated when the config's `updated_at` changes or the config is deleted | The persisted checkpoint under the bucket's metadata prefix, its `state` field, and the owner lease | The backfill section of the bucket status endpoint and the `rustfs_on_demand_migration_backfill_*` series | Source `ListObjectsV2` paging; queue admission into the write-back pipeline (and therefore all of its side effects); checkpoint writes |
+| Backfill recovery loop (registered from `rustfs/src/startup_background.rs`, rustfs/backlog#2159 — not yet in the tree) | The set of persisted checkpoints in `state = running`; runs on every node | Checkpoint owner lease expiry | Takeover is reported through the same backfill status; a takeover emits a warn-level lease event | Claims the lease and resumes the backfill job, inheriting its side effects. Scanning checkpoints is read-only |
+
+The pull pipeline has no separate loop of its own: a bucket's queue dispatcher starts lazily on the first background pull and is cancelled when the bucket's state is rebuilt or removed, and each inline pull commits in a task that outlives its request so a client disconnect cannot truncate the stored object. Neither the switch nor the config is re-read by the workers: the bucket-metadata publish hook rebuilds the state, which is the only desired-state path.
