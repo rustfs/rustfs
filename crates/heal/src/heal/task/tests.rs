@@ -470,6 +470,50 @@ async fn cleanup_pending_recovery_removes_checkpoint_without_rebuild_work() {
 }
 
 #[tokio::test]
+async fn replacement_cleanup_reloads_verified_state_from_survivor_anchor() {
+    let temp = TempDir::new().expect("temporary resume disk directory should be created");
+    let anchor = make_resume_disk(&temp).await;
+    let task_id = crate::heal::resume::ResumeUtils::generate_task_id();
+    let stale_resume = ResumeManager::new_replacement_intent(
+        anchor.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket-a".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![replacement_identity("replacement-a", "device-a", "filesystem-a")],
+    )
+    .await
+    .expect("replacement intent should persist on the survivor anchor");
+    let rebuilding_resume = ResumeManager::load_replacement_intent(anchor.clone(), &task_id)
+        .await
+        .expect("the inner healer should load the persisted replacement intent");
+    rebuilding_resume
+        .mark_replacement_completed_and_verified()
+        .await
+        .expect("the inner healer should persist verified completion");
+
+    assert!(
+        stale_resume.mark_replacement_cleanup_pending().await.is_err(),
+        "the original in-memory manager must remain stale after another manager persists verification"
+    );
+    let verified_resume = super::heal_erasure_set::load_verified_replacement_resume(&anchor, &task_id)
+        .await
+        .expect("cleanup should reload and verify durable replacement completion");
+    verified_resume
+        .mark_replacement_cleanup_pending()
+        .await
+        .expect("the freshly loaded verified state should enter cleanup");
+
+    let state = ResumeManager::load_replacement_intent(anchor, &task_id)
+        .await
+        .expect("cleanup-pending state should remain durable")
+        .get_state()
+        .await;
+    assert!(state.completed);
+    assert_eq!(state.replacement_phase, ReplacementPhase::CleanupPending);
+}
+
+#[tokio::test]
 async fn verified_recovery_keeps_state_when_marker_clear_fails() {
     let temp = TempDir::new().expect("temporary resume disk directory should be created");
     let anchor = make_resume_disk(&temp).await;

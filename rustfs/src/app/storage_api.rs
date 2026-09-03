@@ -24,6 +24,17 @@ pub(crate) fn EndpointServerPools(
     crate::storage::storage_api::EndpointServerPools::from(pools)
 }
 
+/// S3 wire types for app-layer modules, funneled here so new files stay off
+/// the direct s3s surface (s3s footprint ratchet, `scripts/check_s3s_footprint.sh`).
+pub(crate) mod s3 {
+    #[cfg(test)]
+    pub(crate) use s3s::dto::{
+        BucketVersioningStatus, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
+        ReplicationRule, ReplicationRuleStatus, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+        ServerSideEncryptionRule, VersioningConfiguration,
+    };
+}
+
 pub(crate) mod admin {
     pub(crate) async fn get_server_info(get_pools: bool) -> rustfs_madmin::InfoMessage {
         crate::storage::storage_api::ecstore_admin::get_server_info(get_pools).await
@@ -615,7 +626,7 @@ pub(crate) mod bucket {
 
     pub(crate) mod on_demand_migration {
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::source_client::{
-            SourceClient, SourceError, SourceHead,
+            SourceClient, SourceError, SourceGet, SourceHead,
         };
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
@@ -624,7 +635,7 @@ pub(crate) mod bucket {
         };
         pub(crate) use crate::storage::storage_api::ecstore_bucket::on_demand_migration::{
             BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OdmStateError, OnDemandMigrationSys, PolicyConfig,
-            SourceErrorPolicy,
+            PullError, PullLeader, PullOutcome, PullReason, PullSlot, RangeGetPolicy, SourceErrorPolicy, commit_inline,
         };
     }
 

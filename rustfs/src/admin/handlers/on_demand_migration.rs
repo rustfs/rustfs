@@ -18,10 +18,12 @@
 //! pulled on first access. This module is the management plane only:
 //! `PUT`/`GET`/`DELETE /v3/on-demand-migration/{bucket}` configure, read and
 //! clear the source, `?dry-run=true` validates and probes without saving, and
-//! `GET .../status` reports the switch state plus a summary of the backfill
-//! job. `POST .../backfill?op=start|cancel` and `GET .../backfill` drive the
-//! background backfill job (ODM-12, rustfs/backlog#2159) through the
-//! process-wide `BackfillRunner`; the checkpoint document is the wire shape.
+//! `GET .../status` reports the switch state, this node's runtime snapshot
+//! of the bucket (breaker, counters, last source error) and a summary of the
+//! backfill job. `POST .../backfill?op=start|cancel` and `GET .../backfill`
+//! drive the background backfill job (ODM-12, rustfs/backlog#2159) through
+//! the process-wide `BackfillRunner`; the checkpoint document is the wire
+//! shape.
 //!
 //! Credentials in the request body are never echoed: every response carries
 //! the `redacted()` config, probe failures name only the error class, and no
@@ -43,7 +45,7 @@ use crate::admin::storage_api::bucket::on_demand_migration::source_client::{
     SourceClient, SourceClientSpec, SourceError, SourceProbe, SourceProvider, SourceTimeouts,
 };
 use crate::admin::storage_api::bucket::on_demand_migration::{
-    OnDemandMigrationConfig, OnDemandMigrationConfigError, PathStyle, ValidationContext,
+    OdmBucketSnapshot, OnDemandMigrationConfig, OnDemandMigrationConfigError, OnDemandMigrationSys, PathStyle, ValidationContext,
 };
 use crate::admin::storage_api::bucket::remote_s3_client::{PathStyle as RemotePathStyle, RemoteCredentials, RemoteS3ClientError};
 use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketOptions};
@@ -59,6 +61,7 @@ use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,14 +140,142 @@ pub(crate) struct GetBucketOnDemandMigrationResponse {
     pub updated_at: String,
 }
 
+/// `GET .../status` body. Field order and `null` handling are pinned by the
+/// `rustfs-madmin` fixture. Runtime fields are `null` while the bucket has no
+/// live state on this node; `provider` and `endpoint_host` then fall back to
+/// the saved config so a disabled module still shows what is configured.
 #[derive(Debug, Serialize)]
 pub(crate) struct BucketOnDemandMigrationStatus {
     pub configured: bool,
     pub enabled: bool,
     pub module_enabled: bool,
+    pub provider: Option<String>,
+    pub endpoint_host: Option<String>,
+    pub breaker: Option<BreakerStatus>,
+    pub counters: Option<RuntimeCounters>,
+    pub last_source_error: Option<LastSourceErrorStatus>,
+    pub inflight_pulls: u64,
+    pub queue_depth: u64,
+    /// `source_hit / (source_hit + local GETs)`. The API request metrics
+    /// count per operation, not per bucket, and the runtime only sees
+    /// misses, so there is no per-bucket GET total to divide by: this stays
+    /// `null` rather than reporting a made-up 0.
+    pub served_by_source_ratio: Option<f64>,
+    /// RFC 3339 save time of the config; `null` when not configured.
+    pub updated_at: Option<String>,
     /// Latest backfill job of the bucket, absent when none was ever started.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backfill: Option<BackfillSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BreakerStatus {
+    pub state: &'static str,
+    /// The runtime snapshot does not carry the breaker's open instant yet
+    /// (it is a monotonic clock reading inside ecstore), so this is `null`.
+    pub opened_at: Option<String>,
+}
+
+/// Lifetime counters of the bucket's runtime on this node, keyed by the
+/// fixed label values of the Prometheus series with the same names.
+#[derive(Debug, Serialize)]
+pub(crate) struct RuntimeCounters {
+    pub requests_total: BTreeMap<String, BTreeMap<String, u64>>,
+    pub pulled_bytes_total: u64,
+    pub pulled_objects_total: BTreeMap<String, u64>,
+    pub pull_failures_total: BTreeMap<String, u64>,
+    pub source_latency: SourceLatencyStatus,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SourceLatencyStatus {
+    pub buckets: Vec<LatencyBucketStatus>,
+    pub count: u64,
+    pub sum_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct LatencyBucketStatus {
+    pub le_ms: u64,
+    pub count: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct LastSourceErrorStatus {
+    pub class: String,
+    pub at: String,
+}
+
+/// Host of the configured source endpoint, matching the runtime's
+/// `endpoint_host` so the status reads the same with or without live state.
+fn config_endpoint_host(config: &OnDemandMigrationConfig) -> Option<String> {
+    url::Url::parse(&config.source.effective_endpoint())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+}
+
+fn bucket_status(
+    config: Option<(&OnDemandMigrationConfig, OffsetDateTime)>,
+    runtime: Option<OdmBucketSnapshot>,
+    module_enabled: bool,
+) -> S3Result<BucketOnDemandMigrationStatus> {
+    let updated_at = config.map(|(_, updated_at)| format_updated_at(updated_at)).transpose()?;
+    let mut status = BucketOnDemandMigrationStatus {
+        configured: config.is_some(),
+        enabled: config.is_some_and(|(config, _)| config.enabled),
+        module_enabled,
+        provider: config.map(|(config, _)| config.source.provider.as_str().to_string()),
+        endpoint_host: config.and_then(|(config, _)| config_endpoint_host(config)),
+        breaker: None,
+        counters: None,
+        last_source_error: None,
+        inflight_pulls: 0,
+        queue_depth: 0,
+        served_by_source_ratio: None,
+        updated_at,
+        backfill: None,
+    };
+    let Some(runtime) = runtime else {
+        return Ok(status);
+    };
+    let stats = runtime.stats;
+    status.provider = Some(runtime.provider);
+    status.endpoint_host = Some(runtime.endpoint_host);
+    status.breaker = Some(BreakerStatus {
+        state: stats.breaker_state.as_str(),
+        opened_at: None,
+    });
+    status.counters = Some(RuntimeCounters {
+        requests_total: stats.requests_total,
+        pulled_bytes_total: stats.pulled_bytes_total,
+        pulled_objects_total: stats.pulled_objects_total,
+        pull_failures_total: stats.pull_failures_total,
+        source_latency: SourceLatencyStatus {
+            buckets: stats
+                .source_latency
+                .buckets
+                .into_iter()
+                .map(|bucket| LatencyBucketStatus {
+                    le_ms: bucket.le_ms,
+                    count: bucket.count,
+                })
+                .collect(),
+            count: stats.source_latency.count,
+            sum_ms: stats.source_latency.sum_ms,
+        },
+    });
+    status.last_source_error = stats
+        .last_source_error
+        .map(|error| {
+            Ok::<_, S3Error>(LastSourceErrorStatus {
+                class: error.class,
+                at: format_updated_at(error.at)?,
+            })
+        })
+        .transpose()?;
+    status.inflight_pulls = stats.inflight_pulls;
+    status.queue_depth = stats.queue_depth;
+    Ok(status)
 }
 
 /// Counters of the bucket's backfill job for the status endpoint.
@@ -700,6 +831,7 @@ impl Operation for GetBucketOnDemandMigrationStatusHandler {
         let config = metadata_sys::get_on_demand_migration_config(&bucket).await.map_err(|err| {
             admin_s3_error(S3ErrorCode::InternalError, format!("failed to read on-demand migration config: {err}"))
         })?;
+        let runtime = OnDemandMigrationSys::get().bucket_snapshot(&bucket);
 
         let backfill = match global_backfill_runner() {
             Some(runner) => runner
@@ -711,12 +843,12 @@ impl Operation for GetBucketOnDemandMigrationStatusHandler {
             None => None,
         };
 
-        let status = BucketOnDemandMigrationStatus {
-            configured: config.is_some(),
-            enabled: config.is_some_and(|(config, _)| config.enabled),
-            module_enabled: module_enabled(),
-            backfill,
-        };
+        let mut status = bucket_status(
+            config.as_ref().map(|(config, updated_at)| (config, *updated_at)),
+            runtime,
+            module_enabled(),
+        )?;
+        status.backfill = backfill;
         admin_json_response(req.uri.path(), &cred.secret_key, StatusCode::OK, &status)
     }
 }
@@ -881,15 +1013,95 @@ mod tests {
         assert_eq!(serde_json::to_string(&response).expect("serialize"), GET_RESPONSE_FIXTURE.trim());
     }
 
+    /// The runtime snapshot the ecstore golden test (`snapshot_matches_golden_json`)
+    /// produces, as this node would hand it to the status route.
+    fn fixture_runtime_snapshot() -> OdmBucketSnapshot {
+        let fixture: serde_json::Value = serde_json::from_str(STATUS_FIXTURE.trim()).expect("status fixture parses");
+        let counters = &fixture["counters"];
+        let snapshot = serde_json::json!({
+            "bucket": "photos",
+            "provider": fixture["provider"],
+            "endpoint_host": fixture["endpoint_host"],
+            "applied_at": FIXTURE_UPDATED_AT,
+            "client_error": null,
+            "negative_cache_entries": 0,
+            "inflight_keys": 1,
+            "max_concurrent_pulls": 8,
+            "stats": {
+                "requests_total": counters["requests_total"],
+                "pulled_bytes_total": counters["pulled_bytes_total"],
+                "pulled_objects_total": counters["pulled_objects_total"],
+                "pull_failures_total": counters["pull_failures_total"],
+                "inflight_pulls": fixture["inflight_pulls"],
+                "queue_depth": fixture["queue_depth"],
+                "source_latency": counters["source_latency"],
+                "last_source_error": fixture["last_source_error"],
+                "breaker_state": fixture["breaker"]["state"],
+            }
+        });
+        serde_json::from_value(snapshot).expect("runtime snapshot decodes")
+    }
+
     #[test]
     fn status_matches_madmin_golden_fixture() {
-        let status = BucketOnDemandMigrationStatus {
-            configured: true,
-            enabled: true,
-            module_enabled: false,
-            backfill: None,
-        };
-        assert_eq!(serde_json::to_string(&status).expect("serialize"), STATUS_FIXTURE.trim());
+        let config = fixture_config();
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_788_343_200).expect("timestamp");
+        let status = bucket_status(Some((&config, updated_at)), Some(fixture_runtime_snapshot()), true).expect("status");
+        let json = serde_json::to_string(&status).expect("serialize");
+        assert_eq!(json, STATUS_FIXTURE.trim());
+        assert!(json.contains(r#""served_by_source_ratio":null"#), "the ratio field is present as null");
+        assert!(status.backfill.is_none(), "a bucket without a job carries no summary");
+    }
+
+    #[test]
+    fn status_without_runtime_state_describes_the_config_and_nulls_the_runtime() {
+        let config = fixture_config();
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_788_343_200).expect("timestamp");
+        let status = bucket_status(Some((&config, updated_at)), None, false).expect("status");
+        assert_eq!(
+            serde_json::to_value(&status).expect("serialize"),
+            serde_json::json!({
+                "configured": true,
+                "enabled": true,
+                "module_enabled": false,
+                "provider": "minio",
+                "endpoint_host": "source.example.com",
+                "breaker": null,
+                "counters": null,
+                "last_source_error": null,
+                "inflight_pulls": 0,
+                "queue_depth": 0,
+                "served_by_source_ratio": null,
+                "updated_at": FIXTURE_UPDATED_AT,
+            })
+        );
+
+        let status = bucket_status(None, None, true).expect("status");
+        assert_eq!(
+            serde_json::to_value(&status).expect("serialize"),
+            serde_json::json!({
+                "configured": false,
+                "enabled": false,
+                "module_enabled": true,
+                "provider": null,
+                "endpoint_host": null,
+                "breaker": null,
+                "counters": null,
+                "last_source_error": null,
+                "inflight_pulls": 0,
+                "queue_depth": 0,
+                "served_by_source_ratio": null,
+                "updated_at": null,
+            })
+        );
+    }
+
+    #[test]
+    fn config_endpoint_host_matches_the_runtime_host_rule() {
+        let mut config = fixture_config();
+        assert_eq!(config_endpoint_host(&config).as_deref(), Some("source.example.com"));
+        config.source.endpoint = Some("https://Bucket.S3.Example:9000/base".to_string());
+        assert_eq!(config_endpoint_host(&config).as_deref(), Some("bucket.s3.example"));
     }
 
     fn fixture_job() -> BackfillCheckpoint {
@@ -908,12 +1120,10 @@ mod tests {
 
     #[test]
     fn status_with_backfill_summary_matches_madmin_golden_fixture() {
-        let status = BucketOnDemandMigrationStatus {
-            configured: true,
-            enabled: true,
-            module_enabled: true,
-            backfill: Some(BackfillSummary::from_checkpoint(&fixture_job()).expect("summary")),
-        };
+        let config = fixture_config();
+        let updated_at = OffsetDateTime::from_unix_timestamp(1_788_343_200).expect("timestamp");
+        let mut status = bucket_status(Some((&config, updated_at)), Some(fixture_runtime_snapshot()), true).expect("status");
+        status.backfill = Some(BackfillSummary::from_checkpoint(&fixture_job()).expect("summary"));
         assert_eq!(serde_json::to_string(&status).expect("serialize"), STATUS_WITH_BACKFILL_FIXTURE.trim());
     }
 
@@ -1267,6 +1477,12 @@ mod store_tests {
         Ok(response_json(response).await)
     }
 
+    fn assert_status_switches(status: &Value, configured: bool, enabled: bool, module_enabled: bool) {
+        assert_eq!(status["configured"], Value::Bool(configured), "{status}");
+        assert_eq!(status["enabled"], Value::Bool(enabled), "{status}");
+        assert_eq!(status["module_enabled"], Value::Bool(module_enabled), "{status}");
+    }
+
     async fn status() -> Value {
         let router = bucket_router();
         let response = GetBucketOnDemandMigrationStatusHandler {}
@@ -1421,10 +1637,11 @@ mod store_tests {
             let err = get_config().await.expect_err("nothing is configured yet");
             assert_eq!(err.code(), &S3ErrorCode::Custom(ERR_CODE_NO_SUCH_CONFIGURATION.into()));
             assert_eq!(err.status_code(), Some(StatusCode::NOT_FOUND));
-            assert_eq!(
-                status().await,
-                serde_json::json!({"configured": false, "enabled": false, "module_enabled": false})
-            );
+            let body = status().await;
+            assert_status_switches(&body, false, false, false);
+            assert_eq!(body["provider"], Value::Null);
+            assert_eq!(body["counters"], Value::Null);
+            assert_eq!(body["updated_at"], Value::Null);
         })
         .await;
 
@@ -1511,10 +1728,14 @@ mod store_tests {
                 assert_eq!(body["config"]["source"]["credentials"]["secret_key"], Value::String("REDACTED".into()));
                 assert_eq!(body["config"]["source"]["credentials"]["access_key"], Value::String("AKIASOURCE".into()));
                 assert_eq!(body["updated_at"], Value::String(first_updated_at.clone()));
-                assert_eq!(
-                    status().await,
-                    serde_json::json!({"configured": true, "enabled": true, "module_enabled": true})
-                );
+                let body = status().await;
+                assert_status_switches(&body, true, true, true);
+                assert_eq!(body["provider"], Value::String("minio".into()));
+                assert_eq!(body["endpoint_host"], Value::String("127.0.0.1".into()));
+                assert_eq!(body["updated_at"], Value::String(first_updated_at.clone()));
+                assert_eq!(body["served_by_source_ratio"], Value::Null, "no per-bucket GET total exists");
+                assert_eq!(body["inflight_pulls"], Value::from(0));
+                assert_eq!(body["queue_depth"], Value::from(0));
 
                 // The peer fan-out ran: the single unreachable peer is reported.
                 let context = crate::admin::runtime_sources::current_app_context();
@@ -1579,10 +1800,11 @@ mod store_tests {
                 let metadata = metadata_sys::get(BUCKET).await.expect("bucket metadata");
                 assert!(metadata.on_demand_migration_config_json.is_empty());
                 assert!(metadata.on_demand_migration_config_updated_at > OffsetDateTime::UNIX_EPOCH);
-                assert_eq!(
-                    status().await,
-                    serde_json::json!({"configured": false, "enabled": false, "module_enabled": true})
-                );
+                let body = status().await;
+                assert_status_switches(&body, false, false, true);
+                assert_eq!(body["provider"], Value::Null);
+                assert_eq!(body["breaker"], Value::Null);
+                assert_eq!(body["updated_at"], Value::Null);
 
                 let response = DeleteBucketOnDemandMigrationHandler {}
                     .call(root_request(Method::DELETE, config_uri(""), Vec::new()), bucket_params(&router))

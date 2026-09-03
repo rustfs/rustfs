@@ -783,6 +783,22 @@ impl BackfillRunner {
         self.live_job(bucket).is_some()
     }
 
+    /// Last persisted progress of every job running in this process, by
+    /// bucket name. Observability reads this instead of the checkpoint
+    /// documents so a metrics cycle never touches storage; a job that has
+    /// finished is dropped here exactly as [`Self::is_running_locally`]
+    /// drops it. Lock order: `jobs` before a handle's `snapshot`.
+    pub fn local_job_snapshots(&self) -> Vec<(String, BackfillCheckpoint)> {
+        let mut jobs = self.jobs.lock();
+        jobs.retain(|_, handle| !handle.is_done());
+        let mut snapshots: Vec<_> = jobs
+            .iter()
+            .map(|(bucket, handle)| (bucket.clone(), handle.snapshot.lock().clone()))
+            .collect();
+        snapshots.sort_by(|left, right| left.0.cmp(&right.0));
+        snapshots
+    }
+
     fn live_job(&self, bucket: &str) -> Option<Arc<JobHandle>> {
         let mut jobs = self.jobs.lock();
         match jobs.get(bucket) {

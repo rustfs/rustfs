@@ -16,11 +16,12 @@
 //!
 //! `common` is the shared environment: one RustFS under test, one programmable
 //! fake S3 source, admin-API wrappers, seeding and local-state assertions.
-//! `harness_self_test` proves the harness itself; `backfill_test` covers the
-//! background backfill job (ODM-12); further ODM behavior scenarios are
-//! separate modules wired by later tasks.
+//! `harness_self_test` proves the harness itself; `get_basic_test` covers the
+//! GET read-through (rustfs/backlog#2156) and `backfill_test` the background
+//! backfill job (ODM-12, rustfs/backlog#2159).
 
 pub mod common;
 
 mod backfill_test;
+mod get_basic_test;
 mod harness_self_test;

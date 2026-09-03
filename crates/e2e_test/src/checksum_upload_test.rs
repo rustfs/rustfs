@@ -22,7 +22,10 @@ mod tests {
     use aws_sdk_s3::config::{Credentials, Region, RequestChecksumCalculation};
     use aws_sdk_s3::error::ProvideErrorMetadata;
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, CompletedMultipartUpload, CompletedPart, ServerSideEncryption};
+    use aws_sdk_s3::types::{
+        ChecksumAlgorithm, ChecksumMode, ChecksumType as SdkChecksumType, CompletedMultipartUpload, CompletedPart,
+        ServerSideEncryption,
+    };
     use aws_smithy_http_client::Builder as SmithyHttpClientBuilder;
     use md5::{Digest as Md5Digest, Md5};
     use rustfs_rio::{Checksum, ChecksumType as RioChecksumType};
@@ -596,6 +599,222 @@ mod tests {
             Some(full_checksum.as_str()),
             "Multipart object should report the same full-object CRC64NVME as direct upload"
         );
+        assert_eq!(
+            multipart_head.checksum_type(),
+            Some(&SdkChecksumType::FullObject),
+            "Multipart object with a full-object checksum must report FULL_OBJECT"
+        );
+    }
+
+    /// Create a CRC32 FULL_OBJECT multipart upload and upload every part, returning
+    /// the upload id and the `CompletedPart` list ready for CompleteMultipartUpload.
+    async fn start_full_object_crc32_upload(
+        client: &Client,
+        bucket: &str,
+        key: &str,
+        parts: &[&Vec<u8>],
+    ) -> (String, Vec<CompletedPart>) {
+        let create_result = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .checksum_type(SdkChecksumType::FullObject)
+            .send()
+            .await
+            .expect("Failed to create multipart upload");
+        let upload_id = create_result.upload_id().expect("No upload_id").to_string();
+
+        let mut completed_parts = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let part_number = index as i32 + 1;
+            let uploaded = client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from((*part).clone()))
+                .checksum_algorithm(ChecksumAlgorithm::Crc32)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("Failed to upload part {part_number}: {e:?}"));
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(uploaded.e_tag().expect("No etag for part"))
+                    .checksum_crc32(uploaded.checksum_crc32().expect("No CRC32 for part"))
+                    .build(),
+            );
+        }
+
+        (upload_id, completed_parts)
+    }
+
+    /// A multipart upload completed with a **full-object** checksum must report
+    /// `x-amz-checksum-type: FULL_OBJECT` on both GET and HEAD, the way AWS does.
+    ///
+    /// `complete_multipart_upload` used to persist the object-level checksum
+    /// record with the pre-merge checksum type, so the MULTIPART /
+    /// INCLUDES_MULTIPART flags never reached disk. `rustfs_rio::read_checksums`
+    /// only emits the FULL_OBJECT entry inside its MULTIPART branch, so these
+    /// objects came back from GET and HEAD with no checksum-type header at all.
+    /// Found while root-causing rustfs#6825.
+    #[tokio::test]
+    async fn test_full_object_multipart_reports_full_object_checksum_type() {
+        init_logging();
+        info!("TEST: full-object multipart upload round-trips x-amz-checksum-type: FULL_OBJECT");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-full-object-checksum-type";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        const PART_SIZE: usize = 5 * 1024 * 1024;
+        let part1: Vec<u8> = (0..PART_SIZE).map(|i| (i % 241) as u8).collect();
+        let part2: Vec<u8> = (0..PART_SIZE).map(|i| ((i + 29) % 241) as u8).collect();
+        let content: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+
+        // CRC32 with an explicit FULL_OBJECT type: the object checksum is the
+        // CRC32 of the whole object, not the composite hash of the part digests.
+        let full_object_crc32 = Checksum::new_from_data(RioChecksumType::CRC32, &content)
+            .expect("crc32 checksum")
+            .encoded;
+
+        let key = "full-object-multipart.bin";
+        let (upload_id, completed_parts) = start_full_object_crc32_upload(&client, bucket, key, &[&part1, &part2]).await;
+
+        client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+            // Restate the full-object intent and value on CompleteMultipartUpload,
+            // exactly as an AWS SDK client does: `x-amz-checksum-type: FULL_OBJECT`
+            // plus `x-amz-checksum-crc32`, with no `x-amz-checksum-algorithm`
+            // header (CompleteMultipartUpload has no such member).
+            .checksum_type(SdkChecksumType::FullObject)
+            .checksum_crc32(full_object_crc32.clone())
+            .send()
+            .await
+            .expect("Failed to complete multipart upload");
+
+        let head = client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("Failed to head object");
+        assert_eq!(
+            head.checksum_type(),
+            Some(&SdkChecksumType::FullObject),
+            "HeadObject must report x-amz-checksum-type: FULL_OBJECT"
+        );
+        assert_eq!(
+            head.checksum_crc32(),
+            Some(full_object_crc32.as_str()),
+            "HeadObject must report the full-object CRC32, with no -<parts> suffix"
+        );
+
+        let get = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .expect("Failed to get object");
+        assert_eq!(
+            get.checksum_type(),
+            Some(&SdkChecksumType::FullObject),
+            "GetObject must report x-amz-checksum-type: FULL_OBJECT"
+        );
+        assert_eq!(
+            get.checksum_crc32(),
+            Some(full_object_crc32.as_str()),
+            "GetObject must report the full-object CRC32, with no -<parts> suffix"
+        );
+
+        let body = get.body.collect().await.expect("Failed to read body").into_bytes();
+        assert_eq!(body.as_ref(), content.as_slice(), "GetObject body must match the uploaded content");
+
+        info!("PASSED: full-object multipart reports FULL_OBJECT on GET and HEAD");
+    }
+
+    /// Declaring a checksum type on CompleteMultipartUpload that contradicts the
+    /// one recorded at CreateMultipartUpload must be rejected, and rejected as a
+    /// client error (4xx), not a server error.
+    #[tokio::test]
+    async fn test_complete_multipart_rejects_contradicting_checksum_type() {
+        init_logging();
+        info!("TEST: CompleteMultipartUpload rejects a checksum type that contradicts the upload");
+
+        let mut env = RustFSTestEnvironment::new().await.expect("Failed to create test environment");
+        env.start_rustfs_server(vec![]).await.expect("Failed to start RustFS");
+
+        let client = create_s3_client(&env);
+        let bucket = "test-checksum-type-mismatch";
+        create_bucket(&client, bucket).await.expect("Failed to create bucket");
+
+        const PART_SIZE: usize = 5 * 1024 * 1024;
+        let part1: Vec<u8> = (0..PART_SIZE).map(|i| (i % 239) as u8).collect();
+        let part2: Vec<u8> = (0..PART_SIZE).map(|i| ((i + 31) % 239) as u8).collect();
+        let content: Vec<u8> = part1.iter().chain(part2.iter()).copied().collect();
+        let full_object_crc32 = Checksum::new_from_data(RioChecksumType::CRC32, &content)
+            .expect("crc32 checksum")
+            .encoded;
+
+        let key = "checksum-type-mismatch.bin";
+        let (upload_id, completed_parts) = start_full_object_crc32_upload(&client, bucket, key, &[&part1, &part2]).await;
+
+        let err = client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+            // The upload was created as FULL_OBJECT; claiming COMPOSITE here
+            // contradicts it.
+            .checksum_type(SdkChecksumType::Composite)
+            .checksum_crc32(full_object_crc32.clone())
+            .send()
+            .await
+            .expect_err("COMPOSITE on a FULL_OBJECT upload must be rejected");
+
+        let service_err = err.into_service_error();
+        let code = service_err.meta().code().unwrap_or("<no code>").to_string();
+        let message = service_err.meta().message().unwrap_or_default().to_string();
+
+        // Before the fix the storage layer refused the combination with a generic
+        // error and the caller got `500 InternalError` -- "please try again" for a
+        // request that can only ever fail.
+        assert_eq!(
+            code, "InvalidRequest",
+            "a contradicting checksum type is a client error, got {code}: {message}"
+        );
+        assert!(
+            message.contains("FULL_OBJECT") && message.contains("COMPOSITE"),
+            "the message must name the recorded and requested types, got {message}"
+        );
+
+        // The upload is untouched by the rejected completion, so a well-formed
+        // retry on the same upload id still succeeds.
+        let listed = client
+            .list_parts()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .expect("upload must survive the rejected completion");
+        assert_eq!(listed.parts().len(), 2, "both parts must still be listed after the rejection");
+
+        info!("PASSED: contradicting checksum type rejected as InvalidRequest");
     }
 
     /// Integration test for the AWS 2026-04 additional checksum algorithms

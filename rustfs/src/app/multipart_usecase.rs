@@ -104,7 +104,7 @@ use rustfs_utils::http::{
     SUFFIX_MAX_TOTAL_OBJECT_SIZE, SUFFIX_PLAINTEXT_CHECKSUM, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT, SUFFIX_REPLICATION_STATUS,
     SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_SOURCE_REPLICATION_REQUEST, contains_key_str, get_consistent_str, get_header,
     get_source_scheme,
-    headers::{AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
+    headers::{AMZ_CHECKSUM_TYPE, AMZ_DECODED_CONTENT_LENGTH, AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS},
     insert_str,
 };
 use s3s::dto::{
@@ -286,6 +286,50 @@ fn has_complete_multipart_object_lock_headers(headers: &HeaderMap) -> bool {
         || headers.contains_key(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE)
         || headers.contains_key(X_AMZ_OBJECT_LOCK_LEGAL_HOLD)
         || has_bypass_governance_header(headers)
+}
+
+/// Reject a CompleteMultipartUpload whose `x-amz-checksum-type` contradicts the
+/// type the upload was created with, the way AWS does (`InvalidRequest`).
+///
+/// The storage layer already refuses the combination -- `complete_multipart_upload`
+/// compares `opts.want_checksum` against the algorithm/type pair recorded under
+/// `x-rustfs-multipart-checksum*` at CreateMultipartUpload -- but it refuses with a
+/// generic error that reaches the caller as `500 InternalError`, telling them to
+/// retry a request that can only ever fail. The recorded type is already in hand
+/// here, so the contradiction is answered as the client error it is.
+///
+/// Uploads created without a checksum algorithm record no type. There is nothing
+/// to contradict in that case, so the header is left alone rather than newly
+/// rejected.
+fn validate_complete_multipart_checksum_type(headers: &HeaderMap, upload_metadata: &HashMap<String, String>) -> S3Result<()> {
+    let Some(requested) = headers
+        .get(AMZ_CHECKSUM_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let Some(recorded) = upload_metadata
+        .get(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    if requested != recorded {
+        // Routed through `ApiError` rather than the s3s error macro so this
+        // validation does not widen the direct s3s surface the s3gate migration
+        // is shrinking (scripts/check_s3s_footprint.sh); the response is identical.
+        return Err(ApiError::invalid_request(format!(
+            "The upload was created with checksum type {recorded}. The complete request must use the same checksum type, got {requested}."
+        ))
+        .into());
+    }
+
+    Ok(())
 }
 
 fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
@@ -655,6 +699,7 @@ impl DefaultMultipartUsecase {
             }
             .validate_complete_multipart_ssec(&multipart_info.user_defined)?;
         }
+        validate_complete_multipart_checksum_type(&req.headers, &multipart_info.user_defined)?;
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
@@ -1843,6 +1888,64 @@ mod tests {
     use std::{collections::HashMap, io::Cursor};
     use temp_env::async_with_vars;
     use tokio::io::AsyncReadExt;
+
+    fn upload_metadata_with_checksum_type(recorded: &str) -> HashMap<String, String> {
+        HashMap::from([(rustfs_rio::RUSTFS_MULTIPART_CHECKSUM_TYPE.to_string(), recorded.to_string())])
+    }
+
+    fn headers_with_checksum_type(requested: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_CHECKSUM_TYPE, HeaderValue::from_str(requested).expect("header value"));
+        headers
+    }
+
+    /// A CompleteMultipartUpload that restates the type the upload was created
+    /// with is the normal AWS SDK request shape and must pass through.
+    #[test]
+    fn complete_multipart_checksum_type_matching_the_upload_is_accepted() {
+        for kind in ["FULL_OBJECT", "COMPOSITE"] {
+            validate_complete_multipart_checksum_type(
+                &headers_with_checksum_type(kind),
+                &upload_metadata_with_checksum_type(kind),
+            )
+            .unwrap_or_else(|err| panic!("{kind} must be accepted, got {err:?}"));
+        }
+    }
+
+    /// Contradicting the recorded type is a client error, not an internal one:
+    /// before this check the storage layer refused it as a generic error and the
+    /// caller saw `500 InternalError`.
+    #[test]
+    fn complete_multipart_checksum_type_contradicting_the_upload_is_rejected() {
+        for (requested, recorded) in [("COMPOSITE", "FULL_OBJECT"), ("FULL_OBJECT", "COMPOSITE")] {
+            let err = validate_complete_multipart_checksum_type(
+                &headers_with_checksum_type(requested),
+                &upload_metadata_with_checksum_type(recorded),
+            )
+            .expect_err("contradicting checksum type must be rejected");
+            assert_eq!(*err.code(), S3ErrorCode::InvalidRequest, "must be a client error");
+            let message = err.message().unwrap_or_default().to_string();
+            assert!(
+                message.contains(requested) && message.contains(recorded),
+                "message must name both types, got {message}"
+            );
+        }
+    }
+
+    /// No header, an empty header, and an upload that recorded no checksum type
+    /// all leave the request untouched -- the check only resolves contradictions.
+    #[test]
+    fn complete_multipart_checksum_type_without_both_sides_is_accepted() {
+        validate_complete_multipart_checksum_type(&HeaderMap::new(), &upload_metadata_with_checksum_type("FULL_OBJECT"))
+            .expect("absent header is not a contradiction");
+        validate_complete_multipart_checksum_type(
+            &headers_with_checksum_type(""),
+            &upload_metadata_with_checksum_type("FULL_OBJECT"),
+        )
+        .expect("empty header is not a contradiction");
+        validate_complete_multipart_checksum_type(&headers_with_checksum_type("FULL_OBJECT"), &HashMap::new())
+            .expect("upload without a recorded checksum type is not a contradiction");
+    }
 
     fn s3_op_total(op: S3Operation) -> u64 {
         rustfs_io_metrics::s3_op_metrics_snapshot()

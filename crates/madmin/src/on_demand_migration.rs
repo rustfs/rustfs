@@ -27,6 +27,7 @@
 use crate::client::{AdminClient, AdminClientError, percent_encode_path_segment};
 use http::Method;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Config schema version this client speaks.
@@ -298,15 +299,97 @@ pub struct OnDemandMigrationGetResponse {
     pub updated_at: String,
 }
 
-/// `GET .../status` response. Runtime counters are added by later ODM tasks;
-/// `backfill` is present once the bucket had a backfill job.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `GET .../status` response: the switch state plus this node's runtime
+/// snapshot of the bucket. The runtime fields are `null` while the bucket has
+/// no live state on the answering node (module off, config absent or
+/// disabled); `provider` and `endpoint_host` then still describe the saved
+/// config, if any. `backfill` is present once the bucket had a backfill job.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OnDemandMigrationStatus {
     pub configured: bool,
     pub enabled: bool,
     pub module_enabled: bool,
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Host of the source endpoint, without scheme or port.
+    #[serde(default)]
+    pub endpoint_host: Option<String>,
+    #[serde(default)]
+    pub breaker: Option<OnDemandMigrationBreaker>,
+    #[serde(default)]
+    pub counters: Option<OnDemandMigrationCounters>,
+    #[serde(default)]
+    pub last_source_error: Option<OnDemandMigrationSourceError>,
+    #[serde(default)]
+    pub inflight_pulls: u64,
+    #[serde(default)]
+    pub queue_depth: u64,
+    /// `source_hit / (source_hit + local GETs)`; `None` when the server has
+    /// no per-bucket GET total to divide by (it never reports a made-up 0).
+    #[serde(default)]
+    pub served_by_source_ratio: Option<f64>,
+    /// RFC 3339 save time of the config; `None` when not configured.
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    /// Counters of the bucket's latest backfill job; absent until the bucket
+    /// has had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill: Option<OnDemandMigrationBackfillSummary>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDemandMigrationBreakerState {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationBreaker {
+    pub state: OnDemandMigrationBreakerState,
+    /// RFC 3339 time the breaker last opened; `None` while closed or when
+    /// the server does not report it.
+    #[serde(default)]
+    pub opened_at: Option<String>,
+}
+
+/// Lifetime counters of the bucket's runtime on the answering node. Keys are
+/// the fixed label values of the Prometheus series with the same names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationCounters {
+    /// `op -> outcome -> count`.
+    pub requests_total: BTreeMap<String, BTreeMap<String, u64>>,
+    pub pulled_bytes_total: u64,
+    /// `path -> count`.
+    pub pulled_objects_total: BTreeMap<String, u64>,
+    /// `reason -> count`.
+    pub pull_failures_total: BTreeMap<String, u64>,
+    pub source_latency: OnDemandMigrationSourceLatency,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationSourceLatency {
+    pub buckets: Vec<OnDemandMigrationLatencyBucket>,
+    /// Total observations, including those above the last bound.
+    pub count: u64,
+    pub sum_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationLatencyBucket {
+    /// Upper bound of the bucket in milliseconds.
+    pub le_ms: u64,
+    /// Cumulative observations at or below `le_ms`.
+    pub count: u64,
+}
+
+/// The most recent source failure: class only, never the key or message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnDemandMigrationSourceError {
+    pub class: String,
+    /// RFC 3339.
+    pub at: String,
 }
 
 /// Lifecycle of a backfill job.
@@ -564,8 +647,43 @@ mod tests {
         let response: OnDemandMigrationGetResponse = round_trip(GET_RESPONSE_FIXTURE);
         assert_eq!(response.updated_at, "2026-09-02T10:00:00Z");
         let status: OnDemandMigrationStatus = round_trip(STATUS_FIXTURE);
-        assert!(status.configured && status.enabled && !status.module_enabled);
+        assert!(status.configured && status.enabled && status.module_enabled);
+        assert_eq!(status.provider.as_deref(), Some("minio"));
+        assert_eq!(status.endpoint_host.as_deref(), Some("source.example.com"));
+        let breaker = status.breaker.expect("breaker present");
+        assert_eq!(breaker.state, OnDemandMigrationBreakerState::HalfOpen);
+        assert_eq!(breaker.opened_at, None);
+        let counters = status.counters.expect("counters present");
+        assert_eq!(counters.requests_total["get"]["source_hit"], 2);
+        assert_eq!(counters.requests_total["head"]["negative_cached"], 1);
+        assert_eq!(counters.pulled_bytes_total, 4096);
+        assert_eq!(counters.pulled_objects_total["inline"], 1);
+        assert_eq!(counters.pull_failures_total["source_timeout"], 1);
+        assert_eq!(counters.source_latency.buckets.len(), 14);
+        assert_eq!(counters.source_latency.count, 3);
+        assert_eq!(counters.source_latency.sum_ms, 90_753);
+        let last_error = status.last_source_error.expect("last source error present");
+        assert_eq!(last_error.class, "server_error");
+        assert_eq!(last_error.at, "2026-09-02T10:00:00Z");
+        assert_eq!(status.inflight_pulls, 1);
+        assert_eq!(status.queue_depth, 1);
+        assert_eq!(status.served_by_source_ratio, None, "the ratio is null, never a fabricated 0");
+        assert_eq!(status.updated_at.as_deref(), Some("2026-09-02T10:00:00Z"));
         assert!(status.backfill.is_none(), "a bucket without a job carries no summary");
+    }
+
+    #[test]
+    fn status_without_runtime_state_decodes_with_null_runtime_fields() {
+        let status: OnDemandMigrationStatus = serde_json::from_str(
+            r#"{"configured":false,"enabled":false,"module_enabled":false,"provider":null,"endpoint_host":null,"breaker":null,"counters":null,"last_source_error":null,"inflight_pulls":0,"queue_depth":0,"served_by_source_ratio":null,"updated_at":null}"#,
+        )
+        .expect("status decodes");
+        assert!(!status.configured);
+        assert_eq!(status.provider, None);
+        assert_eq!(status.breaker, None);
+        assert_eq!(status.counters, None);
+        assert_eq!(status.served_by_source_ratio, None);
+        assert_eq!(status.updated_at, None);
     }
 
     #[test]

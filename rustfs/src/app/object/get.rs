@@ -15,6 +15,13 @@
 //! GetObject / GetObjectAttributes read path: cold fill, resume, stream tuning.
 
 use super::*;
+use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
+    BucketOdmState, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, PullError, PullLeader, PullOutcome, PullReason, PullSlot,
+    RangeGetPolicy, SourceClient, SourceError, SourceGet, SourceHead, commit_inline,
+};
+use crate::app::storage_api::object_usecase::on_demand_migration::WriteBackBody;
+use rustfs_rio::{TeeOptions, TeePrimary, tee_reader_with_options};
+use tokio_stream::wrappers::ReceiverStream;
 
 struct ColdFillDiskPermitMetric {
     owner: ColdFillDiskPermitOwner,
@@ -3818,6 +3825,58 @@ impl DefaultObjectUsecase {
         }
     }
 
+    /// On-demand migration read-through for a GET miss (rustfs/backlog#2156):
+    /// consulted only after the local read and the replication proxy both
+    /// missed. `None` means the runtime does not intervene and the caller
+    /// keeps its original 404.
+    #[allow(clippy::too_many_arguments)]
+    async fn on_demand_migration_get(
+        &self,
+        req: &S3Request<GetObjectInput>,
+        store: &Arc<ECStore>,
+        bucket: &str,
+        key: &str,
+        range: Option<&HTTPRangeSpec>,
+        opts: &ObjectOptions,
+        part_number: Option<usize>,
+    ) -> Option<OdmGetOutcome> {
+        if !odm_get_may_consult_source(opts, part_number) {
+            return None;
+        }
+        let lookup = OnDemandMigrationSys::get().resolve(bucket, key)?;
+        let (state, client) = match odm_get_verdict(lookup) {
+            OdmGetVerdict::Fail(err) => return Some(OdmGetOutcome::Respond(Err(err))),
+            OdmGetVerdict::Consult { state, client } => (state, client),
+        };
+        let policy = &state.config().policy;
+        // The read path reports a latest delete marker as a plain 404, so the
+        // marker is classified here, and only where one can exist.
+        if policy.respect_local_delete_marker && (opts.versioned || opts.version_suspended) {
+            let lookup = store.get_object_info(bucket, key, opts).await;
+            match odm_local_miss(lookup.as_ref()) {
+                Some(miss) if odm_policy_admits_miss(policy, miss) => {}
+                Some(_) => return None,
+                // The object appeared meanwhile, or the lookup failed for a
+                // reason the source cannot answer: the local read decides.
+                None => return Some(OdmGetOutcome::RetryLocal),
+            }
+        }
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        let reply = odm_get_from_source(&state, client.as_ref(), &req.headers, key, range, request_context).await;
+        Some(match reply {
+            OdmGetReply::Served { output, backfill } => {
+                if let Some(reason) = backfill {
+                    // Queue outcomes are the queue's own accounting
+                    // (`queue_full`); the response does not depend on them.
+                    let _ = state.enqueue_pull(key, reason);
+                }
+                OdmGetOutcome::Respond(Ok(output))
+            }
+            OdmGetReply::Error(err) => OdmGetOutcome::Respond(Err(err)),
+            OdmGetReply::RetryLocal => OdmGetOutcome::RetryLocal,
+        })
+    }
+
     #[instrument(name = "execute_get_object", level = "trace", skip(self, req))]
     pub async fn execute_get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         self.execute_get_object_boxed(req).await
@@ -3941,7 +4000,7 @@ impl DefaultObjectUsecase {
 
         let manager = get_concurrency_manager();
 
-        let prepared_read = match self
+        let mut prepared_read = self
             .prepare_get_object_read_execution(
                 &req,
                 manager,
@@ -3950,29 +4009,70 @@ impl DefaultObjectUsecase {
                 &timeout_config,
                 &bucket,
                 &key,
-                rs,
+                rs.clone(),
                 &opts,
                 part_number,
-                object_traffic_health,
+                object_traffic_health.clone(),
             )
-            .await
+            .await;
+        // An object missing locally (and only missing — other errors keep
+        // their semantics) may still be served by a remote copy.
+        if let Err(err) = &prepared_read
+            && matches!(*err.code(), S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion)
         {
-            Ok(prepared_read) => prepared_read,
-            Err(err) => {
-                // Active-active replication lag window: an object missing
-                // locally (and only missing — other errors keep their
-                // semantics) may still be served by proxying the GET to a
-                // replication target (backlog#1675 P1-5).
-                if matches!(*err.code(), S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion)
-                    && let Some(output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await
-                {
+            // Active-active replication lag window: proxy the GET to a
+            // replication target (backlog#1675 P1-5).
+            if let Some(output) = Self::proxy_get_object_to_replication_targets(&req, &bucket, &key, &opts).await {
+                lifecycle.finish_ok();
+                let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                inject_accept_ranges_header(&mut response.headers);
+                let result = Ok(response);
+                let _ = helper.version_id(version_id_for_event).complete(&result);
+                return result;
+            }
+            // On-demand migration source (rustfs/backlog#2156): the
+            // authoritative external copy, after the cheaper replication
+            // proxy.
+            match self
+                .on_demand_migration_get(&req, &store, &bucket, &key, rs.as_ref(), &opts, part_number)
+                .await
+            {
+                None => {}
+                Some(OdmGetOutcome::Respond(Ok(output))) => {
                     lifecycle.finish_ok();
-                    let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
+                    let mut response = wrap_response_with_cors(&bucket, &req.method, &req.headers, *output).await;
                     inject_accept_ranges_header(&mut response.headers);
+                    mark_on_demand_migration_response(&mut response.headers);
                     let result = Ok(response);
                     let _ = helper.version_id(version_id_for_event).complete(&result);
                     return result;
                 }
+                Some(OdmGetOutcome::Respond(Err(err))) => {
+                    lifecycle.finish_err();
+                    return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
+                }
+                Some(OdmGetOutcome::RetryLocal) => {
+                    prepared_read = self
+                        .prepare_get_object_read_execution(
+                            &req,
+                            manager,
+                            store.clone(),
+                            &wrapper,
+                            &timeout_config,
+                            &bucket,
+                            &key,
+                            rs,
+                            &opts,
+                            part_number,
+                            object_traffic_health,
+                        )
+                        .await;
+                }
+            }
+        }
+        let prepared_read = match prepared_read {
+            Ok(prepared_read) => prepared_read,
+            Err(err) => {
                 lifecycle.finish_err();
                 return Self::complete_get_object_error(helper.version_id(version_id_for_event), err);
             }
@@ -4329,6 +4429,1070 @@ fn object_attributes_requested(object_attributes: &[ObjectAttributes], name: &'s
                 .eq_ignore_ascii_case(name)
         })
     })
+}
+
+/// Bytes the inline tee may queue for the write-back ahead of the client.
+const ODM_INLINE_TEE_BUFFER_BYTES: usize = 1024 * 1024;
+/// Chunks the client-side pump may run ahead of the response body.
+const ODM_INLINE_CLIENT_CHANNEL_CHUNKS: usize = 8;
+/// Read size of the source body streams handed to the client.
+const ODM_SOURCE_BODY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Source seam for the on-demand migration GET read-through: production
+/// goes through [`SourceClient`], tests script the answers.
+pub(super) trait OdmGetSource {
+    async fn head_object(&self, key: &str) -> Result<SourceHead, SourceError>;
+    async fn get_object(&self, key: &str, range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError>;
+    async fn get_object_tagging(&self, key: &str) -> Result<HashMap<String, String>, SourceError>;
+}
+
+impl OdmGetSource for SourceClient {
+    async fn head_object(&self, key: &str) -> Result<SourceHead, SourceError> {
+        SourceClient::head_object(self, key).await
+    }
+
+    async fn get_object(&self, key: &str, range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError> {
+        SourceClient::get_object(self, key, range).await
+    }
+
+    async fn get_object_tagging(&self, key: &str) -> Result<HashMap<String, String>, SourceError> {
+        SourceClient::get_object_tagging(self, key).await
+    }
+}
+
+/// What the on-demand migration runtime decided for a GET miss before any
+/// source traffic.
+pub(super) enum OdmGetVerdict {
+    /// Answer with this error without touching the source.
+    Fail(S3Error),
+    /// Consult the source through `client`.
+    Consult {
+        state: Arc<BucketOdmState>,
+        client: Arc<SourceClient>,
+    },
+}
+
+/// How the source flow answers a GET miss.
+pub(super) enum OdmGetReply {
+    /// Stream this source-backed body to the client; `backfill` names the
+    /// background pull to queue once the response is on its way.
+    Served {
+        output: Box<GetObjectOutput>,
+        backfill: Option<PullReason>,
+    },
+    Error(S3Error),
+    /// A concurrent leader committed the object locally; read local again.
+    RetryLocal,
+}
+
+/// What the GET handler does after the on-demand migration branch.
+pub(super) enum OdmGetOutcome {
+    Respond(S3Result<Box<GetObjectOutput>>),
+    RetryLocal,
+}
+
+/// Request-level gate for the GET read-through, on top of the shared
+/// [`odm_request_may_consult_source`] (version reads and anti-loop marked
+/// requests): a `partNumber` read has no source counterpart, since the
+/// source's part layout is its own, so it keeps the original 404.
+pub(super) fn odm_get_may_consult_source(opts: &ObjectOptions, part_number: Option<usize>) -> bool {
+    part_number.is_none() && odm_request_may_consult_source(opts)
+}
+
+/// Applies the lookup verdict of [`OnDemandMigrationSys::resolve`] to a GET
+/// miss, recording the outcome for every request that stops here. Unlike
+/// HEAD, an open breaker follows `policy.source_error` (the spec's
+/// "source error / breaker open" row).
+pub(super) fn odm_get_verdict(lookup: OdmLookup) -> OdmGetVerdict {
+    let state = Arc::clone(lookup.state());
+    let policy = &state.config().policy;
+    let stats = state.stats();
+    let source_error = |class: &'static str| {
+        stats.record_request(OdmOp::Get, OdmOutcome::SourceError);
+        OdmGetVerdict::Fail(odm_source_error_response(policy, class))
+    };
+    match &lookup {
+        OdmLookup::NegativeCached { .. } => {
+            stats.record_request(OdmOp::Get, OdmOutcome::NegativeCached);
+            OdmGetVerdict::Fail(S3Error::new(S3ErrorCode::NoSuchKey))
+        }
+        OdmLookup::BreakerOpen { .. } => {
+            stats.record_request(OdmOp::Get, OdmOutcome::BreakerOpen);
+            OdmGetVerdict::Fail(odm_source_error_response(policy, "breaker_open"))
+        }
+        OdmLookup::Unavailable { error, .. } => source_error(odm_state_error_class(error)),
+        OdmLookup::Ready { .. } => match state.client() {
+            Ok(client) => OdmGetVerdict::Consult {
+                client: Arc::clone(client),
+                state: Arc::clone(&state),
+            },
+            Err(error) => source_error(odm_state_error_class(error)),
+        },
+    }
+}
+
+/// Runs one source call and feeds its latency and error into the bucket
+/// runtime (breaker scoring, negative cache, `last_source_error`).
+async fn odm_observe<T>(
+    state: &BucketOdmState,
+    key: &str,
+    call: impl std::future::Future<Output = Result<T, SourceError>>,
+) -> Result<T, SourceError> {
+    let started = Instant::now();
+    let result = call.await;
+    state.observe_source(started.elapsed(), key, result.as_ref().err());
+    result
+}
+
+/// Client-facing error for a failed source call, recording the GET outcome:
+/// 404 for a source miss, 424 for an unsupported source object (SSE-C),
+/// `policy.source_error` for everything else.
+fn odm_get_source_failure(state: &BucketOdmState, err: &SourceError) -> S3Error {
+    let stats = state.stats();
+    match err {
+        SourceError::NotFound => {
+            stats.record_request(OdmOp::Get, OdmOutcome::SourceMiss);
+            S3Error::new(S3ErrorCode::NoSuchKey)
+        }
+        SourceError::Unsupported(_) => {
+            stats.record_request(OdmOp::Get, OdmOutcome::Unsupported);
+            odm_source_unavailable_error(err.class_label())
+        }
+        _ => {
+            stats.record_request(OdmOp::Get, OdmOutcome::SourceError);
+            odm_source_error_response(&state.config().policy, err.class_label())
+        }
+    }
+}
+
+fn odm_content_length(size: u64) -> S3Result<i64> {
+    i64::try_from(size)
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "source object size exceeds the content-length range"))
+}
+
+/// Maps a source body onto the s3s output. Only what the source can vouch
+/// for is returned: the ETag and Last-Modified are the source's (the object
+/// is not local yet); no version id, SSE headers, storage class or checksums.
+fn odm_get_output(head: &SourceHead, content_length: i64, content_range: Option<String>, body: StreamingBlob) -> GetObjectOutput {
+    GetObjectOutput {
+        body: Some(body),
+        content_length: Some(content_length),
+        content_range,
+        content_type: head.content_type.as_deref().and_then(|v| ContentType::from_str(v).ok()),
+        content_encoding: head.content_encoding.clone(),
+        content_disposition: head.content_disposition.clone(),
+        content_language: head.content_language.clone(),
+        cache_control: head.cache_control.clone(),
+        expires: head.expires.clone(),
+        accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+        e_tag: head.etag.as_deref().map(to_s3s_etag),
+        last_modified: head.last_modified.map(OffsetDateTime::from).map(Timestamp::from),
+        metadata: (!head.user_metadata.is_empty()).then(|| head.user_metadata.clone()),
+        ..Default::default()
+    }
+}
+
+/// Feeds the tee primary to the client through a channel: the primary owns a
+/// `!Sync` boxed source while the response body must be `Sync`. Dropping the
+/// body ends the pump, which drops the primary and hands the remaining
+/// source bytes to the tee's drain task (`drain_on_primary_drop`).
+fn odm_inline_client_body(primary: TeePrimary) -> StreamingBlob {
+    let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(ODM_INLINE_CLIENT_CHANNEL_CHUNKS);
+    spawn_traced(async move {
+        let mut chunks = tokio_util::io::ReaderStream::with_capacity(primary, ODM_SOURCE_BODY_CHUNK_BYTES);
+        while let Some(chunk) = chunks.next().await {
+            let failed = chunk.is_err();
+            if tx.send(chunk).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    StreamingBlob::wrap(ReceiverStream::new(rx))
+}
+
+/// Streams one source GET straight to the client (no local persistence);
+/// `backfill` is the background pull the caller queues.
+async fn odm_get_passthrough<S: OdmGetSource>(
+    state: &Arc<BucketOdmState>,
+    source: &S,
+    key: &str,
+    range: Option<&HTTPRangeSpec>,
+    backfill: Option<PullReason>,
+) -> OdmGetReply {
+    let get = match odm_observe(state, key, source.get_object(key, range)).await {
+        Ok(get) => get,
+        Err(err) => return OdmGetReply::Error(odm_get_source_failure(state, &err)),
+    };
+    let content_length = match odm_content_length(get.head.size) {
+        Ok(length) => length,
+        Err(err) => {
+            state.stats().record_request(OdmOp::Get, OdmOutcome::SourceError);
+            return OdmGetReply::Error(err);
+        }
+    };
+    let body = StreamingBlob::wrap(tokio_util::io::ReaderStream::with_capacity(
+        get.body.into_async_read(),
+        ODM_SOURCE_BODY_CHUNK_BYTES,
+    ));
+    state.stats().record_request(OdmOp::Get, OdmOutcome::SourceHit);
+    OdmGetReply::Served {
+        output: Box::new(odm_get_output(&get.head, content_length, get.content_range, body)),
+        backfill,
+    }
+}
+
+/// Leader side of an inline pull: one source GET teed between the client
+/// (primary) and [`commit_inline`] (secondary, in a background task that
+/// survives the request). The write-back result completes the singleflight
+/// slot; a failed write-back never affects the client stream.
+async fn odm_get_inline<S: OdmGetSource>(
+    state: &Arc<BucketOdmState>,
+    source: &S,
+    key: &str,
+    leader: PullLeader,
+    request_context: Option<request_context::RequestContext>,
+) -> OdmGetReply {
+    let policy = &state.config().policy;
+    let tags = if policy.copy_tags {
+        match odm_observe(state, key, source.get_object_tagging(key)).await {
+            Ok(tags) => Some(tags),
+            Err(err) => {
+                leader.complete(Err(PullError::from(&err)));
+                return OdmGetReply::Error(odm_get_source_failure(state, &err));
+            }
+        }
+    } else {
+        None
+    };
+    let get = match odm_observe(state, key, source.get_object(key, None)).await {
+        Ok(get) => get,
+        Err(err) => {
+            leader.complete(Err(PullError::from(&err)));
+            return OdmGetReply::Error(odm_get_source_failure(state, &err));
+        }
+    };
+    let SourceGet {
+        head,
+        body,
+        content_range,
+    } = get;
+    // The object outgrew the inline budget between HEAD and GET: followers
+    // stream through on their own and the background pull stores it.
+    if head.size > policy.inline_max_bytes {
+        leader.complete(Err(PullError::canceled("source object exceeds the inline budget")));
+        let content_length = match odm_content_length(head.size) {
+            Ok(length) => length,
+            Err(err) => {
+                state.stats().record_request(OdmOp::Get, OdmOutcome::SourceError);
+                return OdmGetReply::Error(err);
+            }
+        };
+        let body = StreamingBlob::wrap(tokio_util::io::ReaderStream::with_capacity(
+            body.into_async_read(),
+            ODM_SOURCE_BODY_CHUNK_BYTES,
+        ));
+        state.stats().record_request(OdmOp::Get, OdmOutcome::SourceHit);
+        return OdmGetReply::Served {
+            output: Box::new(odm_get_output(&head, content_length, content_range, body)),
+            backfill: Some(PullReason::LargeObject),
+        };
+    }
+    // `inline_max_bytes` is bounded far below `i64::MAX`.
+    let content_length = head.size as i64;
+    let options = TeeOptions {
+        drain_on_primary_drop: true,
+        max_drain_bytes: usize::try_from(policy.inline_max_bytes).unwrap_or(usize::MAX),
+    };
+    let (primary, secondary) = tee_reader_with_options(Box::pin(body.into_async_read()), ODM_INLINE_TEE_BUFFER_BYTES, options);
+    let output = Box::new(odm_get_output(&head, content_length, content_range, odm_inline_client_body(primary)));
+    let commit_state = Arc::clone(state);
+    let commit_key = key.to_string();
+    spawn_background_with_context(request_context, async move {
+        let body: WriteBackBody = Box::pin(secondary.into_stream());
+        let result = commit_inline(&commit_state, &commit_key, head, tags, body).await;
+        leader.complete(result.map(|outcome| PullOutcome {
+            etag: outcome.etag,
+            size: outcome.size,
+        }));
+    });
+    state.stats().record_request(OdmOp::Get, OdmOutcome::SourceHit);
+    OdmGetReply::Served { output, backfill: None }
+}
+
+/// One GET miss against the source (rustfs/backlog#2156). Source HEAD first
+/// (size, validators, metadata); conditional headers are evaluated locally
+/// against it, never forwarded. Then one of: passthrough for a Range GET or
+/// an object above `inline_max_bytes` (plus a queued background pull), or
+/// the inline tee for a small object. Concurrent misses of one key share
+/// the singleflight slot: only the leader tees; followers re-read local once
+/// it commits, or stream through (without queueing) after `first_byte_ms`
+/// or when the leader fails.
+pub(super) async fn odm_get_from_source<S: OdmGetSource>(
+    state: &Arc<BucketOdmState>,
+    source: &S,
+    headers: &HeaderMap,
+    key: &str,
+    range: Option<&HTTPRangeSpec>,
+    request_context: Option<request_context::RequestContext>,
+) -> OdmGetReply {
+    let head = match odm_observe(state, key, source.head_object(key)).await {
+        Ok(head) => head,
+        Err(err) => return OdmGetReply::Error(odm_get_source_failure(state, &err)),
+    };
+    let stats = state.stats();
+    if let Err(err) = odm_check_source_preconditions(headers, &head) {
+        stats.record_request(OdmOp::Get, OdmOutcome::SourceHit);
+        return OdmGetReply::Error(err);
+    }
+    let policy = &state.config().policy;
+    if let Some(range) = range {
+        let backfill = (policy.range_get == RangeGetPolicy::ServeAndBackfill).then_some(PullReason::RangeGet);
+        return odm_get_passthrough(state, source, key, Some(range), backfill).await;
+    }
+    if head.size > policy.inline_max_bytes {
+        return odm_get_passthrough(state, source, key, None, Some(PullReason::LargeObject)).await;
+    }
+    let slot = match state.acquire_pull_slot(key).await {
+        Ok(slot) => slot,
+        // The bucket state was torn down under this request: serve it
+        // without queueing anything on the old state.
+        Err(_) => return odm_get_passthrough(state, source, key, None, None).await,
+    };
+    match slot {
+        PullSlot::Leader(leader) => odm_get_inline(state, source, key, leader, request_context).await,
+        PullSlot::Follower(follower) => {
+            let first_byte = Duration::from_millis(policy.source_timeout.first_byte_ms);
+            match tokio::time::timeout(first_byte, follower.wait()).await {
+                Ok(Ok(_)) => {
+                    stats.record_request(OdmOp::Get, OdmOutcome::SourceHit);
+                    OdmGetReply::RetryLocal
+                }
+                Ok(Err(_)) | Err(_) => odm_get_passthrough(state, source, key, None, None).await,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod on_demand_migration_tests {
+    use super::*;
+    use crate::app::storage_api::object_usecase::bucket::on_demand_migration::{
+        BREAKER_FAILURE_THRESHOLD, BreakerState, FilterConfig, OdmStateError, OnDemandMigrationConfig, PathStyle, PolicyConfig,
+        Provider, SourceConfig, SourceCredentials, SourceErrorPolicy, TlsConfig,
+    };
+    use crate::app::storage_api::object_usecase::on_demand_migration::{
+        LocalObject, OdmWriteBack, WriteBackError, WriteBackOutcome, WriteBackPart, WriteBackRequest,
+    };
+    use async_trait::async_trait;
+    use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicBool;
+    use std::time::SystemTime;
+
+    const KEY: &str = "docs/report.bin";
+
+    /// A configured, enabled bucket source pointing at an unreachable
+    /// endpoint; the client is built (no network) and only the scripted
+    /// source below is ever called.
+    fn odm_config(policy: PolicyConfig) -> OnDemandMigrationConfig {
+        OnDemandMigrationConfig {
+            version: 1,
+            enabled: true,
+            source: SourceConfig {
+                provider: Provider::Minio,
+                endpoint: Some("https://source.example.invalid:9000".to_string()),
+                region: "auto".to_string(),
+                bucket: "legacy".to_string(),
+                path_style: PathStyle::Auto,
+                credentials: Some(SourceCredentials {
+                    access_key: "AK".to_string(),
+                    secret_key: "SK".to_string(),
+                    session_token: None,
+                }),
+                tls: TlsConfig::default(),
+            },
+            filter: FilterConfig {
+                prefix: None,
+                source_prefix: None,
+            },
+            policy,
+        }
+    }
+
+    /// Write-back double: collects every committed body, optionally fails.
+    #[derive(Default)]
+    struct RecordingWriteBack {
+        puts: Mutex<Vec<(WriteBackRequest, Vec<u8>)>>,
+        fail_puts: AtomicBool,
+    }
+
+    impl RecordingWriteBack {
+        fn puts(&self) -> Vec<(WriteBackRequest, Vec<u8>)> {
+            self.puts.lock().expect("write-back lock").clone()
+        }
+
+        async fn wait_for_put(&self) -> (WriteBackRequest, Vec<u8>) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(put) = self.puts().pop() {
+                    return put;
+                }
+                assert!(Instant::now() < deadline, "write-back did not commit in time");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl OdmWriteBack for RecordingWriteBack {
+        async fn local_object(&self, _bucket: &str, _key: &str) -> Result<Option<LocalObject>, WriteBackError> {
+            Ok(None)
+        }
+
+        async fn put_object(
+            &self,
+            request: &WriteBackRequest,
+            mut body: WriteBackBody,
+        ) -> Result<WriteBackOutcome, WriteBackError> {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(|err| WriteBackError::Local(err.to_string()))?;
+                bytes.extend_from_slice(&chunk);
+            }
+            if self.fail_puts.load(Ordering::SeqCst) {
+                return Err(WriteBackError::Local("scripted local failure".to_string()));
+            }
+            let size = bytes.len() as u64;
+            self.puts.lock().expect("write-back lock").push((request.clone(), bytes));
+            Ok(WriteBackOutcome {
+                etag: request.head.etag.clone(),
+                size,
+                version_id: None,
+            })
+        }
+
+        async fn create_multipart_upload(&self, _request: &WriteBackRequest) -> Result<String, WriteBackError> {
+            Err(WriteBackError::Local("multipart is not part of the inline path".to_string()))
+        }
+
+        async fn upload_part(
+            &self,
+            _request: &WriteBackRequest,
+            _upload_id: &str,
+            _part_number: usize,
+            _size: u64,
+            _body: WriteBackBody,
+        ) -> Result<WriteBackPart, WriteBackError> {
+            Err(WriteBackError::Local("multipart is not part of the inline path".to_string()))
+        }
+
+        async fn complete_multipart_upload(
+            &self,
+            _request: &WriteBackRequest,
+            _upload_id: &str,
+            _parts: Vec<WriteBackPart>,
+        ) -> Result<WriteBackOutcome, WriteBackError> {
+            Err(WriteBackError::Local("multipart is not part of the inline path".to_string()))
+        }
+
+        async fn abort_multipart_upload(&self, _bucket: &str, _key: &str, _upload_id: &str) -> Result<(), WriteBackError> {
+            Ok(())
+        }
+    }
+
+    struct TestRuntime {
+        sys: OnDemandMigrationSys,
+        write_back: Arc<RecordingWriteBack>,
+    }
+
+    async fn runtime(bucket: &str, policy: PolicyConfig) -> TestRuntime {
+        let sys = OnDemandMigrationSys::new();
+        sys.set_module_enabled(true);
+        let write_back = Arc::new(RecordingWriteBack::default());
+        sys.set_write_back(Arc::clone(&write_back) as Arc<dyn OdmWriteBack>);
+        sys.apply(bucket, Some(&odm_config(policy))).await;
+        TestRuntime { sys, write_back }
+    }
+
+    impl TestRuntime {
+        fn state(&self, bucket: &str) -> Arc<BucketOdmState> {
+            self.sys.state(bucket).expect("bucket is configured")
+        }
+    }
+
+    type ScriptedGet = Result<(SourceHead, Vec<u8>, Option<String>), SourceError>;
+
+    struct ScriptedSource {
+        heads: Mutex<VecDeque<Result<SourceHead, SourceError>>>,
+        gets: Mutex<VecDeque<ScriptedGet>>,
+        head_calls: AtomicUsize,
+        get_calls: AtomicUsize,
+        tag_calls: AtomicUsize,
+        ranges: Mutex<Vec<Option<(bool, i64, i64)>>>,
+    }
+
+    impl ScriptedSource {
+        fn new(heads: Vec<Result<SourceHead, SourceError>>, gets: Vec<ScriptedGet>) -> Self {
+            Self {
+                heads: Mutex::new(heads.into_iter().collect()),
+                gets: Mutex::new(gets.into_iter().collect()),
+                head_calls: AtomicUsize::new(0),
+                get_calls: AtomicUsize::new(0),
+                tag_calls: AtomicUsize::new(0),
+                ranges: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn for_object(body: &[u8]) -> Self {
+            let head = source_head(body);
+            Self::new(vec![Ok(head.clone())], vec![Ok((head, body.to_vec(), None))])
+        }
+
+        fn head_calls(&self) -> usize {
+            self.head_calls.load(Ordering::SeqCst)
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+
+        fn ranges(&self) -> Vec<Option<(bool, i64, i64)>> {
+            self.ranges.lock().expect("ranges lock").clone()
+        }
+    }
+
+    impl OdmGetSource for ScriptedSource {
+        async fn head_object(&self, _key: &str) -> Result<SourceHead, SourceError> {
+            self.head_calls.fetch_add(1, Ordering::SeqCst);
+            self.heads
+                .lock()
+                .expect("heads lock")
+                .pop_front()
+                .expect("test script must provide a response for every source HEAD")
+        }
+
+        async fn get_object(&self, _key: &str, range: Option<&HTTPRangeSpec>) -> Result<SourceGet, SourceError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.ranges
+                .lock()
+                .expect("ranges lock")
+                .push(range.map(|r| (r.is_suffix_length, r.start, r.end)));
+            let scripted = self
+                .gets
+                .lock()
+                .expect("gets lock")
+                .pop_front()
+                .expect("test script must provide a response for every source GET");
+            scripted.map(|(head, body, content_range)| SourceGet {
+                head,
+                body: AwsByteStream::from(body),
+                content_range,
+            })
+        }
+
+        async fn get_object_tagging(&self, _key: &str) -> Result<HashMap<String, String>, SourceError> {
+            self.tag_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(HashMap::from([("team".to_string(), "docs".to_string())]))
+        }
+    }
+
+    fn payload(len: usize) -> Vec<u8> {
+        (0..len).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn source_head(body: &[u8]) -> SourceHead {
+        SourceHead {
+            etag: Some(Md5::digest(body).iter().map(|byte| format!("{byte:02x}")).collect()),
+            size: body.len() as u64,
+            last_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600)),
+            content_type: Some("application/octet-stream".to_string()),
+            cache_control: Some("max-age=60".to_string()),
+            user_metadata: HashMap::from([("owner".to_string(), "alice".to_string())]),
+            ..Default::default()
+        }
+    }
+
+    async fn collect_body(output: &mut GetObjectOutput) -> Vec<u8> {
+        let mut body = output.body.take().expect("source-backed output carries a body");
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk.expect("body chunk"));
+        }
+        bytes
+    }
+
+    fn get_count(state: &BucketOdmState, outcome: OdmOutcome) -> u64 {
+        state.stats().snapshot(state.breaker().state()).requests_total["get"][outcome.as_str()]
+    }
+
+    fn served(reply: OdmGetReply) -> (GetObjectOutput, Option<PullReason>) {
+        match reply {
+            OdmGetReply::Served { output, backfill } => (*output, backfill),
+            OdmGetReply::Error(err) => panic!("expected Served, got {err:?}"),
+            OdmGetReply::RetryLocal => panic!("expected Served, got RetryLocal"),
+        }
+    }
+
+    fn failed(reply: OdmGetReply) -> S3Error {
+        match reply {
+            OdmGetReply::Error(err) => err,
+            OdmGetReply::Served { .. } => panic!("expected Error, got Served"),
+            OdmGetReply::RetryLocal => panic!("expected Error, got RetryLocal"),
+        }
+    }
+
+    fn consult(sys: &OnDemandMigrationSys, bucket: &str) -> Arc<BucketOdmState> {
+        match odm_get_verdict(sys.resolve(bucket, KEY).expect("bucket is configured")) {
+            OdmGetVerdict::Consult { state, .. } => state,
+            OdmGetVerdict::Fail(err) => panic!("expected Consult, got {err:?}"),
+        }
+    }
+
+    fn fail(sys: &OnDemandMigrationSys, bucket: &str) -> S3Error {
+        match odm_get_verdict(sys.resolve(bucket, KEY).expect("bucket is configured")) {
+            OdmGetVerdict::Fail(err) => err,
+            OdmGetVerdict::Consult { .. } => panic!("expected Fail, got Consult"),
+        }
+    }
+
+    #[test]
+    fn odm_get_gate_rejects_part_reads_and_version_reads() {
+        let plain = ObjectOptions::default();
+        assert!(odm_get_may_consult_source(&plain, None));
+        assert!(!odm_get_may_consult_source(&plain, Some(1)), "a partNumber read keeps its local 404");
+
+        let versioned_read = ObjectOptions {
+            version_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        assert!(!odm_get_may_consult_source(&versioned_read, None));
+
+        let proxy_marked = ObjectOptions {
+            proxy_header_set: true,
+            ..Default::default()
+        };
+        assert!(!odm_get_may_consult_source(&proxy_marked, None));
+    }
+
+    #[tokio::test]
+    async fn odm_get_inline_streams_to_client_and_commits_the_same_bytes() {
+        let rt = runtime("b", PolicyConfig::default()).await;
+        let state = rt.state("b");
+        let data = payload(300 * 1024);
+        let source = ScriptedSource::for_object(&data);
+
+        let (mut output, backfill) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(backfill, None, "inline objects are stored by the tee, not queued");
+        assert_eq!(output.content_length, Some(data.len() as i64));
+        assert_eq!(output.e_tag, Some(to_s3s_etag(source_head(&data).etag.as_deref().unwrap())));
+        assert_eq!(
+            output.content_type.as_ref().map(|v| v.to_string()),
+            Some("application/octet-stream".to_string())
+        );
+        assert_eq!(output.cache_control.as_deref(), Some("max-age=60"));
+        assert_eq!(output.metadata, Some(HashMap::from([("owner".to_string(), "alice".to_string())])));
+        assert_eq!(output.version_id, None, "no x-amz-version-id for a source answer");
+        assert_eq!(output.server_side_encryption, None);
+        assert_eq!(output.storage_class, None);
+        assert_eq!(output.checksum_sha256, None);
+        assert_eq!(collect_body(&mut output).await, data, "the client receives the source bytes");
+
+        let (request, stored) = rt.write_back.wait_for_put().await;
+        assert_eq!(stored, data, "the local copy is the source bytes");
+        assert_eq!(request.bucket, "b");
+        assert_eq!(request.key, KEY);
+        assert_eq!(request.head, source_head(&data));
+        assert_eq!(request.tags, None, "copy_tags is off by default");
+        assert_eq!(source.get_calls(), 1, "exactly one source GET");
+        assert_eq!(source.head_calls(), 1);
+        assert_eq!(source.tag_calls.load(Ordering::SeqCst), 0);
+
+        // The leader released the key; the next miss would lead again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.inflight_keys() != 0 {
+            assert!(Instant::now() < deadline, "leader must release the key after the commit");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(get_count(&state, OdmOutcome::SourceHit), 1);
+        let snapshot = state.stats().snapshot(state.breaker().state());
+        assert_eq!(snapshot.pulled_objects_total["inline"], 1);
+        assert_eq!(snapshot.pulled_bytes_total, data.len() as u64);
+        assert_eq!(snapshot.source_latency.count, 2, "HEAD and GET are both observed");
+    }
+
+    #[tokio::test]
+    async fn odm_get_inline_copies_tags_when_configured() {
+        let rt = runtime(
+            "t",
+            PolicyConfig {
+                copy_tags: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let state = rt.state("t");
+        let data = payload(1024);
+        let source = ScriptedSource::for_object(&data);
+
+        let (mut output, _) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(collect_body(&mut output).await, data);
+        let (request, _) = rt.write_back.wait_for_put().await;
+        assert_eq!(request.tags, Some(HashMap::from([("team".to_string(), "docs".to_string())])));
+        assert_eq!(source.tag_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn odm_get_inline_client_disconnect_still_stores_the_whole_object() {
+        let rt = runtime("d", PolicyConfig::default()).await;
+        let state = rt.state("d");
+        let data = payload(4 * 1024 * 1024);
+        let source = ScriptedSource::for_object(&data);
+
+        let (mut output, _) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        let mut body = output.body.take().expect("body");
+        let mut received = 0usize;
+        while received < data.len() / 10 {
+            let chunk = body.next().await.expect("body chunk").expect("body chunk");
+            received += chunk.len();
+        }
+        drop(body);
+
+        let (_, stored) = rt.write_back.wait_for_put().await;
+        assert_eq!(stored, data, "the drain completes the local copy after the client left");
+        assert_eq!(source.get_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn odm_get_inline_write_back_failure_does_not_touch_the_client_stream() {
+        let rt = runtime("f", PolicyConfig::default()).await;
+        rt.write_back.fail_puts.store(true, Ordering::SeqCst);
+        let state = rt.state("f");
+        let data = payload(64 * 1024);
+        let source = ScriptedSource::for_object(&data);
+
+        let (mut output, _) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(collect_body(&mut output).await, data);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = state.stats().snapshot(state.breaker().state());
+            if snapshot.pull_failures_total["local_write"] == 1 {
+                assert_eq!(snapshot.pulled_objects_total["inline"], 0);
+                break;
+            }
+            assert!(Instant::now() < deadline, "write-back failure must be counted");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(rt.write_back.puts().is_empty());
+        // No retry: the next miss goes to the source again.
+        assert!(matches!(rt.sys.resolve("f", KEY), Some(OdmLookup::Ready { .. })));
+    }
+
+    #[tokio::test]
+    async fn odm_get_large_object_streams_through_and_queues_a_background_pull() {
+        let rt = runtime(
+            "l",
+            PolicyConfig {
+                inline_max_bytes: 1024,
+                ..Default::default()
+            },
+        )
+        .await;
+        let state = rt.state("l");
+        let data = payload(4096);
+        let source = ScriptedSource::for_object(&data);
+
+        let (mut output, backfill) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(backfill, Some(PullReason::LargeObject));
+        assert_eq!(output.content_length, Some(4096));
+        assert_eq!(collect_body(&mut output).await, data);
+        assert_eq!(source.ranges(), vec![None], "the whole object is streamed");
+        assert_eq!(source.get_calls(), 1);
+        assert_eq!(get_count(&state, OdmOutcome::SourceHit), 1);
+        assert_eq!(state.inflight_keys(), 0, "passthrough never takes the singleflight slot");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rt.write_back.puts().is_empty(), "passthrough writes nothing inline");
+    }
+
+    #[tokio::test]
+    async fn odm_get_range_streams_206_and_queues_per_policy() {
+        let data = payload(10_000);
+        let range = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: 10,
+            end: 19,
+        };
+        let slice = data[10..20].to_vec();
+        let mut slice_head = source_head(&data);
+        slice_head.size = 10;
+        let script = || {
+            ScriptedSource::new(
+                vec![Ok(source_head(&data))],
+                vec![Ok((slice_head.clone(), slice.clone(), Some("bytes 10-19/10000".to_string())))],
+            )
+        };
+
+        let rt = runtime("r", PolicyConfig::default()).await;
+        let state = rt.state("r");
+        let source = script();
+        let (mut output, backfill) =
+            served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, Some(&range), None).await);
+        assert_eq!(backfill, Some(PullReason::RangeGet), "serve_and_backfill queues the whole object");
+        assert_eq!(output.content_range.as_deref(), Some("bytes 10-19/10000"));
+        assert_eq!(output.content_length, Some(10));
+        assert_eq!(collect_body(&mut output).await, slice);
+        assert_eq!(source.ranges(), vec![Some((false, 10, 19))], "the Range is passed through");
+        assert_eq!(source.get_calls(), 1);
+        assert_eq!(state.inflight_keys(), 0);
+
+        let rt = runtime(
+            "o",
+            PolicyConfig {
+                range_get: RangeGetPolicy::ServeOnly,
+                ..Default::default()
+            },
+        )
+        .await;
+        let state = rt.state("o");
+        let source = script();
+        let (_, backfill) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, Some(&range), None).await);
+        assert_eq!(backfill, None, "serve_only never queues");
+    }
+
+    #[tokio::test]
+    async fn odm_get_conditional_headers_are_answered_from_the_source_head() {
+        let rt = runtime("c", PolicyConfig::default()).await;
+        let state = rt.state("c");
+        let data = payload(512);
+        let etag = source_head(&data).etag.expect("etag");
+
+        let source = ScriptedSource::for_object(&data);
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_str(&format!("\"{etag}\"")).unwrap());
+        let err = failed(odm_get_from_source(&state, &source, &headers, KEY, None, None).await);
+        assert_eq!(err.code(), &S3ErrorCode::NotModified);
+        assert_eq!(source.head_calls(), 1);
+        assert_eq!(source.get_calls(), 0, "a 304 never pulls");
+
+        let source = ScriptedSource::for_object(&data);
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::IF_MATCH, HeaderValue::from_static("\"another-etag\""));
+        let err = failed(odm_get_from_source(&state, &source, &headers, KEY, None, None).await);
+        assert_eq!(err.code(), &S3ErrorCode::PreconditionFailed);
+        assert_eq!(source.get_calls(), 0, "a 412 never pulls");
+        assert_eq!(get_count(&state, OdmOutcome::SourceHit), 2);
+        assert_eq!(state.inflight_keys(), 0);
+        assert!(rt.write_back.puts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn odm_get_source_not_found_is_404_and_negative_cached() {
+        let rt = runtime("n", PolicyConfig::default()).await;
+        let state = rt.state("n");
+        let source = ScriptedSource::new(vec![Err(SourceError::NotFound)], vec![]);
+
+        let err = failed(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(get_count(&state, OdmOutcome::SourceMiss), 1);
+
+        let err = fail(&rt.sys, "n");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+        assert_eq!(get_count(&state, OdmOutcome::NegativeCached), 1);
+        assert_eq!(source.head_calls(), 1, "the negative cache stops the second miss");
+        assert!(matches!(rt.sys.resolve("n", "other"), Some(OdmLookup::Ready { .. })));
+    }
+
+    #[tokio::test]
+    async fn odm_get_unsupported_source_object_is_424() {
+        let rt = runtime("s", PolicyConfig::default()).await;
+        let state = rt.state("s");
+        let source = ScriptedSource::new(
+            vec![Err(SourceError::Unsupported(
+                "source object is encrypted with SSE-C".to_string(),
+            ))],
+            vec![],
+        );
+
+        let err = failed(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(err.status_code(), Some(StatusCode::FAILED_DEPENDENCY));
+        assert_eq!(err.code(), &S3ErrorCode::Custom(ODM_SOURCE_UNAVAILABLE_CODE.into()));
+        assert_eq!(err.message(), Some("unsupported"));
+        assert_eq!(get_count(&state, OdmOutcome::Unsupported), 1);
+        assert_eq!(source.get_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn odm_get_source_errors_follow_policy_and_open_the_breaker() {
+        let rt = runtime("e", PolicyConfig::default()).await;
+        let state = rt.state("e");
+        let source = ScriptedSource::new(vec![Err(SourceError::ServerError(503)), Err(SourceError::Timeout)], vec![]);
+        let err = failed(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(err.status_code(), Some(StatusCode::FAILED_DEPENDENCY));
+        assert_eq!(err.message(), Some("server_error"));
+        let err = failed(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(err.message(), Some("timeout"));
+        assert_eq!(get_count(&state, OdmOutcome::SourceError), 2);
+
+        // A GET whose body fetch fails is a source error too, and releases the slot.
+        let data = payload(64);
+        let source = ScriptedSource::new(vec![Ok(source_head(&data))], vec![Err(SourceError::AccessDenied)]);
+        let err = failed(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(err.message(), Some("access_denied"));
+        assert_eq!(state.inflight_keys(), 0, "a failed leader releases the key");
+
+        let hidden = runtime(
+            "h",
+            PolicyConfig {
+                source_error: SourceErrorPolicy::NotFound,
+                ..Default::default()
+            },
+        )
+        .await;
+        let hidden_state = hidden.state("h");
+        let source = ScriptedSource::new(vec![Err(SourceError::ServerError(503))], vec![]);
+        let err = failed(odm_get_from_source(&hidden_state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+
+        let breaker = runtime("k", PolicyConfig::default()).await;
+        let source = ScriptedSource::new(
+            (0..BREAKER_FAILURE_THRESHOLD)
+                .map(|_| Err(SourceError::ServerError(503)))
+                .collect(),
+            vec![],
+        );
+        for _ in 0..BREAKER_FAILURE_THRESHOLD {
+            let state = consult(&breaker.sys, "k");
+            let _ = failed(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        }
+        let state = breaker.state("k");
+        assert_eq!(state.breaker().state(), BreakerState::Open);
+        let err = fail(&breaker.sys, "k");
+        assert_eq!(err.status_code(), Some(StatusCode::FAILED_DEPENDENCY), "breaker open propagates");
+        assert_eq!(err.message(), Some("breaker_open"));
+        assert_eq!(get_count(&state, OdmOutcome::BreakerOpen), 1);
+    }
+
+    #[tokio::test]
+    async fn odm_get_verdict_reports_an_unusable_client() {
+        let sys = OnDemandMigrationSys::new();
+        sys.set_module_enabled(true);
+        let mut config = odm_config(PolicyConfig::default());
+        config.source.credentials = None;
+        sys.apply("a", Some(&config)).await;
+        let lookup = sys.resolve("a", KEY).expect("bucket is configured");
+        assert!(matches!(
+            &lookup,
+            OdmLookup::Unavailable {
+                error: OdmStateError::AnonymousUnsupported,
+                ..
+            }
+        ));
+        let err = fail(&sys, "a");
+        assert_eq!(err.status_code(), Some(StatusCode::FAILED_DEPENDENCY));
+        assert_eq!(err.message(), Some("unsupported"));
+    }
+
+    #[tokio::test]
+    async fn odm_get_follower_rereads_local_after_the_leader_commits() {
+        let rt = runtime("g", PolicyConfig::default()).await;
+        let state = rt.state("g");
+        let data = payload(256);
+        let leader = match state.acquire_pull_slot(KEY).await.expect("slot") {
+            PullSlot::Leader(leader) => leader,
+            PullSlot::Follower(_) => panic!("first caller leads"),
+        };
+        let source = ScriptedSource::for_object(&data);
+        let headers = HeaderMap::new();
+
+        let follower = odm_get_from_source(&state, &source, &headers, KEY, None, None);
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            leader.complete(Ok(PullOutcome {
+                etag: source_head(&data).etag,
+                size: data.len() as u64,
+            }));
+        };
+        let (reply, ()) = tokio::join!(follower, release);
+        assert!(matches!(reply, OdmGetReply::RetryLocal));
+        assert_eq!(source.head_calls(), 1, "the follower still validates the miss against the source HEAD");
+        assert_eq!(source.get_calls(), 0, "the follower never pulls");
+        assert_eq!(get_count(&state, OdmOutcome::SourceHit), 1);
+        assert!(rt.write_back.puts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn odm_get_follower_degrades_to_passthrough_on_timeout_or_leader_failure() {
+        let mut policy = PolicyConfig::default();
+        policy.source_timeout.first_byte_ms = 100;
+        let rt = runtime("w", policy).await;
+        let state = rt.state("w");
+        let data = payload(256);
+        let leader = match state.acquire_pull_slot(KEY).await.expect("slot") {
+            PullSlot::Leader(leader) => leader,
+            PullSlot::Follower(_) => panic!("first caller leads"),
+        };
+
+        let source = ScriptedSource::for_object(&data);
+        let (mut output, backfill) = served(odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None).await);
+        assert_eq!(backfill, None, "a degraded follower does not queue; the leader stores the object");
+        assert_eq!(collect_body(&mut output).await, data);
+        assert_eq!(source.get_calls(), 1);
+
+        // A leader that fails while the follower waits: the follower streams
+        // through on its own instead of re-reading local.
+        let source = ScriptedSource::for_object(&data);
+        let headers = HeaderMap::new();
+        let follower = odm_get_from_source(&state, &source, &headers, KEY, None, None);
+        let fail_leader = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            leader.complete(Err(PullError::canceled("scripted leader failure")));
+        };
+        let (reply, ()) = tokio::join!(follower, fail_leader);
+        let (mut output, backfill) = served(reply);
+        assert_eq!(backfill, None);
+        assert_eq!(collect_body(&mut output).await, data);
+        assert_eq!(source.get_calls(), 1);
+        assert!(rt.write_back.puts().is_empty(), "followers never write back");
+    }
+
+    #[tokio::test]
+    async fn odm_get_concurrent_misses_pull_once() {
+        let rt = runtime("p", PolicyConfig::default()).await;
+        let state = rt.state("p");
+        let data = payload(128 * 1024);
+        let source = Arc::new(ScriptedSource::new(
+            (0..32).map(|_| Ok(source_head(&data))).collect(),
+            vec![Ok((source_head(&data), data.clone(), None))],
+        ));
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let state = Arc::clone(&state);
+            let source = Arc::clone(&source);
+            tasks.push(tokio::spawn(async move {
+                odm_get_from_source(&state, source.as_ref(), &HeaderMap::new(), KEY, None, None).await
+            }));
+        }
+        let mut leaders = 0;
+        let mut followers = 0;
+        for task in tasks {
+            match task.await.expect("task") {
+                OdmGetReply::Served { mut output, backfill } => {
+                    assert_eq!(backfill, None);
+                    assert_eq!(collect_body(&mut output).await, data);
+                    leaders += 1;
+                }
+                OdmGetReply::RetryLocal => followers += 1,
+                OdmGetReply::Error(err) => panic!("unexpected error {err:?}"),
+            }
+        }
+        assert_eq!(leaders, 1, "exactly one caller streams from the source");
+        assert_eq!(followers, 31);
+        assert_eq!(source.get_calls(), 1);
+        let (_, stored) = rt.write_back.wait_for_put().await;
+        assert_eq!(stored, data);
+        assert_eq!(rt.write_back.puts().len(), 1, "exactly one local commit");
+    }
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@ pub mod ilm;
 pub mod node;
 pub mod notification;
 pub mod notification_target;
-pub mod on_demand_migration_backfill;
+pub mod on_demand_migration;
 pub mod replication;
 pub(crate) mod request;
 pub mod resource;
@@ -69,8 +69,9 @@ pub(crate) use notification::collect_notification_runtime_metrics;
 pub use notification::{NotificationStats, collect_notification_metrics};
 pub(crate) use notification_target::{NotificationTargetRuntimeStats, collect_notification_target_runtime_metrics};
 pub use notification_target::{NotificationTargetStats, collect_notification_target_metrics};
-pub use on_demand_migration_backfill::{
-    OdmBackfillBucketStats, OdmBackfillRuntimeStats, collect_on_demand_migration_backfill_metrics,
+pub use on_demand_migration::{
+    OdmBackfillBucketStats, OdmBackfillRuntimeStats, OnDemandMigrationBreakerState, OnDemandMigrationBucketStats,
+    collect_on_demand_migration_backfill_metrics, collect_on_demand_migration_metrics, source_latency_le_label,
 };
 pub use replication::{ReplicationMetricsSnapshot, collect_replication_metrics};
 pub(crate) use replication::{ReplicationRuntimeStats, collect_replication_runtime_metrics};
