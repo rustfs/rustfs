@@ -59,6 +59,7 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
     let workload_provider: Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync> =
         Arc::new(RustFsWorkloadAdmissionSnapshotProvider);
     let _ = set_workload_admission_snapshot_provider(workload_provider.clone());
+    rustfs_scanner::set_scanner_workload_admission_snapshot_provider(workload_provider.clone());
 
     if enable_heal || enable_scanner {
         let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()));

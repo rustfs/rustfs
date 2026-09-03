@@ -70,6 +70,7 @@ mod scanner_heal_admission_baseline;
 pub mod scanner_io;
 pub mod sleeper;
 pub(crate) mod storage_api;
+mod workload_admission;
 
 pub use data_usage_define::*;
 pub use error::ScannerError;
@@ -80,7 +81,7 @@ pub use remote_scanner::{
     remote_scanner_request_matches_envelope, serve_remote_scanner_request, validate_remote_scanner_request_fence,
 };
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
-pub use rustfs_scanner_contracts::last_minute;
+pub use rustfs_scanner_metrics::last_minute;
 pub use scanner::{
     ScannerCycleRecoveryMarker, ScannerCycleRecoveryStatus, ScannerCycleScheduleStatus, ScannerPauseBacklogAlertReason,
     ScannerPauseBacklogPhase, ScannerPauseBacklogStatus, ScannerPauseBacklogThresholds, ScannerUsageStateResetResult,
@@ -96,6 +97,7 @@ pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
 pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
 pub use storage_api::scan::{SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION};
+pub use workload_admission::set_scanner_workload_admission_snapshot_provider;
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
 static SCANNER_RUNTIME_INSTANCES: AtomicU64 = AtomicU64::new(0);

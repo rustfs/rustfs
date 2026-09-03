@@ -130,7 +130,7 @@ rustfs-concurrency.workspace = true
 rustfs-credentials = { workspace = true }
 rustfs-common.workspace = true
 rustfs-heal-contracts.workspace = true
-rustfs-scanner-contracts.workspace = true
+rustfs-scanner-metrics.workspace = true
 rustfs-policy.workspace = true
 rustfs-protos.workspace = true
 rustfs-replication.workspace = true

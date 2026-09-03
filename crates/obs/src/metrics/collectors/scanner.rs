@@ -493,7 +493,7 @@ mod tests {
     use super::*;
     use crate::metrics::report::report_metrics;
     use metrics_util::debugging::DebuggingRecorder;
-    use rustfs_scanner_contracts::metrics::{Metric, Metrics};
+    use rustfs_scanner_metrics::metrics::{Metric, Metrics};
 
     fn prometheus_counter_name(name: &str) -> String {
         if name.ends_with("_total") {

@@ -52,7 +52,8 @@ members = [
     "crates/s3select-api", # S3 Select API interface
     "crates/s3select-query", # S3 Select query engine
     "crates/scanner", # Scanner for data integrity checks and health monitoring
-    "crates/scanner-contracts", # Scanner metrics and cycle contracts
+    "crates/scanner-contracts", # Scanner storage and wire contracts
+    "crates/scanner-metrics", # Scanner metrics and cycle telemetry
     "crates/security-governance", # Security governance contracts
     "crates/extension-schema", # Extension schema contracts
     "crates/signer", # client signer
@@ -94,6 +95,7 @@ rustfs = { path = "./rustfs", version = "1.0.0-rc.5" }
 rustfs-heal = { path = "crates/heal", version = "1.0.0-rc.5" }
 rustfs-heal-contracts = { path = "crates/heal-contracts", version = "1.0.0-rc.5" }
 rustfs-scanner-contracts = { path = "crates/scanner-contracts", version = "1.0.0-rc.5" }
+rustfs-scanner-metrics = { path = "crates/scanner-metrics", version = "1.0.0-rc.5" }
 rustfs-audit = { path = "crates/audit", version = "1.0.0-rc.5" }
 rustfs-checksums = { path = "crates/checksums", version = "1.0.0-rc.5" }
 rustfs-common = { path = "crates/common", version = "1.0.0-rc.5" }

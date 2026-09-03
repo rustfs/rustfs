@@ -13,23 +13,33 @@
 # limitations under the License.
 
 [package]
-name = "rustfs-scanner-contracts"
+name = "rustfs-scanner-metrics"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Scanner storage and wire contracts shared by the scanner and storage engine."
-keywords = ["scanner", "contracts", "rustfs", "Minio"]
+description = "Scanner metrics and lifecycle-cycle telemetry shared by the scanner, storage engine, and observability layers."
+keywords = ["scanner", "metrics", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "data-structures"]
 
 [lints]
 workspace = true
 
 [dependencies]
+chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
+metrics = { workspace = true }
+rmp-serde = { workspace = true }
+rustfs-heal-contracts = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [lib]
 doctest = false

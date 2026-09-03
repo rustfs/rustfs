@@ -16,7 +16,7 @@ use super::{BucketQuota, QuotaCheckResult, QuotaError, QuotaOperation};
 use crate::bucket::metadata_sys::{BucketMetadataSys, update, update_if_incarnation};
 use crate::data_usage::get_bucket_usage_memory;
 use rustfs_config::QUOTA_CONFIG_FILE;
-use rustfs_scanner_contracts::metrics::Metric;
+use rustfs_scanner_metrics::metrics::Metric;
 use std::sync::Arc;
 use std::time::Instant;
 use time::OffsetDateTime;
@@ -120,9 +120,9 @@ impl QuotaChecker {
 
         let duration = start_time.elapsed();
         // inc_time is now a plain fn (not async) — no .await needed.
-        rustfs_scanner_contracts::metrics::Metrics::inc_time(Metric::QuotaCheck, duration);
+        rustfs_scanner_metrics::metrics::Metrics::inc_time(Metric::QuotaCheck, duration);
         if !allowed {
-            rustfs_scanner_contracts::metrics::Metrics::inc_time(Metric::QuotaViolation, duration);
+            rustfs_scanner_metrics::metrics::Metrics::inc_time(Metric::QuotaViolation, duration);
         }
 
         Ok(result)
@@ -185,7 +185,7 @@ impl QuotaChecker {
                 .await
                 .map_err(QuotaError::StorageError)?;
 
-        rustfs_scanner_contracts::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed());
+        rustfs_scanner_metrics::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed());
         Ok(updated_at)
     }
 
@@ -206,7 +206,7 @@ impl QuotaChecker {
         }
         .map_err(QuotaError::StorageError)?;
 
-        rustfs_scanner_contracts::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed());
+        rustfs_scanner_metrics::metrics::Metrics::inc_time(Metric::QuotaSync, start_time.elapsed());
         Ok(updated_at)
     }
 
