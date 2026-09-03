@@ -49,6 +49,20 @@ Outer crates reach ECStore only through `rustfs_ecstore::api`, and only from one
 - RustFS startup internals are crate-private: only `startup_entrypoint` is a public startup module of the `rustfs` library (`rustfs/src/lib.rs`), and items inside the other `startup_*` modules use crate visibility.
 - The observability dependency baseline is [obs-ecstore-dependency-inventory.md](obs-ecstore-dependency-inventory.md); observability extraction updates it together with the guard.
 
+## Scanner, Heal, And ECStore
+
+Heal is split by responsibility, not by the shared word "heal". ECStore owns erasure-set repair primitives: quorum metadata arbitration, EC reconstruction, per-disk rename commit, dangling metadata classification, and orphan data-dir reclamation. These stay in ECStore because they share the same object namespace locks, rename commit model, and data-dir cleanup rules as PUT, DELETE, multipart, lifecycle expiry, rebalance, and decommission. Moving those primitives out would split the lock and commit model across crates.
+
+`crates/heal` owns repair orchestration: queueing, deduplication, admission, scheduling, resume, MRF replay, replacement-disk tracking, and the admin-facing status/control surface. It reaches storage through `HealStorageAPI`; ECStore-originated repair requests flow back through typed repair channels rather than a Cargo dependency on the heal crate.
+
+`crates/scanner` owns discovery, data-usage publication, lifecycle/replication scan actions, bitrot scan dispatch, and scanner-driven repair requests. Scanner may request repair through the heal channel, but it must not directly execute erasure-set repair primitives.
+
+`rustfs-scanner-metrics` owns scanner telemetry DTOs, global scanner counters, lifecycle action labels consumed by metrics, and the short-window latency accumulator used by those metrics. ECStore, lifecycle, observability, admin, and scanner code may depend on this crate for metrics only. `rustfs-scanner-contracts` must not regain metrics, globals, or telemetry implementation; it is reserved for scanner storage or wire contract types.
+
+`remote_scanner` remains scanner-owned for now because it carries the scanner cycle fence, replay protection, stream envelope, and per-bucket scan result protocol. A future scanner storage seam may either move remote disk scan execution behind an ECStore storage capability or move the whole remote scanner protocol with scanner; leaving the wire protocol split across both sides without a documented owner is not allowed.
+
+The scanner usage authority decision is fixed in [scanner-usage-authority-decision.md](scanner-usage-authority-decision.md): scanner usage remains hard-quota authority. A future scanner storage seam must therefore model the concrete publication, cycle-lock, usage-floor, observed-snapshot, and recovery-marker capabilities described in [scanner-usage-publication.md](scanner-usage-publication.md), not a generic key-value abstraction.
+
 ## Loss-Prevention Coverage
 
 The guard pins specific public re-export lines (its `require_source_line` entries) so contract surfaces cannot silently disappear during cleanup. The canonical lists are the guard script and the owning files, not this page:
