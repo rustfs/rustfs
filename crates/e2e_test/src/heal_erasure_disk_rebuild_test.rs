@@ -770,6 +770,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_cluster_root_heal_recovers_remote_shards_after_background_target_restart()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        timeout(
+            Duration::from_secs(420),
+            run_cluster_root_heal_interruption(InterruptionScenario::BackgroundTargetRestart),
+        )
+        .await?
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_cluster_root_heal_recovers_remote_shards_after_coordinator_restart() -> Result<(), Box<dyn Error + Send + Sync>>
     {
         timeout(
@@ -792,6 +802,7 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum InterruptionScenario {
         IsolatedTargetRestart,
+        BackgroundTargetRestart,
         BackgroundCoordinatorRestart,
         TargetEndpointBlackhole,
     }
@@ -799,6 +810,7 @@ mod tests {
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
         let (background_enabled, interruption_node, interruption_kind) = match scenario {
             InterruptionScenario::IsolatedTargetRestart => (false, 1, "target_restart"),
+            InterruptionScenario::BackgroundTargetRestart => (true, 1, "background_target_restart"),
             InterruptionScenario::BackgroundCoordinatorRestart => (true, 0, "coordinator_restart"),
             InterruptionScenario::TargetEndpointBlackhole => (false, 1, "target_endpoint_blackhole"),
         };
