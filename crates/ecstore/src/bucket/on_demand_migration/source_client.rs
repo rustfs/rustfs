@@ -26,11 +26,10 @@
 //! forwarded: v1 rejects SSE-C source objects outright.
 
 use crate::bucket::remote_s3_client::{
-    PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, build_remote_s3_config,
+    PathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3EndpointSpec, RemoteS3RetryPolicy, build_remote_s3_config,
 };
 use crate::storage_api_contracts::range::HTTPRangeSpec;
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::get_object::GetObjectOutput;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
@@ -150,6 +149,12 @@ pub struct SourceClientSpec {
     pub skip_tls_verify: bool,
     pub ca_cert_pem: Option<String>,
     pub timeouts: SourceTimeouts,
+    /// Wire requests one logical source call may cost. The pull pipeline and
+    /// the backfill job own the retry budget (`pull.rs` `PULL_MAX_RETRIES`,
+    /// `backfill.rs` `LIST_MAX_RETRIES`) and the breaker counts logical calls,
+    /// so ODM declares [`RemoteS3RetryPolicy::Disabled`] and keeps one counted
+    /// failure equal to one request against a struggling source.
+    pub retry: RemoteS3RetryPolicy,
     /// Bytes per second the pull pipeline may consume from this source;
     /// `None` means unlimited. Enforced by the consumer, not by this client.
     pub bandwidth_limit: Option<NonZeroU64>,
@@ -193,6 +198,7 @@ impl SourceClientSpec {
             ca_cert_pem: self.ca_cert_pem.clone(),
             connect_timeout: Some(self.timeouts.connect),
             read_timeout: Some(self.timeouts.read),
+            retry: self.retry,
             user_agent_suffix: USER_AGENT_SUFFIX,
         })
     }
@@ -579,19 +585,11 @@ impl SourceClient {
         Ok(Self::from_config_builder(config, endpoint.endpoint_url(), spec))
     }
 
+    /// `config` must come from [`SourceClientSpec::endpoint_spec`], which is
+    /// where the retry policy that keeps one logical call equal to one wire
+    /// request is declared.
     fn from_config_builder(config: aws_sdk_s3::config::Builder, endpoint: String, spec: &SourceClientSpec) -> Self {
-        // The pull pipeline and the backfill job own the retry budget for a
-        // source call (`pull.rs` PULL_MAX_RETRIES, `backfill.rs`
-        // LIST_MAX_RETRIES), and the breaker counts logical calls. Leaving the
-        // smithy standard policy on top would turn one counted failure into
-        // three wire requests against a source that is already struggling, so
-        // keep one logical call equal to one wire request.
-        let client = S3Client::from_conf(
-            config
-                .retry_config(RetryConfig::disabled())
-                .interceptor(SourceProxyMarkerInterceptor::new())
-                .build(),
-        );
+        let client = S3Client::from_conf(config.interceptor(SourceProxyMarkerInterceptor::new()).build());
         Self {
             client,
             endpoint,
@@ -862,6 +860,7 @@ mod tests {
             }),
             skip_tls_verify: false,
             ca_cert_pem: None,
+            retry: RemoteS3RetryPolicy::Disabled,
             timeouts: SourceTimeouts::default(),
             bandwidth_limit: NonZeroU64::new(1_000_000),
         }
