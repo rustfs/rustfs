@@ -15,6 +15,7 @@
 use crate::bucket::replication::replication_state_from_filemeta;
 #[cfg(all(test, feature = "test-util"))]
 use crate::bucket::utils::is_meta_bucketname;
+use crate::bucket::versioning::VersioningApi as _;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::bucket::{
     lifecycle::{
@@ -8812,7 +8813,21 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
         return Ok(false);
     };
 
-    let versioned = BucketVersioningSys::prefix_enabled(bucket, &version.name).await;
+    let versioned = match BucketVersioningSys::get_in(&store.ctx, bucket).await {
+        Ok(config) => config.prefix_enabled(&version.name),
+        Err(err) => {
+            warn!(
+                event = EVENT_DECOMMISSION_ENTRY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_POOLS,
+                state = "versioning_config_unavailable",
+                bucket = %bucket,
+                error = %err,
+                "Decommission lifecycle versioning config unavailable; treating object as unversioned"
+            );
+            false
+        }
+    };
     let object_info = crate::object_api::ObjectInfo::from_file_info(version, bucket, &version.name, versioned);
     let event = eval_action_from_lifecycle(lifecycle_config, object_lock_config, &object_info).await;
 
@@ -13293,7 +13308,7 @@ impl ECStore {
             let _ = resolve_decommission_optional_bucket_config_result(
                 &bi.name,
                 "versioning",
-                BucketVersioningSys::get(&bi.name).await,
+                BucketVersioningSys::get_in(&self.ctx, &bi.name).await,
             )?;
             let expiry_configs = get_expiry_configs(self, &bi.name).await?;
             lifecycle_config = expiry_configs.lifecycle.map(|config| (*config).clone());
@@ -13301,7 +13316,7 @@ impl ECStore {
             replication_config = resolve_decommission_optional_bucket_config_result(
                 &bi.name,
                 "replication",
-                metadata_sys::get_replication_config(&bi.name).await,
+                metadata_sys::get_replication_config_in(&self.ctx, &bi.name).await,
             )?;
         }
 
@@ -15635,7 +15650,7 @@ impl ECStore {
                     replication_configured = resolve_decommission_optional_bucket_config_result(
                         &bucket_info.name,
                         "replication",
-                        metadata_sys::get_replication_config(&bucket_info.name).await,
+                        metadata_sys::get_replication_config_in(&self.ctx, &bucket_info.name).await,
                     )?
                     .is_some();
                 }
@@ -17200,7 +17215,14 @@ mod tests {
             .decommission
             .as_ref()
             .expect("the blocked decommission state should remain present");
-        assert!(!info.complete && !info.failed && !info.canceled);
+        assert!(
+            !info.complete && !info.failed && !info.canceled,
+            "capacity-blocked state unexpectedly became terminal: complete={}, failed={}, canceled={}, blocked_reason={:?}",
+            info.complete,
+            info.failed,
+            info.canceled,
+            info.capacity_blocked_reason
+        );
         assert_eq!(info.items_decommission_failed, 0);
         assert_eq!(info.bytes_failed, 0);
         assert!(info.capacity_blocked_reason.is_some());

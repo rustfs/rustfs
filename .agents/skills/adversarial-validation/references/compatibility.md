@@ -22,3 +22,17 @@
   fixtures and encrypted migration data.
 - Compatibility shims use `RUSTFS_COMPAT_TODO(<task-id>)`, have a removal
   condition, and default toward reading old data safely.
+
+## Outbound targets
+
+- A change to what the replication or migration client sends by default
+  (checksum policy, payload framing, headers, version-id addressing) is judged
+  against every target class, not the one it fixes. Name each target-side rule
+  the current default satisfies — checksum required with Object Lock
+  parameters, `aws-chunked` decoding, version-id adoption, ETag equals content
+  MD5 — and show which cell of
+  `crates/e2e_test/src/replication_target_matrix_test.rs` covers each.
+- A test that asserts the fix ("no trailer header") is not evidence; the
+  matrix cell that asserts the target accepted and stored the object is.
+- Every new environment escape hatch appears in
+  `docs/operations/replication-outbound-transport.md` in the same diff.
