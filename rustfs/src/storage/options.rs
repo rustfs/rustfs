@@ -1876,6 +1876,10 @@ mod tests {
 
         let authorized = get_complete_multipart_upload_opts_with_replication_authorization(&headers, true)
             .expect("authorized replica status header should parse");
+        assert!(
+            !authorized.replication_request,
+            "REPLICA-only compatibility requests intentionally omit the source-request marker"
+        );
         assert_eq!(authorized.delete_marker_replication_status(), ReplicationStatusType::Replica);
         // For multipart the on-disk stamp actually comes from the SAME header
         // at initiate time (create-multipart builds its options through

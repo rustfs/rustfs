@@ -48,10 +48,10 @@ pub use delete::{
 pub use filemeta::{
     NULL_VERSION_ID, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, REPLICATE_INCOMING,
     REPLICATE_INCOMING_DELETE, REPLICATE_MRF, REPLICATE_QUEUED, REPLICATION_RESET, REPLICATION_STATUS, ReplicateDecision,
-    ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState,
-    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision,
-    VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replicate_decision_for_admitted_targets,
-    replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
+    ReplicationGenerationSnapshot, ReplicationState, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
+    ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType, get_replication_state, parse_replicate_decision,
+    replicate_decision_for_admitted_targets, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 pub use mrf::{
     MRF_ENVELOPE_FORMAT, MRF_ENVELOPE_VERSION, MRF_V2_FILE, MRF_V2_FORMAT, MRF_V2_NAMESPACE, MRF_V2_VERSION, MrfCapabilities,

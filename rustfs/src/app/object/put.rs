@@ -1854,6 +1854,7 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_stage_duration_from("app_replication_decision", replication_decision_stage_start);
 
         if dsc.replicate_any() {
+            insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(
                 &mut opts.user_defined,

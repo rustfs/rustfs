@@ -45,7 +45,9 @@ use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
 };
-use rustfs_utils::http::{SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, insert_str};
+use rustfs_utils::http::{
+    SUFFIX_REPLICATION_GENERATION, SUFFIX_REPLICATION_STATUS, SUFFIX_REPLICATION_TIMESTAMP, SUFFIX_TAGGING_TIMESTAMP, insert_str,
+};
 use s3s::{S3, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, dto::*, s3_error};
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -679,6 +681,7 @@ impl S3 for FS {
         .await;
         if dsc.replicate_any() {
             let mut eval_metadata = HashMap::new();
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
             insert_str(
@@ -1602,6 +1605,7 @@ impl S3 for FS {
 
         let mut eval_metadata = parse_object_lock_legal_hold(legal_hold)?;
         if dsc.replicate_any() {
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
         }
@@ -1820,6 +1824,7 @@ impl S3 for FS {
 
         let mut eval_metadata = parse_object_lock_retention(retention)?;
         if dsc.replicate_any() {
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
         }
@@ -1908,6 +1913,7 @@ impl S3 for FS {
         .await;
         if dsc.replicate_any() {
             let mut eval_metadata = HashMap::new();
+            insert_str(&mut eval_metadata, SUFFIX_REPLICATION_GENERATION, Uuid::new_v4().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(&mut eval_metadata, SUFFIX_REPLICATION_STATUS, dsc.pending_status().unwrap_or_default());
             insert_str(

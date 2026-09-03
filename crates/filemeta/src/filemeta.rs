@@ -363,6 +363,25 @@ impl FileMeta {
                                 }
                             }
 
+                            // `fi.metadata` is the authoritative replacement
+                            // for every internal suffix it carries. Remove all
+                            // existing RustFS/MinIO and mixed-case aliases for
+                            // those suffixes before inserting the new map;
+                            // otherwise an old MinIO key survives this RMW and
+                            // conflicts with newly written canonical aliases.
+                            let replaced_internal_suffixes = fi
+                                .metadata
+                                .keys()
+                                .filter_map(|key| rustfs_utils::http::strip_internal_prefix_preserving_case(key))
+                                .map(str::to_ascii_lowercase)
+                                .collect::<std::collections::HashSet<_>>();
+                            if !replaced_internal_suffixes.is_empty() {
+                                obj.meta_sys.retain(|key, _| {
+                                    rustfs_utils::http::strip_internal_prefix_preserving_case(key)
+                                        .is_none_or(|suffix| !replaced_internal_suffixes.contains(&suffix.to_ascii_lowercase()))
+                                });
+                            }
+
                             for (k, v) in fi.metadata.iter() {
                                 // Split metadata into meta_user and meta_sys based on prefix
                                 // This logic must match From<FileInfo> for MetaObject

@@ -55,6 +55,7 @@ use crate::api::config::storageclass;
 #[cfg(test)]
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::quota::reservation;
+use crate::bucket::replication::ReplicationStatusType;
 use crate::crash_inject::{self, CrashPoint};
 use crate::disk::DiskAPI;
 #[cfg(test)]
@@ -2366,6 +2367,43 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
+        // The request layer computes replication admission immediately before
+        // completion. Apply that metadata only after the staged upload and its
+        // bucket incarnation are validated, while the object/upload commit
+        // locks are still held, so generation, PENDING targets, and the final
+        // object become visible as one commit.
+        if let Some(eval_metadata) = &opts.eval_metadata {
+            for suffix in [
+                rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+                rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+                rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+            ] {
+                rustfs_utils::http::remove_str(&mut fi.metadata, suffix);
+            }
+            // A source-side completion creates a new local object identity;
+            // replica bookkeeping carried by an internal/legacy staged upload
+            // belongs to the source object and must not survive. Authorized
+            // inbound replication owns these fields and remains exempt. Older
+            // and heterogeneous replication clients can send an authorized
+            // REPLICA status on Complete without repeating the source-request
+            // marker, so either authenticated parser result is sufficient.
+            let authorized_inbound_replica =
+                opts.replication_request || opts.delete_marker_replication_status() == ReplicationStatusType::Replica;
+            if !authorized_inbound_replica {
+                fi.metadata
+                    .retain(|key, _| !key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS));
+                for suffix in [
+                    rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+                    rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
+                ] {
+                    rustfs_utils::http::remove_str(&mut fi.metadata, suffix);
+                }
+            }
+            for (key, value) in eval_metadata {
+                fi.metadata.insert(key.clone(), value.clone());
+            }
+            fi.replication_state_internal = rustfs_filemeta::get_internal_replication_state(&fi.metadata);
+        }
         let has_layout_candidate = range_seek_rollout_enabled
             && fi
                 .data_dir
@@ -2910,6 +2948,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 meta.mod_time = fi.mod_time;
                 meta.parts.clone_from(&fi.parts);
                 meta.metadata = fi.metadata.clone();
+                meta.replication_state_internal = fi.replication_state_internal.clone();
                 meta.versioned = opts.versioned || opts.version_suspended;
                 meta.version_id = fi.version_id;
                 meta.checksum = fi.checksum.clone();
@@ -8246,6 +8285,215 @@ mod tests {
                 .expect("completed version should be addressable by exact version id");
 
             assert_eq!(current.version_id, Some(version_id));
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn complete_multipart_upload_commits_replication_admission_metadata_atomically() {
+            let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+            let bucket = "multipart-replication-admission-bucket";
+            let object = "object";
+            make_bucket_on_all(&disk_stores, bucket).await;
+
+            let mut create_replication_metadata = HashMap::new();
+            rustfs_utils::http::insert_str(
+                &mut create_replication_metadata,
+                rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+                Uuid::from_u128(1).to_string(),
+            );
+            rustfs_utils::http::insert_str(
+                &mut create_replication_metadata,
+                rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+                "create-time".to_string(),
+            );
+            rustfs_utils::http::insert_str(
+                &mut create_replication_metadata,
+                rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+                "arn:create-target=PENDING;".to_string(),
+            );
+            rustfs_utils::http::insert_str(
+                &mut create_replication_metadata,
+                rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+                "REPLICA".to_string(),
+            );
+            rustfs_utils::http::insert_str(
+                &mut create_replication_metadata,
+                rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
+                "foreign-replica-time".to_string(),
+            );
+            create_replication_metadata
+                .insert(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS.to_string(), "REPLICA".to_string());
+            let (upload_id, parts) = stage_upload_with_create_opts(
+                &set_disks,
+                bucket,
+                object,
+                b"multipart replication body",
+                &ObjectOptions {
+                    user_defined: create_replication_metadata.clone(),
+                    ..Default::default()
+                },
+            )
+            .await;
+            let generation = Uuid::from_u128(42).to_string();
+            let timestamp = "opaque-completion-time";
+            let status = "arn:complete-target=PENDING;";
+            let mut replication_metadata = HashMap::new();
+            rustfs_utils::http::insert_str(
+                &mut replication_metadata,
+                rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+                generation.clone(),
+            );
+            rustfs_utils::http::insert_str(
+                &mut replication_metadata,
+                rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+                timestamp.to_string(),
+            );
+            rustfs_utils::http::insert_str(
+                &mut replication_metadata,
+                rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+                status.to_string(),
+            );
+
+            let completed = set_disks
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    object,
+                    &upload_id,
+                    parts,
+                    &ObjectOptions {
+                        eval_metadata: Some(replication_metadata),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("multipart completion with replication admission should succeed");
+
+            assert_eq!(
+                rustfs_utils::http::get_str(completed.user_defined.as_ref(), rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,)
+                    .as_deref(),
+                Some(generation.as_str())
+            );
+            assert_eq!(
+                rustfs_utils::http::get_str(completed.user_defined.as_ref(), rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,)
+                    .as_deref(),
+                Some(timestamp)
+            );
+            assert_eq!(completed.replication_status_internal.as_deref(), Some(status));
+            for suffix in [
+                rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+                rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
+            ] {
+                assert!(
+                    !rustfs_utils::http::contains_key_str(completed.user_defined.as_ref(), suffix),
+                    "source completion must clear staged foreign {suffix}"
+                );
+            }
+            assert!(
+                completed
+                    .user_defined
+                    .iter()
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS))
+                    .all(|(_, value)| value != "REPLICA")
+            );
+
+            let disabled_object = "disabled";
+            let (upload_id, parts) = stage_upload_with_create_opts(
+                &set_disks,
+                bucket,
+                disabled_object,
+                b"multipart replication disabled body",
+                &ObjectOptions {
+                    user_defined: create_replication_metadata,
+                    ..Default::default()
+                },
+            )
+            .await;
+            let completed = set_disks
+                .clone()
+                .complete_multipart_upload(
+                    bucket,
+                    disabled_object,
+                    &upload_id,
+                    parts,
+                    &ObjectOptions {
+                        eval_metadata: Some(HashMap::new()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("completion should clear stale create-time replication admission");
+            assert!(completed.replication_status_internal.is_none());
+            for suffix in [
+                rustfs_utils::http::SUFFIX_REPLICATION_GENERATION,
+                rustfs_utils::http::SUFFIX_REPLICATION_TIMESTAMP,
+                rustfs_utils::http::SUFFIX_REPLICATION_STATUS,
+                rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+                rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
+            ] {
+                assert!(
+                    !rustfs_utils::http::contains_key_str(completed.user_defined.as_ref(), suffix),
+                    "disabled completion must clear stale {suffix}"
+                );
+            }
+
+            let inbound_object = "inbound";
+            let mut inbound_replica_metadata = HashMap::new();
+            rustfs_utils::http::insert_str(
+                &mut inbound_replica_metadata,
+                rustfs_utils::http::SUFFIX_REPLICA_STATUS,
+                "REPLICA".to_string(),
+            );
+            rustfs_utils::http::insert_str(
+                &mut inbound_replica_metadata,
+                rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP,
+                "authorized-inbound-time".to_string(),
+            );
+            inbound_replica_metadata.insert(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS.to_string(), "REPLICA".to_string());
+            let (upload_id, parts) = stage_upload_with_create_opts(
+                &set_disks,
+                bucket,
+                inbound_object,
+                b"authorized inbound multipart body",
+                &ObjectOptions {
+                    user_defined: inbound_replica_metadata,
+                    ..Default::default()
+                },
+            )
+            .await;
+            let mut inbound_complete_opts = ObjectOptions {
+                eval_metadata: Some(HashMap::new()),
+                ..Default::default()
+            };
+            inbound_complete_opts.set_replica_status(ReplicationStatusType::Replica);
+            assert!(
+                !inbound_complete_opts.replication_request,
+                "the compatibility path must not depend on a source-request marker"
+            );
+            let inbound = set_disks
+                .clone()
+                .complete_multipart_upload(bucket, inbound_object, &upload_id, parts, &inbound_complete_opts)
+                .await
+                .expect("authorized REPLICA-only completion must preserve replica bookkeeping");
+            assert_eq!(
+                rustfs_utils::http::get_consistent_str(inbound.user_defined.as_ref(), rustfs_utils::http::SUFFIX_REPLICA_STATUS),
+                Some("REPLICA")
+            );
+            assert_eq!(
+                rustfs_utils::http::get_consistent_str(
+                    inbound.user_defined.as_ref(),
+                    rustfs_utils::http::SUFFIX_REPLICA_TIMESTAMP
+                ),
+                Some("authorized-inbound-time")
+            );
+            assert_eq!(
+                inbound
+                    .user_defined
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS))
+                    .map(|(_, value)| value.as_str()),
+                Some("REPLICA")
+            );
         }
 
         #[tokio::test]
