@@ -407,10 +407,15 @@ test-group = 'ecstore-serial-flaky'
 # harness_self}_test` stays in e2e-full and the fault / concurrency /
 # real-source modules stay in e2e-nightly; this is an allowlist, not a module
 # clause, so a new ODM test never lands here silently.
+#
+# Scanner authoritative usage publication (backlog#2213): data_usage_test is
+# the PR-lane e2e coverage for scanner usage snapshots consumed by quota and
+# admin surfaces. It uses the same single-node, random-port, isolated-temp-dir
+# fixture as the existing smoke modules.
 [profile.e2e-smoke]
 default-filter = """
     package(e2e_test) & (
-        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|list_buckets_auth|list_buckets_iam_filter|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_object_tagging|copy_source_invalid_date|content_encoding|compression|multipart_storage_class|storage_class_capability|ssec_copy|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud|admin_pools|sts_query_compat)_test::|^fake_s3_target::/)
+        test(/^(delete_marker_migration_semantics|version_id_regression|list_objects_v2_pagination|list_object_versions_regression|list_objects_duplicates|list_buckets_double_slash|list_buckets_auth|list_buckets_iam_filter|leading_slash_key|special_chars|create_bucket_region|delete_objects_versioning|head_object_consistency|head_object_range|copy_object_metadata|copy_object_tagging|copy_source_invalid_date|content_encoding|compression|multipart_storage_class|storage_class_capability|ssec_copy|anonymous_access|bucket_policy_check|presigned_negative|negative_sigv4|admin_auth|notification_webhook|tls_hot_reload|console_smoke|admin_iam_crud|admin_pools|sts_query_compat|data_usage)_test::|^fake_s3_target::/)
         | test(/^replication_extension_test::(test_replication_check_succeeds_with_remote_target|test_replication_check_rejects_target_without_object_lock|test_set_remote_target_rejects_unversioned_source_bucket|test_replication_check_rejects_unversioned_source_bucket|test_replication_check_rejects_missing_replication_config|test_replication_check_rejects_invalid_bucket|test_set_remote_target_rejects_same_bucket_on_same_deployment|test_set_remote_target_rejects_unversioned_target_bucket|test_set_remote_target_update_requires_arn|test_set_remote_target_update_rejects_missing_target|test_set_remote_target_rejects_invalid_target_url|test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify|test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem|test_list_remote_targets_rejects_empty_bucket|test_list_remote_targets_rejects_invalid_bucket|test_remove_remote_target_rejects_missing_target|test_remove_remote_target_rejects_missing_arn|test_remove_remote_target_rejects_invalid_bucket|test_remove_remote_target_rejects_target_used_by_replication|test_delete_bucket_replication_removes_remote_target)$/)
         | test(/^reliant::lifecycle::/)
         | test(/^reliant::tiering::/)
@@ -484,11 +489,15 @@ path = "junit.xml"
 # ---------------------------------------------------------------------------
 # e2e-nightly profile — destructive multi-process cluster fault domains
 # ---------------------------------------------------------------------------
-# These seven modules are deliberately outside e2e-full's merge budget. Each
+# These eight modules are deliberately outside e2e-full's merge budget. Each
 # starts a real multi-process or multi-disk topology and exercises node/disk
 # loss, quorum, cleanup, notification fan-in, or admin-timeout behavior. The
 # consolidated nightly workflow runs them serially to avoid resource
 # starvation; failures are never retried.
+#
+# heal_erasure_disk_rebuild_test also runs in e2e-full so core heal rebuild
+# regressions are caught no later than the merge/main lane. It remains here for
+# nightly serial coverage with the other cluster fault domains.
 #
 # On-demand migration (backlog#2158 ODM-11) joins by the second clause: the
 # fault matrix waits out the 30 s circuit-breaker window, the concurrency
@@ -538,11 +547,13 @@ path = "junit.xml"
 # The filter is "the whole e2e_test crate MINUS the sets owned by other lanes":
 #   * protocols:: — FTPS/SFTP/WebDAV, run from the dedicated protocol profile
 #     with one worker because the suite owns fixed ports.
-#   * the 7 cluster suites that spin up a RustFSTestClusterEnvironment
+#   * cluster suites that spin up a RustFSTestClusterEnvironment
 #     (cluster_concurrency, cluster_multidrive_pool, stale_multipart_cleanup_cluster,
-#     namespace_lock_quorum, heal_erasure_disk_rebuild, admin_timeout_regression,
-#     object_lambda) — too heavy for the merge budget; they run in the
-#     e2e-nightly serial cluster-fault lane.
+#     namespace_lock_quorum, admin_timeout_regression, object_lambda) — too
+#     heavy for the merge budget; they run in the e2e-nightly serial
+#     cluster-fault lane. heal_erasure_disk_rebuild is intentionally not
+#     excluded here because backlog#2213 promotes core heal rebuild coverage to
+#     this merge/main lane while retaining nightly coverage.
 #   * replication_extension_test — repl-1 already splits it into the PR
 #     `e2e-smoke` (20 fast) and `e2e-repl-nightly` (56 slow) lanes and reserves
 #     it for those, so e2e-full does not double-run it.
@@ -558,7 +569,7 @@ path = "junit.xml"
 default-filter = """
     package(e2e_test)
     & !test(/^protocols::/)
-    & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|degraded_listing_availability_test|heal_erasure_disk_rebuild_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
+    & !test(/^(admin_timeout_regression_test|cluster_concurrency_test|cluster_multidrive_pool_test|degraded_listing_availability_test|namespace_lock_quorum_test|object_lambda_test|stale_multipart_cleanup_cluster_test)::/)
     & !test(/^replication_extension_test::/)
     & !test(/^on_demand_migration::(concurrency_test|fault_test|real_source_test)::/)
 """
