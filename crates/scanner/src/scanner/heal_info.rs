@@ -62,9 +62,12 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
 /// Read background healing information together with the movement epoch that
 /// fenced the read. The epoch must be reused by the matching cycle update so a
 /// missing-object default cannot be committed across a movement transition.
-pub(super) async fn read_background_heal_info_with_epoch(storeapi: Arc<ECStore>) -> BackgroundHealInfoRead {
+pub(super) async fn read_background_heal_info_with_epoch<S>(storeapi: Arc<S>) -> BackgroundHealInfoRead
+where
+    S: ScannerStorage,
+{
     // Skip for ErasureSD setup
-    if scanner_is_erasure_sd().await {
+    if storeapi.setup_is_erasure_sd().await {
         return BackgroundHealInfoRead {
             info: BackgroundHealInfo::default(),
             expected_epoch: None,
@@ -136,13 +139,15 @@ pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundH
     save_background_heal_info_for_epoch(storeapi, info, None).await;
 }
 
-pub(super) async fn save_background_heal_info_for_epoch(
-    storeapi: Arc<ECStore>,
+pub(super) async fn save_background_heal_info_for_epoch<S>(
+    storeapi: Arc<S>,
     info: BackgroundHealInfo,
     expected_epoch: Option<u64>,
-) {
+) where
+    S: ScannerStorage,
+{
     // Skip for ErasureSD setup
-    if scanner_is_erasure_sd().await {
+    if storeapi.setup_is_erasure_sd().await {
         return;
     }
 

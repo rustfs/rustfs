@@ -43,7 +43,7 @@ use storage_api::owner::{
     ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr,
     ecstore_get_lifecycle_config, ecstore_get_object_lock_config, ecstore_get_replication_config,
     ecstore_invalidate_admin_data_usage_snapshot_cache, ecstore_invalidate_data_usage_snapshot_cache, ecstore_is_erasure,
-    ecstore_is_erasure_sd, ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_object_opts_from_object_info,
+    ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_object_opts_from_object_info,
     ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path, ecstore_read_config,
     ecstore_replace_bucket_usage_memory_from_info, ecstore_resolve_object_store_handle, ecstore_save_config,
     scanner_replication_config_for_lifecycle_eval,
@@ -687,10 +687,6 @@ pub(crate) async fn scanner_is_erasure() -> bool {
     ecstore_is_erasure().await
 }
 
-pub(crate) async fn scanner_is_erasure_sd() -> bool {
-    ecstore_is_erasure_sd().await
-}
-
 pub(crate) async fn scanner_disk_is_online(disk: &Disk) -> bool {
     EcstoreDiskAPI::is_online(disk).await
 }
@@ -977,7 +973,7 @@ impl ScannerConfigObjectDelete for ECStore {
     }
 
     async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
-        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        let (read_guard, epoch) = ECStore::scanner_data_usage_publication_admission_guard(self).await?;
         Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
     }
 
@@ -987,7 +983,7 @@ impl ScannerConfigObjectDelete for ECStore {
         safe_deadline: tokio::time::Instant,
         remote_lease_tokens: Vec<Uuid>,
     ) -> Option<ScannerPublicationCommitScope> {
-        self.scanner_data_usage_publication_commit_scope(expected_movement_epoch, safe_deadline, remote_lease_tokens)
+        ECStore::scanner_data_usage_publication_commit_scope(self, expected_movement_epoch, safe_deadline, remote_lease_tokens)
             .await
     }
 
@@ -998,7 +994,8 @@ impl ScannerConfigObjectDelete for ECStore {
         remote_lease_tokens: Vec<Uuid>,
         lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
     ) -> Option<ScannerPublicationCommitScope> {
-        self.scanner_data_usage_publication_commit_scope_with_release_flag(
+        ECStore::scanner_data_usage_publication_commit_scope_with_release_flag(
+            self,
             expected_movement_epoch,
             safe_deadline,
             remote_lease_tokens,
@@ -1020,7 +1017,7 @@ impl ScannerConfigObjectDelete for SetDisks {
     }
 
     async fn scanner_data_usage_publication_admission(&self) -> Option<ScannerDataUsagePublicationAdmission> {
-        let (read_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        let (read_guard, epoch) = SetDisks::scanner_data_usage_publication_admission_guard(self).await?;
         Some(ScannerDataUsagePublicationAdmission::fenced(read_guard, epoch))
     }
 
@@ -1030,7 +1027,7 @@ impl ScannerConfigObjectDelete for SetDisks {
         safe_deadline: tokio::time::Instant,
         remote_lease_tokens: Vec<Uuid>,
     ) -> Option<ScannerPublicationCommitScope> {
-        self.scanner_data_usage_publication_commit_scope(expected_movement_epoch, safe_deadline, remote_lease_tokens)
+        SetDisks::scanner_data_usage_publication_commit_scope(self, expected_movement_epoch, safe_deadline, remote_lease_tokens)
             .await
     }
 
@@ -1041,7 +1038,8 @@ impl ScannerConfigObjectDelete for SetDisks {
         remote_lease_tokens: Vec<Uuid>,
         lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
     ) -> Option<ScannerPublicationCommitScope> {
-        self.scanner_data_usage_publication_commit_scope_with_release_flag(
+        SetDisks::scanner_data_usage_publication_commit_scope_with_release_flag(
+            self,
             expected_movement_epoch,
             safe_deadline,
             remote_lease_tokens,
