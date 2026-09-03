@@ -367,7 +367,8 @@ pub(crate) mod bucket {
                 version_id: &str,
                 bucket: &str,
                 object: &str,
-            ) -> Result<crate::storage::storage_api::StorageObjectOptions, std::io::Error> {
+            ) -> Result<crate::storage::storage_api::StorageObjectOptions, crate::storage::storage_api::StorageError>
+            {
                 crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::post_restore_opts(
                     version_id, bucket, object,
                 )
