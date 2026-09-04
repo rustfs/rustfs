@@ -201,6 +201,12 @@ pub async fn unseal_secret(sealed: &SealedCredential, scope: &SealScope) -> Resu
 mod tests {
     use super::*;
     use parking_lot::Mutex;
+    use std::collections::BTreeMap;
+
+    fn encode_context(context: &HashMap<String, String>) -> String {
+        let ordered = context.iter().collect::<BTreeMap<_, _>>();
+        serde_json::to_string(&ordered).expect("context serializes")
+    }
 
     /// Stands in for the KMS-backed sealer: records the context it was called
     /// with, and refuses a ciphertext presented under a different one.
@@ -214,7 +220,7 @@ mod tests {
         async fn seal(&self, plaintext: &str, scope: &SealScope) -> Result<SealedCredential, SealedCredentialError> {
             let context = scope.encryption_context();
             self.sealed_contexts.lock().push(context.clone());
-            let mut bound = serde_json::to_string(&context).expect("context serializes");
+            let mut bound = encode_context(&context);
             bound.push('|');
             bound.push_str(plaintext);
             Ok(SealedCredential {
@@ -231,7 +237,7 @@ mod tests {
                 .decode_to_vec(sealed.ct.as_bytes())
                 .map_err(|err| SealedCredentialError::Malformed(err.to_string()))?;
             let bound = String::from_utf8(raw).map_err(|err| SealedCredentialError::Malformed(err.to_string()))?;
-            let expected = serde_json::to_string(&scope.encryption_context()).expect("context serializes");
+            let expected = encode_context(&scope.encryption_context());
             bound
                 .strip_prefix(&expected)
                 .and_then(|rest| rest.strip_prefix('|'))
