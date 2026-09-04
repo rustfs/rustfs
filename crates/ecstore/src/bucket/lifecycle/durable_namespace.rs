@@ -25,6 +25,7 @@ use super::{
     manual_transition_job, tier_delete_journal, transition_transaction,
 };
 use crate::error::{Error, Result};
+use crate::services::tier::tier_probe_intent;
 
 pub(crate) const ILM_META_PREFIX: &str = "ilm";
 const ILM_META_OBJECT_PREFIX: &str = "ilm/";
@@ -35,6 +36,7 @@ pub(crate) enum DurableIlmRecordKind {
     TierDeleteJournal,
     TierDeleteDispatchManifest,
     TransitionTransaction,
+    TierProbeIntent,
     ManualTransitionJob,
     ManualTransitionScope,
     ManualTransitionTask,
@@ -73,6 +75,12 @@ pub(crate) const TRANSITION_TRANSACTION_NAMESPACE: DurableIlmNamespace = Durable
     max_record_size: transition_transaction::MAX_TRANSITION_TRANSACTION_SIZE,
     kind: DurableIlmRecordKind::TransitionTransaction,
 };
+pub(crate) const TIER_PROBE_INTENT_NAMESPACE: DurableIlmNamespace = DurableIlmNamespace {
+    name: "tier-probe-intent",
+    prefix: tier_probe_intent::TIER_PROBE_INTENT_RECORD_PREFIX,
+    max_record_size: tier_probe_intent::MAX_TIER_PROBE_INTENT_SIZE,
+    kind: DurableIlmRecordKind::TierProbeIntent,
+};
 pub(crate) const MANUAL_TRANSITION_JOB_NAMESPACE: DurableIlmNamespace = DurableIlmNamespace {
     name: "manual-transition-job",
     prefix: "ilm/manual-transition/jobs",
@@ -98,11 +106,12 @@ pub(crate) const MANUAL_TRANSITION_WORKER_RESULT_NAMESPACE: DurableIlmNamespace 
     kind: DurableIlmRecordKind::ManualTransitionWorkerResult,
 };
 
-pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 8] = [
+pub(crate) const DURABLE_ILM_NAMESPACES: [DurableIlmNamespace; 9] = [
     TIER_DELETE_JOURNAL_NAMESPACE,
     TIER_DELETE_JOURNAL_V6_NAMESPACE,
     TIER_DELETE_DISPATCH_MANIFEST_NAMESPACE,
     TRANSITION_TRANSACTION_NAMESPACE,
+    TIER_PROBE_INTENT_NAMESPACE,
     MANUAL_TRANSITION_JOB_NAMESPACE,
     MANUAL_TRANSITION_SCOPE_NAMESPACE,
     MANUAL_TRANSITION_TASK_NAMESPACE,
@@ -200,6 +209,15 @@ pub(crate) enum DurableIlmRecordCheckpoint {
         revision: u64,
         state: transition_transaction::TransitionTransactionState,
     },
+    TierProbeIntent {
+        content_sha256: String,
+        identity_sha256: String,
+        remote_version_sha256: String,
+        remote_version_known: bool,
+        owner_fence_sha256: String,
+        revision: u64,
+        state: tier_probe_intent::TierProbeIntentState,
+    },
     ManualTransitionJob {
         content_sha256: String,
         identity_sha256: String,
@@ -232,6 +250,7 @@ impl DurableIlmRecordCheckpoint {
             | Self::TierDeleteDispatchManifest { content_sha256, .. }
             | Self::TierDeleteDispatchParent { content_sha256, .. }
             | Self::TransitionTransaction { content_sha256, .. }
+            | Self::TierProbeIntent { content_sha256, .. }
             | Self::ManualTransitionJob { content_sha256, .. }
             | Self::ManualTransitionScope { content_sha256, .. }
             | Self::ManualTransitionTask { content_sha256 }
@@ -422,6 +441,32 @@ impl DurableIlmRecordCheckpoint {
                     && (!previous_remote_version_known || previous_remote_version == next_remote_version)
             }
             (
+                Self::TierProbeIntent {
+                    identity_sha256: previous_identity,
+                    remote_version_sha256: previous_remote_version,
+                    remote_version_known: previous_remote_version_known,
+                    owner_fence_sha256: previous_owner_fence,
+                    revision: previous_revision,
+                    state: previous_state,
+                    ..
+                },
+                Self::TierProbeIntent {
+                    identity_sha256: next_identity,
+                    remote_version_sha256: next_remote_version,
+                    owner_fence_sha256: next_owner_fence,
+                    revision: next_revision,
+                    state: next_state,
+                    ..
+                },
+            ) => {
+                previous_identity == next_identity
+                    && previous_owner_fence == next_owner_fence
+                    && next_revision
+                        .checked_sub(*previous_revision)
+                        .is_some_and(|distance| distance == 1 && tier_probe_state_reaches(*previous_state, *next_state, distance))
+                    && (!previous_remote_version_known || previous_remote_version == next_remote_version)
+            }
+            (
                 Self::ManualTransitionJob {
                     content_sha256: previous_content,
                     identity_sha256: previous_identity,
@@ -500,6 +545,14 @@ impl DurableIlmRecordCheckpoint {
     /// after the exact terminal ETag and terminal receipt were committed, to
     /// purge older object versions exposed by that deletion.
     pub(crate) fn is_predecessor_of_terminal(&self, terminal: &Self) -> bool {
+        if let Self::TierProbeIntent { state, .. } = terminal
+            && !matches!(
+                state,
+                tier_probe_intent::TierProbeIntentState::AbortedNoRemote | tier_probe_intent::TierProbeIntentState::Completed
+            )
+        {
+            return false;
+        }
         if self == terminal || self.validate_successor(terminal).is_ok() {
             return true;
         }
@@ -568,6 +621,37 @@ impl DurableIlmRecordCheckpoint {
                         }
                     })
             }
+            (
+                Self::TierProbeIntent {
+                    identity_sha256: previous_identity,
+                    remote_version_sha256: previous_remote_version,
+                    remote_version_known: previous_remote_version_known,
+                    owner_fence_sha256: previous_owner_fence,
+                    revision: previous_revision,
+                    state: previous_state,
+                    ..
+                },
+                Self::TierProbeIntent {
+                    identity_sha256: terminal_identity,
+                    remote_version_sha256: terminal_remote_version,
+                    owner_fence_sha256: terminal_owner_fence,
+                    revision: terminal_revision,
+                    state: terminal_state,
+                    ..
+                },
+            ) => {
+                previous_identity == terminal_identity
+                    && previous_owner_fence == terminal_owner_fence
+                    && matches!(
+                        terminal_state,
+                        tier_probe_intent::TierProbeIntentState::AbortedNoRemote
+                            | tier_probe_intent::TierProbeIntentState::Completed
+                    )
+                    && terminal_revision
+                        .checked_sub(*previous_revision)
+                        .is_some_and(|distance| tier_probe_state_reaches(*previous_state, *terminal_state, distance))
+                    && (!previous_remote_version_known || previous_remote_version == terminal_remote_version)
+            }
             _ => false,
         }
     }
@@ -603,6 +687,23 @@ fn transition_state_distance(
         (Uploaded, Committed) => Some(2),
         (LocalCommitStarted, Committed | CleanupPending) => Some(1),
         _ => None,
+    }
+}
+
+fn tier_probe_state_reaches(
+    from: tier_probe_intent::TierProbeIntentState,
+    to: tier_probe_intent::TierProbeIntentState,
+    revision_distance: u64,
+) -> bool {
+    use tier_probe_intent::TierProbeIntentState::{AbortedNoRemote, CleanupPending, Completed, UploadOutcomeUnknown, Uploaded};
+
+    match (from, to) {
+        (UploadOutcomeUnknown, Uploaded | CleanupPending | AbortedNoRemote) => revision_distance == 1,
+        (UploadOutcomeUnknown, Completed) => matches!(revision_distance, 2 | 3),
+        (Uploaded, CleanupPending) => revision_distance == 1,
+        (Uploaded, Completed) => revision_distance == 2,
+        (CleanupPending, Completed) => revision_distance == 1,
+        _ => false,
     }
 }
 
@@ -1082,6 +1183,42 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
                 },
             )
         }
+        DurableIlmRecordKind::TierProbeIntent => {
+            let probe_id = tier_probe_intent::tier_probe_intent_id_from_record_object_name(path)
+                .map_err(|err| Error::other(err.to_string()))?;
+            let intent =
+                tier_probe_intent::TierProbeIntent::decode(probe_id, data).map_err(|err| Error::other(err.to_string()))?;
+            let canonical =
+                tier_probe_intent::tier_probe_intent_record_object_name(probe_id).map_err(|err| Error::other(err.to_string()))?;
+            if canonical != path {
+                return Err(Error::other("tier probe intent path is not canonical"));
+            }
+            let identity_sha256 = checkpoint_hash(&(
+                intent.probe_id,
+                &intent.operation,
+                &intent.tier_name,
+                intent.destination_id,
+                &intent.probe_object,
+                &intent.creator_id,
+                intent.creator_epoch,
+                intent.created_at_unix_nanos,
+            ))?;
+            let remote_version_sha256 = checkpoint_hash(&intent.remote_version)?;
+            let owner_fence_sha256 = checkpoint_hash(&intent.owner)?;
+            (
+                "probe_id",
+                probe_id.to_string(),
+                DurableIlmRecordCheckpoint::TierProbeIntent {
+                    content_sha256,
+                    identity_sha256,
+                    remote_version_sha256,
+                    remote_version_known: !intent.remote_version.is_unknown(),
+                    owner_fence_sha256,
+                    revision: intent.revision,
+                    state: intent.state,
+                },
+            )
+        }
         DurableIlmRecordKind::ManualTransitionJob => {
             let job_id = manual_transition_job::manual_transition_job_id_from_record_object_name(path)
                 .map_err(|err| Error::other(err.to_string()))?;
@@ -1235,6 +1372,102 @@ mod tests {
                 assert!(!path_is_in_namespace(other.prefix, namespace));
             }
         }
+    }
+
+    fn tier_probe_intent_fixture() -> tier_probe_intent::TierProbeIntent {
+        let probe_id = Uuid::parse_str("36e2220e-9ad2-495b-b3bc-c4d2caf70a31").expect("fixture uuid should parse");
+        tier_probe_intent::TierProbeIntent {
+            probe_id,
+            revision: 1,
+            state: tier_probe_intent::TierProbeIntentState::UploadOutcomeUnknown,
+            operation: tier_probe_intent::TierProbeOperationIdentity::Verify {
+                config_etag: "config-etag".to_string(),
+                backend_identity: [1; 32],
+            },
+            tier_name: "COLD-A".to_string(),
+            destination_id: [1; 32],
+            probe_object: tier_probe_intent::tier_probe_object_name(probe_id),
+            creator_id: "node-a".to_string(),
+            creator_epoch: Uuid::parse_str("76746062-c05a-40b7-9e38-d2722d7e0332").expect("fixture creator epoch should parse"),
+            created_at_unix_nanos: 1_780_000_000_000_000_000,
+            owner: tier_probe_intent::TierProbeOwnerFence {
+                owner_id: "node-a".to_string(),
+                owner_epoch: Uuid::parse_str("76746062-c05a-40b7-9e38-d2722d7e0332").expect("fixture owner epoch should parse"),
+                not_after_unix_nanos: 1_780_000_900_000_000_000,
+            },
+            remote_version: tier_probe_intent::TierProbeRemoteVersion::default(),
+        }
+    }
+
+    fn tier_probe_checkpoint(intent: &tier_probe_intent::TierProbeIntent) -> DurableIlmRecordCheckpoint {
+        let path =
+            tier_probe_intent::tier_probe_intent_record_object_name(intent.probe_id).expect("tier probe path should build");
+        let encoded = intent.encode().expect("tier probe intent should encode");
+        let namespace = classify_durable_ilm_record(&path)
+            .expect("tier probe namespace should classify")
+            .expect("tier probe intent should be durable");
+        assert_eq!(namespace, &TIER_PROBE_INTENT_NAMESPACE);
+        validate_durable_ilm_record(&path, &encoded)
+            .expect("tier probe intent should validate")
+            .checkpoint
+    }
+
+    #[test]
+    fn tier_probe_intent_checkpoint_tracks_exact_monotonic_generations() {
+        let initial_intent = tier_probe_intent_fixture();
+        let initial = tier_probe_checkpoint(&initial_intent);
+
+        let mut uploaded_intent = initial_intent.clone();
+        uploaded_intent
+            .advance(
+                tier_probe_intent::TierProbeIntentState::Uploaded,
+                tier_probe_intent::TierProbeRemoteVersion::versioned("opaque-v1"),
+            )
+            .expect("uploaded state should advance");
+        let uploaded = tier_probe_checkpoint(&uploaded_intent);
+        initial
+            .validate_successor(&uploaded)
+            .expect("durable receipt may adopt the exact uploaded generation");
+
+        let mut cleanup_intent = uploaded_intent.clone();
+        cleanup_intent
+            .advance(
+                tier_probe_intent::TierProbeIntentState::CleanupPending,
+                uploaded_intent.remote_version.clone(),
+            )
+            .expect("cleanup state should advance");
+        let cleanup = tier_probe_checkpoint(&cleanup_intent);
+        uploaded
+            .validate_successor(&cleanup)
+            .expect("durable receipt may adopt the exact cleanup generation");
+
+        let mut completed_intent = cleanup_intent.clone();
+        completed_intent
+            .advance(tier_probe_intent::TierProbeIntentState::Completed, cleanup_intent.remote_version.clone())
+            .expect("completed state should advance");
+        let completed = tier_probe_checkpoint(&completed_intent);
+        cleanup
+            .validate_successor(&completed)
+            .expect("durable receipt may adopt the exact terminal generation");
+        assert!(
+            initial.is_predecessor_of_terminal(&completed),
+            "terminal cleanup must recognize the full acknowledged-PUT path"
+        );
+        assert!(
+            initial.validate_successor(&completed).is_err(),
+            "ordinary receipt advancement must not skip intermediate generations"
+        );
+        assert!(
+            !initial.is_predecessor_of_terminal(&uploaded),
+            "a nonterminal generation must not be accepted as terminal proof"
+        );
+
+        let mut rebound = uploaded_intent;
+        rebound.owner.owner_epoch = Uuid::new_v4();
+        assert!(
+            rebound.encode().is_err(),
+            "dormant v1 must reject owner takeover before producing a checkpoint"
+        );
     }
 
     #[test]
