@@ -33,6 +33,7 @@ use crate::common::{
 };
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -59,8 +60,8 @@ struct UpgradeSeed {
     iam_secret: &'static str,
 }
 
-fn source_binary() -> TestResult<PathBuf> {
-    let path = std::env::var_os(SOURCE_BINARY_ENV).map(PathBuf::from).ok_or_else(|| {
+fn resolve_source_binary(value: Option<OsString>) -> TestResult<PathBuf> {
+    let path = value.map(PathBuf::from).ok_or_else(|| {
         format!(
             "{SOURCE_BINARY_ENV} must point to the pinned previous release binary (the e2e-distributed workflow downloads it)"
         )
@@ -69,6 +70,10 @@ fn source_binary() -> TestResult<PathBuf> {
         return Err(format!("upgrade source binary does not exist: {}", path.display()).into());
     }
     Ok(path)
+}
+
+fn source_binary() -> TestResult<PathBuf> {
+    resolve_source_binary(std::env::var_os(SOURCE_BINARY_ENV))
 }
 
 fn capture_upgrade_logs(cluster: &mut DistCluster, label: &str) -> TestResult {
@@ -343,4 +348,16 @@ async fn four_node_rolling_upgrade_preserves_history_and_iam_credentials() -> Te
     dist.replace_node_with_current_binary(3).await?;
     assert_history_and_iam(&dist, &seed, "homogeneous-current").await?;
     Ok(())
+}
+
+#[test]
+fn missing_upgrade_source_binary_fails_closed() {
+    let err = resolve_source_binary(None).expect_err("absent env must fail closed");
+    assert!(err.to_string().contains(SOURCE_BINARY_ENV), "{err}");
+}
+
+#[test]
+fn missing_upgrade_source_binary_file_fails_closed() {
+    let err = resolve_source_binary(Some("/no/such/rustfs-upgrade-source".into())).expect_err("missing file must fail closed");
+    assert!(err.to_string().contains("does not exist"), "{err}");
 }

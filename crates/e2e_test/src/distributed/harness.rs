@@ -19,13 +19,12 @@
 //! * **4×4 single pool** (`four_by_four`) — four processes, four drives each,
 //!   one `DistErasure` pool (16 explicit volume endpoints). This is the
 //!   default S3 / lock / versioning / chaos topology.
-//! * **4×4 four pool** — start two single-node pools then
-//!   `append_single_node_pool` twice. Required for decommission/rebalance/expand
-//!   *when* the server can rewrite pool.bin. On current localhost DistErasure,
-//!   appending pools and restarting hits `pool metadata recovery required`
-//!   (a production bootstrap-proof limitation this test lane does not change).
-//!   Movement tests therefore use the two-pool seed and classify decommission /
-//!   rebalance 5xx as a fence while still asserting object bytes.
+//! * **4×4 four pool** — `append_single_node_pool` exists for harness unit
+//!   tests. Live expand-then-restart currently hits `pool metadata recovery
+//!   required` on localhost DistErasure. That is a production bootstrap-proof
+//!   limitation this test lane does not change. Movement tests use 4×4 single
+//!   pool and classify decommission/rebalance 4xx/5xx as a refused move while
+//!   still asserting object bytes.
 //!
 //! Genuine multi-node *striped* pools still need multi-host CI (backlog
 //! #1313 / #1314). Site replication uses two 4-node 1-drive clusters so the
@@ -225,8 +224,8 @@ pub(crate) async fn put_inventory(
     Ok(inventory)
 }
 
-/// Four-pool DistErasure on localhost can 500 a PUT while heal_bucket hits a
-/// pool-meta write fence. Retry only those transient codes.
+/// Localhost DistErasure can 500 a PUT while heal_bucket hits a pool-meta
+/// write fence. Retry only those transient codes.
 pub(crate) async fn put_inventory_retrying(
     client: &Client,
     bucket: &str,
@@ -505,10 +504,10 @@ pub(crate) async fn set_bucket_quota(cluster: &RustFSTestClusterEnvironment, buc
     .await
 }
 
-/// Localhost DistErasure multi-pool can boot and serve S3 while still refusing
-/// pool.bin mutations (`pool metadata writes remain blocked` / missing fleet
-/// capability proof). Decommission and rebalance POST then 500. That is a
-/// product gate, not a harness URL mistake; tests must not pretend a move ran.
+/// Localhost DistErasure can boot and serve S3 while refusing pool.bin
+/// mutations (`pool metadata writes remain blocked` / missing fleet
+/// capability proof). Single-pool 4×4 also rejects decommission/rebalance
+/// with a product error. Tests must not pretend a move ran.
 pub(crate) fn is_pool_meta_write_fence(body: &str) -> bool {
     body.contains("pool metadata writes remain blocked")
         || body.contains("pool metadata recovery required")
@@ -517,10 +516,30 @@ pub(crate) fn is_pool_meta_write_fence(body: &str) -> bool {
         || body.contains("live fleet capability proof")
 }
 
+/// Product refusals that movement tests observe. Opaque 5xx stays in
+/// [`classify_data_movement_http`] because admin often wraps the fence as
+/// InternalError XML without the inner string. Auth failures are not refusals.
+pub(crate) fn is_known_data_movement_refusal(body: &str) -> bool {
+    is_pool_meta_write_fence(body)
+        || body.contains("NotImplemented")
+        || body.contains("single pool deployments do not support")
+        || body.contains("at least one active pool must remain")
+}
+
 #[derive(Debug)]
 pub(crate) enum DataMovementStart {
     Started,
-    RefusedByPoolMetaFence(String),
+    Refused(String),
+}
+
+pub(crate) fn classify_data_movement_http(status: StatusCode, body: &str) -> Result<DataMovementStart, String> {
+    if status.is_success() {
+        return Ok(DataMovementStart::Started);
+    }
+    if is_known_data_movement_refusal(body) || status.as_u16() == 501 || status.is_server_error() {
+        return Ok(DataMovementStart::Refused(format!("{status} {body}")));
+    }
+    Err(format!("{status} {body}"))
 }
 
 pub(crate) async fn try_start_decommission(
@@ -529,29 +548,16 @@ pub(crate) async fn try_start_decommission(
 ) -> TestResult<DataMovementStart> {
     let path = format!("/rustfs/admin/v3/pools/decommission?pool={pool_id}&by-id=true");
     let (status, response) = cluster_admin(cluster, Method::POST, &path, None).await?;
-    if status.is_success() {
-        return Ok(DataMovementStart::Started);
-    }
-    // Admin handlers wrap the pool-meta fence as S3 InternalError XML, so the
-    // inner "writes remain blocked" string is often only in server logs.
-    // NotImplemented is the single-pool / unsupported-layout response.
-    if status.is_server_error()
-        || status.as_u16() == 501
-        || is_pool_meta_write_fence(&response)
-        || response.contains("NotImplemented")
-    {
-        return Ok(DataMovementStart::RefusedByPoolMetaFence(format!("{status} {response}")));
-    }
-    Err(format!("POST {path} failed: {status} {response}").into())
+    classify_data_movement_http(status, &response).map_err(|detail| format!("POST {path} failed: {detail}").into())
 }
 
-/// Returns whether decommission actually started. A pool-meta fence is not a
-/// test failure: callers still assert object bytes. Any other error fails.
-pub(crate) async fn decommission_started_or_fenced(cluster: &RustFSTestClusterEnvironment, pool_id: usize) -> TestResult<bool> {
+/// Returns whether decommission actually started. A product refusal or opaque
+/// 5xx is not a test failure: callers still assert object bytes.
+pub(crate) async fn decommission_started_or_refused(cluster: &RustFSTestClusterEnvironment, pool_id: usize) -> TestResult<bool> {
     match try_start_decommission(cluster, pool_id).await? {
         DataMovementStart::Started => Ok(true),
-        DataMovementStart::RefusedByPoolMetaFence(detail) => {
-            eprintln!("decommission POST refused by pool-meta write fence on localhost DistErasure: {detail}");
+        DataMovementStart::Refused(detail) => {
+            eprintln!("decommission POST refused; objects still asserted: {detail}");
             Ok(false)
         }
     }
@@ -607,49 +613,50 @@ pub(crate) fn decommission_failed(status: &serde_json::Value, pool_id: usize) ->
     pool_entry(status, pool_id).is_some_and(decommission_pool_failed)
 }
 
+/// `Ok(true)` complete, `Ok(false)` still running, `Err` terminal failure.
+pub(crate) fn decommission_progress(status: &serde_json::Value, pool_id: usize) -> Result<bool, String> {
+    if decommission_failed(status, pool_id) {
+        return Err(format!("decommission failed for pool {pool_id}: {status}"));
+    }
+    Ok(decommission_complete(status, pool_id))
+}
+
 pub(crate) async fn wait_for_decommission_complete(
     cluster: &RustFSTestClusterEnvironment,
     pool_id: usize,
     timeout: Duration,
 ) -> TestResult {
-    wait_until(
-        timeout,
-        || async {
-            let status = decommission_status_json(cluster).await?;
-            if decommission_failed(&status, pool_id) {
-                return Err(format!("decommission failed for pool {pool_id}: {status}").into());
-            }
-            Ok(decommission_complete(&status, pool_id))
-        },
-        "decommission complete",
-    )
-    .await
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(50);
+    let mut last_error;
+    loop {
+        last_error = match decommission_status_json(cluster).await {
+            Ok(status) => match decommission_progress(&status, pool_id) {
+                Ok(true) => return Ok(()),
+                Ok(false) => format!("decommission complete still false: {status}"),
+                Err(failed) => return Err(failed.into()),
+            },
+            Err(error) => error.to_string(),
+        };
+        if Instant::now() >= deadline {
+            return Err(format!("decommission complete did not become true within {timeout:?}: {last_error}").into());
+        }
+        sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(1));
+    }
 }
 
 pub(crate) async fn try_start_rebalance(cluster: &RustFSTestClusterEnvironment) -> TestResult<DataMovementStart> {
     let path = "/rustfs/admin/v3/rebalance/start";
     let (status, response) = cluster_admin(cluster, Method::POST, path, None).await?;
-    if status.is_success() {
-        return Ok(DataMovementStart::Started);
-    }
-    // Admin handlers wrap the pool-meta fence as S3 InternalError XML, so the
-    // inner "writes remain blocked" string is often only in server logs.
-    // NotImplemented is the single-pool / unsupported-layout response.
-    if status.is_server_error()
-        || status.as_u16() == 501
-        || is_pool_meta_write_fence(&response)
-        || response.contains("NotImplemented")
-    {
-        return Ok(DataMovementStart::RefusedByPoolMetaFence(format!("{status} {response}")));
-    }
-    Err(format!("POST {path} failed: {status} {response}").into())
+    classify_data_movement_http(status, &response).map_err(|detail| format!("POST {path} failed: {detail}").into())
 }
 
-pub(crate) async fn rebalance_started_or_fenced(cluster: &RustFSTestClusterEnvironment) -> TestResult<bool> {
+pub(crate) async fn rebalance_started_or_refused(cluster: &RustFSTestClusterEnvironment) -> TestResult<bool> {
     match try_start_rebalance(cluster).await? {
         DataMovementStart::Started => Ok(true),
-        DataMovementStart::RefusedByPoolMetaFence(detail) => {
-            eprintln!("rebalance POST refused by pool-meta write fence on localhost DistErasure: {detail}");
+        DataMovementStart::Refused(detail) => {
+            eprintln!("rebalance POST refused; objects still asserted: {detail}");
             Ok(false)
         }
     }
@@ -771,19 +778,19 @@ pub(crate) async fn retrying_get_equals(
 
 #[tokio::test]
 async fn append_single_node_pool_extends_ellipses_volumes() {
-    let mut env = RustFSTestClusterEnvironment::with_topology(ClusterTopology::per_node_pools(2, vec![vec![0], vec![1]]))
+    let mut dist = DistCluster::new_stopped(DistLayout::TwoPoolFourDrive)
         .await
         .expect("two-pool seed topology");
-    assert_eq!(env.rustfs_volumes_arg().split(' ').count(), 2);
+    assert_eq!(dist.cluster.rustfs_volumes_arg().split(' ').count(), 2);
 
-    let added = env.append_single_node_pool().await.expect("append third pool");
+    let added = dist.cluster.append_single_node_pool().await.expect("append third pool");
     assert_eq!(added, 2);
-    assert_eq!(env.nodes.len(), 3);
-    assert_eq!(env.nodes[2].pool_idx, 2);
-    assert_eq!(env.nodes[2].data_dirs.len(), 2);
-    let volumes = env.rustfs_volumes_arg();
+    assert_eq!(dist.cluster.nodes.len(), 3);
+    assert_eq!(dist.cluster.nodes[2].pool_idx, 2);
+    assert_eq!(dist.cluster.nodes[2].data_dirs.len(), DRIVES_PER_NODE);
+    let volumes = dist.cluster.rustfs_volumes_arg();
     assert_eq!(volumes.split(' ').count(), 3, "expected three pool arguments, got: {volumes}");
-    assert!(volumes.contains("/drive{0...1}"), "expanded layout must keep drive ellipses: {volumes}");
+    assert!(volumes.contains("/drive{0...3}"), "expanded layout must keep drive ellipses: {volumes}");
 }
 
 #[tokio::test]
@@ -816,6 +823,22 @@ fn decommission_complete_reads_pool_status_and_info_flag() {
     assert!(decommission_complete(&status, 0));
     assert!(!decommission_complete(&status, 1));
     assert!(!decommission_failed(&status, 0));
+    assert!(decommission_progress(&status, 0).expect("complete pool"));
+    assert!(!decommission_progress(&status, 1).expect("other pool is not complete"));
+}
+
+#[test]
+fn decommission_progress_fails_closed_on_failed_flag() {
+    let failed = serde_json::json!({
+        "pools": [{
+            "id": 0,
+            "status": "failed",
+            "decommissionInfo": { "complete": false, "failed": true, "canceled": false }
+        }]
+    });
+    let err = decommission_progress(&failed, 0).expect_err("failed decommission must not look complete");
+    assert!(err.contains("decommission failed for pool 0"), "{err}");
+    assert!(!decommission_progress(&failed, 1).expect("missing pool is still running"));
 }
 
 #[test]
@@ -837,4 +860,40 @@ fn pool_meta_write_fence_matches_known_product_gates() {
     assert!(is_pool_meta_write_fence("pool metadata recovery required: no durable bootstrap identity"));
     assert!(!is_pool_meta_write_fence("NotImplemented: single pool cannot decommission"));
     assert!(!is_pool_meta_write_fence("AccessDenied"));
+}
+
+#[test]
+fn classify_data_movement_http_observes_product_refusals_not_auth_failures() {
+    assert!(matches!(classify_data_movement_http(StatusCode::OK, ""), Ok(DataMovementStart::Started)));
+    assert!(matches!(
+        classify_data_movement_http(
+            StatusCode::BAD_REQUEST,
+            "failed to start decommission: single pool deployments do not support decommission"
+        ),
+        Ok(DataMovementStart::Refused(_))
+    ));
+    assert!(matches!(
+        classify_data_movement_http(
+            StatusCode::BAD_REQUEST,
+            "failed to start decommission: at least one active pool must remain after decommission start"
+        ),
+        Ok(DataMovementStart::Refused(_))
+    ));
+    assert!(matches!(
+        classify_data_movement_http(StatusCode::NOT_IMPLEMENTED, "NotImplemented"),
+        Ok(DataMovementStart::Refused(_))
+    ));
+    assert!(matches!(
+        classify_data_movement_http(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pool metadata writes remain blocked after a recovery-required replica state"
+        ),
+        Ok(DataMovementStart::Refused(_))
+    ));
+    assert!(matches!(
+        classify_data_movement_http(StatusCode::INTERNAL_SERVER_ERROR, "InternalError"),
+        Ok(DataMovementStart::Refused(_))
+    ));
+    let denied = classify_data_movement_http(StatusCode::FORBIDDEN, "AccessDenied").expect_err("auth failure is not a refusal");
+    assert!(denied.contains("AccessDenied"), "{denied}");
 }

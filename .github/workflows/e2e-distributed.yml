@@ -100,11 +100,11 @@ jobs:
       - name: Run distributed 4-node e2e suite
         env:
           RUSTFS_E2E_LOG_DIR: ${{ runner.temp }}/rustfs-e2e-distributed-logs
+          NEXTEST_FILTER: ${{ github.event.inputs.filter }}
         run: |
           set -euo pipefail
-          FILTER='${{ github.event.inputs.filter }}'
-          if [ -n "${FILTER}" ]; then
-            cargo nextest run --profile e2e-distributed -p e2e_test -E "${FILTER}"
+          if [ -n "${NEXTEST_FILTER}" ]; then
+            cargo nextest run --profile e2e-distributed -p e2e_test -E "${NEXTEST_FILTER}" --no-tests=fail
           else
             cargo nextest run --profile e2e-distributed -p e2e_test --no-tests=fail
           fi

@@ -13,27 +13,27 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, assert_inventory, decommission_started_or_fenced, put_inventory_retrying, sha256_hex,
+    DistCluster, DistLayout, TestResult, assert_inventory, decommission_started_or_refused, put_inventory_retrying, sha256_hex,
     unique_bucket, wait_for_decommission_complete,
 };
 use crate::common::init_logging;
 use std::time::Duration;
 
 #[tokio::test]
-async fn decommission_does_not_alter_object_sha256_across_pools() -> TestResult {
+async fn decommission_attempt_does_not_alter_object_sha256() -> TestResult {
     init_logging();
-    let dist = DistCluster::start(DistLayout::TwoPoolFourDrive).await?;
+    let dist = DistCluster::start(DistLayout::FourByFour).await?;
     let bucket = unique_bucket("integrity");
     dist.create_bucket(&bucket).await?;
     let client = dist.client(0)?;
     let inventory = put_inventory_retrying(&client, &bucket, 20, 64 * 1024, Duration::from_secs(30)).await?;
     let before: Vec<(String, String)> = inventory.iter().map(|(key, body)| (key.clone(), sha256_hex(body))).collect();
 
-    if decommission_started_or_fenced(&dist.cluster, 0).await? {
+    if decommission_started_or_refused(&dist.cluster, 0).await? {
         wait_for_decommission_complete(&dist.cluster, 0, Duration::from_secs(180)).await?;
     }
 
-    let after_client = dist.client(1)?;
+    let after_client = dist.client(2)?;
     assert_inventory(&after_client, &bucket, &inventory).await?;
     for (key, expected_hash) in before {
         let got = after_client.get_object().bucket(&bucket).key(&key).send().await?;

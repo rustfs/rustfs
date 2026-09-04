@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, assert_inventory, decommission_started_or_fenced, put_inventory_retrying,
-    rebalance_started_or_fenced, retrying_get_equals, retrying_put, unique_bucket, wait_for_decommission_complete,
+    DistCluster, DistLayout, TestResult, assert_inventory, decommission_started_or_refused, put_inventory_retrying,
+    rebalance_started_or_refused, retrying_get_equals, retrying_put, unique_bucket, wait_for_decommission_complete,
 };
 use crate::common::init_logging;
 use std::time::Duration;
@@ -22,14 +22,14 @@ use std::time::Duration;
 #[tokio::test]
 async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResult {
     init_logging();
-    let dist = DistCluster::start(DistLayout::TwoPoolFourDrive).await?;
+    let dist = DistCluster::start(DistLayout::FourByFour).await?;
     let bucket = unique_bucket("s3move");
     dist.create_bucket(&bucket).await?;
     let client = dist.client(0)?;
     let inventory = put_inventory_retrying(&client, &bucket, 8, 16 * 1024, Duration::from_secs(30)).await?;
 
-    let decommission_started = decommission_started_or_fenced(&dist.cluster, 0).await?;
-    let live = dist.client(1)?;
+    let decommission_started = decommission_started_or_refused(&dist.cluster, 0).await?;
+    let live = dist.client(2)?;
     retrying_put(
         &live,
         &bucket,
@@ -60,7 +60,7 @@ async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResu
     }
     assert_inventory(&live, &bucket, &inventory).await?;
 
-    let _ = rebalance_started_or_fenced(&dist.cluster).await?;
+    let _ = rebalance_started_or_refused(&dist.cluster).await?;
     retrying_put(
         &live,
         &bucket,

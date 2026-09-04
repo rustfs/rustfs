@@ -11,11 +11,11 @@ The in-tree harness runs every node on `127.0.0.1` with a distinct port. That ma
 |---|---|---|
 | 4 nodes × 4 drives, one pool | `ClusterTopology::single_pool_multidrive(4, 4)` | S3, object lock, versioning, quota, observability, concurrency, chaos |
 | 4 nodes × 1 drive, one pool | `ClusterTopology::single_pool(4)` | Two-site replication (8 processes total); direct/rolling upgrade from the pinned previous release |
-| 2 single-node pools × 4 drives | `ClusterTopology::per_node_pools(4, [[0],[1]])` | Restart, decommission/rebalance *attempts*, checksum integrity. Appending more pools and restarting currently dies with `pool metadata recovery required`; that is pinned, not patched, in this lane |
+| 2 single-node pools × 4 drives | `ClusterTopology::per_node_pools(4, [[0],[1]])` | Harness-only: `append_single_node_pool` unit tests. Live multi-pool expand/restart currently dies with `pool metadata recovery required`; this lane does not change that production gate |
 
 A pool striped across several localhost ports is not expressible (`RUSTFS_VOLUMES` host ellipses would collide on disk paths). Multi-host striped pools remain the hardware functional-chain / backlog #1313 / #1314 lane.
 
-Decommission and rebalance POST currently 500 on localhost DistErasure multi-pool when pool.bin writes are fenced (`pool metadata writes remain blocked` / missing fleet capability proof). Those cases still assert object bytes and SHA-256; when the API starts they wait for completion and assert post-move integrity. They do not treat the fence as a successful move. This lane does not change production pool-meta bootstrap or write-fence logic; it only observes the current server behavior.
+Decommission and rebalance POST on the 4×4 single-pool layout is refused by the current product (`single pool deployments do not support decommission`, NotImplemented, or an opaque admin 5xx when the inner pool-meta fence is wrapped as InternalError). Those cases still assert object bytes and SHA-256; when the API starts they wait for completion and assert post-move integrity. They do not treat a refusal as a successful move. This lane does not change production pool-meta bootstrap, write-fence, or decommission policy; it only observes the current server behavior.
 
 ## What this lane covers
 
@@ -26,7 +26,7 @@ Decommission and rebalance POST currently 500 on localhost DistErasure multi-poo
 - Versioning, version GET, delete marker
 - Bucket replication between two 4-node clusters; hard quota
 - Health / admin info / storageinfo / audit target list
-- Pool restart, decommission/rebalance *attempts*, checksum integrity, S3 during those attempts. Appending pools and restarting is asserted to fail closed on the current localhost pool-meta recovery gate; this lane does not change that production gate
+- Pool restart, decommission/rebalance *attempts*, checksum integrity, S3 during those attempts on 4×4. Live multi-pool expand/restart is a production pool-meta bootstrap limitation and is not patched here; `append_single_node_pool` is covered by harness unit tests
 - Site replication object convergence
 - High-concurrency PUT/GET; concurrent PUT during decommission
 - Node kill/restart, full process restart, drive offline (4×4). Volume-proxy blackhole stays in `cluster_volume_fault_proxy_pass_smoke` (2×2); a 4-node volume proxy cannot format because RPC audience is the listen port
