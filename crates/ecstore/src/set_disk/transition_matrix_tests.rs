@@ -25,19 +25,24 @@ use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
 use tokio::io::AsyncReadExt;
 
 async fn prime_metadata_generation(set_disks: &SetDisks, bucket: &str, object: &str) -> GetObjectMetadataCacheKey {
-    set_disks
-        .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
-        .await
-        .expect("object metadata should resolve");
-    let generation = set_disks
-        .get_object_metadata_cache_generation(bucket, object)
-        .expect("metadata generation should be active");
-    let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
-    assert!(
-        set_disks.get_object_metadata_cache.get(&key).await.is_some(),
-        "metadata read should publish the generation under test"
-    );
-    key
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            set_disks
+                .get_object_fileinfo(bucket, object, &ObjectOptions::default(), true, false)
+                .await
+                .expect("object metadata should resolve");
+            let generation = set_disks
+                .get_object_metadata_cache_generation(bucket, object)
+                .expect("metadata generation should be active");
+            let key = GetObjectMetadataCacheKey::new(bucket, object, generation);
+            if set_disks.get_object_metadata_cache.get(&key).await.is_some() {
+                return key;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("metadata read should publish the generation under test")
 }
 
 async fn assert_generation_reclaimed(set_disks: &SetDisks, key: &GetObjectMetadataCacheKey) {
@@ -60,8 +65,17 @@ async fn transition_and_restore_reclaim_prior_metadata_generations() {
         .await
         .expect("bucket should be created");
     let mut reader = PutObjReader::from_vec(payload.clone());
+    // Cache priming must not race a quorum-acknowledged PUT's remaining rename tail.
     let original = set_disks
-        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+        .put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
         .await
         .expect("source object should be written");
     let source_generation = prime_metadata_generation(&set_disks, bucket, object).await;
@@ -164,8 +178,17 @@ async fn prepared_snapshot_transition_duplicate_and_late_get_use_committed_remot
         .await
         .expect("bucket should be created");
     let mut reader = PutObjReader::from_vec(payload.clone());
+    // Cache priming must not race a quorum-acknowledged PUT's remaining rename tail.
     let original = set_disks
-        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+        .put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            },
+        )
         .await
         .expect("source object should be written");
 
