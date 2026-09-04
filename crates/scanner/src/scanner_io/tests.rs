@@ -17,6 +17,7 @@ use super::io_disk::tier_stats_template;
 use super::*;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
 use crate::scanner_folder::ScannerItem;
+use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::owner::{
     EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
 };
@@ -908,8 +909,8 @@ fn peer_dirty_usage_snapshot(
     generation: u64,
     complete: bool,
     buckets: &[(&str, u64)],
-) -> rustfs_ecstore::api::rpc::ScannerPeerDirtyUsageSnapshot {
-    rustfs_ecstore::api::rpc::ScannerPeerDirtyUsageSnapshot {
+) -> EcstoreScannerPeerDirtyUsageSnapshot {
+    EcstoreScannerPeerDirtyUsageSnapshot {
         instance_id: instance_id.to_string(),
         generation,
         pending_bucket_count: u64::try_from(buckets.len()).expect("test bucket count should fit"),

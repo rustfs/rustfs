@@ -28,7 +28,6 @@ use rand::seq::SliceRandom as _;
 #[cfg(test)]
 use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
 use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo};
-use rustfs_ecstore::api::rpc::ScannerPeerDirtyUsageSnapshot;
 use rustfs_filemeta::FileMeta;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{LockError, NamespaceLockGuard};
@@ -56,6 +55,7 @@ use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, warn};
 
 use crate::ScannerObjectInfo as ObjectInfo;
+use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::ScannerStorage;
 use crate::storage_api::scan::NamespaceLocking as _;
 use crate::storage_api::scanner_io::{BucketInfo, BucketOptions};
@@ -144,7 +144,7 @@ struct ScannerPeerDirtyUsageExpectation {
 
 fn verified_remote_dirty_usage_buckets(
     expected_peers: &HashMap<String, ScannerPeerDirtyUsageExpectation>,
-    peer_snapshots: Vec<(String, ScannerPeerDirtyUsageSnapshot)>,
+    peer_snapshots: Vec<(String, EcstoreScannerPeerDirtyUsageSnapshot)>,
 ) -> Option<HashSet<String>> {
     if expected_peers.is_empty() || peer_snapshots.len() != expected_peers.len() {
         return None;
