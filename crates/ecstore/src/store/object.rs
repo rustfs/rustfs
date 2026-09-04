@@ -18,7 +18,9 @@ use crate::bucket::lifecycle::{
     get_expiry_configs,
     tier_delete_journal::{
         ActiveTierDeleteDispatch, EVENT_LIFECYCLE_TIER_DELETE_JOURNAL, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_LIFECYCLE,
-        complete_tier_delete_dispatch, prepare_tier_delete_dispatch, record_tier_delete_journal_backend_identity,
+        TierDeleteChunkParentInspection, complete_tier_delete_chunk_parent, complete_tier_delete_dispatch,
+        inspect_tier_delete_chunk_parent, prepare_tier_delete_chunk_dispatch, prepare_tier_delete_dispatch,
+        record_tier_delete_journal_backend_identity, resume_tier_delete_dispatch, tier_delete_dispatch_batch_limit,
         tier_delete_journal_object_name, tier_delete_source_matches_dispatch_scope,
     },
     tier_sweeper::{
@@ -41,7 +43,10 @@ use crate::object_api::{
     NamespaceLockFence, ObjectLockConfigSnapshot, ScannerPublicationCommitScopeGuard, ScannerPublicationCommitState,
     TierFreeVersionReceiptSink,
 };
-use crate::services::notification_sys::acquire_tier_delete_journal_fleet_proof;
+use crate::services::notification_sys::{
+    TierDeleteJournalFleetProofToken, acquire_tier_delete_journal_fleet_proof, tier_delete_journal_fleet_proof_matches,
+    tier_delete_journal_topology_generation,
+};
 use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease, tier_destination_id_from_metadata};
 use crate::set_disk::{
     SetDisks, get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
@@ -52,6 +57,7 @@ use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
     object::{DeleteAccounting, ObjectIO as _, ObjectOperations as _},
 };
+use futures::StreamExt as _;
 use parking_lot::Mutex as ParkingMutex;
 use rustfs_filemeta::ObjectPartInfo;
 use rustfs_io_metrics::{
@@ -73,6 +79,7 @@ const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 1000;
 const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 2;
 const RESTORE_WORKER_LOCK_PREFIX: &str = "ilm/restore-worker-locks";
 const RESTORE_WORKER_LOCK_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+const TIER_DELETE_DISPATCH_LOCAL_REPLAY_CONCURRENCY: usize = 16;
 
 fn install_tier_free_version_receipt_sink(opts: &mut ObjectOptions) -> Option<TierFreeVersionReceiptSink> {
     if opts.tier_free_version_receipt_sink.is_some() || opts.skip_free_version || opts.delete_prefix {
@@ -147,14 +154,76 @@ async fn prepare_prefix_tier_delete_journal_entries(
     Box::pin(prepare_prefix_tier_delete_journal_entries_inner(api, bucket, prefix, opts)).await
 }
 
+type TierDeleteLeaseReference = (String, Option<TierDestinationId>);
+
+fn tier_delete_walk_cancellation_is_expected(truncated: bool, limit_cancellation: bool, error: &Error) -> bool {
+    truncated && limit_cancellation && matches!(error, Error::OperationCanceled)
+}
+
+async fn acquire_prefix_tier_delete_reference_leases(
+    api: &Arc<ECStore>,
+    tier_references: &std::collections::HashSet<TierDeleteLeaseReference>,
+) -> Result<Vec<TierOperationLease>> {
+    let mut tier_references = tier_references.iter().cloned().collect::<Vec<_>>();
+    tier_references.sort_unstable();
+    let mut leases = Vec::with_capacity(tier_references.len());
+    for (tier_name, backend_identity) in tier_references {
+        let lease = match backend_identity {
+            Some(backend_identity) => {
+                TierConfigMgr::acquire_operation_lease_for_backend_identity(&api.tier_config_mgr(), &tier_name, backend_identity)
+                    .await
+            }
+            None => TierConfigMgr::acquire_operation_lease(&api.tier_config_mgr(), &tier_name).await,
+        }
+        .map_err(Error::other)?;
+        leases.push(lease);
+    }
+    Ok(leases)
+}
+
+async fn acquire_prefix_tier_delete_leases(api: &Arc<ECStore>, entries: &[Jentry]) -> Result<Vec<TierOperationLease>> {
+    let tier_references = entries
+        .iter()
+        .map(|entry| (entry.tier_name.clone(), entry.backend_identity))
+        .collect::<std::collections::HashSet<_>>();
+    acquire_prefix_tier_delete_reference_leases(api, &tier_references).await
+}
+
 async fn prepare_prefix_tier_delete_journal_entries_inner(
     api: &Arc<ECStore>,
     bucket: &str,
     prefix: &str,
     opts: &ObjectOptions,
 ) -> Result<PreparedPrefixTierDelete> {
+    let (chunk_parent_active, legacy_manifest_active, chunk_parent_topology_generation) = if is_meta_bucketname(bucket) {
+        (false, false, None)
+    } else {
+        let bucket_incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+        let bucket_fence = opts
+            .bucket_lifecycle_lock_fence
+            .as_ref()
+            .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
+        match inspect_tier_delete_chunk_parent(Arc::clone(api), bucket, bucket_incarnation, prefix, bucket_fence).await? {
+            TierDeleteChunkParentInspection::NoParent => (false, false, None),
+            TierDeleteChunkParentInspection::LegacyManifest => (false, true, None),
+            TierDeleteChunkParentInspection::Ready(topology_generation) => (true, false, Some(topology_generation)),
+            TierDeleteChunkParentInspection::Resume(dispatch) => {
+                let leases = acquire_prefix_tier_delete_leases(api, dispatch.entries()?).await?;
+                return Ok(PreparedPrefixTierDelete {
+                    dispatch: Some(*dispatch),
+                    chunk_parent_active: true,
+                    chunk_parent_fleet_proof: None,
+                    _leases: leases,
+                });
+            }
+            TierDeleteChunkParentInspection::RetryRequired => {
+                return Err(Error::other("tier delete chunk parent made durable progress; retry the next batch"));
+            }
+        }
+    };
     let mut tier_references = std::collections::HashSet::<(String, Option<TierDestinationId>)>::new();
     let mut entries_by_name = std::collections::BTreeMap::new();
+    let batch_limit = tier_delete_dispatch_batch_limit();
     let logical_prefix = decode_dir_object(prefix);
     let exact_object = opts.delete_prefix_object.then(|| logical_prefix.clone());
     let physical_sets = api
@@ -164,12 +233,11 @@ async fn prepare_prefix_tier_delete_journal_entries_inner(
         .collect::<Vec<_>>();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ObjectInfoOrErr>(100);
     let cancellation = tokio_util::sync::CancellationToken::new();
+    let limit_cancellation = Arc::new(AtomicBool::new(false));
     let walk_cancel = cancellation.clone();
     let bucket_owned = bucket.to_string();
     let prefix_owned = prefix.to_string();
     let walk = async move {
-        use futures::StreamExt as _;
-
         let results = futures::stream::iter(physical_sets.into_iter().map(|set| {
             let tx = tx.clone();
             let cancellation = walk_cancel.clone();
@@ -201,11 +269,25 @@ async fn prepare_prefix_tier_delete_journal_entries_inner(
         drop(tx);
         results.into_iter().collect::<Result<Vec<_>>>().map(|_| ())
     };
+    let collect_limit_cancellation = limit_cancellation.clone();
     let collect = async {
+        let mut truncated = false;
         while let Some(result) = rx.recv().await {
             if let Some(err) = result.err {
+                // Once limit + 1 has been observed this request can authorize
+                // only the exact retained batch; it cannot infer prefix
+                // absence or run the raw delete. Drain only the explicit
+                // cancellation fallout; a real walker error must still fail
+                // the request even when another set reached the limit first.
+                if tier_delete_walk_cancellation_is_expected(truncated, collect_limit_cancellation.load(Ordering::Acquire), &err)
+                {
+                    continue;
+                }
                 cancellation.cancel();
                 return Err(err);
+            }
+            if truncated {
+                continue;
             }
             let Some(source) = result.item else {
                 continue;
@@ -223,62 +305,125 @@ async fn prepare_prefix_tier_delete_journal_entries_inner(
                     "recursive prefix delete cannot discard an existing tier free-version cleanup obligation",
                 ));
             }
-            if source.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE {
+            let tier_reference = if source.transitioned_object.status == rustfs_filemeta::TRANSITION_COMPLETE {
                 let backend_identity = tier_destination_id_from_metadata(&source.user_defined).map_err(Error::other)?;
-                tier_references.insert((source.transitioned_object.tier.clone(), backend_identity));
-            }
+                Some((source.transitioned_object.tier.clone(), backend_identity))
+            } else {
+                None
+            };
             if let Some(entry) = build_tier_delete_journal_entry(bucket, &object, opts, &source)? {
-                entries_by_name
-                    .entry(tier_delete_journal_object_name(&entry))
-                    .or_insert(entry);
+                let name = tier_delete_journal_object_name(&entry);
+                let at_limit = entries_by_name.len() == batch_limit;
+                match entries_by_name.entry(name) {
+                    std::collections::btree_map::Entry::Occupied(_) => {}
+                    std::collections::btree_map::Entry::Vacant(_) if at_limit => {
+                        truncated = true;
+                        collect_limit_cancellation.store(true, Ordering::Release);
+                        cancellation.cancel();
+                    }
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        if let Some(tier_reference) = tier_reference {
+                            tier_references.insert(tier_reference);
+                        }
+                        slot.insert(entry);
+                    }
+                }
+            } else if let Some(tier_reference) = tier_reference {
+                tier_references.insert(tier_reference);
             }
         }
-        Ok(())
+        Ok(truncated)
     };
     let (walk_result, collect_result) = tokio::join!(walk, collect);
-    collect_result?;
-    walk_result?;
-    let entries = entries_by_name.into_values().collect::<Vec<_>>();
-
-    let mut tier_references = tier_references.into_iter().collect::<Vec<_>>();
-    tier_references.sort_unstable();
-    let mut leases = Vec::with_capacity(tier_references.len());
-    for (tier_name, backend_identity) in tier_references {
-        let lease = match backend_identity {
-            Some(backend_identity) => {
-                TierConfigMgr::acquire_operation_lease_for_backend_identity(&api.tier_config_mgr(), &tier_name, backend_identity)
-                    .await
-            }
-            None => TierConfigMgr::acquire_operation_lease(&api.tier_config_mgr(), &tier_name).await,
-        }
-        .map_err(Error::other)?;
-        leases.push(lease);
+    let truncated = collect_result?;
+    // A truncated walk normally reports OperationCanceled from the physical
+    // walkers. That cancellation is expected; any other result is a genuine
+    // scan failure and cannot be hidden by the bounded batch.
+    if let Err(err) = walk_result
+        && !tier_delete_walk_cancellation_is_expected(truncated, limit_cancellation.load(Ordering::Acquire), &err)
+    {
+        return Err(err);
     }
+    let entries = entries_by_name.into_values().collect::<Vec<_>>();
+    let mut leased_tier_references = tier_references;
+    let mut leases = acquire_prefix_tier_delete_reference_leases(api, &leased_tier_references).await?;
     if entries.is_empty() {
+        let chunk_parent_fleet_proof = if let Some(expected_topology) = chunk_parent_topology_generation.as_deref() {
+            let fleet_proof = acquire_tier_delete_journal_fleet_proof()
+                .ok_or_else(|| Error::other("tier delete chunk parent fleet capability is unavailable"))?;
+            if tier_delete_journal_topology_generation(&fleet_proof) != expected_topology {
+                return Err(Error::other("tier delete chunk parent topology changed during final source scan"));
+            }
+            Some(fleet_proof)
+        } else {
+            None
+        };
         return Ok(PreparedPrefixTierDelete {
             dispatch: None,
+            chunk_parent_active,
+            chunk_parent_fleet_proof,
             _leases: leases,
         });
     }
 
     let bucket_incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
-    let fleet_proof = acquire_tier_delete_journal_fleet_proof()
-        .ok_or_else(|| Error::other("tier delete journal v6 fleet capability is unavailable"))?;
     let bucket_fence = opts
         .bucket_lifecycle_lock_fence
         .as_ref()
         .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
-    let dispatch =
+    let fleet_proof = acquire_tier_delete_journal_fleet_proof()
+        .ok_or_else(|| Error::other("tier delete journal v6 fleet capability is unavailable"))?;
+    if chunk_parent_topology_generation
+        .as_deref()
+        .is_some_and(|expected| tier_delete_journal_topology_generation(&fleet_proof) != expected)
+    {
+        return Err(Error::other("tier delete chunk parent topology changed during source scan"));
+    }
+    let mut dispatch = if !legacy_manifest_active && (chunk_parent_active || truncated) {
+        prepare_tier_delete_chunk_dispatch(
+            Arc::clone(api),
+            bucket,
+            bucket_incarnation,
+            prefix,
+            entries,
+            truncated && !chunk_parent_active,
+            fleet_proof,
+            bucket_fence,
+        )
+        .await?
+    } else if legacy_manifest_active && truncated {
+        resume_tier_delete_dispatch(Arc::clone(api), bucket, bucket_incarnation, prefix, entries, fleet_proof, bucket_fence)
+            .await?
+    } else {
         prepare_tier_delete_dispatch(Arc::clone(api), bucket, bucket_incarnation, prefix, entries, fleet_proof, bucket_fence)
-            .await?;
+            .await?
+    };
+    // A resumed legacy authorization may own predecessors that are absent
+    // from this bounded scan. Pin every backend generation in the actual
+    // permit before any local mutation, while avoiding duplicate leases for
+    // entries already covered by the scan.
+    let additional_tier_references = dispatch
+        .entries()?
+        .iter()
+        .map(|entry| (entry.tier_name.clone(), entry.backend_identity))
+        .filter(|reference| leased_tier_references.insert(reference.clone()))
+        .collect::<std::collections::HashSet<_>>();
+    leases.extend(acquire_prefix_tier_delete_reference_leases(api, &additional_tier_references).await?);
+    if legacy_manifest_active && truncated {
+        dispatch.require_exact_predecessor_replay();
+    }
     Ok(PreparedPrefixTierDelete {
         dispatch: Some(dispatch),
+        chunk_parent_active: chunk_parent_active || truncated,
+        chunk_parent_fleet_proof: None,
         _leases: leases,
     })
 }
 
 struct PreparedPrefixTierDelete {
     dispatch: Option<crate::bucket::lifecycle::tier_delete_journal::PreparedTierDeleteDispatch>,
+    chunk_parent_active: bool,
+    chunk_parent_fleet_proof: Option<TierDeleteJournalFleetProofToken>,
     _leases: Vec<TierOperationLease>,
 }
 
@@ -365,12 +510,16 @@ async fn delete_prefix_with_tier_delete_journal(
     let Some(api) = tier_journal_api else {
         return store.delete_prefix(bucket, object, opts).await;
     };
-    let PreparedPrefixTierDelete { dispatch, _leases } =
-        prepare_prefix_tier_delete_journal_entries(api, bucket, object, opts).await?;
+    let PreparedPrefixTierDelete {
+        dispatch,
+        chunk_parent_active,
+        chunk_parent_fleet_proof,
+        _leases,
+    } = prepare_prefix_tier_delete_journal_entries(api, bucket, object, opts).await?;
     let Some(dispatch) = dispatch else {
-        // There is no remote-cleanup candidate, so no v6 manifest or fleet
-        // proof is required.  Keep any compatibility-path tier leases alive
-        // until the local delete has committed.
+        // There is no new remote-cleanup candidate. Keep compatibility-path
+        // tier leases and, for a chunked final pass, the matching parent fleet
+        // proof alive until local deletion and parent completion both commit.
         let _tier_leases = _leases;
         let mut operation_opts = opts.clone();
         // `tier_delete_journal_api` means a v6 dispatch authorization must be
@@ -379,7 +528,42 @@ async fn delete_prefix_with_tier_delete_journal(
         // transitioned metadata retains its FreeVersion fallback.
         operation_opts.tier_delete_journal_api = None;
         operation_opts.tier_delete_dispatch_authorization = None;
-        return store.delete_prefix(bucket, object, &operation_opts).await;
+        let parent_fleet_proof = if chunk_parent_active {
+            Some(
+                chunk_parent_fleet_proof
+                    .as_ref()
+                    .filter(|proof| tier_delete_journal_fleet_proof_matches(proof))
+                    .ok_or_else(|| Error::other("tier delete chunk parent fleet proof changed before final deletion"))?,
+            )
+        } else {
+            None
+        };
+        store.delete_prefix(bucket, object, &operation_opts).await?;
+        if let Some(parent_fleet_proof) = parent_fleet_proof {
+            #[cfg(all(test, feature = "test-util"))]
+            crate::bucket::lifecycle::tier_delete_journal::tier_delete_chunk_test_pause(
+                crate::bucket::lifecycle::tier_delete_journal::TierDeleteChunkTestStage::FinalLocalDeletionCompleted,
+            )
+            .await;
+            let bucket_incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
+            let bucket_fence = opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .ok_or_else(|| Error::other("tier delete dispatch requires a bucket lifecycle write fence"))?;
+            if !complete_tier_delete_chunk_parent(
+                Arc::clone(api),
+                bucket,
+                bucket_incarnation,
+                object,
+                bucket_fence,
+                parent_fleet_proof,
+            )
+            .await?
+            {
+                return Err(Error::other("tier delete chunk parent disappeared after final local deletion"));
+            }
+        }
+        return Ok(());
     };
     let bucket_incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
     let bucket_fence = opts
@@ -396,9 +580,19 @@ async fn delete_prefix_with_tier_delete_journal(
     // Keep every backend generation lease until the whole local operation has
     // either committed its journal set or returned an ambiguous mutation.
     let _tier_leases = _leases;
-    if active.predecessor_replay_required() {
+    if active.predecessor_replay_required() || active.is_chunked() {
         replay_authorized_tier_delete_sources(store, bucket, object, &active, &operation_opts).await?;
+        #[cfg(all(test, feature = "test-util"))]
+        if active.is_chunked() {
+            crate::bucket::lifecycle::tier_delete_journal::tier_delete_chunk_test_pause(
+                crate::bucket::lifecycle::tier_delete_journal::TierDeleteChunkTestStage::LocalReplayCompleted,
+            )
+            .await;
+        }
         complete_tier_delete_dispatch(Arc::clone(api), &active, bucket_fence).await?;
+        if active.is_chunked() {
+            return Err(Error::other("tier delete chunk completed; retry the next durable batch"));
+        }
         return Err(Error::other("authorized tier delete predecessor completed; retry the successor dispatch"));
     }
     let result = store.delete_prefix(bucket, object, &operation_opts).await;
@@ -443,7 +637,7 @@ async fn replay_authorized_tier_delete_sources(
     let authorization = active.authorization();
     authorization.mark_mutation_started(bucket, bucket_incarnation, prefix)?;
 
-    let mut source_objects = std::collections::BTreeSet::new();
+    let mut source_objects = std::collections::HashSet::with_capacity(active.entries().len());
     for entry in active.entries() {
         let source = entry
             .source
@@ -453,60 +647,129 @@ async fn replay_authorized_tier_delete_sources(
         if !tier_delete_source_matches_replay_scope(source, bucket, prefix, opts.delete_prefix_object) {
             return Err(Error::other("authorized tier delete predecessor source escaped its prefix scope"));
         }
-        source_objects.insert(source.object.clone());
+        source_objects.insert(source.object.as_str());
     }
 
-    let mut deleted = 0;
-    for object in source_objects {
-        if bucket_fence.is_lock_lost() {
-            return Err(Error::other("tier delete dispatch namespace fence was lost during predecessor replay"));
+    if let Some(scope) = publication_scope {
+        if scope.state() == ScannerPublicationCommitState::Admitted {
+            scope
+                .try_begin()
+                .map_err(|_| Error::other("scanner publication predecessor replay scope cannot start"))?;
         }
-        let encoded_object = encode_dir_object(&object);
-        let guards = if opts.delete_prefix_object {
-            store
-                .acquire_remaining_physical_object_write_locks("tier_delete_dispatch_predecessor_replay", bucket, &encoded_object)
-                .await?
-        } else {
-            store
-                .acquire_all_physical_object_write_locks("tier_delete_dispatch_predecessor_replay", bucket, &encoded_object)
-                .await?
-        };
-        authorization.ensure_current(bucket, bucket_incarnation, prefix)?;
-        if let Some(scope) = publication_scope {
-            if scope.state() == ScannerPublicationCommitState::Admitted {
-                scope
-                    .try_begin()
-                    .map_err(|_| Error::other("scanner publication predecessor replay scope cannot start"))?;
-            }
-            if !scope.can_commit() {
-                let _ = scope.mark_indeterminate();
-                return Err(StorageError::OperationCanceled);
-            }
-        }
-        let mut replay_opts = opts.clone();
-        replay_opts.no_lock = true;
-        replay_opts.delete_prefix = false;
-        replay_opts.delete_prefix_object = false;
-        for guard in &guards {
-            guard.add_namespace_lock_fence(&mut replay_opts);
-        }
-        for pool in &store.pools {
-            for set in &pool.disk_set {
-                authorization.ensure_current(bucket, bucket_incarnation, prefix)?;
-                deleted += set
-                    .replay_authorized_tier_delete_sources(bucket, &object, &authorization, &replay_opts)
-                    .await?;
-            }
-        }
-        if bucket_fence.is_lock_lost() || guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
-            return Err(Error::other("tier delete dispatch namespace fence was lost during predecessor replay"));
+        if !scope.can_commit() {
+            let _ = scope.mark_indeterminate();
+            return Err(StorageError::OperationCanceled);
         }
     }
-    if let Some(scope) = publication_scope {
-        let _ = scope.mark_committed();
+
+    let stopped = Arc::new(AtomicBool::new(false));
+    // The caller holds bucket lifecycle WRITE. Each bounded future acquires
+    // only one logical object's physical lock set and releases it before
+    // completion; no future nests locks for two object keys.
+    let make_replay = |object: String| {
+        let stopped = stopped.clone();
+        let authorization = authorization.clone();
+        async move {
+            if stopped.load(Ordering::Acquire) {
+                return Ok::<_, Error>(0usize);
+            }
+            let result = async {
+                if bucket_fence.is_lock_lost() {
+                    return Err(Error::other("tier delete dispatch namespace fence was lost during predecessor replay"));
+                }
+                let encoded_object = encode_dir_object(&object);
+                let guards = if opts.delete_prefix_object {
+                    store
+                        .acquire_remaining_physical_object_write_locks(
+                            "tier_delete_dispatch_predecessor_replay",
+                            bucket,
+                            &encoded_object,
+                        )
+                        .await?
+                } else {
+                    store
+                        .acquire_all_physical_object_write_locks(
+                            "tier_delete_dispatch_predecessor_replay",
+                            bucket,
+                            &encoded_object,
+                        )
+                        .await?
+                };
+                authorization.ensure_current(bucket, bucket_incarnation, prefix)?;
+                if publication_scope.is_some_and(|scope| !scope.can_commit()) {
+                    return Err(StorageError::OperationCanceled);
+                }
+                let mut replay_opts = opts.clone();
+                replay_opts.no_lock = true;
+                replay_opts.delete_prefix = false;
+                replay_opts.delete_prefix_object = false;
+                for guard in &guards {
+                    guard.add_namespace_lock_fence(&mut replay_opts);
+                }
+                let mut deleted = 0usize;
+                for pool in &store.pools {
+                    for set in &pool.disk_set {
+                        authorization.ensure_current(bucket, bucket_incarnation, prefix)?;
+                        deleted = deleted
+                            .checked_add(
+                                set.replay_authorized_tier_delete_sources(bucket, &object, &authorization, &replay_opts)
+                                    .await?,
+                            )
+                            .ok_or_else(|| Error::other("tier delete dispatch replay count overflow"))?;
+                    }
+                }
+                if bucket_fence.is_lock_lost() || guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
+                    return Err(Error::other("tier delete dispatch namespace fence was lost during predecessor replay"));
+                }
+                Ok(deleted)
+            }
+            .await;
+            if result.is_err() {
+                stopped.store(true, Ordering::Release);
+            }
+            result
+        }
+    };
+    let mut objects = source_objects.into_iter();
+    let mut replays = futures::stream::FuturesUnordered::new();
+    for _ in 0..TIER_DELETE_DISPATCH_LOCAL_REPLAY_CONCURRENCY {
+        let Some(object) = objects.next().map(ToOwned::to_owned) else {
+            break;
+        };
+        replays.push(make_replay(object));
+    }
+    let mut deleted = 0usize;
+    let mut first_error = None;
+    while let Some(result) = replays.next().await {
+        match result {
+            Ok(count) => {
+                deleted = deleted
+                    .checked_add(count)
+                    .ok_or_else(|| Error::other("tier delete dispatch replay count overflow"))?;
+            }
+            Err(err) if first_error.is_none() => first_error = Some(err),
+            Err(_) => {}
+        }
+        if first_error.is_none()
+            && !stopped.load(Ordering::Acquire)
+            && let Some(object) = objects.next().map(ToOwned::to_owned)
+        {
+            replays.push(make_replay(object));
+        }
     }
     if deleted > 0 {
         super::list_objects::observe_list_objects_mutation(store, bucket).await;
+    }
+    if let Some(err) = first_error {
+        if publication_scope.is_some_and(|scope| !scope.can_commit())
+            && let Some(scope) = publication_scope
+        {
+            let _ = scope.mark_indeterminate();
+        }
+        return Err(err);
+    }
+    if let Some(scope) = publication_scope {
+        let _ = scope.mark_committed();
     }
     Ok(())
 }
@@ -6516,6 +6779,15 @@ mod tests {
             .to_string()
             .contains("requires a stable transitioned source")
         );
+    }
+
+    #[test]
+    fn tier_delete_walk_only_accepts_explicit_limit_cancellation() {
+        let cancelled = Error::OperationCanceled;
+        assert!(tier_delete_walk_cancellation_is_expected(true, true, &cancelled));
+        assert!(!tier_delete_walk_cancellation_is_expected(false, true, &cancelled));
+        assert!(!tier_delete_walk_cancellation_is_expected(true, false, &cancelled));
+        assert!(!tier_delete_walk_cancellation_is_expected(true, true, &Error::other("scan failed")));
     }
 
     impl Drop for BodyCacheHookGuard {

@@ -182,6 +182,16 @@ pub(crate) enum DurableIlmRecordCheckpoint {
         identity_sha256: String,
         state: tier_delete_journal::TierDeleteDispatchManifestState,
     },
+    TierDeleteDispatchParent {
+        content_sha256: String,
+        identity_sha256: String,
+        revision: u64,
+        next_chunk_sequence: u64,
+        completed_journal_count: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_chunk_identity_sha256: Option<String>,
+        completed: bool,
+    },
     TransitionTransaction {
         content_sha256: String,
         identity_sha256: String,
@@ -220,6 +230,7 @@ impl DurableIlmRecordCheckpoint {
         match self {
             Self::TierDeleteJournal { content_sha256, .. }
             | Self::TierDeleteDispatchManifest { content_sha256, .. }
+            | Self::TierDeleteDispatchParent { content_sha256, .. }
             | Self::TransitionTransaction { content_sha256, .. }
             | Self::ManualTransitionJob { content_sha256, .. }
             | Self::ManualTransitionScope { content_sha256, .. }
@@ -340,6 +351,52 @@ impl DurableIlmRecordCheckpoint {
                         (previous_state, next_state),
                         (Preparing, DispatchAuthorized | Aborting) | (Aborting, Aborted) | (DispatchAuthorized, Completed)
                     )
+            }
+            (
+                Self::TierDeleteDispatchParent {
+                    identity_sha256: previous_identity,
+                    revision: previous_revision,
+                    next_chunk_sequence: previous_sequence,
+                    completed_journal_count: previous_completed_journals,
+                    active_chunk_identity_sha256: previous_active,
+                    completed: previous_completed,
+                    ..
+                },
+                Self::TierDeleteDispatchParent {
+                    identity_sha256: next_identity,
+                    revision: next_revision,
+                    next_chunk_sequence: next_sequence,
+                    completed_journal_count: next_completed_journals,
+                    active_chunk_identity_sha256: next_active,
+                    completed: next_completed,
+                    ..
+                },
+            ) => {
+                let Some((sequence_delta, completed_journal_delta)) = tier_delete_dispatch_parent_progress_delta(
+                    *previous_sequence,
+                    *previous_completed_journals,
+                    *next_sequence,
+                    *next_completed_journals,
+                ) else {
+                    return Err(Error::other("durable ILM record generation is not a monotonic successor"));
+                };
+                let same_position_transition = sequence_delta == 0
+                    && completed_journal_delta == 0
+                    && matches!(
+                        (previous_active.as_ref(), next_active.as_ref(), previous_completed, next_completed),
+                        (None, Some(_), false, false) | (Some(_), None, false, false) | (None, None, false, true)
+                    );
+                let progress_transition = sequence_delta > 0
+                    && completed_journal_delta > 0
+                    && !matches!(
+                        (previous_active.as_ref(), next_active.as_ref()),
+                        (Some(previous), Some(next)) if previous == next
+                    );
+                previous_identity == next_identity
+                    && !previous_completed
+                    && next_revision > previous_revision
+                    && (!next_completed || next_active.is_none())
+                    && (same_position_transition || progress_transition)
             }
             (
                 Self::TransitionTransaction {
@@ -475,9 +532,56 @@ impl DurableIlmRecordCheckpoint {
                     ..
                 },
             ) => previous_identity == terminal_identity,
+            (
+                Self::TierDeleteDispatchParent {
+                    identity_sha256: previous_identity,
+                    revision: previous_revision,
+                    next_chunk_sequence: previous_sequence,
+                    completed_journal_count: previous_completed_journals,
+                    active_chunk_identity_sha256: previous_active,
+                    completed: false,
+                    ..
+                },
+                Self::TierDeleteDispatchParent {
+                    identity_sha256: terminal_identity,
+                    revision: terminal_revision,
+                    next_chunk_sequence: terminal_sequence,
+                    completed_journal_count: terminal_completed_journals,
+                    active_chunk_identity_sha256: None,
+                    completed: true,
+                    ..
+                },
+            ) => {
+                previous_identity == terminal_identity
+                    && terminal_revision > previous_revision
+                    && tier_delete_dispatch_parent_progress_delta(
+                        *previous_sequence,
+                        *previous_completed_journals,
+                        *terminal_sequence,
+                        *terminal_completed_journals,
+                    )
+                    .is_some_and(|(sequence_delta, completed_journal_delta)| {
+                        if sequence_delta == 0 && completed_journal_delta == 0 {
+                            previous_active.is_none()
+                        } else {
+                            sequence_delta > 0 && completed_journal_delta > 0
+                        }
+                    })
+            }
             _ => false,
         }
     }
+}
+
+fn tier_delete_dispatch_parent_progress_delta(
+    previous_sequence: u64,
+    previous_completed_journals: u64,
+    next_sequence: u64,
+    next_completed_journals: u64,
+) -> Option<(u64, u64)> {
+    let sequence_delta = next_sequence.checked_sub(previous_sequence)?;
+    let completed_journal_delta = next_completed_journals.checked_sub(previous_completed_journals)?;
+    (sequence_delta <= completed_journal_delta).then_some((sequence_delta, completed_journal_delta))
 }
 
 fn transition_state_distance(
@@ -913,17 +1017,42 @@ pub(crate) fn validate_durable_ilm_record(path: &str, data: &[u8]) -> Result<Val
             )
         }
         DurableIlmRecordKind::TierDeleteDispatchManifest => {
-            let (operation_id, identity_sha256, state) =
-                tier_delete_journal::validate_tier_delete_dispatch_manifest_record(path, data)?;
-            (
-                "operation_id",
-                hex_sha256(operation_id.as_bytes(), ToOwned::to_owned),
-                DurableIlmRecordCheckpoint::TierDeleteDispatchManifest {
-                    content_sha256,
+            match tier_delete_journal::validate_tier_delete_dispatch_manifest_record(path, data)? {
+                tier_delete_journal::TierDeleteDispatchDurableRecord::Manifest {
+                    operation_id,
                     identity_sha256,
                     state,
-                },
-            )
+                } => (
+                    "operation_id",
+                    hex_sha256(operation_id.as_bytes(), ToOwned::to_owned),
+                    DurableIlmRecordCheckpoint::TierDeleteDispatchManifest {
+                        content_sha256,
+                        identity_sha256,
+                        state,
+                    },
+                ),
+                tier_delete_journal::TierDeleteDispatchDurableRecord::Parent {
+                    operation_id,
+                    identity_sha256,
+                    revision,
+                    next_chunk_sequence,
+                    completed_journal_count,
+                    active_chunk_identity_sha256,
+                    completed,
+                } => (
+                    "operation_id",
+                    hex_sha256(operation_id.as_bytes(), ToOwned::to_owned),
+                    DurableIlmRecordCheckpoint::TierDeleteDispatchParent {
+                        content_sha256,
+                        identity_sha256,
+                        revision,
+                        next_chunk_sequence,
+                        completed_journal_count,
+                        active_chunk_identity_sha256,
+                        completed,
+                    },
+                ),
+            }
         }
         DurableIlmRecordKind::TransitionTransaction => {
             let transaction = transition_transaction::decode_transition_transaction_record(path, data)
@@ -1141,6 +1270,85 @@ mod tests {
         assert!(authorized.validate_successor(&aborting).is_err());
         assert!(completed.validate_successor(&authorized).is_err());
         assert!(aborted.validate_successor(&preparing).is_err());
+    }
+
+    #[test]
+    fn tier_delete_dispatch_parent_checkpoint_is_monotonic_across_chunks() {
+        let identity = "a".repeat(64);
+        let checkpoint = |revision, sequence, completed_journals, active: Option<&str>, completed| {
+            DurableIlmRecordCheckpoint::TierDeleteDispatchParent {
+                content_sha256: format!("{revision:064x}"),
+                identity_sha256: identity.clone(),
+                revision,
+                next_chunk_sequence: sequence,
+                completed_journal_count: completed_journals,
+                active_chunk_identity_sha256: active.map(ToOwned::to_owned),
+                completed,
+            }
+        };
+        let idle = checkpoint(0, 0, 0, None, false);
+        let first_child = "b".repeat(64);
+        let second_child = "c".repeat(64);
+        let bound = checkpoint(1, 0, 0, Some(&first_child), false);
+        let advanced = checkpoint(2, 1, 2, None, false);
+        let next_bound = checkpoint(3, 1, 2, Some(&second_child), false);
+        let completed = checkpoint(4, 2, 3, None, true);
+        let terminal_after_more_chunks = checkpoint(6, 4, 7, None, true);
+
+        idle.validate_successor(&bound).expect("an idle parent may bind one child");
+        bound
+            .validate_successor(&advanced)
+            .expect("a completed child may advance the parent sequence");
+        advanced
+            .validate_successor(&next_bound)
+            .expect("the next sequence may bind a new immutable child");
+        next_bound
+            .validate_successor(&completed)
+            .expect("receipt progress may skip directly to a later terminal checkpoint");
+        assert!(
+            bound.is_predecessor_of_terminal(&terminal_after_more_chunks),
+            "terminal cleanup may still recognize a valid multi-chunk predecessor"
+        );
+        assert!(
+            advanced.is_predecessor_of_terminal(&terminal_after_more_chunks),
+            "terminal cleanup may still skip over later valid parent generations"
+        );
+        assert!(
+            idle.validate_successor(&checkpoint(1, 0, 1, Some(&first_child), false))
+                .is_err()
+        );
+        assert!(bound.validate_successor(&checkpoint(2, 1, 0, None, false)).is_err());
+        assert!(
+            bound.validate_successor(&checkpoint(2, 2, 1, None, false)).is_err(),
+            "sequence cannot advance beyond completed journal evidence"
+        );
+        assert!(
+            advanced.validate_successor(&checkpoint(3, 1, 3, None, false)).is_err(),
+            "completed journal count cannot grow without a completed child sequence"
+        );
+        assert!(
+            bound.validate_successor(&checkpoint(2, 0, 0, None, true)).is_err(),
+            "an active child cannot be marked completed without completion evidence"
+        );
+        assert!(
+            bound
+                .validate_successor(&checkpoint(2, 0, 0, Some(&second_child), false))
+                .is_err(),
+            "an active child cannot be replaced at the same parent sequence"
+        );
+        assert!(
+            bound
+                .validate_successor(&checkpoint(2, 1, 1, Some(&first_child), false))
+                .is_err(),
+            "sequence growth cannot retain the same active child identity"
+        );
+        assert!(
+            !bound.is_predecessor_of_terminal(&checkpoint(2, 0, 0, None, true)),
+            "terminal cleanup must not treat an active child as completed without count evidence"
+        );
+        assert!(completed.validate_successor(&checkpoint(5, 3, 4, None, true)).is_err());
+        assert!(completed.validate_successor(&advanced).is_err());
+        assert!(advanced.validate_successor(&idle).is_err());
     }
 
     #[test]
