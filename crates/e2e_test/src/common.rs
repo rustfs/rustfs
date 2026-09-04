@@ -1483,8 +1483,9 @@ impl RustFSTestClusterEnvironment {
             self.spawn_node(node_idx, binary_path, &volumes_arg)?;
         }
 
-        for (i, node) in self.nodes.iter().enumerate() {
-            self.wait_for_node_ready(&node.address, i).await?;
+        for i in 0..self.nodes.len() {
+            let address = self.nodes[i].address.clone();
+            self.wait_for_node_ready(&address, i).await?;
         }
 
         for node_idx in 0..self.nodes.len() {
@@ -1510,7 +1511,8 @@ impl RustFSTestClusterEnvironment {
         let volumes_arg = self.build_volumes_arg();
         self.spawn_node(node_idx, binary_path, &volumes_arg)?;
 
-        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await?;
+        let address = self.nodes[node_idx].address.clone();
+        self.wait_for_node_ready(&address, node_idx).await?;
         self.wait_for_node_service_ready(node_idx).await?;
         Ok(())
     }
@@ -1559,8 +1561,18 @@ impl RustFSTestClusterEnvironment {
     ///
     /// Attempts to establish a TCP connection to the node's address, retries up to 60 times
     /// with a 1-second interval between attempts. Fails if the port is unreachable after all retries.
-    async fn wait_for_node_ready(&self, address: &str, idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn node_process_exited(&mut self, idx: usize) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(process) = self.nodes.get_mut(idx).and_then(|node| node.process.as_mut()) else {
+            return Ok(true);
+        };
+        Ok(process.try_wait()?.is_some())
+    }
+
+    async fn wait_for_node_ready(&mut self, address: &str, idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for attempt in 0..60 {
+            if self.node_process_exited(idx)? {
+                return Err(format!("cluster node {idx} process exited before TCP ready").into());
+            }
             if TcpStream::connect(address).await.is_ok() {
                 info!("Node {} ({}) TCP ready after {} attempts", idx, address, attempt + 1);
                 return Ok(());
@@ -1574,10 +1586,13 @@ impl RustFSTestClusterEnvironment {
     ///
     /// Verifies service availability by calling the S3 `list_buckets` API against the requested node,
     /// retries up to 120 times with a 1-second interval between attempts.
-    async fn wait_for_node_service_ready(&self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn wait_for_node_service_ready(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let client = self.create_s3_client(node_idx)?;
 
         for attempt in 0..120 {
+            if self.node_process_exited(node_idx)? {
+                return Err(format!("cluster node {node_idx} process exited before S3 ready").into());
+            }
             match client.list_buckets().send().await {
                 Ok(_) => {
                     info!("Cluster node {} service ready after {} attempts", node_idx, attempt + 1);

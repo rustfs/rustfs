@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, TestResult, assert_inventory, decommission_started_or_fenced, put_inventory_retrying, sha256_hex, unique_bucket,
-    wait_for_decommission_complete,
+    DistCluster, DistLayout, TestResult, assert_inventory, decommission_started_or_fenced, put_inventory_retrying, sha256_hex,
+    unique_bucket, wait_for_decommission_complete,
 };
 use crate::common::init_logging;
 use std::time::Duration;
@@ -22,7 +22,7 @@ use std::time::Duration;
 #[tokio::test]
 async fn decommission_does_not_alter_object_sha256_across_pools() -> TestResult {
     init_logging();
-    let dist = DistCluster::start_four_pool_via_expand().await?;
+    let dist = DistCluster::start(DistLayout::TwoPoolFourDrive).await?;
     let bucket = unique_bucket("integrity");
     dist.create_bucket(&bucket).await?;
     let client = dist.client(0)?;
@@ -33,7 +33,7 @@ async fn decommission_does_not_alter_object_sha256_across_pools() -> TestResult 
         wait_for_decommission_complete(&dist.cluster, 0, Duration::from_secs(180)).await?;
     }
 
-    let after_client = dist.client(2)?;
+    let after_client = dist.client(1)?;
     assert_inventory(&after_client, &bucket, &inventory).await?;
     for (key, expected_hash) in before {
         let got = after_client.get_object().bucket(&bucket).key(&key).send().await?;

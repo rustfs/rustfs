@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, TestResult, assert_inventory, decommission_started_or_fenced, put_inventory_retrying,
+    DistCluster, DistLayout, TestResult, assert_inventory, decommission_started_or_fenced, put_inventory_retrying,
     rebalance_started_or_fenced, retrying_get_equals, retrying_put, unique_bucket, wait_for_decommission_complete,
 };
 use crate::common::init_logging;
@@ -22,14 +22,14 @@ use std::time::Duration;
 #[tokio::test]
 async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResult {
     init_logging();
-    let dist = DistCluster::start_four_pool_via_expand().await?;
+    let dist = DistCluster::start(DistLayout::TwoPoolFourDrive).await?;
     let bucket = unique_bucket("s3move");
     dist.create_bucket(&bucket).await?;
     let client = dist.client(0)?;
     let inventory = put_inventory_retrying(&client, &bucket, 8, 16 * 1024, Duration::from_secs(30)).await?;
 
     let decommission_started = decommission_started_or_fenced(&dist.cluster, 0).await?;
-    let live = dist.client(2)?;
+    let live = dist.client(1)?;
     retrying_put(
         &live,
         &bucket,

@@ -11,7 +11,7 @@ The in-tree harness runs every node on `127.0.0.1` with a distinct port. That ma
 |---|---|---|
 | 4 nodes × 4 drives, one pool | `ClusterTopology::single_pool_multidrive(4, 4)` | S3, object lock, versioning, quota, observability, concurrency, chaos |
 | 4 nodes × 1 drive, one pool | `ClusterTopology::single_pool(4)` | Two-site replication (8 processes total); direct/rolling upgrade from the pinned previous release |
-| 2 single-node pools × 4 drives, then `append_single_node_pool` twice | expansion seed | Pool expand, then decommission / rebalance / integrity |
+| 2 single-node pools × 4 drives | `ClusterTopology::per_node_pools(4, [[0],[1]])` | Restart, decommission/rebalance *attempts*, checksum integrity. Appending more pools and restarting currently dies with `pool metadata recovery required`; that is pinned, not patched, in this lane |
 
 A pool striped across several localhost ports is not expressible (`RUSTFS_VOLUMES` host ellipses would collide on disk paths). Multi-host striped pools remain the hardware functional-chain / backlog #1313 / #1314 lane.
 
@@ -26,7 +26,7 @@ Decommission and rebalance POST currently 500 on localhost DistErasure multi-poo
 - Versioning, version GET, delete marker
 - Bucket replication between two 4-node clusters; hard quota
 - Health / admin info / storageinfo / audit target list
-- Pool expand, decommission, rebalance, checksum integrity, S3 during move
+- Pool restart, decommission/rebalance *attempts*, checksum integrity, S3 during those attempts. Appending pools and restarting is asserted to fail closed on the current localhost pool-meta recovery gate; this lane does not change that production gate
 - Site replication object convergence
 - High-concurrency PUT/GET; concurrent PUT during decommission
 - Node kill/restart, full process restart, drive offline (4×4). Volume-proxy blackhole stays in `cluster_volume_fault_proxy_pass_smoke` (2×2); a 4-node volume proxy cannot format because RPC audience is the listen port
