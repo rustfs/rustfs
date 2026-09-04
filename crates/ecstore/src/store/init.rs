@@ -17013,6 +17013,10 @@ mod tests {
                             .find(|version| version.version_id == history.version_id)
                             .expect("transitioned history should exist");
                         transitioned.transition_version_state = rustfs_filemeta::TransitionVersionState::Unknown;
+                        rustfs_utils::http::metadata_compat::remove_str(
+                            &mut transitioned.metadata,
+                            rustfs_utils::http::metadata_compat::SUFFIX_TRANSITIONED_VERSION_STATE,
+                        );
                         metadata
                             .add_version(transitioned)
                             .expect("unknown state should replace the transitioned version");
