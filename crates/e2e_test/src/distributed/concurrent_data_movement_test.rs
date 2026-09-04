@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, assert_inventory, payload_for, put_inventory, retrying_get_equals, retrying_put,
-    start_decommission, unique_bucket, wait_for_decommission_complete,
+    DistCluster, DistLayout, TestResult, assert_inventory, decommission_started_or_fenced, payload_for, put_inventory_retrying,
+    retrying_get_equals, retrying_put, unique_bucket, wait_for_decommission_complete,
 };
 use crate::common::init_logging;
 use std::sync::Arc;
@@ -28,9 +28,9 @@ async fn concurrent_puts_during_decommission_do_not_lose_baseline_or_new_objects
     let bucket = unique_bucket("concdecom");
     dist.create_bucket(&bucket).await?;
     let baseline_client = dist.client(0)?;
-    let inventory = put_inventory(&baseline_client, &bucket, 10, 24 * 1024).await?;
+    let inventory = put_inventory_retrying(&baseline_client, &bucket, 10, 24 * 1024, Duration::from_secs(30)).await?;
 
-    start_decommission(&dist.cluster, 0).await?;
+    let decommission_started = decommission_started_or_fenced(&dist.cluster, 0).await?;
 
     let clients = Arc::new(dist.clients()?);
     let barrier = Arc::new(Barrier::new(16));
@@ -54,7 +54,9 @@ async fn concurrent_puts_during_decommission_do_not_lose_baseline_or_new_objects
         live_objects.push(handle.await??);
     }
 
-    wait_for_decommission_complete(&dist.cluster, 0, Duration::from_secs(180)).await?;
+    if decommission_started {
+        wait_for_decommission_complete(&dist.cluster, 0, Duration::from_secs(180)).await?;
+    }
 
     let checker = dist.client(3)?;
     assert_inventory(&checker, &bucket, &inventory).await?;

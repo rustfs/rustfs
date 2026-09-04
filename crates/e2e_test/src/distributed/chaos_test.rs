@@ -75,30 +75,62 @@ async fn offline_drive_then_replace_keeps_object_readable() -> TestResult {
 #[tokio::test]
 async fn volume_proxy_blackhole_then_restore_keeps_s3_available() -> TestResult {
     init_logging();
-    // 4 nodes × 1 drive (4-disk DistErasure). Proxying a 16-disk 4×4 set
-    // prevents first-disk format: proxied drives look like missing peers, so
-    // `should_init_erasure_disks` is false and the first disk waits out.
+    // 4-node volume proxy cannot format: RPC v2 `expected_audience` is the
+    // node listen address while `RUSTFS_VOLUMES` points at the proxy port
+    // (`invalid_v2_signature` / first-disk wait). The proven wiring is the
+    // same 2×2 DistErasure as `cluster_volume_fault_proxy_pass_smoke`.
+    // Four-node chaos is covered by kill / restart / offline-drive on 4×4.
     let mut cluster =
-        crate::common::RustFSTestClusterEnvironment::with_topology(crate::common::ClusterTopology::single_pool(4)).await?;
-    let proxy = cluster.start_volume_proxy_for_node(1).await?;
-    cluster.start().await?;
-    cluster.create_test_bucket("chaos-net").await?;
-    let client = cluster.create_s3_client(0)?;
-    let body = vec![0x33u8; 32 * 1024];
-    put_object(&client, "chaos-net", "via-proxy.bin", body.clone()).await?;
+        crate::common::RustFSTestClusterEnvironment::with_topology(crate::common::ClusterTopology::single_pool_multidrive(2, 2))
+            .await?;
+    let proxy = cluster.start_volume_proxy_for_node(0).await?;
+    let result: TestResult = async {
+        cluster.start().await?;
+        let bucket = unique_bucket("chaosnet");
+        cluster.create_test_bucket(&bucket).await?;
+        let client = cluster.create_s3_client(0)?;
+        let body = vec![0x33u8; 32 * 1024];
+        put_object(&client, &bucket, "via-proxy.bin", body.clone()).await?;
 
-    proxy.set_mode(FaultMode::Blackhole);
-    retrying_get_equals(
-        &cluster.create_s3_client(2)?,
-        "chaos-net",
-        "via-proxy.bin",
-        &body,
-        Duration::from_secs(20),
-    )
-    .await?;
+        proxy.set_mode(FaultMode::Blackhole);
+        retrying_get_equals(&cluster.create_s3_client(1)?, &bucket, "via-proxy.bin", &body, Duration::from_secs(20)).await?;
 
-    proxy.set_mode(FaultMode::Pass);
-    assert_object_bytes(&cluster.create_s3_client(3)?, "chaos-net", "via-proxy.bin", &body).await?;
+        proxy.set_mode(FaultMode::Pass);
+        assert_object_bytes(&cluster.create_s3_client(1)?, &bucket, "via-proxy.bin", &body).await?;
+        Ok(())
+    }
+    .await;
     proxy.shutdown().await;
+    result
+}
+
+#[tokio::test]
+async fn concurrent_gets_survive_peer_node_kill() -> TestResult {
+    init_logging();
+    let mut dist = DistCluster::start(DistLayout::FourByFour).await?;
+    let bucket = unique_bucket("getkill");
+    dist.create_bucket(&bucket).await?;
+    let body = vec![0x7Au8; 96 * 1024];
+    put_object(&dist.client(0)?, &bucket, "steady.bin", body.clone()).await?;
+
+    dist.cluster.stop_node(3)?;
+
+    let live: Vec<_> = (0..3).map(|idx| dist.client(idx)).collect::<Result<Vec<_>, _>>()?;
+    let mut handles = Vec::new();
+    for idx in 0..12 {
+        let client = live[idx % live.len()].clone();
+        let bucket = bucket.clone();
+        let body = body.clone();
+        handles.push(tokio::spawn(async move {
+            retrying_get_equals(&client, &bucket, "steady.bin", &body, Duration::from_secs(20)).await
+        }));
+    }
+    for handle in handles {
+        handle.await??;
+    }
+
+    dist.cluster.start_node(3).await?;
+    wait_for_ready(&dist.cluster).await?;
+    assert_object_bytes(&dist.client(3)?, &bucket, "steady.bin", &body).await?;
     Ok(())
 }

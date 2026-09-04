@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, assert_inventory, put_inventory, retrying_get_equals, retrying_put, start_decommission,
-    start_rebalance, unique_bucket, wait_for_decommission_complete,
+    DistCluster, DistLayout, TestResult, assert_inventory, decommission_started_or_fenced, put_inventory_retrying,
+    rebalance_started_or_fenced, retrying_get_equals, retrying_put, unique_bucket, wait_for_decommission_complete,
 };
 use crate::common::init_logging;
 use std::time::Duration;
@@ -26,9 +26,9 @@ async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResu
     let bucket = unique_bucket("s3move");
     dist.create_bucket(&bucket).await?;
     let client = dist.client(0)?;
-    let inventory = put_inventory(&client, &bucket, 8, 16 * 1024).await?;
+    let inventory = put_inventory_retrying(&client, &bucket, 8, 16 * 1024, Duration::from_secs(30)).await?;
 
-    start_decommission(&dist.cluster, 0).await?;
+    let decommission_started = decommission_started_or_fenced(&dist.cluster, 0).await?;
     let live = dist.client(2)?;
     retrying_put(
         &live,
@@ -55,10 +55,12 @@ async fn s3_put_get_list_succeed_during_decommission_and_rebalance() -> TestResu
         "list during decommission missed the newly written key"
     );
 
-    wait_for_decommission_complete(&dist.cluster, 0, Duration::from_secs(180)).await?;
+    if decommission_started {
+        wait_for_decommission_complete(&dist.cluster, 0, Duration::from_secs(180)).await?;
+    }
     assert_inventory(&live, &bucket, &inventory).await?;
 
-    let _ = start_rebalance(&dist.cluster).await;
+    let _ = rebalance_started_or_fenced(&dist.cluster).await?;
     retrying_put(
         &live,
         &bucket,

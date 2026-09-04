@@ -106,3 +106,42 @@ async fn four_node_four_drive_multipart_and_cross_node_listing_agree() -> TestRe
     assert_eq!(got, b"a");
     Ok(())
 }
+
+#[tokio::test]
+async fn four_node_list_buckets_agree_and_deleted_bucket_can_be_recreated() -> TestResult {
+    init_logging();
+    let dist = DistCluster::start(DistLayout::FourByFour).await?;
+    let bucket = unique_bucket("recreate");
+    dist.create_bucket(&bucket).await?;
+    put_object(&dist.client(0)?, &bucket, "gone.bin", b"old".to_vec()).await?;
+
+    for node_idx in 0..dist.cluster.nodes.len() {
+        let listed = dist.client(node_idx)?.list_buckets().send().await?;
+        assert!(
+            listed.buckets().iter().any(|entry| entry.name() == Some(bucket.as_str())),
+            "node {node_idx} did not list {bucket}"
+        );
+    }
+
+    dist.client(1)?.delete_object().bucket(&bucket).key("gone.bin").send().await?;
+    dist.client(2)?.delete_bucket().bucket(&bucket).send().await?;
+
+    match dist.client(3)?.head_bucket().bucket(&bucket).send().await {
+        Ok(_) => return Err("deleted bucket still visible via HEAD".into()),
+        Err(_) => {}
+    }
+
+    dist.create_bucket(&bucket).await?;
+    put_object(&dist.client(3)?, &bucket, "new.bin", b"new".to_vec()).await?;
+    assert_object_bytes(&dist.client(0)?, &bucket, "new.bin", b"new").await?;
+    match get_object_bytes(&dist.client(1)?, &bucket, "gone.bin").await {
+        Ok(_) => return Err("recreated bucket still contains the previous object".into()),
+        Err(error) => {
+            let message = error.to_string();
+            if !(message.contains("NoSuchKey") || message.contains("NotFound")) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
+}

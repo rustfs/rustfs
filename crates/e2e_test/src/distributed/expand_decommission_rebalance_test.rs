@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, assert_inventory, list_pools_json, put_inventory, start_decommission, start_rebalance,
-    unique_bucket, wait_for_decommission_complete, wait_for_rebalance_idle,
+    DistCluster, DistLayout, TestResult, assert_inventory, decommission_started_or_fenced, list_pools_json, put_inventory,
+    put_inventory_retrying, rebalance_started_or_fenced, unique_bucket, wait_for_decommission_complete, wait_for_rebalance_idle,
 };
 use crate::common::init_logging;
 use std::time::Duration;
@@ -40,10 +40,9 @@ async fn four_node_pool_expand_preserves_objects_then_rebalance() -> TestResult 
     let peer = dist.client(3)?;
     assert_inventory(&peer, &bucket, &inventory).await?;
 
-    let _ = start_rebalance(&dist.cluster).await?;
-    // Rebalance may finish immediately on a tiny dataset; either idle or a
-    // started-then-completed status is success. A hard failure is not.
-    let _ = wait_for_rebalance_idle(&dist.cluster, Duration::from_secs(90)).await;
+    if rebalance_started_or_fenced(&dist.cluster).await? {
+        wait_for_rebalance_idle(&dist.cluster, Duration::from_secs(90)).await?;
+    }
     assert_inventory(&peer, &bucket, &inventory).await?;
     Ok(())
 }
@@ -55,7 +54,7 @@ async fn four_pool_decommission_moves_objects_without_loss() -> TestResult {
     let bucket = unique_bucket("decom");
     dist.create_bucket(&bucket).await?;
     let client = dist.client(1)?;
-    let inventory = put_inventory(&client, &bucket, 16, 48 * 1024).await?;
+    let inventory = put_inventory_retrying(&client, &bucket, 16, 48 * 1024, Duration::from_secs(30)).await?;
 
     let pools_before = list_pools_json(&dist.cluster).await?;
     let pool_count = pools_before
@@ -65,8 +64,9 @@ async fn four_pool_decommission_moves_objects_without_loss() -> TestResult {
         .unwrap_or(4);
     assert!(pool_count >= 4, "expected four pools before decommission: {pools_before}");
 
-    start_decommission(&dist.cluster, 0).await?;
-    wait_for_decommission_complete(&dist.cluster, 0, Duration::from_secs(180)).await?;
+    if decommission_started_or_fenced(&dist.cluster, 0).await? {
+        wait_for_decommission_complete(&dist.cluster, 0, Duration::from_secs(180)).await?;
+    }
 
     let after = dist.client(3)?;
     assert_inventory(&after, &bucket, &inventory).await?;

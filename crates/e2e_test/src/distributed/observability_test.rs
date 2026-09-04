@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::harness::{DistCluster, DistLayout, TestResult, cluster_admin_ok, put_object, unique_bucket, wait_for_ready};
+use super::harness::{
+    DistCluster, DistLayout, TestResult, cluster_admin, cluster_admin_ok, put_object, unique_bucket, wait_for_ready,
+};
 use crate::common::{init_logging, local_http_client};
 use http::Method;
 
@@ -49,6 +51,23 @@ async fn four_node_four_drive_health_admin_info_and_audit_list() -> TestResult {
     let trimmed = audit.trim();
     if !trimmed.is_empty() && trimmed != "null" && !trimmed.starts_with('[') && !trimmed.starts_with('{') {
         return Err(format!("audit target list was not machine-readable: {audit}").into());
+    }
+
+    // Logs / capabilities surfaces: 404 is acceptable (route not enabled);
+    // 5xx is not. A 2xx body must be non-empty.
+    for path in [
+        "/rustfs/admin/v3/log/search",
+        "/rustfs/admin/v4/runtime/capabilities",
+        "/minio/v2/metrics/cluster",
+    ] {
+        let (status, body) = cluster_admin(&dist.cluster, Method::GET, path, None).await?;
+        assert!(
+            status.is_success() || status.is_client_error(),
+            "observability path {path} returned {status}: {body}"
+        );
+        if status.is_success() {
+            assert!(!body.trim().is_empty(), "empty body from {path}");
+        }
     }
 
     let bucket = unique_bucket("obs");
