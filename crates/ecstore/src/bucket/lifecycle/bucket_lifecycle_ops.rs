@@ -11283,6 +11283,120 @@ mod tests {
         }
     }
 
+    /// backlog#2202: the batch `NewerNoncurrentVersions` path used to delete
+    /// noncurrent versions without telling notification subscribers anything,
+    /// while the current-version path emitted a lifecycle expiration event.
+    /// Only versions this batch actually removed may produce an event.
+    #[tokio::test]
+    #[serial]
+    async fn lifecycle_noncurrent_batch_expiry_emits_events_only_for_committed_deletes() {
+        use crate::services::event_notification::test_recorder;
+        use rustfs_s3_types::EventName;
+
+        let (_disk_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("lifecycle-noncurrent-events-{}", Uuid::new_v4().simple());
+        let object = "logs/object";
+        create_test_bucket(&ecstore, &bucket).await;
+
+        metadata_sys::update_in(
+            &ecstore.ctx,
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("bucket versioning should be enabled");
+
+        let now = OffsetDateTime::now_utc();
+        let mut noncurrent_reader = PutObjReader::from_vec(b"noncurrent".to_vec());
+        let noncurrent = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut noncurrent_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(now - time::Duration::days(40)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the noncurrent version should be created");
+        let noncurrent_version_id = noncurrent.version_id.expect("a versioned PUT has an exact identity");
+        let mut current_reader = PutObjReader::from_vec(b"current".to_vec());
+        let current = ecstore
+            .put_object(
+                &bucket,
+                object,
+                &mut current_reader,
+                &ObjectOptions {
+                    versioned: true,
+                    mod_time: Some(now - time::Duration::days(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the current version should be created");
+        let current_version_id = current.version_id.expect("a versioned PUT has an exact identity");
+
+        let incarnation = ecstore
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("bucket incarnation should be available");
+
+        test_recorder::install();
+
+        // One version that exists and one that never did: `delete_objects`
+        // suppresses the not-found error, so only the committed delete may be
+        // announced.
+        let missing_version_id = Uuid::new_v4();
+        let targets = vec![
+            ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: Some(noncurrent_version_id),
+                ..Default::default()
+            },
+            ObjectToDelete {
+                object_name: object.to_string(),
+                version_id: Some(missing_version_id),
+                ..Default::default()
+            },
+        ];
+        let failed = crate::bucket::lifecycle::object_handlers_common::delete_object_versions(
+            &ecstore,
+            &bucket,
+            &targets,
+            lifecycle::Event::default(),
+            incarnation,
+        )
+        .await;
+        assert_eq!(failed, 0, "a missing version is not a batch failure");
+
+        let events = test_recorder::recorded_for_bucket(&bucket);
+        let announced = events.iter().map(|event| event.version_id).collect::<Vec<_>>();
+        assert_eq!(
+            announced,
+            vec![Some(noncurrent_version_id)],
+            "only the committed noncurrent delete should be announced \
+             (noncurrent={noncurrent_version_id}, current={current_version_id}, missing={missing_version_id}), got {events:?}"
+        );
+        assert_eq!(events[0].event_name, EventName::LifecycleExpirationDelete.to_string());
+        assert_eq!(events[0].object, object);
+        assert!(!events[0].delete_marker);
+
+        let remaining = ecstore
+            .clone()
+            .list_object_versions(&bucket, object, None, None, None, 10)
+            .await
+            .expect("remaining versions should be listable")
+            .objects
+            .into_iter()
+            .filter(|candidate| candidate.name == object)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].version_id, Some(current_version_id));
+    }
+
     #[tokio::test]
     #[serial]
     async fn lifecycle_deletes_only_the_historical_null_version_after_versioning_is_reenabled() {

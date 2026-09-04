@@ -117,26 +117,85 @@ pub fn send_event(args: EventArgs) {
     );
 }
 
+/// Shared event recorder for this crate's tests.
+///
+/// [`register_event_dispatch_hook`] backs a `OnceLock`, so only the first
+/// caller in a test binary can install a hook. Every test that needs to
+/// observe dispatched events must therefore go through this single recorder
+/// instead of registering its own.
+#[cfg(test)]
+pub(crate) mod test_recorder {
+    use super::register_event_dispatch_hook;
+    use std::sync::{Mutex, OnceLock};
+    use uuid::Uuid;
+
+    /// The fields a test needs from a dispatched event. `EventArgs` itself is
+    /// not `Clone`, and recording a reduced shape keeps this test seam from
+    /// constraining the production type.
+    #[derive(Clone, Debug)]
+    pub(crate) struct RecordedEvent {
+        pub(crate) event_name: String,
+        pub(crate) bucket: String,
+        pub(crate) object: String,
+        pub(crate) version_id: Option<Uuid>,
+        pub(crate) delete_marker: bool,
+    }
+
+    static RECORDED: OnceLock<Mutex<Vec<RecordedEvent>>> = OnceLock::new();
+
+    fn recorded() -> &'static Mutex<Vec<RecordedEvent>> {
+        RECORDED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    pub(crate) fn install() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            assert!(
+                register_event_dispatch_hook(|args| {
+                    recorded().lock().unwrap_or_else(|err| err.into_inner()).push(RecordedEvent {
+                        event_name: args.event_name,
+                        bucket: args.bucket_name,
+                        object: args.object.name,
+                        version_id: args.object.version_id,
+                        delete_marker: args.object.delete_marker,
+                    });
+                }),
+                "the test event recorder must own this binary's dispatch hook"
+            );
+        });
+    }
+
+    /// Everything recorded for one bucket. Tests select by their own unique
+    /// bucket name rather than draining, because tests that are not
+    /// `#[serial]` may dispatch events concurrently.
+    pub(crate) fn recorded_for_bucket(bucket: &str) -> Vec<RecordedEvent> {
+        recorded()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .iter()
+            .filter(|event| event.bucket == bucket)
+            .cloned()
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static DISPATCH_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn send_event_dispatches_to_registered_hook() {
-        let _ = register_event_dispatch_hook(|_args| {
-            DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
-        });
-        let before = DISPATCH_COUNT.load(Ordering::Relaxed);
+        test_recorder::install();
+        let bucket = format!("event-dispatch-{}", uuid::Uuid::new_v4().simple());
 
         send_event(EventArgs {
             event_name: "s3:ObjectCreated:Put".to_string(),
-            bucket_name: "demo".to_string(),
+            bucket_name: bucket.clone(),
             ..Default::default()
         });
 
-        assert_eq!(DISPATCH_COUNT.load(Ordering::Relaxed), before + 1);
+        let dispatched = test_recorder::recorded_for_bucket(&bucket);
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(dispatched[0].event_name, "s3:ObjectCreated:Put");
     }
 }
