@@ -7935,6 +7935,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     delete_marker_mtime: vr.mod_time.or(goi.mod_time),
                     object_name: vr.name.clone(),
                     replication_state: vr.replication_state_internal.clone(),
+                    source_missing,
                     ..Default::default()
                 }
             } else {
@@ -7946,6 +7947,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         vr.version_id
                     },
                     replication_state: vr.replication_state_internal.clone(),
+                    source_missing,
                     ..Default::default()
                 };
                 accounting[i] = Some(DeleteAccounting {

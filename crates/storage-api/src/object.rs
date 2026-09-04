@@ -243,6 +243,16 @@ impl ObjectToDelete {
 #[derive(Debug, Default, Clone)]
 pub struct DeletedObject {
     pub delete_marker: bool,
+    /// True when the delete plan looked the target up and found no such
+    /// object or version.
+    ///
+    /// The lookup only runs when the plan needs the source (Object Lock
+    /// check, replication decision, tier journal, or an expected identity),
+    /// so this proves absence and never proves presence: it stays false when
+    /// no lookup ran. Callers that must not announce a delete that removed
+    /// nothing need this, because the disk layer treats an absent version as
+    /// an idempotent success and reports `found` regardless.
+    pub source_missing: bool,
     pub delete_marker_version_id: Option<Uuid>,
     pub object_name: String,
     pub version_id: Option<Uuid>,
