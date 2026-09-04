@@ -57,7 +57,11 @@ fn deserialize_code<'de, D>(d: D) -> Result<S3ErrorCode, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Ok(S3ErrorCode::from_bytes(String::deserialize(d)?.as_bytes()).unwrap_or(S3ErrorCode::Custom("".into())))
+    let code = String::deserialize(d)?;
+    if code == "NoSuchObject" {
+        return Ok(S3ErrorCode::NoSuchKey);
+    }
+    Ok(S3ErrorCode::from_bytes(code.as_bytes()).unwrap_or(S3ErrorCode::Custom("".into())))
 }
 
 impl Default for ErrorResponse {
@@ -323,6 +327,23 @@ mod tests {
         );
 
         assert_eq!(response.code, S3ErrorCode::NoSuchVersion);
+        assert_eq!(response.status_code, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn normalizes_provider_specific_missing_object_code() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-request-id", "request-id".parse().expect("request ID header should parse"));
+
+        let response = http_resp_to_error_response(
+            StatusCode::NOT_FOUND,
+            &headers,
+            b"<Error><Code>NoSuchObject</Code><Message>remote detail</Message></Error>".to_vec(),
+            "bucket",
+            "object",
+        );
+
+        assert_eq!(response.code, S3ErrorCode::NoSuchKey);
         assert_eq!(response.status_code, StatusCode::NOT_FOUND);
     }
 }

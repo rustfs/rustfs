@@ -87,16 +87,12 @@ use rustfs_filemeta::{
 use rustfs_scanner_metrics::metrics::{
     IlmAction, Metrics, ScannerLifecycleExpiryStateUpdate, ScannerLifecycleTransitionStateUpdate, global_metrics,
 };
-use rustfs_utils::{
-    get_env_i64, get_env_usize,
-    path::encode_dir_object,
-    string::{parse_bool, strings_has_prefix_fold},
-};
+use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::parse_bool};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, ObjectLockConfiguration, RestoreRequest, RestoreRequestType, RestoreStatus,
     Timestamp,
 };
-use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION};
+use s3s::header::X_AMZ_RESTORE;
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -165,7 +161,6 @@ pub const AMZ_TAG_COUNT: &str = "x-amz-tagging-count";
     reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
 )]
 pub const AMZ_TAG_DIRECTIVE: &str = "X-Amz-Tagging-Directive";
-pub const AMZ_ENCRYPTION_AES: &str = "AES256";
 #[allow(
     dead_code,
     reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
@@ -4802,24 +4797,24 @@ fn attach_tier_operation_lease(mut reader: GetObjectReader, lease: TierOperation
     reader
 }
 
-pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> Result<ObjectOptions, std::io::Error> {
+/// Resolve the RestoreObject request options.
+///
+/// Returns the typed [`StorageError`]: flattening these into an opaque
+/// `io::Error` string erased the identity the S3 layer needs to answer
+/// InvalidArgument instead of a generic 500 (backlog#2205).
+pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> Result<ObjectOptions, Error> {
     let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
     let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
     let vid = version_id.trim();
     if !vid.is_empty() && vid != NULL_VERSION_ID {
         if let Err(_err) = Uuid::parse_str(vid) {
-            return Err(std::io::Error::other(
-                StorageError::InvalidVersionID(bucket.to_string(), object.to_string(), vid.to_string()).to_string(),
-            ));
+            return Err(StorageError::InvalidVersionID(bucket.to_string(), object.to_string(), vid.to_string()));
         }
         if !versioned && !version_suspended {
-            return Err(std::io::Error::other(
-                StorageError::InvalidArgument(
-                    bucket.to_string(),
-                    object.to_string(),
-                    format!("version-id specified {} but versioning is not enabled on {}", vid, bucket),
-                )
-                .to_string(),
+            return Err(StorageError::InvalidArgument(
+                bucket.to_string(),
+                object.to_string(),
+                format!("version-id specified {vid} but versioning is not enabled on {bucket}"),
             ));
         }
     }
@@ -4872,43 +4867,18 @@ pub async fn put_restore_opts(
     }
     meta.insert(X_AMZ_STORAGE_CLASS.as_str().to_lowercase(), sc);*/
 
-    if let Some(type_) = &rreq.type_
-        && type_.as_str() == RestoreRequestType::SELECT
+    // A SELECT restore must never reach the restore writer: the caller writes
+    // the retrieved bytes back to the source bucket/object, so building
+    // SELECT output options here produced a source overwrite carrying only
+    // the OutputLocation metadata instead of a write to `OutputLocation.S3`
+    // (backlog#1341). RestoreObject rejects SELECT at the API boundary; this
+    // is the fail-closed backstop for any other caller.
+    if rreq
+        .type_
+        .as_ref()
+        .is_some_and(|type_| type_.as_str() == RestoreRequestType::SELECT)
     {
-        let Some(s3) = select_restore_s3_location(rreq)? else {
-            return Err(std::io::Error::other("OutputLocation.S3 required for SELECT requests"));
-        };
-        if let Some(user_metadata) = s3.user_metadata.as_ref() {
-            for metadata in user_metadata {
-                let name = metadata
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| std::io::Error::other("SELECT restore metadata name is required"))?;
-                let value = metadata.value.clone().unwrap_or_default();
-                if strings_has_prefix_fold(name, "x-amz-meta") {
-                    meta.insert(name.to_string(), value);
-                } else {
-                    meta.insert(format!("x-amz-meta-{name}"), value);
-                }
-            }
-        }
-        if let Some(tags) = &s3.tagging {
-            meta.insert(
-                AMZ_OBJECT_TAGGING.to_string(),
-                serde_urlencoded::to_string(tags.tag_set.clone()).unwrap_or_else(|_| "".to_string()),
-            );
-        }
-        if let Some(encryption) = &s3.encryption
-            && encryption.encryption_type.as_str() != ""
-        {
-            meta.insert(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str().to_string(), AMZ_ENCRYPTION_AES.to_string());
-        }
-        return Ok(ObjectOptions {
-            versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
-            version_suspended: BucketVersioningSys::prefix_suspended(bucket, object).await,
-            user_defined: meta,
-            ..Default::default()
-        });
+        return Err(std::io::Error::other("SELECT restore requests are not supported"));
     }
     for (k, v) in oi.user_defined.iter() {
         meta.insert(k.to_string(), v.clone());

@@ -165,18 +165,49 @@ impl DefaultObjectUsecase {
 
         validate_table_catalog_object_mutation(&bucket, &object).await?;
 
-        let rreq = rreq.ok_or_else(|| {
-            S3Error::with_message(S3ErrorCode::Custom("ErrValidRestoreObject".into()), "restore request is required")
-        })?;
+        // Typed S3 errors on every RestoreObject failure (backlog#2205): a
+        // `Custom` code serializes as a generic 500, which makes SDK clients
+        // retry client errors and conflicts alike.
+        let rreq = rreq.ok_or_else(|| S3Error::with_message(S3ErrorCode::MalformedXML, "restore request is required"))?;
+
+        // SELECT-type restore is not supported (backlog#1341). The restore
+        // path can only write the retrieved bytes back to the source key, so
+        // honouring a SELECT request overwrote the source object with
+        // SELECT-only metadata (dropping `x-amz-restore`, user metadata and
+        // tags on an unversioned bucket, or publishing a bogus latest version
+        // on a versioned one) while never writing anything to
+        // `OutputLocation.S3`. Reject before any guard, metadata write or
+        // fabricated `x-amz-restore-output-path` response header.
+        if rreq
+            .type_
+            .as_ref()
+            .is_some_and(|type_| type_.as_str() == RestoreRequestType::SELECT)
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::NotImplemented,
+                "SELECT restore requests are not supported.",
+            ));
+        }
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        // Validate the request shape before taking any lock or reading the
+        // object: a malformed request or an illegal `Days` value is a client
+        // error, and the validator messages are static — they carry no
+        // backend or credential detail.
+        if let Err(e) = validate_restore_request(&rreq, store.clone()) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("Restore object validation failed: {e}"),
+            ));
+        }
+
         let version_id_str = version_id.clone().unwrap_or_default();
         let mut opts = post_restore_opts(&version_id_str, &bucket, &object)
             .await
-            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrPostRestoreOpts".into()), "restore object failed."))?;
+            .map_err(ApiError::from)?;
         apply_bucket_generation_guard(&req, &bucket, &mut opts)?;
         // `apply_bucket_generation_guard` deliberately tolerates a missing guard
         // (only the S3 access layer installs one), so this must not hard-require
@@ -192,11 +223,7 @@ impl DefaultObjectUsecase {
             }
         };
 
-        // SELECT-type restores skip both the ongoing check and the metadata
-        // write below, so the accept guard would protect nothing for them —
-        // they keep the plain (read-locked) accept path.
-        let is_select = rreq.type_.as_ref().is_some_and(|t| t.as_str() == "SELECT");
-        let restore_operation_id = (!is_select).then(Uuid::new_v4);
+        let restore_operation_id = Some(Uuid::new_v4());
         let mut restore_worker_guard = if let Some(operation_id) = restore_operation_id {
             Some(
                 store
@@ -210,10 +237,10 @@ impl DefaultObjectUsecase {
 
         // Hold the restore-accept guard across the restore-status read, the
         // ongoing/already-restored decision, and the metadata write below, so
-        // two concurrent (non-SELECT) POST ?restore cannot both observe
-        // ongoing=false and both start a copy-back (backlog#1304). Reads and
-        // writes inside this scope run with no_lock; the guard is dropped
-        // before the copy-back is spawned so it never blocks readers.
+        // two concurrent POST ?restore cannot both observe ongoing=false and
+        // both start a copy-back (backlog#1304). Reads and writes inside this
+        // scope run with no_lock; the guard is dropped before the copy-back is
+        // spawned so it never blocks readers.
         // Contention on the accept guard (e.g. a concurrent accept or an
         // in-flight commit on the same object) is transient — answer 503
         // SlowDown so SDK clients back off and retry instead of treating it
@@ -222,9 +249,7 @@ impl DefaultObjectUsecase {
         if store.bucket_incarnation_id_from_disk(&bucket).await.map_err(ApiError::from)? != restore_bucket_incarnation_id {
             return Err(ApiError::from(StorageError::BucketNotFound(bucket.clone())).into());
         }
-        let mut accept_guard = if is_select {
-            None
-        } else {
+        let mut accept_guard = {
             let guard = store
                 .acquire_restore_accept_guard(&bucket, &object)
                 .await
@@ -233,24 +258,17 @@ impl DefaultObjectUsecase {
             Some(guard)
         };
 
-        let mut obj_info = store
-            .get_object_info(&bucket, &object, &opts)
-            .await
-            .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "restore object failed."))?;
+        // A missing key or version must stay NoSuchKey / NoSuchVersion, and an
+        // authorization or storage failure must keep its own identity, so map
+        // the storage error instead of flattening it (backlog#2205).
+        let mut obj_info = store.get_object_info(&bucket, &object, &opts).await.map_err(ApiError::from)?;
 
-        // Check if object is in a transitioned state
+        // Restoring an object that was never transitioned is the S3
+        // InvalidObjectState case, not an internal error.
         if obj_info.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
             return Err(S3Error::with_message(
-                S3ErrorCode::Custom("ErrInvalidTransitionedState".into()),
-                "restore object failed.",
-            ));
-        }
-
-        // Validate restore request
-        if let Err(e) = validate_restore_request(&rreq, store.clone()) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::Custom("ErrValidRestoreObject".into()),
-                format!("Restore object validation failed: {}", e),
+                S3ErrorCode::InvalidObjectState,
+                "The operation is not valid for the object's storage class.",
             ));
         }
 
@@ -260,7 +278,7 @@ impl DefaultObjectUsecase {
         // would create an ABBA cycle. If the probe succeeds, reacquire and
         // re-read the object before replacing the exact orphan generation.
         let mut superseded_worker_guard = None;
-        if obj_info.restore_ongoing && !is_select {
+        if obj_info.restore_ongoing {
             match classify_ongoing_restore(obj_info.user_defined.as_ref(), OffsetDateTime::now_utc()) {
                 OngoingRestoreRecovery::ActiveOrUnsafe => {
                     return Err(S3Error::with_message(
@@ -293,13 +311,11 @@ impl DefaultObjectUsecase {
                             .map_err(|_| S3Error::with_message(S3ErrorCode::SlowDown, "restore object failed."))?,
                     );
                     opts.no_lock = true;
-                    obj_info = store.get_object_info(&bucket, &object, &opts).await.map_err(|_| {
-                        S3Error::with_message(S3ErrorCode::Custom("ErrInvalidObjectState".into()), "restore object failed.")
-                    })?;
+                    obj_info = store.get_object_info(&bucket, &object, &opts).await.map_err(ApiError::from)?;
                     if obj_info.transitioned_object.status != lifecycle::TRANSITION_COMPLETE {
                         return Err(S3Error::with_message(
-                            S3ErrorCode::Custom("ErrInvalidTransitionedState".into()),
-                            "restore object failed.",
+                            S3ErrorCode::InvalidObjectState,
+                            "The operation is not valid for the object's storage class.",
                         ));
                     }
                     if obj_info.restore_ongoing {
@@ -327,11 +343,11 @@ impl DefaultObjectUsecase {
         remove_str(&mut metadata, SUFFIX_RESTORE_OPERATION_ID);
         remove_str(&mut metadata, SUFFIX_RESTORE_WORKER_LOCK);
 
-        let mut header = HeaderMap::new();
-
         let event_object_info = obj_info.clone();
         let obj_info_ = obj_info.clone();
-        if !is_select {
+        // Scopes the accept-guarded metadata write: everything below runs
+        // inside the accept critical section, which is released right after.
+        {
             obj_info.metadata_only = true;
             metadata.insert(AMZ_RESTORE_EXPIRY_DAYS.to_string(), rreq.days.unwrap_or(1).to_string());
             let request_date = OffsetDateTime::now_utc().format(&Rfc3339).map_err(|e| {
@@ -403,7 +419,7 @@ impl DefaultObjectUsecase {
                     &restore_dst_opts,
                 )
                 .await
-                .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed."))?;
+                .map_err(ApiError::from)?;
             rustfs_scanner::record_dirty_usage_bucket(&bucket);
             #[cfg(test)]
             maybe_pause_after_restore_status_commit(&bucket, &object).await;
@@ -428,17 +444,6 @@ impl DefaultObjectUsecase {
         // the background copy-back and concurrent reads are never blocked on it.
         drop(accept_guard);
         drop(restore_bucket_lifecycle_guard);
-
-        // Handle output location for SELECT requests
-        if let Some(output_location) = &rreq.output_location
-            && let Some(s3) = &output_location.s3
-            && !s3.bucket_name.is_empty()
-        {
-            let restore_object = Uuid::new_v4().to_string();
-            if let Ok(header_value) = format!("{}{}{}", s3.bucket_name, s3.prefix, restore_object).parse() {
-                header.insert(X_AMZ_RESTORE_OUTPUT_PATH, header_value);
-            }
-        }
 
         // Spawn restoration task in the background. Pin the copy-back to the
         // version the accept resolved and flagged: with a versionless request
@@ -499,7 +504,7 @@ impl DefaultObjectUsecase {
             restore_output_path: None,
         };
         helper = helper.object(event_object_info).version_id(version_id_str);
-        let result = Ok(S3Response::with_headers(output, header));
+        let result = Ok(S3Response::new(output));
         let _ = helper.complete(&result);
         result
     }
@@ -629,6 +634,28 @@ mod tests {
         assert_eq!(classify_ongoing_restore(&conflicting_date, now), OngoingRestoreRecovery::ActiveOrUnsafe);
     }
 
+    fn restore_request(days: Option<i32>) -> RestoreRequest {
+        RestoreRequest {
+            days,
+            description: None,
+            glacier_job_parameters: None,
+            output_location: None,
+            select_parameters: None,
+            tier: None,
+            type_: None,
+        }
+    }
+
+    fn restore_input(bucket: &str, key: &str, rreq: RestoreRequest) -> RestoreObjectInput {
+        RestoreObjectInput::builder()
+            .bucket(bucket.to_string())
+            .key(key.to_string())
+            .restore_request(Some(rreq))
+            .build()
+            .expect("restore input should build")
+    }
+
+    /// backlog#2205: a missing restore body is a client error, not a 500.
     #[tokio::test]
     async fn execute_restore_object_rejects_missing_restore_request() {
         let input = RestoreObjectInput::builder()
@@ -641,10 +668,92 @@ mod tests {
         let usecase = DefaultObjectUsecase::without_context();
 
         let err = usecase.execute_restore_object(req).await.unwrap_err();
-        match err.code() {
-            S3ErrorCode::Custom(code) => assert_eq!(code, "ErrValidRestoreObject"),
-            code => panic!("unexpected error code: {:?}", code),
-        }
+        assert_eq!(err.code(), &S3ErrorCode::MalformedXML);
+    }
+
+    /// backlog#1341: a SELECT restore must be rejected outright — the restore
+    /// path can only write back to the source key, never to
+    /// `OutputLocation.S3`. Rejection happens before the store is resolved, so
+    /// an uninitialized usecase still answers NotImplemented rather than the
+    /// InternalError every request that gets past this point returns.
+    #[tokio::test]
+    async fn execute_restore_object_rejects_select_type() {
+        let mut rreq = restore_request(None);
+        rreq.type_ = Some(s3s::dto::RestoreRequestType::from_static(s3s::dto::RestoreRequestType::SELECT));
+
+        let req = build_request(restore_input("test-bucket", "test-key", rreq), Method::POST);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_restore_object(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::NotImplemented);
+    }
+
+    /// backlog#2205: every RestoreObject failure that reaches storage must
+    /// keep its typed S3 identity. Before this, a missing key, a malformed
+    /// version-id, an illegal `Days` and an object that was never transitioned
+    /// all collapsed into `Custom(...)` codes, which serialize as a retryable
+    /// HTTP 500.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_restore_object_maps_failures_to_typed_s3_errors() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let context = crate::app::gating_test_env::shared_gating_ambient().await;
+        let bucket = format!("restore-typed-errors-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create restore test bucket");
+        let mut reader = PutObjReader::from_vec(b"never transitioned".to_vec());
+        store
+            .put_object(&bucket, "local-object", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put untransitioned test object");
+
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+
+        // An illegal `Days` is a client error, rejected before any lock or
+        // object read.
+        let err = usecase
+            .execute_restore_object(build_request(
+                restore_input(&bucket, "local-object", restore_request(Some(0))),
+                Method::POST,
+            ))
+            .await
+            .expect_err("days=0 must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+
+        // A malformed version-id keeps InvalidArgument instead of being
+        // flattened inside `post_restore_opts`.
+        let mut input = restore_input(&bucket, "local-object", restore_request(Some(1)));
+        input.version_id = Some("not-a-uuid".to_string());
+        let err = usecase
+            .execute_restore_object(build_request(input, Method::POST))
+            .await
+            .expect_err("malformed version-id must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+
+        // A missing key stays NoSuchKey.
+        let err = usecase
+            .execute_restore_object(build_request(
+                restore_input(&bucket, "missing-object", restore_request(Some(1))),
+                Method::POST,
+            ))
+            .await
+            .expect_err("missing key must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::NoSuchKey);
+
+        // Restoring an object that was never transitioned is the S3
+        // InvalidObjectState case, not an internal error.
+        let err = usecase
+            .execute_restore_object(build_request(
+                restore_input(&bucket, "local-object", restore_request(Some(1))),
+                Method::POST,
+            ))
+            .await
+            .expect_err("untransitioned object must be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidObjectState);
     }
 
     #[tokio::test]

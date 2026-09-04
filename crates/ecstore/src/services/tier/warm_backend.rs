@@ -20,7 +20,7 @@
 
 use crate::error::is_err_bucket_not_found;
 use crate::services::tier::{
-    tier::{ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
+    tier::{ERR_TIER_BACKEND_IN_USE, ERR_TIER_INVALID_CONFIG, ERR_TIER_TYPE_UNSUPPORTED},
     tier_config::{TierConfig, TierType},
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
     warm_backend_aliyun::WarmBackendAliyun,
@@ -55,18 +55,21 @@ use s3s::header::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::{Rfc2822, Rfc3339};
+use tokio::io::AsyncReadExt;
 use tracing::{info, warn};
 
 pub type WarmBackendImpl = Box<dyn WarmBackend + Send + Sync + 'static>;
-
-const PROBE_OBJECT: &str = "probeobject";
 
 /// Largest object the S3-compatible warm backends accept for a multipart put.
 pub(crate) const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
 /// Part-count ceiling S3-compatible services impose on a multipart upload.
 pub(crate) const MAX_PARTS_COUNT: i64 = 10000;
+pub(crate) const WARM_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const WARM_BACKEND_PROBE_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const WARM_BACKEND_PROBE_FINAL_RECONCILE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub struct WarmBackendGetOpts {
@@ -260,6 +263,23 @@ pub(crate) struct S3CompatibleWarmBackendParams<'a> {
     pub validate_endpoint: fn(&url::Url) -> Result<(), rustfs_utils::egress::OutboundUrlError>,
 }
 
+/// Return the authority format accepted by `TransitionClient::new` while
+/// retaining an explicitly configured port. `url::Url::host_str()` omits the
+/// brackets needed when an IPv6 literal is combined with a port.
+pub(crate) fn endpoint_authority(url: &url::Url) -> Result<String, std::io::Error> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+    let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+    if host.starts_with('[') && host.ends_with(']') {
+        Ok(format!("{host}:{port}"))
+    } else if host.contains(':') {
+        Ok(format!("[{host}]:{port}"))
+    } else {
+        Ok(format!("{host}:{port}"))
+    }
+}
+
 /// Build the [`WarmBackendS3`] shared by the S3-compatible warm backend providers.
 ///
 /// Credential, bucket, and endpoint validation run in this order because the
@@ -298,17 +318,11 @@ pub(crate) async fn new_s3_compatible_warm_backend(
         bucket_lookup: params.bucket_lookup,
         ..Default::default()
     };
-    let scheme = u.scheme();
-    let default_port = if scheme == "https" { 443 } else { 80 };
-    let host = u
-        .host_str()
-        .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
-    // Runs after the host-presence check above (not immediately after Url::parse) so a
-    // host-less endpoint still reports this constructor's own "missing host" text instead of
-    // validate_endpoint's differently-worded rejection for the same input.
+    let endpoint = endpoint_authority(&u)?;
+    // Run the SSRF guard after the host-presence check so a host-less endpoint
+    // keeps this constructor's stable error text.
     (params.validate_endpoint)(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
-    let client =
-        TransitionClient::new(&format!("{}:{}", host, u.port().unwrap_or(default_port)), opts, params.provider_tag).await?;
+    let client = TransitionClient::new(&endpoint, opts, params.provider_tag).await?;
 
     let client = Arc::new(client);
     let core = TransitionCore(Arc::clone(&client));
@@ -451,25 +465,187 @@ impl TransitionCandidateReconciler for MeteredTransitionCandidateReconciler {
     }
 }
 
-pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), AdminError> {
-    let w = w.ok_or_else(|| ERR_TIER_NOT_FOUND.clone())?;
-    w.validate().await.map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
-    let remote_version_id = w
-        .put(PROBE_OBJECT, ReaderImpl::Body(Bytes::from("RustFS".as_bytes().to_vec())), 5)
-        .await
-        .map_err(|_| ERR_TIER_PERM_ERR.clone())?;
+async fn remove_discovered_probe_candidate(
+    w: &WarmBackendImpl,
+    probe_object: &str,
+    candidate: TransitionCandidateProbe,
+) -> Result<bool, std::io::Error> {
+    match candidate {
+        TransitionCandidateProbe::Missing => Ok(false),
+        TransitionCandidateProbe::VersionedPresent(remote_version_id) => {
+            w.remove_exact(probe_object, &remote_version_id).await?;
+            Ok(true)
+        }
+        TransitionCandidateProbe::UnversionedPresent => {
+            w.remove(probe_object, "").await?;
+            Ok(true)
+        }
+        TransitionCandidateProbe::Ambiguous => {
+            Err(std::io::Error::other("remote tier probe PUT produced multiple possible versions"))
+        }
+        TransitionCandidateProbe::Unsupported => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remote tier cannot discover the outcome of a probe PUT",
+        )),
+    }
+}
 
-    if w.validate_remote_version_id(&remote_version_id).is_err() {
-        w.remove_exact(PROBE_OBJECT, &remote_version_id)
+async fn compensate_uncertain_probe_put(
+    w: &WarmBackendImpl,
+    probe_object: &str,
+    settle_deadline: tokio::time::Instant,
+) -> Result<(), std::io::Error> {
+    let final_deadline = settle_deadline + WARM_BACKEND_PROBE_FINAL_RECONCILE_TIMEOUT;
+    let mut removed_any = false;
+    while tokio::time::Instant::now() < settle_deadline {
+        let candidate = match tokio::time::timeout_at(settle_deadline, w.probe_transition_candidate(probe_object)).await {
+            Ok(candidate) => candidate?,
+            Err(_) => break,
+        };
+        if matches!(candidate, TransitionCandidateProbe::Missing) && removed_any {
+            break;
+        }
+        removed_any |= tokio::time::timeout_at(settle_deadline, remove_discovered_probe_candidate(w, probe_object, candidate))
             .await
-            .map_err(|_| ERR_TIER_PERM_ERR.clone())?;
-        return Err(ERR_TIER_INVALID_CONFIG.clone());
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out reconciling a remote tier probe PUT"))??;
+
+        let now = tokio::time::Instant::now();
+        if now >= settle_deadline {
+            break;
+        }
+        tokio::time::sleep_until(std::cmp::min(settle_deadline, now + WARM_BACKEND_PROBE_RECONCILE_INTERVAL)).await;
     }
 
-    let read_result = w.get(PROBE_OBJECT, &remote_version_id, WarmBackendGetOpts::default()).await;
-    let remove_result = w.remove(PROBE_OBJECT, &remote_version_id).await;
-    //xhttp.DrainBody(r);
-    if read_result.is_err() || remove_result.is_err() {
+    let candidate = tokio::time::timeout_at(final_deadline, w.probe_transition_candidate(probe_object))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out confirming the final remote tier probe state")
+        })??;
+    if !tokio::time::timeout_at(final_deadline, remove_discovered_probe_candidate(w, probe_object, candidate))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out removing the final remote tier probe candidate")
+        })??
+    {
+        return Ok(());
+    }
+
+    let final_candidate = tokio::time::timeout_at(final_deadline, w.probe_transition_candidate(probe_object))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out confirming remote tier probe cleanup"))??;
+    match final_candidate {
+        TransitionCandidateProbe::Missing => Ok(()),
+        _ => Err(std::io::Error::other("remote tier probe cleanup could not be confirmed")),
+    }
+}
+
+fn probe_cleanup_incomplete_error() -> AdminError {
+    let mut err = ERR_TIER_PERM_ERR.clone();
+    err.message = "Remote tier probe outcome is uncertain; cleanup is incomplete".to_string();
+    err
+}
+
+async fn check_warm_backend_with_deadlines(
+    w: Option<&WarmBackendImpl>,
+    deadline: tokio::time::Instant,
+    cleanup_deadline: tokio::time::Instant,
+) -> Result<(), AdminError> {
+    let w = w.ok_or_else(|| ERR_TIER_NOT_FOUND.clone())?;
+    let probe_object = format!("rustfs-tier-probe-{}", uuid::Uuid::new_v4());
+    let timeout_error = || {
+        let mut err = ERR_TIER_BACKEND_IN_USE.clone();
+        err.message = "Timed out validating the remote tier mutation".to_string();
+        err
+    };
+    tokio::time::timeout_at(deadline, w.validate())
+        .await
+        .map_err(|_| timeout_error())?
+        .map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
+    let put_result =
+        tokio::time::timeout_at(deadline, w.put(&probe_object, ReaderImpl::Body(Bytes::from_static(b"RustFS")), 6)).await;
+    let remote_version_id = match put_result {
+        Ok(Ok(remote_version_id)) => remote_version_id,
+        Ok(Err(_)) => {
+            return Err(match compensate_uncertain_probe_put(w, &probe_object, cleanup_deadline).await {
+                Ok(()) => ERR_TIER_PERM_ERR.clone(),
+                Err(_) => probe_cleanup_incomplete_error(),
+            });
+        }
+        Err(_) => {
+            let err = timeout_error();
+            return Err(match compensate_uncertain_probe_put(w, &probe_object, cleanup_deadline).await {
+                Ok(()) => err,
+                Err(_) => probe_cleanup_incomplete_error(),
+            });
+        }
+    };
+
+    // S3-family backends do not replay a failed request before returning `Ok`,
+    // while GCS discovers every matching generation. The authoritative probe
+    // below therefore closes the acknowledged-PUT path; only an error or
+    // timeout needs the longer visibility reconciliation above.
+    let authoritative_candidate = match tokio::time::timeout_at(deadline, w.probe_transition_candidate(&probe_object)).await {
+        Ok(Ok(candidate)) => candidate,
+        Ok(Err(_)) | Err(_) => {
+            return Err(match compensate_uncertain_probe_put(w, &probe_object, cleanup_deadline).await {
+                Ok(()) => ERR_TIER_INVALID_CONFIG.clone(),
+                Err(_) => probe_cleanup_incomplete_error(),
+            });
+        }
+    };
+    let response_version_is_valid = w.validate_remote_version_id(&remote_version_id).is_ok();
+    let response_matches_candidate = match &authoritative_candidate {
+        TransitionCandidateProbe::UnversionedPresent => remote_version_id.is_empty(),
+        TransitionCandidateProbe::VersionedPresent(candidate_version) => candidate_version == &remote_version_id,
+        TransitionCandidateProbe::Missing | TransitionCandidateProbe::Ambiguous | TransitionCandidateProbe::Unsupported => false,
+    };
+    if !response_version_is_valid || !response_matches_candidate {
+        return Err(match compensate_uncertain_probe_put(w, &probe_object, cleanup_deadline).await {
+            Ok(()) => ERR_TIER_INVALID_CONFIG.clone(),
+            Err(_) => probe_cleanup_incomplete_error(),
+        });
+    }
+
+    let read_result = tokio::time::timeout_at(deadline, async {
+        let mut reader = w
+            .get(
+                &probe_object,
+                &remote_version_id,
+                WarmBackendGetOpts {
+                    start_offset: 0,
+                    length: 7,
+                },
+            )
+            .await
+            .map_err(|_| ERR_TIER_PERM_ERR.clone())?;
+        let mut body = Vec::new();
+        reader
+            .take(7)
+            .read_to_end(&mut body)
+            .await
+            .map_err(|_| ERR_TIER_PERM_ERR.clone())?;
+        if body != b"RustFS" {
+            return Err(ERR_TIER_PERM_ERR.clone());
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| timeout_error())
+    .and_then(|result| result);
+    let cleanup_result = tokio::time::timeout_at(cleanup_deadline, async {
+        if !remove_discovered_probe_candidate(w, &probe_object, authoritative_candidate).await? {
+            return Err(std::io::Error::other("remote tier probe disappeared before cleanup"));
+        }
+        match w.probe_transition_candidate(&probe_object).await? {
+            TransitionCandidateProbe::Missing => Ok(()),
+            _ => Err(std::io::Error::other("remote tier probe remained after cleanup")),
+        }
+    })
+    .await;
+    if !matches!(cleanup_result, Ok(Ok(()))) {
+        return Err(probe_cleanup_incomplete_error());
+    }
+    if let Err(err) = read_result {
         //if is_err_bucket_not_found(&err) {
         //    return Err(ERR_TIER_BUCKET_NOT_FOUND);
         //}
@@ -477,10 +653,26 @@ pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), Admin
             return Err(ERR_TIER_MISSING_CREDENTIALS);
         }*/
         //else {
-        return Err(ERR_TIER_PERM_ERR.clone());
+        return Err(err);
         //}
     }
     Ok(())
+}
+
+/// Validate a backend using a caller-owned deadline while retaining a bounded
+/// reconciliation window for an uncertain probe PUT. The validation future is
+/// kept alive through cleanup so an outer timeout cannot abandon the remote
+/// probe object.
+pub(crate) async fn check_warm_backend_until(
+    w: Option<&WarmBackendImpl>,
+    deadline: tokio::time::Instant,
+) -> Result<(), AdminError> {
+    check_warm_backend_with_deadlines(w, deadline, deadline + WARM_BACKEND_PROBE_FINAL_RECONCILE_TIMEOUT).await
+}
+
+pub async fn check_warm_backend(w: Option<&WarmBackendImpl>) -> Result<(), AdminError> {
+    let deadline = tokio::time::Instant::now() + WARM_BACKEND_PROBE_TIMEOUT;
+    check_warm_backend_with_deadlines(w, deadline, deadline + WARM_BACKEND_PROBE_TIMEOUT).await
 }
 
 pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBackendImpl, AdminError> {
@@ -701,7 +893,7 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
     let d: WarmBackendImpl = Box::new(MeteredWarmBackend { inner: d });
 
     if probe {
-        d.validate().await.map_err(|_| ERR_TIER_INVALID_CONFIG.clone())?;
+        check_warm_backend(Some(&d)).await?;
     }
     Ok(d)
 }
@@ -754,6 +946,7 @@ pub(crate) async fn new_transition_candidate_reconciler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::tier::test_util::{MockWarmBackend, MockWarmOp};
     use crate::services::tier::tier_config::TierWasabi;
     use std::sync::{
         Arc,
@@ -920,13 +1113,38 @@ mod tests {
 
     struct RejectingProbeVersionBackend {
         gets: Arc<AtomicUsize>,
+        present: Arc<std::sync::atomic::AtomicBool>,
         removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+        returned_version: String,
     }
 
     struct RecordingProbeBackend {
         get_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+        present: Arc<std::sync::atomic::AtomicBool>,
         removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+        remove_clears_candidate: bool,
         fail_get: bool,
+        body: ProbeBody,
+    }
+
+    struct HangingProbePutBackend {
+        put_started: Arc<tokio::sync::Notify>,
+        present: Arc<std::sync::atomic::AtomicBool>,
+        probes: Arc<AtomicUsize>,
+        removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    struct LateVisibleProbeBackend {
+        visible_at: tokio::time::Instant,
+        removed: Arc<std::sync::atomic::AtomicBool>,
+        probes: Arc<AtomicUsize>,
+        removed_versions: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProbeBody {
+        Exact,
+        Mismatch,
     }
 
     #[async_trait::async_trait]
@@ -976,7 +1194,7 @@ mod tests {
         }
 
         async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
-            Ok(uuid::Uuid::nil().to_string())
+            Ok(self.returned_version.clone())
         }
 
         async fn put_with_meta(
@@ -999,8 +1217,17 @@ mod tests {
         }
 
         async fn remove_exact(&self, _object: &str, rv: &str) -> Result<(), std::io::Error> {
+            self.present.store(false, Ordering::SeqCst);
             self.removed_versions.lock().await.push(rv.to_string());
             Ok(())
+        }
+
+        async fn probe_transition_candidate(&self, _object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+            if self.present.load(Ordering::SeqCst) {
+                Ok(TransitionCandidateProbe::VersionedPresent(PROBE_VERSION.to_string()))
+            } else {
+                Ok(TransitionCandidateProbe::Missing)
+            }
         }
 
         async fn in_use(&self) -> Result<bool, std::io::Error> {
@@ -1029,13 +1256,119 @@ mod tests {
             if self.fail_get {
                 Err(std::io::Error::other("probe GET failed"))
             } else {
-                Ok(ReadCloser::new(std::io::Cursor::new(Vec::new())))
+                match self.body {
+                    ProbeBody::Exact => Ok(ReadCloser::new(std::io::Cursor::new(b"RustFS".to_vec()))),
+                    ProbeBody::Mismatch => Ok(ReadCloser::new(std::io::Cursor::new(b"RustFT".to_vec()))),
+                }
             }
         }
 
         async fn remove(&self, _object: &str, rv: &str) -> Result<(), std::io::Error> {
+            if self.remove_clears_candidate {
+                self.present.store(false, Ordering::SeqCst);
+            }
             self.removed_versions.lock().await.push(rv.to_string());
             Ok(())
+        }
+
+        async fn probe_transition_candidate(&self, _object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+            if self.present.load(Ordering::SeqCst) {
+                Ok(TransitionCandidateProbe::VersionedPresent(PROBE_VERSION.to_string()))
+            } else {
+                Ok(TransitionCandidateProbe::Missing)
+            }
+        }
+
+        async fn in_use(&self) -> Result<bool, std::io::Error> {
+            Ok(false)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WarmBackend for HangingProbePutBackend {
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
+            self.put_started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+            Err(std::io::Error::other("GET must not run after a timed out probe PUT"))
+        }
+
+        async fn remove(&self, _object: &str, _rv: &str) -> Result<(), std::io::Error> {
+            Err(std::io::Error::other("generic remove must not replace exact probe cleanup"))
+        }
+
+        async fn remove_exact(&self, _object: &str, rv: &str) -> Result<(), std::io::Error> {
+            self.present.store(false, Ordering::SeqCst);
+            self.removed_versions.lock().await.push(rv.to_string());
+            Ok(())
+        }
+
+        async fn probe_transition_candidate(&self, _object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            if self.present.load(Ordering::SeqCst) {
+                Ok(TransitionCandidateProbe::VersionedPresent(PROBE_VERSION.to_string()))
+            } else {
+                Ok(TransitionCandidateProbe::Missing)
+            }
+        }
+
+        async fn in_use(&self) -> Result<bool, std::io::Error> {
+            Ok(false)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WarmBackend for LateVisibleProbeBackend {
+        async fn put(&self, _object: &str, _r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "probe PUT response was lost before the object became visible",
+            ))
+        }
+
+        async fn put_with_meta(
+            &self,
+            object: &str,
+            r: ReaderImpl,
+            length: i64,
+            _meta: HashMap<String, String>,
+        ) -> Result<String, std::io::Error> {
+            self.put(object, r, length).await
+        }
+
+        async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+            Err(std::io::Error::other("GET must not run after a lost probe PUT response"))
+        }
+
+        async fn remove(&self, _object: &str, _rv: &str) -> Result<(), std::io::Error> {
+            Err(std::io::Error::other("generic remove must not replace exact probe cleanup"))
+        }
+
+        async fn remove_exact(&self, _object: &str, rv: &str) -> Result<(), std::io::Error> {
+            self.removed.store(true, Ordering::SeqCst);
+            self.removed_versions.lock().await.push(rv.to_string());
+            Ok(())
+        }
+
+        async fn probe_transition_candidate(&self, _object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            if tokio::time::Instant::now() >= self.visible_at && !self.removed.load(Ordering::SeqCst) {
+                Ok(TransitionCandidateProbe::VersionedPresent(PROBE_VERSION.to_string()))
+            } else {
+                Ok(TransitionCandidateProbe::Missing)
+            }
         }
 
         async fn in_use(&self) -> Result<bool, std::io::Error> {
@@ -1098,13 +1431,15 @@ mod tests {
         assert_eq!(probe, TransitionCandidateProbe::Unsupported);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn check_warm_backend_removes_exact_probe_when_versioning_drifts() {
         let gets = Arc::new(AtomicUsize::new(0));
         let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let backend: WarmBackendImpl = Box::new(RejectingProbeVersionBackend {
             gets: gets.clone(),
+            present: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             removed_versions: removed_versions.clone(),
+            returned_version: uuid::Uuid::nil().to_string(),
         });
 
         let err = check_warm_backend(Some(&backend))
@@ -1113,7 +1448,27 @@ mod tests {
 
         assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
         assert_eq!(gets.load(Ordering::SeqCst), 0);
-        assert_eq!(removed_versions.lock().await.as_slice(), [uuid::Uuid::nil().to_string()]);
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn check_warm_backend_rejects_empty_put_version_for_a_versioned_candidate() {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let backend: WarmBackendImpl = Box::new(RejectingProbeVersionBackend {
+            gets: gets.clone(),
+            present: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            removed_versions: removed_versions.clone(),
+            returned_version: String::new(),
+        });
+
+        let err = check_warm_backend(Some(&backend))
+            .await
+            .expect_err("an empty PUT version must not read or generically delete a versioned object");
+
+        assert_eq!(err.code, ERR_TIER_INVALID_CONFIG.code);
+        assert_eq!(gets.load(Ordering::SeqCst), 0);
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
     }
 
     #[tokio::test]
@@ -1122,8 +1477,11 @@ mod tests {
         let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let backend: WarmBackendImpl = Box::new(RecordingProbeBackend {
             get_versions: get_versions.clone(),
+            present: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             removed_versions: removed_versions.clone(),
+            remove_clears_candidate: true,
             fail_get: false,
+            body: ProbeBody::Exact,
         });
 
         check_warm_backend(Some(&backend))
@@ -1140,8 +1498,11 @@ mod tests {
         let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let backend: WarmBackendImpl = Box::new(RecordingProbeBackend {
             get_versions: get_versions.clone(),
+            present: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             removed_versions: removed_versions.clone(),
+            remove_clears_candidate: true,
             fail_get: true,
+            body: ProbeBody::Exact,
         });
 
         let err = check_warm_backend(Some(&backend))
@@ -1150,6 +1511,169 @@ mod tests {
 
         assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
         assert_eq!(get_versions.lock().await.as_slice(), [PROBE_VERSION]);
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_removes_probe_after_body_mismatch() {
+        let get_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let backend: WarmBackendImpl = Box::new(RecordingProbeBackend {
+            get_versions,
+            present: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            removed_versions: removed_versions.clone(),
+            remove_clears_candidate: true,
+            fail_get: false,
+            body: ProbeBody::Mismatch,
+        });
+
+        let err = check_warm_backend(Some(&backend))
+            .await
+            .expect_err("a mismatched body should fail after cleanup");
+
+        assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_rejects_a_stale_candidate_after_successful_delete() {
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let backend: WarmBackendImpl = Box::new(RecordingProbeBackend {
+            get_versions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            present: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            removed_versions: removed_versions.clone(),
+            remove_clears_candidate: false,
+            fail_get: false,
+            body: ProbeBody::Exact,
+        });
+
+        let err = check_warm_backend(Some(&backend))
+            .await
+            .expect_err("cleanup must not succeed while the deleted candidate remains visible");
+
+        assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
+        assert!(err.message.contains("cleanup is incomplete"));
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn check_warm_backend_reconciles_a_lost_put_response() {
+        let backend = MockWarmBackend::new();
+        backend.lose_next_put_response();
+        let driver: WarmBackendImpl = Box::new(backend.clone());
+
+        let err = check_warm_backend(Some(&driver))
+            .await
+            .expect_err("a lost probe PUT response must fail after compensation");
+
+        assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
+        assert_eq!(backend.object_count().await, 0);
+        assert_eq!(backend.exact_remove_count(), 1);
+        let operations = backend.op_log().await;
+        let put = operations.iter().find_map(|operation| match operation {
+            MockWarmOp::Put { object } => Some(object),
+            _ => None,
+        });
+        let probe = operations.iter().find_map(|operation| match operation {
+            MockWarmOp::Probe { object } => Some(object),
+            _ => None,
+        });
+        let remove = operations.iter().find_map(|operation| match operation {
+            MockWarmOp::Remove { object } => Some(object),
+            _ => None,
+        });
+        let (Some(put), Some(probe), Some(remove)) = (put, probe, remove) else {
+            panic!("lost-response compensation should PUT, probe, and remove");
+        };
+        assert_eq!(put, probe);
+        assert_eq!(probe, remove);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn check_warm_backend_retries_until_a_late_put_becomes_visible() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let driver: WarmBackendImpl = Box::new(LateVisibleProbeBackend {
+            visible_at: tokio::time::Instant::now() + Duration::from_secs(5),
+            removed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            probes: probes.clone(),
+            removed_versions: removed_versions.clone(),
+        });
+
+        let err = check_warm_backend(Some(&driver))
+            .await
+            .expect_err("a late-visible probe PUT must still report the lost response");
+
+        assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
+        assert!(
+            probes.load(Ordering::SeqCst) > 5,
+            "reconciliation must not stop at the first Missing result"
+        );
+        assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_reports_incomplete_cleanup_without_guessing() {
+        for candidate in [TransitionCandidateProbe::Unsupported, TransitionCandidateProbe::Ambiguous] {
+            let backend = MockWarmBackend::new();
+            backend.set_transition_candidate_probe_override(Some(candidate)).await;
+            backend.lose_next_put_response();
+            let driver: WarmBackendImpl = Box::new(backend.clone());
+
+            let err = check_warm_backend(Some(&driver))
+                .await
+                .expect_err("an uncertain candidate must fail without a guessed delete");
+
+            assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
+            assert!(err.message.contains("cleanup is incomplete"));
+            assert_eq!(backend.remove_count().await, 0);
+            assert_eq!(backend.object_count().await, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn check_warm_backend_reports_an_exact_cleanup_failure() {
+        let backend = MockWarmBackend::new();
+        backend.set_remove_failure(true);
+        backend.lose_next_put_response();
+        let driver: WarmBackendImpl = Box::new(backend.clone());
+
+        let err = check_warm_backend(Some(&driver))
+            .await
+            .expect_err("an exact cleanup failure must replace the ambiguous PUT error");
+
+        assert_eq!(err.code, ERR_TIER_PERM_ERR.code);
+        assert!(err.message.contains("cleanup is incomplete"));
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.object_count().await, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn check_warm_backend_reconciles_a_timed_out_put() {
+        let put_started = Arc::new(tokio::sync::Notify::new());
+        let probes = Arc::new(AtomicUsize::new(0));
+        let removed_versions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let driver: WarmBackendImpl = Box::new(HangingProbePutBackend {
+            put_started: put_started.clone(),
+            present: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            probes: probes.clone(),
+            removed_versions: removed_versions.clone(),
+        });
+        let check = check_warm_backend(Some(&driver));
+        tokio::pin!(check);
+        tokio::select! {
+            _ = put_started.notified() => {}
+            result = &mut check => panic!("probe completed before the PUT timeout: {result:?}"),
+        }
+
+        tokio::time::advance(WARM_BACKEND_PROBE_TIMEOUT + Duration::from_millis(1)).await;
+        let err = check.await.expect_err("a timed out probe PUT must fail after compensation");
+
+        assert_eq!(err.code, ERR_TIER_BACKEND_IN_USE.code);
+        assert!(
+            probes.load(Ordering::SeqCst) > 1,
+            "timed-out PUT reconciliation must keep checking through the visibility window"
+        );
         assert_eq!(removed_versions.lock().await.as_slice(), [PROBE_VERSION]);
     }
 
@@ -1296,6 +1820,15 @@ mod tests {
         assert!(!insecure.client.secure);
         assert_eq!(insecure.client.endpoint_url.scheme(), "http");
         assert_eq!(insecure.client.endpoint_url.port_or_known_default(), Some(80));
+    }
+
+    #[test]
+    fn endpoint_authority_preserves_ipv6_brackets_and_explicit_port() {
+        let url = url::Url::parse("https://[2001:db8::1]:9443").expect("the IPv6 endpoint should parse");
+        assert_eq!(
+            endpoint_authority(&url).expect("the endpoint should have an authority"),
+            "[2001:db8::1]:9443"
+        );
     }
 
     #[tokio::test]

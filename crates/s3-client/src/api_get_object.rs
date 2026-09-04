@@ -30,7 +30,9 @@ use tokio_util::io::StreamReader;
 use crate::{
     api_error_response::err_invalid_argument,
     api_get_options::GetObjectOptions,
-    transition_api::{ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, to_object_info_for_provider},
+    transition_api::{
+        ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, collect_response_body, to_object_info_for_provider,
+    },
 };
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
@@ -38,6 +40,42 @@ use hyper::body::Body;
 use hyper::body::Bytes;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use tokio_util::io::ReaderStream;
+
+fn response_limit_from_range(opts: &GetObjectOptions) -> Result<Option<usize>, std::io::Error> {
+    let Some(range) = opts
+        .headers
+        .iter()
+        .find_map(|(name, value)| name.eq_ignore_ascii_case("range").then_some(value.as_str()))
+    else {
+        return Ok(None);
+    };
+    let Some((unit, bounds)) = range.split_once('=') else {
+        return Ok(None);
+    };
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Ok(None);
+    }
+    let Some((start, end)) = bounds.split_once('-') else {
+        return Ok(None);
+    };
+    if start.is_empty() || end.is_empty() || end.contains(',') {
+        return Ok(None);
+    }
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "closed response range start is invalid"))?;
+    let end = end
+        .parse::<u64>()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "closed response range end is invalid"))?;
+    let length = end
+        .checked_sub(start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "closed response range length overflows"))?;
+    let limit = usize::try_from(length).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "closed response range length does not fit in memory")
+    })?;
+    Ok(Some(limit))
+}
 
 impl TransitionClient {
     pub fn get_object(&self, bucket_name: &str, object_name: &str, opts: &GetObjectOptions) -> Result<Object, std::io::Error> {
@@ -54,6 +92,7 @@ impl TransitionClient {
         object_name: &str,
         opts: &GetObjectOptions,
     ) -> Result<(ObjectInfo, HeaderMap, ReadCloser), std::io::Error> {
+        let max_response_bytes = response_limit_from_range(opts)?;
         let resp = self
             .execute_method(
                 http::Method::GET,
@@ -81,15 +120,211 @@ impl TransitionClient {
 
         let h = resp.headers().clone();
 
-        let mut body_vec = Vec::new();
         let mut body = resp.into_body();
-        while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            if let Some(data) = frame.data_ref() {
-                body_vec.extend_from_slice(data);
+        let body_vec = if let Some(limit) = max_response_bytes {
+            collect_response_body(body, limit).await?
+        } else {
+            let mut body_vec = Vec::new();
+            while let Some(frame) = body.frame().await {
+                let frame = frame.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                if let Some(data) = frame.data_ref() {
+                    body_vec.extend_from_slice(data);
+                }
             }
-        }
+            body_vec
+        };
         Ok((object_stat, h, BufReader::new(Cursor::new(body_vec))))
+    }
+}
+
+#[cfg(test)]
+mod bounded_response_tests {
+    use super::response_limit_from_range;
+    use crate::{
+        api_get_options::GetObjectOptions,
+        credentials::{Credentials, SignatureType, Static, Value},
+        transition_api::{BucketLookupType, Options, TransitionClient, collect_response_body},
+    };
+    use http_body_util::Full;
+    use hyper::body::Bytes;
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[test]
+    fn closed_range_derives_a_collection_limit_without_new_public_options() {
+        let mut opts = GetObjectOptions::default();
+        opts.set_range(5, 11).expect("the closed range should be valid");
+
+        assert_eq!(response_limit_from_range(&opts).expect("the range should parse"), Some(7));
+    }
+
+    #[tokio::test]
+    async fn response_collection_rejects_the_body_that_exceeds_its_range_limit() {
+        let mut opts = GetObjectOptions::default();
+        opts.set_range(0, 6).expect("the probe range should be valid");
+        let max_response_bytes = response_limit_from_range(&opts)
+            .expect("the range should parse")
+            .expect("the closed range should have a limit");
+        let err = collect_response_body(Full::new(Bytes::from_static(b"RustFSxx")), max_response_bytes)
+            .await
+            .expect_err("the collection layer must reject a response larger than its limit");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    async fn bounded_get_fixture(body: &'static [u8]) -> Option<(TransitionClient, tokio::task::JoinHandle<String>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let request = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("fixture should accept one GET");
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.expect("fixture should read request headers");
+                assert_ne!(read, 0, "connection closed before request headers were received");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request).into_owned();
+            let response = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("fixture should write response headers");
+            stream.write_all(body).await.expect("fixture should write response body");
+            request
+        });
+        let client = TransitionClient::new(
+            &endpoint,
+            Options {
+                creds: Credentials::new(Static(Value {
+                    access_key_id: "access-key".to_string(),
+                    secret_access_key: "secret-key".to_string(),
+                    signer_type: SignatureType::SignatureV4,
+                    ..Default::default()
+                })),
+                region: "us-east-1".to_string(),
+                bucket_lookup: BucketLookupType::BucketLookupPath,
+                max_retries: 1,
+                ..Default::default()
+            },
+            "",
+        )
+        .await
+        .expect("fixture client should build");
+        Some((client, request))
+    }
+
+    #[tokio::test]
+    async fn real_transport_accepts_the_exact_closed_range_length() {
+        let Some((client, request)) = bounded_get_fixture(b"RustFS!").await else {
+            return;
+        };
+        let mut opts = GetObjectOptions::default();
+        opts.set_range(0, 6).expect("the probe range should be valid");
+
+        let (_, _, mut reader) = client
+            .get_object_inner("bucket", "probe", &opts)
+            .await
+            .expect("a seven-byte response should fit the requested range");
+        let mut body = Vec::new();
+        reader
+            .read_to_end(&mut body)
+            .await
+            .expect("bounded response should be readable");
+
+        assert_eq!(body, b"RustFS!");
+        assert!(
+            request
+                .await
+                .expect("fixture should join")
+                .to_ascii_lowercase()
+                .contains("\r\nrange: bytes=0-6\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn real_transport_rejects_a_body_larger_than_the_closed_range() {
+        let Some((client, request)) = bounded_get_fixture(b"RustFS!!").await else {
+            return;
+        };
+        let mut opts = GetObjectOptions::default();
+        opts.set_range(0, 6).expect("the probe range should be valid");
+
+        let err = client
+            .get_object_inner("bucket", "probe", &opts)
+            .await
+            .expect_err("an eight-byte response must exceed the seven-byte range limit");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            request
+                .await
+                .expect("fixture should join")
+                .to_ascii_lowercase()
+                .contains("\r\nrange: bytes=0-6\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn overflowing_closed_range_is_rejected_before_network_io() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
+        let client = TransitionClient::new(
+            &endpoint,
+            Options {
+                creds: Credentials::new(Static(Value {
+                    access_key_id: "access-key".to_string(),
+                    secret_access_key: "secret-key".to_string(),
+                    signer_type: SignatureType::SignatureV4,
+                    ..Default::default()
+                })),
+                region: "us-east-1".to_string(),
+                bucket_lookup: BucketLookupType::BucketLookupPath,
+                max_retries: 1,
+                ..Default::default()
+            },
+            "",
+        )
+        .await
+        .expect("fixture client should build");
+        let mut opts = GetObjectOptions::default();
+        opts.headers
+            .insert("range".to_string(), "bytes=0-18446744073709551615".to_string());
+
+        let err = client
+            .get_object_inner("bucket", "probe", &opts)
+            .await
+            .expect_err("an overflowing closed range must be rejected locally");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
     }
 }
 
