@@ -183,9 +183,11 @@ fn source_page_entries(bucket: &str, page: SourcePage) -> Vec<SideEntry> {
 
 /// Runs one merged `ListObjectsV2` page.
 ///
-/// Cost: one local listing plus at most two source listings per request (the
-/// first page of each side, plus one refill when the previous page consumed
-/// most of what a side had buffered).
+/// Cost: at most two listings per side per request — the first page of each
+/// side, plus one refill when the previous page had already consumed most of
+/// what that side buffered. A full walk of N merged keys at `max_keys = K`
+/// therefore costs ceil(N/K) requests and between ceil(N/K) and 2*ceil(N/K)
+/// source listings.
 pub(crate) async fn merged_list_objects_v2(
     store: &Arc<ECStore>,
     state: &Arc<BucketOdmState>,
