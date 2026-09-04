@@ -213,7 +213,6 @@ pub struct InstanceContext {
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     tier_delete_journal_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
     transition_transaction_recovery_stores: std::sync::Mutex<HashSet<Uuid>>,
-    #[cfg(test)]
     tier_delete_journal_recovery_wakeup: tokio::sync::Notify,
 }
 
@@ -260,7 +259,6 @@ impl InstanceContext {
             object_encryption_resolver: OnceLock::new(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
             transition_transaction_recovery_stores: std::sync::Mutex::new(HashSet::new()),
-            #[cfg(test)]
             tier_delete_journal_recovery_wakeup: tokio::sync::Notify::new(),
         }
     }
@@ -655,16 +653,10 @@ impl InstanceContext {
             .insert(store_id)
     }
 
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "driven by the tier-delete-journal recovery test behind `--features test-util` (backlog#1823)"
-    )]
     pub(crate) fn wake_tier_delete_journal_recovery(&self) {
         self.tier_delete_journal_recovery_wakeup.notify_one();
     }
 
-    #[cfg(test)]
     pub(crate) async fn wait_for_tier_delete_journal_recovery(&self) {
         self.tier_delete_journal_recovery_wakeup.notified().await;
     }
