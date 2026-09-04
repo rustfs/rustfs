@@ -830,6 +830,7 @@ impl From<TransitionCandidateProbe> for TransitionOperatorProbe {
         match value {
             TransitionCandidateProbe::Missing => Self::Missing,
             TransitionCandidateProbe::UnversionedPresent => Self::UnversionedPresent,
+            TransitionCandidateProbe::SuspendedNullPresent => Self::VersionedPresent("null".to_string()),
             TransitionCandidateProbe::VersionedPresent(version_id) => Self::VersionedPresent(version_id),
             TransitionCandidateProbe::Ambiguous => Self::Ambiguous,
             TransitionCandidateProbe::Unsupported => Self::Unsupported,
@@ -1183,6 +1184,10 @@ async fn recover_unknown_upload_outcome(
         TransitionCandidateProbe::UnversionedPresent => {
             cleanup_recovered_unknown_upload_candidate(api, transaction, TransitionRemoteVersion::unversioned()).await
         }
+        TransitionCandidateProbe::SuspendedNullPresent => {
+            cleanup_recovered_unknown_upload_candidate(api, transaction, TransitionRemoteVersion::versioned("null".to_string()))
+                .await
+        }
         TransitionCandidateProbe::VersionedPresent(version_id)
             if Uuid::parse_str(&version_id).is_ok_and(|version_id| version_id.is_nil()) =>
         {
@@ -1511,6 +1516,14 @@ mod tests {
     use super::*;
 
     const BACKEND_FINGERPRINT: [u8; 32] = [7; 32];
+
+    #[test]
+    fn suspended_null_probe_preserves_operator_null_version_semantics() {
+        assert_eq!(
+            TransitionOperatorProbe::from(TransitionCandidateProbe::SuspendedNullPresent),
+            TransitionOperatorProbe::VersionedPresent("null".to_string())
+        );
+    }
 
     #[derive(Default)]
     struct MemoryTransactionStore {

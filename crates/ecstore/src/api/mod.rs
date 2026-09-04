@@ -37,6 +37,16 @@ pub mod bucket {
     }
 
     pub mod lifecycle {
+        pub mod legacy_transition_state_reconcile {
+            pub use crate::bucket::lifecycle::legacy_transition_state_reconcile::{
+                LegacyTransitionStateCopyRepresentation, LegacyTransitionStateMetadataAlias, LegacyTransitionStateReconcileError,
+                LegacyTransitionStateReconcileOutcome, LegacyTransitionStateReconcileReadiness,
+                LegacyTransitionStateReconcileRequest, LegacyTransitionStateReconcileResponse,
+                LegacyTransitionStateReconcileSelector, LegacyTransitionStateSetRepresentation, LegacyTransitionStateSource,
+                LegacyTransitionStateTarget,
+            };
+        }
+
         pub mod bucket_lifecycle_audit {
             pub use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
         }

@@ -223,6 +223,10 @@ pub(crate) mod lifecycle {
         renew_manual_transition_job_lease_if_owned, request_manual_transition_job_cancel, save_manual_transition_job_record,
         update_manual_transition_job_record,
     };
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::lifecycle::legacy_transition_state_reconcile::{
+        LegacyTransitionStateReconcileError, LegacyTransitionStateReconcileRequest, LegacyTransitionStateReconcileResponse,
+        LegacyTransitionStateReconcileSelector,
+    };
     pub(crate) type ManualTransitionCancelCheck =
         super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ManualTransitionCancelCheck;
     pub(crate) type ManualTransitionQueueSnapshot =

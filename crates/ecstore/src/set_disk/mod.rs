@@ -3877,6 +3877,31 @@ pub struct SetDisks {
     >,
 }
 
+/// Read every available `xl.meta` copy for an exact logical object after
+/// enforcing this set's metadata read quorum. Callers use the individual
+/// buffers only for diagnostics and immutable reconciliation digests; a
+/// missing disk remains visible as `None` and must never be mistaken for an
+/// absent metadata key.
+pub(crate) async fn read_legacy_transition_state_metadata_copies(
+    set: &SetDisks,
+    bucket: &str,
+    object: &str,
+) -> Result<Vec<Option<Vec<u8>>>> {
+    let disk_object = rustfs_utils::path::encode_dir_object(object);
+    let disks = set.get_disks_internal().await;
+    if disks.is_empty() {
+        return Err(to_object_err(StorageError::ErasureReadQuorum, vec![bucket, object]));
+    }
+
+    let read_quorum = disks.len().div_ceil(2).max(1);
+    let (copies, errs) = SetDisks::read_all_raw_file_info(&disks, bucket, disk_object.as_str(), false).await;
+    if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+        return Err(to_object_err(err.into(), vec![bucket, object]));
+    }
+
+    Ok(copies.into_iter().map(|copy| copy.map(|copy| copy.buf)).collect())
+}
+
 // DistributedLock sends the raw ObjectKey to its clients; LockRegistry clones
 // each endpoint's canonical Arc, so an exact Arc set identifies the lock domain.
 pub(crate) fn same_distributed_lock_domain(left: &[Arc<dyn LockClient>], right: &[Arc<dyn LockClient>]) -> bool {

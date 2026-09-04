@@ -792,6 +792,8 @@ impl WarmBackend for MockWarmBackend {
         };
         if stored.remote_version_id.is_empty() {
             Ok(TransitionCandidateProbe::UnversionedPresent)
+        } else if stored.remote_version_id == "null" {
+            Ok(TransitionCandidateProbe::SuspendedNullPresent)
         } else {
             Ok(TransitionCandidateProbe::VersionedPresent(stored.remote_version_id.clone()))
         }
@@ -991,7 +993,7 @@ mod tests {
     use bytes::Bytes;
 
     #[tokio::test]
-    async fn mock_probe_distinguishes_missing_unversioned_and_versioned_candidates() {
+    async fn mock_probe_distinguishes_all_known_remote_version_states() {
         let backend = MockWarmBackend::new();
 
         assert_eq!(
@@ -1029,6 +1031,19 @@ mod tests {
             TransitionCandidateProbe::VersionedPresent(remote_version)
         );
 
+        backend.set_put_remote_version(Some("null".to_string())).await;
+        backend
+            .put("suspended-null", ReaderImpl::Body(Bytes::new()), 0)
+            .await
+            .expect("put suspended null candidate");
+        assert_eq!(
+            backend
+                .probe_transition_candidate_state("suspended-null")
+                .await
+                .expect("probe suspended null candidate"),
+            TransitionCandidateProbe::SuspendedNullPresent
+        );
+
         assert_eq!(
             backend
                 .op_log()
@@ -1036,7 +1051,7 @@ mod tests {
                 .into_iter()
                 .filter(|op| matches!(op, MockWarmOp::Probe { .. }))
                 .count(),
-            3
+            4
         );
     }
 

@@ -78,6 +78,8 @@ pub struct WarmBackendGetOpts {
 pub enum TransitionCandidateProbe {
     Missing,
     UnversionedPresent,
+    /// The provider listed the candidate under the exact S3 `null` version.
+    SuspendedNullPresent,
     VersionedPresent(String),
     Ambiguous,
     Unsupported,

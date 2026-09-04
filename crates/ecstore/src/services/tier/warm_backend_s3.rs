@@ -214,7 +214,8 @@ impl WarmBackendS3 {
                 return Ok(TransitionCandidateProbe::Ambiguous);
             }
             if !versions.is_truncated {
-                return classify_transition_candidates(candidates, bucket_versioning);
+                let confirmed_versioning = self.remote_bucket_versioning().await?;
+                return classify_transition_candidates(candidates, bucket_versioning, confirmed_versioning);
             }
 
             advance_version_markers(&mut key_marker, &mut version_id_marker, &versions)?;
@@ -275,7 +276,8 @@ impl WarmBackendS3 {
                     version_id: matched_version,
                     ambiguous: false,
                 };
-                return classify_transition_candidates(candidates, bucket_versioning);
+                let confirmed_versioning = self.remote_bucket_versioning().await?;
+                return classify_transition_candidates(candidates, bucket_versioning, confirmed_versioning);
             }
             advance_version_markers(&mut key_marker, &mut version_id_marker, &versions)?;
         }
@@ -310,9 +312,15 @@ fn transition_candidate_metadata_matches(
 
 fn classify_transition_candidates(
     candidates: TransitionCandidateVersions,
-    bucket_versioning: RemoteBucketVersioning,
+    initial_versioning: RemoteBucketVersioning,
+    confirmed_versioning: RemoteBucketVersioning,
 ) -> Result<TransitionCandidateProbe, std::io::Error> {
-    let probe = candidates.classify(bucket_versioning);
+    // GetBucketVersioning and ListObjectVersions are separate requests. An
+    // observed state change makes the combined proof unsafe to persist.
+    if initial_versioning != confirmed_versioning {
+        return Ok(TransitionCandidateProbe::Ambiguous);
+    }
+    let probe = candidates.classify(initial_versioning);
     if let TransitionCandidateProbe::VersionedPresent(version_id) = &probe {
         validate_remote_version_id(version_id)?;
     }
@@ -366,8 +374,19 @@ impl TransitionCandidateVersions {
         };
 
         match bucket_versioning {
-            RemoteBucketVersioning::Disabled => TransitionCandidateProbe::UnversionedPresent,
-            RemoteBucketVersioning::Suspended if version_id == "null" => TransitionCandidateProbe::VersionedPresent(version_id),
+            // A never-versioned S3 object may be listed with either an empty
+            // version or the provider's `null` sentinel. Any opaque version is
+            // inconsistent with a disabled bucket and must remain ambiguous.
+            RemoteBucketVersioning::Disabled if version_id.is_empty() || version_id == "null" => {
+                TransitionCandidateProbe::UnversionedPresent
+            }
+            RemoteBucketVersioning::Disabled => TransitionCandidateProbe::Ambiguous,
+            // A `null` version survives a later transition back to Enabled, so
+            // the listed identifier, not only the current bucket status, binds
+            // suspended-null request routing.
+            RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled if version_id == "null" => {
+                TransitionCandidateProbe::SuspendedNullPresent
+            }
             RemoteBucketVersioning::Suspended | RemoteBucketVersioning::Enabled if !version_id.is_empty() => {
                 TransitionCandidateProbe::VersionedPresent(version_id)
             }
@@ -426,7 +445,8 @@ mod tests {
         for page in pages {
             candidates.extend("archive/object", page);
         }
-        candidates.classify(bucket_versioning)
+        classify_transition_candidates(candidates, bucket_versioning, bucket_versioning)
+            .expect("fixture version identifiers are valid")
     }
 
     fn candidate_identity() -> TransitionCandidateIdentity {
@@ -505,7 +525,35 @@ mod tests {
                 RemoteBucketVersioning::Suspended,
                 &[list_versions(&[("archive/object", "null")], &[], false)],
             ),
-            TransitionCandidateProbe::VersionedPresent("null".to_string())
+            TransitionCandidateProbe::SuspendedNullPresent
+        );
+        assert_eq!(
+            classify_pages(
+                RemoteBucketVersioning::Enabled,
+                &[list_versions(&[("archive/object", "null")], &[], false)],
+            ),
+            TransitionCandidateProbe::SuspendedNullPresent
+        );
+        assert_eq!(
+            classify_pages(
+                RemoteBucketVersioning::Suspended,
+                &[list_versions(&[("archive/object", "version-a")], &[], false)],
+            ),
+            TransitionCandidateProbe::VersionedPresent("version-a".to_string())
+        );
+        assert_eq!(
+            classify_pages(
+                RemoteBucketVersioning::Disabled,
+                &[list_versions(&[("archive/object", "null")], &[], false)],
+            ),
+            TransitionCandidateProbe::UnversionedPresent
+        );
+        assert_eq!(
+            classify_pages(
+                RemoteBucketVersioning::Disabled,
+                &[list_versions(&[("archive/object", "unexpected-version")], &[], false)],
+            ),
+            TransitionCandidateProbe::Ambiguous
         );
         assert_eq!(
             classify_pages(RemoteBucketVersioning::Enabled, &[list_versions(&[("archive/object", "")], &[], false)],),
@@ -573,9 +621,21 @@ mod tests {
         let mut candidates = TransitionCandidateVersions::default();
         candidates.extend("archive/object", &list_versions(&[("archive/object", "version\ninjection")], &[], false));
 
-        let err = classify_transition_candidates(candidates, RemoteBucketVersioning::Enabled)
+        let err = classify_transition_candidates(candidates, RemoteBucketVersioning::Enabled, RemoteBucketVersioning::Enabled)
             .expect_err("control characters in listed version IDs must fail closed");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn transition_candidate_probe_rejects_bucket_versioning_drift() {
+        let mut candidates = TransitionCandidateVersions::default();
+        candidates.extend("archive/object", &list_versions(&[("archive/object", "null")], &[], false));
+
+        assert_eq!(
+            classify_transition_candidates(candidates, RemoteBucketVersioning::Suspended, RemoteBucketVersioning::Enabled,)
+                .expect("observed versioning drift should be a safe probe result"),
+            TransitionCandidateProbe::Ambiguous
+        );
     }
 
     #[test]

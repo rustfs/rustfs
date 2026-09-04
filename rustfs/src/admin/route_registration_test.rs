@@ -225,6 +225,8 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/v3/ilm/transition/reconcile/{transaction_id}",
             "/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111",
         ),
+        admin_route(Method::GET, "/v3/ilm/transition/state/reconcile"),
+        admin_route(Method::POST, "/v3/ilm/transition/state/reconcile"),
         admin_route_sample(
             Method::DELETE,
             "/v3/ilm/transition/jobs/{job_id}",
@@ -951,6 +953,8 @@ fn test_register_routes_cover_representative_admin_paths() {
         Method::POST,
         &admin_path("/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111"),
     );
+    assert_route(&router, Method::GET, &admin_path("/v3/ilm/transition/state/reconcile"));
+    assert_route(&router, Method::POST, &admin_path("/v3/ilm/transition/state/reconcile"));
 
     assert_route(&router, Method::GET, &table_catalog_path("/config"));
     assert_route(&router, Method::PUT, &table_catalog_path("/buckets/analytics"));

@@ -714,6 +714,14 @@ async fn resolve_transition_delete_version_plan(
                         remote_already_missing: false,
                     })
                 }
+                ("null", crate::services::tier::warm_backend::TransitionCandidateProbe::SuspendedNullPresent) => {
+                    lease.validate_remote_version_id("null")?;
+                    Ok(ResolvedTransitionDeleteVersion {
+                        version_id_exact: true,
+                        verify_missing_after_delete: false,
+                        remote_already_missing: false,
+                    })
+                }
                 (_, crate::services::tier::warm_backend::TransitionCandidateProbe::Missing) => {
                     Ok(ResolvedTransitionDeleteVersion {
                         version_id_exact: false,

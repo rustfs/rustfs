@@ -18,6 +18,7 @@ mod config_boundary;
 pub mod core;
 mod durable_namespace;
 pub mod evaluator;
+pub mod legacy_transition_state_reconcile;
 pub mod manual_transition_job;
 mod metadata_boundary;
 pub(crate) use metadata_boundary::{LifecycleExpiryConfigs, get_expiry_configs, get_lifecycle_config};
