@@ -5876,21 +5876,6 @@ dependencies = [
 
 [[package]]
 name = "kafka-protocol"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66292444a1cd4d430d450d472c30cba839d0724229aba2d79affffcf901516e2"
-dependencies = [
- "anyhow",
- "bytes",
- "crc",
- "crc32c",
- "indexmap 2.14.1",
- "paste",
- "uuid",
-]
-
-[[package]]
-name = "kafka-protocol"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "099d5c2f1b40cd830cbf18ca4d2a0805f2875b811ca18f0372b2433e68fe2dda"
@@ -7597,12 +7582,6 @@ dependencies = [
  "getrandom 0.4.3",
  "phc",
 ]
-
-[[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "path-absolutize"
@@ -9969,16 +9948,16 @@ dependencies = [
 
 [[package]]
 name = "rustfs-kafka"
-version = "1.3.0"
+version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2918799ba36c2524d7458b7f9cd3695aab6e6b6db7506ab62bb2a1fa88718515"
+checksum = "759f8ddf709b497006e0f422a89890f11ac86c84c2c39df282891477c22f1a13"
 dependencies = [
  "base64 0.23.1",
  "bytes",
  "fnv",
  "hmac 0.13.0",
  "indexmap 2.14.1",
- "kafka-protocol 0.18.0",
+ "kafka-protocol",
  "metrics",
  "pbkdf2 0.13.0",
  "rand 0.10.2",
@@ -9994,24 +9973,24 @@ dependencies = [
 
 [[package]]
 name = "rustfs-kafka-async"
-version = "1.2.0"
+version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd1997c3116cb94ede80d9a0b828f46dd27386cc93825fce141a92eb3aa9630"
+checksum = "5aa574a13d91ef529e3a08f059a5c3ee8d4c3b16cf62f62c72595a6dc4f79f8f"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "hmac 0.13.0",
- "kafka-protocol 0.17.0",
+ "kafka-protocol",
  "metrics",
  "pbkdf2 0.13.0",
  "rand 0.10.2",
  "rustfs-kafka",
  "rustls",
- "rustls-native-certs",
  "sha2 0.11.0",
  "tokio",
  "tokio-rustls",
  "tracing",
+ "uuid",
  "webpki-roots 1.0.9",
 ]
 
@@ -12292,7 +12271,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
