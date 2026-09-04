@@ -40,6 +40,7 @@ pub mod system_memory;
 pub mod system_network;
 pub mod system_network_host;
 pub mod system_process;
+pub mod tier;
 
 pub(crate) use audit::{AuditTargetRuntimeStats, collect_audit_runtime_metrics};
 pub use audit::{AuditTargetStats, collect_audit_metrics};
@@ -94,3 +95,4 @@ pub use system_process::{
     ProcessAttributeError, ProcessAttributes, ProcessStats, ProcessStatusType, collect_process_attributes,
     collect_process_metrics,
 };
+pub use tier::{TierRequestStats, collect_tier_request_metrics};

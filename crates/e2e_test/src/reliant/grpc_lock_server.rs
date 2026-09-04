@@ -904,6 +904,13 @@ impl NodeService for MinimalLockNodeService {
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::LoadTransitionTierConfigResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
+
+    async fn tier_daily_stats(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::TierDailyStatsRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::TierDailyStatsResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
 }
 
 /// Spawn a gRPC lock server on a random port

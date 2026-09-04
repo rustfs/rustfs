@@ -1482,6 +1482,25 @@ pub struct LoadTransitionTierConfigResponse {
     #[prost(enumeration = "ControlPlaneErrorCode", optional, tag = "3")]
     pub error_code: ::core::option::Option<i32>,
 }
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TierDailyStatsRequest {}
+/// One node's own rolling-day transition counters, per remote tier.
+///
+/// `tier_daily_stats` is a msgpack map of tier name to the responder's 24-bin
+/// ring plus the clock that ring was last aged to. A node counts only the
+/// transitions it completed itself, so a caller sums the rings of every node to
+/// obtain a cluster total. A peer that does not implement this RPC answers
+/// UNIMPLEMENTED, which the caller reports as a non-reporting node rather than
+/// as zero activity.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TierDailyStatsResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub tier_daily_stats: ::prost::bytes::Bytes,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TierMutationPrepareRequest {
     #[prost(uint32, tag = "1")]
@@ -3075,6 +3094,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "LoadTransitionTierConfig"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn tier_daily_stats(
+            &mut self,
+            request: impl tonic::IntoRequest<super::TierDailyStatsRequest>,
+        ) -> std::result::Result<tonic::Response<super::TierDailyStatsResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/TierDailyStats");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "TierDailyStats"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn get_live_events(
             &mut self,
             request: impl tonic::IntoRequest<super::GetLiveEventsRequest>,
@@ -3475,6 +3509,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::LoadTransitionTierConfigRequest>,
         ) -> std::result::Result<tonic::Response<super::LoadTransitionTierConfigResponse>, tonic::Status>;
+        async fn tier_daily_stats(
+            &self,
+            request: tonic::Request<super::TierDailyStatsRequest>,
+        ) -> std::result::Result<tonic::Response<super::TierDailyStatsResponse>, tonic::Status>;
         async fn get_live_events(
             &self,
             request: tonic::Request<super::GetLiveEventsRequest>,
@@ -6071,6 +6109,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = LoadTransitionTierConfigSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/TierDailyStats" => {
+                    #[allow(non_camel_case_types)]
+                    struct TierDailyStatsSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::TierDailyStatsRequest> for TierDailyStatsSvc<T> {
+                        type Response = super::TierDailyStatsResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::TierDailyStatsRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::tier_daily_stats(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = TierDailyStatsSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)
