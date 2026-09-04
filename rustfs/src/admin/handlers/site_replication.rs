@@ -434,6 +434,7 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
     // into this module: startup sits below this layer and must not depend upwards. The admin
     // router is built before startup reconciles, so the hook is always installed in time.
     crate::site_replication_reconcile::register_site_replication_reconciler(reconcile_site_replication_wiring);
+    crate::site_replication_reconcile::register_site_replication_retry_drainer(reconcile_site_replication_retry_drain);
 
     for (method, path, operation) in [
         (Method::PUT, "/v3/site-replication/add", AdminOperation(&SiteReplicationAddHandler {})),
@@ -1803,28 +1804,55 @@ async fn reconcile_site_replication_buckets() -> S3Result<()> {
 /// (`SiteReplicationEditHandler`), so a tick landing between them would rewrite the targets
 /// from the stale endpoint. The pending marker in the persisted state closes that window.
 /// Skipping costs nothing — the timer comes back.
+async fn site_replication_reconcile_prerequisites_ready() -> bool {
+    if current_iam_handle().is_none() || current_object_store_handle().is_none() {
+        return false;
+    }
+    if let Err(err) = migrate_collapsed_retry_queue_paths().await {
+        warn!(
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            result = "retry_queue_migration_failed",
+            error = ?err,
+            "admin site replication state"
+        );
+        return false;
+    }
+    true
+}
+
+fn reconcile_site_replication_retry_drain() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async {
+        let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
+            return;
+        };
+        if !site_replication_reconcile_prerequisites_ready().await {
+            return;
+        }
+        match load_site_replication_state().await {
+            Ok(state) => {
+                if state.pending_endpoint_refresh.is_some() || state.pending_rotation.is_some() || state.pending_remove.is_some()
+                {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+        drain_site_replication_retry_queue().await;
+    })
+}
+
 fn reconcile_site_replication_wiring() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async {
         // The scheduler starts before IAM and the object store are guaranteed ready (IAM
         // bootstrap may still be recovering), so an early tick returns quietly instead of
         // logging a failure for every reconciler.
-        if current_iam_handle().is_none() || current_object_store_handle().is_none() {
-            return;
-        }
-
         let Some(_lifecycle) = SiteReplicationLifecycleGuard::try_acquire() else {
             return;
         };
 
-        if let Err(err) = migrate_collapsed_retry_queue_paths().await {
-            warn!(
-                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                component = LOG_COMPONENT_ADMIN,
-                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                result = "retry_queue_migration_failed",
-                error = ?err,
-                "admin site replication state"
-            );
+        if !site_replication_reconcile_prerequisites_ready().await {
             return;
         }
 
@@ -3046,6 +3074,7 @@ fn set_pending_endpoint_refresh(state: &mut SiteReplicationState, pending: Pendi
         last_error: "endpoint target refresh pending".to_string(),
         updated_at: Some(OffsetDateTime::now_utc()),
         edit_generation: None,
+        peer_unreachable: false,
         deletions_recorded: false,
     });
     state.pending_endpoint_refresh = Some(pending);
@@ -12791,6 +12820,7 @@ mod tests {
                 last_error: "site replication is not enabled".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                peer_unreachable: false,
                 deletions_recorded: false,
             }],
             ..Default::default()
@@ -12989,6 +13019,7 @@ mod tests {
                 last_error: "peer offline".to_string(),
                 updated_at: Some(OffsetDateTime::now_utc()),
                 edit_generation: None,
+                peer_unreachable: false,
                 deletions_recorded: false,
             }],
             ..Default::default()

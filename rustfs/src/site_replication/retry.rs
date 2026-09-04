@@ -41,6 +41,12 @@ pub(crate) struct SiteReplicationRetryEvent {
     /// [`settle_site_replication_retry_events`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) edit_generation: Option<u64>,
+    /// The latest delivery failure happened before an authenticated peer
+    /// response was received (connect, timeout, DNS, or TLS). Such failures
+    /// may bypass the expensive replay backoff only after a cheap devnull
+    /// reachability probe proves the peer is back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) peer_unreachable: bool,
     /// Whether every failure folded into this collapsed IAM entry had its
     /// deletion body (if it was a deletion) recorded in
     /// [`SiteReplicationState::iam_deletion_replays`]. Only then may a
@@ -206,11 +212,13 @@ pub(crate) fn upsert_site_replication_retry_event(
     let path = collapsed_retry_queue_path(path).unwrap_or(path);
     let now = OffsetDateTime::now_utc();
     let detail = summarize_peer_error_detail(error);
+    let peer_unreachable = retry_error_indicates_peer_unreachable(error);
     if let Some(event) = queue.iter_mut().find(|event| retry_event_matches(event, peer, path)) {
         event.retry_count = event.retry_count.saturating_add(1);
         event.failed = event.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
         event.last_error = detail;
         event.updated_at = Some(now);
+        event.peer_unreachable = peer_unreachable;
         // Keep the newest generation: an older delivery that fails afterwards
         // must not lower the fence and let its own success settle the event.
         event.edit_generation = event.edit_generation.max(generation);
@@ -227,12 +235,21 @@ pub(crate) fn upsert_site_replication_retry_event(
         last_error: detail,
         updated_at: Some(now),
         edit_generation: generation,
+        peer_unreachable,
         deletions_recorded: false,
     });
     if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
         let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
         queue.drain(0..overflow);
     }
+}
+
+pub(crate) fn retry_error_indicates_peer_unreachable(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("failed (connect)")
+        || error.contains("failed (timeout)")
+        || error.contains("failed (dns resolution)")
+        || error.contains("failed (tls handshake)")
 }
 
 pub(crate) fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRetryStats> {
@@ -989,10 +1006,10 @@ pub(crate) fn actionable_site_replication_retry_events(
 /// backoff exists to spare a *dead* peer the expensive replay (plan build,
 /// snapshot resend) — it must not delay convergence to a peer that has
 /// already RECOVERED, or a failure window ends in up to a day of silent
-/// divergence (backlog#2071). The drain probes each such peer with one cheap
-/// request per tick and promotes its backlog when the probe succeeds. The
-/// base backoff still floors individual re-attempts so a reachable peer that
-/// keeps failing a delivery is not hammered faster than before.
+/// divergence (backlog#2071). Transport failures may be probed before the
+/// normal replay backoff elapses; application failures still wait at least
+/// one base interval so a reachable peer that keeps rejecting a replay is not
+/// hammered faster than before.
 pub(crate) fn deferred_site_replication_retry_events(
     state: &SiteReplicationState,
     now: OffsetDateTime,
@@ -1005,7 +1022,9 @@ pub(crate) fn deferred_site_replication_retry_events(
         .filter(|event| !site_replication_retry_backoff_elapsed(event, now))
         .filter(|event| {
             event.updated_at.is_none_or(|updated_at| {
-                now.unix_timestamp().saturating_sub(updated_at.unix_timestamp()) >= SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS
+                event.peer_unreachable
+                    || now.unix_timestamp().saturating_sub(updated_at.unix_timestamp())
+                        >= SITE_REPLICATION_RETRY_DRAIN_BASE_BACKOFF_SECS
             })
         })
         .cloned()

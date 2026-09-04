@@ -419,6 +419,7 @@ fn drain_event(peer: &str, path: &str, retry_count: u32, updated_at: Option<Offs
         last_error: "remote-operation-failed".to_string(),
         updated_at,
         edit_generation: None,
+        peer_unreachable: false,
         deletions_recorded: false,
     }
 }
@@ -828,6 +829,47 @@ fn test_site_replication_retry_backoff_schedule() {
     assert!(elapsed(30, 86_401));
 }
 
+#[test]
+fn test_retry_error_marks_peer_unreachable_only_for_transport_failures() {
+    let mut queue = Vec::new();
+    let peer = peer("remote", "https://remote.example.com");
+    let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+
+    upsert_site_replication_retry_event(
+        &mut queue,
+        &peer,
+        bucket_make,
+        "peer request to https://remote.example.com failed (connect): connection refused",
+        None,
+    );
+    assert!(queue[0].peer_unreachable);
+
+    upsert_site_replication_retry_event(
+        &mut queue,
+        &peer,
+        bucket_make,
+        "peer request to https://remote.example.com failed with 500 Internal Server Error",
+        None,
+    );
+    assert!(!queue[0].peer_unreachable, "application failures must keep the normal replay backoff");
+}
+
+#[test]
+fn test_retry_event_peer_unreachable_is_legacy_serde_default() {
+    let json = r#"{
+        "id":"evt-legacy",
+        "peer_deployment_id":"remote",
+        "peer_endpoint":"https://remote.example.com",
+        "path":"/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning",
+        "retry_count":1,
+        "failed":false,
+        "last_error":"legacy"
+    }"#;
+
+    let event: SiteReplicationRetryEvent = serde_json::from_str(json).expect("legacy retry event decodes");
+    assert!(!event.peer_unreachable);
+}
+
 /// The actionable subset respects classification, peer membership and
 /// backoff; everything else stays untouched in the queue.
 #[test]
@@ -913,6 +955,51 @@ fn test_deferred_site_replication_retry_events_partition() {
     let actionable = actionable_site_replication_retry_events(&state, now);
     assert_eq!(actionable.len(), 1);
     assert_eq!(actionable[0].path, "/rustfs/admin/v3/site-replication/peer/bucket-meta");
+}
+
+#[test]
+fn test_deferred_retry_events_probe_fresh_peer_transport_failures() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let mut state = SiteReplicationState::default();
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+    let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+    let mut fresh_transport_failure = drain_event("remote", bucket_make, 1, Some(now - time::Duration::seconds(30)));
+    fresh_transport_failure.peer_unreachable = true;
+    state.retry_queue.push(fresh_transport_failure);
+
+    let deferred = deferred_site_replication_retry_events(&state, now);
+    assert_eq!(
+        deferred.len(),
+        1,
+        "fresh transport failures must be eligible for a cheap reachability probe"
+    );
+    assert_eq!(deferred[0].path, bucket_make);
+
+    let actionable = actionable_site_replication_retry_events(&state, now);
+    assert!(actionable.is_empty(), "the event is still protected from direct replay by normal backoff");
+}
+
+#[test]
+fn test_deferred_retry_events_do_not_probe_fresh_application_failures() {
+    let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("timestamp");
+    let mut state = SiteReplicationState::default();
+    state
+        .peers
+        .insert("remote".to_string(), peer("remote", "https://remote.example.com"));
+
+    let bucket_make = "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning";
+    state
+        .retry_queue
+        .push(drain_event("remote", bucket_make, 1, Some(now - time::Duration::seconds(30))));
+
+    assert!(
+        deferred_site_replication_retry_events(&state, now).is_empty(),
+        "reachable peers that reject an operation must keep the base replay backoff"
+    );
+    assert!(actionable_site_replication_retry_events(&state, now).is_empty());
 }
 
 /// The drain settles a peer-edit success under a freshly allocated
