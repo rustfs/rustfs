@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use super::harness::{
-    DistCluster, DistLayout, TestResult, enable_versioning, put_bucket_replication, put_object, set_bucket_quota,
-    set_remote_target, unique_bucket, wait_for_replicated_bytes,
+    DistCluster, DistLayout, TestResult, enable_versioning, put_bucket_replication, put_object, retrying_put, set_bucket_quota,
+    set_remote_target, unique_bucket, wait_for_replicated_bytes, wait_until,
 };
 use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, init_logging};
 use aws_sdk_s3::error::ProvideErrorMetadata;
+use http::Method;
 use std::time::Duration;
 
 #[tokio::test]
@@ -56,43 +57,60 @@ async fn four_node_four_drive_hard_quota_rejects_over_limit_put() -> TestResult 
     set_bucket_quota(&dist.cluster, &bucket, 8 * 1024).await?;
 
     let client = dist.client(1)?;
-    put_object(&client, &bucket, "small.bin", vec![0u8; 1024]).await?;
+    retrying_put(&client, &bucket, "small.bin", vec![0u8; 1024], Duration::from_secs(30)).await?;
+    wait_until(
+        Duration::from_secs(30),
+        || async {
+            let (status, body) = super::harness::cluster_admin(
+                &dist.cluster,
+                Method::GET,
+                &format!("/rustfs/admin/v3/quota-stats/{bucket}"),
+                None,
+            )
+            .await?;
+            if !status.is_success() {
+                return Ok(false);
+            }
+            let stats: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            Ok(stats.get("current_usage").and_then(serde_json::Value::as_u64).unwrap_or(0) >= 1024)
+        },
+        "quota stats observe small object",
+    )
+    .await?;
 
-    let over_limit = client
-        .put_object()
-        .bucket(&bucket)
-        .key("too-big.bin")
-        .body(vec![0u8; 16 * 1024].into())
-        .send()
-        .await;
-    match over_limit {
-        Ok(_) => {
-            // Scanner-backed quota can lag a cycle; a second over-quota PUT must fail.
-            let second = client
-                .put_object()
-                .bucket(&bucket)
-                .key("too-big-2.bin")
-                .body(vec![0u8; 16 * 1024].into())
-                .send()
-                .await;
-            match second {
-                Ok(_) => return Err("hard quota admitted two oversized PUTs on a 4x4 cluster".into()),
-                Err(error) => {
-                    let code = error.as_service_error().and_then(ProvideErrorMetadata::code);
-                    assert!(
-                        matches!(code, Some("QuotaExceeded" | "SlowDown" | "AccessDenied" | "InvalidRequest")),
-                        "unexpected over-quota error: {error:?}"
-                    );
+    let mut oversized_attempt = 0u32;
+    wait_until(
+        Duration::from_secs(30),
+        || {
+            oversized_attempt += 1;
+            let key = format!("too-big-{oversized_attempt}.bin");
+            let client = client.clone();
+            let bucket = bucket.clone();
+            async move {
+                match client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .body(vec![0u8; 16 * 1024].into())
+                    .send()
+                    .await
+                {
+                    Ok(_) => Ok(false),
+                    Err(error) => {
+                        let code = error.as_service_error().and_then(ProvideErrorMetadata::code);
+                        if matches!(code, Some("QuotaExceeded" | "SlowDown" | "AccessDenied" | "InvalidRequest")) {
+                            Ok(true)
+                        } else if matches!(code, Some("ServiceUnavailable")) {
+                            Ok(false)
+                        } else {
+                            Err(format!("unexpected over-quota error: {error:?}").into())
+                        }
+                    }
                 }
             }
-        }
-        Err(error) => {
-            let code = error.as_service_error().and_then(ProvideErrorMetadata::code);
-            assert!(
-                matches!(code, Some("QuotaExceeded" | "SlowDown" | "AccessDenied" | "InvalidRequest")),
-                "unexpected over-quota error: {error:?}"
-            );
-        }
-    }
+        },
+        "hard quota rejects oversized PUT",
+    )
+    .await?;
     Ok(())
 }

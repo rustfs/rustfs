@@ -28,7 +28,7 @@ A pool striped across several localhost ports is not expressible (`RUSTFS_VOLUME
 - Pool expand, decommission, rebalance, checksum integrity, S3 during move
 - Site replication object convergence
 - High-concurrency PUT/GET; concurrent PUT during decommission
-- Node kill/restart, full process restart, drive offline, volume-proxy blackhole
+- Node kill/restart, full process restart, drive offline, volume-proxy blackhole (4-node 1-drive DistErasure; a 4×4 volume proxy cannot format)
 - Multipart and cross-node listing agreement
 
 ## Existing Actions gaps this lane does not replace

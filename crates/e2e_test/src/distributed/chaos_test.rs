@@ -75,9 +75,11 @@ async fn offline_drive_then_replace_keeps_object_readable() -> TestResult {
 #[tokio::test]
 async fn volume_proxy_blackhole_then_restore_keeps_s3_available() -> TestResult {
     init_logging();
+    // 4 nodes × 1 drive (4-disk DistErasure). Proxying a 16-disk 4×4 set
+    // prevents first-disk format: proxied drives look like missing peers, so
+    // `should_init_erasure_disks` is false and the first disk waits out.
     let mut cluster =
-        crate::common::RustFSTestClusterEnvironment::with_topology(crate::common::ClusterTopology::single_pool_multidrive(4, 4))
-            .await?;
+        crate::common::RustFSTestClusterEnvironment::with_topology(crate::common::ClusterTopology::single_pool(4)).await?;
     let proxy = cluster.start_volume_proxy_for_node(1).await?;
     cluster.start().await?;
     cluster.create_test_bucket("chaos-net").await?;

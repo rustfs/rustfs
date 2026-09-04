@@ -4407,12 +4407,40 @@ pub(crate) enum PoolMetaBootstrapAuthority {
 }
 
 impl PoolMetaBootstrapAuthority {
+    /// Merge per-pool format-load proofs into one cluster bootstrap proof.
+    ///
+    /// `None` means this pool did not prove bootstrap itself: it loaded an
+    /// already-written `format.json`, usually formatted by that pool's first-disk
+    /// peer. That must not cancel a `Fresh` or `LegacyAdoption` proof from another
+    /// pool. Two different proven authorities still collapse to `None`.
     pub(crate) fn combine_across_pools(self, other: Self) -> Self {
-        if self == other { self } else { Self::None }
+        match (self, other) {
+            (Self::None, proven) | (proven, Self::None) => proven,
+            (Self::Fresh, Self::Fresh) => Self::Fresh,
+            (Self::LegacyAdoption, Self::LegacyAdoption) => Self::LegacyAdoption,
+            (Self::Fresh, Self::LegacyAdoption) | (Self::LegacyAdoption, Self::Fresh) => Self::None,
+        }
     }
 
     fn is_proven(self) -> bool {
         !matches!(self, Self::None)
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_authority_combine_tests {
+    use super::PoolMetaBootstrapAuthority::*;
+
+    #[test]
+    fn none_does_not_cancel_a_proven_pool() {
+        assert_eq!(Fresh.combine_across_pools(None), Fresh);
+        assert_eq!(None.combine_across_pools(Fresh), Fresh);
+        assert_eq!(LegacyAdoption.combine_across_pools(None), LegacyAdoption);
+        assert_eq!(None.combine_across_pools(LegacyAdoption), LegacyAdoption);
+        assert_eq!(Fresh.combine_across_pools(Fresh), Fresh);
+        assert_eq!(None.combine_across_pools(None), None);
+        assert_eq!(Fresh.combine_across_pools(LegacyAdoption), None);
+        assert_eq!(LegacyAdoption.combine_across_pools(Fresh), None);
     }
 }
 
