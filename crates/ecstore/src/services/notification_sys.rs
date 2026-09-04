@@ -2087,18 +2087,13 @@ impl NotificationSys {
             return Err(Error::other("scanner dirty usage snapshot probe has no remote peers"));
         }
         if self.all_peer_clients.len() != self.peer_clients.len() + 1 {
-            return Err(Error::other(format!(
-                "scanner dirty usage snapshot peer topology is incomplete: {} remote peers for {} cluster members",
-                self.peer_clients.len(),
-                self.all_peer_clients.len()
-            )));
+            return Err(Error::other("scanner dirty usage snapshot peer topology is incomplete"));
         }
 
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        for (idx, client) in self.peer_clients.iter().cloned().enumerate() {
+        for client in self.peer_clients.iter().cloned() {
             futures.push(async move {
-                let client =
-                    client.ok_or_else(|| Error::other(format!("scanner dirty usage snapshot peer[{idx}] is unreachable")))?;
+                let client = client.ok_or_else(|| Error::other("scanner dirty usage snapshot peer is unreachable"))?;
                 let host = client.grid_host.clone();
                 scanner_dirty_usage_snapshot_with_retry(&client, &host)
                     .await
@@ -3782,7 +3777,7 @@ mod tests {
             .scanner_dirty_usage_snapshots()
             .await
             .expect_err("an unreachable peer must invalidate the distributed dirty usage snapshot");
-        assert!(err.to_string().contains("peer[0] is unreachable"));
+        assert!(err.to_string().contains("peer is unreachable"));
 
         let empty = NotificationSys {
             peer_clients: Vec::new(),

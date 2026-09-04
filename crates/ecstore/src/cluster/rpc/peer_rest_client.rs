@@ -343,10 +343,7 @@ fn decode_scanner_dirty_usage_snapshot_with_verifier(
     verify_proof(&canonical, &response.response_proof)?;
 
     if response.protocol_version != SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION {
-        return Err(Error::other(format!(
-            "peer returned unsupported scanner dirty usage snapshot protocol {}",
-            response.protocol_version
-        )));
+        return Err(Error::other("peer returned unsupported scanner dirty usage snapshot protocol"));
     }
     if !scanner_instance_id_is_valid(&response.instance_id) {
         return Err(Error::other("peer returned an invalid scanner dirty usage snapshot instance ID"));
