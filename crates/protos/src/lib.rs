@@ -541,6 +541,34 @@ pub fn canonical_scanner_activity_v7_response_body(
     Ok(body)
 }
 
+pub fn canonical_scanner_dirty_usage_snapshot_request_body(
+    request: &proto_gen::node_service::ScannerDirtyUsageSnapshotRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-scanner-dirty-usage-snapshot-request-v1\0");
+    body.push_u32(request.protocol_version);
+    body.push_bytes(request.challenge.as_ref())?;
+    Ok(body.finish())
+}
+
+pub fn canonical_scanner_dirty_usage_snapshot_response_body(
+    challenge: &[u8],
+    response: &proto_gen::node_service::ScannerDirtyUsageSnapshotResponse,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-scanner-dirty-usage-snapshot-response-v1\0");
+    body.push_bytes(challenge)?;
+    body.push_str(&response.instance_id)?;
+    body.push_u64(response.generation);
+    body.push_u64(response.pending_bucket_count);
+    body.push_u32(response.protocol_version);
+    body.push_bool(response.complete);
+    body.push_count(response.buckets.len())?;
+    for bucket in &response.buckets {
+        body.push_str(&bucket.bucket)?;
+        body.push_u64(bucket.generation);
+    }
+    Ok(body.finish())
+}
+
 /// Builds the body authenticated by the short-lived remote scanner publication
 /// lease request. This is a separate domain from ScannerActivity so v6/v7
 /// observation proofs remain byte-for-byte compatible.
@@ -1751,12 +1779,111 @@ mod scanner_activity_tests {
     use super::{
         canonical_scanner_activity_request_body, canonical_scanner_activity_response_body,
         canonical_scanner_activity_v4_response_body, canonical_scanner_activity_v7_response_body,
+        canonical_scanner_dirty_usage_snapshot_request_body, canonical_scanner_dirty_usage_snapshot_response_body,
         canonical_scanner_publication_lease_release_request_body, canonical_scanner_publication_lease_request_body,
         canonical_scanner_publication_lease_response_body,
         proto_gen::node_service::{
-            ScannerActivityRequest, ScannerActivityResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+            ScannerActivityRequest, ScannerActivityResponse, ScannerDirtyUsageBucket, ScannerDirtyUsageSnapshotRequest,
+            ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
         },
     };
+
+    #[test]
+    fn canonical_scanner_dirty_usage_snapshot_request_binds_every_field() {
+        let request = ScannerDirtyUsageSnapshotRequest {
+            challenge: vec![1; 16].into(),
+            protocol_version: 1,
+        };
+        let baseline = canonical_scanner_dirty_usage_snapshot_request_body(&request)
+            .expect("scanner dirty usage snapshot request should encode");
+
+        for variant in [
+            ScannerDirtyUsageSnapshotRequest {
+                challenge: vec![2; 16].into(),
+                ..request.clone()
+            },
+            ScannerDirtyUsageSnapshotRequest {
+                protocol_version: 2,
+                ..request.clone()
+            },
+        ] {
+            assert_ne!(
+                baseline,
+                canonical_scanner_dirty_usage_snapshot_request_body(&variant)
+                    .expect("scanner dirty usage snapshot request variant should encode")
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_scanner_dirty_usage_snapshot_response_binds_every_field() {
+        let response = ScannerDirtyUsageSnapshotResponse {
+            instance_id: "0123456789abcdef0123456789abcdef".to_string(),
+            generation: 7,
+            pending_bucket_count: 2,
+            protocol_version: 1,
+            complete: true,
+            buckets: vec![
+                ScannerDirtyUsageBucket {
+                    bucket: "archive".to_string(),
+                    generation: 3,
+                },
+                ScannerDirtyUsageBucket {
+                    bucket: "photos".to_string(),
+                    generation: 7,
+                },
+            ],
+            response_proof: vec![9; 32].into(),
+        };
+        let baseline = canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &response)
+            .expect("scanner dirty usage snapshot response should encode");
+        let mut variants = Vec::new();
+        let mut instance = response.clone();
+        instance.instance_id = "fedcba9876543210fedcba9876543210".to_string();
+        variants.push(instance);
+        let mut generation = response.clone();
+        generation.generation = 8;
+        variants.push(generation);
+        let mut count = response.clone();
+        count.pending_bucket_count = 3;
+        variants.push(count);
+        let mut protocol = response.clone();
+        protocol.protocol_version = 2;
+        variants.push(protocol);
+        let mut complete = response.clone();
+        complete.complete = false;
+        variants.push(complete);
+        let mut bucket_name = response.clone();
+        bucket_name.buckets[0].bucket = "backups".to_string();
+        variants.push(bucket_name);
+        let mut bucket_generation = response.clone();
+        bucket_generation.buckets[0].generation = 4;
+        variants.push(bucket_generation);
+        let mut bucket_order = response.clone();
+        bucket_order.buckets.reverse();
+        variants.push(bucket_order);
+
+        for variant in variants {
+            assert_ne!(
+                baseline,
+                canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &variant)
+                    .expect("scanner dirty usage snapshot response variant should encode")
+            );
+        }
+        assert_ne!(
+            baseline,
+            canonical_scanner_dirty_usage_snapshot_response_body(&[2; 16], &response)
+                .expect("scanner dirty usage snapshot response challenge variant should encode")
+        );
+
+        let mut proof_only = response;
+        proof_only.response_proof = vec![8; 32].into();
+        assert_eq!(
+            baseline,
+            canonical_scanner_dirty_usage_snapshot_response_body(&[1; 16], &proof_only)
+                .expect("response proof must not authenticate itself")
+        );
+    }
 
     #[test]
     fn canonical_scanner_activity_request_binds_every_field() {

@@ -27,6 +27,25 @@ pub struct ScannerDirtyUsageState {
     pub pending: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannerDirtyUsageBucket {
+    pub bucket: String,
+    pub generation: u64,
+}
+
+/// A point-in-time view of the local dirty bucket generations.
+///
+/// `complete == false` is an all-or-nothing overflow signal: `buckets` is
+/// empty and callers must fall back to the global dirty generation rather than
+/// treating a bounded prefix as authoritative.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannerDirtyUsageSnapshot {
+    pub generation: u64,
+    pub pending_bucket_count: u64,
+    pub complete: bool,
+    pub buckets: Vec<ScannerDirtyUsageBucket>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ScannerDirtyUsageAckError {
     #[error("scanner process instance changed before dirty usage acknowledgement")]
@@ -95,6 +114,35 @@ pub fn scanner_dirty_usage_state() -> ScannerDirtyUsageState {
     ScannerDirtyUsageState {
         generation: DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire),
         pending: !dirty_buckets.is_empty(),
+    }
+}
+
+pub fn scanner_dirty_usage_snapshot(max_entries: usize) -> ScannerDirtyUsageSnapshot {
+    let (generation, pending_bucket_count, complete, mut buckets) = {
+        let dirty_buckets = dirty_usage_buckets();
+        let generation = DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire);
+        let pending_bucket_count = usize_to_u64_saturated(dirty_buckets.len());
+        let complete = dirty_buckets.len() <= max_entries;
+        let buckets = complete
+            .then(|| {
+                dirty_buckets
+                    .iter()
+                    .map(|(bucket, generation)| ScannerDirtyUsageBucket {
+                        bucket: bucket.clone(),
+                        generation: *generation,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (generation, pending_bucket_count, complete, buckets)
+    };
+    buckets.sort_unstable_by(|left, right| left.bucket.cmp(&right.bucket));
+
+    ScannerDirtyUsageSnapshot {
+        generation,
+        pending_bucket_count,
+        complete,
+        buckets,
     }
 }
 

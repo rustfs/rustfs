@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::bucket::lifecycle::tier_last_day_stats::DailyAllTierStats;
-use crate::cluster::rpc::{PeerRestClient, ScannerPeerActivity, ScannerPublicationLease, TierConfigReloadOutcome};
+use crate::cluster::rpc::{
+    PeerRestClient, ScannerPeerActivity, ScannerPeerDirtyUsageSnapshot, ScannerPublicationLease, TierConfigReloadOutcome,
+};
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::disk::DiskAPI;
 use crate::error::{Error, Result};
@@ -2080,6 +2082,37 @@ impl NotificationSys {
         Ok(generations)
     }
 
+    pub async fn scanner_dirty_usage_snapshots(&self) -> Result<Vec<(String, ScannerPeerDirtyUsageSnapshot)>> {
+        if self.peer_clients.is_empty() {
+            return Err(Error::other("scanner dirty usage snapshot probe has no remote peers"));
+        }
+        if self.all_peer_clients.len() != self.peer_clients.len() + 1 {
+            return Err(Error::other(format!(
+                "scanner dirty usage snapshot peer topology is incomplete: {} remote peers for {} cluster members",
+                self.peer_clients.len(),
+                self.all_peer_clients.len()
+            )));
+        }
+
+        let mut futures = Vec::with_capacity(self.peer_clients.len());
+        for (idx, client) in self.peer_clients.iter().cloned().enumerate() {
+            futures.push(async move {
+                let client =
+                    client.ok_or_else(|| Error::other(format!("scanner dirty usage snapshot peer[{idx}] is unreachable")))?;
+                let host = client.grid_host.clone();
+                scanner_dirty_usage_snapshot_with_retry(&client, &host)
+                    .await
+                    .map(|snapshot| (host, snapshot))
+            });
+        }
+
+        let mut snapshots = Vec::with_capacity(futures.len());
+        for result in join_all(futures).await {
+            snapshots.push(result?);
+        }
+        Ok(snapshots)
+    }
+
     pub async fn acknowledge_scanner_dirty_usage(&self, acknowledgements: Vec<(String, String, u64)>) -> Result<bool> {
         let mut by_host = HashMap::with_capacity(acknowledgements.len());
         for (host, instance_id, generation) in acknowledgements {
@@ -2583,6 +2616,54 @@ async fn scanner_activity_with_retry(client: &PeerRestClient, host: &str) -> Res
     }
 
     match timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_activity()).await {
+        Ok(result) => result,
+        Err(_) => {
+            client.evict_connection().await;
+            Err(Error::Timeout)
+        }
+    }
+}
+
+async fn scanner_dirty_usage_snapshot_with_retry(client: &PeerRestClient, host: &str) -> Result<ScannerPeerDirtyUsageSnapshot> {
+    let first = timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_dirty_usage_snapshot()).await;
+    let should_retry = match &first {
+        Ok(Ok(_)) => false,
+        Ok(Err(err)) => scanner_activity_should_retry(Some(err), false),
+        Err(_) => scanner_activity_should_retry(None, true),
+    };
+
+    match first {
+        Ok(Ok(snapshot)) => return Ok(snapshot),
+        Ok(Err(err)) if !should_retry => return Err(err),
+        Ok(Err(err)) => {
+            debug!(
+                event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                result = "retrying",
+                capability = "scanner_dirty_usage_snapshot",
+                peer = host,
+                error = %err,
+                "notification capability probe retrying"
+            );
+            client.prepare_retry().await;
+        }
+        Err(_) => {
+            debug!(
+                event = EVENT_NOTIFICATION_CAPABILITY_PROBE,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                result = "retrying",
+                capability = "scanner_dirty_usage_snapshot",
+                peer = host,
+                timeout = ?SCANNER_ACTIVITY_PROBE_TIMEOUT,
+                "notification capability probe retrying"
+            );
+            client.prepare_retry().await;
+        }
+    }
+
+    match timeout(SCANNER_ACTIVITY_PROBE_TIMEOUT, client.scanner_dirty_usage_snapshot()).await {
         Ok(result) => result,
         Err(_) => {
             client.evict_connection().await;
@@ -3685,6 +3766,52 @@ mod tests {
             .await
             .expect_err("an incomplete peer topology must disable scanner idle backoff");
 
+        assert!(err.to_string().contains("peer topology is incomplete"));
+    }
+
+    #[tokio::test]
+    async fn scanner_dirty_usage_snapshot_probe_rejects_unusable_peer_topologies() {
+        let unreachable = NotificationSys {
+            peer_clients: vec![None],
+            all_peer_clients: vec![None, None],
+            peer_topology_hosts: vec!["node-a:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+        let err = unreachable
+            .scanner_dirty_usage_snapshots()
+            .await
+            .expect_err("an unreachable peer must invalidate the distributed dirty usage snapshot");
+        assert!(err.to_string().contains("peer[0] is unreachable"));
+
+        let empty = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: Vec::new(),
+            peer_topology_hosts: Vec::new(),
+            peer_admin_caches: Vec::new(),
+            tier_config_reload_workers: Default::default(),
+        };
+        let err = empty
+            .scanner_dirty_usage_snapshots()
+            .await
+            .expect_err("an empty peer set must not produce a distributed dirty usage snapshot");
+        assert!(err.to_string().contains("no remote peers"));
+
+        let client = PeerRestClient::new(
+            "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
+            "http://127.0.0.1:9000".to_string(),
+        );
+        let incomplete = NotificationSys {
+            peer_clients: vec![Some(client)],
+            all_peer_clients: vec![None],
+            peer_topology_hosts: vec!["127.0.0.1:9000".to_string()],
+            peer_admin_caches: vec![Mutex::new(PeerAdminCache::new())],
+            tier_config_reload_workers: Default::default(),
+        };
+        let err = incomplete
+            .scanner_dirty_usage_snapshots()
+            .await
+            .expect_err("an incomplete topology must not produce a distributed dirty usage snapshot");
         assert!(err.to_string().contains("peer topology is incomplete"));
     }
 
