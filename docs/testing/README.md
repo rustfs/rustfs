@@ -61,7 +61,7 @@ All profiles are defined in `.config/nextest.toml`; its block comments hold the 
 | `e2e-full` | Merge-queue / main-push single-node e2e lane |
 | `e2e-repl-nightly` | Nightly slow / cross-process replication lane |
 | `e2e-nightly` | Nightly serial multi-process cluster fault lane |
-| `e2e-distributed` | Nightly 4-node 4-disk S3 / lock / versioning / replication / quota / expand / decommission / rebalance / site-replication / chaos lane |
+| `e2e-distributed` | Nightly 4-node 4-disk S3 / lock / versioning / replication / quota / expand / decommission / rebalance / site-replication / chaos / upgrade (history + IAM AK/SK) lane |
 | `e2e-protocols` | Nightly fixed-port FTPS/SFTP/WebDAV lane, run with `-j 1` |
 
 Membership of each e2e profile is pinned by a digest in `.config/e2e-<profile>-selection.txt` and checked by `scripts/check_test_wiring.py --check-profile <profile>` before the lane runs. To list what a profile selects on your platform (the result is platform-dependent because some modules are linux-only):

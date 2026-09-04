@@ -538,7 +538,8 @@ test-group = 'e2e-cluster-nightly'
 # ---------------------------------------------------------------------------
 # Nightly / dispatch lane owned by .github/workflows/e2e-distributed.yml.
 # Each case starts four rustfs processes (and for site replication, two
-# clusters). Serialized via e2e-cluster-nightly. Not a PR merge gate.
+# clusters). Upgrade cases also require RUSTFS_UPGRADE_SOURCE_BINARY.
+# Serialized via e2e-cluster-nightly. Not a PR merge gate.
 [profile.e2e-distributed]
 default-filter = 'package(e2e_test) & test(/^distributed::/)'
 fail-fast = false
@@ -614,7 +615,7 @@ path = "junit.xml"
 #     this merge/main lane while retaining nightly coverage.
 #   * distributed:: — 4-node 4-disk Actions suite (S3, lock, versioning,
 #     replication, quota, observability, expand/decommission/rebalance, site
-#     replication, chaos). Owns [profile.e2e-distributed] and
+#     replication, chaos, upgrade history/IAM). Owns [profile.e2e-distributed] and
 #     .github/workflows/e2e-distributed.yml.
 #   * on_demand_migration::interop_test — the ODM-20 provider interoperability
 #     cases, which are meaningless without a source: they run in the dedicated

@@ -26,7 +26,7 @@ Registered in [`src/lib.rs`](src/lib.rs). Grouped by concern:
 | **protocols** | [`src/protocols/`](src/protocols) | FTPS, WebDAV, SFTP compliance. Fixed ports, own guide: [`src/protocols/README.md`](src/protocols/README.md) |
 | **reliant** | [`src/reliant/`](src/reliant) | Tests that reuse an **externally started** server (SQL/select, conditional writes, lifecycle, deleted-object reads, node-interact). Run via [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh); see [`src/reliant/README.md`](src/reliant/README.md) |
 | **cluster** | `cluster_concurrency_test`, `stale_multipart_cleanup_cluster_test`, `namespace_lock_quorum_test`, `admin_timeout_regression_test`, `object_lambda_test`, `replication_extension_test`, `tier_stats_cluster_test` | Multi-node scenarios via `RustFSTestClusterEnvironment` |
-| **distributed 4×4** | [`src/distributed/`](src/distributed) | Nightly `e2e-distributed` lane: S3, object lock/WORM, versioning, bucket/site replication, quota, expand/decommission/rebalance, concurrency, chaos. Map: [`docs/testing/distributed-e2e.md`](../../docs/testing/distributed-e2e.md) |
+| **distributed 4×4** | [`src/distributed/`](src/distributed) | Nightly `e2e-distributed` lane: S3, object lock/WORM, versioning, bucket/site replication, quota, expand/decommission/rebalance, concurrency, chaos, 4-node upgrade of historical data and IAM AK/SK. Map: [`docs/testing/distributed-e2e.md`](../../docs/testing/distributed-e2e.md) |
 | **chaos / reliability** | [`src/chaos.rs`](src/chaos.rs), `reliability_disk_fault_test`, `heal_erasure_disk_rebuild_test`, `server_startup_failfast_test` | Disk offline/replace/corrupt, EC rebuild, heal, fail-fast startup |
 | **upgrade compatibility** | `upgrade_compatibility_test` | Pinned previous-release writes followed by current-build reads on the same data directory |
 
@@ -193,7 +193,8 @@ cargo nextest run --profile e2e-smoke -p e2e_test
 cargo nextest run --profile e2e-full -p e2e_test
 # Cluster fault nightly lane
 cargo nextest run --profile e2e-nightly -p e2e_test
-# 4-node 4-disk distributed lane (S3 / lock / versioning / replication / decommission / chaos)
+# 4-node 4-disk distributed lane (S3 / lock / versioning / replication / decommission / chaos / upgrade)
+# Upgrade cases need RUSTFS_UPGRADE_SOURCE_BINARY; without it they fail closed.
 cargo nextest run --profile e2e-distributed -p e2e_test
 # Replication nightly lane; awscurl is required for STS paths
 cargo nextest run --profile e2e-repl-nightly -p e2e_test

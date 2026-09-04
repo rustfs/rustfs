@@ -10,7 +10,7 @@ The in-tree harness runs every node on `127.0.0.1` with a distinct port. That ma
 | Layout | Constructor | Use |
 |---|---|---|
 | 4 nodes × 4 drives, one pool | `ClusterTopology::single_pool_multidrive(4, 4)` | S3, object lock, versioning, quota, observability, concurrency, chaos |
-| 4 nodes × 1 drive, one pool | `ClusterTopology::single_pool(4)` | Two-site replication (8 processes total) |
+| 4 nodes × 1 drive, one pool | `ClusterTopology::single_pool(4)` | Two-site replication (8 processes total); direct/rolling upgrade from the pinned previous release |
 | 2 single-node pools × 4 drives, then `append_single_node_pool` twice | expansion seed | Pool expand, then decommission / rebalance / integrity |
 
 A pool striped across several localhost ports is not expressible (`RUSTFS_VOLUMES` host ellipses would collide on disk paths). Multi-host striped pools remain the hardware functional-chain / backlog #1313 / #1314 lane.
@@ -32,6 +32,7 @@ Decommission and rebalance POST currently 500 on localhost DistErasure multi-poo
 - Node kill/restart, full process restart, drive offline (4×4). Volume-proxy blackhole stays in `cluster_volume_fault_proxy_pass_smoke` (2×2); a 4-node volume proxy cannot format because RPC audience is the listen port
 - Multipart, cross-node listing, list-buckets agreement
 - Concurrent GET while a peer node is killed
+- Direct and rolling upgrade from the pinned previous release: historical objects, versioned history, and IAM user AK/SK still work afterwards
 
 ## Existing Actions gaps this lane does not replace
 
@@ -39,7 +40,8 @@ Those suites stay in place; this lane fills the in-tree 4×4 hole they leave.
 
 | Existing lane | Gap |
 |---|---|
-| `rustfs-*-test.yml` functional chain | Clones private `rustfs/auto-testing`, runs on three shared VMs (`vm000`–`vm002`), `continue-on-error: true`, not a merge signal, not 4 nodes |
+| `rustfs-*-test.yml` functional chain | Clones private `rustfs/auto-testing`, runs on three shared VMs (`vm000`–`vm002`), `continue-on-error: true`, not a merge signal, not 4 nodes. Hardware `rustfs-upgrade-test.yml` stays there |
+| `e2e-upgrade.yml` | Single-node SSE/multipart/delete-marker contracts plus mixed-version listing; does not pin IAM user AK/SK on a 4-node cluster |
 | `e2e-smoke` / `e2e-full` | Almost all cases are single-node |
 | `e2e-nightly` | 4-node cluster faults and heal, not S3/lock/versioning/quota/decommission matrix |
 | `e2e-repl-nightly` | Site and bucket replication on 1–3 *single-node* processes |
@@ -52,7 +54,17 @@ Hardware power-loss, NIC pull, and real disk replacement still belong on the smo
 
 ```bash
 cargo build -p rustfs --bins
+# Upgrade cases require the pinned previous binary (CI downloads it).
+export RUSTFS_UPGRADE_SOURCE_BINARY=/path/to/rustfs-1.0.0-rc.2
 cargo nextest run --profile e2e-distributed -p e2e_test
 ```
+
+Without `RUSTFS_UPGRADE_SOURCE_BINARY` the two `distributed::upgrade_test::*` cases fail closed. Filter them out for a local run that is not checking upgrade:
+
+```bash
+cargo nextest run --profile e2e-distributed -p e2e_test -E 'not test(/^distributed::upgrade_test::/)'
+```
+
+The upgrade topology is `ClusterTopology::single_pool(4)` (4 nodes × 1 drive). That matches the proven mixed-version fixture in `upgrade_compatibility_test`; 4×4 localhost drives are rejected by the previous release's same-device disk check.
 
 Membership is pinned by `.config/e2e-distributed-selection.txt`. Update it with `python3 ./scripts/check_test_wiring.py --update-profile e2e-distributed <listing.json> linux` after adding or renaming a case.

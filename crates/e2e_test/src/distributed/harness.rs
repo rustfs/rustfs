@@ -29,8 +29,8 @@
 //! process count stays at eight rather than sixteen.
 
 use crate::common::{
-    ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, admin_request, local_http_client,
-    replication_fast_env, signed_request,
+    ClusterTopology, FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment, admin_request, build_test_s3_config,
+    local_http_client, replication_fast_env, signed_request,
 };
 use crate::replication_extension_test::LOOPBACK_REPLICATION_TARGET_ENV;
 use aws_sdk_s3::Client;
@@ -69,6 +69,20 @@ impl DistCluster {
     }
 
     pub async fn start_with_env(layout: DistLayout, extra_env: &[(&str, &str)]) -> TestResult<Self> {
+        let mut dist = Self::new_stopped_with_env(layout, extra_env).await?;
+        dist.cluster.start().await?;
+        Ok(dist)
+    }
+
+    /// Allocate ports and data dirs without spawning processes.
+    ///
+    /// Upgrade tests configure capture logs, then start a pinned previous
+    /// binary against the same directories.
+    pub async fn new_stopped(layout: DistLayout) -> TestResult<Self> {
+        Self::new_stopped_with_env(layout, &[]).await
+    }
+
+    pub async fn new_stopped_with_env(layout: DistLayout, extra_env: &[(&str, &str)]) -> TestResult<Self> {
         let topology = match layout {
             DistLayout::FourByFour => ClusterTopology::single_pool_multidrive(NODE_COUNT, DRIVES_PER_NODE),
             DistLayout::FourNodeFourDisk => ClusterTopology::single_pool(NODE_COUNT),
@@ -81,8 +95,45 @@ impl DistCluster {
         for &(key, value) in extra_env {
             cluster.set_env(key, value);
         }
-        cluster.start().await?;
         Ok(Self { cluster })
+    }
+
+    /// Start every node with a specific `rustfs` binary, keeping the allocated
+    /// data directories. Used to seed an old on-disk format before upgrading.
+    pub async fn start_from_binary(&mut self, binary: &Path) -> TestResult {
+        self.cluster.start_with_binary(binary).await?;
+        wait_for_ready(&self.cluster).await?;
+        Ok(())
+    }
+
+    /// Stop every node and bring the same data directories up on the workspace
+    /// binary (direct upgrade).
+    pub async fn restart_with_current_binary(&mut self) -> TestResult {
+        self.cluster.stop();
+        self.cluster.start().await?;
+        wait_for_ready(&self.cluster).await?;
+        Ok(())
+    }
+
+    /// Replace one running node with the workspace binary (rolling upgrade).
+    pub async fn replace_node_with_current_binary(&mut self, node_idx: usize) -> TestResult {
+        self.cluster.stop_node(node_idx)?;
+        self.cluster.start_node(node_idx).await?;
+        wait_for_ready(&self.cluster).await?;
+        Ok(())
+    }
+
+    pub fn client_with_credentials(&self, node_idx: usize, access_key: &str, secret_key: &str) -> TestResult<Client> {
+        if node_idx >= self.cluster.nodes.len() {
+            return Err("node_idx is invalid".into());
+        }
+        Ok(Client::from_conf(build_test_s3_config(
+            &self.cluster.nodes[node_idx].url,
+            access_key,
+            secret_key,
+            None,
+            "cluster-iam-test",
+        )))
     }
 
     /// Four single-node pools, started as two pools then expanded. Cold-start
