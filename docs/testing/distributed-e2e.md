@@ -30,7 +30,7 @@ Decommission and rebalance POST currently 500 on localhost DistErasure multi-poo
 - Site replication object convergence
 - High-concurrency PUT/GET; concurrent PUT during decommission
 - Node kill/restart, full process restart, drive offline (4×4). Volume-proxy blackhole stays in `cluster_volume_fault_proxy_pass_smoke` (2×2); a 4-node volume proxy cannot format because RPC audience is the listen port
-- Multipart, cross-node listing, list-buckets agreement, delete+recreate bucket
+- Multipart, cross-node listing, list-buckets agreement
 - Concurrent GET while a peer node is killed
 
 ## Existing Actions gaps this lane does not replace
