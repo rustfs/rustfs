@@ -8170,6 +8170,44 @@ fn scanner_activity_snapshot_digest_fences_dirty_usage_state() {
 }
 
 #[test]
+fn scanner_activity_structural_digest_ignores_regular_bucket_writes() {
+    let baseline = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let mut written = baseline.clone();
+    let activity = written.get_mut("node-2").expect("node should exist");
+    activity.namespace_generation = 8;
+    activity.dirty_usage_generation = 6;
+    activity.dirty_usage_pending = true;
+
+    assert_ne!(scanner_activity_snapshot_digest(&baseline), scanner_activity_snapshot_digest(&written));
+    assert_eq!(
+        scanner_activity_structural_digest(&baseline),
+        scanner_activity_structural_digest(&written),
+        "bucket writes are refreshed through the dirty-bucket scope rather than invalidating every cache"
+    );
+}
+
+#[test]
+fn scanner_activity_structural_digest_fences_restart_and_maintenance() {
+    let baseline = BTreeMap::from([("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3))]);
+    let mut restarted = baseline.clone();
+    restarted.get_mut("node-2").expect("node should exist").instance_id = "epoch-b".to_string();
+    let mut maintained = baseline.clone();
+    maintained
+        .get_mut("node-2")
+        .expect("node should exist")
+        .maintenance_generation = 4;
+
+    assert_ne!(
+        scanner_activity_structural_digest(&baseline),
+        scanner_activity_structural_digest(&restarted)
+    );
+    assert_ne!(
+        scanner_activity_structural_digest(&baseline),
+        scanner_activity_structural_digest(&maintained)
+    );
+}
+
+#[test]
 fn scanner_dirty_usage_acknowledgements_exclude_local_and_clean_nodes() {
     let snapshot = BTreeMap::from([
         (
