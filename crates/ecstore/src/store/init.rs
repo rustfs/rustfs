@@ -820,9 +820,9 @@ mod tests {
                 TierDeleteDispatchRollbackTestHook, complete_tier_delete_dispatch, encode_tier_delete_journal_entry,
                 install_test_tier_delete_dispatch_fixture, persist_tier_delete_journal_entry, prepare_tier_delete_dispatch,
                 recover_test_tier_delete_dispatch_manifest, recover_test_tier_delete_dispatch_manifest_with_page_budget,
-                recover_tier_delete_dispatch_manifests, recover_tier_delete_journal_entries,
-                test_tier_delete_dispatch_manifest_checkpoint, test_tier_delete_dispatch_manifest_state,
-                tier_delete_dispatch_manifest_operation_lock_held_for_test,
+                recover_test_tier_delete_journal_pass_with_budget, recover_tier_delete_dispatch_manifests,
+                recover_tier_delete_journal_entries, test_tier_delete_dispatch_manifest_checkpoint,
+                test_tier_delete_dispatch_manifest_state, tier_delete_dispatch_manifest_operation_lock_held_for_test,
                 tier_delete_dispatch_manifest_recovery_count_for_test, tier_delete_dispatch_manifest_recovery_inflight_for_test,
                 tier_delete_journal_object_name,
             },
@@ -8697,6 +8697,35 @@ mod tests {
     }
 
     #[cfg(feature = "test-util")]
+    async fn install_committed_tier_delete_journals(
+        store: Arc<crate::store::ECStore>,
+        tier_name: &str,
+        backend_identity: [u8; 32],
+        count: usize,
+    ) -> Vec<Jentry> {
+        let mut entries = Vec::with_capacity(count);
+        for index in 0..count {
+            let entry = Jentry {
+                persisted_version: 0,
+                obj_name: format!("remote/pass-drain-{index:06}.bin"),
+                version_id: uuid::Uuid::new_v4().to_string(),
+                tier_name: tier_name.to_string(),
+                backend_identity: Some(backend_identity),
+                version_id_exact: true,
+                version_state: rustfs_filemeta::TransitionVersionState::Exact,
+                state: TierDeleteJournalState::Committed,
+                source: None,
+                dispatch: None,
+            };
+            persist_tier_delete_journal_entry(store.clone(), &entry)
+                .await
+                .expect("committed tier-delete journal fixture should persist");
+            entries.push(entry);
+        }
+        entries
+    }
+
+    #[cfg(feature = "test-util")]
     fn synthetic_v6_dispatch_entry(
         bucket: &str,
         object: &str,
@@ -8790,6 +8819,196 @@ mod tests {
         })
         .await
         .expect("same-disk restart recovery should converge without retained dispatch state");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_recovery_pass_drains_multiple_fast_manifest_pages() {
+        const MANIFEST_COUNT: usize = 10;
+
+        let temp_dir = tempfile::tempdir().expect("create fast manifest pass recovery store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-delete-fast-manifest-pass", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "tier-delete-fast-manifest-pass-bucket";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("fast manifest pass bucket should be created");
+        let incarnation = store
+            .bucket_incarnation_id(bucket)
+            .await
+            .expect("fast manifest pass bucket incarnation should resolve");
+        let tier_name = "FAST-MANIFEST-PASS";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("fast manifest pass tier lease should resolve")
+            .backend_identity();
+        for index in 0..MANIFEST_COUNT {
+            install_aborting_dispatch_fixture(
+                store.clone(),
+                bucket,
+                incarnation,
+                &format!("manifest-page-{index:06}/"),
+                tier_name,
+                backend_identity,
+                1,
+            )
+            .await;
+        }
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, MANIFEST_COUNT);
+        assert_eq!(tier_delete_journal_count(store.clone()).await, MANIFEST_COUNT);
+
+        let cancel = CancellationToken::new();
+        let mut manifest_marker = None;
+        let mut journal_marker = None;
+        let stats = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(!stats.canceled);
+        assert!(!stats.deadline_exhausted);
+        assert!(
+            stats.manifest_pages > 1,
+            "one production pass must cross the default eight-manifest page limit"
+        );
+        assert_eq!(stats.manifests.scanned, MANIFEST_COUNT);
+        assert_eq!(stats.manifests.deleted, MANIFEST_COUNT);
+        assert_eq!(stats.manifests.failed, 0);
+        assert_eq!(manifest_marker, None);
+        assert_eq!(tier_delete_dispatch_manifest_count(store.clone()).await, 0);
+        assert_eq!(tier_delete_journal_count(store).await, 0);
+        assert_eq!(backend.remove_count().await, 0, "rollback recovery must not call the remote tier");
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_recovery_pass_drains_multiple_fast_journal_pages() {
+        const JOURNAL_COUNT: usize = 25;
+
+        let temp_dir = tempfile::tempdir().expect("create fast pass recovery store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-delete-fast-pass", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "FAST-PASS-RECOVERY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("fast pass tier lease should resolve")
+            .backend_identity();
+        let entries = install_committed_tier_delete_journals(store.clone(), tier_name, backend_identity, JOURNAL_COUNT).await;
+        assert_eq!(tier_delete_journal_count(store.clone()).await, JOURNAL_COUNT);
+
+        let cancel = CancellationToken::new();
+        let mut manifest_marker = None;
+        let mut journal_marker = None;
+        let stats = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(!stats.canceled);
+        assert!(!stats.deadline_exhausted);
+        assert!(
+            stats.journal_pages > 1,
+            "one production pass must cross the default eight-record page limit"
+        );
+        assert_eq!(stats.journals.scanned, JOURNAL_COUNT);
+        assert_eq!(stats.journals.deleted, JOURNAL_COUNT);
+        assert_eq!(stats.journals.failed, 0);
+        assert_eq!(journal_marker, None);
+        assert_eq!(tier_delete_journal_count(store).await, 0);
+        assert_eq!(backend.exact_remove_count(), JOURNAL_COUNT);
+        let mut removed = backend.remove_versions().await;
+        removed.sort();
+        let mut expected = entries
+            .into_iter()
+            .map(|entry| (entry.obj_name, entry.version_id))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(removed, expected);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn tier_delete_recovery_pass_rotates_failed_journal_pages_without_busy_loop() {
+        const JOURNAL_COUNT: usize = 9;
+
+        let temp_dir = tempfile::tempdir().expect("create failed pass recovery store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-delete-failed-pass", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let tier_name = "FAILED-PASS-RECOVERY";
+        let backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
+        let backend_identity = TierConfigMgr::acquire_operation_lease(&ctx.tier_config_mgr(), tier_name)
+            .await
+            .expect("failed pass tier lease should resolve")
+            .backend_identity();
+        install_committed_tier_delete_journals(store.clone(), tier_name, backend_identity, JOURNAL_COUNT).await;
+        backend.set_remove_failure(true);
+
+        let cancel = CancellationToken::new();
+        let mut manifest_marker = None;
+        let mut journal_marker = None;
+        let first = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(first.journal_pages, 1, "a no-progress failed page must stop the pass");
+        assert_eq!(first.journals.scanned, 8);
+        assert_eq!(first.journals.deleted, 0);
+        assert_eq!(first.journals.failed, 8);
+        assert!(journal_marker.is_some(), "a truncated failed page must retain its continuation marker");
+        assert_eq!(tier_delete_journal_count(store.clone()).await, JOURNAL_COUNT);
+
+        let second = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(second.journal_pages, 1);
+        assert_eq!(second.journals.scanned, 1);
+        assert_eq!(second.journals.deleted, 0);
+        assert_eq!(second.journals.failed, 1);
+        assert_eq!(
+            journal_marker, None,
+            "end-of-list rotation must revisit the failed prefix on a later pass"
+        );
+        assert_eq!(tier_delete_journal_count(store.clone()).await, JOURNAL_COUNT);
+
+        backend.set_remove_failure(false);
+        let third = recover_test_tier_delete_journal_pass_with_budget(
+            store.clone(),
+            &cancel,
+            &mut manifest_marker,
+            &mut journal_marker,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert_eq!(third.journals.scanned, JOURNAL_COUNT);
+        assert_eq!(third.journals.deleted, JOURNAL_COUNT);
+        assert_eq!(third.journals.failed, 0);
+        assert_eq!(tier_delete_journal_count(store).await, 0);
     }
 
     #[cfg(feature = "test-util")]

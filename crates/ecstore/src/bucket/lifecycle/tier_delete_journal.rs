@@ -61,12 +61,13 @@ pub(crate) const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 pub(crate) const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
 pub(crate) const EVENT_LIFECYCLE_TIER_DELETE_JOURNAL: &str = "lifecycle_tier_delete_journal";
 
-// Keep one background pass small enough that a slow remote tier cannot hold
-// the shared recovery worker for minutes. Subsequent passes resume from the
-// returned marker, so this bounds latency without reducing eventual coverage.
+// Keep one page small enough that slow remote tiers remain bounded by per-entry
+// deadlines and worker concurrency. A production pass may consume multiple
+// successful pages while its wall-clock budget remains.
 pub const DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT: usize = 8;
 const TIER_DELETE_JOURNAL_RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 const TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(300);
+const TIER_DELETE_JOURNAL_RECOVERY_PASS_BUDGET: Duration = Duration::from_secs(240);
 const TIER_DELETE_REMOTE_DEADLINE: Duration = Duration::from_secs(30);
 const TIER_DELETE_JOURNAL_ENTRY_RECOVERY_TIMEOUT: Duration = Duration::from_secs(90);
 const TIER_DELETE_JOURNAL_RECOVERY_CONCURRENCY: usize = 4;
@@ -729,7 +730,7 @@ fn validate_version_state(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TierDeleteJournalRecoveryStats {
     pub scanned: usize,
     pub deleted: usize,
@@ -738,7 +739,7 @@ pub struct TierDeleteJournalRecoveryStats {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TierDeleteDispatchManifestRecoveryStats {
     pub scanned: usize,
     pub advanced: usize,
@@ -747,6 +748,18 @@ pub struct TierDeleteDispatchManifestRecoveryStats {
     pub failed: usize,
     pub next_marker: Option<String>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TierDeleteJournalRecoveryPassStats {
+    pub manifest_pages: usize,
+    pub journal_pages: usize,
+    pub manifest_errors: usize,
+    pub journal_errors: usize,
+    pub deadline_exhausted: bool,
+    pub canceled: bool,
+    pub manifests: TierDeleteDispatchManifestRecoveryStats,
+    pub journals: TierDeleteJournalRecoveryStats,
 }
 
 pub(crate) fn tier_delete_journal_object_name(je: &Jentry) -> String {
@@ -4467,6 +4480,201 @@ pub async fn recover_tier_delete_journal_entries(
     Ok(stats)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TierDeleteJournalRecoveryPageStep {
+    stop_queue: bool,
+    made_progress: bool,
+}
+
+fn remaining_recovery_pass_budget(
+    deadline: tokio::time::Instant,
+    stats: &mut TierDeleteJournalRecoveryPassStats,
+) -> Option<Duration> {
+    match deadline.checked_duration_since(tokio::time::Instant::now()) {
+        Some(remaining) if !remaining.is_zero() => Some(remaining),
+        _ => {
+            stats.deadline_exhausted = true;
+            None
+        }
+    }
+}
+
+fn accumulate_dispatch_manifest_recovery_stats(
+    total: &mut TierDeleteDispatchManifestRecoveryStats,
+    page: TierDeleteDispatchManifestRecoveryStats,
+) {
+    total.scanned += page.scanned;
+    total.advanced += page.advanced;
+    total.deleted += page.deleted;
+    total.retained += page.retained;
+    total.failed += page.failed;
+    total.next_marker = page.next_marker;
+    total.truncated = page.truncated;
+}
+
+fn accumulate_tier_delete_journal_recovery_stats(
+    total: &mut TierDeleteJournalRecoveryStats,
+    page: TierDeleteJournalRecoveryStats,
+) {
+    total.scanned += page.scanned;
+    total.deleted += page.deleted;
+    total.failed += page.failed;
+    total.next_marker = page.next_marker;
+    total.truncated = page.truncated;
+}
+
+async fn recover_tier_delete_dispatch_manifest_pass_page(
+    api: Arc<ECStore>,
+    cancel_token: &CancellationToken,
+    marker: &mut Option<String>,
+    deadline: tokio::time::Instant,
+    stats: &mut TierDeleteJournalRecoveryPassStats,
+) -> Option<TierDeleteJournalRecoveryPageStep> {
+    if cancel_token.is_cancelled() {
+        stats.canceled = true;
+        return None;
+    }
+    let remaining = remaining_recovery_pass_budget(deadline, stats)?;
+    let page_marker = marker.clone();
+    let recovery = recover_tier_delete_dispatch_manifests(api, DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT, page_marker.clone());
+    let page =
+        await_tier_delete_journal_recovery(cancel_token, remaining.min(TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT), recovery).await;
+    let Some(page) = page else {
+        stats.canceled = true;
+        return None;
+    };
+    match page {
+        Ok(page) => {
+            stats.manifest_pages += 1;
+            let made_progress = page.advanced > 0 || page.deleted > 0;
+            let stop_queue = !page.truncated || !made_progress;
+            *marker = page.next_marker.clone();
+            accumulate_dispatch_manifest_recovery_stats(&mut stats.manifests, page);
+            Some(TierDeleteJournalRecoveryPageStep {
+                stop_queue,
+                made_progress,
+            })
+        }
+        Err(err) => {
+            stats.manifest_errors += 1;
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                next_marker = ?page_marker,
+                error = ?err,
+                "Failed to recover tier delete dispatch manifest page"
+            );
+            Some(TierDeleteJournalRecoveryPageStep {
+                stop_queue: true,
+                made_progress: false,
+            })
+        }
+    }
+}
+
+async fn recover_tier_delete_journal_pass_page(
+    api: Arc<ECStore>,
+    cancel_token: &CancellationToken,
+    marker: &mut Option<String>,
+    deadline: tokio::time::Instant,
+    stats: &mut TierDeleteJournalRecoveryPassStats,
+) -> Option<TierDeleteJournalRecoveryPageStep> {
+    if cancel_token.is_cancelled() {
+        stats.canceled = true;
+        return None;
+    }
+    let remaining = remaining_recovery_pass_budget(deadline, stats)?;
+    let page_marker = marker.clone();
+    let recovery = recover_tier_delete_journal_entries(api, DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT, page_marker.clone());
+    let page =
+        await_tier_delete_journal_recovery(cancel_token, remaining.min(TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT), recovery).await;
+    let Some(page) = page else {
+        stats.canceled = true;
+        return None;
+    };
+    match page {
+        Ok(page) => {
+            stats.journal_pages += 1;
+            let made_progress = page.deleted > 0;
+            let stop_queue = !page.truncated || !made_progress;
+            *marker = page.next_marker.clone();
+            accumulate_tier_delete_journal_recovery_stats(&mut stats.journals, page);
+            Some(TierDeleteJournalRecoveryPageStep {
+                stop_queue,
+                made_progress,
+            })
+        }
+        Err(err) => {
+            stats.journal_errors += 1;
+            warn!(
+                event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                next_marker = ?page_marker,
+                error = ?err,
+                "Failed to recover tier delete journal page"
+            );
+            Some(TierDeleteJournalRecoveryPageStep {
+                stop_queue: true,
+                made_progress: false,
+            })
+        }
+    }
+}
+
+async fn recover_tier_delete_journal_pass(
+    api: Arc<ECStore>,
+    cancel_token: &CancellationToken,
+    manifest_marker: &mut Option<String>,
+    journal_marker: &mut Option<String>,
+    budget: Duration,
+) -> TierDeleteJournalRecoveryPassStats {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut stats = TierDeleteJournalRecoveryPassStats::default();
+    let mut manifest_stopped = false;
+    let mut journal_stopped = false;
+
+    while !manifest_stopped || !journal_stopped {
+        let mut made_progress = false;
+        if !manifest_stopped {
+            let Some(step) =
+                recover_tier_delete_dispatch_manifest_pass_page(api.clone(), cancel_token, manifest_marker, deadline, &mut stats)
+                    .await
+            else {
+                return stats;
+            };
+            manifest_stopped = step.stop_queue;
+            made_progress |= step.made_progress;
+        }
+        if !journal_stopped {
+            let Some(step) =
+                recover_tier_delete_journal_pass_page(api.clone(), cancel_token, journal_marker, deadline, &mut stats).await
+            else {
+                return stats;
+            };
+            journal_stopped = step.stop_queue;
+            made_progress |= step.made_progress;
+        }
+        if !made_progress {
+            break;
+        }
+    }
+
+    stats
+}
+
+#[cfg(all(test, feature = "test-util"))]
+pub(crate) async fn recover_test_tier_delete_journal_pass_with_budget(
+    api: Arc<ECStore>,
+    cancel_token: &CancellationToken,
+    manifest_marker: &mut Option<String>,
+    journal_marker: &mut Option<String>,
+    budget: Duration,
+) -> TierDeleteJournalRecoveryPassStats {
+    recover_tier_delete_journal_pass(api, cancel_token, manifest_marker, journal_marker, budget).await
+}
+
 pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_token: CancellationToken) {
     let mut interval = tokio::time::interval(TIER_DELETE_JOURNAL_RECOVERY_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -4488,78 +4696,40 @@ pub async fn run_tier_delete_journal_recovery_loop(api: Arc<ECStore>, cancel_tok
             _ = interval.tick() => {},
         }
 
-        let manifest_recovery = recover_tier_delete_dispatch_manifests(
+        let stats = recover_tier_delete_journal_pass(
             api.clone(),
-            DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT,
-            manifest_marker.clone(),
+            &cancel_token,
+            &mut manifest_marker,
+            &mut marker,
+            TIER_DELETE_JOURNAL_RECOVERY_PASS_BUDGET,
+        )
+        .await;
+        if stats.canceled {
+            return;
+        }
+        debug!(
+            event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+            manifest_pages = stats.manifest_pages,
+            manifest_scanned = stats.manifests.scanned,
+            manifest_advanced = stats.manifests.advanced,
+            manifest_deleted = stats.manifests.deleted,
+            manifest_retained = stats.manifests.retained,
+            manifest_failed = stats.manifests.failed,
+            manifest_errors = stats.manifest_errors,
+            manifest_truncated = stats.manifests.truncated,
+            manifest_next_marker = ?manifest_marker,
+            journal_pages = stats.journal_pages,
+            journal_scanned = stats.journals.scanned,
+            journal_deleted = stats.journals.deleted,
+            journal_failed = stats.journals.failed,
+            journal_errors = stats.journal_errors,
+            journal_truncated = stats.journals.truncated,
+            journal_next_marker = ?marker,
+            deadline_exhausted = stats.deadline_exhausted,
+            "Recovered tier delete journal pass"
         );
-        let Some(manifest_result) =
-            await_tier_delete_journal_recovery(&cancel_token, TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT, manifest_recovery).await
-        else {
-            return;
-        };
-        match manifest_result {
-            Ok(stats) => {
-                manifest_marker = stats.next_marker;
-                debug!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    scanned = stats.scanned,
-                    advanced = stats.advanced,
-                    deleted = stats.deleted,
-                    retained = stats.retained,
-                    failed = stats.failed,
-                    truncated = stats.truncated,
-                    next_marker = ?manifest_marker,
-                    "Reconciled tier delete dispatch manifests"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    next_marker = ?manifest_marker,
-                    error = ?err,
-                    "Failed to recover tier delete dispatch manifests"
-                );
-            }
-        }
-
-        let recovery =
-            recover_tier_delete_journal_entries(api.clone(), DEFAULT_TIER_DELETE_JOURNAL_RECOVERY_LIMIT, marker.clone());
-        let Some(result) =
-            await_tier_delete_journal_recovery(&cancel_token, TIER_DELETE_JOURNAL_RECOVERY_TIMEOUT, recovery).await
-        else {
-            return;
-        };
-        match result {
-            Ok(stats) => {
-                marker = stats.next_marker;
-                debug!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    scanned = stats.scanned,
-                    deleted = stats.deleted,
-                    failed = stats.failed,
-                    truncated = stats.truncated,
-                    next_marker = ?marker,
-                    "Recovered tier delete journal tasks"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    event = EVENT_LIFECYCLE_TIER_DELETE_JOURNAL,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_LIFECYCLE,
-                    next_marker = ?marker,
-                    error = ?err,
-                    "Failed to recover tier delete journal tasks"
-                );
-            }
-        }
     }
 }
 
