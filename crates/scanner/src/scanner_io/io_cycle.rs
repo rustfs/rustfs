@@ -168,6 +168,7 @@ where
     scoped_scan_scope_from_dirty_buckets(
         resolution.requested_scope,
         dirty_buckets,
+        (!distributed).then_some(resolution.dirty_usage_snapshot.scopes.as_ref()),
         true,
         resolution.all_buckets,
         resolution.baseline_proof,

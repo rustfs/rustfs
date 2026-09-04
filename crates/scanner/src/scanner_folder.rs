@@ -675,6 +675,28 @@ fn partial_cache_is_useful(root: &DataUsageEntry, pending_heals_changed: bool) -
     data_usage_root_has_progress(root) || pending_heals_changed
 }
 
+/// Process-local hint that narrows a dirty bucket scan to known changed direct children.
+///
+/// The hint is used only while rebuilding a complete bucket cache. It never
+/// changes usage publication semantics and callers must discard it when the
+/// mutation source cannot be verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannerBucketPrefixScanScope {
+    selected_top_level_entries: Arc<HashSet<String>>,
+}
+
+impl ScannerBucketPrefixScanScope {
+    pub(crate) fn from_dirty_top_level_entries(entries: HashSet<String>) -> Option<Self> {
+        (!entries.is_empty()).then(|| Self {
+            selected_top_level_entries: Arc::new(entries),
+        })
+    }
+
+    fn contains(&self, entry: &str) -> bool {
+        self.selected_top_level_entries.contains(entry)
+    }
+}
+
 /// Folder scanner for scanning directory structures
 pub struct FolderScanner {
     root: String,
@@ -686,6 +708,7 @@ pub struct FolderScanner {
     heal_object_select: u32,
     scan_mode: HealScanMode,
     is_erasure_mode: bool,
+    prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
 
     failed_object_ttl_secs: u64,
     failed_objects_max: usize,
@@ -779,6 +802,47 @@ impl FolderScanner {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    fn should_reuse_clean_root_child(
+        &self,
+        folder: &CachedFolder,
+        into: &DataUsageEntry,
+        child: &CachedFolder,
+        child_hash: &DataUsageHash,
+        abandoned_children: &DataUsageHashMap,
+    ) -> bool {
+        let Some(prefix_scan_scope) = &self.prefix_scan_scope else {
+            return false;
+        };
+        // Erasure-mode usage scans also perform probabilistic object-health
+        // work. Reusing a clean subtree here would silently suppress that
+        // independent maintenance path, so prefix reuse is limited to the
+        // non-erasure data-usage scanner.
+        if self.is_erasure_mode
+            || folder.parent.is_some()
+            || folder.name != self.old_cache.info.name
+            || into.compacted
+            || !abandoned_children.contains(&child_hash.key())
+        {
+            return false;
+        }
+
+        let Some(entry) = child
+            .name
+            .strip_prefix(folder.name.as_str())
+            .and_then(|entry| entry.strip_prefix('/'))
+        else {
+            return false;
+        };
+        !entry.is_empty() && !entry.contains('/') && !prefix_scan_scope.contains(entry)
+    }
+
+    fn reuse_clean_root_child(&mut self, child: &CachedFolder, child_hash: &DataUsageHash, into: &mut DataUsageEntry) {
+        self.new_cache.copy_with_children(&self.old_cache, child_hash, &child.parent);
+        self.update_cache
+            .copy_with_children(&self.old_cache, child_hash, &child.parent);
+        into.add_child(child_hash);
     }
 
     fn should_skip_failed(&self, path: &str) -> bool {
@@ -1451,13 +1515,16 @@ impl FolderScanner {
                         continue;
                     }
 
-                    abandoned_children.remove(&h.key());
-
-                    if exists {
+                    if exists && self.should_reuse_clean_root_child(&folder, into, &this, &h, &abandoned_children) {
+                        abandoned_children.remove(&h.key());
+                        self.reuse_clean_root_child(&this, &h, into);
+                    } else if exists {
+                        abandoned_children.remove(&h.key());
                         existing_folders.push(this);
                         self.update_cache
                             .copy_with_children(&self.old_cache, &h, &Some(this_hash.clone()));
                     } else {
+                        abandoned_children.remove(&h.key());
                         new_folders.push(this);
                     }
                     continue;
@@ -1633,11 +1700,15 @@ impl FolderScanner {
             if !found_object_metadata && !found_erasure_data_directory {
                 for (candidate, exists, _) in erasure_data_directory_candidates {
                     let h = hash_path(&candidate.name);
-                    abandoned_children.remove(&h.key());
-                    if exists {
+                    if exists && self.should_reuse_clean_root_child(&folder, into, &candidate, &h, &abandoned_children) {
+                        abandoned_children.remove(&h.key());
+                        self.reuse_clean_root_child(&candidate, &h, into);
+                    } else if exists {
+                        abandoned_children.remove(&h.key());
                         self.update_cache.copy_with_children(&self.old_cache, &h, &candidate.parent);
                         existing_folders.push(candidate);
                     } else {
+                        abandoned_children.remove(&h.key());
                         new_folders.push(candidate);
                     }
                 }
@@ -2378,6 +2449,21 @@ pub async fn scan_data_folder(
     scan_mode: HealScanMode,
     sleeper: DynamicSleeper,
 ) -> Result<DataUsageCache, ScannerError> {
+    scan_data_folder_scoped(ctx, budget, disks, local_disk, cache, updates, scan_mode, sleeper, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan_data_folder_scoped(
+    ctx: CancellationToken,
+    budget: Arc<ScannerCycleBudget>,
+    disks: Vec<Arc<Disk>>,
+    local_disk: Arc<Disk>,
+    cache: DataUsageCache,
+    updates: Option<mpsc::Sender<DataUsageEntry>>,
+    scan_mode: HealScanMode,
+    sleeper: DynamicSleeper,
+    prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
+) -> Result<DataUsageCache, ScannerError> {
     use crate::data_usage_define::DATA_USAGE_ROOT;
 
     // Check that we're not trying to scan the root
@@ -2428,6 +2514,7 @@ pub async fn scan_data_folder(
         heal_object_select,
         scan_mode,
         is_erasure_mode,
+        prefix_scan_scope,
         failed_object_ttl_secs: failed_object_ttl,
         failed_objects_max,
         sleeper,

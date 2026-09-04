@@ -155,6 +155,7 @@ impl ScannerIODisk for Disk {
         cache: DataUsageCache,
         updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
+        prefix_scan_scope: Option<ScannerBucketPrefixScanScope>,
     ) -> Result<ScannerDiskScanOutcome> {
         let done_drive = Metrics::time(Metric::ScanBucketDrive);
         let drive_start = std::time::Instant::now();
@@ -198,7 +199,19 @@ impl ScannerIODisk for Disk {
             cache.info.object_lock = Some(Arc::new(object_lock_config));
         }
 
-        let result = scan_data_folder(
+        // Prefix reuse never crosses semantic maintenance boundaries. A
+        // lifecycle, replication, Object Lock, or erasure health walk can
+        // make a clean data subtree require scanner-side work even without a
+        // direct object mutation in the local journal. The folder scanner
+        // separately rejects scopes in erasure mode.
+        let prefix_scan_scope = (scan_mode == HealScanMode::Normal
+            && cache.info.lifecycle.is_none()
+            && cache.info.replication.is_none()
+            && cache.info.object_lock.is_none())
+        .then_some(prefix_scan_scope)
+        .flatten();
+
+        let result = scan_data_folder_scoped(
             ctx.clone(),
             budget,
             set_disks,
@@ -207,6 +220,7 @@ impl ScannerIODisk for Disk {
             updates,
             scan_mode,
             SCANNER_SLEEPER.clone(),
+            prefix_scan_scope,
         )
         .await;
 

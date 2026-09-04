@@ -332,6 +332,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         heal_object_select: 0,
         scan_mode: HealScanMode::Normal,
         is_erasure_mode: false,
+        prefix_scan_scope: None,
         failed_object_ttl_secs: u64::MAX,
         failed_objects_max: usize::MAX,
         sleeper: SCANNER_SLEEPER.clone(),
@@ -2382,6 +2383,115 @@ async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
     assert!(result.is_err(), "non-erasure scans must not stop at metadata-shaped files");
     assert!(budget.budget_elapsed());
     assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entries() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(bucket_dir.join("clean"))
+        .await
+        .expect("failed to create clean top-level directory");
+    tokio::fs::create_dir_all(bucket_dir.join("dirty"))
+        .await
+        .expect("failed to create dirty top-level directory");
+
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+    scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+    scanner.old_cache.replace(
+        "bucket/clean",
+        "bucket",
+        DataUsageEntry {
+            size: 17,
+            objects: 3,
+            ..Default::default()
+        },
+    );
+    scanner.old_cache.replace(
+        "bucket/dirty",
+        "bucket",
+        DataUsageEntry {
+            size: 23,
+            objects: 4,
+            ..Default::default()
+        },
+    );
+    scanner.prefix_scan_scope = ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["dirty".to_string()]));
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut root = DataUsageEntry::default();
+    scanner
+        .scan_folder(CancellationToken::new(), folder, &mut root)
+        .await
+        .expect("scoped root scan should finish successfully");
+
+    let clean = scanner
+        .new_cache
+        .size_recursive("bucket/clean")
+        .expect("clean entry should be copied from the complete cache");
+    assert_eq!((clean.size, clean.objects), (17, 3));
+    let dirty = scanner
+        .new_cache
+        .size_recursive("bucket/dirty")
+        .expect("dirty entry should be rescanned");
+    assert_eq!((dirty.size, dirty.objects), (0, 0));
+    let bucket = scanner
+        .new_cache
+        .size_recursive("bucket")
+        .expect("bucket root should include reused and rescanned entries");
+    assert_eq!((bucket.size, bucket.objects), (17, 3));
+}
+
+#[tokio::test]
+#[serial]
+async fn scoped_root_scan_preserves_erasure_health_walks() {
+    let (mut scanner, temp_dir) = build_test_scanner().await;
+    let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
+    let bucket_dir = temp_dir.join("bucket");
+    tokio::fs::create_dir_all(bucket_dir.join("clean"))
+        .await
+        .expect("failed to create clean top-level directory");
+
+    scanner.is_erasure_mode = true;
+    scanner.old_cache.info.name = "bucket".to_string();
+    scanner.new_cache.info.name = "bucket".to_string();
+    scanner.update_cache.info.name = "bucket".to_string();
+    scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
+    scanner.old_cache.replace(
+        "bucket/clean",
+        "bucket",
+        DataUsageEntry {
+            size: 17,
+            objects: 3,
+            ..Default::default()
+        },
+    );
+    scanner.prefix_scan_scope = ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["dirty".to_string()]));
+
+    let folder = CachedFolder {
+        name: "bucket".to_string(),
+        parent: None,
+        object_heal_prob_div: 1,
+    };
+    let mut root = DataUsageEntry::default();
+    scanner
+        .scan_folder(CancellationToken::new(), folder, &mut root)
+        .await
+        .expect("erasure root scan should finish successfully");
+
+    let clean = scanner
+        .new_cache
+        .size_recursive("bucket/clean")
+        .expect("erasure scan should visit the clean entry");
+    assert_eq!((clean.size, clean.objects), (0, 0));
 }
 
 #[tokio::test]
