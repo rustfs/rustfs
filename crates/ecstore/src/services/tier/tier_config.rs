@@ -914,16 +914,9 @@ mod tests {
             "REDACTED"
         );
         assert!(redacted.rustfs.is_none(), "the external view should retain only the active provider");
-        assert_eq!(
-            config
-                .clone()
-                .wasabi
-                .as_ref()
-                .expect("redacted Wasabi clone should remain")
-                .secret_key,
-            "REDACTED"
-        );
-        assert!(config.clone().rustfs.is_none(), "ordinary Clone must retain its redacted API semantics");
+        let cloned = config.clone();
+        assert_eq!(cloned.wasabi.expect("redacted Wasabi clone should remain").secret_key, "REDACTED");
+        assert!(cloned.rustfs.is_none(), "ordinary Clone must retain its redacted API semantics");
         let preserved = config.clone_with_credentials();
         assert_eq!(
             preserved
