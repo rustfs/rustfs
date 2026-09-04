@@ -22,9 +22,9 @@
 //! binds a ciphertext to the record owning it, the sealer registration point,
 //! and the fail-closed error type. What it deliberately does not own: any KMS
 //! call (ECStore does not depend on `rustfs-kms`; the binary installs a
-//! sealer, exactly like `ON_DEMAND_MIGRATION_CONFIG_HOOK` and
-//! `EVENT_DISPATCH_HOOK`), and any decision about which stored field a
-//! consumer writes.
+//! sealer, exactly like `ON_DEMAND_MIGRATION_CONFIG_HOOK` and the event
+//! dispatch hook in `crates/ecstore/src/services/event_notification.rs`), and
+//! any decision about which stored field a consumer writes.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
