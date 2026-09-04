@@ -152,6 +152,60 @@ jobs:
           else
             PACKAGE_SOURCE="${RUSTFS_NIGHTLY_PACKAGE_URL}"
           fi
+          STEPS_TABLE="/tmp/rustfs-heal-steps.md"
+          python3 - "${LOG_FILE}" "${STEPS_TABLE}" <<'PY'
+          import re
+          import sys
+
+          log_file, out_file = sys.argv[1], sys.argv[2]
+          ansi = re.compile(r'\x1b\[[0-9;]*m')
+          step_re = re.compile(r'^\[HEAL-STEP\]\s+(\d+)\s+(.+?)\s+(PASS|FAIL|SKIP)\s*$')
+          ver_re = re.compile(r'^\[HEAL-VERSION\]\s+(\S+)(?:\s+\(node\s+(\S+)\))?\s*$')
+          result_re = re.compile(r'^\[HEAL-RESULT\]\s+(PASS|FAIL)\s+(.*)$')
+
+          steps = {}
+          order = []
+          version = None
+          version_node = None
+          verdict = None
+          verdict_detail = ''
+          try:
+              with open(log_file, 'r', encoding='utf-8', errors='replace') as fh:
+                  for raw in fh:
+                      line = ansi.sub('', raw).strip()
+                      m = step_re.match(line)
+                      if m:
+                          n, desc, status = m.group(1), m.group(2), m.group(3)
+                          if n not in steps:
+                              order.append(n)
+                          steps[n] = (desc, status)  # later lines win (fail after pass)
+                          continue
+                      m = ver_re.match(line)
+                      if m:
+                          version, version_node = m.group(1), m.group(2)
+                          continue
+                      m = result_re.match(line)
+                      if m:
+                          verdict, verdict_detail = m.group(1), m.group(2)
+          except FileNotFoundError:
+              pass
+
+          with open(out_file, 'w', encoding='utf-8') as out:
+              out.write('## Step Results\n\n')
+              if version:
+                  node_note = f' (captured via `rustfs --version` on {version_node})' if version_node else ''
+                  out.write(f'- Version under test: **{version}**{node_note}\n')
+              if verdict:
+                  out.write(f'- Overall result: **{verdict}** — {verdict_detail}\n')
+              out.write('\n')
+              out.write('| Step | Description | Result |\n')
+              out.write('| --- | --- | --- |\n')
+              for n in sorted(order, key=int):
+                  desc, status = steps[n]
+                  out.write(f'| {n} | {desc} | {status} |\n')
+              if not order:
+                  out.write('| - | - | NOT RUN (no step result lines found) |\n')
+          PY
           {
             echo "# RustFS heal test report"
             echo ""
@@ -159,6 +213,8 @@ jobs:
             echo "- Trigger: ${{ github.event_name }}"
             echo "- Package: ${PACKAGE_SOURCE}"
             echo "- Test Step Outcome: ${{ steps.test.outcome }}"
+            echo ""
+            cat "${STEPS_TABLE}" || true
             echo ""
             echo "## Log tail"
             echo '```text'
