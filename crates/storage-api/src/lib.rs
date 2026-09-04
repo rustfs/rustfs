@@ -56,6 +56,9 @@ pub const SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION: u32 = 5;
 /// state is not authenticated by that version.
 pub const SCANNER_ACTIVITY_V6_PROTOCOL_VERSION: u32 = 6;
 pub const SCANNER_ACTIVITY_PROTOCOL_VERSION: u32 = 7;
+pub const SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION: u32 = 1;
+pub const SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES: usize = 4096;
+pub const SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE: usize = 512 * 1024;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
