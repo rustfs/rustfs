@@ -28,7 +28,7 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -81,8 +81,8 @@ impl SealScope {
     /// The encryption context handed to the sealer. Keys are stable: they are
     /// part of the on-disk contract, because a ciphertext only decrypts under
     /// the same context.
-    pub fn encryption_context(&self) -> HashMap<String, String> {
-        HashMap::from([
+    pub fn encryption_context(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
             ("rustfs:store".to_string(), self.store.as_str().to_string()),
             ("rustfs:owner".to_string(), self.owner.clone()),
             ("rustfs:field".to_string(), self.field.to_string()),
@@ -206,7 +206,7 @@ mod tests {
     /// with, and refuses a ciphertext presented under a different one.
     #[derive(Default)]
     struct FakeSealer {
-        sealed_contexts: Mutex<Vec<HashMap<String, String>>>,
+        sealed_contexts: Mutex<Vec<BTreeMap<String, String>>>,
     }
 
     #[async_trait]
