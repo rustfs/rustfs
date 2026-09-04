@@ -125,16 +125,18 @@ Validation also rejects two shapes outright: a source whose endpoint and bucket 
 
 ## Provider presets and source permissions
 
-| Provider | Endpoint | Addressing | `region` | Notes |
-|---|---|---|---|---|
-| `aws` | Optional; derived as `https://s3.<region>.amazonaws.com` | Virtual-host | Real region required (`auto` rejected) | The derived form only accepts `[A-Za-z0-9-]` in `region` |
-| `s3` | Required | Path-style | Real region | Generic S3-compatible endpoint (Wasabi, Backblaze B2 S3 API, Ceph RGW, …) |
-| `minio` | Required | Path-style | `auto` allowed | |
-| `rustfs` | Required | Path-style | `auto` allowed | A RustFS source answers the migration request locally thanks to the anti-loop marker |
-| `r2` | `https://<account-id>.r2.cloudflarestorage.com` | Virtual-host | `auto` allowed (signed as `us-east-1`) | |
-| `gcs` | `https://storage.googleapis.com` | Virtual-host | Real region required | Uses the GCS XML interoperability API with an HMAC key pair, not a service-account JSON key |
+| Provider | Endpoint | Addressing | `region` | Notes | Interop evidence |
+|---|---|---|---|---|---|
+| `aws` | Optional; derived as `https://s3.<region>.amazonaws.com` | Virtual-host | Real region required (`auto` rejected) | The derived form only accepts `[A-Za-z0-9-]` in `region` | `cloud-source (aws)`, only while `ODM_INTEROP_AWS_*` are configured; no difference recorded yet |
+| `s3` | Required | Path-style | Real region | Generic S3-compatible endpoint (Wasabi, Backblaze B2 S3 API, Ceph RGW, …) | No lane of its own; the preset is the same code path the `minio` job exercises |
+| `minio` | Required | Path-style | `auto` allowed | | `minio-source`, nightly: read-through, HEAD passthrough, merged list pagination and a 5,000-object backfill; no difference recorded yet |
+| `rustfs` | Required | Path-style | `auto` allowed | A RustFS source answers the migration request locally thanks to the anti-loop marker | `real_source_test.rs` in the `e2e-nightly` lane |
+| `r2` | `https://<account-id>.r2.cloudflarestorage.com` | Virtual-host | `auto` allowed (signed as `us-east-1`) | | `cloud-source (r2)`, only while `ODM_INTEROP_R2_*` are configured; no difference recorded yet |
+| `gcs` | `https://storage.googleapis.com` | Virtual-host | Real region required | Uses the GCS XML interoperability API with an HMAC key pair, not a service-account JSON key | `cloud-source (gcs)`, only while `ODM_INTEROP_GCS_HMAC_*` are configured; no difference recorded yet |
 
 Azure Blob has no preset; a native provider is deferred (rustfs/backlog#2166).
+
+The "Interop evidence" column names the job in `.github/workflows/on-demand-migration-interop.yml` (rustfs/backlog#2167) that last exercised the preset against a real implementation, and is where a provider difference belongs once the lane finds one. That lane is report-only and scheduled: it runs `crates/e2e_test/src/on_demand_migration/interop_test.rs` — the same case bodies as the merge-gate suite, with the source injected through `RUSTFS_ODM_INTEROP_*` — against a pinned MinIO container, and against each cloud provider whose repository secrets are configured. A provider without secrets is skipped with a note in the run summary rather than failing, so "no difference recorded yet" means exactly that and not "verified clean"; see [ci-gates.md](../testing/ci-gates.md) for the row.
 
 The credentials only ever need read access to the source bucket:
 

@@ -1,0 +1,315 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# On-demand migration provider interop (rustfs/backlog#2167, ODM-20).
+#
+# The in-process fake source that the merge-gate ODM suite runs against covers
+# the protocol semantics, but real implementations differ in path-style vs
+# virtual-host addressing, region handling, ETag shape, list pagination and
+# rate limiting. This lane runs the same case bodies
+# (crates/e2e_test/src/on_demand_migration/interop_test.rs) against real
+# sources; the source is injected through RUSTFS_ODM_INTEROP_* environment
+# variables, so nothing about the cases is duplicated per provider.
+#
+# Report-only and scheduled. It is never a required check and must not be
+# promoted to one: it depends on third-party endpoints and on repository
+# secrets that a fork does not have.
+#
+# Jobs:
+#   * minio-source runs the whole e2e-odm-interop profile — read-through,
+#     HEAD passthrough, merged list pagination and a backfill — against a
+#     pinned MinIO container. The backfill is sized at 5,000 objects here: the
+#     fake source retains at most 4,096 object versions and 4,096 journal
+#     entries, so the merge-gate backfill coverage cannot go past that, and a
+#     real source is where a production-shaped batch belongs.
+#   * cloud-source runs the three-case minimum (GET miss, HEAD miss, merged
+#     list pagination) against AWS S3, Cloudflare R2 and the GCS XML
+#     interoperability API. Each provider is skipped with a summary note when
+#     its ODM_INTEROP_* repository secrets are absent, which is the normal
+#     state on a fork and in any clone of this repository.
+#
+# Every job uploads one JSON report per provider naming the cases, their
+# timings and the source request accounting.
+name: on-demand-migration-interop
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 05:23 UTC, offset from the other nightly lanes.
+    - cron: "23 5 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The three cases a cloud provider is asked for. Named individually rather
+  # than by module so adding a fourth case does not silently start billing a
+  # cloud account for it.
+  CLOUD_CASE_FILTER: >-
+    package(e2e_test) & test(/^on_demand_migration::interop_test::(interop_get_miss_pulls_from_the_source_and_serves_locally|interop_head_miss_answers_from_the_source_without_persisting|interop_list_through_pages_the_source_namespace)$/)
+  CLOUD_CASE_COUNT: "3"
+
+jobs:
+  minio-source:
+    name: MinIO source (read-through, list-through, backfill)
+    # Skip on forks: needs this repository's runners and is not a contributor
+    # gate.
+    if: github.repository == 'rustfs/rustfs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      NO_PROXY: 127.0.0.1,localhost
+      # Fixed credentials of the container this job starts and throws away;
+      # not a secret and deliberately not read from one, so the lane runs
+      # unattended in any clone that enables it.
+      MINIO_ROOT_USER: rustfsodminterop
+      MINIO_ROOT_PASSWORD: rustfsodminteropsecret
+      RUSTFS_ODM_INTEROP_PROVIDER: minio
+      RUSTFS_ODM_INTEROP_ENDPOINT: http://127.0.0.1:9100
+      RUSTFS_ODM_INTEROP_REGION: auto
+      RUSTFS_ODM_INTEROP_BUCKET: odm-interop-source
+      RUSTFS_ODM_INTEROP_PATH_STYLE: path
+      RUSTFS_ODM_INTEROP_ACCESS_KEY: rustfsodminterop
+      RUSTFS_ODM_INTEROP_SECRET_KEY: rustfsodminteropsecret
+      RUSTFS_ODM_INTEROP_BACKFILL_OBJECTS: "5000"
+      RUSTFS_ODM_INTEROP_REPORT_DIR: ${{ github.workspace }}/artifacts/odm-interop/minio/cases
+      NEXTEST_LISTING: ${{ github.workspace }}/artifacts/odm-interop/minio/selection.json
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: ci-odm-interop
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+          install-build-packaging-tools: 'false'
+
+      - name: Start MinIO source
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/odm-interop/minio
+          docker run -d --name rustfs-odm-interop-minio \
+            -e "MINIO_ROOT_USER=${MINIO_ROOT_USER}" \
+            -e "MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}" \
+            -p 9100:9000 \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for _ in $(seq 1 120); do
+            curl -fsS http://127.0.0.1:9100/minio/health/live >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9100/minio/health/live
+
+      # The harness never creates a bucket, so that pointing it at a cloud
+      # account cannot create one there either. The source bucket for the
+      # container is created here instead.
+      - name: Create the MinIO source bucket
+        env:
+          AWS_ACCESS_KEY_ID: ${{ env.MINIO_ROOT_USER }}
+          AWS_SECRET_ACCESS_KEY: ${{ env.MINIO_ROOT_PASSWORD }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          aws --endpoint-url "${RUSTFS_ODM_INTEROP_ENDPOINT}" \
+            s3api create-bucket --bucket "${RUSTFS_ODM_INTEROP_BUCKET}"
+
+      - name: Build the RustFS binary under test
+        run: cargo build --locked -p rustfs --bins
+
+      # The lane selects tests by module, so a rename would quietly shrink it.
+      # The committed digest in .config/e2e-odm-interop-selection.txt fails
+      # closed on that.
+      - name: Verify interop lane membership
+        run: |
+          cargo nextest list --profile e2e-odm-interop -p e2e_test --message-format json > "${NEXTEST_LISTING}"
+          python3 ./scripts/check_test_wiring.py --check-profile e2e-odm-interop "${NEXTEST_LISTING}"
+
+      - name: Run the interop cases against MinIO
+        run: cargo nextest run --profile e2e-odm-interop -p e2e_test --no-tests=fail
+
+      - name: Build the MinIO interop report
+        if: always()
+        uses: ./.github/actions/odm-interop-report
+        with:
+          provider: minio
+          cases-dir: ${{ env.RUSTFS_ODM_INTEROP_REPORT_DIR }}
+          junit: target/nextest/e2e-odm-interop/junit.xml
+          output: artifacts/odm-interop/minio/report.json
+
+      - name: Collect MinIO logs
+        if: always()
+        run: |
+          docker logs --tail 500 rustfs-odm-interop-minio \
+            > artifacts/odm-interop/minio/minio.log 2>&1 || true
+
+      - name: Stop MinIO source
+        if: always()
+        run: docker rm -f rustfs-odm-interop-minio >/dev/null 2>&1 || true
+
+      - name: Upload the MinIO interop report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: odm-interop-minio-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            artifacts/odm-interop/minio
+            target/nextest/e2e-odm-interop/junit.xml
+          retention-days: 14
+
+  # Unlike a production migration source, which needs read access only, the
+  # credentials here also seed the objects each case reads back, so they need
+  # write and delete on the interop bucket. Every run seeds under
+  # `odm-interop/<case>/<uuid>/` and deletes what it seeded when the case
+  # passes; give the bucket an expiration lifecycle rule so the prefixes a
+  # failing case leaves behind cannot accumulate.
+  cloud-source:
+    name: ${{ matrix.provider }} source (three-case minimum)
+    if: github.repository == 'rustfs/rustfs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: aws
+            secret_prefix: AWS
+            path_style: virtual
+          - provider: r2
+            secret_prefix: R2
+            path_style: virtual
+          - provider: gcs
+            secret_prefix: GCS_HMAC
+            path_style: virtual
+    env:
+      RUSTFS_ODM_INTEROP_PROVIDER: ${{ matrix.provider }}
+      RUSTFS_ODM_INTEROP_PATH_STYLE: ${{ matrix.path_style }}
+      RUSTFS_ODM_INTEROP_ENDPOINT: ${{ secrets[format('ODM_INTEROP_{0}_ENDPOINT', matrix.secret_prefix)] }}
+      RUSTFS_ODM_INTEROP_REGION: ${{ secrets[format('ODM_INTEROP_{0}_REGION', matrix.secret_prefix)] }}
+      RUSTFS_ODM_INTEROP_BUCKET: ${{ secrets[format('ODM_INTEROP_{0}_BUCKET', matrix.secret_prefix)] }}
+      RUSTFS_ODM_INTEROP_ACCESS_KEY: ${{ secrets[format('ODM_INTEROP_{0}_ACCESS_KEY_ID', matrix.secret_prefix)] }}
+      RUSTFS_ODM_INTEROP_SECRET_KEY: ${{ secrets[format('ODM_INTEROP_{0}_SECRET_ACCESS_KEY', matrix.secret_prefix)] }}
+      RUSTFS_ODM_INTEROP_REPORT_DIR: ${{ github.workspace }}/artifacts/odm-interop/${{ matrix.provider }}/cases
+      NEXTEST_LISTING: ${{ github.workspace }}/artifacts/odm-interop/${{ matrix.provider }}/selection.json
+    steps:
+      # Absent secrets are the normal state, not a failure: the lane reports
+      # which providers it could reach and skips the rest. An empty value is
+      # what an unset repository secret expands to, so it is checked, not the
+      # secret's existence.
+      - name: Check for provider credentials
+        id: credentials
+        run: |
+          set -euo pipefail
+          if [ -z "${RUSTFS_ODM_INTEROP_ENDPOINT}" ] \
+            || [ -z "${RUSTFS_ODM_INTEROP_REGION}" ] \
+            || [ -z "${RUSTFS_ODM_INTEROP_BUCKET}" ] \
+            || [ -z "${RUSTFS_ODM_INTEROP_ACCESS_KEY}" ] \
+            || [ -z "${RUSTFS_ODM_INTEROP_SECRET_KEY}" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### On-demand migration interop: \`${{ matrix.provider }}\`"
+              echo
+              echo "Skipped: the \`ODM_INTEROP_${{ matrix.secret_prefix }}_*\` repository secrets"
+              echo "(\`_ENDPOINT\`, \`_REGION\`, \`_BUCKET\`, \`_ACCESS_KEY_ID\`, \`_SECRET_ACCESS_KEY\`)"
+              echo "are not configured, so no real \`${{ matrix.provider }}\` source was reached."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.credentials.outputs.present == 'true'
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        if: steps.credentials.outputs.present == 'true'
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: ci-odm-interop
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Build the RustFS binary under test
+        if: steps.credentials.outputs.present == 'true'
+        run: cargo build --locked -p rustfs --bins
+
+      # A filterset that matches nothing is valid, so the count is asserted
+      # rather than inferred from a green run.
+      - name: Verify the three-case minimum still selects three cases
+        if: steps.credentials.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${NEXTEST_LISTING}")"
+          cargo nextest list --profile e2e-odm-interop -p e2e_test \
+            -E "${CLOUD_CASE_FILTER}" --message-format json > "${NEXTEST_LISTING}"
+          selected="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sum(1 for suite in d.get("rust-suites", {}).values() for test in suite.get("testcases", {}).values() if test.get("filter-match", {}).get("status") == "matches"))' "${NEXTEST_LISTING}")"
+          echo "cloud interop cases selected: ${selected}"
+          if [ "${selected}" != "${CLOUD_CASE_COUNT}" ]; then
+            echo "::error::CLOUD_CASE_FILTER selected ${selected} cases, expected ${CLOUD_CASE_COUNT}; the interop cases were renamed or moved. Context: rustfs/backlog#2167."
+            exit 1
+          fi
+
+      - name: Run the three-case minimum
+        if: steps.credentials.outputs.present == 'true'
+        run: |
+          cargo nextest run --profile e2e-odm-interop -p e2e_test \
+            -E "${CLOUD_CASE_FILTER}" --no-tests=fail
+
+      - name: Build the ${{ matrix.provider }} interop report
+        if: always() && steps.credentials.outputs.present == 'true'
+        uses: ./.github/actions/odm-interop-report
+        with:
+          provider: ${{ matrix.provider }}
+          cases-dir: ${{ env.RUSTFS_ODM_INTEROP_REPORT_DIR }}
+          junit: target/nextest/e2e-odm-interop/junit.xml
+          output: artifacts/odm-interop/${{ matrix.provider }}/report.json
+
+      - name: Upload the ${{ matrix.provider }} interop report
+        if: always() && steps.credentials.outputs.present == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: odm-interop-${{ matrix.provider }}-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            artifacts/odm-interop/${{ matrix.provider }}
+            target/nextest/e2e-odm-interop/junit.xml
+          retention-days: 14
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    needs: [minio-source, cloud-source]
+    if: >-
+      always() && github.event_name == 'schedule' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
