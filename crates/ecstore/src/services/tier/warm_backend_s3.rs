@@ -26,7 +26,7 @@ use crate::services::tier::{
     tier_config::TierS3,
     warm_backend::{
         TransitionCandidateIdentity, TransitionCandidateProbe, TransitionCandidateReconciler, WarmBackend, WarmBackendGetOpts,
-        build_transition_put_options, endpoint_authority,
+        build_transition_put_options, endpoint_authority, transition_client_timeouts_from_env,
     },
 };
 use http::HeaderMap;
@@ -139,6 +139,7 @@ impl WarmBackendS3 {
         } else {
             return Err(std::io::Error::other("insufficient parameters for S3 backend authentication"));
         }
+        let timeouts = transition_client_timeouts_from_env();
         let opts = Options {
             creds,
             secure: u.scheme() == "https",
@@ -147,7 +148,7 @@ impl WarmBackendS3 {
             ..Default::default()
         };
         let endpoint = endpoint_authority(&u)?;
-        let client = TransitionClient::new(&endpoint, opts, tier_type).await?;
+        let client = TransitionClient::new_with_timeouts(&endpoint, opts, tier_type, timeouts).await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));

@@ -37,7 +37,7 @@ use crate::services::tier::{
 use bytes::Bytes;
 use http::StatusCode;
 use rustfs_s3_client::credentials::{Credentials, SignatureType, Static, Value};
-use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionCore};
+use rustfs_s3_client::transition_api::{BucketLookupType, Options, TransitionClient, TransitionClientTimeouts, TransitionCore};
 use rustfs_s3_client::{
     admin_handler_utils::AdminError,
     api_put_object::{AdvancedPutOptions, PutObjectOptions},
@@ -280,6 +280,27 @@ pub(crate) fn endpoint_authority(url: &url::Url) -> Result<String, std::io::Erro
     }
 }
 
+fn transition_timeout_from_env(env_key: &str, default_secs: u64) -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(env_key, default_secs))
+}
+
+pub(crate) fn transition_client_timeouts_from_env() -> TransitionClientTimeouts {
+    TransitionClientTimeouts::new(
+        transition_timeout_from_env(
+            rustfs_config::ENV_TIER_REMOTE_CONNECT_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_TIER_REMOTE_CONNECT_TIMEOUT_SECS,
+        ),
+        transition_timeout_from_env(
+            rustfs_config::ENV_TIER_REMOTE_REQUEST_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_TIER_REMOTE_REQUEST_TIMEOUT_SECS,
+        ),
+        transition_timeout_from_env(
+            rustfs_config::ENV_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+            rustfs_config::DEFAULT_TIER_REMOTE_RESPONSE_BODY_IDLE_TIMEOUT_SECS,
+        ),
+    )
+}
+
 /// Build the [`WarmBackendS3`] shared by the S3-compatible warm backend providers.
 ///
 /// Credential, bucket, and endpoint validation run in this order because the
@@ -310,6 +331,7 @@ pub(crate) async fn new_s3_compatible_warm_backend(
         signer_type: SignatureType::SignatureV4,
         ..Default::default()
     }));
+    let timeouts = transition_client_timeouts_from_env();
     let opts = Options {
         creds,
         secure: u.scheme() == "https",
@@ -322,7 +344,7 @@ pub(crate) async fn new_s3_compatible_warm_backend(
     // Run the SSRF guard after the host-presence check so a host-less endpoint
     // keeps this constructor's stable error text.
     (params.validate_endpoint)(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
-    let client = TransitionClient::new(&endpoint, opts, params.provider_tag).await?;
+    let client = TransitionClient::new_with_timeouts(&endpoint, opts, params.provider_tag, timeouts).await?;
 
     let client = Arc::new(client);
     let core = TransitionCore(Arc::clone(&client));
