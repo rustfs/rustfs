@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::harness::{DistCluster, DistLayout, TestResult, assert_object_bytes, get_object_bytes, put_object, unique_bucket};
+use super::harness::{
+    DistCluster, DistLayout, TestResult, assert_object_bytes, get_object_bytes, put_object, unique_bucket, wait_until,
+};
 use crate::common::init_logging;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use std::time::Duration;
 
 #[tokio::test]
 async fn four_node_four_drive_multipart_and_cross_node_listing_agree() -> TestResult {
@@ -116,20 +119,67 @@ async fn four_node_list_buckets_agree_and_deleted_bucket_can_be_recreated() -> T
     put_object(&dist.client(0)?, &bucket, "gone.bin", b"old".to_vec()).await?;
 
     for node_idx in 0..dist.cluster.nodes.len() {
-        let listed = dist.client(node_idx)?.list_buckets().send().await?;
-        assert!(
-            listed.buckets().iter().any(|entry| entry.name() == Some(bucket.as_str())),
-            "node {node_idx} did not list {bucket}"
-        );
+        let client = dist.client(node_idx)?;
+        let name = bucket.clone();
+        wait_until(
+            Duration::from_secs(20),
+            || {
+                let client = client.clone();
+                let name = name.clone();
+                async move {
+                    let listed = client.list_buckets().send().await?;
+                    Ok(listed.buckets().iter().any(|entry| entry.name() == Some(name.as_str())))
+                }
+            },
+            &format!("node {node_idx} lists {bucket}"),
+        )
+        .await?;
     }
 
     dist.client(1)?.delete_object().bucket(&bucket).key("gone.bin").send().await?;
-    dist.client(2)?.delete_bucket().bucket(&bucket).send().await?;
 
-    match dist.client(3)?.head_bucket().bucket(&bucket).send().await {
-        Ok(_) => return Err("deleted bucket still visible via HEAD".into()),
-        Err(_) => {}
-    }
+    let deleter = dist.client(2)?;
+    let delete_name = bucket.clone();
+    wait_until(
+        Duration::from_secs(20),
+        || {
+            let deleter = deleter.clone();
+            let delete_name = delete_name.clone();
+            async move {
+                match deleter.delete_bucket().bucket(&delete_name).send().await {
+                    Ok(_) => Ok(true),
+                    Err(error) => {
+                        let message = error.to_string();
+                        if message.contains("BucketNotEmpty")
+                            || message.contains("InternalError")
+                            || message.contains("SlowDown")
+                            || message.contains("500")
+                            || message.contains("NoSuchBucket")
+                        {
+                            Ok(message.contains("NoSuchBucket"))
+                        } else {
+                            Err(error.into())
+                        }
+                    }
+                }
+            }
+        },
+        "delete empty bucket",
+    )
+    .await?;
+
+    let checker = dist.client(3)?;
+    let head_name = bucket.clone();
+    wait_until(
+        Duration::from_secs(20),
+        || {
+            let checker = checker.clone();
+            let head_name = head_name.clone();
+            async move { Ok(checker.head_bucket().bucket(&head_name).send().await.is_err()) }
+        },
+        "deleted bucket no longer visible",
+    )
+    .await?;
 
     dist.create_bucket(&bucket).await?;
     put_object(&dist.client(3)?, &bucket, "new.bin", b"new".to_vec()).await?;

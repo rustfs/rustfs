@@ -50,7 +50,7 @@ async fn four_node_pool_expand_preserves_objects_then_rebalance() -> TestResult 
 #[tokio::test]
 async fn four_pool_decommission_moves_objects_without_loss() -> TestResult {
     init_logging();
-    let dist = DistCluster::start(DistLayout::FourPoolFourDrive).await?;
+    let dist = DistCluster::start_four_pool_via_expand().await?;
     let bucket = unique_bucket("decom");
     dist.create_bucket(&bucket).await?;
     let client = dist.client(1)?;

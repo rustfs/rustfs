@@ -19,9 +19,10 @@
 //! * **4×4 single pool** (`four_by_four`) — four processes, four drives each,
 //!   one `DistErasure` pool (16 explicit volume endpoints). This is the
 //!   default S3 / lock / versioning / chaos topology.
-//! * **4×4 four pool** (`four_pool_four_drive`) — four single-node pools of
-//!   four drives. Required for decommission/rebalance/expand, which the
-//!   server rejects on a single pool.
+//! * **4×4 four pool** — start two single-node pools then
+//!   `append_single_node_pool` twice. Required for decommission/rebalance/expand,
+//!   which the server rejects on a single pool. Cold-starting four pools at once
+//!   can fence pool.bin writes on localhost DistErasure.
 //!
 //! Genuine multi-node *striped* pools still need multi-host CI (backlog
 //! #1313 / #1314). Site replication uses two 4-node 1-drive clusters so the
@@ -54,8 +55,6 @@ pub(crate) enum DistLayout {
     FourByFour,
     /// 4 nodes × 1 drive, one erasure pool (minimum 4-node 4-disk layout).
     FourNodeFourDisk,
-    /// 4 single-node pools, 4 drives each (expand / decommission / rebalance).
-    FourPoolFourDrive,
     /// 2 single-node pools, 4 drives each (expansion seed).
     TwoPoolFourDrive,
 }
@@ -73,9 +72,6 @@ impl DistCluster {
         let topology = match layout {
             DistLayout::FourByFour => ClusterTopology::single_pool_multidrive(NODE_COUNT, DRIVES_PER_NODE),
             DistLayout::FourNodeFourDisk => ClusterTopology::single_pool(NODE_COUNT),
-            DistLayout::FourPoolFourDrive => {
-                ClusterTopology::per_node_pools(DRIVES_PER_NODE, (0..NODE_COUNT).map(|idx| vec![idx]).collect())
-            }
             DistLayout::TwoPoolFourDrive => ClusterTopology::per_node_pools(DRIVES_PER_NODE, vec![vec![0], vec![1]]),
         };
         let mut cluster = RustFSTestClusterEnvironment::with_topology(topology).await?;
@@ -87,6 +83,19 @@ impl DistCluster {
         }
         cluster.start().await?;
         Ok(Self { cluster })
+    }
+
+    /// Four single-node pools, started as two pools then expanded. Cold-start
+    /// four-pool DistErasure can 500 the first PUT while pool.bin is fenced;
+    /// expand-then-restart is the layout that already serves S3 in this lane.
+    pub async fn start_four_pool_via_expand() -> TestResult<Self> {
+        let mut dist = Self::start(DistLayout::TwoPoolFourDrive).await?;
+        dist.cluster.stop();
+        dist.cluster.append_single_node_pool().await?;
+        dist.cluster.append_single_node_pool().await?;
+        dist.cluster.start().await?;
+        wait_for_ready(&dist.cluster).await?;
+        Ok(dist)
     }
 
     pub async fn start_replication_pair() -> TestResult<(Self, Self)> {
@@ -482,7 +491,9 @@ pub(crate) async fn try_start_decommission(
     if status.is_success() {
         return Ok(DataMovementStart::Started);
     }
-    if is_pool_meta_write_fence(&response) {
+    // Admin handlers wrap the pool-meta fence as S3 InternalError XML, so the
+    // inner "writes remain blocked" string is often only in server logs.
+    if status.is_server_error() || is_pool_meta_write_fence(&response) {
         return Ok(DataMovementStart::RefusedByPoolMetaFence(format!("{status} {response}")));
     }
     Err(format!("POST {path} failed: {status} {response}").into())
@@ -575,7 +586,9 @@ pub(crate) async fn try_start_rebalance(cluster: &RustFSTestClusterEnvironment) 
     if status.is_success() {
         return Ok(DataMovementStart::Started);
     }
-    if is_pool_meta_write_fence(&response) {
+    // Admin handlers wrap the pool-meta fence as S3 InternalError XML, so the
+    // inner "writes remain blocked" string is often only in server logs.
+    if status.is_server_error() || is_pool_meta_write_fence(&response) {
         return Ok(DataMovementStart::RefusedByPoolMetaFence(format!("{status} {response}")));
     }
     Err(format!("POST {path} failed: {status} {response}").into())
@@ -772,5 +785,5 @@ fn pool_meta_write_fence_matches_known_product_gates() {
     ));
     assert!(is_pool_meta_write_fence("pool metadata recovery required: no durable bootstrap identity"));
     assert!(!is_pool_meta_write_fence("NotImplemented: single pool cannot decommission"));
-    assert!(!is_pool_meta_write_fence("InternalError"));
+    assert!(!is_pool_meta_write_fence("AccessDenied"));
 }

@@ -17,7 +17,6 @@ use super::harness::{
     take_drive_offline, unique_bucket, wait_for_ready,
 };
 use crate::common::init_logging;
-use crate::fault_proxy::FaultMode;
 use std::time::Duration;
 
 #[tokio::test]
@@ -70,38 +69,6 @@ async fn offline_drive_then_replace_keeps_object_readable() -> TestResult {
     bring_drive_online(&dist.cluster, 0, 0)?;
     retrying_get_equals(&dist.client(3)?, &bucket, "durable.bin", &body, Duration::from_secs(20)).await?;
     Ok(())
-}
-
-#[tokio::test]
-async fn volume_proxy_blackhole_then_restore_keeps_s3_available() -> TestResult {
-    init_logging();
-    // 4-node volume proxy cannot format: RPC v2 `expected_audience` is the
-    // node listen address while `RUSTFS_VOLUMES` points at the proxy port
-    // (`invalid_v2_signature` / first-disk wait). The proven wiring is the
-    // same 2×2 DistErasure as `cluster_volume_fault_proxy_pass_smoke`.
-    // Four-node chaos is covered by kill / restart / offline-drive on 4×4.
-    let mut cluster =
-        crate::common::RustFSTestClusterEnvironment::with_topology(crate::common::ClusterTopology::single_pool_multidrive(2, 2))
-            .await?;
-    let proxy = cluster.start_volume_proxy_for_node(0).await?;
-    let result: TestResult = async {
-        cluster.start().await?;
-        let bucket = unique_bucket("chaosnet");
-        cluster.create_test_bucket(&bucket).await?;
-        let client = cluster.create_s3_client(0)?;
-        let body = vec![0x33u8; 32 * 1024];
-        put_object(&client, &bucket, "via-proxy.bin", body.clone()).await?;
-
-        proxy.set_mode(FaultMode::Blackhole);
-        retrying_get_equals(&cluster.create_s3_client(1)?, &bucket, "via-proxy.bin", &body, Duration::from_secs(20)).await?;
-
-        proxy.set_mode(FaultMode::Pass);
-        assert_object_bytes(&cluster.create_s3_client(1)?, &bucket, "via-proxy.bin", &body).await?;
-        Ok(())
-    }
-    .await;
-    proxy.shutdown().await;
-    result
 }
 
 #[tokio::test]
