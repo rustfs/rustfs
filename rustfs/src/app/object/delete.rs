@@ -1143,7 +1143,7 @@ impl DefaultObjectUsecase {
         let manager = get_capacity_manager();
         manager.record_write_operation().await;
         let _ = helper.complete(&result);
-        rustfs_scanner::record_dirty_usage_bucket(&bucket);
+        rustfs_scanner::record_dirty_usage_object(&bucket, &key);
         result
     }
 }

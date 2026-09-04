@@ -770,7 +770,7 @@ async fn scan_and_persist_local_bucket(
 
     let set_disks = scanner_set_disk_inventory(set.as_ref()).await;
     let scan_ctx = ctx.child_token();
-    let scan = ScannerIODisk::nsscanner_disk(disk.clone(), scan_ctx.clone(), budget, set_disks, cache, None, scan_mode);
+    let scan = ScannerIODisk::nsscanner_disk(disk.clone(), scan_ctx.clone(), budget, set_disks, cache, None, scan_mode, None);
     tokio::pin!(scan);
     let fence_watch = watch_remote_scanner_request_fence(next_cycle, leader_epoch, store.clone(), NS_SCANNER_FENCE_POLL_INTERVAL);
     tokio::pin!(fence_watch);
